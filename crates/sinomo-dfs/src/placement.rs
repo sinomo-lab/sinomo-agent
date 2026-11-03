@@ -5892,18 +5892,20 @@ mod tests {
     }
 
     fn native_placement_objects(
+        runtime: &crate::test_support::DfsTestRuntime,
         service: &mut NetworkedDfsService<crate::DfsNodeTransport>,
         objects: Vec<DfsObjectMetadata>,
     ) -> Vec<DfsObjectMetadata> {
-        objects
+        use crate::DfsMetadataBackend as _;
+        let stats = objects
             .into_iter()
             .map(|planned| {
-                let stat = if planned.kind == DfsObjectKind::Directory {
+                if planned.kind == DfsObjectKind::Directory {
                     service
                         .posix_mkdir_all(&planned.path)
                         .expect("normal current directory producer");
                     service
-                        .posix_stat(&planned.path)
+                        .posix_stat_distributed(&planned.path)
                         .expect("actual committed directory stat")
                 } else {
                     assert_eq!(planned.kind, DfsObjectKind::File);
@@ -5932,10 +5934,17 @@ mod tests {
                             },
                         )
                         .expect("normal current byte/version/receipt producer")
-                };
-                service
-                    .metadata_backend()
-                    .unwrap()
+                }
+            })
+            .collect::<Vec<_>>();
+        // The committed rows live in the metadata owner's durable store.
+        let store = runtime
+            .node_metadata(service.node_id())
+            .expect("owner's durable metadata store");
+        stats
+            .into_iter()
+            .map(|stat| {
+                store
                     .get_object(&stat.object_id)
                     .unwrap()
                     .expect("actual committed metadata row")
@@ -7284,7 +7293,7 @@ mod tests {
 
     #[test]
     fn placement_preview_token_fences_descendant_snapshot_plans_with_an_unchanged_root_plan() {
-        let (_runtime, mut service, nodes) =
+        let (runtime, mut service, nodes) =
             native_placement_fixture("preview-descendant-plan-fence", 4);
         let node = |label: &str| nodes[label].clone();
         let advertisement = |label: &str, zone: &str| {
@@ -7332,7 +7341,7 @@ mod tests {
             vec![owner.clone()],
             Some(10),
         );
-        let mut actual = native_placement_objects(&mut service, vec![directory, child]);
+        let mut actual = native_placement_objects(&runtime, &mut service, vec![directory, child]);
         let child = actual.pop().unwrap();
         let directory = actual.pop().unwrap();
         // Scores below are pure planner inputs for token sensitivity only.
@@ -7657,7 +7666,13 @@ mod tests {
             (first, second)
         });
 
-        let mut newer = service
+        // Placement reconciliation is Main-side work on the root owner's
+        // store-backed service; the delegating client keeps no store.
+        let mut worker = runtime
+            .metadata_primary_service("/")
+            .expect("actual root metadata owner");
+        assert_eq!(worker.node_id(), &root_shard.primary_node_id);
+        let mut newer = worker
             .run_placement_reconciliation_bounded(1)
             .expect("newer pass")
             .expect("authoritative job");
@@ -7667,7 +7682,7 @@ mod tests {
             if newer.state.is_terminal() {
                 break;
             }
-            newer = service
+            newer = worker
                 .run_placement_reconciliation_bounded(1)
                 .expect("continue newer job")
                 .expect("authoritative job remains queued");
@@ -7675,7 +7690,7 @@ mod tests {
         }
         assert_eq!(newer.state, DfsPlacementReconciliationState::Completed);
 
-        let superseded = service
+        let superseded = worker
             .run_placement_reconciliation_bounded(1)
             .expect("supersede pass")
             .expect("stale job");
@@ -7689,6 +7704,7 @@ mod tests {
                 .is_some_and(|error| error.contains("superseded"))
         );
         drop(admission);
+        drop(worker);
         drop(service);
         drop(control_plane);
         runtime.close().expect("native owner drain");
@@ -7953,7 +7969,7 @@ mod tests {
 
     #[test]
     fn aggregate_impact_counts_scope_bytes_and_replica_deltas() {
-        let (_runtime, mut service, nodes) =
+        let (runtime, mut service, nodes) =
             native_placement_fixture("aggregate_impact_counts_scope_bytes_and_replica_deltas", 2);
         let node = |label: &str| nodes[label].clone();
         let advertisement = |label: &str, zone: &str| {
@@ -7963,6 +7979,7 @@ mod tests {
         };
         let owner = node("node-a");
         native_placement_objects(
+            &runtime,
             &mut service,
             vec![
                 placement_object(
@@ -8041,7 +8058,7 @@ mod tests {
 
     #[test]
     fn aggregate_impact_excludes_objects_preserved_by_nested_override() {
-        let (_runtime, mut service, nodes) = native_placement_fixture(
+        let (runtime, mut service, nodes) = native_placement_fixture(
             "aggregate_impact_excludes_objects_preserved_by_nested_override",
             2,
         );
@@ -8053,6 +8070,7 @@ mod tests {
         };
         let owner = node("node-a");
         native_placement_objects(
+            &runtime,
             &mut service,
             vec![
                 placement_object(
@@ -8115,7 +8133,7 @@ mod tests {
 
     #[test]
     fn aggregate_impact_reports_nested_unsatisfiable_override_and_is_incomplete() {
-        let (_runtime, mut service, nodes) = native_placement_fixture(
+        let (runtime, mut service, nodes) = native_placement_fixture(
             "aggregate_impact_reports_nested_unsatisfiable_override_and_is_incomplete",
             2,
         );
@@ -8127,6 +8145,7 @@ mod tests {
         };
         let owner = node("node-a");
         native_placement_objects(
+            &runtime,
             &mut service,
             vec![
                 placement_object(
@@ -8237,7 +8256,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let objects = native_placement_objects(&mut service, objects);
+        let objects = native_placement_objects(&runtime, &mut service, objects);
         assert_eq!(objects.len(), PLACEMENT_IMPACT_PAGE_SIZE + 17);
         let parent = service.posix_stat("/services/paged").unwrap();
         assert_eq!(parent.kind, DfsObjectKind::Directory);
@@ -8611,9 +8630,13 @@ mod admitted_placement_coordinator_native_tests {
                 ]),
             )
             .unwrap();
-        assert_eq!(owner.posix_read_file(path).unwrap(), b"actual owner bytes");
-        let durable = owner
-            .metadata_backend()
+        assert_eq!(
+            owner.posix_read_file_distributed(path).unwrap(),
+            b"actual owner bytes"
+        );
+        use crate::DfsMetadataBackend as _;
+        let durable = runtime
+            .node_metadata(&root_shard.primary_node_id)
             .unwrap()
             .get_object(&stat.object_id)
             .unwrap()

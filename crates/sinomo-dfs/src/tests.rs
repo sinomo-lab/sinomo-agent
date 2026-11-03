@@ -442,10 +442,14 @@ fn native_read_fixture_observing_materialization(
         },
     )
     .expect("reader must observe the original publication inside the unchanged write window");
-    let ready_reader = runtime.client(&reader).unwrap();
-    let visible = ready_reader
-        .current_read_object_metadata(&stat.object_id)
-        .unwrap();
+    // The reader node's own durable store, which its Main materialized; a
+    // delegating client keeps no store of its own.
+    let visible = runtime
+        .node_metadata(&reader)
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .expect("the reader node's store holds the published object");
     assert_eq!(visible.object_id, stat.object_id);
     assert_eq!(visible.version, stat.version);
     assert_eq!(visible.content_hash, stat.content_hash);
@@ -458,7 +462,6 @@ fn native_read_fixture_observing_materialization(
             .collect::<BTreeSet<_>>(),
         expected_holders
     );
-    drop(ready_reader);
     drop(writer);
     (runtime, owner, replica, reader, stat, bytes)
 }
@@ -662,6 +665,70 @@ fn temp_root(name: &str) -> sinomo_testdir::TestDir {
     sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
 }
 
+/// The live row `node`'s own durable metadata store holds at `path`, with
+/// tombstones reported as absent. Store-convergence checks inspect the node's
+/// store: its delegating clients keep none, and a distributed read would only
+/// ask the shard primary.
+fn node_store_object(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    node: &NodeId,
+    path: &str,
+) -> Option<DfsObjectMetadata> {
+    runtime
+        .node_metadata(node)
+        .unwrap_or_else(|error| panic!("inspect the store of {node}: {error}"))
+        .get_object_by_path(&sifs_file_system_id(), path)
+        .unwrap_or_else(|error| panic!("{path} in the store of {node}: {error}"))
+        .filter(|object| object.kind != DfsObjectKind::Tombstone)
+}
+
+/// The live direct children of `directory` in `node`'s own store, as
+/// (name, kind, object id) sorted by name.
+fn node_store_children(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    node: &NodeId,
+    directory: &str,
+) -> Vec<(String, DfsObjectKind, DfsObjectId)> {
+    let mut children = runtime
+        .node_metadata(node)
+        .unwrap_or_else(|error| panic!("inspect the store of {node}: {error}"))
+        .child_objects_for_directory(&sifs_file_system_id(), directory)
+        .unwrap_or_else(|error| panic!("{directory} children in the store of {node}: {error}"))
+        .into_iter()
+        .map(|object| {
+            let name = object
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            (name, object.kind, object.object_id)
+        })
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| left.0.cmp(&right.0));
+    children
+}
+
+/// The content hash `node`'s store holds for the file at `path`, following a
+/// hardlink row to its target object as stat does.
+fn node_store_content_hash(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    node: &NodeId,
+    path: &str,
+) -> Option<String> {
+    let object = node_store_object(runtime, node, path)?;
+    if object.kind != DfsObjectKind::Hardlink {
+        return object.content_hash;
+    }
+    let target = object.link_target_object_id?;
+    runtime
+        .node_metadata(node)
+        .unwrap_or_else(|error| panic!("inspect the store of {node}: {error}"))
+        .get_object(&target)
+        .unwrap_or_else(|error| panic!("{target} in the store of {node}: {error}"))
+        .and_then(|target| target.content_hash)
+}
+
 fn native_sifs_service(
     name: &str,
     node_id: NodeId,
@@ -707,7 +774,10 @@ fn assert_malformed_remote_range_rejected(
         true,
         b"authoritative ranged response bytes".to_vec(),
     );
-    let mut dfs = runtime.client(&reader).unwrap();
+    // The authoritative reader runs the read engine over its node's store; a
+    // delegating client has no local object view to plan from.
+    let mut dfs = runtime.metadata_primary_service(&stat.path).unwrap();
+    assert_eq!(dfs.node_id(), &reader);
     let offset = 3_u64;
     let max_bytes = 7_usize;
     assert_eq!(
@@ -1033,8 +1103,11 @@ fn sifs_cluster_publish_metadata_until(
     }
 }
 
-/// Makes remote content locally readable on a node by requesting a remote
-/// read and pumping the cluster until the local read succeeds.
+/// Reads a file through a node's caller, pumping the cluster until the read
+/// succeeds. The fixture's callers delegate to their Main and keep no local
+/// metadata view, so this is the distributed read: it fetches remote content
+/// without caching it. A test that requires the node's own copy asserts the
+/// node's content store separately.
 fn sifs_cluster_fetch_for_local_read(
     cluster: &mut SifsPosixCluster,
     node: fn(&mut SifsPosixCluster) -> &mut NetworkedDfsService<DfsNodeTransport>,
@@ -1042,17 +1115,14 @@ fn sifs_cluster_fetch_for_local_read(
 ) -> Vec<u8> {
     let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     loop {
-        match node(cluster).posix_read_file(path) {
+        match node(cluster).posix_read_file_distributed(path) {
             Ok(bytes) => return bytes,
             Err(DfsPosixError::NotFound { .. }) => {}
             Err(error) => panic!("cluster read of {path} failed: {error}"),
         }
-        node(cluster)
-            .posix_request_remote_read(path)
-            .expect("request remote read");
         sifs_posix_cluster_pump_round(cluster);
         if Instant::now() >= deadline {
-            panic!("cluster read of {path} did not become locally readable");
+            panic!("cluster read of {path} did not become readable");
         }
         std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
     }

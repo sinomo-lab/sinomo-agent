@@ -1072,7 +1072,7 @@ mod tests {
                 .source_reference_applied
         );
         assert!(service.content_reference_present(&reference).unwrap());
-        assert!(service.posix_stat("/users/copied").is_err());
+        assert!(service.posix_stat_distributed("/users/copied").is_err());
         // Exercise the ordinary owning-shard maintenance caller's cancellation
         // handling against the real checkpointed job and reservation.
         let stopped_before = stopped.load(Ordering::SeqCst);
@@ -1108,7 +1108,9 @@ mod tests {
         let complete = service.test_resume_content_copy_job(&job, 16).unwrap();
         assert_eq!(complete.status, DfsNamespaceJobStatus::Completed);
         assert_eq!(
-            service.posix_read_file("/users/copied").unwrap(),
+            service
+                .posix_read_file_distributed("/users/copied")
+                .unwrap(),
             b"protected source"
         );
         assert!(!service.content_reference_present(&reference).unwrap());
@@ -1144,7 +1146,7 @@ mod tests {
             .clone()
             .unwrap();
         assert!(service.content_reference_present(&reference).unwrap());
-        assert!(service.posix_stat("/users/copied").is_err());
+        assert!(service.posix_stat_distributed("/users/copied").is_err());
         let concurrent = service
             .posix_write_file("/users/copied", b"concurrent destination", options(&node))
             .unwrap();
@@ -1157,10 +1159,12 @@ mod tests {
             Some(DfsContentCopyJobResult::Rejected { .. })
         ));
         assert_eq!(
-            service.posix_read_file("/users/copied").unwrap(),
+            service
+                .posix_read_file_distributed("/users/copied")
+                .unwrap(),
             b"concurrent destination"
         );
-        let preserved = service.posix_stat("/users/copied").unwrap();
+        let preserved = service.posix_stat_distributed("/users/copied").unwrap();
         assert_eq!(preserved.object_id, concurrent.object_id);
         assert_eq!(preserved.version, concurrent.version);
         assert_eq!(preserved.content_hash, concurrent.content_hash);
@@ -1425,7 +1429,7 @@ mod tests {
                 .content_reference_present(&private_reference)
                 .unwrap()
         );
-        assert!(service.posix_stat("/users/copied").is_err());
+        assert!(service.posix_stat_distributed("/users/copied").is_err());
         // Retry the existing job after its source grant is gone, rather than
         // admitting another source-dependent Begin request.
         let replay = service.test_resume_content_copy_job(&selected, 8).unwrap();

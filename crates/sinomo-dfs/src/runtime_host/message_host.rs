@@ -567,6 +567,87 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
     })
 }
 
+/// Run `operation` on this node's resident Main maintenance service, which
+/// holds every shard copy on the node, under the global exclusive admission,
+/// DATA owner and publication provider an ordinary maintenance tick holds.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn with_daemon_dfs_main_maintenance_service<R>(
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    operation: impl FnOnce(&mut NetworkedDfsService<DfsNodeTransport>) -> R,
+) -> Result<R, sinomo_dfs::DfsError> {
+    let invalid = |detail: String| sinomo_dfs::DfsError::Metadata { message: detail };
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(|error| invalid(error.to_string()))?;
+    let peer = read_daemon_dfs_message_peer_snapshot(&cluster_paths)?
+        .ok_or_else(|| invalid("Main has no current peer snapshot".into()))?;
+    let admission = runtime
+        .block_on(
+            daemon_dfs_mutation_scheduler(data_dir)
+                .map_err(|error| invalid(error.to_string()))?
+                .admit(&DfsMessageExecutionScope::GlobalExclusive),
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+    let owners = sinomo_dfs::publication_guard::DfsPublicationExecutionOwners::from_runtime(
+        data_dir.root(),
+        DfsMessageExecutionScope::GlobalExclusive,
+        admission,
+        require_daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(data_dir))
+            .map_err(|error| invalid(error.to_string()))?,
+    );
+    // An authority generation that advanced after its preflight is ordinary
+    // churn; warm a fresh preflight, as a maintenance tick does.
+    let mut attempts = 0;
+    let mut retained = loop {
+        let preflight = runtime.block_on(
+            warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                &cluster_paths,
+                &peer,
+                runtime,
+            ),
+        )?;
+        match try_take_daemon_dfs_message_mutation_service_for_maintenance(
+            data_dir,
+            &cluster_paths,
+            &state,
+            runtime,
+            Some(&preflight),
+        ) {
+            Ok(retained) => break retained,
+            Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_)) if attempts < 8 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error.into_dfs_error()),
+        }
+    };
+    let provider = sinomo_dfs::DfsPublicationExecutionProvider::from_execution_owners(
+        &owners,
+        Arc::clone(&retained.metadata_authority_generation),
+        runtime.clone(),
+    );
+    let result = provider.map(|provider| {
+        let execution = retained
+            .lane
+            .service
+            .publication_execution
+            .install(Arc::clone(&owners));
+        let provider_scope = retained.lane.service.publication_provider.install(provider);
+        let result = operation(&mut retained.lane.service);
+        drop(provider_scope);
+        drop(execution);
+        result
+    });
+    restore_daemon_dfs_message_mutation_service_after_maintenance(
+        data_dir,
+        &cluster_paths,
+        runtime,
+        retained,
+    )?;
+    drop(owners);
+    result.map_err(sinomo_dfs::DfsError::from)
+}
+
 pub(crate) fn restore_daemon_dfs_message_mutation_service_after_maintenance(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -3620,10 +3701,11 @@ impl sinomo_dfs::DfsCommittedEffectsHost for DaemonDfsCommittedEffectsHost<'_> {
         advanced
     }
 
-    fn wake_maintenance(&self, _repair: bool, _namespace: bool) {
-        #[cfg(test)]
-        if _repair {
+    fn wake_maintenance(&self, repair: bool, _namespace: bool) {
+        if repair {
+            #[cfg(test)]
             record_daemon_dfs_repair_maintenance_edge_request(self.data_dir);
+            request_daemon_dfs_repair_maintenance(self.data_dir);
         }
         notify_daemon_dfs_maintenance_work(self.data_dir);
     }

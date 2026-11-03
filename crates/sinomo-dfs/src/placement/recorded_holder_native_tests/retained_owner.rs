@@ -507,7 +507,7 @@ fn native_managed_original_becomes_nonactive_history_after_core_capture_and_head
     // Internal Original preparation starts from a fresh ordinary effect owner
     // AFTER the actual registered Main publication, never the pre-CAS opener.
     let mut service = native.metadata_primary_service(PATH).unwrap();
-    let managed = actual_record(&service, &job, &object);
+    let managed = actual_record(&native, service.node_id(), &job, &object);
     evidence(
         &native,
         &primary,

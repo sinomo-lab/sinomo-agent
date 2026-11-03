@@ -29,13 +29,19 @@ fn semantic_fixture(
         SinomoDataDir::new(root),
     )
     .unwrap();
-    let mut dfs = runtime.client(&owner).unwrap();
-    let stat = dfs
+    let mut client = runtime.client(&owner).unwrap();
+    let stat = client
         .posix_write_file(
             "/services/semantic-source.txt",
             b"immutable source bytes",
             DfsWriteOptions::replicated_eventual(vec![owner]),
         )
+        .unwrap();
+    drop(client);
+    // Contributions are Main-side store work: the client delegating to its
+    // Main keeps no store, so they run on the shard's store-backed opener.
+    let mut dfs = runtime
+        .metadata_primary_service("/services/semantic-source.txt")
         .unwrap();
     let object = dfs
         .metadata_backend
@@ -559,6 +565,9 @@ fn contribution_rechecks_the_original_head_under_the_actual_writer() {
     let path = object.path.clone();
     let owner = object.owner_node_id.clone();
     let mut concurrent = _runtime.client(&owner).unwrap();
+    // The delegating writer keeps no store; observe the owner's durable store.
+    let store_root = default_dfs_metadata_shards_root(_runtime.data_dir(&owner));
+    let shards = _runtime.metadata_shards().unwrap();
     let _hook = crate::service_metadata::install_namespace_prepare_after_expectations_test_hook(
         move |_backend| {
             let stat = concurrent
@@ -568,8 +577,12 @@ fn contribution_rechecks_the_original_head_under_the_actual_writer() {
                     DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
                 )
                 .unwrap();
-            *observed.lock().unwrap() = concurrent
-                .metadata_backend()
+            *observed.lock().unwrap() =
+                crate::local_state::open_local_sharded_metadata_backend_for_inspection_at_node(
+                    store_root.clone(),
+                    shards.clone(),
+                    &owner,
+                )
                 .unwrap()
                 .get_object(&stat.object_id)
                 .unwrap();
@@ -934,7 +947,9 @@ fn expired_contribution_cannot_restamp_its_original_timestamp() {
     drop(dfs);
     _runtime.stop_node(&node).unwrap();
     _runtime.reopen_node(node.clone()).unwrap();
-    let mut reopened = _runtime.client(&node).unwrap();
+    let mut reopened = _runtime
+        .metadata_primary_service("/services/semantic-source.txt")
+        .unwrap();
     let error = reopened.apply_atomic_contribution(admitted).unwrap_err();
     assert!(error.to_string().contains("terminally evicted"), "{error}");
     assert_eq!(read_version(&reopened, &reference), before);

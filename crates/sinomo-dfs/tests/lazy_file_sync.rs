@@ -140,7 +140,8 @@ fn native_file_sync_stale_authority_redirects_to_local_main_after_real_handoff()
                 .map_err(|error| error.to_string())?
                 .service;
             assert_eq!(caller.node_id(), &worker_node);
-            assert!(caller.metadata_backend().is_some());
+            // The mounted caller delegates to its Main and keeps no store.
+            assert!(caller.metadata_backend().is_none());
             // Finish genuine lookup/prewarm BEFORE installing the hold. After
             // ready, the only caller API is this exact frozen FileSync target.
             let warmed = caller
@@ -201,7 +202,7 @@ fn native_file_sync_stale_authority_redirects_to_local_main_after_real_handoff()
             route: Some(DFS_DATA_NAMESPACE_ROUTE.to_owned()),
             call_id: None,
             origin: Some(DfsTestRpcOrigin::RegisteredHost),
-            remaining_hits: 1,
+            remaining_hits: 2,
             action: DfsTestFaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
         });
         // Only the controller, cleanup and configured rule own this gate now.
@@ -211,6 +212,11 @@ fn native_file_sync_stale_authority_redirects_to_local_main_after_real_handoff()
         let action_started = Instant::now();
         let deadline = action_started + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         start_tx.send(deadline).unwrap();
+        // The caller delegates to its Main and keeps no local view: it reads the
+        // frozen target's current object from the authority before sending its
+        // FileSync. Let exactly that first authority read through, then hold
+        // the FileSync carrier itself.
+        let mut released_authority_read = false;
         let held_call = loop {
             let calls = runtime.rpc_observations();
             let matching = calls[rpc_begin..]
@@ -222,8 +228,15 @@ fn native_file_sync_stale_authority_redirects_to_local_main_after_real_handoff()
                         && event.phase == DfsTestRpcPhase::BeforeDispatch
                 })
                 .collect::<Vec<_>>();
-            if matching.len() == 1 && Arc::strong_count(&gate) > installed_gate_owners {
-                let call = (*matching[0]).clone();
+            if matching.len() == 1
+                && !released_authority_read
+                && Arc::strong_count(&gate) > installed_gate_owners
+            {
+                released_authority_read = true;
+                gate.add_permits(1);
+            }
+            if matching.len() == 2 && Arc::strong_count(&gate) > installed_gate_owners {
+                let call = (*matching[1]).clone();
                 assert!(!worker.is_finished(), "held ordinary call is not terminal");
                 assert!(
                     !calls[rpc_begin..]
@@ -249,8 +262,14 @@ fn native_file_sync_stale_authority_redirects_to_local_main_after_real_handoff()
             Arc::strong_count(&gate)
         );
         assert!(
-            old_receiver.records().is_empty(),
-            "the held call must not reach the old receiver before the handoff"
+            !old_receiver
+                .records()
+                .iter()
+                .any(|frame| matches!(&frame.message,
+                sinomo_dfs::DfsNetworkMessage::NamespaceRequest(request)
+                    if matches!(&request.operation,
+                        sinomo_dfs::DfsNamespaceOperation::FileSync { .. }))),
+            "the held FileSync must not reach the old receiver before the handoff"
         );
         runtime.assert_fault_budgets().unwrap();
         // The paused real call owns its cloned negative action. Removing the

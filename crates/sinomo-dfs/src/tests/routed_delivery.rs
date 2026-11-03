@@ -108,8 +108,8 @@ fn native_delivery_case(body: Body, uncertain: bool, close_owner: bool) {
             DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
         )
         .unwrap();
-    let object = authority
-        .metadata_backend()
+    let object = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_object(&original.object_id)
         .unwrap()
@@ -317,8 +317,8 @@ fn native_stale_authority_redirect_keeps_original_identity_after_lost_reply() {
             DfsWriteOptions::replicated_eventual(vec![old_primary.clone()]),
         )
         .unwrap();
-    let object = old
-        .metadata_backend()
+    let object = runtime
+        .node_metadata(&old_primary)
         .unwrap()
         .get_object(&original.object_id)
         .unwrap()

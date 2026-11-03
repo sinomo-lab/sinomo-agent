@@ -1444,6 +1444,7 @@ fn authenticated_dfs_cluster_source_node_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DfsMetadataBackend as _;
     use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DfsMetadataJournalFrameBatch};
     use crate::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchResponse,
@@ -2246,11 +2247,11 @@ mod tests {
         let status = |runtime: &crate::test_runtime::DfsTestRuntime, target: &NodeId| {
             // Exact diagnostic summaries validate the bounded route's claims
             // without asking that route to scan or hide declared omissions.
-            let observer = runtime.client(target).unwrap();
-            let backend = observer.metadata_backend().unwrap();
+            // Clients keep no store; read the target node's durable metadata.
+            let backend = runtime.node_metadata(target).unwrap();
             let inventory = backend.metadata_summary().unwrap();
             let owned = backend.metadata_summary_for_local_primary_shards().unwrap();
-            drop(observer);
+            drop(backend);
             // As with the exact metadata inventory above, establish the real
             // durable queue view outside the bounded status route. An idle
             // replica need not have run repair maintenance before this query.
@@ -2418,7 +2419,7 @@ mod tests {
         let mut receiver = runtime.client(&target).unwrap();
         assert_eq!(
             receiver
-                .posix_stat("/users/status-scope-file")
+                .posix_stat_distributed("/users/status-scope-file")
                 .unwrap()
                 .object_id,
             object.object_id
@@ -2647,16 +2648,15 @@ mod tests {
             response.result,
             crate::DfsMetadataJournalBatchResult::Rejected { .. }
         ));
-        let receiver_view = runtime.client(&receiver).unwrap();
         assert_eq!(
-            receiver_view
-                .metadata_backend()
+            runtime
+                .node_metadata(&receiver)
                 .unwrap()
                 .metadata_prefix_proof(&shard)
                 .unwrap(),
             Some(snapshot.prefix_proof)
         );
-        drop((receiver_view, source));
+        drop(source);
         runtime
             .close()
             .expect("all native receivers and owners stopped");
@@ -2868,12 +2868,12 @@ mod tests {
         assert!(smoke.committed_replica_node_ids.contains(&local));
         let mut client = runtime.client(&local).expect("actual native smoke reader");
         let actual = client
-            .posix_stat(&smoke.path)
+            .posix_stat_distributed(&smoke.path)
             .expect("actual committed smoke path");
         assert_eq!(actual.object_id, smoke.object_id);
         assert_eq!(actual.version, smoke.version);
         let bytes = client
-            .posix_read_file(&smoke.path)
+            .posix_read_file_distributed(&smoke.path)
             .expect("actual committed smoke bytes");
         assert!(!bytes.is_empty());
         assert_eq!(Some(bytes.len() as u64), smoke.size_bytes);
@@ -2935,8 +2935,9 @@ mod tests {
         bootstrap.posix_sync_directory("/").unwrap();
         drop(bootstrap);
         let snapshot = || {
-            let observer = runtime.client(&authenticated).unwrap();
-            let backend = observer.metadata_backend().unwrap();
+            // The node's durable store, which a rejected routed identity
+            // must leave unchanged; clients keep no store of their own.
+            let backend = runtime.node_metadata(&authenticated).unwrap();
             let summary = backend.metadata_summary().unwrap();
             let prefixes = backend
                 .metadata_shard_statuses()

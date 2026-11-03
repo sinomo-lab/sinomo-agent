@@ -15,7 +15,7 @@ use crate::posix_model::{
     DfsPosixDistributedOpenedFileRangeReadOutcome, DfsPosixError, DfsPosixFileRangeReadStream,
     DfsPosixFileReadStream, DfsStat, Result,
 };
-use crate::posix_path::normalize_posix_path;
+use crate::posix_path::{normalize_posix_path, path_after_dot_resolution};
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsDirectReadClientResult,
     DfsError, DfsMessageTransport, DfsMetadataShardConfig, DfsNetworkMessage, DfsNodeTransport,
@@ -527,10 +527,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(String, DfsObjectMetadata)> {
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, follow_final)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        // A hardlink's target may live only at its authority.
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         self.posix_file_content_object(path, object)
     }
 
     pub fn posix_read_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let (path, object) = service.local_posix_file_content_object(path, true)?;
             match service.read_object_metadata_local_content_with_state(&object, false)? {
@@ -551,6 +557,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let (path, object) = service.local_posix_file_content_object(path, true)?;
             match service
@@ -568,6 +575,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_open_file_stream(&self, path: &str) -> Result<DfsPosixFileReadStream> {
+        self.ensure_local_view_readable(path)?;
         let (path, object) = self.local_posix_file_content_object(path, true)?;
         self.open_local_posix_file_stream_for_object(path, object)
     }
@@ -610,6 +618,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<DfsPosixFileRangeReadStream> {
+        self.ensure_local_view_readable(path)?;
         let (path, object) = self.local_posix_file_content_object(path, true)?;
         match self.open_local_object_metadata_range_stream_with_state(&object, offset, max_bytes)? {
             NetworkedDfsRangeReadStreamOutcome::Found(stream) => Ok(DfsPosixFileRangeReadStream {
@@ -643,9 +652,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_posix_dot_components_distributed(path)?;
-        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
-            service.posix_read_file_distributed_outcome_from_snapshot(&path, shard_snapshot)
+        let requested = self.resolve_posix_dot_components_distributed(path)?;
+        // Keep a trailing slash: it requires the target to be a directory.
+        let lookup = path_after_dot_resolution(path, &requested);
+        self.with_local_primary_metadata_read_snapshot(&requested, |service, shard_snapshot| {
+            service.posix_read_file_distributed_outcome_from_snapshot(&lookup, shard_snapshot)
         })
     }
 
@@ -713,10 +724,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_posix_dot_components_distributed(path)?;
-        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
+        let requested = self.resolve_posix_dot_components_distributed(path)?;
+        let lookup = path_after_dot_resolution(path, &requested);
+        self.with_local_primary_metadata_read_snapshot(&requested, |service, shard_snapshot| {
             service.posix_read_file_prefix_distributed_outcome_from_snapshot(
-                &path,
+                &lookup,
                 max_bytes,
                 shard_snapshot,
             )
@@ -1309,25 +1321,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 data: DfsReadData { bytes, .. },
                 ..
             } => {
-                let atime_update = (|| -> Result<()> {
-                    // A read-only namespace lookup may resolve authoritative
-                    // metadata without materializing it in this node's local
-                    // mirror. Only the metadata authority may journal atime;
-                    // replicas and outside readers intentionally use noatime
-                    // semantics.
-                    if !self.is_local_metadata_primary_for_object(&object)? {
-                        return Ok(());
-                    }
-                    let Some(mut object) = self.object_by_id(&object.object_id)? else {
-                        return Ok(());
-                    };
-                    (_, object) = self.posix_file_content_object(path.clone(), object)?;
-                    object.accessed_at_unix_nanos = now_unix_nanos();
-                    object.version = next_version(&object.version);
-                    self.add_object_metadata(object)?;
-                    Ok(())
-                })();
-                if let Err(error) = atime_update {
+                if let Err(error) = self.record_posix_access(&object) {
                     // The content read above is already authoritative and
                     // complete. Access-time bookkeeping must never turn that
                     // success into a false data-access failure.
@@ -1365,17 +1359,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 data: DfsReadData { bytes, .. },
                 ..
             } => {
-                if self.is_local_metadata_primary_for_object(&object)? {
-                    let mut current = self
-                        .object_by_id(&object.object_id)?
-                        .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                    if current.kind == DfsObjectKind::Tombstone {
-                        return Err(DfsPosixError::NotFound { path });
-                    }
-                    current.accessed_at_unix_nanos = now_unix_nanos();
-                    current.version = next_version(&current.version);
-                    self.add_object_metadata(current)?;
-                }
+                self.record_posix_access(&object)?;
                 Ok(bytes)
             }
             NetworkedDfsReadOutcome::PendingReplication { .. }
@@ -1580,21 +1564,53 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let outcome = self
             .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?;
         let read = distributed_file_range_content_outcome(path.clone(), &object, outcome)?;
-        if matches!(read, DfsPosixDistributedFileReadOutcome::Found { .. })
-            && update_access
-            && self.is_local_metadata_primary_for_object(&object)?
-        {
-            let Some(mut current) = self.object_by_id(&object.object_id)? else {
-                return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
-            };
-            if current.kind == DfsObjectKind::Tombstone {
-                return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
+        if matches!(read, DfsPosixDistributedFileReadOutcome::Found { .. }) && update_access {
+            match self.record_posix_access(&object) {
+                Ok(()) => {}
+                Err(DfsPosixError::NotFound { .. }) => {
+                    return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
+                }
+                Err(error) => return Err(error),
             }
-            current.accessed_at_unix_nanos = now_unix_nanos();
-            current.version = next_version(&current.version);
-            self.add_object_metadata(current)?;
         }
         Ok(read)
+    }
+
+    /// Record a completed read's access time. Only the metadata authority
+    /// journals atime; replicas and outside readers use noatime semantics. A
+    /// caller delegating to its Main keeps no metadata store, so Main records it.
+    pub(super) fn record_posix_access(&mut self, object: &DfsObjectMetadata) -> Result<()> {
+        if !self.is_local_metadata_primary_for_object(object)? {
+            return Ok(());
+        }
+        if self.transport.delegates_local_namespace_authority() && self.control_plane.is_some() {
+            let main = self.node_id.clone();
+            return self.route_namespace_operation(
+                main,
+                crate::DfsNamespaceOperation::RecordAccess {
+                    path: object.path.clone(),
+                    object_id: object.object_id.clone(),
+                },
+            );
+        }
+        self.record_posix_access_local(&object.object_id, &object.path)
+    }
+
+    pub(crate) fn record_posix_access_local(
+        &mut self,
+        object_id: &DfsObjectId,
+        path: &str,
+    ) -> Result<()> {
+        let mut current = self
+            .object_by_id(object_id)?
+            .filter(|current| current.kind != DfsObjectKind::Tombstone)
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: path.to_string(),
+            })?;
+        current.accessed_at_unix_nanos = now_unix_nanos();
+        current.version = next_version(&current.version);
+        self.add_object_metadata(current)?;
+        Ok(())
     }
 
     pub(super) fn read_current_object_or_fetch_remote(
@@ -2073,7 +2089,7 @@ impl NetworkedDfsService<DfsNodeTransport> {
 #[cfg(test)]
 mod opened_stat_tests {
     use super::*;
-    use crate::DfsWriteOptions;
+    use crate::{DfsMetadataBackend as _, DfsWriteOptions};
 
     use sinomo_core::DfsObjectPolicy;
 
@@ -2177,8 +2193,9 @@ mod opened_stat_tests {
         service
             .posix_hardlink("/catalog.sobj", "/catalog-link.sobj")
             .expect("normal hardlink publication");
-        let hardlink = service
-            .metadata_backend()
+        // The owner's durable store; the client keeps no store of its own.
+        let hardlink = native
+            .node_metadata(&local)
             .unwrap()
             .get_object_by_path(&source.file_system_id, "/catalog-link.sobj")
             .unwrap()
@@ -2279,14 +2296,14 @@ mod opened_stat_tests {
             .posix_write_file("/opened.txt", b"version-one", options.clone())
             .expect("normal first version publication");
         let opened = service
-            .posix_stat("/opened.txt")
+            .posix_stat_distributed("/opened.txt")
             .expect("actual opened stat");
         service
             .posix_write_file("/opened.txt", b"version-two", options)
             .expect("normal second version publication");
         assert_ne!(
             service
-                .posix_stat("/opened.txt")
+                .posix_stat_distributed("/opened.txt")
                 .expect("current stat")
                 .version,
             opened.version
@@ -2296,7 +2313,7 @@ mod opened_stat_tests {
             .posix_rename("/opened.txt", "/moved-after-open.txt")
             .expect("normal rename after open");
         assert!(matches!(
-            service.posix_stat("/opened.txt"),
+            service.posix_stat_distributed("/opened.txt"),
             Err(DfsPosixError::NotFound { .. })
         ));
         assert_eq!(

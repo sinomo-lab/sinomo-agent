@@ -1840,8 +1840,8 @@ fn background_metadata_publication_waits_but_durability_catchup_preempts() {
     let replica = shard.replica_node_ids[0].clone();
     let file_system = crate::distributed_sifs(primary.clone());
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-    let source = native.client(&primary).unwrap();
-    let backend = source.metadata_backend().unwrap();
+    let source = native.node_metadata(&primary).unwrap();
+    let backend: &dyn DfsMetadataBackend = &source;
     let mut subscription = backend.subscribe(0);
     let batch = backend.poll_subscription(&mut subscription).unwrap();
     let frames =
@@ -2404,8 +2404,8 @@ impl NativeOwnedBackgroundRepairFixture {
                 },
             )
             .unwrap();
-        let payload_bytes = writer.posix_read_file(path).unwrap();
-        let current = writer.posix_stat(path).unwrap();
+        let payload_bytes = writer.posix_read_file_distributed(path).unwrap();
+        let current = writer.posix_stat_distributed(path).unwrap();
         assert_eq!(current.object_id, stat.object_id);
         assert_eq!(current.version, stat.version);
         drop(writer);
@@ -5952,15 +5952,15 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
     let primary = config.primary_node_id.clone();
     let replica = config.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
-    let mut source = native.client(&primary).unwrap();
-    let before = source
-        .metadata_backend()
+    let before = native
+        .node_metadata(&primary)
         .unwrap()
         .export_shard_table_snapshot(&shard_id)
         .unwrap()
         .unwrap()
         .prefix_proof
         .journal_sequence;
+    let mut source = native.client(&primary).unwrap();
     let marker = source
         .posix_mkdir("/native-resident-ingress-marker")
         .unwrap();
@@ -6390,7 +6390,8 @@ fn daemon_dfs_metadata_journal_batch_rejects_non_primary_source() {
     .unwrap();
     let target = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-    let backend = source.metadata_backend().unwrap();
+    let primary_store = runtime.node_metadata(&shard.primary_node_id).unwrap();
+    let backend: &dyn DfsMetadataBackend = &primary_store;
     let batch = backend
         .journal_batch_for_shard_since_limited(
             &shard_id,
@@ -6413,10 +6414,9 @@ fn daemon_dfs_metadata_journal_batch_rejects_non_primary_source() {
         false,
     );
     command.source_node_id = Some(target.clone());
+    drop(primary_store);
     let before = runtime
-        .client(&target)
-        .unwrap()
-        .metadata_backend()
+        .node_metadata(&target)
         .unwrap()
         .export_shard_table_snapshot(&shard_id)
         .unwrap()
@@ -6430,10 +6430,8 @@ fn daemon_dfs_metadata_journal_batch_rejects_non_primary_source() {
         response.result,
         DfsMetadataJournalBatchResult::Rejected { .. }
     ));
-    let target_client = runtime.client(&target).unwrap();
+    let target_client = runtime.node_metadata(&target).unwrap();
     let after = target_client
-        .metadata_backend()
-        .unwrap()
         .export_shard_table_snapshot(&shard_id)
         .unwrap()
         .unwrap();
@@ -6466,19 +6464,10 @@ fn daemon_dfs_status_reads_default_metadata_backend() {
     service
         .posix_sync_file("/services/native-status.txt", DfsPosixSyncKind::File)
         .unwrap();
-    let expected = service
-        .metadata_backend()
-        .unwrap()
-        .metadata_summary()
-        .unwrap();
-    assert!(
-        service
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
-            .is_some()
-    );
+    let node_store = runtime.node_metadata(&node).unwrap();
+    let expected = node_store.metadata_summary().unwrap();
+    assert!(node_store.get_object(&stat.object_id).unwrap().is_some());
+    drop(node_store);
     drop(service);
     let data = runtime.data_dir(&node);
     let status =
@@ -6573,10 +6562,10 @@ fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
         0
     );
     assert_eq!(
-        client.posix_read_file(&target_file).unwrap(),
+        client.posix_read_file_distributed(&target_file).unwrap(),
         b"actual native namespace job"
     );
-    assert!(client.posix_read_file(&source_file).is_err());
+    assert!(client.posix_read_file_distributed(&source_file).is_err());
     drop(client);
     native.close().unwrap();
 }
@@ -7677,7 +7666,8 @@ fn source_less_write_intent_projects_exact_stale_deadline() {
 fn daemon_dfs_offline_only_receipt_below_quorum_is_not_executable_work() {
     let mut fixture = native_pending_source_fixture("native-offline-only-below-w", false);
     let replica = fixture.native.root_shard().unwrap().replica_node_ids[0].clone();
-    let reader = fixture.native.client(&replica).unwrap();
+    // The replica's own durable store, opened before the primary stops.
+    let reader = fixture.native.node_metadata(&replica).unwrap();
     let intent = fixture.intent.clone();
     let receipt = fixture.receipt.clone();
     drop(fixture.source.take());
@@ -7685,7 +7675,7 @@ fn daemon_dfs_offline_only_receipt_below_quorum_is_not_executable_work() {
     let offline = BTreeSet::from([fixture.primary.clone()]);
     let source_less = daemon_dfs_intents_without_recovery_source(
         fixture.native.data_dir(&replica),
-        reader.metadata_backend().unwrap(),
+        &reader,
         std::slice::from_ref(&intent),
         std::slice::from_ref(&receipt),
         &offline,
@@ -8229,7 +8219,11 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
             desired.epoch,
         )
     });
-    assert!(promoted.posix_stat("/native-rebind-source-cut").is_ok());
+    assert!(
+        promoted
+            .posix_stat_distributed("/native-rebind-source-cut")
+            .is_ok()
+    );
     promoted.posix_mkdir("/native-rebind-new-author").unwrap();
     drop(promoted);
     drop(control);
@@ -8349,7 +8343,7 @@ fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
         )
         .unwrap();
     let object = client
-        .current_read_object_metadata(&stat.object_id)
+        .current_read_object_metadata_distributed(&stat.object_id)
         .unwrap();
     assert!(object.current_locations.contains(&node));
     client
@@ -8588,8 +8582,8 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         .expect("actual primary service");
     let before = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths).unwrap();
     let services_id = DfsMetadataShardId::new("services");
-    let before_sequence = source
-        .metadata_backend()
+    let before_sequence = runtime
+        .node_metadata(&source_node)
         .unwrap()
         .export_shard_table_snapshot(&services_id)
         .unwrap()
@@ -8654,8 +8648,9 @@ fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         .filter(|target| **target != offline_node)
     {
         loop {
-            let cursor = source
-                .metadata_backend()
+            // Reopen the durable primary store for each observation.
+            let cursor = runtime
+                .node_metadata(&source_node)
                 .unwrap()
                 .metadata_replication_cursor(target, &services_id)
                 .unwrap();
@@ -8854,6 +8849,39 @@ fn late_native_publish_from_current_authority(
     )
 }
 
+/// The primary's durable replication cursor for `target` once Main's own
+/// publication of the fixture setup is acknowledged, so later comparisons
+/// start from a settled, actually acknowledged position rather than a race.
+fn settled_native_replication_cursor(
+    native: &crate::test_runtime::DfsTestRuntime,
+    shard: &DfsMetadataShardConfig,
+    target: &NodeId,
+) -> u64 {
+    let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let store = native.node_metadata(&shard.primary_node_id).unwrap();
+        let cursor = store
+            .metadata_replication_cursor(target, &shard_id)
+            .unwrap();
+        let head = store
+            .metadata_shard_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.shard_id == shard_id)
+            .unwrap()
+            .journal_last_sequence;
+        if cursor == head {
+            return cursor;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Main must acknowledge the fixture setup to {target} within the existing network budget; cursor={cursor}, head={head}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn late_native_publish_options() -> crate::DfsMetadataJournalReplicationOptions {
     crate::DfsMetadataJournalReplicationOptions {
         probe_caught_up_replicas: true,
@@ -8989,11 +9017,9 @@ fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
     }
     assert_eq!(frames.last().unwrap().batch.next_after_sequence, head);
     drop(sent);
-    let source = native.client(&local).unwrap();
+    let source = native.node_metadata(&local).unwrap();
     assert_eq!(
         source
-            .metadata_backend()
-            .unwrap()
             .metadata_replication_cursor(&target, &DfsMetadataShardId::new(shard.shard_id))
             .unwrap(),
         head
@@ -9009,11 +9035,7 @@ fn daemon_dfs_metadata_journal_publish_rejects_mismatched_ack_cursor() {
     let local = shard.primary_node_id.clone();
     let target = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-    let before = service
-        .metadata_backend()
-        .unwrap()
-        .metadata_replication_cursor(&target, &shard_id)
-        .unwrap();
+    let before = settled_native_replication_cursor(&native, &shard, &target);
     let head = late_native_hidden_suffix(&mut service, &shard, 1);
     drop(service);
     let (peer, _) = native.peer_transports(&local).unwrap();
@@ -9045,21 +9067,17 @@ fn daemon_dfs_metadata_journal_publish_rejects_mismatched_ack_cursor() {
     .unwrap();
     assert!(report.outcomes.iter().any(|outcome| matches!(outcome,
         DfsMetadataJournalReplicationOutcome::Failed { target_node_id, .. } if target_node_id == &target)));
-    let source = native.client(&local).unwrap();
+    let source = native.node_metadata(&local).unwrap();
     assert_eq!(
         source
-            .metadata_backend()
-            .unwrap()
             .metadata_replication_cursor(&target, &DfsMetadataShardId::new(shard.shard_id))
             .unwrap(),
         before,
         "a corrupted actual response must not advance the scheduling cursor"
     );
-    let receiver = native.client(&target).unwrap();
+    let receiver = native.node_metadata(&target).unwrap();
     assert!(
         receiver
-            .metadata_backend()
-            .unwrap()
             .metadata_shard_statuses()
             .unwrap()
             .iter()
@@ -9078,11 +9096,7 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
     let local = shard.primary_node_id.clone();
     let target = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-    let before = service
-        .metadata_backend()
-        .unwrap()
-        .metadata_replication_cursor(&target, &shard_id)
-        .unwrap();
+    let before = settled_native_replication_cursor(&native, &shard, &target);
     late_native_hidden_suffix(&mut service, &shard, 1);
     drop(service);
     let (peer, _) = native.peer_transports(&local).unwrap();
@@ -9119,11 +9133,9 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
     );
     assert!(report.outcomes.iter().any(|outcome| matches!(outcome,
         DfsMetadataJournalReplicationOutcome::Rejected { target_node_id, .. } if target_node_id == &target)));
-    let source = native.client(&local).unwrap();
+    let source = native.node_metadata(&local).unwrap();
     assert_eq!(
         source
-            .metadata_backend()
-            .unwrap()
             .metadata_replication_cursor(&target, &DfsMetadataShardId::new("root"))
             .unwrap(),
         before
@@ -9208,27 +9220,17 @@ fn daemon_dfs_metadata_journal_publish_repairs_sequence_conflict_with_snapshot()
     ));
     assert_eq!(repaired.next_after_sequence, head);
     assert!(root.join("replica-repair-archives").is_dir());
-    let receiver = native.client(&target).unwrap();
-    let retained = receiver
-        .metadata_backend()
-        .unwrap()
-        .get_object(&object.object_id)
-        .unwrap()
-        .unwrap();
+    let receiver = native.node_metadata(&target).unwrap();
+    let retained = receiver.get_object(&object.object_id).unwrap().unwrap();
     assert_eq!(retained.version, object.version);
     assert_eq!(retained.content_hash, object.content_hash);
     drop(receiver);
     drop(sender);
     native.stop_node(&target).unwrap();
     native.reopen_node(target.clone()).unwrap();
-    let receiver = native.client(&target).unwrap();
+    let receiver = native.node_metadata(&target).unwrap();
     assert_eq!(
-        receiver
-            .metadata_backend()
-            .unwrap()
-            .get_object(&object.object_id)
-            .unwrap()
-            .unwrap(),
+        receiver.get_object(&object.object_id).unwrap().unwrap(),
         retained
     );
     drop(receiver);
@@ -9936,8 +9938,8 @@ fn daemon_dfs_message_processes_stage_blob_and_returns_response() {
         "non-primary content replicas must not append authoritative metadata while handling DFS messages"
     );
     assert!(
-        writer
-            .metadata_backend()
+        native
+            .node_metadata(&owner)
             .unwrap()
             .get_object(&object_id)
             .unwrap()
@@ -13440,7 +13442,9 @@ fn metadata_authority_change_schedules_inherited_local_primary_backlog() {
     let retiring = native.root_shard().unwrap();
     let mut source = native.client(&retiring.primary_node_id).unwrap();
     source.posix_mkdir("/native-inherited-prefix").unwrap();
-    let inherited = source.posix_stat("/native-inherited-prefix").unwrap();
+    let inherited = source
+        .posix_stat_distributed("/native-inherited-prefix")
+        .unwrap();
     let promoted_data = native.data_dir(&nodes[1]).clone();
     let paths = ClusterPaths::new(&promoted_data);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
@@ -13489,7 +13493,7 @@ fn metadata_authority_change_schedules_inherited_local_primary_backlog() {
     let mut promoted = native.client(&nodes[1]).unwrap();
     assert_eq!(
         promoted
-            .posix_stat("/native-inherited-prefix")
+            .posix_stat_distributed("/native-inherited-prefix")
             .unwrap()
             .object_id,
         inherited.object_id
@@ -16868,7 +16872,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
         let read = written
             .as_ref()
             .ok()
-            .map(|_| cold.posix_read_file("/cold-cache-after"));
+            .map(|_| cold.posix_read_file_distributed("/cold-cache-after"));
         drop(cold);
         (written, read)
     });
@@ -16882,7 +16886,7 @@ fn native_cold_root_cache_does_not_block_another_ready_root() {
     let read = written
         .as_ref()
         .ok()
-        .map(|_| ready.posix_read_file("/ready-cache-during"));
+        .map(|_| ready.posix_read_file_distributed("/ready-cache-during"));
     let resident = observe_ready(independent_deadline);
     // Resume before assertions or close so a failed independent-root check
     // cannot strand a genuine started child behind this negative test gate.
@@ -17003,11 +17007,15 @@ fn native_storage_rollover_retains_only_unchanged_shard_instances() {
         services_instance
     );
     assert_eq!(
-        writer.posix_read_file("/resident-slot-before").unwrap(),
+        writer
+            .posix_read_file_distributed("/resident-slot-before")
+            .unwrap(),
         b"root before"
     );
     assert_eq!(
-        writer.posix_read_file("/resident-slot-after").unwrap(),
+        writer
+            .posix_read_file_distributed("/resident-slot-after")
+            .unwrap(),
         b"root after"
     );
     // Every retained DATA handle is dropped before the normal mounted owner

@@ -356,20 +356,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
-    /// Attach the existing on-demand backend for an ordinary SIFS requester
-    /// whose namespace effects belong to its registered Main. This initializer
-    /// seeds only SIFS configuration; author floors, running-job guards and
-    /// replay cursors remain duties of the generic owning constructors.
-    pub fn with_boxed_metadata_backend_for_main_sifs_client(
-        mut self,
-        backend: Box<dyn DfsMetadataBackend>,
-    ) -> Result<Self, DfsError> {
+    /// Initialize a caller that delegates namespace work to its node's Main.
+    /// It keeps no local metadata store: Main alone owns and recovers the
+    /// node's shards, reads go to their authorities and writes to Main. This
+    /// initializer seeds only SIFS configuration.
+    pub fn into_main_sifs_client(mut self) -> Result<Self, DfsError> {
         if !self.transport.delegates_local_namespace_authority() || self.control_plane.is_none() {
             return Err(DfsError::Metadata {
                 message: "Main SIFS client initialization requires delegated namespace routing and an existing control-plane client".into(),
             });
         }
-        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         self.bootstrap_distributed_sifs()
             .map_err(|source| match source {
                 crate::DfsPosixError::Dfs(error) => error,
@@ -867,8 +863,8 @@ mod projection_release_tests {
         let stat = service
             .posix_mkdir("/services/projection-release")
             .expect("normal guarded directory");
-        let object = service
-            .metadata_backend()
+        let object = runtime
+            .node_metadata(&node)
             .unwrap()
             .get_object(&stat.object_id)
             .unwrap()

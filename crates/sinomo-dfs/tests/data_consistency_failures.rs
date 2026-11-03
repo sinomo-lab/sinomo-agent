@@ -1,4 +1,6 @@
-use sinomo_dfs::{DfsReplicationPolicy, DfsWriteOptions, test_support::DfsTestRuntime};
+use sinomo_dfs::{
+    DfsMetadataBackend, DfsReplicationPolicy, DfsWriteOptions, test_support::DfsTestRuntime,
+};
 
 #[test]
 fn stale_conditional_replace_cannot_advance_native_metadata() {
@@ -22,8 +24,10 @@ fn stale_conditional_replace_cannot_advance_native_metadata() {
     let winner = writer
         .posix_write_file(path, b"winner", options.clone())
         .unwrap();
-    let before = writer
-        .metadata_backend()
+    // The owning primary's durable store; the delegating writer keeps none.
+    let primary = runtime.root_shard().unwrap().primary_node_id;
+    let before = runtime
+        .node_metadata(&primary)
         .unwrap()
         .metadata_summary()
         .unwrap();
@@ -38,10 +42,13 @@ fn stale_conditional_replace_cannot_advance_native_metadata() {
             )
             .is_err()
     );
-    assert_eq!(writer.posix_stat(path).unwrap().version, winner.version);
-    assert_eq!(writer.posix_read_file(path).unwrap(), b"winner");
-    let after = writer
-        .metadata_backend()
+    assert_eq!(
+        writer.posix_stat_distributed(path).unwrap().version,
+        winner.version
+    );
+    assert_eq!(writer.posix_read_file_distributed(path).unwrap(), b"winner");
+    let after = runtime
+        .node_metadata(&primary)
         .unwrap()
         .metadata_summary()
         .unwrap();
@@ -50,8 +57,14 @@ fn stale_conditional_replace_cannot_advance_native_metadata() {
     runtime.stop_node(&nodes[0]).unwrap();
     runtime.reopen_node(nodes[0].clone()).unwrap();
     let mut recovered = runtime.client(&nodes[0]).unwrap();
-    assert_eq!(recovered.posix_stat(path).unwrap().version, winner.version);
-    assert_eq!(recovered.posix_read_file(path).unwrap(), b"winner");
+    assert_eq!(
+        recovered.posix_stat_distributed(path).unwrap().version,
+        winner.version
+    );
+    assert_eq!(
+        recovered.posix_read_file_distributed(path).unwrap(),
+        b"winner"
+    );
     drop(recovered);
     runtime.close().unwrap();
 }

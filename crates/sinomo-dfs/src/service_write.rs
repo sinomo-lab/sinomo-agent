@@ -3810,7 +3810,9 @@ mod routed_patch_native_tests {
                 crate::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
             )
             .unwrap();
-        let object = client.current_object_for_write(&before.object_id).unwrap();
+        let object = client
+            .current_read_object_metadata_distributed(&before.object_id)
+            .unwrap();
         let shard = client
             .select_metadata_shard_for_object(&object)
             .unwrap()
@@ -3852,10 +3854,10 @@ mod routed_patch_native_tests {
             client.settle_ready_write_outcome(pending, false).unwrap(),
             NetworkedDfsWriteOutcome::Committed { .. }
         ));
-        let committed = client.posix_stat(path).unwrap();
+        let committed = client.posix_stat_distributed(path).unwrap();
         let mut expected = initial;
         expected[offset as usize..offset as usize + patch.len()].copy_from_slice(patch);
-        assert_eq!(client.posix_read_file(path).unwrap(), expected);
+        assert_eq!(client.posix_read_file_distributed(path).unwrap(), expected);
         assert!(
             !client
                 .content
@@ -3901,8 +3903,8 @@ mod routed_patch_native_tests {
                     }
                 ));
             }
-            assert_eq!(client.posix_stat(path).unwrap(), committed);
-            assert_eq!(client.posix_read_file(path).unwrap(), expected);
+            assert_eq!(client.posix_stat_distributed(path).unwrap(), committed);
+            assert_eq!(client.posix_read_file_distributed(path).unwrap(), expected);
         }
         drop(client);
         runtime.close().unwrap();
@@ -3921,7 +3923,9 @@ mod routed_patch_native_tests {
         let before = client
             .posix_write_file(path, b"original", options.clone())
             .unwrap();
-        let old_object = client.current_object_for_write(&before.object_id).unwrap();
+        let old_object = client
+            .current_read_object_metadata_distributed(&before.object_id)
+            .unwrap();
         let shard = client
             .select_metadata_shard_for_object(&old_object)
             .unwrap()
@@ -3950,9 +3954,9 @@ mod routed_patch_native_tests {
             )
             .unwrap();
         assert!(client.settle_ready_write_outcome(pending, false).is_err());
-        assert_eq!(client.posix_stat(path).unwrap(), current);
+        assert_eq!(client.posix_stat_distributed(path).unwrap(), current);
         assert_eq!(
-            client.posix_read_file(path).unwrap(),
+            client.posix_read_file_distributed(path).unwrap(),
             b"current replacement"
         );
         assert!(

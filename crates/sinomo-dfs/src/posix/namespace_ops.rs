@@ -710,7 +710,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         match selected_shard {
-            Some(shard) if shard.primary_node_id != self.node_id => {
+            // A caller delegating to its Main routes even to a local primary.
+            Some(shard)
+                if shard.primary_node_id != self.node_id
+                    || self.transport.delegates_local_namespace_authority() =>
+            {
                 self.route_namespace_operation(
                     shard.primary_node_id,
                     DfsNamespaceOperation::RenameSingleNamespaceAtomic {
@@ -1122,6 +1126,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod atomic_namespace_tests {
     use super::*;
+    use crate::DfsMetadataBackend as _;
     use crate::{DfsMessageCommand, DfsMessageResponse, DfsNetworkMessage};
     use crate::{
         DfsMetadataMutation, DfsNamespaceCommand, DfsNamespacePosixError, DfsNamespaceResult,
@@ -1174,13 +1179,14 @@ mod atomic_namespace_tests {
         assert_eq!(second_tombstone.object_id, original.object_id);
         assert_ne!(second_tombstone.version, first_tombstone.version);
         assert!(matches!(
-            service.posix_stat(directory_path),
+            service.posix_stat_distributed(directory_path),
             Err(DfsPosixError::NotFound { .. })
         ));
 
-        let journal = service
-            .metadata_backend()
-            .expect("metadata backend")
+        // The owner node's durable journal; the client keeps no store.
+        let journal = runtime
+            .node_metadata(&owner)
+            .expect("node metadata store")
             .journal_since(0)
             .expect("rmdir journal");
         let rmdir_transactions = journal
@@ -1227,18 +1233,22 @@ mod atomic_namespace_tests {
                 version.object_id == parent.object_id && version.version == parent.version
             }));
         }
-        let expected_parent = service.posix_stat(parent_path).expect("parent after rmdir");
+        let expected_parent = service
+            .posix_stat_distributed(parent_path)
+            .expect("parent after rmdir");
 
         drop(service);
         runtime.stop_node(&owner).unwrap();
         runtime.reopen_node(owner.clone()).unwrap();
-        let reopened = runtime.client(&owner).unwrap();
+        let mut reopened = runtime.client(&owner).unwrap();
         assert!(matches!(
-            reopened.posix_stat(directory_path),
+            reopened.posix_stat_distributed(directory_path),
             Err(DfsPosixError::NotFound { .. })
         ));
         assert_eq!(
-            reopened.posix_stat(parent_path).expect("reopened parent"),
+            reopened
+                .posix_stat_distributed(parent_path)
+                .expect("reopened parent"),
             expected_parent
         );
         drop(reopened);
@@ -1273,7 +1283,7 @@ mod atomic_namespace_tests {
         assert!(matches!(stale, DfsPosixError::Conflict { .. }));
         assert_eq!(
             service
-                .posix_stat(path)
+                .posix_stat_distributed(path)
                 .expect("recreated directory remains"),
             recreated
         );
@@ -1318,12 +1328,14 @@ mod atomic_namespace_tests {
             .expect_err("new destination must be fenced");
         assert!(matches!(stale, DfsPosixError::Conflict { .. }));
         assert_eq!(
-            service.posix_stat(source_path).expect("source remains"),
+            service
+                .posix_stat_distributed(source_path)
+                .expect("source remains"),
             source
         );
         assert_eq!(
             service
-                .posix_stat(destination_path)
+                .posix_stat_distributed(destination_path)
                 .expect("destination remains"),
             destination
         );
@@ -1364,7 +1376,7 @@ mod atomic_namespace_tests {
             "normal caller scope restored"
         );
         assert!(matches!(
-            service.posix_lstat("/services/rmdir-deadline"),
+            service.posix_lstat_distributed("/services/rmdir-deadline"),
             Err(DfsPosixError::NotFound { .. })
         ));
         drop(service);
@@ -1426,23 +1438,19 @@ mod atomic_namespace_tests {
                 })
                 .expect("actual native namespace response")
         };
-        let before = service
-            .metadata_backend()
-            .unwrap()
-            .journal_since(0)
-            .unwrap()
-            .len();
-        let first = call(&runtime, command.clone());
-        assert!(matches!(first.result, DfsNamespaceResult::Applied));
-        assert!(
-            service
-                .metadata_backend()
+        // The primary node's durable journal; the client keeps no store.
+        let journal_len = |runtime: &crate::test_runtime::DfsTestRuntime| {
+            runtime
+                .node_metadata(&primary)
                 .unwrap()
                 .journal_since(0)
                 .unwrap()
                 .len()
-                > before
-        );
+        };
+        let before = journal_len(&runtime);
+        let first = call(&runtime, command.clone());
+        assert!(matches!(first.result, DfsNamespaceResult::Applied));
+        assert!(journal_len(&runtime) > before);
         let local_path = "/services/local-primary-rmdir-replay";
         let local_original = service.posix_mkdir(local_path).unwrap();
         let local_expected = DfsNamespaceObjectPrecondition {
@@ -1456,12 +1464,7 @@ mod atomic_namespace_tests {
                 local_expected.clone(),
             )
             .unwrap();
-        let journal_len = service
-            .metadata_backend()
-            .unwrap()
-            .journal_since(0)
-            .unwrap()
-            .len();
+        let settled_len = journal_len(&runtime);
         drop(service);
         runtime.stop_node(&primary).unwrap();
         runtime.reopen_node(primary.clone()).unwrap();
@@ -1469,17 +1472,12 @@ mod atomic_namespace_tests {
         let replay = call(&runtime, command.clone());
         assert!(matches!(replay.result, DfsNamespaceResult::Applied));
         assert_eq!(
-            restarted
-                .metadata_backend()
-                .unwrap()
-                .journal_since(0)
-                .unwrap()
-                .len(),
-            journal_len,
+            journal_len(&runtime),
+            settled_len,
             "an exact lost-response retry adds no second namespace mutation"
         );
         assert!(matches!(
-            restarted.posix_stat(path),
+            restarted.posix_stat_distributed(path),
             Err(DfsPosixError::NotFound { .. })
         ));
         let local_recreated = restarted.posix_mkdir(local_path).unwrap();
@@ -1491,30 +1489,20 @@ mod atomic_namespace_tests {
             )
             .unwrap_err();
         assert!(matches!(local_replay, DfsPosixError::Conflict { .. }));
-        assert_eq!(restarted.posix_stat(local_path).unwrap(), local_recreated);
+        assert_eq!(
+            restarted.posix_stat_distributed(local_path).unwrap(),
+            local_recreated
+        );
         let recreated = restarted.posix_mkdir(path).unwrap();
-        let before_replay = restarted
-            .metadata_backend()
-            .unwrap()
-            .journal_since(0)
-            .unwrap()
-            .len();
+        let before_replay = journal_len(&runtime);
         let replay_after_recreate = call(&runtime, command.clone());
         assert!(matches!(
             replay_after_recreate.result,
             DfsNamespaceResult::Applied
         ));
+        assert_eq!(journal_len(&runtime), before_replay);
         assert_eq!(
-            restarted
-                .metadata_backend()
-                .unwrap()
-                .journal_since(0)
-                .unwrap()
-                .len(),
-            before_replay
-        );
-        assert_eq!(
-            restarted.posix_stat(path).unwrap(),
+            restarted.posix_stat_distributed(path).unwrap(),
             recreated,
             "durable replay cannot consume a newer pathname generation"
         );

@@ -1,4 +1,5 @@
 use super::*;
+use crate::DfsMetadataBackend as _;
 use crate::test_runtime::{DfsTestRuntime, RpcPhase};
 use crate::{DfsMetadataShardId, SharedDfsControlPlaneKvClient, sifs_file_system_id};
 
@@ -119,10 +120,10 @@ impl NativePlacementFixture {
                     crate::DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
                 )
                 .unwrap();
-            let stat = writer.posix_stat(&name).unwrap();
+            let stat = writer.posix_stat_distributed(&name).unwrap();
             objects.push(
                 writer
-                    .current_read_object_metadata(&stat.object_id)
+                    .current_read_object_metadata_distributed(&stat.object_id)
                     .unwrap(),
             );
             if checkpoint_setup && index % 16 == 15 {
@@ -157,7 +158,8 @@ impl NativePlacementFixture {
         }
         let mut service = runtime.client(&root_primary).unwrap();
         if remote {
-            let backend = service.metadata_backend().unwrap();
+            let store = runtime.node_metadata(&root_primary).unwrap();
+            let backend = &store;
             for object in &objects {
                 assert_eq!(
                     backend.get_object(&object.object_id).unwrap().as_ref(),
@@ -213,6 +215,11 @@ impl NativePlacementFixture {
                     && call.phase == RpcPhase::BeforeDispatch
             })
             .count()
+    }
+    /// The durable metadata store of the node this fixture's caller runs on.
+    /// The delegating caller itself keeps no store.
+    fn node_store(&self) -> crate::LocalShardedMetadataBackend {
+        self.runtime.node_metadata(self.service.node_id()).unwrap()
     }
     fn close(self) {
         drop(self.service);
@@ -378,7 +385,10 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
         reconciliation_placement_for_object(&accepted, &job, &object).unwrap();
     assert_eq!(placement.plan.desired_replica_nodes, nodes[..2]);
     assert!(!placement.plan.desired_replica_nodes.contains(&nodes[2]));
-    case.service
+    // A local placement effect executes on the store-backed metadata owner.
+    let mut owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+    assert_eq!(owner.node_id(), &case.primary);
+    owner
         .reconcile_object_placement_local(
             &job.job_id,
             &object.path,
@@ -415,13 +425,8 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
             .compare_and_put_placement_update(&accepted, &current, &newer_job)
             .unwrap()
     }));
-    let before = case
-        .service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
-    case.service
+    let before = case.node_store().journal_last_sequence().unwrap();
+    owner
         .reconcile_object_placement_local(
             &job.job_id,
             &delayed.path,
@@ -434,18 +439,12 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
         .unwrap();
     assert_eq!(
         case.service
-            .current_read_object_metadata(&delayed.object_id)
+            .current_read_object_metadata_distributed(&delayed.object_id)
             .unwrap(),
         delayed
     );
-    assert_eq!(
-        case.service
-            .metadata_backend()
-            .unwrap()
-            .journal_last_sequence()
-            .unwrap(),
-        before
-    );
+    assert_eq!(case.node_store().journal_last_sequence().unwrap(), before);
+    drop(owner);
     case.close();
 }
 
@@ -453,16 +452,14 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
 fn native_placement_noop_preserves_exact_visible_generation_and_journal() {
     let mut case = NativePlacementFixture::new("native-placement-noop", false, 1);
     let object = case.objects[0].clone();
-    let before = case
-        .service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
+    let before = case.node_store().journal_last_sequence().unwrap();
     let (resolved, replication, placement) =
         reconciliation_placement_for_object(&case.job.accepted_config, &case.job, &object).unwrap();
+    // A local placement effect executes on the store-backed metadata owner.
+    let mut owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+    assert_eq!(owner.node_id(), &case.primary);
     for _ in 0..2 {
-        case.service
+        owner
             .reconcile_object_placement_local(
                 &case.job.job_id,
                 &object.path,
@@ -475,19 +472,13 @@ fn native_placement_noop_preserves_exact_visible_generation_and_journal() {
             .unwrap();
         assert_eq!(
             case.service
-                .current_read_object_metadata(&object.object_id)
+                .current_read_object_metadata_distributed(&object.object_id)
                 .unwrap(),
             object
         );
-        assert_eq!(
-            case.service
-                .metadata_backend()
-                .unwrap()
-                .journal_last_sequence()
-                .unwrap(),
-            before
-        );
+        assert_eq!(case.node_store().journal_last_sequence().unwrap(), before);
     }
+    drop(owner);
     case.close();
 }
 
@@ -496,16 +487,20 @@ fn native_local_noop_uses_actual_page_authority_and_rechecks_generation() {
     let mut case = NativePlacementFixture::new("native-local-noop-authority", false, 1);
     let original = case.objects[0].clone();
     let config = case.job.accepted_config.clone();
-    let authority = case
-        .service
-        .prepare_placement_page_authority(&config)
+    // The page authority and no-op check run on the store-backed metadata
+    // owner; the delegating caller only supplies the newer write.
+    let mut owner = case
+        .runtime
+        .metadata_primary_service(&original.path)
         .unwrap();
+    assert_eq!(owner.node_id(), &case.primary);
+    let authority = owner.prepare_placement_page_authority(&config).unwrap();
     assert!(
         authority.is_some(),
         "normal native ReadIndex must certify the page"
     );
     assert!(matches!(
-        case.service
+        owner
             .placement_noop_check(&original, false, authority.as_ref())
             .unwrap(),
         PlacementNoopCheck::CertifiedLocal
@@ -518,11 +513,12 @@ fn native_local_noop_uses_actual_page_authority_and_rechecks_generation() {
         )
         .unwrap();
     assert!(matches!(
-        case.service
+        owner
             .placement_noop_check(&original, false, authority.as_ref())
             .unwrap(),
         PlacementNoopCheck::RequiresReconciliation
     ));
+    drop(owner);
     case.close();
 }
 
@@ -543,10 +539,13 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
             crate::DfsWriteOptions::replicated_eventual(vec![nodes[1].clone()]),
         )
         .unwrap();
-    let object = owner.current_read_object_metadata(&stat.object_id).unwrap();
-    assert_eq!(object.owner_node_id, nodes[1]);
     let mut primary = runtime.metadata_primary_service(&path).unwrap();
     assert_eq!(primary.node_id(), &nodes[0]);
+    // The committed row at the actual metadata primary.
+    let object = primary
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
+    assert_eq!(object.owner_node_id, nodes[1]);
     let cached_before = primary
         .content()
         .has_blob(object.content_hash.as_ref().unwrap())
@@ -602,10 +601,10 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
         object,
         "the actual metadata primary must preserve the owner's canonical locations and generation"
     );
-    assert_eq!(owner.posix_read_file(&path).unwrap(), bytes);
+    assert_eq!(owner.posix_read_file_distributed(&path).unwrap(), bytes);
     assert_eq!(
         owner
-            .current_read_object_metadata(&object.object_id)
+            .current_read_object_metadata_distributed(&object.object_id)
             .unwrap(),
         object
     );
@@ -737,26 +736,19 @@ async fn native_remote_noop_delivery_failure_produces_no_authority() {
 async fn native_remote_noop_pages_resume_at_exact_backend_cursor_without_mutation() {
     let mut case = NativePlacementFixture::new("native-remote-noop-pages", true, 4);
     let config = case.job.accepted_config.clone();
-    let directory = case.service.posix_stat(&case.job.path).unwrap();
+    let directory = case.service.posix_stat_distributed(&case.job.path).unwrap();
     let directory = case
         .service
-        .current_read_object_metadata(&directory.object_id)
+        .current_read_object_metadata_distributed(&directory.object_id)
         .unwrap();
     let mut selected = case.job.clone();
     selected.state = DfsPlacementReconciliationState::Scanning;
     selected.cursor = Some(
-        case.service
-            .metadata_backend()
-            .unwrap()
+        case.node_store()
             .object_page_cursor_for_object(&directory)
             .unwrap(),
     );
-    let before = case
-        .service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
+    let before = case.node_store().journal_last_sequence().unwrap();
     let calls = case.namespace_calls();
     case.service
         .advance_placement_reconciliation_page_async(
@@ -793,18 +785,11 @@ async fn native_remote_noop_pages_resume_at_exact_backend_cursor_without_mutatio
     assert!(selected.cursor.is_none());
     assert_eq!(case.namespace_calls() - calls, 2);
     assert_eq!(selected.pending_repair_count, 0);
-    assert_eq!(
-        case.service
-            .metadata_backend()
-            .unwrap()
-            .journal_last_sequence()
-            .unwrap(),
-        before
-    );
+    assert_eq!(case.node_store().journal_last_sequence().unwrap(), before);
     for object in &case.objects {
         assert_eq!(
             case.service
-                .current_read_object_metadata(&object.object_id)
+                .current_read_object_metadata_distributed(&object.object_id)
                 .unwrap(),
             *object
         );
@@ -1691,15 +1676,14 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
             },
         )
         .unwrap();
-    let stat = case.service.posix_stat(&path).unwrap();
+    let stat = case.service.posix_stat_distributed(&path).unwrap();
     let object = case
         .service
-        .current_read_object_metadata(&stat.object_id)
+        .current_read_object_metadata_distributed(&stat.object_id)
         .unwrap();
+    assert_eq!(case.service.node_id(), &case.primary);
     let mut version = case
-        .service
-        .metadata_backend()
-        .unwrap()
+        .node_store()
         .get_version(&object.object_id, &object.version)
         .unwrap()
         .unwrap();
@@ -1717,9 +1701,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
     assert_eq!(actual_nodes.len(), 2);
     assert_eq!(actual_nodes, nodes.iter().collect::<BTreeSet<_>>());
     let original_intents = case
-        .service
-        .metadata_backend()
-        .unwrap()
+        .node_store()
         .write_intents_page(None, 128)
         .unwrap()
         .intents;
@@ -1748,8 +1730,11 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
                 },
             }),
         );
+        // Publication is Main-side work on the store-backed metadata owner.
         assert!(
-            case.service
+            case.runtime
+                .metadata_primary_service(&path)
+                .unwrap()
                 .publish_object_metadata_effects(
                     &object,
                     vec![crate::DfsPreparedMetadataEffect::PutVersion { version }]
@@ -1786,9 +1771,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
             job.job_id, object.object_id, object.version
         );
         let recorded = case
-            .service
-            .metadata_backend()
-            .unwrap()
+            .node_store()
             .get_intent(&object.object_id, &intent_id)
             .unwrap()
             .unwrap();
@@ -1844,7 +1827,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
     }
     assert_eq!(
         case.service
-            .current_read_object_metadata(&object.object_id)
+            .current_read_object_metadata_distributed(&object.object_id)
             .unwrap()
             .current_locations,
         if retain {
@@ -1855,16 +1838,15 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         "only independently retained copies survive current placement pruning"
     );
     if !retain {
+        let store = case.node_store();
         assert!(
-            case.service
-                .metadata_backend()
-                .unwrap()
+            store
                 .get_intent_receipt(&object.object_id, &original_intent)
                 .unwrap()
                 .is_some(),
             "the exact original request remains a receipt, never executable old repair work"
         );
-        let view = crate::DfsOperatorInspector::new(case.service.metadata_backend().unwrap())
+        let view = crate::DfsOperatorInspector::new(&store)
             .object(&object.object_id)
             .unwrap()
             .unwrap();
@@ -1885,7 +1867,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         );
         assert!(
             crate::content_durability::current_placement_durability_for_intent_from_backend(
-                case.service.metadata_backend().unwrap(),
+                &store,
                 &view.object,
                 &original_intent,
             )
@@ -1894,16 +1876,14 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
             "an exact terminal receipt cannot be revived as current placement DATA"
         );
     }
-    case.service
-        .gc_metadata_history(crate::DfsMetadataHistoryGcOptions::delete_eligible(
-            Duration::ZERO,
-            0,
-        ))
+    // History collection runs on each current store-backed shard owner.
+    case.runtime
+        .gc_metadata_history_on_current_primaries(
+            crate::DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0),
+        )
         .unwrap();
-    let retained = case
-        .service
-        .metadata_backend()
-        .unwrap()
+    let store = case.node_store();
+    let retained = store
         .get_version(&object.object_id, &object.version)
         .unwrap()
         .unwrap();
@@ -1916,20 +1896,18 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         job.job_id, object.object_id, object.version
     );
     assert!(
-        case.service
-            .metadata_backend()
-            .unwrap()
+        store
             .get_intent_receipt(&object.object_id, &current_goal)
             .unwrap()
             .is_none(),
         "completed current placement remains a full repair contract after GC"
     );
-    let view = crate::DfsOperatorInspector::new(case.service.metadata_backend().unwrap())
+    let view = crate::DfsOperatorInspector::new(&store)
         .object(&object.object_id)
         .unwrap()
         .unwrap();
     let exact = crate::content_durability::current_placement_durability_for_intent_from_backend(
-        case.service.metadata_backend().unwrap(),
+        &store,
         &view.object,
         &current_goal,
     )
@@ -1947,13 +1925,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
                 .grant
                 .is_some()
         );
-        let owners = case
-            .service
-            .metadata_backend()
-            .unwrap()
-            .write_intents_page(None, 128)
-            .unwrap()
-            .intents;
+        let owners = store.write_intents_page(None, 128).unwrap().intents;
         let owner = owners
             .iter()
             .find(|intent| {
@@ -1968,15 +1940,17 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         );
     } else {
         assert!(retained.retention.is_empty());
-        case.service.hydrate_from_metadata_backend().unwrap();
+        // Repair hydration is Main-side work on the store-backed owner.
+        let mut owner = case.runtime.metadata_primary_service(&path).unwrap();
+        owner.hydrate_from_metadata_backend().unwrap();
         assert!(
-            !case
-                .service
+            !owner
                 .coordinator
                 .repair_jobs()
                 .iter()
                 .any(|repair| repair.object_id == object.object_id)
         );
+        drop(owner);
         let primary = case.primary.clone();
         drop(case.service);
         case.runtime.stop_node(&primary).unwrap();
@@ -2025,16 +1999,14 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
 async fn native_remote_response_validator_rejects_ambiguous_or_foreign_captured_rows() {
     let mut case = NativePlacementFixture::new("native-remote-noop-malformed-rows", true, 3);
     let config = case.job.accepted_config.clone();
-    let directory = case.service.posix_stat(&case.job.path).unwrap();
+    let directory = case.service.posix_stat_distributed(&case.job.path).unwrap();
     let directory = case
         .service
-        .current_read_object_metadata(&directory.object_id)
+        .current_read_object_metadata_distributed(&directory.object_id)
         .unwrap();
     let mut selected = case.job.clone();
     selected.cursor = Some(
-        case.service
-            .metadata_backend()
-            .unwrap()
+        case.node_store()
             .object_page_cursor_for_object(&directory)
             .unwrap(),
     );
@@ -2131,7 +2103,13 @@ fn native_local_owner_rejects_substitution_missing_owner_and_policy_conversion()
             crate::DfsWriteOptions::replicated_eventual(vec![nodes[1].clone()]),
         )
         .unwrap();
-    let object = owner.current_read_object_metadata(&stat.object_id).unwrap();
+    // The local placement effect executes on the store-backed metadata owner,
+    // whose committed row is the object every later view must preserve.
+    let mut primary = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(primary.node_id(), &nodes[0]);
+    let object = primary
+        .current_read_object_metadata(&stat.object_id)
+        .unwrap();
     assert_eq!(object.owner_node_id, nodes[1]);
     assert_eq!(object.policy, DfsObjectPolicy::LocalOwned);
     assert!(validate_local_placement_owner(&object, &DfsObjectPolicy::LocalOwned).is_ok());
@@ -2149,7 +2127,6 @@ fn native_local_owner_rejects_substitution_missing_owner_and_policy_conversion()
             Err(DfsError::InvalidReplicationPolicy { .. })
         ));
     }
-    let mut primary = runtime.client(&nodes[0]).unwrap();
     let control = runtime.shared_control_plane().unwrap();
     let config = control.with_client(|kv| {
         DfsControlPlaneStore::new(kv.as_mut())
@@ -2195,13 +2172,19 @@ fn native_local_owner_rejects_substitution_missing_owner_and_policy_conversion()
         before
     );
     assert_eq!(
-        owner
+        primary
             .current_read_object_metadata(&object.object_id)
             .unwrap(),
         object
     );
     assert_eq!(
-        owner.posix_read_file(&path).unwrap(),
+        owner
+            .current_read_object_metadata_distributed(&object.object_id)
+            .unwrap(),
+        object
+    );
+    assert_eq!(
+        owner.posix_read_file_distributed(&path).unwrap(),
         b"actual local-owner bytes"
     );
     drop(primary);
@@ -2272,12 +2255,7 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
     );
     assert!(durable_before.cursor.is_none());
     let mut durable_started = None;
-    let before = case
-        .service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
+    let before = case.node_store().journal_last_sequence().unwrap();
     for _ in 0..3 {
         let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let first_call = case
@@ -2333,10 +2311,9 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
             "cancelled native lookup preserves its actual pre-dispatch checkpoint"
         );
         assert_eq!(
-            case.service
-                .current_read_object_metadata(&object.object_id)
-                .unwrap(),
-            object
+            case.node_store().get_object(&object.object_id).unwrap(),
+            Some(object.clone()),
+            "the node's durable row is unchanged"
         );
     }
     let scanning = case
@@ -2359,14 +2336,7 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
         .unwrap();
     assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
     assert_eq!(completed.pending_repair_count, 0);
-    assert_eq!(
-        case.service
-            .metadata_backend()
-            .unwrap()
-            .journal_last_sequence()
-            .unwrap(),
-        before
-    );
+    assert_eq!(case.node_store().journal_last_sequence().unwrap(), before);
     drop(admission);
     case.close();
 }
@@ -2397,6 +2367,9 @@ fn native_served_placement_yields_actual_global_owner_to_foreground_query() {
     });
     let handle = case.runtime.runtime_handle();
     let root_shard = case.runtime.root_shard().unwrap();
+    // The foreground query reads this node's durable store; the delegating
+    // caller keeps none.
+    let mut store = case.runtime.node_metadata(&root_node).unwrap();
     let first_call = case
         .runtime
         .rpc_observations()
@@ -2422,7 +2395,7 @@ fn native_served_placement_yields_actual_global_owner_to_foreground_query() {
             assert!(scheduler.global_is_exclusively_held());
             scheduler.request_foreground_admission();
             let foreground = tokio::time::timeout(Duration::from_millis(500), scheduler.admit(&crate::DfsMessageExecutionScope::ExactShard { file_system_id: root_shard.file_system_id.clone(), shard_id: crate::DfsMetadataShardId::new(&root_shard.shard_id) })).await.expect("foreground query must acquire the normal owner before stalled RPC release").unwrap();
-            let backend = case.service.metadata_backend_mut().unwrap();
+            let backend = &mut store;
             backend.begin_consistent_read_snapshot().unwrap();
             let query = crate::DfsMetadataShardQuery { file_system_id: root_shard.file_system_id.clone(), shard_id: crate::DfsMetadataShardId::new(&root_shard.shard_id), epoch: root_shard.epoch, selection: crate::DfsMetadataSelection::RetainedRevisions { namespace: Some("module.dfs.history".into()), path: Some("/unrelated".into()), object_id: None, after: None, limit: 128 } };
             let result = backend.query_file_history_on_shard(&query).unwrap();
@@ -2459,12 +2432,7 @@ async fn native_routed_noop_revalidates_live_permit_without_namespace_journal_ch
         replication_policy: replication,
         desired_replica_node_ids: placement.plan.desired_replica_nodes,
     };
-    let before = case
-        .service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
+    let before = case.node_store().journal_last_sequence().unwrap();
     for request in ["native-routed-noop-1", "native-routed-noop-2"] {
         let result = case
             .service
@@ -2481,21 +2449,12 @@ async fn native_routed_noop_revalidates_live_permit_without_namespace_journal_ch
             .unwrap();
         assert_eq!(result.result, crate::DfsNamespaceResult::Applied);
         assert!(
-            case.service
-                .metadata_backend()
-                .unwrap()
+            case.node_store()
                 .get_namespace_request(case.service.node_id(), request)
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
-            case.service
-                .metadata_backend()
-                .unwrap()
-                .journal_last_sequence()
-                .unwrap(),
-            before
-        );
+        assert_eq!(case.node_store().journal_last_sequence().unwrap(), before);
     }
     let (_, _, mut permit) = case
         .service
@@ -2526,14 +2485,7 @@ async fn native_routed_noop_revalidates_live_permit_without_namespace_journal_ch
     case.service
         .release_placement_authority_permit(&mut permit)
         .unwrap();
-    assert_eq!(
-        case.service
-            .metadata_backend()
-            .unwrap()
-            .journal_last_sequence()
-            .unwrap(),
-        before
-    );
+    assert_eq!(case.node_store().journal_last_sequence().unwrap(), before);
     case.close();
 }
 

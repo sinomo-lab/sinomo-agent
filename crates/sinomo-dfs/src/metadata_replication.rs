@@ -2869,6 +2869,32 @@ mod metadata_publish_membership_tests {
             .scope_shard(&shard.file_system_id, &shard_id)
             .unwrap();
         let mut lease = handle.checkout().unwrap();
+        // The delegating writer authors nothing on its own, and Main publishes
+        // its committed write at once. Append one actual hidden preparation
+        // through Main's resident shard so the journal holds a real suffix
+        // that has not been sent to the target.
+        {
+            let backend: &mut dyn crate::DfsMetadataBackend = &mut *lease;
+            let mut file_system = backend
+                .get_file_system_on_shard(&shard_id, &shard.file_system_id)
+                .unwrap()
+                .unwrap();
+            file_system.display_name.push_str("-required-suffix");
+            let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+                crate::DfsPreparedOperationScope {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard_id.clone(),
+                    owner_epoch: shard.epoch,
+                    operation_id: format!("required-suffix-{}", sinomo_core::Id::generate()),
+                },
+                Vec::new(),
+                Vec::new(),
+                vec![crate::DfsPreparedMetadataEffect::PutFileSystem { file_system }],
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+            backend.prepare_operation(payload, None).unwrap();
+        }
         let head = lease.journal_last_sequence();
         let cursor = lease
             .metadata_replication_cursor(&target, &shard_id)
@@ -8992,7 +9018,8 @@ mod cursor_update_tests {
         runtime.start_nodes().unwrap();
         let shard = runtime.root_shard().unwrap();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-        let mut client = runtime.client(&shard.primary_node_id).unwrap();
+        // Publication planning belongs to the store-backed owning service.
+        let mut client = runtime.metadata_primary_service("/").unwrap();
         let backend = client.metadata_backend_mut().unwrap();
         let before = backend
             .export_shard_table_snapshot(&shard_id)

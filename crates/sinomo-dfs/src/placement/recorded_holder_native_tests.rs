@@ -53,7 +53,7 @@ fn base(name: &str) -> (DfsTestRuntime, Service, Vec<NodeId>, DfsObjectMetadata)
         )
         .unwrap();
     let object = service
-        .current_read_object_metadata(&stat.object_id)
+        .current_read_object_metadata_distributed(&stat.object_id)
         .unwrap();
     assert_eq!(object.current_locations, vec![root.primary_node_id]);
     (native, service, nodes, object)
@@ -175,13 +175,15 @@ fn reconcile(
         .unwrap();
 }
 
+/// The placement owner recorded in `node`'s durable metadata store.
 fn actual_record(
-    service: &Service,
+    native: &DfsTestRuntime,
+    node: &NodeId,
     job: &DfsPlacementReconciliationJob,
     object: &DfsObjectMetadata,
 ) -> DfsWriteIntentRecord {
-    service
-        .metadata_backend()
+    native
+        .node_metadata(node)
         .unwrap()
         .get_intent(
             &object.object_id,
@@ -223,7 +225,7 @@ fn pending_case(
         replication,
         placement.plan.desired_replica_nodes,
     );
-    let record = actual_record(&service, &job, &object);
+    let record = actual_record(&native, &primary, &job, &object);
     assert_eq!(record.status, DfsWriteIntentStatus::Committed);
     assert_eq!(
         record.object_metadata.as_ref().unwrap().current_locations,
@@ -234,30 +236,62 @@ fn pending_case(
 
 fn finish_missing(
     native: DfsTestRuntime,
-    service: &Service,
+    primary: &NodeId,
     record: &DfsWriteIntentRecord,
 ) -> (DfsTestRuntime, DfsRepairQueueView) {
-    let primary = service.node_id().clone();
+    let primary = primary.clone();
     let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
         native.data_dir(&primary),
     ));
+    // The runtime moves into the maintenance worker below; observe the
+    // primary's durable store through the same inspection view it exposes.
+    let metadata_root = crate::default_dfs_metadata_shards_root(native.data_dir(&primary));
+    let shards = native.metadata_shards().unwrap();
+    let primary_store = || {
+        crate::local_state::open_local_sharded_metadata_backend_for_inspection_at_node(
+            metadata_root.clone(),
+            shards.clone(),
+            &primary,
+        )
+        .unwrap()
+    };
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let tick_primary = primary.clone();
+    let worker_queue = queue.clone();
+    let intent_id = record.intent_id.clone();
+    let reached = std::sync::atomic::AtomicBool::new(false);
     let (native, outcomes, observed) = std::thread::scope(|scope| {
+        let reached = &reached;
         let worker = scope.spawn(move || {
             // A clean-MAX Set invalidates the existing observed page. Its next
-            // normal pass consumes the new token; neither call supplies DATA.
-            let first = native
-                .maintenance_tick(&tick_primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let second =
-                (!remaining.is_zero()).then(|| native.maintenance_tick(&tick_primary, remaining));
-            (native, (first, second))
+            // normal pass consumes the new token. The pass that dispatches the
+            // missing target returns before its reply lands, and a later pass
+            // closes that completed custody; automatic passes may carry any of
+            // these steps. Keep running ordinary passes until the goal lands,
+            // letting each in-flight transfer settle first. No call supplies
+            // DATA.
+            let mut outcomes = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || reached.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                outcomes.push(native.maintenance_tick(&tick_primary, remaining));
+                while !reached.load(std::sync::atomic::Ordering::Acquire)
+                    && Instant::now() < deadline
+                    && worker_queue.view().is_ok_and(|view| {
+                        view.records
+                            .iter()
+                            .any(|row| row.intent_id == intent_id && row.in_flight)
+                    })
+                {
+                    std::thread::yield_now();
+                }
+            }
+            (native, outcomes)
         });
         let observed = loop {
-            let receipts = service
-                .metadata_backend()
-                .unwrap()
+            let receipts = primary_store()
                 .receipts_for_version(&record.object_id, &record.target_version)
                 .unwrap();
             let cut = queue.view().unwrap();
@@ -272,6 +306,7 @@ fn finish_missing(
                 .any(|row| row.intent_id == record.intent_id);
             let now = Instant::now();
             if goal || now >= deadline {
+                reached.store(true, std::sync::atomic::Ordering::Release);
                 break (goal && now < deadline, receipts, cut);
             }
             std::thread::yield_now();
@@ -514,9 +549,9 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
             }
             std::thread::yield_now();
         };
-        let actual_before = service.current_read_object_metadata(&initial.object_id);
-        let actual_history = service
-            .metadata_backend()
+        let actual_before = service.current_read_object_metadata_distributed(&initial.object_id);
+        let actual_history = native
+            .node_metadata(&primary)
             .unwrap()
             .intents_for_object(&initial.object_id);
         evidence(
@@ -559,8 +594,31 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([primary.clone(), extra.clone()])
         );
+        // Main serves the committed repair promptly, so a maintenance pass,
+        // possibly the one carrying this late repair, can still be finishing
+        // its GLOBAL turn when the receiver completes. Wait for that turn to
+        // end while the gate still holds the reply: a source that kept GLOBAL
+        // across its reply hold never releases it before the gate opens below.
+        let global_released = loop {
+            if !scheduler.global_is_exclusively_held() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let reply_held = !native.rpc_observations().iter().any(|call| {
+            call.source == primary
+                && call.target == extra
+                && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                && matches!(
+                    call.phase,
+                    RpcPhase::Completed | RpcPhase::EndedWithoutResponse
+                )
+        });
         assert!(
-            !scheduler.global_is_exclusively_held(),
+            global_released && reply_held,
             "normal source Main must release GLOBAL before reply hold"
         );
         let before = actual_before.unwrap();
@@ -585,7 +643,7 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
             replication.clone(),
             targets.clone(),
         );
-        let record = actual_record(&service, &job, &before);
+        let record = actual_record(&native, &primary, &job, &before);
         assert_eq!(record.desired_replica_node_ids, targets);
         assert_eq!(
             record.object_metadata.as_ref().unwrap().current_locations,
@@ -594,7 +652,7 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
         gate.add_permits(1);
         let grown = loop {
             let object = service
-                .current_read_object_metadata(&initial.object_id)
+                .current_read_object_metadata_distributed(&initial.object_id)
                 .unwrap();
             if object.current_locations.contains(&extra) {
                 break object;
@@ -632,10 +690,10 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
         replication,
         targets.clone(),
     );
-    assert_eq!(actual_record(&service, &job, &grown), record);
+    assert_eq!(actual_record(&native, &primary, &job, &grown), record);
     drop(hold_target);
     native.clear_faults();
-    let (mut native, cut) = finish_missing(native, &service, &record);
+    let (mut native, cut) = finish_missing(native, &primary, &record);
     let receiver = native.client(&target).unwrap();
     assert_eq!(
         receiver
@@ -645,7 +703,7 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
             .1,
         BYTES
     );
-    assert_eq!(actual_record(&service, &job, &grown), record);
+    assert_eq!(actual_record(&native, &primary, &job, &grown), record);
     drop(receiver);
     drop(service);
     closed_original(&mut native, &primary, &record, &target, &cut);
@@ -654,9 +712,13 @@ fn native_recorded_holder_cut_survives_real_late_ordinary_repair() {
 
 #[test]
 fn native_clean_max_rearms_the_same_real_missing_target() {
-    let (native, mut service, _, object, job, record, hold) =
-        pending_case("native-recorded-clean-max");
+    let (native, service, _, object, job, record, hold) = pending_case("native-recorded-clean-max");
     let primary = service.node_id().clone();
+    // Restoring and parking committed repair custody is Main-side work on the
+    // store that owns the original; the delegating caller keeps no store.
+    drop(service);
+    let mut service = native.metadata_primary_service(PATH).unwrap();
+    assert_eq!(service.node_id(), &primary);
     let path = default_dfs_repair_attempt_snapshot_path(native.data_dir(&primary));
     let queue = LocalDfsRepairQueueStore::new(&path);
     let (before, observation) = queue.view_for_maintenance().unwrap();
@@ -695,8 +757,8 @@ fn native_clean_max_rearms_the_same_real_missing_target() {
         }),
     );
     drop(hold);
-    let (mut native, cut) = finish_missing(native, &service, &record);
-    assert_eq!(actual_record(&service, &job, &object), record);
+    let (mut native, cut) = finish_missing(native, &primary, &record);
+    assert_eq!(actual_record(&native, &primary, &job, &object), record);
     let target = row.missing_replica_node_id;
     let receiver = native.client(&target).unwrap();
     assert_eq!(
@@ -718,8 +780,13 @@ fn native_capture_rejects_missing_or_inconsistent_original_data() {
     let (native, service, nodes, object, job, record, hold) =
         pending_case("native-recorded-capture-negative");
     let primary = service.node_id().clone();
-    let before = service
-        .metadata_backend()
+    // Placement planning reads the recorded original from the store that
+    // owns it; the delegating caller keeps no store.
+    drop(service);
+    let service = native.metadata_primary_service(PATH).unwrap();
+    assert_eq!(service.node_id(), &primary);
+    let before = native
+        .node_metadata(&primary)
         .unwrap()
         .journal_last_sequence()
         .unwrap();
@@ -775,14 +842,14 @@ fn native_capture_rejects_missing_or_inconsistent_original_data() {
         record.desired_replica_node_ids
     );
     assert_eq!(
-        service
-            .metadata_backend()
+        native
+            .node_metadata(&primary)
             .unwrap()
             .journal_last_sequence()
             .unwrap(),
         before
     );
-    assert_eq!(actual_record(&service, &job, &object), record);
+    assert_eq!(actual_record(&native, &primary, &job, &object), record);
     drop(hold);
     drop(service);
     native.close().unwrap();
@@ -790,9 +857,14 @@ fn native_capture_rejects_missing_or_inconsistent_original_data() {
 
 #[test]
 fn native_stale_policy_and_uncertain_scheduling_remain_fenced() {
-    let (native, mut service, _, object, job, record, hold) =
+    let (native, service, _, object, job, record, hold) =
         pending_case("native-recorded-stale-negative");
     let primary = service.node_id().clone();
+    // Restoring and parking committed repair custody and the authority check
+    // are Main-side work on the owning store.
+    drop(service);
+    let mut service = native.metadata_primary_service(PATH).unwrap();
+    assert_eq!(service.node_id(), &primary);
     let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
         native.data_dir(&primary),
     ));
@@ -857,7 +929,7 @@ fn native_stale_policy_and_uncertain_scheduling_remain_fenced() {
     );
     assert!(!authoritative);
     assert!(negatives.iter().all(|rejected| *rejected));
-    assert_eq!(actual_record(&service, &job, &object), record);
+    assert_eq!(actual_record(&native, &primary, &job, &object), record);
     drop(hold);
     drop(service);
     native.close().unwrap();

@@ -376,7 +376,10 @@ Path and object metadata is answered by the shard's primary or one of its
 replicas. A node outside the replica set reads paths, open handles, inode
 identities and hardlink targets through the primary, plans its writes against
 the primary's current object, and surfaces the primary's error rather than a
-local copy.
+local copy. Callers that delegate to their node's Main (mounted SIFS, sandbox,
+browser, CLI, Cloud Files) keep no metadata store of their own: they read
+through the shard authorities and write through Main, which alone owns and
+recovers the node's shards.
 
 Reads prefer the closest valid copy:
 

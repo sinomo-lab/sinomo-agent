@@ -229,13 +229,21 @@ fn browser_parent_exact_hint_does_not_require_cached_ancestors_or_recreate_delet
             .object_by_normalized_posix_path(&fs, ancestor)
             .is_none()
     );
+    // A caller delegating to its Main has no local metadata view: the
+    // store-backed hint fails closed, and the exact transient DATA projection
+    // alone lets parent preparation skip recursive creation.
+    assert!(matches!(
+        cluster.observer.posix_object_metadata_hint(parent),
+        Err(DfsPosixError::Dfs(DfsError::Distributed { ref message }))
+            if message.contains("no local metadata view")
+    ));
     assert_eq!(
         cluster
             .observer
-            .posix_object_metadata_hint(parent)
-            .unwrap()
-            .kind,
-        DfsObjectKind::Directory,
+            .metadata()
+            .object_by_normalized_posix_path(&fs, parent)
+            .map(|object| object.kind.clone()),
+        Some(DfsObjectKind::Directory),
         "a missing ancestor projection alone does not invalidate the exact DATA hint"
     );
     let capture = cluster
@@ -806,8 +814,8 @@ fn authoritative_stat_rejects_actual_corrupted_replies_and_restores_deadline() {
             },
         });
         let before = cluster
-            .observer
-            .metadata_backend()
+            ._runtime
+            .node_metadata(&cluster.observer_node)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap();
@@ -834,8 +842,8 @@ fn authoritative_stat_rejects_actual_corrupted_replies_and_restores_deadline() {
         assert_eq!(
             before,
             cluster
-                .observer
-                .metadata_backend()
+                ._runtime
+                .node_metadata(&cluster.observer_node)
                 .unwrap()
                 .metadata_shard_statuses()
                 .unwrap()
@@ -1168,8 +1176,8 @@ fn authoritative_stat_outsider_counts_link_and_unlink_without_local_replay() {
     cluster.writer.posix_hardlink(path, alias).unwrap();
     for expected in [2, 1] {
         let before = cluster
-            .observer
-            .metadata_backend()
+            ._runtime
+            .node_metadata(&cluster.observer_node)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap();
@@ -1195,8 +1203,8 @@ fn authoritative_stat_outsider_counts_link_and_unlink_without_local_replay() {
         assert_eq!(
             before,
             cluster
-                .observer
-                .metadata_backend()
+                ._runtime
+                .node_metadata(&cluster.observer_node)
                 .unwrap()
                 .metadata_shard_statuses()
                 .unwrap(),
@@ -1234,7 +1242,7 @@ fn browser_exact_parent_hint_without_replica_cannot_recreate_a_deleted_parent() 
     }));
     cluster.observer.add_transient_object_metadata(old_parent.clone()).unwrap();
     assert_eq!(cluster.observer.metadata().object(&old_parent.object_id), Some(&old_parent));
-    let before = cluster.observer.metadata_backend().unwrap().metadata_shard_statuses().unwrap();
+    let before = cluster._runtime.node_metadata(&cluster.observer_node).unwrap().metadata_shard_statuses().unwrap();
     let capture = cluster._runtime.capture_served_work(&cluster.primary_node, 32).unwrap();
     crate::browser_service::prepare_sifs_browser_write_parent(&mut cluster.observer, &child).unwrap();
     let reports = capture.records();
@@ -1265,7 +1273,7 @@ fn browser_exact_parent_hint_without_replica_cannot_recreate_a_deleted_parent() 
     ).unwrap();
     assert_eq!(implicit_creates, 0, "an exact parent hint must not cause an implicit Main recreation");
     assert_eq!(after, tombstone);
-    assert_eq!(before, cluster.observer.metadata_backend().unwrap().metadata_shard_statuses().unwrap());
+    assert_eq!(before, cluster._runtime.node_metadata(&cluster.observer_node).unwrap().metadata_shard_statuses().unwrap());
     let create = cluster.observer.posix_write_file(
         &child, b"must remain absent",
         DfsWriteOptions::replicated_eventual(vec![cluster.observer_node.clone()]),
@@ -1301,8 +1309,8 @@ fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
         .unwrap();
     cluster.replica.posix_hardlink(path, alias).unwrap();
     let before = cluster
-        .replica
-        .metadata_backend()
+        ._runtime
+        .node_metadata(&cluster.replica_node)
         .unwrap()
         .metadata_shard_statuses()
         .unwrap();
@@ -1314,8 +1322,8 @@ fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
     assert_eq!(
         before,
         cluster
-            .replica
-            .metadata_backend()
+            ._runtime
+            .node_metadata(&cluster.replica_node)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap()
@@ -1446,7 +1454,17 @@ fn complete_native_routed_write(
         .authority_shard
         .clone();
     runtime.clear_faults();
-    let mut owner = runtime.client(&primary).unwrap();
+    // Repair retry and publication are Main-side store work: use the
+    // authority's store-backed opener, not a caller delegating to its Main.
+    let path = runtime
+        .node_metadata(&primary)
+        .unwrap()
+        .get_object(&request.object_id)
+        .unwrap()
+        .expect("authority row for the routed write")
+        .path;
+    let mut owner = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(owner.node_id(), &primary);
     owner.hydrate_from_metadata_backend().unwrap();
     owner.retry_pending_repairs().unwrap();
     owner.process_incoming().unwrap();
@@ -1648,118 +1666,12 @@ fn routed_write_stale_pending_response_does_not_downgrade_completion() {
     runtime.close().unwrap();
 }
 
+/// A caller delegating to its Main never ingests routed journal batches, even
+/// when its node replicates the shard and the primary holds a backlog larger
+/// than one ordinary batch: its routed requests advertise no journal position
+/// and it reads its own effects through the authority.
 #[test]
-fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
-    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-    let (runtime, mut client, request, base, bytes, nodes, operation, pending_response) =
-        native_pending_routed_write("native-local-committed-before-routed-reply");
-    let primary = client.writes.pending_routed_writes[&operation]
-        .primary_node_id
-        .clone();
-    client
-        .handle_distributed_write_response(primary.clone(), pending_response)
-        .unwrap();
-    let (_, terminal) = complete_native_routed_write(
-        &runtime,
-        &mut client,
-        &request,
-        &base,
-        &bytes,
-        &nodes,
-        &operation,
-    );
-    let DfsDistributedWriteResult::Outcome {
-        outcome:
-            NetworkedDfsWriteOutcome::Committed {
-                intent_id,
-                version,
-                content_hash: hash,
-                ..
-            },
-    } = &terminal.result
-    else {
-        unreachable!()
-    };
-    let pending = &client.writes.pending_routed_writes[intent_id];
-    assert!(
-        pending.result.is_none(),
-        "the actual terminal response has not been consumed"
-    );
-    assert_eq!(pending.canonical_request_id, operation);
-    assert!(
-        pending.remote_intent_id.is_none(),
-        "retry registration carries no unconsumed remote receipt evidence"
-    );
-    // Reconstruct local committed custody from the actual replicated native
-    // record while the genuine terminal response stays unconsumed.
-    // Owner commit proves publication, not that this replica has already
-    // applied its detached commit notification. Establish this test's local
-    // custody premise through normal bounded maintenance before hydrating.
-    let mut observed = Vec::new();
-    loop {
-        let record = client
-            .metadata_backend()
-            .unwrap()
-            .get_intent(&request.object_id, intent_id)
-            .unwrap()
-            .expect("actual local native intent");
-        observed.push(record.status.clone());
-        if record.status == DfsWriteIntentStatus::Committed {
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "local committed custody unavailable within the original fixture deadline: {observed:?}"
-        );
-        let tick = runtime
-            .maintenance_tick(
-                &primary,
-                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
-            )
-            .unwrap();
-        assert!(tick.outcome.is_ok(), "{:?}", tick.outcome);
-        assert_eq!(tick.omitted_kv_event_count, 0);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "replica catch-up exceeded the original fixture deadline"
-        );
-        let tick = runtime
-            .maintenance_tick(
-                client.node_id(),
-                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
-            )
-            .unwrap();
-        assert!(tick.outcome.is_ok(), "{:?}", tick.outcome);
-        assert_eq!(tick.omitted_kv_event_count, 0);
-    }
-    eprintln!("NATIVE_LOCAL_COMMITTED_CUSTODY {observed:?}");
-    client.hydrate_from_metadata_backend().unwrap();
-    let recorded = client
-        .metadata_backend()
-        .unwrap()
-        .get_intent(&request.object_id, intent_id)
-        .unwrap()
-        .expect("actual committed local native intent");
-    assert_eq!(recorded.status, DfsWriteIntentStatus::Committed);
-    assert_eq!(recorded.target_version, *version);
-    assert_eq!(recorded.content_hash, Some(hash.clone()));
-    assert!(
-        client.writes.pending_routed_writes[intent_id]
-            .result
-            .is_none()
-    );
-    assert!(
-        matches!(client.write_outcome(intent_id).unwrap(), NetworkedDfsWriteOutcome::Committed { intent_id: actual_intent, version: actual_version, content_hash: actual_hash, .. }
-        if actual_intent == *intent_id && actual_version == *version && actual_hash == *hash)
-    );
-    drop(client);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn native_routed_namespace_replays_a_bounded_actual_backlog() {
+fn native_routed_namespace_requester_advertises_no_backlog_position() {
     let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-routing-backlog", 3);
     let mut runtime =
         crate::test_runtime::DfsTestRuntime::new("native-routing-backlog", nodes[0].clone())
@@ -1814,8 +1726,17 @@ fn native_routed_namespace_replays_a_bounded_actual_backlog() {
         .unwrap();
     let rows = client.posix_list_dir_distributed("/services").unwrap();
     assert!(rows.iter().any(|row| row.name == "native-after-backlog"));
-    let actual = client
-        .metadata_backend()
+    assert!(
+        client.metadata_backend().is_none(),
+        "a caller delegating to its Main keeps no store to replay a backlog into"
+    );
+    assert!(
+        current_shard.replica_node_ids.contains(&requester),
+        "the requester's node replicates the shard, so only delegation withholds the backlog"
+    );
+    // The primary's actual backlog exceeds one ordinary batch.
+    let backlog = runtime
+        .node_metadata(&current_shard.primary_node_id)
         .unwrap()
         .journal_batch_for_shard_since_limited(
             &DfsMetadataShardId::new("services"),
@@ -1825,15 +1746,7 @@ fn native_routed_namespace_replays_a_bounded_actual_backlog() {
         )
         .unwrap()
         .unwrap();
-    assert!(actual.entries.len() > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
-    assert!(actual.entries.len() <= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT);
-    for entry in actual.entries {
-        assert!(matches!(
-            entry.mutation,
-            DfsMetadataMutation::PrepareOperationV7 { .. }
-                | DfsMetadataMutation::CommitPreparedOperationV7 { .. }
-        ));
-    }
+    assert!(backlog.entries.len() > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT);
     // This window observes only real post-backlog Main dispatches. Its records()
     // checks zero omissions independently of the long-lived transport vector.
     let requests = capture.records();
@@ -1860,6 +1773,16 @@ fn native_routed_namespace_replays_a_bounded_actual_backlog() {
                 if path == "/services/native-after-backlog/deep"))
             })
     );
+    for message in requests.iter().filter(|message| exact_owner_request(message)) {
+        let DfsNetworkMessage::NamespaceRequest(request) = &message.message else {
+            unreachable!()
+        };
+        assert!(
+            !request.include_metadata_journal_batches
+                && request.metadata_journal_after_sequences.is_empty(),
+            "a delegating requester advertises no journal position: {request:?}"
+        );
+    }
     assert!(requests.iter().filter(|message| exact_owner_request(message)).any(|message| {
         matches!(&message.message, DfsNetworkMessage::NamespaceRequest(request)
             if matches!(&request.operation, DfsNamespaceOperation::MetadataQuery { query }
@@ -2388,14 +2311,16 @@ fn local_owned_read_is_routed_to_owner_node() {
     // Certify the actual author cut on both metadata members before the
     // object-id read.
     // The barrier and existing lookup share the original five-second budget.
+    // Quorum sync is Main-side store work on the store-backed opener.
     let sync_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    let object = owner_dfs
+    let mut author = runtime.metadata_primary_service(path).unwrap();
+    let object = author
         .current_read_object_metadata(&stat.object_id)
         .unwrap();
-    let target = owner_dfs
+    let target = author
         .capture_metadata_quorum_sync_target(&object)
         .unwrap();
-    let certificate = owner_dfs
+    let certificate = author
         .sync_metadata_shard_to_quorum(
             &target,
             sync_deadline.saturating_duration_since(Instant::now()),
@@ -2414,9 +2339,18 @@ fn local_owned_read_is_routed_to_owner_node() {
         !remaining.is_zero(),
         "metadata setup retains its original sync budget"
     );
+    // The reader delegates to its Main and keeps no store; it reads the
+    // object identity certified on its node's metadata member.
+    let certified = runtime
+        .node_metadata(&remote)
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .expect("certified remote metadata member row");
+    assert_eq!(certified.version, stat.version);
     assert_eq!(
         reader
-            .request_remote_object_read_without_cache(&stat.object_id)
+            .request_remote_object_read_for_metadata_without_cache(&certified)
             .unwrap(),
         vec![owner.clone()]
     );
@@ -2440,6 +2374,7 @@ fn local_owned_read_is_routed_to_owner_node() {
             .any(|event| event.target == remote && event.route == DFS_DATA_STAGE_BLOB_ROUTE)
     );
     drop(reader);
+    drop(author);
     drop(owner_dfs);
     runtime.close().unwrap();
 }
@@ -2451,14 +2386,12 @@ fn replicated_eventual_write_is_routed_to_metadata_primary_and_committed() {
     sifs_cluster_primary_posix_write(&mut cluster, path, b"old bytes");
     let original_hash = content_hash(b"old bytes");
     sifs_cluster_publish_metadata_until(&mut cluster, "seed writer metadata", |cluster| {
-        cluster
-            .writer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(original_hash.as_str()))
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.writer_node, path)
+            .is_some_and(|object| object.content_hash.as_deref() == Some(original_hash.as_str()))
     });
     let original = cluster
         .writer
-        .posix_stat(path)
+        .posix_stat_distributed(path)
         .expect("original writer stat");
     let object_id = original.object_id.clone();
     let target_version = crate::namespace::next_version(&original.version);
@@ -2492,21 +2425,32 @@ fn replicated_eventual_write_is_routed_to_metadata_primary_and_committed() {
             NetworkedDfsWriteOutcome::Committed { .. }
         ));
     }
+    // The primary client delegates to its Main and keeps no store: the
+    // primary node's durable row and local content hold the routed write.
+    let primary_object = cluster
+        ._runtime
+        .node_metadata(&cluster.primary_node)
+        .unwrap()
+        .get_object(&object_id)
+        .unwrap()
+        .expect("primary read");
+    assert_eq!(primary_object.version, target_version);
+    assert_eq!(
+        primary_object.content_hash,
+        Some(content_hash(b"updated bytes"))
+    );
     assert_eq!(
         cluster
             .primary
-            .read_local_object(&object_id)
-            .expect("primary read"),
-        Some(DfsReadData {
-            object_id: object_id.clone(),
-            version: target_version.clone(),
-            content_hash: Some(content_hash(b"updated bytes")),
-            bytes: b"updated bytes".to_vec(),
-        }),
+            .content()
+            .read_object_version(object_id.as_str(), target_version.as_str())
+            .expect("primary local content")
+            .1,
+        b"updated bytes"
     );
     let writer_stat = cluster
         .writer
-        .posix_stat(path)
+        .posix_stat_distributed(path)
         .expect("writer metadata updated");
     assert_eq!(writer_stat.object_id, object_id);
     assert_eq!(writer_stat.version, target_version);
@@ -2554,7 +2498,9 @@ fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
         Some(&runtime.runtime_handle()),
     )
     .unwrap();
-    let mut stale_stream = reader.posix_open_file_stream(path).unwrap();
+    // The delegating reader has no local metadata view; it opens the current
+    // generation through the authority before the overwrite.
+    let mut stale_stream = reader.posix_open_current_file_stream(path).unwrap();
     let replacement = writer.posix_write_file(path, &new, options).unwrap();
     let mut stale = Vec::new();
     stale_stream.reader.read_to_end(&mut stale).unwrap();
@@ -2632,18 +2578,17 @@ fn sifs_cluster_posix_routed_write_is_visible_on_primary() {
 
     // The shard primary serialized the write, so its metadata must already be
     // authoritative: correct kind, size, and content hash.
-    let stat = cluster.primary.posix_stat(path).expect("primary stat");
+    let stat = super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.primary_node, path)
+        .expect("primary stat");
     assert_eq!(stat.kind, DfsObjectKind::File);
-    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(stat.content_size_bytes, Some(bytes.len() as u64));
     assert_eq!(
         stat.content_hash.as_deref(),
         Some(content_hash(bytes).as_str())
     );
 
-    let entries = cluster
-        .primary
-        .posix_list_dir("/users")
-        .expect("primary list /users");
+    let entries =
+        super::cross_shard::node_store_child_objects(&cluster._runtime, &cluster.primary_node, "/users");
     assert!(
         entries.iter().any(|entry| entry.path == path),
         "primary directory listing must contain the routed write: {entries:?}"
@@ -2651,7 +2596,10 @@ fn sifs_cluster_posix_routed_write_is_visible_on_primary() {
 
     // The content was staged on the writer; the primary must be able to make
     // it locally readable through the remote-read path.
-    let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    let read = cluster
+        .primary
+        .posix_read_file_distributed(path)
+        .expect("primary read");
     assert_eq!(read, bytes.to_vec());
 
     drop(cluster);
@@ -2734,27 +2682,27 @@ fn sifs_cluster_posix_routed_create_updates_parent_directory_mtime_cluster_wide(
 
     let writer_parent_before = cluster
         .writer
-        .posix_stat(parent)
+        .posix_stat_distributed(parent)
         .expect("writer parent stat before");
 
     sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
 
     // POSIX: creating an entry updates the parent directory mtime. The shard
-    // primary journals that update, so the writer must observe it through the
-    // routed-write response replay without appending to its own journal.
+    // primary journals that update; the writer delegates to its Main, ingests
+    // no journal of its own and observes the primary's record.
     let primary_parent = cluster
         .primary
-        .posix_stat(parent)
+        .posix_stat_distributed(parent)
         .expect("primary parent stat");
     sifs_posix_cluster_pump_until(&mut cluster, "writer parent mtime replay", |cluster| {
         cluster
             .writer
-            .posix_stat(parent)
+            .posix_stat_distributed(parent)
             .is_ok_and(|stat| stat.modified_at_unix_nanos == primary_parent.modified_at_unix_nanos)
     });
     let writer_parent = cluster
         .writer
-        .posix_stat(parent)
+        .posix_stat_distributed(parent)
         .expect("writer parent stat after");
     assert!(
         writer_parent.modified_at_unix_nanos > writer_parent_before.modified_at_unix_nanos,
@@ -2762,15 +2710,16 @@ fn sifs_cluster_posix_routed_create_updates_parent_directory_mtime_cluster_wide(
     );
     assert_eq!(
         writer_parent.version, primary_parent.version,
-        "writer must replay the primary's parent directory record, not invent its own"
+        "writer must observe the primary's parent directory record, not invent its own"
     );
 
     // The observer converges to the identical parent record after publication.
     sifs_cluster_publish_metadata_until(&mut cluster, "observer parent mtime", |cluster| {
-        cluster.observer.posix_stat(parent).is_ok_and(|stat| {
-            stat.modified_at_unix_nanos == primary_parent.modified_at_unix_nanos
-                && stat.version == primary_parent.version
-        })
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.observer_node, parent)
+            .is_some_and(|object| {
+                object.modified_at_unix_nanos == primary_parent.modified_at_unix_nanos
+                    && object.version == primary_parent.version
+            })
     });
 
     assert!(
@@ -3219,9 +3168,9 @@ fn routed_attribute_results_observe_current_authority_after_mutation() {
             DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
         )
         .unwrap();
-    // Prime this actual requester's existing local read view before the remote
+    // Observe the requester's current attribute generation before the remote
     // mutation. A setter result must not reuse that older attribute generation.
-    let before = cluster.writer.posix_stat(path).unwrap();
+    let before = cluster.writer.posix_stat_distributed(path).unwrap();
     assert_ne!(before.accessed_at_unix_nanos, 123_000_000_000);
     let times = cluster
         .writer
@@ -3526,7 +3475,7 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         observer.posix_symlink_with_create_attrs(
             "other",
             "/users/routed-attrs/link",
-            DfsWriteOptions::replicated_eventual(vec![observer_node]),
+            DfsWriteOptions::replicated_eventual(vec![observer_node.clone()]),
             DfsPosixCreateAttrs::new(0o777, 5103, 5203),
         ),
         Err(DfsPosixError::AlreadyExists { .. })
@@ -3769,12 +3718,16 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
             ],
             &mut rejections,
         );
-        if matches!(
-            observer.posix_stat("/users/routed-dir"),
-            Err(DfsPosixError::NotFound { .. })
-        ) && observer
-            .posix_stat("/users/routed-dir/renamed.txt")
-            .is_err()
+        // The observer delegates to its Main and keeps no store; replica
+        // convergence is observed in its node's durable store.
+        if super::cross_shard::node_store_object_at(&_runtime, &observer_node, "/users/routed-dir")
+            .is_none()
+            && super::cross_shard::node_store_object_at(
+                &_runtime,
+                &observer_node,
+                "/users/routed-dir/renamed.txt",
+            )
+            .is_none()
         {
             break;
         }
@@ -3798,8 +3751,12 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         .expect("normal Main and native owner drain");
 }
 
+/// A caller delegating to its Main keeps no local metadata chain to answer an
+/// idempotent mkdir_all from: even when its node mirrors the existing chain,
+/// the request reaches the remote primary, surfaces that carrier's typed
+/// delivery failure and mutates nothing.
 #[test]
-fn sifs_cluster_posix_mkdir_all_remote_primary_falls_back_when_local_chain_exists() {
+fn sifs_cluster_posix_mkdir_all_delegating_caller_has_no_local_chain_fallback() {
     let name = "native-mkdir-all-local-chain";
     let (runtime, mut primary, config) =
         crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
@@ -3816,35 +3773,49 @@ fn sifs_cluster_posix_mkdir_all_remote_primary_falls_back_when_local_chain_exist
         Some(&runtime.runtime_handle()),
     )
     .unwrap();
-    local.hydrate_from_metadata_backend().unwrap();
+    // The client delegates to its Main and keeps no store: the existing chain
+    // is mirrored in the observer node's durable store.
     assert_eq!(
-        local.posix_stat(path).unwrap().kind,
+        runtime
+            .node_metadata(&observer)
+            .unwrap()
+            .get_object_by_path(&sifs_file_system_id(), path)
+            .unwrap()
+            .expect("locally mirrored existing chain")
+            .kind,
         DfsObjectKind::Directory
     );
     let shard = DfsMetadataShardId::new(config.shard_id);
-    let before = primary
-        .metadata_backend()
+    let before = runtime
+        .node_metadata(&primary_node)
         .unwrap()
         .metadata_prefix_proof(&shard)
         .unwrap();
     runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(observer.clone()),
-        target: Some(primary_node),
+        target: Some(primary_node.clone()),
         route: None,
         call_id: None,
         origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
         remaining_hits: 32,
         action: crate::test_runtime::FaultAction::BudgetExhausted,
     });
-    local
+    let error = local
         .posix_mkdir_all(path)
-        .expect("the actual locally mirrored existing chain is idempotent");
-    local
-        .posix_mkdir_all_without_local_replay(path)
-        .expect("the actual existing chain needs no replay or remote mutation");
+        .expect_err("a delegating caller has no local chain to fall back on");
+    assert!(
+        matches!(
+            &error,
+            DfsPosixError::Dfs(DfsError::NetworkDelivery {
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
     assert_eq!(
-        primary
-            .metadata_backend()
+        runtime
+            .node_metadata(&primary_node)
             .unwrap()
             .metadata_prefix_proof(&shard)
             .unwrap(),
@@ -4268,8 +4239,18 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         .posix_mkdir_all(remote_dir)
         .expect("remote bulk parent");
     sifs_two_primary_publish_until(&mut cluster, "remote bulk parent", |cluster| {
-        cluster.users_primary.posix_stat(remote_dir).is_ok()
-            && cluster.replica.posix_stat(remote_dir).is_ok()
+        super::cross_shard::node_store_object_at(
+            &cluster._runtime,
+            &cluster.users_primary_node,
+            remote_dir,
+        )
+        .is_some()
+            && super::cross_shard::node_store_object_at(
+                &cluster._runtime,
+                &cluster.replica_node,
+                remote_dir,
+            )
+            .is_some()
     });
 
     let SifsTwoPrimaryCluster {
@@ -4423,6 +4404,29 @@ fn sifs_remote_primary_deferred_publish_write_persists_for_fresh_replica_reader(
         .expect("second overwrite response replay");
 
     drop(replica);
+
+    // The writer delegates to its Main and ingests no routed journal; its
+    // node's replica converges through ordinary Main publication.
+    let expected_hash = content_hash(&writer_b);
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    while super::cross_shard::node_store_object_at(&_runtime, &replica_node, path)
+        .is_none_or(|object| object.content_hash.as_deref() != Some(expected_hash.as_str()))
+    {
+        let publication = _runtime
+            .maintenance_tick(
+                &services_primary_node,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .expect("ordinary Main metadata publication");
+        assert!(publication.outcome.is_ok(), "{:?}", publication.outcome);
+        assert!(
+            Instant::now() < deadline,
+            "replica metadata must converge to the committed remote-primary write"
+        );
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
 
     let actual_configs = _runtime
         .metadata_shards()
@@ -4727,7 +4731,11 @@ fn native_routed_stale_unlink_preserves_typed_conflict_and_actual_winner() {
         matches!(error, DfsPosixError::Conflict { ref path, .. } if path == "/services/stale-caller")
     );
     assert_eq!(
-        cluster.replica.posix_stat(path).unwrap().version,
+        cluster
+            .replica
+            .posix_stat_distributed(path)
+            .unwrap()
+            .version,
         winner.version
     );
     assert_eq!(
@@ -4775,11 +4783,15 @@ fn native_routed_stale_rename_cannot_replace_a_current_generation() {
         matches!(error, DfsPosixError::Conflict { ref path, .. } if path == "/services/stale-rename-source")
     );
     assert_eq!(
-        cluster.replica.posix_stat(from).unwrap().version,
+        cluster
+            .replica
+            .posix_stat_distributed(from)
+            .unwrap()
+            .version,
         winner.version
     );
     assert!(matches!(
-        cluster.replica.posix_stat(to),
+        cluster.replica.posix_stat_distributed(to),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(

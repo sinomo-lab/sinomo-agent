@@ -118,7 +118,8 @@ fn revision_metadata_preserves_live_object_repin_without_authorizing_reads() {
         "an expired structural capture must not revive a tombstoned source"
     );
     assert!(
-        dfs.metadata_backend()
+        runtime
+            .node_metadata(&owner)
             .unwrap()
             .version_pins_for_object(&identity.object_id)
             .unwrap()
@@ -236,7 +237,10 @@ fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
         panic!("retained bytes must be readable");
     };
     assert_eq!(data.bytes, b"igi");
-    assert_eq!(dfs.posix_stat(path).unwrap().version, edited.version);
+    assert_eq!(
+        dfs.posix_stat_distributed(path).unwrap().version,
+        edited.version
+    );
     let restored = dfs
         .history()
         .restore_file_history(
@@ -251,7 +255,10 @@ fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
         .unwrap();
     assert_ne!(restored.committed.version, identity.version);
     assert_ne!(restored.committed.version, edited.version);
-    assert_eq!(dfs.posix_read_file(path).unwrap(), b"original\n");
+    assert_eq!(
+        dfs.posix_read_file_distributed(path).unwrap(),
+        b"original\n"
+    );
     assert!(
         dfs.history()
             .restore_file_history(
@@ -266,7 +273,7 @@ fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
             .is_err()
     );
     assert_eq!(
-        dfs.posix_stat(path).unwrap().version,
+        dfs.posix_stat_distributed(path).unwrap().version,
         restored.committed.version
     );
     dfs.posix_unlink(path).unwrap();
@@ -284,11 +291,14 @@ fn file_history_reads_restore_and_deleted_recovery_keep_one_current_view() {
         .unwrap();
     assert_ne!(recovered.committed.object_id, identity.object_id);
     assert_eq!(
-        dfs.posix_stat(path).unwrap().object_id,
+        dfs.posix_stat_distributed(path).unwrap().object_id,
         recovered.committed.object_id,
         "releasing an old version pin must not re-publish its deleted object's tombstone"
     );
-    assert_eq!(dfs.posix_read_file(path).unwrap(), b"original\n");
+    assert_eq!(
+        dfs.posix_read_file_distributed(path).unwrap(),
+        b"original\n"
+    );
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -345,7 +355,7 @@ fn file_history_path_query_keeps_captured_current_reused_and_unlinked_families()
         .unwrap();
     capture_history(&mut dfs, &original);
     dfs.posix_rename(original_path, moved_path).unwrap();
-    let moved = dfs.posix_stat(moved_path).unwrap();
+    let moved = dfs.posix_stat_distributed(moved_path).unwrap();
     capture_history(&mut dfs, &moved);
     let reused = dfs
         .posix_write_file(original_path, b"second family", options)

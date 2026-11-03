@@ -5,11 +5,13 @@
 //! facade's path-resolution and metadata helpers so mutation code and query
 //! code share one interpretation of tombstones, hardlinks, and directories.
 
-use super::{POSIX_LIST_DIR_COLLECT_PAGE_SIZE, now_unix_nanos};
+use super::POSIX_LIST_DIR_COLLECT_PAGE_SIZE;
 use crate::metadata_pages::try_walk_metadata_pages;
-use crate::namespace::next_version;
 use crate::posix_model::{DfsDirEntry, DfsDirEntryPage, DfsPosixError, DfsStat, Result};
-use crate::posix_path::{join_posix_path, normalize_posix_path, posix_path_is_at_or_under_prefix};
+use crate::posix_path::{
+    join_posix_path, normalize_posix_path, path_after_dot_resolution,
+    posix_path_is_at_or_under_prefix,
+};
 use crate::{
     DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
     DfsReadData, NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
@@ -193,7 +195,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(prefetched)
     }
 
+    /// A caller delegating to its Main keeps no local metadata store, so a
+    /// local read cannot answer it; such a caller uses the distributed reads.
+    pub(super) fn ensure_local_view_readable(&self, path: &str) -> Result<()> {
+        if self.transport.delegates_local_namespace_authority() && self.control_plane.is_some() {
+            return Err(DfsPosixError::Dfs(crate::DfsError::Distributed {
+                message: format!(
+                    "{path}: a caller delegating to its Main has no local metadata view; use the distributed read"
+                ),
+            }));
+        }
+        Ok(())
+    }
+
     pub fn posix_readlink(&self, path: &str) -> Result<String> {
+        self.ensure_local_view_readable(path)?;
         let path = self.resolve_existing_posix_path(path, false)?;
         let object = self
             .lookup_sifs_path(&path)?
@@ -218,6 +234,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_readlink_distributed(&mut self, path: &str) -> Result<String> {
         let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_readlink_distributed_object(path)
+            .map(|(target, _)| target)
+    }
+
+    fn posix_readlink_distributed_object(
+        &mut self,
+        path: &str,
+    ) -> Result<(String, DfsObjectMetadata)> {
         let (path, object) = if self.metadata_backend.is_none()
             && self.transport.delegates_local_namespace_authority()
             && self.control_plane.is_some()
@@ -237,34 +261,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotSymlink { path });
         }
         let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
-        super::metadata::symlink_target_from_distributed_read_outcome(&path, outcome)
+        let target = super::metadata::symlink_target_from_distributed_read_outcome(&path, outcome)?;
+        Ok((target, object))
     }
 
     pub fn posix_readlink_update_access(&mut self, path: &str) -> Result<String> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let resolved_path = self.resolve_existing_posix_path_distributed(path, false)?;
-        let target = self.posix_readlink_distributed(path)?;
-        let object =
-            self.lookup_sifs_path(&resolved_path)?
-                .ok_or_else(|| DfsPosixError::NotFound {
-                    path: resolved_path.clone(),
-                })?;
-        let mut object = self.resolve_hardlink_target(&object)?;
-        if object.kind != DfsObjectKind::Symlink {
-            return Err(DfsPosixError::NotSymlink {
-                path: resolved_path,
-            });
-        }
-        if !self.is_local_metadata_primary_for_object(&object)? {
-            return Ok(target);
-        }
-        object.accessed_at_unix_nanos = now_unix_nanos();
-        object.version = next_version(&object.version);
-        self.add_object_metadata(object)?;
+        let (target, object) = self.posix_readlink_distributed_object(path)?;
+        self.record_posix_access(&object)?;
         Ok(target)
     }
 
     pub fn posix_stat(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -276,6 +285,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Resolve the same local namespace target as stat without projecting content
     /// size or link counts. Mutation admission still revalidates these hints.
     pub(crate) fn posix_object_metadata_hint(&self, path: &str) -> Result<DfsObjectMetadata> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = service.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -322,16 +332,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn posix_stat_authoritative(&mut self, path: &str) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_posix_dot_components_distributed(path)?;
+        let requested = self.resolve_posix_dot_components_distributed(path)?;
+        // Keep a trailing slash: it requires the target to be a directory.
+        let lookup = path_after_dot_resolution(path, &requested);
         let (path, snapshot) =
-            self.with_local_primary_stat_read_snapshot(&path, |service, shard_snapshot| {
+            self.with_local_primary_stat_read_snapshot(&requested, |service, shard_snapshot| {
                 service.with_metadata_lookup_cache_mut(|service| {
                     service.check_cancelled("distributed stat")?;
                     service.ensure_distributed_read_path_not_in_cross_shard_flight(
                         &sifs_file_system_id(),
-                        &path,
+                        &requested,
                     )?;
-                    let path = service.resolve_existing_posix_path_distributed(&path, true)?;
+                    let path = service.resolve_existing_posix_path_distributed(&lookup, true)?;
                     service.ensure_distributed_read_path_not_in_cross_shard_flight(
                         &sifs_file_system_id(),
                         &path,
@@ -373,6 +385,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -407,7 +420,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &sifs_file_system_id(),
             &requested,
         )?;
-        let path = self.resolve_existing_posix_path_distributed(&requested, false)?;
+        let path = self.resolve_existing_posix_path_distributed(
+            &path_after_dot_resolution(path, &requested),
+            false,
+        )?;
         let snapshot = self.refresh_sifs_metadata_shards()?;
         self.ensure_distributed_read_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
         self.stat_path_from_authorities(&path, snapshot.as_deref())
@@ -420,6 +436,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// This stricter surface exists for capability boundaries that must reject
     /// all link records before performing a follow operation.
     pub fn posix_namespace_lstat(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -526,6 +543,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir(&self, path: &str) -> Result<Vec<DfsDirEntry>> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let path = service.resolve_existing_posix_path(path, true)?;
             service.posix_collect_resolved_dir(&path)
@@ -573,6 +591,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let path = service.resolve_existing_posix_path(path, true)?;
             service.posix_list_resolved_dir_page(&path, after, max_entries)
@@ -903,25 +922,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_list_dir_update_access(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let resolved_path = self.resolve_existing_posix_path_distributed(path, true)?;
-        let entries = self.posix_list_dir(&resolved_path)?;
-        let object =
-            self.lookup_sifs_path(&resolved_path)?
-                .ok_or_else(|| DfsPosixError::NotFound {
-                    path: resolved_path.clone(),
-                })?;
-        let mut object = self.resolve_hardlink_target(&object)?;
+        let (resolved_path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let object = object
+            .filter(|object| object.kind != DfsObjectKind::Tombstone)
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: resolved_path.clone(),
+            })?;
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         if object.kind != DfsObjectKind::Directory {
             return Err(DfsPosixError::NotDirectory {
                 path: resolved_path,
             });
         }
-        if !self.is_local_metadata_primary_for_object(&object)? {
-            return Ok(entries);
-        }
-        object.accessed_at_unix_nanos = now_unix_nanos();
-        object.version = next_version(&object.version);
-        self.add_object_metadata(object)?;
+        let entries = self.posix_list_dir_distributed(&resolved_path)?;
+        self.record_posix_access(&object)?;
         Ok(entries)
     }
 }

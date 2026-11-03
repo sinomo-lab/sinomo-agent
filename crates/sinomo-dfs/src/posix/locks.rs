@@ -79,7 +79,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }));
         }
         let command = scope_advisory_lock_command(command, &self.node_id)?;
-        let object = self.advisory_lock_object_by_id(object_id, path)?;
+        let object = self.advisory_lock_object_by_id_distributed(object_id, path)?;
         let authority_path = object.path.clone();
 
         let operation = DfsNamespaceOperation::AdvisoryLock {
@@ -313,15 +313,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn advisory_lock_object_for_path(&mut self, path: &str) -> Result<(String, DfsObjectMetadata)> {
         let resolved = self.resolve_existing_posix_path_distributed(path, true)?;
         let object = self
-            .lookup_sifs_path(&resolved)?
+            .lookup_sifs_path_direct_distributed_synced(&resolved)?
             .ok_or_else(|| DfsPosixError::NotFound {
                 path: resolved.clone(),
             })?;
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory || object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::InvalidPath { path: resolved });
-        }
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
+        let object = advisory_lock_target(object, &resolved)?;
         Ok((object.path.clone(), object))
+    }
+
+    /// The requester resolves the opened identity through its authority; a
+    /// caller delegating to its Main keeps no local metadata view.
+    fn advisory_lock_object_by_id_distributed(
+        &mut self,
+        object_id: &DfsObjectId,
+        path_hint: &str,
+    ) -> Result<DfsObjectMetadata> {
+        let object = self
+            .current_read_object_metadata_distributed(object_id)
+            .map_err(DfsPosixError::from)?;
+        advisory_lock_target(object, path_hint)
     }
 
     fn advisory_lock_object_by_id(
@@ -332,13 +343,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object = self
             .current_read_object_metadata(object_id)
             .map_err(DfsPosixError::from)?;
-        if object.kind == DfsObjectKind::Directory || object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::InvalidPath {
-                path: path_hint.to_string(),
-            });
-        }
-        Ok(object)
+        advisory_lock_target(object, path_hint)
     }
+}
+
+fn advisory_lock_target(object: DfsObjectMetadata, path_hint: &str) -> Result<DfsObjectMetadata> {
+    if object.kind == DfsObjectKind::Directory || object.kind == DfsObjectKind::Tombstone {
+        return Err(DfsPosixError::InvalidPath {
+            path: path_hint.to_string(),
+        });
+    }
+    Ok(object)
 }
 
 fn advisory_lock_node_scope(node_id: &sinomo_core::node::NodeId) -> String {
@@ -539,8 +554,8 @@ mod tests {
                 },
             )
             .expect("normal immutable publication");
-        let object = setup
-            .metadata_backend()
+        let object = runtime
+            .node_metadata(&primary)
             .unwrap()
             .get_object(&stat.object_id)
             .unwrap()
@@ -553,9 +568,12 @@ mod tests {
                     .expect("stop unavailable lock replica");
             }
         }
+        // The local lock authority prepares and commits grants in the
+        // metadata owner's store; the delegating client keeps no store.
         let (service, txn_calls) = runtime
-            .client_with_control_plane_probe(&primary)
-            .expect("normal foreground DFS lock client");
+            .metadata_primary_service_with_control_plane_probe(&object.path)
+            .expect("normal foreground DFS lock authority");
+        assert_eq!(service.node_id(), &primary);
         (runtime, service, object, txn_calls)
     }
 

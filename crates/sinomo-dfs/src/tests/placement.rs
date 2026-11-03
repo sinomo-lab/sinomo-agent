@@ -468,12 +468,12 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
         )
         .expect("observer routed rename of writer file");
     assert!(matches!(
-        observer.posix_stat("/users/shared/from-writer.txt"),
+        observer.posix_stat_distributed("/users/shared/from-writer.txt"),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
         observer
-            .posix_stat("/users/shared/renamed-by-observer.txt")
+            .posix_stat_distributed("/users/shared/renamed-by-observer.txt")
             .expect("observer stat renamed")
             .content_hash
             .as_deref(),
@@ -504,14 +504,17 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
             ],
             &mut rejections,
         );
-        let writer_sees_rename = writer
-            .posix_stat("/users/shared/renamed-by-observer.txt")
-            .is_ok()
-            && matches!(
-                writer.posix_stat("/users/shared/from-writer.txt"),
-                Err(DfsPosixError::NotFound { .. })
-            );
-        let writer_sees_observer_dir = writer.posix_stat("/users/shared/from-observer").is_ok();
+        // The writer node's own store converges to the observer's mutations.
+        let writer_sees_rename = node_store_object(
+            &_runtime,
+            &writer_node,
+            "/users/shared/renamed-by-observer.txt",
+        )
+        .is_some()
+            && node_store_object(&_runtime, &writer_node, "/users/shared/from-writer.txt")
+                .is_none();
+        let writer_sees_observer_dir =
+            node_store_object(&_runtime, &writer_node, "/users/shared/from-observer").is_some();
         if writer_sees_rename && writer_sees_observer_dir {
             break;
         }
@@ -525,9 +528,10 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
         "cross-replica namespace ops must keep journals aligned: {rejections:?}"
     );
 
-    // All three nodes list the same namespace identity.
+    // All three nodes' stores hold the same namespace identity, and the
+    // observer's caller lists that same identity.
     let names = |entries: &[DfsDirEntry]| {
-        entries
+        let mut names = entries
             .iter()
             .map(|entry| {
                 (
@@ -536,29 +540,44 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
                     entry.object_id.clone(),
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        names.sort_by(|left, right| left.0.cmp(&right.0));
+        names
     };
-    let primary_entries = primary
-        .posix_list_dir("/users/shared")
-        .expect("primary list shared");
+    let primary_entries = node_store_children(&_runtime, &primary_node, "/users/shared");
+    assert_eq!(primary_entries.len(), 2, "{primary_entries:?}");
     assert_eq!(
-        names(&primary_entries),
-        names(&writer.posix_list_dir("/users/shared").expect("writer list"))
+        primary_entries,
+        node_store_children(&_runtime, &writer_node, "/users/shared")
+    );
+    let observer_node = observer.node_id().clone();
+    assert_eq!(
+        primary_entries,
+        node_store_children(&_runtime, &observer_node, "/users/shared")
     );
     assert_eq!(
-        names(&primary_entries),
+        primary_entries,
         names(
             &observer
-                .posix_list_dir("/users/shared")
+                .posix_list_dir_distributed("/users/shared")
                 .expect("observer list")
         )
     );
+    drop(primary);
 
-    // The renamed content reads identically from its staging replica.
+    // The renamed content reads identically, and its staging replica holds
+    // the bytes locally.
     assert_eq!(
         writer
-            .posix_read_file("/users/shared/renamed-by-observer.txt")
+            .posix_read_file_distributed("/users/shared/renamed-by-observer.txt")
             .expect("writer read renamed"),
+        bytes
+    );
+    assert_eq!(
+        writer
+            .content()
+            .read_blob(&content_hash(&bytes))
+            .expect("writer holds its staging copy"),
         bytes
     );
 
@@ -687,7 +706,7 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
     drop(target);
     assert_eq!(
         replica
-            .posix_read_file("/users/relocated.txt")
+            .posix_read_file_distributed("/users/relocated.txt")
             .expect("read after reverse move"),
         bytes
     );
@@ -713,22 +732,47 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
     };
     let expected_hash = content_hash(&bytes);
     sifs_two_primary_publish_until(&mut cluster, "reverse move convergence", |cluster| {
-        cluster
-            .replica
-            .posix_stat("/users/relocated.txt")
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
-            && matches!(
-                cluster.replica.posix_stat("/services/origin.txt"),
-                Err(DfsPosixError::NotFound { .. })
-            )
+        let runtime = &cluster._runtime;
+        node_store_content_hash(runtime, &cluster.replica_node, "/users/relocated.txt")
+            .is_some_and(|hash| hash == expected_hash)
+            && node_store_object(runtime, &cluster.replica_node, "/services/origin.txt").is_none()
     });
+    // The replica's store resolves the object id to the live users record,
+    // not the services eviction tombstone, and holds its bytes locally.
+    let by_id = cluster
+        ._runtime
+        .node_metadata(&cluster.replica_node)
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .expect("replica by-id record after convergence");
+    assert_eq!(
+        (
+            by_id.path.as_str(),
+            by_id.kind,
+            by_id.content_hash.as_deref()
+        ),
+        (
+            "/users/relocated.txt",
+            DfsObjectKind::File,
+            Some(expected_hash.as_str())
+        ),
+        "replica object resolution must prefer the live record over the eviction tombstone"
+    );
     assert_eq!(
         cluster
             .replica
-            .posix_read_file("/users/relocated.txt")
-            .expect("replica by-id read after convergence"),
-        bytes,
-        "replica object resolution must prefer the live record over the eviction tombstone"
+            .content()
+            .read_blob(&expected_hash)
+            .expect("replica holds the moved bytes"),
+        bytes
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_read_file_distributed("/users/relocated.txt")
+            .expect("replica read after convergence"),
+        bytes
     );
     assert!(
         cluster.rejections.is_empty(),
@@ -910,7 +954,10 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
         )
         .expect("existing file");
     assert_eq!(
-        service.posix_stat(path).expect("initial stat").policy,
+        service
+            .posix_stat_distributed(path)
+            .expect("initial stat")
+            .policy,
         DfsObjectPolicy::ReplicatedEventual
     );
 
@@ -984,7 +1031,13 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
         job
     });
 
-    let first_page = service
+    // Reconciliation scans and updates the owning shard's store: Main-side
+    // work the delegating client cannot do, so drive it on the store-backed
+    // owner.
+    let mut driver = runtime
+        .metadata_primary_service(path)
+        .expect("store-backed placement owner");
+    let first_page = driver
         .run_placement_reconciliation_bounded(1)
         .expect("first reconciliation page")
         .expect("active job");
@@ -995,15 +1048,19 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     );
     assert_eq!(first_page.scanned_object_count, 1);
     assert_eq!(first_page.total_object_count, 1);
+    drop(driver);
     drop(service);
 
     runtime.stop_node(&local).unwrap();
     drop(first_page_owner);
     runtime.reopen_node(local.clone()).unwrap();
     let mut reopened = runtime.client(&local).unwrap();
+    let mut driver = runtime
+        .metadata_primary_service(path)
+        .expect("reopened store-backed placement owner");
     let mut completed = None;
     for _ in 0..32 {
-        let Some(next) = reopened
+        let Some(next) = driver
             .run_placement_reconciliation_bounded(2)
             .expect("resume reconciliation")
         else {
@@ -1014,6 +1071,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
             break;
         }
     }
+    drop(driver);
     let recorded = control_plane
         .with_client(|kv| {
             DfsControlPlaneStore::new(kv.as_mut())
@@ -1034,7 +1092,10 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
     assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
     assert_eq!(completed.matched_object_count, 1);
     assert_eq!(
-        reopened.posix_stat(path).expect("reconciled stat").policy,
+        reopened
+            .posix_stat_distributed(path)
+            .expect("reconciled stat")
+            .policy,
         DfsObjectPolicy::ReplicatedConfirmed
     );
     control_plane.with_client(|kv| {

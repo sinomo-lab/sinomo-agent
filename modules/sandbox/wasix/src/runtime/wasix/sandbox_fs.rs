@@ -2269,9 +2269,9 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncWriteExt::write_all(&mut file, b"X"))
             .expect("write through descriptor opened before chmod");
 
-        let guard = sifs_fs.lock().unwrap();
-        assert_eq!(guard.read_unchecked(&path, None).unwrap(), b"oldX");
-        assert_eq!(guard.stat_unchecked(&path).unwrap().mode, 0);
+        let mut guard = sifs_fs.lock().unwrap();
+        assert_eq!(guard.read_unchecked_mut(&path, None).unwrap(), b"oldX");
+        assert_eq!(guard.stat_unchecked_mut(&path).unwrap().mode, 0);
         drop(guard);
 
         drop(sifs_fs);
@@ -2321,7 +2321,12 @@ mod tests {
             .expect("read through descriptor opened before chmod");
         assert_eq!(bytes, b"readable");
         assert_eq!(
-            sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap().mode,
+            sifs_fs
+                .lock()
+                .unwrap()
+                .stat_unchecked_mut(&path)
+                .unwrap()
+                .mode,
             0
         );
 
@@ -2909,11 +2914,11 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncWriteExt::write_all(&mut file, b"-renamed"))
             .expect("write descriptor after rename must keep workspace identity");
 
-        let guard = sifs_fs.lock().unwrap();
-        assert_eq!(guard.read(&new_path, None).unwrap(), b"old-renamed");
+        let mut guard = sifs_fs.lock().unwrap();
+        assert_eq!(guard.read_mut(&new_path, None).unwrap(), b"old-renamed");
         assert_eq!(
             guard
-                .read(&SandboxPath::new("/readonly-work/new.txt").unwrap(), None)
+                .read_mut(&SandboxPath::new("/readonly-work/new.txt").unwrap(), None)
                 .unwrap(),
             b"old-renamed"
         );
@@ -3766,7 +3771,7 @@ mod tests {
             sifs_fs
                 .lock()
                 .unwrap()
-                .stat(&SandboxPath::new("/work/missing.txt").unwrap()),
+                .stat_mut(&SandboxPath::new("/work/missing.txt").unwrap()),
             Err(SandboxFsError::NotFound { .. })
         ));
 
@@ -3812,10 +3817,10 @@ mod tests {
             .expect("open existing file with create");
         drop(file);
 
-        let metadata = sifs_fs.lock().unwrap().stat(&path).unwrap();
+        let metadata = sifs_fs.lock().unwrap().stat_mut(&path).unwrap();
         assert_eq!(metadata.modified_at_unix_nanos, 67_890);
         assert_eq!(
-            sifs_fs.lock().unwrap().read(&path, None).unwrap(),
+            sifs_fs.lock().unwrap().read_mut(&path, None).unwrap(),
             b"content"
         );
 
@@ -3944,7 +3949,7 @@ mod tests {
             sifs_fs
                 .lock()
                 .unwrap()
-                .read(&SandboxPath::new("/work/file.txt").unwrap(), None)
+                .read_mut(&SandboxPath::new("/work/file.txt").unwrap(), None)
                 .expect("read original after open truncate"),
             b"",
             "O_TRUNC through a hardlink must truncate the shared SIFS object immediately"
@@ -3963,7 +3968,7 @@ mod tests {
         let bytes = sifs_fs
             .lock()
             .unwrap()
-            .read(&SandboxPath::new("/work/file.txt").unwrap(), None)
+            .read_mut(&SandboxPath::new("/work/file.txt").unwrap(), None)
             .expect("read original");
         assert_eq!(bytes, b"updated");
 

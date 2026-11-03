@@ -236,7 +236,7 @@ fn admitted_contribution_retry_rejects_disjoint_owner_without_original_outcome()
     });
     let moved = cluster.run(2, |requester| {
         requester
-            .posix_stat("/services/admitted-contribution-b")
+            .posix_stat_distributed("/services/admitted-contribution-b")
             .unwrap()
     });
     assert_eq!(
@@ -312,7 +312,9 @@ fn distributed_contribution_original_head_rejects_disjoint_move_aba_without_outc
     });
     assert!(error.to_string().contains("authority changed"), "{error}");
     let b_head = cluster.run(2, |requester| {
-        requester.posix_stat("/services/contribution-b").unwrap()
+        requester
+            .posix_stat_distributed("/services/contribution-b")
+            .unwrap()
     });
     assert_ne!(b_head.version, head.version);
     let fresh = request(
@@ -336,7 +338,9 @@ fn distributed_contribution_original_head_rejects_disjoint_move_aba_without_outc
             .unwrap();
     });
     let a_head = cluster.run(2, |requester| {
-        requester.posix_stat("/users/contribution-a").unwrap()
+        requester
+            .posix_stat_distributed("/users/contribution-a")
+            .unwrap()
     });
     assert_eq!(a_head.path, head.path);
     assert_ne!(a_head.version, head.version);

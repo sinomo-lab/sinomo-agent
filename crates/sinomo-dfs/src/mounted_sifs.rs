@@ -621,7 +621,7 @@ mod tests {
         );
         assert!(
             service
-                .posix_stat("/services/actual-mounted-capture")
+                .posix_stat_distributed("/services/actual-mounted-capture")
                 .is_ok()
         );
         drop(service);
@@ -2605,9 +2605,12 @@ mod tests {
         )
         .expect("clustered mount from daemon authority");
         assert_eq!(opened.service.node_id(), &local_node);
+        // The mount delegates namespace work to its node's Main, which alone
+        // owns the node's metadata store; opening it authors no local store.
+        assert!(opened.service.metadata_backend().is_none());
         assert!(
-            metadata_root.exists(),
-            "successful open must author metadata"
+            !metadata_root.exists(),
+            "a delegating mount must not author a local metadata store"
         );
         assert!(peer.routes().iter().any(|route| {
             route == sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE

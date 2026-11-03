@@ -4099,6 +4099,21 @@ impl DfsTestRuntime {
     pub fn file_system(&self) -> DfsFileSystem {
         default_cluster_sifs(&self.state)
     }
+    /// A read-only view of `node`'s local metadata store under the current
+    /// shard configuration. Clients delegate to Main and keep no store, so
+    /// tests inspect a node's durable metadata here.
+    pub fn node_metadata(
+        &self,
+        node: &NodeId,
+    ) -> Result<crate::LocalShardedMetadataBackend, String> {
+        crate::local_state::open_local_sharded_metadata_backend_for_inspection_at_node(
+            crate::default_dfs_metadata_shards_root(self.data_dir(node)),
+            self.metadata_shards()?,
+            node,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn metadata_shards(&self) -> Result<Vec<DfsMetadataShardConfig>, String> {
         let paths = ClusterPaths::new(self.data_dir(&self.primary));
         let mut control = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
@@ -4129,6 +4144,35 @@ impl DfsTestRuntime {
             self.data_dir(&shard.primary_node_id),
             Some(executor().handle()),
             &shard,
+        )
+        .map_err(|error| error.to_string())
+    }
+    /// Run `operation` on `node`'s resident Main maintenance service, which
+    /// holds every shard copy on the node, under ordinary maintenance
+    /// admission. Use it for Main-side work that spans the node's shards.
+    pub fn with_main_maintenance_service<R>(
+        &self,
+        node: &NodeId,
+        operation: impl FnOnce(&mut NetworkedDfsService<DfsNodeTransport>) -> R,
+    ) -> Result<R, String> {
+        crate::runtime_host::with_daemon_dfs_main_maintenance_service(
+            self.data_dir(node),
+            executor().handle(),
+            operation,
+        )
+        .map_err(|error| error.to_string())
+    }
+    /// Open `node`'s own copy of `shard`, as Main does for selected local
+    /// recovery. The node holds the shard as its primary or a replica.
+    pub fn local_shard_copy_service(
+        &self,
+        node: &NodeId,
+        shard: &crate::DfsMetadataShardConfig,
+    ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+        crate::runtime_host::open_dfs_runtime_service_on_local_shard_copy(
+            self.data_dir(node),
+            Some(executor().handle()),
+            shard,
         )
         .map_err(|error| error.to_string())
     }
@@ -5793,6 +5837,7 @@ impl Drop for DfsTestRuntime {
 pub struct DfsTestControlPlaneProbe {
     calls: Arc<AtomicUsize>,
     point_reads: Arc<AtomicUsize>,
+    point_read_keys: Arc<Mutex<Vec<String>>>,
     prefix_reads: Arc<AtomicUsize>,
 }
 impl DfsTestControlPlaneProbe {
@@ -5802,6 +5847,20 @@ impl DfsTestControlPlaneProbe {
     /// Counts only this native client's synchronous point-read API calls.
     pub fn point_read_calls(&self) -> usize {
         self.point_reads.load(Ordering::SeqCst)
+    }
+    /// Keys requested by this native client's synchronous point reads.
+    pub fn point_read_keys(&self) -> Vec<String> {
+        self.point_read_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+    fn record_point_read<'a>(&self, keys: impl IntoIterator<Item = &'a str>) {
+        self.point_reads.fetch_add(1, Ordering::SeqCst);
+        self.point_read_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .extend(keys.into_iter().map(str::to_string));
     }
     /// Counts only this native client's synchronous prefix-read API calls.
     pub fn prefix_read_calls(&self) -> usize {
@@ -5845,21 +5904,21 @@ impl DfsControlPlaneKvClient for ProbedNormalControlPlane {
             .authorizes_prior_process_placement_authority_recovery(local_node_id, current_process)
     }
     fn get(&self, key: &str) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
-        self.probe.point_reads.fetch_add(1, Ordering::SeqCst);
+        self.probe.record_point_read([key]);
         self.inner.get(key)
     }
     fn get_consistent(
         &self,
         keys: &[String],
     ) -> Result<Vec<Option<sinomo_core::kv::KvEntry>>, sinomo_core::kv::KvError> {
-        self.probe.point_reads.fetch_add(1, Ordering::SeqCst);
+        self.probe.record_point_read(keys.iter().map(String::as_str));
         self.inner.get_consistent(keys)
     }
     fn get_authoritative_consistent(
         &mut self,
         keys: &[String],
     ) -> Result<Vec<Option<sinomo_core::kv::KvEntry>>, sinomo_core::kv::KvError> {
-        self.probe.point_reads.fetch_add(1, Ordering::SeqCst);
+        self.probe.record_point_read(keys.iter().map(String::as_str));
         self.inner.get_authoritative_consistent(keys)
     }
     fn get_authoritative_consistent_before(
@@ -5867,7 +5926,7 @@ impl DfsControlPlaneKvClient for ProbedNormalControlPlane {
         keys: &[String],
         deadline: std::time::Instant,
     ) -> Result<Vec<Option<sinomo_core::kv::KvEntry>>, sinomo_core::kv::KvError> {
-        self.probe.point_reads.fetch_add(1, Ordering::SeqCst);
+        self.probe.record_point_read(keys.iter().map(String::as_str));
         self.inner
             .get_authoritative_consistent_before(keys, deadline)
     }

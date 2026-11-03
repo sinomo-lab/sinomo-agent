@@ -37,7 +37,9 @@ fn lifecycle_maintenance_host_applies_bounded_tombstone_compaction_options() {
     )
     .unwrap();
     runtime.start_nodes().unwrap();
-    let mut dfs = runtime.client(&nodes[0]).unwrap();
+    // Tombstone compaction is Main-side store maintenance: run it on the
+    // store-backed opener, not a caller delegating to its Main.
+    let mut dfs = runtime.metadata_primary_service("/").unwrap();
     let mut host = RecordingMaintenanceHost::default();
     let reports = run_dfs_lifecycle_maintenance_with_host(
         &mut dfs,
@@ -79,14 +81,12 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
         .unwrap()
         .clone();
     let shard_id = DfsMetadataShardId::new(source.shard_id.clone());
-    let receiver = runtime.client(&target).unwrap();
-    let cut = receiver
-        .metadata_backend()
+    let cut = runtime
+        .node_metadata(&target)
         .unwrap()
         .export_shard_table_snapshot(&shard_id)
         .unwrap()
         .unwrap();
-    drop(receiver);
     let mut command = DfsMetadataJournalBatchCommand {
         request_id: "native-exact-prefix".into(),
         source_node_id: Some(source.primary_node_id.clone()),
@@ -140,9 +140,7 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
         DfsMetadataJournalBatchResult::Rejected { .. }
     ));
     let after = runtime
-        .client(&target)
-        .unwrap()
-        .metadata_backend()
+        .node_metadata(&target)
         .unwrap()
         .export_shard_table_snapshot(&shard_id)
         .unwrap()
@@ -391,12 +389,15 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
 
 #[test]
 fn recovery_hydration_can_cancel_between_synchronous_backend_phases() {
-    let (runtime, mut service, _) = crate::test_support::current_native_metadata_service(
+    let (runtime, client, _) = crate::test_support::current_native_metadata_service(
         "native-recovery-cancellation-between-phases",
         1,
         "/services",
     )
     .unwrap();
+    drop(client);
+    // Recovery hydration is Main-side store work on the store-backed opener.
+    let mut service = runtime.metadata_primary_service("/services").unwrap();
     let cancellation_checks = AtomicUsize::new(0);
     let before = service
         .metadata_backend()
@@ -456,8 +457,8 @@ fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
     // Receiver execution is real. An uncertain sender response cannot undo the
     // already committed metadata/content that normal reconciliation observes.
     let stat = owner_dfs.posix_stat_distributed(path).unwrap();
-    let receipts = owner_dfs
-        .metadata_backend()
+    let receipts = runtime
+        .node_metadata(&owner)
         .unwrap()
         .receipts_for_version(&stat.object_id, &stat.version)
         .unwrap();
@@ -496,7 +497,9 @@ fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
     runtime.clear_faults();
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let mut recovered = runtime.client(&owner).unwrap();
+    // Commit-promotion recovery is Main-side store work on the store-backed
+    // opener; a caller delegating to its Main has nothing to hydrate.
+    let mut recovered = runtime.metadata_primary_service(path).unwrap();
     let before = runtime.rpc_observations().len();
     recovered
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
@@ -748,11 +751,14 @@ fn sifs_recursive_clear_survives_metadata_backend_reopen() {
             DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
         )
         .expect("write");
-        assert_eq!(dfs.posix_read_file(file_path).expect("read"), b"tmp");
+        assert_eq!(
+            dfs.posix_read_file_distributed(file_path).expect("read"),
+            b"tmp"
+        );
         dfs.posix_clear_dir_recursive(clear_root)
             .expect("clear recursive");
         assert!(matches!(
-            dfs.posix_read_file(file_path),
+            dfs.posix_read_file_distributed(file_path),
             Err(DfsPosixError::NotFound { .. })
         ));
     }
@@ -760,9 +766,9 @@ fn sifs_recursive_clear_survives_metadata_backend_reopen() {
     runtime.stop_node(&node_id).unwrap();
     runtime.reopen_node(node_id.clone()).unwrap();
     {
-        let dfs = runtime.client(&node_id).unwrap();
+        let mut dfs = runtime.client(&node_id).unwrap();
         assert!(matches!(
-            dfs.posix_read_file(file_path),
+            dfs.posix_read_file_distributed(file_path),
             Err(DfsPosixError::NotFound { .. })
         ));
     }
@@ -780,7 +786,8 @@ fn sifs_recursive_clear_survives_metadata_backend_reopen() {
         )
         .expect("rewrite after clear");
         assert_eq!(
-            dfs.posix_read_file(file_path).expect("fresh read"),
+            dfs.posix_read_file_distributed(file_path)
+                .expect("fresh read"),
             b"fresh"
         );
     }
@@ -815,6 +822,10 @@ fn sifs_recursive_clear_bounded_job_resumes_after_reopen() {
             )
             .expect("write file");
         }
+        drop(dfs);
+        // Starting a bounded clear job is Main-side store work (callers use
+        // the routed unbounded clear); run it on the store-backed opener.
+        let mut dfs = runtime.metadata_primary_service(clear_root).unwrap();
 
         let job = dfs
             .posix_clear_dir_recursive_bounded(clear_root, 1)
@@ -851,12 +862,12 @@ fn sifs_recursive_clear_bounded_job_resumes_after_reopen() {
         assert!(job.processed_object_count >= files.len() as u64);
         for path in &files {
             assert!(matches!(
-                dfs.posix_read_file(path),
+                dfs.posix_read_file_distributed(path),
                 Err(DfsPosixError::NotFound { .. })
             ));
         }
         assert!(
-            dfs.posix_list_dir(clear_root)
+            dfs.posix_list_dir_distributed(clear_root)
                 .expect("cleared root list")
                 .is_empty()
         );
@@ -865,11 +876,10 @@ fn sifs_recursive_clear_bounded_job_resumes_after_reopen() {
     runtime.stop_node(&node_id).unwrap();
     runtime.reopen_node(node_id.clone()).unwrap();
     {
-        let dfs = runtime.client(&node_id).unwrap();
-        let job = dfs
-            .metadata_backend
-            .as_ref()
-            .expect("backend")
+        let mut dfs = runtime.client(&node_id).unwrap();
+        let job = runtime
+            .node_metadata(&node_id)
+            .expect("node metadata store")
             .get_namespace_job(&job_id)
             .expect("get completed job")
             .expect("job");
@@ -877,7 +887,7 @@ fn sifs_recursive_clear_bounded_job_resumes_after_reopen() {
         assert!(job.completed_at.is_some());
         for path in &files {
             assert!(matches!(
-                dfs.posix_read_file(path),
+                dfs.posix_read_file_distributed(path),
                 Err(DfsPosixError::NotFound { .. })
             ));
         }
@@ -1020,7 +1030,7 @@ fn sifs_posix_unlink_tombstone_survives_fresh_shared_metadata_recovery() {
 
     let mut remover = runtime.client(&node).unwrap();
     let live_changed_at = remover
-        .posix_lstat(path)
+        .posix_lstat_distributed(path)
         .expect("live file stat")
         .changed_at_unix_nanos;
     let removed = remover.posix_unlink(path).expect("unlink file");
@@ -1029,15 +1039,15 @@ fn sifs_posix_unlink_tombstone_survives_fresh_shared_metadata_recovery() {
         "unlink tombstone ctime must fence historical namespace transactions"
     );
 
-    let verifier = runtime.client(&node).unwrap();
+    let mut verifier = runtime.client(&node).unwrap();
     assert!(matches!(
-        verifier.posix_stat(path),
+        verifier.posix_stat_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
-        verifier
-            .metadata_backend()
-            .expect("verifier backend")
+        runtime
+            .node_metadata(&node)
+            .expect("node metadata store")
             .get_object_by_path(&sifs_file_system_id(), path)
             .expect("durable path lookup")
             .expect("durable tombstone")
@@ -1197,7 +1207,10 @@ fn sifs_cluster_posix_routed_write_survives_writer_restart() {
     runtime.stop_node(&nodes[1]).unwrap();
     runtime.reopen_node(nodes[1].clone()).unwrap();
     let mut recovered = runtime.client(&nodes[1]).unwrap();
-    assert_eq!(recovered.posix_stat(path).unwrap().version, stat.version);
+    assert_eq!(
+        recovered.posix_stat_distributed(path).unwrap().version,
+        stat.version
+    );
     assert_eq!(
         recovered.posix_read_file_distributed(path).unwrap(),
         b"durable routed bytes"

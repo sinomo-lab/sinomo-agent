@@ -49,7 +49,7 @@ impl NativeSourceFetch {
                 },
             )
             .unwrap();
-        assert_eq!(writer.posix_read_file(&path).unwrap(), bytes);
+        assert_eq!(writer.posix_read_file_distributed(&path).unwrap(), bytes);
         drop(writer);
         // Keep repair claims parked while the normal configuration owner
         // observes Apply. A resident-preflight hold here would also prevent

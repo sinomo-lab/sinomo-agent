@@ -65,7 +65,7 @@ impl NativeFenceFixture {
         // on the initial primary. This primitive must not supersede them.
         // Use an existing replica and prove eligibility on its actual store.
         let acceptor = shard.replica_node_ids[0].clone();
-        let service = runtime.client(&acceptor).unwrap();
+        let service = runtime.local_shard_copy_service(&acceptor, &shard).unwrap();
         assert!(service.native_publication_owner_for_observation().is_some());
         let mut peer = runtime.client(&shard.replica_node_ids[0]).unwrap();
         let control = peer
@@ -133,12 +133,23 @@ impl NativeFenceFixture {
             .unwrap()
     }
 
+    /// `node`'s durable metadata store under its actual data layout. Callers
+    /// delegate to their Main and keep no store of their own.
+    fn node_store(&self, node: &sinomo_core::node::NodeId) -> crate::LocalShardedMetadataBackend {
+        if !self.selected {
+            return self.runtime.node_metadata(node).unwrap();
+        }
+        crate::LocalShardedMetadataBackend::open_for_inspection_at_node_with_layout(
+            crate::default_dfs_metadata_shards_root(self.runtime.data_dir(node)),
+            self.runtime.metadata_shards().unwrap(),
+            node,
+            self.runtime.selected_original_data_layout(node).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn prefix(&self) -> DfsMetadataPrefixProof {
-        self.service
-            .as_ref()
-            .unwrap()
-            .metadata_backend()
-            .unwrap()
+        self.node_store(&self.acceptor)
             .metadata_prefix_proof(&self.shard_id())
             .unwrap()
             .unwrap()
@@ -168,7 +179,8 @@ impl NativeFenceFixture {
 
     fn current_records(&mut self) -> Vec<DfsPreparedOperationRecord> {
         let id = self.shard_id();
-        let backend = self.service().metadata_backend_mut().unwrap();
+        let mut store = self.node_store(&self.acceptor);
+        let backend: &mut dyn DfsMetadataBackend = &mut store;
         backend
             .begin_consistent_read_snapshot_on_shard(&id)
             .unwrap();
@@ -265,7 +277,11 @@ impl NativeFenceFixture {
         );
         drop(primary);
         drop(self.service.take());
-        self.service = Some(self.runtime.client(&self.acceptor).unwrap());
+        self.service = Some(
+            self.runtime
+                .local_shard_copy_service(&self.acceptor, &self.shard)
+                .unwrap(),
+        );
         self.current_records();
         record
     }
@@ -487,34 +503,32 @@ fn native_selected_local_recovery_fence_refuses_actual_replica_ingest_and_all_ac
                 );
             }
         }
-        let mut receiver = crate::runtime_host::open_dfs_runtime_service(
-            fixture.runtime.data_dir(&target),
-            Some(&fixture.runtime.runtime_handle()),
-        )
-        .unwrap();
+        let mut receiver = fixture
+            .runtime
+            .local_shard_copy_service(&target, &fixture.shard)
+            .unwrap();
         assert_eq!(receiver.node_id(), &target);
         assert!(
             receiver
                 .native_publication_owner_for_observation()
                 .is_some()
         );
+        let target_store = fixture.node_store(&target);
         assert!(
-            receiver
-                .metadata_backend()
-                .unwrap()
+            target_store
                 .metadata_shard_write_freeze(&shard_id)
                 .unwrap()
                 .is_none()
         );
-        let backend = receiver.metadata_backend().unwrap();
-        let prefix_floor = backend
+        let prefix_floor = target_store
             .metadata_prefix_ack_floor(&shard_id)
             .unwrap()
             .unwrap();
-        let authority_floor = backend
+        let authority_floor = target_store
             .metadata_authority_ack_floor(&shard_id)
             .unwrap()
             .unwrap();
+        drop(target_store);
         assert_eq!(prefix_floor.durable_prefix_proof, prefix);
         assert_eq!(authority_floor.durable_prefix_proof, prefix);
         let request = fixture.request();
@@ -603,20 +617,16 @@ fn native_selected_local_recovery_fence_recertifies_without_serving_or_writer_au
             .map(|record| record.digest)
             .collect::<Vec<_>>();
         let prefix = fixture.prefix();
-        let prefix_floor = fixture
-            .service()
-            .metadata_backend()
-            .unwrap()
+        let acceptor_store = fixture.node_store(&fixture.acceptor);
+        let prefix_floor = acceptor_store
             .metadata_prefix_ack_floor(&shard_id)
             .unwrap()
             .unwrap();
-        let authority_floor = fixture
-            .service()
-            .metadata_backend()
-            .unwrap()
+        let authority_floor = acceptor_store
             .metadata_authority_ack_floor(&shard_id)
             .unwrap()
             .unwrap();
+        drop(acceptor_store);
         let primary_marker = crate::local_dfs_metadata_shard_path(
             fixture.runtime.data_dir(&fixture.shard.primary_node_id),
             &shard_id,
@@ -768,9 +778,7 @@ fn native_selected_local_recovery_fence_refuses_expired_malformed_and_spent_requ
         );
         assert!(
             fixture
-                .service()
-                .metadata_backend()
-                .unwrap()
+                .node_store(&fixture.acceptor)
                 .selected_local_recovery_fence(&shard_id)
                 .unwrap()
                 .is_none()

@@ -1052,6 +1052,30 @@ mod tests {
 
     use sinomo_core::DfsObjectPolicy;
 
+    /// The node whose durable store owns `path`'s metadata shard. Clients
+    /// delegate to their Main and keep no store, so the operator inspector
+    /// reads this node's durable metadata.
+    fn owning_node(runtime: &crate::test_support::DfsTestRuntime, path: &str) -> NodeId {
+        let shards = runtime.metadata_shards().unwrap();
+        crate::select_metadata_shard_config_for_path(
+            &runtime.file_system().file_system_id,
+            &shards,
+            path,
+        )
+        .unwrap()
+        .expect("normal runtime assigns every path to a metadata shard")
+        .primary_node_id
+    }
+
+    /// Filesystem publication is Main-side work on a store-backed owner.
+    fn publish_file_system(
+        runtime: &crate::test_support::DfsTestRuntime,
+        file_system: DfsFileSystem,
+    ) {
+        let mut owner = runtime.metadata_primary_service("/").unwrap();
+        owner.add_file_system(file_system).unwrap();
+    }
+
     fn empty_operator_status() -> DfsOperatorStatus {
         DfsOperatorStatus {
             incomplete_reasons: Vec::new(),
@@ -1168,7 +1192,8 @@ mod tests {
             .policy
             .replication_policy(Default::default())
             .unwrap();
-        let baseline = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+        let owner = owning_node(&runtime, path);
+        let baseline = DfsOperatorInspector::new(&runtime.node_metadata(&owner).unwrap())
             .status()
             .unwrap();
         runtime.install_fault(DfsTestFaultRule {
@@ -1192,8 +1217,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let backend = writer.metadata_backend().unwrap();
-        let inspector = DfsOperatorInspector::new(backend);
+        let backend = runtime.node_metadata(&owner).unwrap();
+        let inspector = DfsOperatorInspector::new(&backend);
         let status = inspector.status().unwrap();
         assert_eq!(status.file_system_count, baseline.file_system_count);
         assert_eq!(status.object_count, baseline.object_count + 1);
@@ -1264,7 +1289,6 @@ mod tests {
         )
         .unwrap();
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
         let path = "/users/terminal-current.bin".to_string();
         let mut file_system = runtime.file_system();
         file_system
@@ -1275,7 +1299,8 @@ mod tests {
                 1,
                 1,
             ));
-        writer.add_file_system(file_system).unwrap();
+        publish_file_system(&runtime, file_system);
+        let mut writer = runtime.client(&nodes[0]).unwrap();
         let bytes = b"current grant survives terminal collection";
         let stat = writer
             .posix_write_file_with_operation_id(
@@ -1290,8 +1315,9 @@ mod tests {
                 "operator-terminal-current",
             )
             .unwrap();
-        let before = writer
-            .metadata_backend()
+        let owner = owning_node(&runtime, &path);
+        let before = runtime
+            .node_metadata(&owner)
             .unwrap()
             .get_version(&stat.object_id, &stat.version)
             .unwrap()
@@ -1300,7 +1326,10 @@ mod tests {
             .content_durability
             .clone()
             .expect("normal publication carries actual W/N grant");
-        let collection = writer
+        // History collection runs on the store-backed owner of the path.
+        let collection = runtime
+            .metadata_primary_service(&path)
+            .unwrap()
             .gc_metadata_history(
                 crate::DfsMetadataHistoryGcOptions::delete_eligible(std::time::Duration::ZERO, 1)
                     .with_now_unix_nanos(u64::MAX),
@@ -1310,9 +1339,8 @@ mod tests {
             collection.compacted_intent_count > 0,
             "the regression must actually compact a real terminal intent"
         );
-        let after = writer
-            .metadata_backend()
-            .unwrap()
+        let store = runtime.node_metadata(&owner).unwrap();
+        let after = store
             .get_version(&stat.object_id, &stat.version)
             .unwrap()
             .unwrap();
@@ -1321,7 +1349,7 @@ mod tests {
             Some(grant),
             "terminal cleanup cannot reconstruct or weaken the durable plan"
         );
-        let view = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+        let view = DfsOperatorInspector::new(&store)
             .object(&stat.object_id)
             .unwrap()
             .unwrap();
@@ -1359,27 +1387,19 @@ mod tests {
         changed.push(stale);
         for stale in changed {
             assert!(
-                crate::content_durability::current_content_durability_from_backend(
-                    writer.metadata_backend().unwrap(),
-                    &stale,
-                )
-                .is_err(),
+                crate::content_durability::current_content_durability_from_backend(&store, &stale,)
+                    .is_err(),
                 "an observation cannot reuse durability for changed current object semantics"
             );
         }
         assert_eq!(
-            writer
-                .metadata_backend()
-                .unwrap()
-                .get_object(&stat.object_id)
-                .unwrap()
-                .unwrap(),
+            store.get_object(&stat.object_id).unwrap().unwrap(),
             current,
             "durability observation never rewrites the current object"
         );
         assert!(view.repairs.is_empty());
         assert_eq!(view.agent_state, DfsAgentObjectState::Current);
-        assert_eq!(writer.posix_read_file(&path).unwrap(), bytes);
+        assert_eq!(writer.posix_read_file_distributed(&path).unwrap(), bytes);
         drop(writer);
         runtime.close().unwrap();
     }
@@ -1491,34 +1511,43 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
         let path = "/operator-superseded.bin";
         let mut file_system = runtime.file_system();
         let mut policy =
             crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 1, 2);
         policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         file_system.subtree_policies.push(policy);
-        writer.add_file_system(file_system).unwrap();
+        publish_file_system(&runtime, file_system);
+        let mut writer = runtime.client(&nodes[0]).unwrap();
+        let owner = owning_node(&runtime, path);
         let options = crate::DfsWriteOptions {
             policy: DfsReplicationPolicy::new(1, 2).unwrap(),
             replica_candidates: nodes.clone(),
             wait_for_commit: true,
             foreground_replica_repair: false,
         };
-        runtime.install_fault(DfsTestFaultRule {
-            source: None,
-            target: Some(nodes[2].clone()),
-            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
-            call_id: None,
-            origin: None,
-            remaining_hits: 32,
-            action: DfsTestFaultAction::BudgetExhausted,
-        });
+        // Main maintenance can repair after the W1 write returns, even when
+        // foreground repair is disabled. Keep the old version's replica
+        // missing until it has been inspected, as the paging test does.
+        for route in [
+            crate::DFS_DATA_STAGE_BLOB_ROUTE,
+            crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+        ] {
+            runtime.install_fault(DfsTestFaultRule {
+                source: None,
+                target: Some(nodes[2].clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: DfsTestFaultAction::BudgetExhausted,
+            });
+        }
         let old = writer
             .posix_write_file(path, b"old incomplete placement", options.clone())
             .unwrap();
         assert!(
-            !DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+            !DfsOperatorInspector::new(&runtime.node_metadata(&owner).unwrap())
                 .object(&old.object_id)
                 .unwrap()
                 .unwrap()
@@ -1541,7 +1570,7 @@ mod tests {
             .posix_sync_file(path, crate::DfsPosixSyncKind::File)
             .unwrap();
         assert_ne!(old.version, current.version);
-        let view = DfsOperatorInspector::new(writer.metadata_backend().unwrap())
+        let view = DfsOperatorInspector::new(&runtime.node_metadata(&owner).unwrap())
             .object(&current.object_id)
             .unwrap()
             .unwrap();
@@ -1551,7 +1580,7 @@ mod tests {
         );
         assert_eq!(view.agent_state, DfsAgentObjectState::Current);
         assert_eq!(
-            writer.posix_read_file(path).unwrap(),
+            writer.posix_read_file_distributed(path).unwrap(),
             b"current fully placed"
         );
         drop(writer);
@@ -1568,14 +1597,14 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
         let path = "/operator-paging-target.bin";
         let mut file_system = runtime.file_system();
         let mut policy =
             crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 1, 4);
         policy.required_node_ids = nodes.clone();
         file_system.subtree_policies.push(policy);
-        writer.add_file_system(file_system).unwrap();
+        publish_file_system(&runtime, file_system);
+        let owner = owning_node(&runtime, path);
         for node in &nodes[1..] {
             // Main maintenance can repair after the W1 write returns, even
             // when foreground repair is disabled. Keep all three replicas
@@ -1595,14 +1624,14 @@ mod tests {
                 });
             }
         }
-        let baseline = writer
-            .metadata_backend()
+        let baseline = runtime
+            .node_metadata(&owner)
             .unwrap()
             .metadata_summary()
             .unwrap()
             .object_count;
-        let template = writer
-            .metadata_backend()
+        let template = runtime
+            .node_metadata(&owner)
             .unwrap()
             .get_object_by_path(&runtime.file_system().file_system_id, "/")
             .unwrap()
@@ -1640,8 +1669,7 @@ mod tests {
         )
         .unwrap();
         // The custom corpus is authored by the actual Root Core, rather than
-        // by the browser used for ordinary writes and later inspection.
-        drop(writer);
+        // by the browser used for ordinary writes.
         let mut writer = runtime.metadata_primary_service(path).unwrap();
         crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
         // The kernel helper has committed the 1,024-row setup corpus, while
@@ -1685,9 +1713,8 @@ mod tests {
             )
             .unwrap();
         drop(writer);
-        let reader = runtime.client(&nodes[0]).unwrap();
-        let backend = reader.metadata_backend().unwrap();
-        let inspector = DfsOperatorInspector::new(backend);
+        let backend = runtime.node_metadata(&owner).unwrap();
+        let inspector = DfsOperatorInspector::new(&backend);
         let all = inspector
             .repairs(Some(&stat.file_system_id), Some(&stat.object_id))
             .unwrap();
@@ -1736,7 +1763,7 @@ mod tests {
                 .state,
             DfsAgentObjectState::PendingRepair
         );
-        drop(reader);
+        drop(backend);
         runtime.close().unwrap();
     }
 
@@ -1750,24 +1777,32 @@ mod tests {
             runtime.define_node(node.clone()).unwrap();
         }
         runtime.start_nodes().unwrap();
-        let mut writer = runtime.client(&nodes[0]).unwrap();
         let path = "/operator-paging-target.bin";
         let mut file_system = runtime.file_system();
         let mut policy =
             crate::DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedEventual, 1, 4);
         policy.required_node_ids = nodes.clone();
         file_system.subtree_policies.push(policy);
-        writer.add_file_system(file_system).unwrap();
+        publish_file_system(&runtime, file_system);
+        let mut writer = runtime.client(&nodes[0]).unwrap();
         for node in &nodes[1..] {
-            runtime.install_fault(DfsTestFaultRule {
-                source: None,
-                target: Some(node.clone()),
-                route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
-                call_id: None,
-                origin: None,
-                remaining_hits: 32,
-                action: DfsTestFaultAction::BudgetExhausted,
-            });
+            // Main maintenance can repair after the W1 write returns, even
+            // when foreground repair is disabled. Keep all three replicas
+            // missing throughout the paging reads below.
+            for route in [
+                crate::DFS_DATA_STAGE_BLOB_ROUTE,
+                crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+            ] {
+                runtime.install_fault(DfsTestFaultRule {
+                    source: None,
+                    target: Some(node.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action: DfsTestFaultAction::BudgetExhausted,
+                });
+            }
         }
         let stat = writer
             .posix_write_file(
@@ -1781,8 +1816,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let backend = writer.metadata_backend().unwrap();
-        let inspector = DfsOperatorInspector::new(backend);
+        let backend = runtime.node_metadata(&owning_node(&runtime, path)).unwrap();
+        let inspector = DfsOperatorInspector::new(&backend);
         let all = inspector
             .repairs(Some(&stat.file_system_id), Some(&stat.object_id))
             .unwrap();

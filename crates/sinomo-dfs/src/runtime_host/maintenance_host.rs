@@ -375,6 +375,47 @@ pub(super) fn refresh_daemon_dfs_repair_queue_nonempty(
     Ok(nonempty)
 }
 
+/// Record that committed work asks for the routine repair pass. A
+/// reconciliation tick consuming the same wake leaves the request pending.
+pub(crate) fn request_daemon_dfs_repair_maintenance(data_dir: &SinomoDataDir) {
+    DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.root());
+}
+
+/// Keep a request taken by a routine pass that did not complete.
+pub(super) fn restore_daemon_dfs_repair_maintenance_request(paths: &DaemonPaths) {
+    let Some(data_root) = paths.root.parent() else {
+        return;
+    };
+    DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_root.to_path_buf());
+}
+
+/// Whether committed work still waits for a routine repair pass. `take`
+/// clears the request as that pass begins.
+pub(super) fn daemon_dfs_repair_maintenance_requested(paths: &DaemonPaths, take: bool) -> bool {
+    let Some(data_root) = paths.root.parent() else {
+        return false;
+    };
+    let Some(requests) = DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS.get() else {
+        return false;
+    };
+    let mut requests = requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if take {
+        requests.remove(data_root)
+    } else {
+        requests.contains(data_root)
+    }
+}
+
 /// Return the process-local queue state sampled at startup, a committed repair
 /// edge, or the end of the previous bounded maintenance pass.
 ///

@@ -103,7 +103,9 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
         "/services/batched/one/two",
     ] {
         assert_eq!(
-            dfs.posix_stat(path).expect("created directory").kind,
+            dfs.posix_stat_distributed(path)
+                .expect("created directory")
+                .kind,
             DfsObjectKind::Directory
         );
     }
@@ -243,12 +245,14 @@ fn reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest() {
         crate::intent::stable_write_target_version(&node_id, &created.object_id, &operation_id,),
         "stable create must publish its deterministic target version",
     );
-    let reopened = restarted.posix_stat(path).expect("reopen created file");
+    let reopened = restarted
+        .posix_stat_distributed(path)
+        .expect("reopen created file");
     assert_eq!(reopened.object_id, created.object_id);
     assert_eq!(reopened.version, created.version);
-    let durable_object = restarted
-        .metadata_backend()
-        .expect("backend")
+    let durable_object = runtime
+        .node_metadata(&node_id)
+        .expect("node store")
         .get_object(&created.object_id)
         .expect("get durable object")
         .expect("durable object");
@@ -282,7 +286,9 @@ fn reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest() {
     assert_eq!(replayed.object_id, created.object_id);
     assert_eq!(replayed.version, created.version);
     assert_eq!(
-        restarted.posix_read_file(path).expect("replayed bytes"),
+        restarted
+            .posix_read_file_distributed(path)
+            .expect("replayed bytes"),
         b"captured once"
     );
 
@@ -297,7 +303,7 @@ fn reader_backed_stable_create_replays_after_reopen_and_rejects_a_new_digest() {
     ));
     assert_eq!(
         restarted
-            .posix_read_file(path)
+            .posix_read_file_distributed(path)
             .expect("original bytes remain"),
         b"captured once"
     );
@@ -375,7 +381,7 @@ fn reader_backed_stable_cas_replays_but_rejects_a_recreated_path() {
     ));
     assert_eq!(
         restarted
-            .posix_read_file(path)
+            .posix_read_file_distributed(path)
             .expect("replacement remains"),
         b"replacement identity"
     );
@@ -402,7 +408,11 @@ fn sifs_posix_recreate_directory_uses_a_new_namespace_transaction_generation() {
 
     assert_eq!(recreated.object_id, original.object_id);
     assert_ne!(recreated.version, original.version);
-    assert_eq!(dfs.posix_stat(dir_path).expect("recreated stat"), recreated);
+    assert_eq!(
+        dfs.posix_stat_distributed(dir_path)
+            .expect("recreated stat"),
+        recreated
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

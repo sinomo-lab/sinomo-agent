@@ -333,13 +333,16 @@ fn default_sifs_metadata_materialization_writes_node_directories_and_visible_ver
     runtime
         .start_nodes()
         .expect("normal guarded materialization");
-    let mut service = runtime.client(&nodes[0]).unwrap();
+    // Materialization is a property of the node's durable store; the client
+    // delegating to its Main keeps none.
+    let backend = runtime.node_metadata(&nodes[0]).unwrap();
     for node in &nodes {
         let path = sifs_node_files_path(node);
-        let object = service
-            .posix_stat(&path)
+        let object = backend
+            .get_object_by_path(&sifs_file_system_id(), &path)
+            .unwrap()
             .expect("normal node files directory");
-        let backend = service.metadata_backend().unwrap();
+        assert_eq!(object.kind, DfsObjectKind::Directory);
         let version = backend
             .get_version(&object.object_id, &object.version)
             .unwrap()
@@ -347,7 +350,7 @@ fn default_sifs_metadata_materialization_writes_node_directories_and_visible_ver
         assert!(version.visible);
         assert_eq!(version.locations, object.current_locations);
     }
-    drop(service);
+    drop(backend);
     runtime.close().expect("normal owner stopped");
 }
 
@@ -2952,8 +2955,7 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
             runtime.data_dir(&replica), &request.file_system_id, &shard, &runtime.runtime_handle(),
         ).unwrap().expect("actual pre-publication replica");
         assert!(observed.durable_sequence.unwrap() < published_sequence, "the controlled original commit has not been sent yet: {observed:?}");
-        let target = runtime.client(&replica).unwrap();
-        let old = target.metadata_backend().unwrap().get_object(&request.object_id).unwrap().unwrap();
+        let old = runtime.node_metadata(&replica).unwrap().get_object(&request.object_id).unwrap().unwrap();
         assert_ne!(old.version, version, "the primary committed while this actual replica still has the earlier cut");
         delayed_view = Some(serde_json::json!({"object": old, "before_original_publication": format!("{observed:?}")}));
     }
@@ -3062,8 +3064,8 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     )
     .unwrap();
     let target = runtime.client(&replica).unwrap();
-    let before = target
-        .metadata_backend()
+    let before = runtime
+        .node_metadata(&replica)
         .unwrap()
         .get_object(&request.object_id)
         .unwrap()
@@ -3133,8 +3135,8 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     );
     drop(replies);
     let target = runtime.client(&replica).unwrap();
-    let after = target
-        .metadata_backend()
+    let after = runtime
+        .node_metadata(&replica)
         .unwrap()
         .get_object(&request.object_id)
         .unwrap()
@@ -3229,13 +3231,14 @@ fn sifs_self_only_eventual_write_uses_local_fast_path() {
 
     assert_eq!(stat.size_bytes, Some(19));
     assert_eq!(
-        dfs.posix_read_file(file_path).expect("read"),
+        dfs.posix_read_file_distributed(file_path).expect("read"),
         b"print('fast path')\n"
     );
-    let backend = dfs
-        .metadata_backend()
+    // The client delegates to its Main; inspect the node's durable store.
+    let backend = runtime
+        .node_metadata(dfs.node_id())
         .expect("actual current physical backend");
-    let status = DfsOperatorInspector::new(backend)
+    let status = DfsOperatorInspector::new(&backend)
         .status()
         .expect("actual Main durable status after self-only commit");
     assert!(status.incomplete_reasons.is_empty());
@@ -3264,6 +3267,7 @@ fn sifs_self_only_eventual_write_uses_local_fast_path() {
         "self-only write should not emit per-file distributed intent/receipt/commit journals"
     );
 
+    drop(backend);
     drop(dfs);
     runtime
         .close()
@@ -3404,10 +3408,11 @@ fn sifs_posix_exclusive_create_never_overwrites_an_existing_file() {
         Err(DfsPosixError::AlreadyExists { .. })
     ));
     assert_eq!(
-        dfs.posix_read_file(path).expect("existing bytes"),
+        dfs.posix_read_file_distributed(path)
+            .expect("existing bytes"),
         b"keep me"
     );
-    let existing = dfs.posix_stat(path).expect("existing attrs");
+    let existing = dfs.posix_stat_distributed(path).expect("existing attrs");
     assert_eq!(
         (existing.mode, existing.uid, existing.gid),
         (0o640, 1001, 1002)
@@ -3459,8 +3464,8 @@ fn sifs_posix_write_updates_mtime_without_changing_atime() {
 
     assert_eq!(stat.accessed_at_unix_nanos, 12_345);
     assert!(stat.modified_at_unix_nanos > 67_890);
-    let original_stat = dfs.posix_stat(original).expect("original stat");
-    let link_stat = dfs.posix_stat(link).expect("link stat");
+    let original_stat = dfs.posix_stat_distributed(original).expect("original stat");
+    let link_stat = dfs.posix_stat_distributed(link).expect("link stat");
     assert_eq!(original_stat.accessed_at_unix_nanos, 12_345);
     assert_eq!(link_stat.accessed_at_unix_nanos, 12_345);
     assert_eq!(
@@ -3503,8 +3508,14 @@ fn sifs_posix_bulk_local_eventual_writes_visible_files() {
     assert_eq!(stats[1].path, path_b);
     assert_eq!(stats[1].current_locations, vec![node_id]);
     assert_eq!(stats[1].size_bytes, Some("bulk beta".len() as u64));
-    assert_eq!(dfs.posix_read_file(path_a).expect("read a"), b"bulk alpha");
-    assert_eq!(dfs.posix_read_file(path_b).expect("read b"), b"bulk beta");
+    assert_eq!(
+        dfs.posix_read_file_distributed(path_a).expect("read a"),
+        b"bulk alpha"
+    );
+    assert_eq!(
+        dfs.posix_read_file_distributed(path_b).expect("read b"),
+        b"bulk beta"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -3535,6 +3546,12 @@ fn sifs_posix_bulk_overwrite_pins_metadata_generation_during_preparation() {
             .map(|(path, initial, _)| (path.as_str(), initial.as_slice())),
     )
     .expect("initial bulk create");
+    drop(dfs);
+    // The probe counters are thread-local and the pinned metadata generation
+    // belongs to the service preparing the bulk write. A caller delegating to
+    // its Main prepares nothing locally, so the store-backed opener runs the
+    // bulk preparation and its later local stat on this thread.
+    let mut dfs = _runtime.metadata_primary_service(work).unwrap();
     let versions_before = owned_files
         .iter()
         .map(|(path, _, _)| dfs.posix_stat(path).expect("stat initial").version)
@@ -3628,7 +3645,9 @@ fn sifs_distributed_write_rejects_stale_backend_base_version() {
             DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
         )
         .expect("fresh offset write");
-    let fresh_stat = writer.posix_stat(file_path).expect("fresh stat");
+    let fresh_stat = writer
+        .posix_stat_distributed(file_path)
+        .expect("fresh stat");
     let journal_count_before_conflict = stale_writer
         .metadata_backend()
         .expect("writer metadata backend")
@@ -3667,17 +3686,19 @@ fn sifs_distributed_write_rejects_stale_backend_base_version() {
         "stale writer rejection must not append conflict metadata or overwrite fresh writer entries"
     );
 
-    let reloaded = runtime.client(&node_id).unwrap();
+    let mut reloaded = runtime.client(&node_id).unwrap();
     assert_eq!(
         reloaded
-            .posix_stat(file_path)
+            .posix_stat_distributed(file_path)
             .expect("stat after stale rejection")
             .content_hash,
         fresh_stat.content_hash,
         "stale rejection must not replace the committed content hash"
     );
     assert_eq!(
-        reloaded.posix_read_file(file_path).expect("read winner"),
+        reloaded
+            .posix_read_file_distributed(file_path)
+            .expect("read winner"),
         b"XYcdef"
     );
 }
@@ -3699,7 +3720,7 @@ fn sifs_distributed_write_validates_replica_plan_before_storing_content() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("initial write");
-    let stat = dfs.posix_stat(file_path).expect("stat");
+    let stat = dfs.posix_stat_distributed(file_path).expect("stat");
     let rejected_bytes = b"replica plan is invalid";
     let rejected_hash = content_hash(rejected_bytes);
     let target_version = crate::namespace::next_version(&stat.version);
@@ -3788,13 +3809,16 @@ fn sifs_cluster_posix_contract_concurrent_whole_file_overwrite_many_readers() {
         &mut cluster,
         "overwrite observer seed catch-up",
         |cluster| {
-            cluster
-                .observer
-                .posix_stat(path)
-                .is_ok_and(|stat| stat.content_hash.as_deref() == Some(valid_hashes[0].as_str()))
+            super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.observer_node, path)
+                .is_some_and(|object| {
+                    object.content_hash.as_deref() == Some(valid_hashes[0].as_str())
+                })
         },
     );
-    let base_stat = cluster.writer.posix_stat(path).expect("base stat");
+    let base_stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("base stat");
     record_posix_observation(
         &mut observations,
         scenario,
@@ -3859,17 +3883,17 @@ fn sifs_cluster_posix_contract_concurrent_whole_file_overwrite_many_readers() {
             (
                 "reader-writer",
                 cluster.writer_node.clone(),
-                cluster.writer.posix_stat(path),
+                cluster.writer.posix_stat_distributed(path),
             ),
             (
                 "reader-observer",
                 cluster.observer_node.clone(),
-                cluster.observer.posix_stat(path),
+                cluster.observer.posix_stat_distributed(path),
             ),
             (
                 "reader-primary",
                 cluster.primary_node.clone(),
-                cluster.primary.posix_stat(path),
+                cluster.primary.posix_stat_distributed(path),
             ),
         ] {
             if let Ok(stat) = read {
@@ -3916,7 +3940,7 @@ fn sifs_cluster_posix_contract_concurrent_whole_file_overwrite_many_readers() {
 
     let final_stat = cluster
         .primary
-        .posix_stat(path)
+        .posix_stat_distributed(path)
         .expect("primary final stat");
     assert!(
         final_stat
@@ -3925,7 +3949,10 @@ fn sifs_cluster_posix_contract_concurrent_whole_file_overwrite_many_readers() {
             .is_some_and(|hash| valid_hashes.contains(hash)),
         "final visible version must be one complete serialized overwrite: {final_stat:?}"
     );
-    let final_bytes = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    let final_bytes = cluster
+        .primary
+        .posix_read_file_distributed(path)
+        .expect("primary final read");
     assert!(
         [&base, &writer_bytes, &observer_bytes]
             .iter()
@@ -4194,16 +4221,16 @@ fn sifs_cluster_posix_contract_rename_over_existing_with_concurrent_write() {
                 cluster.writer.write_outcome(intent),
                 Ok(NetworkedDfsWriteOutcome::Pending { .. })
             )
-        }) && cluster.primary.posix_stat(destination).is_ok()
+        }) && cluster.primary.posix_stat_distributed(destination).is_ok()
     });
 
     assert!(matches!(
-        cluster.primary.posix_stat(source),
+        cluster.primary.posix_stat_distributed(source),
         Err(DfsPosixError::NotFound { .. })
     ));
     let final_stat = cluster
         .primary
-        .posix_stat(destination)
+        .posix_stat_distributed(destination)
         .expect("destination stat");
     assert!(
         final_stat
@@ -4214,7 +4241,7 @@ fn sifs_cluster_posix_contract_rename_over_existing_with_concurrent_write() {
     );
     let source_entries = cluster
         .primary
-        .posix_list_dir("/users")
+        .posix_list_dir_distributed("/users")
         .expect("list users");
     assert_eq!(
         source_entries
@@ -4263,7 +4290,10 @@ fn sharded_lazy_reader_sees_sibling_visible_overwrite() {
         .unwrap();
     assert_ne!(current.version, first.version);
     assert_eq!(reader.posix_read_file_distributed(path).unwrap(), new);
-    assert_eq!(reader.posix_stat(path).unwrap().version, current.version);
+    assert_eq!(
+        reader.posix_stat_distributed(path).unwrap().version,
+        current.version
+    );
     drop(reader);
     drop(writer);
     runtime.close().unwrap();
@@ -4344,7 +4374,8 @@ fn sifs_cluster_metadata_less_bulk_overwrite_prefetches_authoritative_children()
         .posix_mkdir_all(remote_dir)
         .expect("remote bulk parent");
     sifs_two_primary_publish_until(&mut cluster, "metadata-less overwrite parent", |cluster| {
-        cluster.replica.posix_stat(remote_dir).is_ok()
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.replica_node, remote_dir)
+            .is_some()
     });
 
     let SifsTwoPrimaryCluster {
@@ -4383,7 +4414,7 @@ fn sifs_cluster_metadata_less_bulk_overwrite_prefetches_authoritative_children()
         .map(|stat| (stat.object_id.clone(), stat.version.clone()))
         .collect::<BTreeMap<_, _>>();
     let parent_object_id = replica
-        .posix_stat(remote_dir)
+        .posix_stat_distributed(remote_dir)
         .expect("metadata-less overwrite parent before eviction")
         .object_id;
 
@@ -4446,11 +4477,11 @@ fn sifs_cluster_metadata_less_bulk_overwrite_prefetches_authoritative_children()
     }
 
     stop.store(true, Ordering::SeqCst);
-    let services_primary = services_thread.join().expect("services primary thread");
+    let mut services_primary = services_thread.join().expect("services primary thread");
     for (path, _, replacement) in &files {
         assert_eq!(
             services_primary
-                .posix_stat(path)
+                .posix_stat_distributed(path)
                 .expect("stat authoritative overwrite")
                 .content_hash
                 .as_deref(),
@@ -4473,7 +4504,8 @@ fn sifs_cluster_metadata_less_bulk_overwrite_follows_authoritative_symlink() {
         .posix_mkdir_all(remote_dir)
         .expect("remote symlink parent");
     sifs_two_primary_publish_until(&mut cluster, "metadata-less symlink parent", |cluster| {
-        cluster.replica.posix_stat(remote_dir).is_ok()
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.replica_node, remote_dir)
+            .is_some()
     });
 
     let SifsTwoPrimaryCluster {
@@ -4498,13 +4530,15 @@ fn sifs_cluster_metadata_less_bulk_overwrite_follows_authoritative_symlink() {
     replica
         .posix_symlink("target.txt", link, options)
         .expect("create symlink");
-    let target_before = replica.posix_stat(target).expect("stat symlink target");
+    let target_before = replica
+        .posix_stat_distributed(target)
+        .expect("stat symlink target");
     let link_before = replica
         .posix_lstat_distributed(link)
         .expect("lstat symlink before metadata eviction");
     assert_eq!(link_before.kind, DfsObjectKind::Symlink);
     let parent_id = replica
-        .posix_stat(remote_dir)
+        .posix_stat_distributed(remote_dir)
         .expect("stat symlink parent")
         .object_id;
 
@@ -4536,10 +4570,10 @@ fn sifs_cluster_metadata_less_bulk_overwrite_follows_authoritative_symlink() {
     assert_eq!(link_after.object_id, link_before.object_id);
 
     stop.store(true, Ordering::SeqCst);
-    let services_primary = services_thread.join().expect("services primary thread");
+    let mut services_primary = services_thread.join().expect("services primary thread");
     assert_eq!(
         services_primary
-            .posix_stat(target)
+            .posix_stat_distributed(target)
             .expect("authoritative symlink target stat")
             .content_hash
             .as_deref(),
@@ -4777,10 +4811,8 @@ impl NativeMainAbortFixture {
             canonical.compact_retained_at.is_none(),
             "actual Pending is not a terminal outcome"
         );
-        let observed = runtime.client(&main).unwrap();
+        let observed = runtime.node_metadata(&main).unwrap();
         let record = observed
-            .metadata_backend()
-            .unwrap()
             .get_intent(&request.object_id, &intent_id)
             .unwrap()
             .unwrap();
@@ -4795,8 +4827,6 @@ impl NativeMainAbortFixture {
             (2, 2)
         );
         let receipts = observed
-            .metadata_backend()
-            .unwrap()
             .receipts_for_version(&request.object_id, &request.target_version)
             .unwrap();
         let holders = receipts
@@ -4828,18 +4858,16 @@ impl NativeMainAbortFixture {
         }
     }
     fn record(&self) -> DfsWriteIntentRecord {
-        let owner = self.runtime.client(&self.main).unwrap();
-        owner
-            .metadata_backend()
+        self.runtime
+            .node_metadata(&self.main)
             .unwrap()
             .get_intent(&self.request.object_id, &self.intent_id)
             .unwrap()
             .unwrap()
     }
     fn prefix(&self) -> DfsMetadataPrefixProof {
-        let owner = self.runtime.client(&self.main).unwrap();
-        owner
-            .metadata_backend()
+        self.runtime
+            .node_metadata(&self.main)
             .unwrap()
             .metadata_prefix_proof(&self.shard)
             .unwrap()
@@ -5288,11 +5316,9 @@ fn normal_main_foreign_target_collision_preserves_the_actual_unprepared_claim() 
     let mut case = NativeMainAbortFixture::new("native-main-foreign-target-collision");
     let original = case.record();
     let operation = format!("write:{}", case.intent_id);
-    let owner = case.runtime.client(&case.main).unwrap();
+    let owner = case.runtime.node_metadata(&case.main).unwrap();
     assert!(
         owner
-            .metadata_backend()
-            .unwrap()
             .prepared_operation_record(&operation)
             .unwrap()
             .is_none(),
@@ -5346,11 +5372,9 @@ fn normal_main_foreign_target_collision_preserves_the_actual_unprepared_claim() 
         "{rejection}"
     );
     assert_eq!(case.record(), original);
-    let owner = case.runtime.client(&case.main).unwrap();
+    let owner = case.runtime.node_metadata(&case.main).unwrap();
     assert!(
         owner
-            .metadata_backend()
-            .unwrap()
             .prepared_operation_record(&operation)
             .unwrap()
             .is_none()

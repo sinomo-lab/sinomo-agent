@@ -466,7 +466,7 @@ fn native_file_sync_repairs_full_committed_w1_n3_owner_after_healing_receivers()
                     && repair.missing_replica_node_id != primary)
         );
     }
-    assert_eq!(writer.posix_read_file(path).unwrap(), bytes);
+    assert_eq!(writer.posix_read_file_distributed(path).unwrap(), bytes);
     drop(writer);
     let before = runtime.rpc_observations().len();
     runtime.clear_faults();
@@ -496,7 +496,10 @@ fn native_file_sync_repairs_full_committed_w1_n3_owner_after_healing_receivers()
                     && event.phase == DfsTestRpcPhase::Completed
             )
     );
-    assert_eq!(syncer.posix_stat(path).unwrap().version, stat.version);
+    assert_eq!(
+        syncer.posix_stat_distributed(path).unwrap().version,
+        stat.version
+    );
     drop(syncer);
     for node in &nodes {
         let replica = runtime.client(node).unwrap();
@@ -585,11 +588,13 @@ fn networked_dfs_supports_three_nodes_two_replicas_with_cross_reads() {
         writer
             .posix_sync_file(paths[index], sinomo_dfs::DfsPosixSyncKind::File)
             .expect("real two-replica durability");
-        let receipts = writer
+        let owner = runtime.metadata_primary_service(paths[index]).unwrap();
+        let receipts = owner
             .metadata_backend()
             .unwrap()
             .receipts_for_version(&stat.object_id, &stat.version)
             .unwrap();
+        drop(owner);
         let actual = receipts
             .iter()
             .map(|receipt| receipt.replica_node_id.clone())
@@ -662,11 +667,13 @@ fn networked_dfs_transfers_large_writes() {
     writer
         .posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File)
         .expect("real W2 durability");
-    let receipts = writer
+    let owner = runtime.metadata_primary_service(path).unwrap();
+    let receipts = owner
         .metadata_backend()
         .unwrap()
         .receipts_for_version(&stat.object_id, &stat.version)
         .expect("actual replica receipts");
+    drop(owner);
     let acknowledged = receipts
         .iter()
         .map(|receipt| receipt.replica_node_id.clone())
@@ -725,11 +732,13 @@ fn networked_dfs_streams_large_writes_from_reader() {
     writer
         .posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File)
         .expect("real W2 durability");
-    let receipts = writer
+    let owner = runtime.metadata_primary_service(path).unwrap();
+    let receipts = owner
         .metadata_backend()
         .unwrap()
         .receipts_for_version(&stat.object_id, &stat.version)
         .expect("actual replica receipts");
+    drop(owner);
     let acknowledged = receipts
         .iter()
         .map(|receipt| receipt.replica_node_id.clone())
@@ -989,17 +998,17 @@ fn posix_paths_treat_backslash_as_filename_character() {
 
     assert_ne!(backslash_stat.object_id, slash_stat.object_id);
     assert_eq!(
-        dfs.posix_read_file(r"/services/names/a\b.txt")
+        dfs.posix_read_file_distributed(r"/services/names/a\b.txt")
             .expect("read backslash filename"),
         b"backslash"
     );
     assert_eq!(
-        dfs.posix_read_file("/services/names/a/b.txt")
+        dfs.posix_read_file_distributed("/services/names/a/b.txt")
             .expect("read slash path"),
         b"slash"
     );
     assert_eq!(
-        dfs.posix_list_dir("/services/names")
+        dfs.posix_list_dir_distributed("/services/names")
             .expect("list names")
             .into_iter()
             .map(|entry| entry.name)
@@ -1010,16 +1019,16 @@ fn posix_paths_treat_backslash_as_filename_character() {
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reloaded = runtime.client(&owner).unwrap();
+    let mut reloaded = runtime.client(&owner).unwrap();
     assert_eq!(
         reloaded
-            .posix_read_file(r"/services/names/a\b.txt")
+            .posix_read_file_distributed(r"/services/names/a\b.txt")
             .expect("read backslash after reload"),
         b"backslash"
     );
     assert_eq!(
         reloaded
-            .posix_read_file("/services/names/a/b.txt")
+            .posix_read_file_distributed("/services/names/a/b.txt")
             .expect("read slash after reload"),
         b"slash"
     );
@@ -1066,13 +1075,13 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
 
     assert_eq!(stat.path, "/services/paths/file.txt");
     assert_eq!(
-        dfs.posix_read_file("/../services/paths/./file.txt")
+        dfs.posix_read_file_distributed("/../services/paths/./file.txt")
             .expect("read with root parent and current component"),
         b"normalized"
     );
     assert!(
         matches!(
-            dfs.posix_stat("/services/paths/tmp/file.txt"),
+            dfs.posix_stat_distributed("/services/paths/tmp/file.txt"),
             Err(sinomo_dfs::DfsPosixError::NotFound { .. })
         ),
         "parent components must be resolved instead of becoming path data"
@@ -1080,7 +1089,7 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
     dfs.posix_rmdir("/services/paths/tmp")
         .expect("the intermediate directory stays empty");
     assert_eq!(
-        dfs.posix_list_dir("/services/paths/../paths")
+        dfs.posix_list_dir_distributed("/services/paths/../paths")
             .expect("list normalized path")
             .into_iter()
             .map(|entry| entry.name)
@@ -1091,10 +1100,10 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reloaded = runtime.client(&owner).unwrap();
+    let mut reloaded = runtime.client(&owner).unwrap();
     assert_eq!(
         reloaded
-            .posix_read_file("/services/paths/../paths/file.txt")
+            .posix_read_file_distributed("/services/paths/../paths/file.txt")
             .expect("read normalized path after reload"),
         b"normalized"
     );
@@ -1140,7 +1149,7 @@ fn posix_paths_reject_nul_bytes_before_metadata_mutation() {
     }
 
     assert!(
-        dfs.posix_list_dir("/services/nul")
+        dfs.posix_list_dir_distributed("/services/nul")
             .expect("list nul parent")
             .is_empty(),
         "invalid paths must not create metadata entries"
@@ -1149,10 +1158,10 @@ fn posix_paths_reject_nul_bytes_before_metadata_mutation() {
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reloaded = runtime.client(&owner).unwrap();
+    let mut reloaded = runtime.client(&owner).unwrap();
     assert!(
         reloaded
-            .posix_list_dir("/services/nul")
+            .posix_list_dir_distributed("/services/nul")
             .expect("reload list nul parent")
             .is_empty()
     );
@@ -1193,7 +1202,7 @@ fn posix_symlink_rejects_invalid_targets_before_metadata_mutation() {
     }
 
     assert!(
-        dfs.posix_list_dir("/services/links")
+        dfs.posix_list_dir_distributed("/services/links")
             .expect("list links parent")
             .is_empty(),
         "invalid symlink targets must not create metadata entries"
@@ -1202,10 +1211,10 @@ fn posix_symlink_rejects_invalid_targets_before_metadata_mutation() {
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reloaded = runtime.client(&owner).unwrap();
+    let mut reloaded = runtime.client(&owner).unwrap();
     assert!(
         reloaded
-            .posix_list_dir("/services/links")
+            .posix_list_dir_distributed("/services/links")
             .expect("reload list links parent")
             .is_empty()
     );
@@ -1244,19 +1253,19 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     .expect("create file symlink");
 
     assert_eq!(
-        dfs.posix_lstat("/services/symlink-targets/link.txt")
+        dfs.posix_lstat_distributed("/services/symlink-targets/link.txt")
             .expect("lstat link")
             .kind,
         DfsObjectKind::Symlink
     );
     assert_eq!(
-        dfs.posix_stat("/services/symlink-targets/link.txt")
+        dfs.posix_stat_distributed("/services/symlink-targets/link.txt")
             .expect("stat follows link")
             .kind,
         DfsObjectKind::File
     );
     assert_eq!(
-        dfs.posix_read_file("/services/symlink-targets/link.txt")
+        dfs.posix_read_file_distributed("/services/symlink-targets/link.txt")
             .expect("read follows link"),
         b"target"
     );
@@ -1267,25 +1276,25 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     )
     .expect("write follows link");
     assert_eq!(
-        dfs.posix_read_file("/services/symlink-targets/target.txt")
+        dfs.posix_read_file_distributed("/services/symlink-targets/target.txt")
             .expect("read updated target"),
         b"updated"
     );
     assert_eq!(
-        dfs.posix_readlink("/services/symlink-targets/link.txt")
+        dfs.posix_readlink_distributed("/services/symlink-targets/link.txt")
             .expect("readlink preserves target"),
         "target.txt"
     );
     dfs.posix_set_mode("/services/symlink-targets/link.txt", 0o600)
         .expect("chmod follows link");
     assert_eq!(
-        dfs.posix_stat("/services/symlink-targets/target.txt")
+        dfs.posix_stat_distributed("/services/symlink-targets/target.txt")
             .expect("target mode")
             .mode,
         0o600
     );
     assert_ne!(
-        dfs.posix_lstat("/services/symlink-targets/link.txt")
+        dfs.posix_lstat_distributed("/services/symlink-targets/link.txt")
             .expect("link mode remains independent")
             .mode,
         0o600
@@ -1297,7 +1306,7 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     )
     .expect("utimens follows link");
     assert_eq!(
-        dfs.posix_stat("/services/symlink-targets/target.txt")
+        dfs.posix_stat_distributed("/services/symlink-targets/target.txt")
             .expect("target atime")
             .accessed_at_unix_nanos,
         11_111
@@ -1309,13 +1318,13 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     )
     .expect("lutimens updates link");
     assert_eq!(
-        dfs.posix_lstat("/services/symlink-targets/link.txt")
+        dfs.posix_lstat_distributed("/services/symlink-targets/link.txt")
             .expect("link atime")
             .accessed_at_unix_nanos,
         33_333
     );
     assert_eq!(
-        dfs.posix_stat("/services/symlink-targets/target.txt")
+        dfs.posix_stat_distributed("/services/symlink-targets/target.txt")
             .expect("target atime unchanged by lutimens")
             .accessed_at_unix_nanos,
         11_111
@@ -1334,12 +1343,12 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     )
     .expect("create directory symlink");
     assert_eq!(
-        dfs.posix_read_file("/services/symlink-targets/dir-link/nested.txt")
+        dfs.posix_read_file_distributed("/services/symlink-targets/dir-link/nested.txt")
             .expect("read through intermediate symlink"),
         b"nested"
     );
     assert_eq!(
-        dfs.posix_list_dir("/services/symlink-targets/dir-link")
+        dfs.posix_list_dir_distributed("/services/symlink-targets/dir-link")
             .expect("list follows directory symlink")
             .into_iter()
             .map(|entry| entry.name)
@@ -1350,22 +1359,22 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reloaded = runtime.client(&owner).unwrap();
+    let mut reloaded = runtime.client(&owner).unwrap();
     assert_eq!(
         reloaded
-            .posix_read_file("/services/symlink-targets/link.txt")
+            .posix_read_file_distributed("/services/symlink-targets/link.txt")
             .expect("reloaded read follows link"),
         b"updated"
     );
     assert_eq!(
         reloaded
-            .posix_read_file("/services/symlink-targets/dir-link/nested.txt")
+            .posix_read_file_distributed("/services/symlink-targets/dir-link/nested.txt")
             .expect("reloaded read through intermediate symlink"),
         b"nested"
     );
     assert_eq!(
         reloaded
-            .posix_list_dir("/services/symlink-targets/dir-link")
+            .posix_list_dir_distributed("/services/symlink-targets/dir-link")
             .expect("reloaded list follows directory symlink")
             .into_iter()
             .map(|entry| entry.name)
@@ -1374,7 +1383,7 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
     );
     assert_eq!(
         reloaded
-            .posix_lstat("/services/symlink-targets/link.txt")
+            .posix_lstat_distributed("/services/symlink-targets/link.txt")
             .expect("reloaded lstat link")
             .kind,
         DfsObjectKind::Symlink
@@ -1421,24 +1430,24 @@ fn posix_operations_follow_intermediate_parent_symlinks() {
     )
     .expect("hardlink through parent symlink");
     assert_eq!(
-        dfs.posix_stat("/services/parents/real/original.txt")
+        dfs.posix_stat_distributed("/services/parents/real/original.txt")
             .expect("original link count")
             .link_count,
         2
     );
     assert_eq!(
-        dfs.posix_read_file("/services/parents/real/original-alias.txt")
+        dfs.posix_read_file_distributed("/services/parents/real/original-alias.txt")
             .expect("read hardlink alias"),
         b"original"
     );
     assert_eq!(
-        dfs.posix_stat("/services/parents/real/created")
+        dfs.posix_stat_distributed("/services/parents/real/created")
             .expect("created target dir")
             .kind,
         DfsObjectKind::Directory
     );
     assert_eq!(
-        dfs.posix_stat("/services/parents/link/created")
+        dfs.posix_stat_distributed("/services/parents/link/created")
             .expect("stat through parent symlink")
             .kind,
         DfsObjectKind::Directory
@@ -1451,13 +1460,13 @@ fn posix_operations_follow_intermediate_parent_symlinks() {
     )
     .expect("create symlink through parent symlink");
     assert_eq!(
-        dfs.posix_lstat("/services/parents/link/created-link")
+        dfs.posix_lstat_distributed("/services/parents/link/created-link")
             .expect("lstat follows parent symlink only")
             .kind,
         DfsObjectKind::Symlink
     );
     assert_eq!(
-        dfs.posix_lstat("/services/parents/real/created-link")
+        dfs.posix_lstat_distributed("/services/parents/real/created-link")
             .expect("canonical lstat")
             .kind,
         DfsObjectKind::Symlink
@@ -1469,11 +1478,11 @@ fn posix_operations_follow_intermediate_parent_symlinks() {
     )
     .expect("rename through parent symlink");
     assert!(matches!(
-        dfs.posix_stat("/services/parents/real/created"),
+        dfs.posix_stat_distributed("/services/parents/real/created"),
         Err(sinomo_dfs::DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
-        dfs.posix_stat("/services/parents/real/renamed")
+        dfs.posix_stat_distributed("/services/parents/real/renamed")
             .expect("renamed target dir")
             .kind,
         DfsObjectKind::Directory
@@ -1482,17 +1491,17 @@ fn posix_operations_follow_intermediate_parent_symlinks() {
     dfs.posix_unlink("/services/parents/link/created-link")
         .expect("unlink through parent symlink");
     assert!(matches!(
-        dfs.posix_lstat("/services/parents/real/created-link"),
+        dfs.posix_lstat_distributed("/services/parents/real/created-link"),
         Err(sinomo_dfs::DfsPosixError::NotFound { .. })
     ));
 
     drop(dfs);
     runtime.stop_node(&owner).unwrap();
     runtime.reopen_node(owner.clone()).unwrap();
-    let reloaded = runtime.client(&owner).unwrap();
+    let mut reloaded = runtime.client(&owner).unwrap();
     assert_eq!(
         reloaded
-            .posix_stat("/services/parents/link/renamed")
+            .posix_stat_distributed("/services/parents/link/renamed")
             .expect("reloaded stat through parent symlink")
             .kind,
         DfsObjectKind::Directory
@@ -1657,13 +1666,13 @@ fn posix_write_file_from_reader_streams_content() {
 
     assert_eq!(stat.size_bytes, Some(bytes as u64));
     assert_eq!(
-        dfs.posix_read_file("/services/web/stream.bin")
+        dfs.posix_read_file_distributed("/services/web/stream.bin")
             .expect("read streamed POSIX file"),
         pattern_bytes(bytes)
     );
-    let backend_object = dfs
-        .metadata_backend()
-        .expect("metadata backend")
+    let backend_object = runtime
+        .node_metadata(&owner)
+        .expect("node metadata store")
         .get_object_by_path(
             &sinomo_dfs::sifs_file_system_id(),
             "/services/web/stream.bin",
@@ -1701,7 +1710,12 @@ fn posix_open_file_stream_reads_file_and_range_incrementally() {
         )
         .expect("streaming POSIX write");
 
-    let mut stream = dfs
+    // Local file streams belong to a store-backed service; the delegating
+    // writer keeps no local metadata view.
+    let streamer = runtime
+        .metadata_primary_service("/services/web/stream-read.bin")
+        .unwrap();
+    let mut stream = streamer
         .posix_open_file_stream("/services/web/stream-read.bin")
         .expect("open file stream");
     assert_eq!(stream.object_id, stat.object_id);
@@ -1721,7 +1735,7 @@ fn posix_open_file_stream_reads_file_and_range_incrementally() {
 
     let offset = 4097_u64;
     let range_len = 8192 + 13;
-    let mut range_stream = dfs
+    let mut range_stream = streamer
         .posix_open_file_range_stream("/services/web/stream-read.bin", offset, range_len)
         .expect("open range stream");
     assert_eq!(range_stream.object_id, stat.object_id);
@@ -1742,6 +1756,7 @@ fn posix_open_file_stream_reads_file_and_range_incrementally() {
         expected[range_start..range_start + range_len].to_vec()
     );
 
+    drop(streamer);
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -1763,22 +1778,43 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
     runtime.start_nodes().expect("real native startup");
     let bytes = b"confirmed backend bytes";
     let path = "/users/confirmed-current.bin";
+    // Delegating callers keep no local store. The confirmed local read runs on
+    // the store-backed owner at a real second content holder, so place the two
+    // copies on the writer and on the owning shard's primary.
+    let owner_node = sinomo_dfs::select_metadata_shard_config_for_path(
+        &runtime.file_system().file_system_id,
+        &runtime.metadata_shards().unwrap(),
+        path,
+    )
+    .unwrap()
+    .unwrap()
+    .primary_node_id;
+    let writer_node = nodes
+        .iter()
+        .find(|node| **node != owner_node)
+        .unwrap()
+        .clone();
+    let required = vec![writer_node.clone(), owner_node.clone()];
+    let mut placement =
+        sinomo_dfs::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    placement.required_node_ids = required.clone();
     runtime
         .apply_placement_policy(
             &nodes[0],
             path,
             sinomo_dfs::DfsPlacementScope::Subtree,
-            sinomo_dfs::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2)
-                .unwrap(),
+            placement,
         )
         .expect("normal confirmed W2/N2 policy Apply");
-    let mut writer = runtime.client(&nodes[0]).expect("writer client");
+    let mut writer = runtime.client(&writer_node).expect("writer client");
+    let mut content_policy = DfsReplicationPolicy::new(2, 2).expect("content policy");
+    content_policy.required_node_ids = required;
     let stat = writer
         .posix_write_file(
             path,
             bytes,
             sinomo_dfs::DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).expect("content policy"),
+                policy: content_policy,
                 replica_candidates: nodes.clone(),
                 wait_for_commit: true,
                 foreground_replica_repair: true,
@@ -1788,16 +1824,19 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
     writer
         .posix_sync_file(path, sinomo_dfs::DfsPosixSyncKind::File)
         .expect("real durability certificate");
-    let holder = writer
+    let mut reader = runtime
+        .metadata_primary_service(path)
+        .expect("actual holder owner");
+    let holder = reader
         .metadata_backend()
-        .expect("current writer backend")
+        .expect("current owner backend")
         .receipts_for_version(&stat.object_id, &stat.version)
         .expect("actual recorded content owners")
         .into_iter()
         .find(|receipt| receipt.replica_node_id != *writer.node_id())
         .expect("real second content holder")
         .replica_node_id;
-    let mut reader = runtime.client(&holder).expect("actual holder client");
+    assert_eq!(&holder, reader.node_id());
     assert_eq!(
         reader
             .posix_read_file(path)
@@ -1854,27 +1893,43 @@ fn networked_dfs_reconnect_reconciliation_uses_backend_current_metadata() {
         runtime.define_node(node.clone()).expect("node identity");
     }
     runtime.start_nodes().expect("real native startup");
-    let mut dfs = runtime.client(&nodes[0]).expect("normal client");
-    let path = format!("{}/reconnect.bin", sifs_node_files_path(&nodes[0]));
+    // Reconnect reconciliation compares a node's local manifests with its own
+    // store, so it runs on the store-backed owner at the content holder:
+    // write the node files of the owning shard's primary from that node.
+    let shards = runtime.metadata_shards().unwrap();
+    let fs_id = runtime.file_system().file_system_id;
+    let holder = sinomo_dfs::select_metadata_shard_config_for_path(
+        &fs_id,
+        &shards,
+        &format!("{}/reconnect.bin", sifs_node_files_path(&nodes[0])),
+    )
+    .unwrap()
+    .unwrap()
+    .primary_node_id;
+    let path = format!("{}/reconnect.bin", sifs_node_files_path(&holder));
+    let mut writer = runtime.client(&holder).expect("normal client");
     let options = sinomo_dfs::DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-        replica_candidates: vec![nodes[0].clone()],
+        replica_candidates: vec![holder.clone()],
         wait_for_commit: true,
         foreground_replica_repair: false,
     };
-    let old = dfs
+    let old = writer
         .posix_write_file(&path, b"old reconnect bytes", options.clone())
         .expect("first normal publication");
-    let mut stale = dfs
-        .metadata_backend()
+    let mut stale = runtime
+        .node_metadata(&holder)
         .unwrap()
         .get_object(&old.object_id)
         .unwrap()
         .unwrap();
     let bytes = b"backend-current reconnect bytes";
-    let current = dfs
+    let current = writer
         .posix_write_file(&path, bytes, options)
         .expect("current normal publication");
+    drop(writer);
+    let mut dfs = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(dfs.node_id(), &holder);
     stale.version = old.version;
     dfs.add_transient_object_metadata(stale)
         .expect("stale transient overlay");
@@ -2264,7 +2319,10 @@ fn native_pending_write_survives_restart_without_publishing_or_admitting_a_secon
         actual, before,
         "restart retains the exact pending identity and captured content"
     );
-    assert_eq!(recovered.posix_read_file(path).unwrap(), b"original");
+    assert_eq!(
+        recovered.posix_read_file_distributed(path).unwrap(),
+        b"original"
+    );
     // Restart has no private requester registry. Reuse the original immutable
     // durable locator through the existing public authenticated Main route.
     let abort = recovered
@@ -2332,7 +2390,10 @@ fn native_pending_write_survives_restart_without_publishing_or_admitting_a_secon
             .status,
         sinomo_dfs::DfsWriteIntentStatus::Aborted
     );
-    assert_eq!(recovered.posix_read_file(path).unwrap(), b"original");
+    assert_eq!(
+        recovered.posix_read_file_distributed(path).unwrap(),
+        b"original"
+    );
     drop(recovered);
     runtime.close().unwrap();
 }
@@ -2352,14 +2413,15 @@ fn native_create_seals_parent_version_content_and_terminal_intent_in_one_visibil
     let mut writer = runtime.client(&node).unwrap();
     let fs_id = runtime.file_system().file_system_id;
     let root = DfsMetadataShardId::new("root");
-    let parent = writer
-        .metadata_backend()
+    // The node's durable store; the delegating writer keeps none.
+    let parent = runtime
+        .node_metadata(&node)
         .unwrap()
         .get_object_by_path(&fs_id, "/")
         .unwrap()
         .unwrap();
-    let before = writer
-        .metadata_backend()
+    let before = runtime
+        .node_metadata(&node)
         .unwrap()
         .export_shard_table_snapshot(&root)
         .unwrap()
@@ -2372,7 +2434,7 @@ fn native_create_seals_parent_version_content_and_terminal_intent_in_one_visibil
         bytes,
         sinomo_dfs::DfsWriteOptions {
             policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-            replica_candidates: vec![node],
+            replica_candidates: vec![node.clone()],
             wait_for_commit: true,
             foreground_replica_repair: false,
         },
@@ -2390,8 +2452,8 @@ fn native_create_seals_parent_version_content_and_terminal_intent_in_one_visibil
             panic!("native publication failed: {error:?}");
         }
     };
-    let batch = writer
-        .metadata_backend()
+    let batch = runtime
+        .node_metadata(&node)
         .unwrap()
         .journal_batch_for_shard_since_limited(
             &root,
@@ -2453,7 +2515,12 @@ fn native_create_seals_parent_version_content_and_terminal_intent_in_one_visibil
         commits, 1,
         "the visibility commit references that exact sealed digest"
     );
-    assert_eq!(writer.posix_read_file("/native-atomic.bin").unwrap(), bytes);
+    assert_eq!(
+        writer
+            .posix_read_file_distributed("/native-atomic.bin")
+            .unwrap(),
+        bytes
+    );
     drop(writer);
     if let Some(trace) = &trace {
         trace.close().unwrap();
@@ -2486,7 +2553,10 @@ fn native_bounded_journal_pages_reconstruct_the_actual_durable_suffix_without_mu
             .unwrap();
     }
     let root = DfsMetadataShardId::new("root");
-    let backend = writer.metadata_backend().unwrap();
+    // Page the owning store through its store-backed service; the delegating
+    // writer keeps no local store.
+    let owner = runtime.metadata_primary_service("/").unwrap();
+    let backend = owner.metadata_backend().unwrap();
     let before = backend.export_shard_table_snapshot(&root).unwrap().unwrap();
     let all = backend
         .journal_batch_for_shard_since_limited(&root, 0, usize::MAX, usize::MAX)
@@ -2525,6 +2595,7 @@ fn native_bounded_journal_pages_reconstruct_the_actual_durable_suffix_without_mu
         actual, before,
         "bounded observation must not author or rematerialize state"
     );
+    drop(owner);
     drop(writer);
     runtime.close().unwrap();
 }
@@ -2606,7 +2677,7 @@ fn native_metadata_authority_dispatches_the_actual_replica_set_before_waiting() 
     });
     assert_eq!(runtime.observation_dropped_count(), 0);
     let mut reader = runtime.client(&primary).unwrap();
-    assert_eq!(reader.posix_read_file(path).unwrap(), bytes);
+    assert_eq!(reader.posix_read_file_distributed(path).unwrap(), bytes);
     drop(reader);
     runtime.close().unwrap();
 }
@@ -2861,12 +2932,15 @@ fn native_cross_shard_move_keeps_capture_and_recorded_data_generation() {
             .content_reference_present(&located)
             .expect("capture follows object identity")
     );
-    let retained = writer
+    // The destination owner's durable store; the delegating writer keeps none.
+    let owner = runtime.metadata_primary_service(to).unwrap();
+    let retained = owner
         .metadata_backend()
         .unwrap()
         .get_version(&original.object_id, &original.version)
         .unwrap()
         .unwrap();
+    drop(owner);
     assert!(retained.has_retention_grant());
     let data = retained
         .content_durability
@@ -2884,8 +2958,9 @@ fn native_replica_rejects_wrong_signer_filesystem_and_epoch_without_mutating_its
     let source = runtime.root_shard().unwrap();
     let shard = DfsMetadataShardId::new(source.shard_id.clone());
     let target = source.replica_node_ids[0].clone();
-    let client = runtime.client(&source.primary_node_id).unwrap();
-    let backend = client.metadata_backend().unwrap();
+    // The primary's and the target's durable stores; callers keep none.
+    let client = runtime.node_metadata(&source.primary_node_id).unwrap();
+    let backend: &dyn DfsMetadataBackend = &client;
     let decoded = backend
         .journal_batch_for_shard_since_limited(&shard, 0, 256, 16 * 1024 * 1024)
         .unwrap()
@@ -2899,10 +2974,8 @@ fn native_replica_rejects_wrong_signer_filesystem_and_epoch_without_mutating_its
     let command =
         sinomo_dfs::test_support::native_replica_journal_command(&source, &target, frames);
     drop(client);
-    let target_client = runtime.client(&target).unwrap();
+    let target_client = runtime.node_metadata(&target).unwrap();
     let before = target_client
-        .metadata_backend()
-        .unwrap()
         .export_shard_table_snapshot(&shard)
         .unwrap()
         .unwrap();
@@ -2940,13 +3013,8 @@ fn native_replica_rejects_wrong_signer_filesystem_and_epoch_without_mutating_its
             ),
             "mismatch {mismatch} must reject"
         );
-        let actual = runtime.client(&target).unwrap();
-        let after = actual
-            .metadata_backend()
-            .unwrap()
-            .export_shard_table_snapshot(&shard)
-            .unwrap()
-            .unwrap();
+        let actual = runtime.node_metadata(&target).unwrap();
+        let after = actual.export_shard_table_snapshot(&shard).unwrap().unwrap();
         assert_eq!(after.prefix_proof, before.prefix_proof);
         assert_eq!(
             after.semantic_state_fingerprint,
@@ -3207,7 +3275,7 @@ fn native_whole_shard_healthy_w2_capture_uses_actual_receiver_and_full_metadata_
         .unwrap();
     assert_eq!(
         client
-            .posix_read_file("/native-whole-shard-w2.bin")
+            .posix_read_file_distributed("/native-whole-shard-w2.bin")
             .unwrap(),
         bytes
     );
@@ -3468,7 +3536,7 @@ fn native_whole_shard_partial_metadata_probe_uses_actual_operation_bound_native_
         .unwrap();
     assert_eq!(stat.object_id, object.object_id);
     assert_eq!(stat.version, object.version);
-    assert_eq!(client.posix_read_file(path).unwrap(), bytes);
+    assert_eq!(client.posix_read_file_distributed(path).unwrap(), bytes);
     let source = runtime.metadata_primary_service(path).unwrap();
     let backend = source.metadata_backend().unwrap();
     let committed = backend
