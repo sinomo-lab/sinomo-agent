@@ -22,7 +22,7 @@ pub fn validate_workspace_usage(
 }
 
 pub fn sandbox_filesystem_workspace_usage<F: SandboxFileSystem>(
-    filesystem: &F,
+    filesystem: &mut F,
 ) -> Result<SandboxWorkspaceUsage, SandboxFsError> {
     let mut usage = SandboxWorkspaceUsage::default();
     for root in [
@@ -40,7 +40,7 @@ pub fn sandbox_filesystem_workspace_usage<F: SandboxFileSystem>(
 }
 
 pub fn validate_sandbox_write_resource_limits<F: SandboxFileSystem>(
-    filesystem: &F,
+    filesystem: &mut F,
     path: &SandboxPath,
     bytes_len: u64,
     limits: &SandboxResourceLimits,
@@ -50,7 +50,7 @@ pub fn validate_sandbox_write_resource_limits<F: SandboxFileSystem>(
     }
     validate_written_bytes(bytes_len, limits)?;
     let mut usage = sandbox_filesystem_workspace_usage(filesystem)?;
-    match filesystem.stat(path) {
+    match filesystem.stat_mut(path) {
         Ok(metadata) if metadata.is_dir => {
             return Err(SandboxFsError::ReadOnly { path: path.clone() });
         }
@@ -68,13 +68,13 @@ pub fn validate_sandbox_write_resource_limits<F: SandboxFileSystem>(
 }
 
 fn collect_sandbox_filesystem_usage<F: SandboxFileSystem>(
-    filesystem: &F,
+    filesystem: &mut F,
     path: &SandboxPath,
     usage: &mut SandboxWorkspaceUsage,
 ) -> Result<(), SandboxFsError> {
-    let metadata = filesystem.stat(path)?;
+    let metadata = filesystem.stat_mut(path)?;
     if metadata.is_dir {
-        for entry in filesystem.list(path)? {
+        for entry in filesystem.list_mut(path)? {
             collect_sandbox_filesystem_usage(filesystem, &entry.path, usage)?;
         }
     } else {

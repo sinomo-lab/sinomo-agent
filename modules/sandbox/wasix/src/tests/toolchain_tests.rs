@@ -605,12 +605,12 @@ fn virtual_device_writes_do_not_consume_workspace_write_quota() {
         ..SandboxResourceLimits::default()
     };
 
-    validate_sandbox_write_resource_limits(&fs, &null, 128, &limits)
+    validate_sandbox_write_resource_limits(&mut fs, &null, 128, &limits)
         .expect("virtual device write bypasses workspace quotas");
     fs.write(&null, b"discarded").expect("write null");
     assert!(matches!(
         validate_sandbox_write_resource_limits(
-            &fs,
+            &mut fs,
             &SandboxPath::new("/work/out.txt").expect("work"),
             2,
             &limits,

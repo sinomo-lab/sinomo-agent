@@ -417,8 +417,8 @@ impl SandboxBackend for LocalSandboxBackend {
         if (cwd.is_some() || mounts_reconciliation.replacement_requested)
             && !preserves_simple_native_host_cwd
         {
-            let fs = LocalSandboxFileSystem::new(layout);
-            validate_sandbox_working_directory(&fs, effective_cwd)?;
+            let mut fs = LocalSandboxFileSystem::new(layout);
+            validate_sandbox_working_directory(&mut fs, effective_cwd)?;
         }
         if let Some(cwd) = cwd {
             manifest.cwd = cwd;
@@ -515,7 +515,7 @@ impl SandboxBackend for LocalSandboxBackend {
         let (mut manifest, layout) = self.store.load(&request.sandbox_id)?;
         let mut fs = LocalSandboxFileSystem::new(layout);
         validate_sandbox_write_resource_limits(
-            &fs,
+            &mut fs,
             &request.path,
             request.bytes.len() as u64,
             &manifest.limits,

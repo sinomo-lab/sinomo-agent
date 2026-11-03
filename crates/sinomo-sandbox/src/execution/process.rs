@@ -103,7 +103,7 @@ pub fn validate_sandbox_process_plan(
 
 pub fn validate_sandbox_process_plan_working_directories(
     plan: &SandboxProcessPlan,
-    fs: &impl SandboxFileSystem,
+    fs: &mut impl SandboxFileSystem,
     default_cwd: &SandboxPath,
 ) -> Result<(), SandboxCommandExecutionError> {
     for (index, step) in plan.steps.iter().enumerate() {

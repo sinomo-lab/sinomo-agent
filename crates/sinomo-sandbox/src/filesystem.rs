@@ -21,7 +21,7 @@ pub use usage::{
 pub use virtual_devices::sandbox_path_is_virtual_device_sink;
 
 pub fn validate_sandbox_working_directory(
-    fs: &impl SandboxFileSystem,
+    fs: &mut impl SandboxFileSystem,
     cwd: &SandboxPath,
 ) -> Result<(), SandboxFsError> {
     if virtual_devices::sandbox_path_is_dev_tree(cwd) {
@@ -29,7 +29,7 @@ pub fn validate_sandbox_working_directory(
             operation: format!("use virtual device path as sandbox cwd {cwd}"),
         });
     }
-    let metadata = fs.stat_follow(cwd)?;
+    let metadata = fs.stat_follow_mut(cwd)?;
     if !metadata.is_dir {
         return Err(SandboxFsError::Unsupported {
             operation: format!("use non-directory sandbox cwd {cwd}"),
