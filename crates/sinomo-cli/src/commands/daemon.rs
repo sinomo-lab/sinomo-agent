@@ -459,7 +459,8 @@ fn cli_agent_component_factory(
         .map_err(|detail| CliError::Parse { detail })
 }
 
-fn audio_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError> {
+pub fn audio_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError>
+{
     let factory = sinomo_runtime::module::StaticComponentFactory::new(
         sinomo_runtime::module::ComponentDescriptor::new("sinomo-audio", env!("CARGO_PKG_VERSION")),
         |_, scope| {
@@ -467,6 +468,8 @@ fn audio_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFa
                 sinomo_audio::service::register_services(
                     sinomo_runtime::service::ServiceRegistry::builder(),
                 )
+                .register(sinomo_video::service::CameraService)
+                .register(sinomo_runtime::device::sensors::SensorService)
                 .build(),
             );
             Ok(())
@@ -1520,6 +1523,33 @@ pub(crate) fn handle_daemon_rollout_build_request(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn media_routes_use_the_daemon_member_authorization_vocabulary() {
+        use sinomo_runtime::daemon::DaemonSignerAuthority;
+        use sinomo_runtime::service::Service;
+        let mut routes = sinomo_audio::service::MediaAudioService::new().route_categories();
+        routes.extend(sinomo_video::service::CameraService.route_categories());
+        routes.extend(sinomo_runtime::device::sensors::SensorService.route_categories());
+        for route in routes {
+            let scope = route.auth_scope.as_deref().expect("media scope");
+            assert!(
+                DaemonSignerAuthority::Local.authorizes_route_scope(scope),
+                "{}",
+                route.route
+            );
+            assert!(
+                DaemonSignerAuthority::Member.authorizes_route_scope(scope),
+                "{}",
+                route.route
+            );
+            assert!(
+                !DaemonSignerAuthority::JoinCandidate.authorizes_route_scope(scope),
+                "{}",
+                route.route
+            );
+        }
+    }
+
     use super::*;
     use std::cell::Cell;
 

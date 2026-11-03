@@ -19,7 +19,7 @@ desktop = [
     "dep:rfd",
     "sui/desktop",
 ]
-mobile = ["gui", "sui/mobile"]
+mobile = ["gui", "sui/mobile", "native-devices"]
 native-devices = [
     "sinomo-audio/native-devices",
     "sinomo-video/native-devices",

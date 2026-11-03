@@ -34,6 +34,7 @@ pub(crate) async fn open_desktop_video_source(
     let kind = DesktopModule::AppUse;
     let client = media_daemon_client(data_dir, node_id).await?;
     let request = DesktopStreamRequest {
+        transport: sinomo_video::codec::VideoTransport::Auto,
         session_id,
         frames_per_second: 30,
         include_cursor: !app,
@@ -59,9 +60,10 @@ pub(crate) async fn open_desktop_video_source(
         .response
         .decode_body()
         .map_err(|e| media_network_error(node_id, e))?;
-    if metadata.get("version").and_then(serde_json::Value::as_u64)
-        != Some(u64::from(sinomo_video::stream::VIDEO_STREAM_VERSION))
-    {
+    if !matches!(
+        metadata.get("version").and_then(serde_json::Value::as_u64),
+        Some(1 | 2)
+    ) {
         return Err(media_network_error(
             node_id,
             "unsupported video stream version",

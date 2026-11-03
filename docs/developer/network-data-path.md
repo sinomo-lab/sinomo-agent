@@ -81,7 +81,11 @@ opt-in. Service-RPC callers select the same policy with
 of the persistent carrier pool key, so modes are never mixed by reuse.
 
 Intermediate nodes run `accept_or_relay_routed_session`. They authenticate the
-adjacent links once and validate the routed envelope. Linux TCP-to-TCP relays
+adjacent links once and validate the routed envelope. Endpoint IDs select dialing
+addresses; an already traversed edge may name a caller-private route hint. Each
+relay validates its own outbound endpoint against its directory, while the
+destination validates the authenticated incoming peer and path without requiring
+those private addresses to be published in its own directory. Linux TCP-to-TCP relays
 use `splice` in both directions; portable relays move each record through one
 pooled slab. Relay memory is constant per direction. Relays do not
 decode SOBJ heads, inspect service methods, or select an RPC implementation.

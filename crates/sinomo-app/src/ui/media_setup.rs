@@ -1005,6 +1005,8 @@ where
 fn open_media_setup_microphone(
     config: sinomo_audio::NativeAudioCaptureConfig,
 ) -> Result<sinomo_audio::NativeAudioCapture, String> {
+    #[cfg(target_os = "android")]
+    crate::android_media::request("microphone")?;
     sinomo_audio::start_native_microphone_capture(config).map_err(|error| error.to_string())
 }
 
@@ -1012,6 +1014,8 @@ fn open_media_setup_microphone(
 fn open_media_setup_camera(
     config: sinomo_video::NativeVideoCaptureConfig,
 ) -> Result<sinomo_video::NativeVideoCapture, String> {
+    #[cfg(target_os = "android")]
+    crate::android_media::request("camera")?;
     sinomo_video::start_native_camera_capture(config).map_err(|error| error.to_string())
 }
 
@@ -1581,7 +1585,7 @@ fn open_media_privacy_settings() -> Result<(), String> {
         .map_err(|error| format!("open macOS privacy settings: {error}"))
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
 fn open_media_privacy_settings() -> Result<(), String> {
     Err(
         "Open your system privacy settings, allow microphone/camera access, then retry."
@@ -1984,4 +1988,15 @@ mod tests {
             &mut camera_enabled,
         ));
     }
+}
+
+#[cfg(target_os = "android")]
+fn open_media_privacy_settings() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("android-privacy-settings".into())
+        .spawn(|| {
+            let _ = crate::android_media::request("settings");
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }

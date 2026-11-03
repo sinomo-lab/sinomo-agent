@@ -146,8 +146,35 @@ opt-level = 2
 [profile.dev.package.tracing-subscriber]
 opt-level = 2
 
-[profile.android-debug-small]
+# Keep the Android media hot path representative while retaining debugging,
+# assertions and observability for the rest of the application.
+[profile.android-debug]
 inherits = "dev"
+
+[profile.android-debug.package.image]
+opt-level = 2
+
+[profile.android-debug.package.openh264]
+opt-level = 2
+
+[profile.android-debug.package.sinomo-video]
+opt-level = 2
+
+[profile.android-debug.package.sinomo-lm]
+opt-level = 2
+
+# Image decoding uses zune's JPEG codec and shared bitstream helpers.
+[profile.android-debug.package.zune-jpeg]
+opt-level = 2
+
+[profile.android-debug.package.zune-core]
+opt-level = 2
+
+[profile.android-debug.package.sinomo-app-use-module]
+opt-level = 2
+
+[profile.android-debug-small]
+inherits = "android-debug"
 debug = 0
 strip = "debuginfo"
 
@@ -192,6 +219,8 @@ cap-std = "4.0.2"
 cpal = "0.18.1"
 image = { version = "0.25.10", default-features = false }
 jni = "0.22.4"
+openh264 = "0.9.8"
+h264-reader = "0.9.0"
 rustls-platform-verifier = "0.7.0"
 x11rb = { version = "0.13.2", features = ["composite", "damage", "xfixes", "xtest", "res"] }
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }

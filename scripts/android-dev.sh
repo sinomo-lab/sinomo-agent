@@ -6,7 +6,7 @@ cd "${repo_root}"
 
 ndk_version="27.2.12479018"
 package_name="net.sinomo.app"
-profile_dir="debug"
+profile_dir="android-debug"
 
 if [[ -n "${SINOMO_ANDROID_HOME:-}" ]]; then
   resolved_android_home="${SINOMO_ANDROID_HOME}"
@@ -24,13 +24,13 @@ export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_HOME}/ndk/${ndk_version}}
 export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME}}"
 export PATH="${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/cmdline-tools/latest/bin:${HOME}/.cargo/bin:${PATH}"
 export CARGO_TARGET_DIR="${SINOMO_ANDROID_TARGET_DIR:-${repo_root}/target/android-host}"
-export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-1}"
+export CARGO_PROFILE_ANDROID_DEBUG_DEBUG="${CARGO_PROFILE_ANDROID_DEBUG_DEBUG:-${CARGO_PROFILE_DEV_DEBUG:-1}}"
 
 apk_path="${CARGO_TARGET_DIR}/${profile_dir}/apk/sinomo-app.apk"
 debug_keystore="${CARGO_TARGET_DIR}/android-debug.keystore"
 debug_keystore_password="android"
-export CARGO_APK_DEV_KEYSTORE="${debug_keystore}"
-export CARGO_APK_DEV_KEYSTORE_PASSWORD="${debug_keystore_password}"
+export CARGO_APK_ANDROID_DEBUG_KEYSTORE="${debug_keystore}"
+export CARGO_APK_ANDROID_DEBUG_KEYSTORE_PASSWORD="${debug_keystore_password}"
 
 usage() {
   cat <<'EOF'
@@ -38,7 +38,7 @@ Usage: scripts/android-dev.sh <command>
 
 Commands:
   doctor       Check SDK, NDK, Rust, cargo-apk, and ADB device access
-  build        Build an APK with line-table debug symbols
+  build        Build a media-optimized APK with line-table debug symbols
   install      Install the existing debug APK on the connected device
   run          Build, install, and launch the app
   logs         Follow logcat for the running app process
@@ -97,10 +97,10 @@ device_serial() {
 build_apk() {
   require_command cargo
   ensure_debug_keystore
-  cargo apk build -p sinomo-app-android --target-dir "${CARGO_TARGET_DIR}"
+  cargo apk build -p sinomo-app-android --profile "${profile_dir}" --target-dir "${CARGO_TARGET_DIR}"
   python3 scripts/android-runtime-jars.py --output "${CARGO_TARGET_DIR}/android-java"
-  python3 modules/desktop/app-use/android/package.py "${apk_path}" \
-    --keystore "${debug_keystore}" --password-env CARGO_APK_DEV_KEYSTORE_PASSWORD \
+  python3 modules/desktop/app-use/android/package.py "${apk_path}" --debuggable \
+    --keystore "${debug_keystore}" --password-env CARGO_APK_ANDROID_DEBUG_KEYSTORE_PASSWORD \
     --java-archive "${CARGO_TARGET_DIR}/android-java/rustls-platform-verifier.jar" \
     --java-archive "${CARGO_TARGET_DIR}/android-java/kotlin-stdlib.jar"
 }
@@ -112,7 +112,7 @@ install_apk() {
   fi
   local serial
   serial="$(device_serial)"
-  adb -s "${serial}" install -r -t "${apk_path}"
+  adb -s "${serial}" install --no-incremental -r -t "${apk_path}"
 }
 
 launch_app() {
@@ -188,11 +188,21 @@ case "${command}" in
     ;;
   debug)
     require_command adb
-    require_command cargo-apk
-    ensure_debug_keystore
+    build_apk
+    install_apk
     serial="$(device_serial)"
-    exec cargo apk gdb -p sinomo-app-android \
-      --target-dir "${CARGO_TARGET_DIR}" --device "${serial}"
+    debug_project="${CARGO_TARGET_DIR}/${profile_dir}/apk"
+    debug_abi="$(adb -s "${serial}" shell getprop ro.product.cpu.abi | tr -d '\r')"
+    case "${debug_abi}" in
+      arm64-v8a|armeabi-v7a|x86|x86_64) ;;
+      *) echo "Unsupported debugger ABI: ${debug_abi}" >&2; exit 1 ;;
+    esac
+    mkdir -p "${debug_project}/jni"
+    printf 'APP_ABI=%s\nTARGET_OUT=\n' "${debug_abi}" > "${debug_project}/jni/Android.mk"
+    # cargo apk gdb rebuilds a bare APK and would discard our Java services and
+    # development manifest override. Attach NDK LLDB to the packaged APK instead.
+    exec "${ANDROID_NDK_HOME}/ndk-gdb" --project "${debug_project}" \
+      --adb "$(command -v adb)" --launch android.app.NativeActivity -s "${serial}"
     ;;
   uninstall)
     require_command adb

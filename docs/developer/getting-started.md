@@ -234,6 +234,15 @@ Install the host's Android USB/udev support first and set `ANDROID_SERIAL` when
 several devices are visible. `run` builds, installs, and launches the app;
 `debug` attaches the NDK LLDB frontend with native/Rust line information.
 
+The host helper uses `android-debug`: media encoding, image decoding and the
+native App Use pixel path are optimized while debug assertions and line
+information remain available. Development packaging explicitly keeps the APK
+debuggable; release packaging does not enable that override. Its APK is under
+`target/android-host/android-debug/apk/`. The Docker helper defaults to
+`android-debug-small`, which inherits the same optimization settings and strips
+debug information. Select `--profile android-debug` for matching manual Android
+Cargo builds, including separately built native providers.
+
 ## Run the User Interfaces
 
 With the isolated daemon running:

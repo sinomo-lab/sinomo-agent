@@ -5837,6 +5837,15 @@ fn adopt_cluster_raft_read_index_state(
     } else {
         sinomo_kv::ClusterKvRaftConfigRecord::from(&fence.confirmed_state)
     };
+    // The caller can retain a removed learner/non-voter in its bootstrap
+    // observations. Merging fresh endpoint data must not resurrect that node
+    // into the exact active partition established by this committed fence.
+    adopted.members.retain(|member| {
+        !member.state.is_authorized()
+            || committed_config.voters.contains(&member.node_id)
+            || committed_config.learners.contains(&member.node_id)
+            || committed_config.non_voting.contains(&member.node_id)
+    });
     project_read_index_forwarding_config(
         &mut adopted,
         &committed_config,

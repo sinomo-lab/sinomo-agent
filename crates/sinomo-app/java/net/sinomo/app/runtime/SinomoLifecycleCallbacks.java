@@ -27,6 +27,10 @@ public final class SinomoLifecycleCallbacks implements
         Application.ActivityLifecycleCallbacks,
         View.OnApplyWindowInsetsListener,
         ViewTreeObserver.OnWindowFocusChangeListener {
+    public SinomoVideoEncoder openVideoEncoder(int width, int height, int fps) throws Exception {
+        return new SinomoVideoEncoder(width, height, fps);
+    }
+
     private final Activity activity;
     private boolean registered;
     private boolean observingOperatingConditions;
@@ -298,6 +302,335 @@ public final class SinomoLifecycleCallbacks implements
             } catch (RuntimeException ignored) {
                 // The listener may already have been removed during teardown.
             }
+        }
+    }
+
+    public String readSensors() throws Exception {
+        android.hardware.SensorManager manager = activity.getSystemService(android.hardware.SensorManager.class);
+        if (manager == null) throw new IllegalStateException("Sensors unavailable");
+        android.os.HandlerThread worker = new android.os.HandlerThread("sinomo-sensors");
+        worker.start();
+        final java.util.Map<Integer, org.json.JSONObject> samples = new java.util.TreeMap<>();
+        final java.util.Set<Integer> requested = new java.util.HashSet<>();
+        final java.util.concurrent.CountDownLatch sampleReady = new java.util.concurrent.CountDownLatch(1);
+        android.hardware.SensorEventListener listener = new android.hardware.SensorEventListener() {
+            @Override public void onAccuracyChanged(android.hardware.Sensor sensor, int accuracy) {}
+            @Override public void onSensorChanged(android.hardware.SensorEvent event) {
+                try {
+                    org.json.JSONObject sample = new org.json.JSONObject();
+                    sample.put("sensor", event.sensor.getName());
+                    sample.put("sensor_type", event.sensor.getType());
+                    sample.put("timestamp_ns", event.timestamp);
+                    sample.put("accuracy", event.accuracy);
+                    org.json.JSONArray values = new org.json.JSONArray();
+                    for (float value : event.values) values.put((double)value);
+                    sample.put("values", values);
+                    synchronized (samples) {
+                        samples.put(event.sensor.getType(), sample);
+                        if (samples.keySet().containsAll(requested)) sampleReady.countDown();
+                    }
+                } catch (org.json.JSONException ignored) { /* Invalid samples are not published. */ }
+            }
+        };
+        try {
+            int[] types = { android.hardware.Sensor.TYPE_ACCELEROMETER, android.hardware.Sensor.TYPE_GYROSCOPE,
+                android.hardware.Sensor.TYPE_MAGNETIC_FIELD, android.hardware.Sensor.TYPE_GRAVITY,
+                android.hardware.Sensor.TYPE_ROTATION_VECTOR, android.hardware.Sensor.TYPE_LIGHT,
+                android.hardware.Sensor.TYPE_PRESSURE };
+            synchronized (samples) {
+                for (int type : types) if (manager.getDefaultSensor(type) != null) requested.add(type);
+                for (int type : types) {
+                    android.hardware.Sensor sensor = manager.getDefaultSensor(type);
+                    if (sensor != null && !manager.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL,
+                            new android.os.Handler(worker.getLooper()))) requested.remove(type);
+                }
+            }
+            if (requested.isEmpty()) throw new IllegalStateException("No supported sensors available");
+            sampleReady.await(1, java.util.concurrent.TimeUnit.SECONDS);
+            synchronized (samples) {
+                if (samples.isEmpty()) throw new IllegalStateException("No sensor samples received");
+                return new org.json.JSONArray(samples.values()).toString();
+            }
+        } finally { manager.unregisterListener(listener); worker.quitSafely(); }
+    }
+
+    public CameraStream openCamera(String selector, int width, int height) throws Exception {
+        return new CameraStream(activity, selector, width, height);
+    }
+
+    public static final class CameraStream implements AutoCloseable {
+        final android.os.HandlerThread thread = new android.os.HandlerThread("sinomo-camera2");
+        final java.util.concurrent.CountDownLatch ready = new java.util.concurrent.CountDownLatch(1);
+        android.hardware.camera2.CameraDevice camera;
+        android.hardware.camera2.CameraCaptureSession session;
+        android.media.ImageReader reader;
+        int sensorOrientation;
+        boolean frontFacing;
+        byte[] latest;
+        String failure;
+        boolean closed;
+
+        CameraStream(Context context, String selector, int requestedWidth, int requestedHeight) throws Exception {
+            if (context.checkSelfPermission(android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                throw new SecurityException("Camera permission denied");
+            thread.start();
+            android.os.Handler handler = new android.os.Handler(thread.getLooper());
+            try {
+                android.hardware.camera2.CameraManager manager = context.getSystemService(android.hardware.camera2.CameraManager.class);
+                String[] ids = manager.getCameraIdList();
+                if (ids.length == 0) throw new IllegalStateException("No Android camera available");
+                String id = ids[0];
+                for (String candidate : ids) {
+                    Integer facing = manager.getCameraCharacteristics(candidate).get(android.hardware.camera2.CameraCharacteristics.LENS_FACING);
+                    if (facing != null && facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT) { id = candidate; break; }
+                }
+                if (selector != null && !selector.isEmpty() && !selector.equals("android:camera:default"))
+                    throw new IllegalArgumentException("Unknown Android camera selector");
+                android.hardware.camera2.CameraCharacteristics info = manager.getCameraCharacteristics(id);
+                Integer orientation = info.get(android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION);
+                sensorOrientation = orientation == null ? 0 : orientation;
+                Integer facing = info.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING);
+                frontFacing = facing != null && facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT;
+                android.hardware.camera2.params.StreamConfigurationMap map = info.get(android.hardware.camera2.CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+                android.util.Size[] sizes = map.getOutputSizes(android.graphics.ImageFormat.YUV_420_888);
+                android.util.Size chosen = null;
+                long distance = Long.MAX_VALUE;
+                for (android.util.Size size : sizes) {
+                    if (size.getWidth() > 1920 || size.getHeight() > 1920 || size.getWidth() % 2 != 0 || size.getHeight() % 2 != 0) continue;
+                    long delta = Math.abs((long)size.getWidth() * size.getHeight() - (long)requestedWidth * requestedHeight);
+                    if (delta < distance) { chosen = size; distance = delta; }
+                }
+                if (chosen == null) throw new IllegalStateException("No bounded YUV camera size");
+                reader = android.media.ImageReader.newInstance(chosen.getWidth(), chosen.getHeight(), android.graphics.ImageFormat.YUV_420_888, 2);
+                reader.setOnImageAvailableListener(source -> {
+                    try (android.media.Image image = source.acquireLatestImage()) {
+                        if (image == null) return;
+                        int w = image.getWidth(), h = image.getHeight();
+                        byte[] packet = new byte[8 + w * h * 3 / 2];
+                        java.nio.ByteBuffer.wrap(packet).putInt(w).putInt(h);
+                        android.media.Image.Plane[] planes = image.getPlanes();
+                        for (int p = 0; p < 3; p++) {
+                            java.nio.ByteBuffer buffer = planes[p].getBuffer();
+                            int rows = p == 0 ? h : h / 2, cols = p == 0 ? w : w / 2;
+                            int base = buffer.position();
+                            for (int y = 0; y < rows; y++) for (int x = 0; x < cols; x++) {
+                                int output = p == 0 ? 8 + y * w + x : 8 + w * h + y * w + x * 2 + p - 1;
+                                packet[output] = buffer.get(base + y * planes[p].getRowStride() + x * planes[p].getPixelStride());
+                            }
+                        }
+                        int rotation = ((Activity)context).getWindowManager().getDefaultDisplay().getRotation() * 90;
+                        int degrees = (sensorOrientation + (frontFacing ? rotation : -rotation) + 360) % 360;
+                        packet = rotateNv12(packet, w, h, degrees);
+                        synchronized (this) { if (!closed) { latest = packet; notifyAll(); } }
+                    } catch (RuntimeException error) { fail(error.toString()); }
+                }, handler);
+                manager.openCamera(id, new android.hardware.camera2.CameraDevice.StateCallback() {
+                    @Override public void onOpened(android.hardware.camera2.CameraDevice device) {
+                        synchronized (CameraStream.this) {
+                            if (closed) { device.close(); return; }
+                            camera = device;
+                        }
+                        try {
+                            device.createCaptureSession(java.util.Collections.singletonList(reader.getSurface()),
+                                new android.hardware.camera2.CameraCaptureSession.StateCallback() {
+                                    @Override public void onConfigured(android.hardware.camera2.CameraCaptureSession configured) {
+                                        synchronized (CameraStream.this) {
+                                            if (closed) { configured.close(); return; }
+                                            session = configured;
+                                        }
+                                        try {
+                                            android.hardware.camera2.CaptureRequest.Builder request = device.createCaptureRequest(android.hardware.camera2.CameraDevice.TEMPLATE_RECORD);
+                                            request.addTarget(reader.getSurface());
+                                            configured.setRepeatingRequest(request.build(), null, handler);
+                                            ready.countDown();
+                                        } catch (Exception error) { fail(error.toString()); }
+                                    }
+                                    @Override public void onConfigureFailed(android.hardware.camera2.CameraCaptureSession session) { fail("Camera configuration failed"); }
+                                }, handler);
+                        } catch (Exception error) { fail(error.toString()); }
+                    }
+                    @Override public void onDisconnected(android.hardware.camera2.CameraDevice device) { device.close(); fail("Camera disconnected"); }
+                    @Override public void onError(android.hardware.camera2.CameraDevice device, int error) { device.close(); fail("Camera error " + error); }
+                }, handler);
+                if (!ready.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new IllegalStateException("Camera open timed out");
+                synchronized (this) { if (failure != null) throw new IllegalStateException(failure); }
+            } catch (Exception error) { close(); throw error; }
+        }
+        static byte[] rotateNv12(byte[] input, int width, int height, int degrees) {
+            if (degrees == 0) return input;
+            int outWidth = degrees == 180 ? width : height;
+            int outHeight = degrees == 180 ? height : width;
+            byte[] output = new byte[input.length];
+            java.nio.ByteBuffer.wrap(output).putInt(outWidth).putInt(outHeight);
+            for (int plane = 0; plane < 2; plane++) {
+                int unit = plane == 0 ? 1 : 2;
+                int w = plane == 0 ? width : width / 2;
+                int h = plane == 0 ? height : height / 2;
+                int ow = degrees == 180 ? w : h;
+                int offset = plane == 0 ? 8 : 8 + width * height;
+                for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+                    int dx = degrees == 90 ? h - 1 - y : degrees == 180 ? w - 1 - x : y;
+                    int dy = degrees == 90 ? x : degrees == 180 ? h - 1 - y : w - 1 - x;
+                    for (int c = 0; c < unit; c++) output[offset + (dy * ow + dx) * unit + c] = input[offset + (y * w + x) * unit + c];
+                }
+            }
+            return output;
+        }
+        synchronized void fail(String error) { failure = error; ready.countDown(); notifyAll(); }
+        public synchronized byte[] next() throws Exception {
+            if (latest == null && failure == null && !closed) wait(100);
+            if (failure != null) throw new IllegalStateException(failure);
+            if (closed) throw new IllegalStateException("Camera closed");
+            byte[] packet = latest; latest = null; return packet;
+        }
+        @Override public synchronized void close() {
+            if (closed) return;
+            closed = true; latest = null; notifyAll();
+            if (session != null) session.close();
+            if (camera != null) camera.close();
+            if (reader != null) reader.close();
+            thread.quitSafely();
+        }
+    }
+
+    /** Called only by a native worker, never by the UI thread. */
+    public synchronized String mediaRequest(String operation) throws Exception {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            throw new IllegalStateException("Media request must run on a worker");
+        }
+        MediaRequest request = new MediaRequest();
+        request.operation = operation;
+        activity.runOnUiThread(() -> {
+            try {
+                if (activity.isFinishing() || activity.isDestroyed()) {
+                    request.complete("error:Activity is closed");
+                    return;
+                }
+                activity.getFragmentManager().beginTransaction()
+                        .add(request, "sinomo-media-" + System.identityHashCode(request))
+                        .commitAllowingStateLoss();
+            } catch (RuntimeException error) {
+                request.complete("error:" + error.getMessage());
+            }
+        });
+        if (!request.done.await(120, java.util.concurrent.TimeUnit.SECONDS)) {
+            activity.runOnUiThread(() -> request.complete("error:Media request timed out"));
+            return "error:Media request timed out";
+        }
+        return request.result;
+    }
+
+    /** A local UI request; this class is never reachable through cluster RPC. */
+    public static final class MediaRequest extends android.app.Fragment {
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        String operation;
+        volatile String result = "error:Media request cancelled";
+        boolean started;
+
+        @Override public void onCreate(Bundle state) {
+            super.onCreate(state);
+            setRetainInstance(true);
+        }
+
+        @Override public void onResume() {
+            super.onResume();
+            if (started) return;
+            started = true;
+            if (operation == null) { complete("error:Media request interrupted"); return; }
+            try {
+                if (operation.equals("files") || operation.equals("file")) {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, operation.equals("files"));
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, 1);
+                } else if (operation.equals("app-use")) {
+                    Intent intent = new Intent();
+                    intent.setClassName(getActivity(), "net.sinomo.app.use.AppUseConsentActivity");
+                    startActivity(intent);
+                    complete("ok");
+                } else if (operation.equals("settings")) {
+                    startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:" + getActivity().getPackageName())));
+                    complete("ok");
+                } else {
+                    String permission = operation.equals("microphone") ? android.Manifest.permission.RECORD_AUDIO
+                            : operation.equals("camera") ? android.Manifest.permission.CAMERA : null;
+                    if (permission == null) { complete("error:Unknown media request"); return; }
+                    if (getActivity().checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        complete("ok");
+                    } else {
+                        requestPermissions(new String[] {permission}, 2);
+                    }
+                }
+            } catch (RuntimeException error) { complete("error:" + error.getMessage()); }
+        }
+
+        @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
+            if (code == 2) complete(grants.length == 1 && grants[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    ? "ok" : "error:Permission denied; allow access in Android app settings and retry");
+        }
+
+        @Override public void onActivityResult(int code, int status, Intent data) {
+            if (code != 1) return;
+            if (status != Activity.RESULT_OK || data == null) { complete("cancelled"); return; }
+            final Context context = getActivity().getApplicationContext();
+            new Thread(() -> {
+                java.util.ArrayList<java.io.File> copied = new java.util.ArrayList<>();
+                try {
+                    java.util.LinkedHashSet<android.net.Uri> uris = new java.util.LinkedHashSet<>();
+                    if (data.getClipData() != null) {
+                        if (data.getClipData().getItemCount() > 32) throw new java.io.IOException("Select at most 32 files");
+                        for (int i = 0; i < data.getClipData().getItemCount(); i++) uris.add(data.getClipData().getItemAt(i).getUri());
+                    } else if (data.getData() != null) uris.add(data.getData());
+                    org.json.JSONArray paths = new org.json.JSONArray();
+                    long total = 0;
+                    for (android.net.Uri uri : uris) {
+                        String name = "attachment";
+                        try (android.database.Cursor cursor = context.getContentResolver().query(uri,
+                                new String[] {android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) name = cursor.getString(0);
+                        }
+                        name = name.replaceAll("[\\/\\\\\\p{Cntrl}]", "_");
+                        if (name.equals(".") || name.equals("..") || name.isEmpty()) name = "attachment";
+                        if (name.length() > 160) name = name.substring(name.length() - 160);
+                        java.io.File directory = new java.io.File(context.getCacheDir(), "attachments/" + java.util.UUID.randomUUID());
+                        if (!directory.mkdirs()) throw new java.io.IOException("Cannot create attachment cache");
+                        java.io.File file = new java.io.File(directory, name);
+                        copied.add(file);
+                        try (java.io.InputStream input = context.getContentResolver().openInputStream(uri);
+                             java.io.OutputStream output = new java.io.FileOutputStream(file)) {
+                            if (input == null) throw new java.io.IOException("Selected document is unavailable");
+                            byte[] buffer = new byte[65536];
+                            int count;
+                            while ((count = input.read(buffer)) != -1) {
+                                total += count;
+                                if (total > 128L * 1024 * 1024 || done.getCount() == 0) throw new java.io.IOException("Attachment import cancelled or exceeds 128 MiB");
+                                output.write(buffer, 0, count);
+                            }
+                        }
+                        paths.put(file.getAbsolutePath());
+                    }
+                    final String value = paths.toString();
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> complete(value));
+                } catch (Exception error) {
+                    for (java.io.File file : copied) { file.delete(); file.getParentFile().delete(); }
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> complete("error:" + error.getMessage()));
+                }
+            }, "sinomo-document-import").start();
+        }
+
+        void complete(String value) {
+            if (done.getCount() == 0) return;
+            result = value;
+            done.countDown();
+            if (isAdded()) getFragmentManager().beginTransaction().remove(this).commitAllowingStateLoss();
+        }
+
+        @Override public void onDestroy() {
+            complete("error:Media request interrupted");
+            super.onDestroy();
         }
     }
 

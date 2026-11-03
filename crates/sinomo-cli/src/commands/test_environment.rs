@@ -958,6 +958,8 @@ mod tests {
     fn sample(time: u128) -> VideoFrame {
         (
             sinomo_video::stream::VideoFrameMetadata {
+                transport: sinomo_video::codec::VideoTransport::Image,
+                packet_sequence: None,
                 identity: None,
                 tiles: Vec::new(),
                 sequence: time as u64,
