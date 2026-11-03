@@ -32,6 +32,11 @@ pub(super) enum DocumentFormat {
     Html,
     Svg,
     Pdf,
+    Sqlite,
+    Parquet,
+    Zip,
+    Npy,
+    Npz,
     Notebook,
     Markdown,
     Json,
@@ -44,6 +49,11 @@ pub(super) enum DocumentFormat {
 impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::Sqlite => "SQLite",
+            Self::Parquet => "Parquet",
+            Self::Zip => "ZIP",
+            Self::Npy => "NumPy array",
+            Self::Npz => "NumPy archive",
             Self::Notebook => "Jupyter notebook",
             Self::Html => "HTML",
             Self::Svg => "SVG",
@@ -62,8 +72,36 @@ impl DocumentFormat {
         }
     }
 
+    pub(super) fn binary_artifact(self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite | Self::Parquet | Self::Zip | Self::Npy | Self::Npz
+        )
+    }
+    pub(super) fn artifact(name: &str, prefix: &[u8]) -> Option<Self> {
+        if prefix.starts_with(b"SQLite format 3\0") {
+            return Some(Self::Sqlite);
+        }
+
+        if prefix.starts_with(b"\x93NUMPY") {
+            return Some(Self::Npy);
+        }
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "parquet" | "pq" => Some(Self::Parquet),
+            "sqlite" | "sqlite3" => Some(Self::Sqlite),
+            "npy" => Some(Self::Npy),
+            "zip" => Some(Self::Zip),
+            "npz" => Some(Self::Npz),
+            _ => None,
+        }
+    }
     pub(super) fn hex_buffer(self) -> bool {
-        matches!(self, Self::Hex | Self::Image | Self::Sobj | Self::Pdf)
+        self.binary_artifact() || matches!(self, Self::Hex | Self::Image | Self::Sobj | Self::Pdf)
     }
 
     pub(super) fn paged(self) -> bool {
@@ -90,6 +128,9 @@ impl DocumentFormat {
 
 /// Called on the document load worker. Raster validation warms the bounded preview cache.
 pub(super) fn document_from_bytes(path: &str, bytes: &[u8]) -> (DocumentFormat, String) {
+    if let Some(format) = DocumentFormat::artifact(path, bytes) {
+        return (format, encode_hex(bytes));
+    }
     if bytes.starts_with(b"%PDF-") {
         return (DocumentFormat::Pdf, encode_hex(bytes));
     }
@@ -320,7 +361,7 @@ pub(super) fn json_preview_content(text: &str) -> Result<(String, JsonPreviewLim
     ))
 }
 
-pub(super) struct PreviewWidget(WidgetPod);
+pub(super) struct PreviewWidget(pub(super) WidgetPod);
 
 impl Widget for PreviewWidget {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
@@ -349,7 +390,13 @@ pub(super) fn preview_widget(
     reader: &ThemeReader,
 ) -> Option<PreviewWidget> {
     Some(PreviewWidget(match format {
-        DocumentFormat::Notebook | DocumentFormat::Pdf
+        DocumentFormat::Sqlite
+        | DocumentFormat::Parquet
+        | DocumentFormat::Zip
+        | DocumentFormat::Npy
+        | DocumentFormat::Npz
+        | DocumentFormat::Notebook
+        | DocumentFormat::Pdf
         | DocumentFormat::Html
         | DocumentFormat::Svg
         | DocumentFormat::Text

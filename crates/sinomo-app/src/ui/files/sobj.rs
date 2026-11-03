@@ -22,6 +22,54 @@ enum RowAction {
     Page(Vec<usize>, usize),
 }
 
+pub(super) fn field_row(
+    reader: &ThemeReader,
+    indent: f32,
+    name: &str,
+    glyph: &str,
+    value: Option<String>,
+    detail: String,
+) -> ListItem {
+    let mut line = Flex::horizontal()
+        .align_items(Alignment::Center)
+        .gap(6.)
+        .with_child(Label::new(glyph).theme_when(clone_reader(reader)))
+        .with_child(
+            Label::new(middle_short(name, 48))
+                .single_line(true)
+                .theme_when(clone_reader(reader)),
+        );
+    if let Some(value) = value {
+        let value = middle_short(&value.replace('\n', " "), 60);
+        line = line.with_item(
+            Label::new(value)
+                .single_line(true)
+                .theme_when(clone_reader(reader)),
+            FlexItem::fill(),
+        );
+    } else {
+        line = line.spacer();
+    }
+    line = line.with_child(
+        Label::new(detail.clone()).text_style_when(live_text_style(reader, |theme| {
+            theme.text_style(theme.palette.text_muted)
+        })),
+    );
+    ListItem::new(name)
+        .description(detail)
+        .activate_with_child(true)
+        .child(
+            WidgetPadding::new(
+                Insets {
+                    left: indent,
+                    ..Insets::ZERO
+                },
+                line,
+            )
+            .fill_child_width(true),
+        )
+}
+
 fn tree_rows(
     node: &Node<'_>,
     key: &str,
@@ -43,44 +91,7 @@ fn tree_rows(
     let indent = reader().metrics.tree_indent * path.len() as f32;
     let selected = state.selected.as_deref() == Some(path.as_slice());
     let item = |name: &str, glyph: &str, value: Option<String>, detail: String| {
-        let mut line = Flex::horizontal()
-            .align_items(Alignment::Center)
-            .gap(6.)
-            .with_child(Label::new(glyph).theme_when(clone_reader(reader)))
-            .with_child(
-                Label::new(middle_short(name, 48))
-                    .single_line(true)
-                    .theme_when(clone_reader(reader)),
-            );
-        if let Some(value) = value {
-            let value = middle_short(&value.replace('\n', " "), 60);
-            line = line.with_item(
-                Label::new(value)
-                    .single_line(true)
-                    .theme_when(clone_reader(reader)),
-                FlexItem::fill(),
-            );
-        } else {
-            line = line.spacer();
-        }
-        line = line.with_child(
-            Label::new(detail.clone()).text_style_when(live_text_style(reader, |theme| {
-                theme.text_style(theme.palette.text_muted)
-            })),
-        );
-        ListItem::new(name)
-            .description(detail)
-            .activate_with_child(true)
-            .child(
-                WidgetPadding::new(
-                    Insets {
-                        left: indent,
-                        ..Insets::ZERO
-                    },
-                    line,
-                )
-                .fill_child_width(true),
-            )
+        field_row(reader, indent, name, glyph, value, detail)
     };
     let glyph = if branch {
         if page.is_some() { "▾" } else { "▸" }
@@ -389,7 +400,7 @@ fn locate<'a>(doc: &'a DocumentCursor<'a>, path: &[usize]) -> Result<(String, No
     }
     Ok((names.join(" / "), node))
 }
-fn display(id: TypeId, data: &[u8]) -> Option<String> {
+pub(super) fn display(id: TypeId, data: &[u8]) -> Option<String> {
     macro_rules! number {
         ($t:ty) => {
             <$t>::from_le_bytes(data.try_into().ok()?).to_string()

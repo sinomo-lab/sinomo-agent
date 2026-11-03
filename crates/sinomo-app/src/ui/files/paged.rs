@@ -8,20 +8,20 @@ const PAGE_BYTES: usize = 16 * 1024;
 const PAGE_ROWS: usize = 64;
 const RECORD_BYTES: usize = 64 * 1024;
 
-enum Source {
+pub(super) enum Source {
     Memory(Vec<u8>),
     Local(fs::File, LocalFileFingerprint),
     Sifs(sinomo_client::SifsBrowser, SifsFileFingerprint),
 }
 impl Source {
-    fn len(&self) -> u64 {
+    pub(super) fn len(&self) -> u64 {
         match self {
             Self::Memory(bytes) => bytes.len() as u64,
             Self::Local(_, f) => f.len,
             Self::Sifs(_, f) => f.size_bytes.unwrap_or(0),
         }
     }
-    fn read(&mut self, offset: u64, length: usize) -> Result<Vec<u8>, String> {
+    pub(super) fn read(&mut self, offset: u64, length: usize) -> Result<Vec<u8>, String> {
         match self {
             Self::Memory(bytes) => Ok(bytes[offset as usize..offset as usize + length].to_vec()),
             Self::Local(file, f) => {

@@ -20,6 +20,7 @@
 //! under strict limits, and keep decoded pixels plus renderer registrations bounded. Sorting and
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
+pub(super) mod artifact;
 mod diff;
 mod editor_surface;
 mod formats;
@@ -981,6 +982,25 @@ struct SifsFileFingerprint {
     policy: String,
 }
 
+/// A large delimited file is paged before it has an editable source buffer.
+enum SourceSnapshot {
+    Local(LocalFileFingerprint),
+    Sifs(SifsFileFingerprint),
+}
+impl SourceSnapshot {
+    fn matches(&self, load: &FilesDocumentLoad) -> bool {
+        match self {
+            Self::Local(expected) => load.local_fingerprint.as_ref().is_some_and(|actual| {
+                actual.canonical_path == expected.canonical_path
+                    && actual.len == expected.len
+                    && actual.modified_at_unix_nanos == expected.modified_at_unix_nanos
+                    && actual.symlink == expected.symlink
+            }),
+            Self::Sifs(expected) => load.sifs_fingerprint.as_ref() == Some(expected),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesDocumentLoad {
     format: DocumentFormat,
@@ -1073,6 +1093,20 @@ impl FilesDocument {
                     .is_some_and(sobj::FieldDraft::modified))
     }
 
+    fn deferred_csv(&self) -> bool {
+        matches!(self.format, DocumentFormat::Csv | DocumentFormat::Tsv)
+            && self.text.is_empty()
+            && self.saved_text.is_empty()
+            && self
+                .local_fingerprint
+                .as_ref()
+                .map(|f| f.len)
+                .or_else(|| self.sifs_fingerprint.as_ref().and_then(|f| f.size_bytes))
+                .is_some_and(|n| n > FILE_DOCUMENT_MAX_BYTES)
+    }
+    fn streamed_artifact(&self) -> bool {
+        self.format.binary_artifact() && self.text.is_empty() && self.read_only_reason.is_some()
+    }
     fn streamed_pdf(&self) -> bool {
         self.format == DocumentFormat::Pdf && self.text.is_empty() && self.read_only_reason.is_some()
     }
@@ -1973,6 +2007,23 @@ impl FilesState {
                 if let Some(format) = restored_format {
                     document.format = format;
                     document.preview_open = !document.dirty();
+                }
+                if document.format == DocumentFormat::Hex && !document.dirty() {
+                    let prefix: Vec<_> = document
+                        .text
+                        .split_ascii_whitespace()
+                        .take(16)
+                        .map_while(|s| u8::from_str_radix(s, 16).ok())
+                        .collect();
+                    if let Some(format) = DocumentFormat::artifact(&document.path, &prefix) {
+                        document.format = format;
+                        document.preview_open = true;
+                        if format == DocumentFormat::Sqlite {
+                            document.text.clear();
+                            document.saved_text.clear();
+                            document.read_only_reason = Some("SQLite preview".into());
+                        }
+                    }
                 }
                 if document.saving {
                     document.saving = false;
@@ -4444,6 +4495,16 @@ impl FilesState {
         title: String,
         waker: Option<sui::UiHandle>,
     ) {
+        self.begin_document_load_mode(source, path, title, waker, None);
+    }
+    fn begin_document_load_mode(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        title: String,
+        waker: Option<sui::UiHandle>,
+        expected: Option<SourceSnapshot>,
+    ) {
         self.document_external_task = None;
         if let Some(waker) = waker {
             self.ensure_worker(waker);
@@ -4470,6 +4531,7 @@ impl FilesState {
         if tx
             .send(FilesWorkerCommand::ReadDocument {
                 request_id,
+                expected,
                 source,
                 path,
             })
@@ -4645,7 +4707,11 @@ impl FilesState {
         if document.report_base.is_some() {
             return;
         }
-        if document.streamed_pdf() || document.records_only() {
+        if document.deferred_csv()
+            || document.streamed_artifact()
+            || document.streamed_pdf()
+            || document.records_only()
+        {
             self.attachment_error = Some("Attach the original file from the file browser.".into());
             return;
         }
@@ -7538,6 +7604,7 @@ enum FilesWorkerCommand {
     },
     ReadDocument {
         request_id: u64,
+        expected: Option<SourceSnapshot>,
         source: FilesSourceKind,
         path: String,
     },
@@ -8077,6 +8144,7 @@ fn files_worker_loop(
             }
             FilesWorkerCommand::ReadDocument {
                 request_id,
+                expected,
                 source,
                 path,
             } => {
@@ -8084,7 +8152,11 @@ fn files_worker_loop(
                 let (path, result) = if source == FilesSourceKind::Local {
                     match requested_path {
                         Ok(path) => {
-                            let result = load_local_text_document(&path, FILE_DOCUMENT_MAX_BYTES);
+                            let result = load_local_document_mode(
+                                &path,
+                                FILE_DOCUMENT_MAX_BYTES,
+                                expected.is_some(),
+                            );
                             (path, result)
                         }
                         Err(error) => (path, Err(error)),
@@ -8110,8 +8182,12 @@ fn files_worker_loop(
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
                             let path = browser.normalize(&requested_path);
-                            let result =
-                                load_sifs_text_document(browser, &path, FILE_DOCUMENT_MAX_BYTES);
+                            let result = load_sifs_document_mode(
+                                browser,
+                                &path,
+                                FILE_DOCUMENT_MAX_BYTES,
+                                expected.is_some(),
+                            );
                             (path, result)
                         }
                         (None, Some(error)) => (requested_path, Err(error.clone())),
@@ -8121,6 +8197,15 @@ fn files_worker_loop(
                         ),
                     }
                 };
+                let result = result.and_then(|mut loaded| {
+                    if let Some(expected) = expected {
+                        if !expected.matches(&loaded) {
+                            return Err("The file changed after preview opened. Reload to edit the current version.".into());
+                        }
+                        loaded.preview_open = false;
+                    }
+                    Ok(loaded)
+                });
                 let _ = result_tx.send(FilesWorkerResult::Document {
                     request_id,
                     source,
@@ -9791,14 +9876,15 @@ fn pdf_name(path: &str) -> bool {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
-fn streamed_pdf_load(
+fn streamed_document_load(
+    format: DocumentFormat,
     source: FilesSourceKind,
     path: &str,
     local_fingerprint: Option<LocalFileFingerprint>,
     sifs_fingerprint: Option<SifsFileFingerprint>,
 ) -> FilesDocumentLoad {
     FilesDocumentLoad {
-        format: DocumentFormat::Pdf,
+        format,
         preview_open: true,
         source,
         path: path.into(),
@@ -9810,14 +9896,54 @@ fn streamed_pdf_load(
         text: String::new(),
         local_fingerprint,
         sifs_fingerprint,
-        read_only_reason: Some("PDF preview".into()),
+        read_only_reason: Some(format!("{} preview", format.label())),
     }
 }
 
+#[cfg(test)]
 fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentLoad, String> {
+    load_local_document_mode(path, max_bytes, false)
+}
+fn load_local_document_mode(
+    path: &str,
+    max_bytes: u64,
+    materialize: bool,
+) -> Result<FilesDocumentLoad, String> {
     let before = local_file_fingerprint(path)?;
+    if before.len > max_bytes {
+        let mut signature = [0; 16];
+        fs::File::open(&before.canonical_path)
+            .and_then(|mut f| f.read_exact(&mut signature))
+            .map_err(|e| e.to_string())?;
+        if let Some(format) = DocumentFormat::artifact(path, &signature) {
+            return Ok(streamed_document_load(
+                format,
+                FilesSourceKind::Local,
+                path,
+                Some(before),
+                None,
+            ));
+        }
+    }
+    let text_format = formats::text_format(path);
+    if !materialize
+        && before.len > max_bytes
+        && matches!(text_format, DocumentFormat::Csv | DocumentFormat::Tsv)
+    {
+        let reason = local_document_read_only_reason(&before);
+        let mut load = streamed_document_load(
+            text_format,
+            FilesSourceKind::Local,
+            path,
+            Some(before),
+            None,
+        );
+        load.read_only_reason = reason;
+        return Ok(load);
+    }
     if before.len > max_bytes && pdf_name(path) {
-        return Ok(streamed_pdf_load(
+        return Ok(streamed_document_load(
+            DocumentFormat::Pdf,
             FilesSourceKind::Local,
             path,
             Some(before),
@@ -9849,6 +9975,15 @@ fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentL
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
+    if format == DocumentFormat::Sqlite {
+        return Ok(streamed_document_load(
+            format,
+            FilesSourceKind::Local,
+            path,
+            Some(fingerprint),
+            None,
+        ));
+    }
     let read_only_reason =
         encoding_reason.or_else(|| local_document_read_only_reason(&fingerprint));
     Ok(FilesDocumentLoad {
@@ -9928,15 +10063,67 @@ fn read_sifs_snapshot_bytes(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn load_sifs_text_document(
     browser: &SifsBrowser,
     path: &str,
     max_bytes: u64,
 ) -> Result<FilesDocumentLoad, String> {
+    load_sifs_document_mode(browser, path, max_bytes, false)
+}
+fn load_sifs_document_mode(
+    browser: &SifsBrowser,
+    path: &str,
+    max_bytes: u64,
+    materialize: bool,
+) -> Result<FilesDocumentLoad, String> {
     let details = browser.stat(path)?;
     let fingerprint = sifs_file_fingerprint(&details)?;
+    // Probe the opened generation, so a SQLite database does not need a particular extension.
+    if fingerprint.size_bytes.is_some_and(|n| n > max_bytes) {
+        let size = fingerprint.size_bytes.unwrap();
+        let prefix = browser.read_object_range(
+            &sinomo_client::api::DaemonDfsBrowserReadObjectRangeRequest {
+                object_id: fingerprint.object_id.clone(),
+                version: fingerprint.version.clone(),
+                content_hash: fingerprint
+                    .content_hash
+                    .clone()
+                    .ok_or("Missing SIFS content hash")?,
+                size_bytes: size,
+                offset: 0,
+                length: size.min(16) as u32,
+            },
+        )?;
+        if let Some(format) = DocumentFormat::artifact(path, &prefix) {
+            return Ok(streamed_document_load(
+                format,
+                FilesSourceKind::Sifs,
+                path,
+                None,
+                Some(fingerprint),
+            ));
+        }
+    }
+    let text_format = formats::text_format(path);
+    if !materialize
+        && fingerprint.size_bytes.is_some_and(|n| n > max_bytes)
+        && matches!(text_format, DocumentFormat::Csv | DocumentFormat::Tsv)
+    {
+        let mut load = streamed_document_load(
+            text_format,
+            FilesSourceKind::Sifs,
+            path,
+            None,
+            Some(fingerprint),
+        );
+        load.read_only_reason =
+            (details.mode & 0o222 == 0).then(|| "SIFS marks this file read-only.".into());
+        return Ok(load);
+    }
     if fingerprint.size_bytes.is_some_and(|size| size > max_bytes) && pdf_name(path) {
-        return Ok(streamed_pdf_load(
+        return Ok(streamed_document_load(
+            DocumentFormat::Pdf,
             FilesSourceKind::Sifs,
             path,
             None,
@@ -9976,6 +10163,15 @@ fn load_sifs_text_document(
     };
     let (format, text, encoding_reason, preview_open) =
         decode_loaded_document(path, bytes, max_bytes)?;
+    if format == DocumentFormat::Sqlite {
+        return Ok(streamed_document_load(
+            format,
+            FilesSourceKind::Sifs,
+            path,
+            None,
+            Some(fingerprint),
+        ));
+    }
     let title = path
         .rsplit('/')
         .find(|part| !part.is_empty())
@@ -14534,6 +14730,34 @@ fn file_entry_key(entry: &SifsEntry) -> u64 {
     key.max(1)
 }
 
+fn paint_file_name(
+    ctx: &mut PaintCtx,
+    theme: &DefaultTheme,
+    name_cell: Rect,
+    name: &str,
+    icon: Option<IconGlyph>,
+    side: f32,
+    icon_color: Color,
+    label_color: Color,
+) {
+    let style = LeadingLabelCellPaint::new()
+        .icon_color(icon_color)
+        .label_color(label_color)
+        .label_weight(FontWeight::MEDIUM)
+        .icon_slot_side(ROW_THUMBNAIL_SIDE)
+        .icon_inset(2.0)
+        .gap(8.0);
+    let style = if icon.is_none() {
+        style.padding(6.0 + side + 8.0, 8.0)
+    } else {
+        style.icon(icon.unwrap()).padding(6.0, 8.0)
+    };
+    let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
+    let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
+    let display_name = display_name_for_width(name, label_width, average_char_width);
+    paint_leading_label_cell(ctx, theme, name_cell, &display_name, style);
+}
+
 fn paint_file_table_row(
     ctx: &mut PaintCtx,
     shared: &Shared,
@@ -14602,22 +14826,16 @@ fn paint_file_table_row(
                 ))
             })
             .unwrap_or(false);
-        let style = LeadingLabelCellPaint::new()
-            .icon_color(icon_color)
-            .label_color(label_color)
-            .label_weight(FontWeight::MEDIUM)
-            .icon_slot_side(ROW_THUMBNAIL_SIDE)
-            .icon_inset(2.0)
-            .gap(8.0);
-        let style = if painted {
-            style.padding(6.0 + side + 8.0, 8.0)
-        } else {
-            style.icon(entry_icon(entry)).padding(6.0, 8.0)
-        };
-        let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
-        let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
-        let display_name = display_name_for_width(&entry.name, label_width, average_char_width);
-        paint_leading_label_cell(ctx, &theme, name_cell, &display_name, style);
+        paint_file_name(
+            ctx,
+            &theme,
+            name_cell,
+            &entry.name,
+            (!painted).then(|| entry_icon(entry)),
+            side,
+            icon_color,
+            label_color,
+        );
     }
 
     if let Some(placement_cell) = row.column_rects.get(2).copied() {
@@ -22437,6 +22655,12 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 return WidgetPod::new(SizedBox::new());
             };
             if document.preview_open
+                && (document.format.binary_artifact()
+                    || matches!(document.format, DocumentFormat::Csv | DocumentFormat::Tsv))
+            {
+                return artifact::view(document, &s, &r);
+            }
+            if document.preview_open
                 && matches!(
                     document.format,
                     DocumentFormat::Html | DocumentFormat::Svg | DocumentFormat::Pdf
@@ -22529,7 +22753,10 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 return WidgetPod::new(SizedBox::new().height(0.));
             }
             let mut row = Flex::horizontal().gap(8.0).align_items(Alignment::Center);
-            if document.format.has_preview() && !document.records_only() && !document.streamed_pdf()
+            if document.format.has_preview()
+                && !document.records_only()
+                && !document.streamed_artifact()
+                && !document.streamed_pdf()
             {
                 let change = s.clone();
                 row = row.with_child(
@@ -22549,7 +22776,26 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                         .selected(if document.preview_open { 0 } else { 1 })
                         .theme_when(clone_reader(&r))
                         .on_change_with_ctx(move |ctx, index, _| {
+                            let waker = change.borrow().waker.clone();
                             let mut files = change.files_mut();
+                            if index == 1
+                                && let Some(d) =
+                                    files.document.as_ref().filter(|d| d.deferred_csv())
+                            {
+                                let expected = d
+                                    .local_fingerprint
+                                    .clone()
+                                    .map(SourceSnapshot::Local)
+                                    .or_else(|| {
+                                        d.sifs_fingerprint.clone().map(SourceSnapshot::Sifs)
+                                    });
+                                let (source, path, title) =
+                                    (d.source, d.path.clone(), d.title.clone());
+                                files
+                                    .begin_document_load_mode(source, path, title, waker, expected);
+                                request_files_overlay_rebuild(ctx);
+                                return;
+                            }
                             if let Some(document) = files.document.as_mut() {
                                 if document.format == DocumentFormat::Sobj {
                                     if let Err(error) = sobj::apply_field(document) {
@@ -22685,6 +22931,8 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         let files = attach_enabled.files();
         files.document.as_ref().is_some_and(|document| {
             document.report_base.is_none()
+                && !document.deferred_csv()
+                && !document.streamed_artifact()
                 && !document.streamed_pdf()
                 && !document.records_only()
                 && !document.loading

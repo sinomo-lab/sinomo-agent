@@ -192,6 +192,12 @@ wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 [workspace.dependencies]
 sha2 = "0.11"
 xz2 = { version = "0.1.7", features = ["static"] }
+csv = "1.4"
+half = "2.7.1"
+npyz = "0.9.1"
+parquet = { version = "60.1", default-features = false, features = ["snap", "zstd", "brotli", "lz4", "flate2-zlib-rs", "json"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "limits", "hooks"] }
+tempfile = "3.27"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sinomo-actions = { path = "crates/sinomo-actions" }
 sinomo-video = { path = "crates/sinomo-video", default-features = false }

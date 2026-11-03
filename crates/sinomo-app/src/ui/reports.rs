@@ -114,6 +114,7 @@ impl DesktopExtension for ReportHost {
 }
 pub(super) enum Content {
     Bytes(Vec<u8>),
+    Archive(Arc<[u8]>, super::files::artifact::Assets),
     LocalPdf(PathBuf, u64, Option<u64>),
     SifsPdf(String, String, String, u64),
 }
@@ -216,17 +217,22 @@ impl Origin {
         thread::Builder::new()
             .name("sinomo-report-assets".into())
             .spawn(move || {
-                let local = if report.source == FilesSourceKind::Local
+                let local = if !matches!(report.content, Content::Archive(..))
+                    && report.source == FilesSourceKind::Local
                     && Path::new(&report.base).is_absolute()
                 {
                     Dir::open_ambient_dir(&report.base, ambient_authority()).ok()
                 } else {
                     None
                 };
-                if report.mime == NOTEBOOK_MIME
-                    && let Content::Bytes(data) = &mut report.content
-                {
-                    *data = notebook::page(data).into_bytes();
+                if report.mime == NOTEBOOK_MIME {
+                    match &mut report.content {
+                        Content::Bytes(data) => *data = notebook::page(data).into_bytes(),
+                        Content::Archive(data, _) => {
+                            *data = notebook::page(data).into_bytes().into()
+                        }
+                        _ => {}
+                    }
                 }
                 let mut browser = None;
                 while !stop.load(Ordering::Acquire) {
@@ -443,11 +449,13 @@ fn serve(
                 .to_owned(),
         )
     };
+    let archive_bytes;
     let resource = if renderer {
         Resource::Memory(notebook::SCRIPT.as_bytes())
     } else if primary {
         match &report.content {
             Content::Bytes(data) => Resource::Memory(data),
+            Content::Archive(data, _) => Resource::Memory(data),
             Content::LocalPdf(path, len, modified) => {
                 let f = std::fs::File::open(path).map_err(|_| missing())?;
                 let m = f.metadata().map_err(|_| missing())?;
@@ -470,6 +478,9 @@ fn serve(
         }
     } else if report.mime == "application/pdf" {
         return Err(missing());
+    } else if let Content::Archive(_, assets) = &report.content {
+        archive_bytes = assets.read(&path).map_err(|_| missing())?;
+        Resource::Memory(&archive_bytes)
     } else {
         match report.source {
             FilesSourceKind::Local => {
@@ -709,6 +720,37 @@ mod tests {
         let (status, script, _) = get(&origin, Some(notebook::SCRIPT_NAME), None);
         assert_eq!(status, 200);
         assert_eq!(script, notebook::SCRIPT.as_bytes());
+    }
+    #[test]
+    fn artifact_archive_report_resolves_member_assets_without_host_fallback() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = sinomo_testdir::TestDir::new("archive-asset-root");
+        std::fs::write(dir.join("host-only.txt"), b"host data").unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "reports/images/plot.svg",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"<svg/>").unwrap();
+        let assets = super::super::files::artifact::test_archive_assets(
+            writer.finish().unwrap().into_inner(),
+            "reports",
+        );
+        let origin = Origin::start(Report {
+            source: FilesSourceKind::Local,
+            base: dir.to_string_lossy().into_owned(),
+            name: "report.html".into(),
+            mime: "text/html",
+            content: Content::Archive(Arc::from(&b"<img src='images/plot.svg'>"[..]), assets),
+            address: None,
+            runtime: rt.handle().clone(),
+        })
+        .unwrap();
+        assert_eq!(get(&origin, Some("images/plot.svg"), None).1, b"<svg/>");
+        assert_eq!(get(&origin, Some("host-only.txt"), None).0, 404);
+        assert_eq!(get(&origin, Some("../outside.txt"), None).0, 404);
     }
     #[test]
     fn report_pdf_serves_full_and_partial_responses() {
