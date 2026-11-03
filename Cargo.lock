@@ -10221,6 +10221,7 @@ dependencies = [
  "blake3",
  "fs2",
  "serde",
+ "sinomo-file-sync",
  "sinomo-module-api",
  "sinomo-runtime",
  "time",
@@ -10347,6 +10348,17 @@ dependencies = [
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
+]
+
+[[package]]
+name = "sinomo-file-sync"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fs2",
+ "serde",
+ "sinomo-core",
+ "sinomo-module-api",
 ]
 
 [[package]]
@@ -10761,6 +10773,7 @@ dependencies = [
  "sinomo-dfs-migration",
  "sinomo-dfs-nfs",
  "sinomo-eval",
+ "sinomo-file-sync",
  "sinomo-installer",
  "sinomo-module",
  "sinomo-module-api",

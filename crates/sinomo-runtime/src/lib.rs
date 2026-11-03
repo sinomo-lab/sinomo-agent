@@ -273,3 +273,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(feature = "file-sync")]
+pub use sinomo_file_sync as file_sync;

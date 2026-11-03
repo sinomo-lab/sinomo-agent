@@ -25,6 +25,7 @@ crate-type = ["rlib", "cdylib"]
 default = []
 
 [dependencies]
+sinomo-file-sync = { path = "../../../crates/sinomo-file-sync" }
 blake3.workspace = true
 fs2.workspace = true
 serde.workspace = true
