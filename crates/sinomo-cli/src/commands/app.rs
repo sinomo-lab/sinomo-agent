@@ -44,6 +44,30 @@ fn parse_app_matches(matches: &CliCommandMatches) -> Result<AppSupervisorCommand
 }
 
 fn run_app_supervisor(command: AppSupervisorCommand) -> Result<(), CliError> {
+    use sinomo_runtime::api::app::update::{
+        APP_FATAL_DIALOG_ARG, APP_FATAL_DIALOG_ENV, APP_REPORTED_ERROR_EXIT_CODE,
+    };
+
+    let result = supervise_desktop(&command);
+    if let Err(error) = &result
+        && std::env::var_os(APP_FATAL_DIALOG_ENV).is_some()
+        && !matches!(error, CliError::ModuleCommandExit {exit_code, ..} if *exit_code == i32::from(APP_REPORTED_ERROR_EXIT_CODE))
+    {
+        // This mode runs just the native dialog, even if startup failed before
+        // the daemon, the renderer or the user's data directory was available.
+        let detail = error.to_string();
+        if let Err(report_error) = std::process::Command::new(&command.executable)
+            .arg(APP_FATAL_DIALOG_ARG)
+            .arg(detail.chars().take(4096).collect::<String>())
+            .spawn()
+        {
+            eprintln!("Could not open the Sinomo error dialog: {report_error}");
+        }
+    }
+    result
+}
+
+fn supervise_desktop(command: &AppSupervisorCommand) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let code = run_desktop_app_supervisor(&data_dir, &command.executable, &command.args).map_err(
         |detail| CliError::ExternalCommand {
@@ -57,7 +81,7 @@ fn run_app_supervisor(command: AppSupervisorCommand) -> Result<(), CliError> {
         Err(CliError::ModuleCommandExit {
             command: "app supervise".into(),
             detail: format!("desktop application exited with status {code}"),
-            exit_code: code.clamp(0, 255),
+            exit_code: code.clamp(1, 255),
         })
     }
 }
