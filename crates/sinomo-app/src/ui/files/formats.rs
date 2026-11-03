@@ -28,6 +28,7 @@ pub(super) enum DocumentFormat {
     Log,
     JsonLines,
     Diff,
+    Sobj,
     Markdown,
     Json,
     Csv,
@@ -40,6 +41,7 @@ impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Text => "Text",
+            Self::Sobj => "SOBJ",
             Self::Diff => "Unified diff",
             Self::Log => "Log",
             Self::JsonLines => "JSON Lines",
@@ -50,6 +52,10 @@ impl DocumentFormat {
             Self::Image => "Image",
             Self::Hex => "Hex",
         }
+    }
+
+    pub(super) fn hex_buffer(self) -> bool {
+        matches!(self, Self::Hex | Self::Image | Self::Sobj)
     }
 
     pub(super) fn paged(self) -> bool {
@@ -76,6 +82,13 @@ impl DocumentFormat {
 
 /// Called on the document load worker. Raster validation warms the bounded preview cache.
 pub(super) fn document_from_bytes(path: &str, bytes: &[u8]) -> (DocumentFormat, String) {
+    if bytes.starts_with(sinomo_runtime::object::MAGIC)
+        || Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sobj"))
+    {
+        return (DocumentFormat::Sobj, encode_hex(bytes));
+    }
     if bytes.len() as u64 <= FILE_DOCUMENT_MAX_BYTES
         && image::guess_format(bytes).is_ok_and(supported_image)
         && image_bitmap(bytes).is_ok()
@@ -106,7 +119,7 @@ pub(super) fn text_format(path: &str) -> DocumentFormat {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(super) fn encode_hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len().saturating_mul(3));
     for (index, byte) in bytes.iter().enumerate() {
         if index != 0 {
@@ -119,7 +132,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 pub(super) fn document_bytes(format: DocumentFormat, text: &str) -> Result<Vec<u8>, String> {
     let limit = FILE_DOCUMENT_MAX_BYTES as usize;
-    if !matches!(format, DocumentFormat::Hex | DocumentFormat::Image) {
+    if !format.hex_buffer() {
         return Ok(text.as_bytes().to_vec());
     }
     if text.len() > limit.saturating_mul(6) {
@@ -326,6 +339,10 @@ pub(super) fn preview_widget(
         | DocumentFormat::Hex
         | DocumentFormat::Log
         | DocumentFormat::JsonLines => return None,
+        DocumentFormat::Sobj => note(
+            super::sobj::summary(text).unwrap_or_else(|e| format!("Fields unavailable: {e}")),
+            reader,
+        ),
         DocumentFormat::Diff => WidgetPod::new(super::diff::patch(text).view(reader)),
         DocumentFormat::Image => match document_bytes(format, text) {
             Ok(bytes) => WidgetPod::new(DocumentImage::new(bytes, reader)),

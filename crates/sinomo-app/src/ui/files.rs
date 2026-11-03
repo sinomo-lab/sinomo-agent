@@ -25,6 +25,7 @@ mod editor_surface;
 mod formats;
 mod paged;
 mod source_editor;
+mod sobj;
 use formats::DocumentFormat;
 
 use std::cell::{Cell, RefCell};
@@ -983,6 +984,7 @@ struct SifsFileFingerprint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesDocumentLoad {
     format: DocumentFormat,
+    preview_open: bool,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -1011,6 +1013,8 @@ struct FilesDocument {
     format: DocumentFormat,
     #[serde(default)]
     preview_open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sobj_field: Option<sobj::FieldDraft>,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -1038,6 +1042,7 @@ impl FilesDocument {
         Self {
             format: DocumentFormat::Text,
             preview_open: false,
+            sobj_field: None,
             source,
             path,
             title,
@@ -1055,7 +1060,13 @@ impl FilesDocument {
     }
 
     fn dirty(&self) -> bool {
-        !self.loading && self.load_error.is_none() && self.text != self.saved_text
+        !self.loading
+            && self.load_error.is_none()
+            && (self.text != self.saved_text
+                || self
+                    .sobj_field
+                    .as_ref()
+                    .is_some_and(sobj::FieldDraft::modified))
     }
 
     fn records_only(&self) -> bool {
@@ -1928,6 +1939,17 @@ impl FilesState {
             {
                 self.begin_document_load(document.source, document.path, document.title, waker);
             } else {
+                if document.format == DocumentFormat::Hex
+                    && (Path::new(&document.path)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("sobj"))
+                        || document.text.starts_with("53 4F 42 4A"))
+                {
+                    document.format = DocumentFormat::Sobj;
+                    document.preview_open = !document.dirty()
+                        && formats::document_bytes(document.format, &document.text)
+                            .is_ok_and(|bytes| sobj::can_inspect(&bytes));
+                }
                 if document.saving {
                     document.saving = false;
                     document.save_error = Some("The app closed during a save. Your edits are preserved; reload or retry with version protection.".into());
@@ -3239,7 +3261,8 @@ impl FilesState {
                     Ok(load) => {
                         self.document = Some(FilesDocument {
                             format: load.format,
-                            preview_open: (load.format.has_preview() && !load.format.paged()) || load.read_only_reason.as_deref() == Some(UNDECODABLE_LOG),
+                            preview_open: load.preview_open,
+                            sobj_field: None,
                             source: load.source,
                             path: load.path,
                             title: load.title,
@@ -4455,6 +4478,10 @@ impl FilesState {
         if !document.editable() || !document.dirty() || document.saving {
             return;
         }
+        if let Err(error) = sobj::apply_field(document) {
+            document.save_error = Some(error);
+            return;
+        }
         let bytes = match formats::document_bytes(document.format, &document.text) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -4578,13 +4605,13 @@ impl FilesState {
             return;
         }
         if document.text.len() as u64 > FILE_ATTACHMENT_MAX_BYTES
-            && !matches!(document.format, DocumentFormat::Image | DocumentFormat::Hex)
+            && !document.format.hex_buffer()
         {
             self.attachment_error = Some("This file exceeds the attachment size limit.".into());
             return;
         }
         self.attachment_error = None;
-        let bytes = match formats::document_bytes(document.format, &document.text) {
+        let bytes = match sobj::draft_bytes(document) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.attachment_error = Some(error);
@@ -9694,20 +9721,25 @@ fn decode_loaded_document(
     path: &str,
     data: Option<Vec<u8>>,
     binary_limit: u64,
-) -> Result<(DocumentFormat, String, Option<String>), String> {
+) -> Result<(DocumentFormat, String, Option<String>, bool), String> {
     if let Some(data) = data {
         if data.len() as u64 > binary_limit {
+            let format = formats::text_format(path);
             return Ok((
-                formats::text_format(path),
+                format,
                 String::from_utf8(data).map_err(|e| e.to_string())?,
                 None,
+                format.has_preview() && !format.paged(),
             ));
         }
         let (format, text) = formats::document_from_bytes(path, &data);
-        return Ok((format, text, None));
+        let preview_open = format.has_preview()
+            && !format.paged()
+            && (format != DocumentFormat::Sobj || sobj::can_inspect(&data));
+        return Ok((format, text, None, preview_open));
     }
     DocumentFormat::log_format(path)
-        .map(|format| (format, String::new(), Some(UNDECODABLE_LOG.into())))
+        .map(|format| (format, String::new(), Some(UNDECODABLE_LOG.into()), true))
         .ok_or_else(|| "Binary file exceeds the hex editor size limit.".into())
 }
 
@@ -9732,7 +9764,8 @@ fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentL
         let (data, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
         (Some(data), fingerprint)
     };
-    let (format, text, encoding_reason) = decode_loaded_document(path, content, max_bytes)?;
+    let (format, text, encoding_reason, preview_open) =
+        decode_loaded_document(path, content, max_bytes)?;
     let title = Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -9741,6 +9774,7 @@ fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentL
         encoding_reason.or_else(|| local_document_read_only_reason(&fingerprint));
     Ok(FilesDocumentLoad {
         format,
+        preview_open,
         source: FilesSourceKind::Local,
         path: path.to_string(),
         title,
@@ -9853,7 +9887,8 @@ fn load_sifs_text_document(
             max_bytes,
         )?)
     };
-    let (format, text, encoding_reason) = decode_loaded_document(path, bytes, max_bytes)?;
+    let (format, text, encoding_reason, preview_open) =
+        decode_loaded_document(path, bytes, max_bytes)?;
     let title = path
         .rsplit('/')
         .find(|part| !part.is_empty())
@@ -9869,6 +9904,7 @@ fn load_sifs_text_document(
     });
     Ok(FilesDocumentLoad {
         format,
+        preview_open,
         source: FilesSourceKind::Sifs,
         path: path.to_string(),
         title,
@@ -22258,6 +22294,9 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             let Some(document) = files.document.as_ref() else {
                 return WidgetPod::new(SizedBox::new());
             };
+            if document.format == DocumentFormat::Sobj && document.preview_open {
+                return sobj::view(document, &s, &r);
+            }
             if document.format.paged() && document.preview_open {
                 return paged::view(document, &s, &r, &active);
             }
@@ -22278,7 +22317,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                     );
                 }
             }
-            if !matches!(document.format, DocumentFormat::Hex | DocumentFormat::Image) {
+            if !document.format.hex_buffer() {
                 return source_editor::view(document, &s, &r, &active);
             }
             let editor_shared = s.clone();
@@ -22322,12 +22361,13 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 row = row.with_child(
                     SegmentedControl::new("Document view")
                         .items([
-                            SegmentedControlItem::new("Preview"),
+                            SegmentedControlItem::new(if document.format == DocumentFormat::Sobj {
+                                "Fields"
+                            } else {
+                                "Preview"
+                            }),
                             SegmentedControlItem::new(
-                                if matches!(
-                                    document.format,
-                                    DocumentFormat::Image | DocumentFormat::Hex
-                                ) {
+                                if document.format.hex_buffer() {
                                     "Hex editor"
                                 } else {
                                     "Source"
@@ -22339,6 +22379,15 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                         .on_change_with_ctx(move |ctx, index, _| {
                             let mut files = change.files_mut();
                             if let Some(document) = files.document.as_mut() {
+                                if document.format == DocumentFormat::Sobj {
+                                    if let Err(error) = sobj::apply_field(document) {
+                                        document.save_error = Some(error);
+                                        files.document_revision = files.document_revision.wrapping_add(1);
+                                        request_files_overlay_rebuild(ctx);
+                                        return;
+                                    }
+                                    document.sobj_field = None;
+                                }
                                 document.preview_open = index == 0;
                             }
                             files.document_revision = files.document_revision.wrapping_add(1);
@@ -38380,6 +38429,7 @@ mod tests {
         files.document = Some(FilesDocument {
             format: DocumentFormat::Text,
             preview_open: false,
+            sobj_field: None,
             source: loaded.source,
             path: loaded.path,
             title: loaded.title,
@@ -38436,6 +38486,7 @@ mod tests {
                     files.document = Some(FilesDocument {
                         format: DocumentFormat::Text,
                         preview_open: false,
+                        sobj_field: None,
                         source: FilesSourceKind::Local,
                         path: document_path.clone(),
                         title: "service_handler.rs".to_string(),
