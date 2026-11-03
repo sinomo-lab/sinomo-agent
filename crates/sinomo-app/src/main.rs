@@ -4,6 +4,28 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(not(target_os = "android"))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--external-edit-launch"))
+    {
+        return match sinomo_app::external_edit::monitor() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("ERR {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(not(target_os = "android"))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--external-edit-worker"))
+    {
+        return match sinomo_app::external_edit::run_helper() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("External edit: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if std::env::var_os(sinomo_client::api::app::update::APP_SUPERVISED_ENV).is_none() {
         let result = (|| -> Result<Option<std::process::Child>, String> {
             let app = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -41,6 +63,8 @@ fn main() -> ExitCode {
             }
         }
     }
+    #[cfg(not(target_os = "android"))]
+    sinomo_app::external_edit::resume_sessions();
     match sinomo_app::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

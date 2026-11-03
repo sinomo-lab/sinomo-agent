@@ -31,6 +31,9 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [dependencies]
+sysinfo.workspace = true
+notify.workspace = true
+fs2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
@@ -59,6 +62,7 @@ sinomo-runtime = { path = "../sinomo-runtime", default-features = false, feature
     "client",
     "native-devices",
     "module-client",
+    "file-sync",
     "observe-client",
 ] }
 
@@ -69,6 +73,12 @@ sinomo-agent = { path = "../sinomo-agent" }
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
 sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }
 sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Registry"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [build-dependencies]
 android-build = "0.1.4"

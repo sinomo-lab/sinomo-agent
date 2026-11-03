@@ -533,6 +533,35 @@ impl SifsBrowser {
         Ok(())
     }
 
+    pub fn durable_replace(
+        &self,
+        payload: &api::DaemonDfsBrowserDurableReplaceRequest,
+    ) -> Result<api::DaemonDfsBrowserDurableReplaceOutcome, String> {
+        let request = ObjectRpcRequest::encode_body(
+            api::DAEMON_DFS_BROWSER_DURABLE_REPLACE_ROUTE,
+            api::DAEMON_RPC_CATEGORY,
+            payload,
+        )
+        .map_err(|error| error.to_string())?;
+        let response = self.send(&request).map_err(|error| error.to_string())?;
+        response.error_detail().map_err(|error| error.to_string())?;
+        response.decode_body().map_err(|error| error.to_string())
+    }
+
+    pub fn live_mount_status(&self) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, String> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_runtime::dfs::SIFS_MOUNT_STATUS_ROUTE,
+            "sinomo.dfs.mount.status",
+            &sinomo_runtime::dfs::SifsMountStatusRequest,
+        )
+        .map_err(|error| error.to_string())?;
+        let response = self.send(&request).map_err(|error| error.to_string())?;
+        response.error_detail().map_err(|error| error.to_string())?;
+        let response: sinomo_runtime::dfs::SifsMountStatusResponse =
+            response.decode_body().map_err(|error| error.to_string())?;
+        Ok(response.status)
+    }
+
     pub fn replace_file_if_version(
         &self,
         path: &str,

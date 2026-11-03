@@ -284,6 +284,38 @@ and WebP previews load as you scroll. Selection, marked files, sorting, and file
 actions work across views. Single-click to select and double-click to open; use the
 arrow keys to move between cards, Space to mark an item, and Enter to open it.
 
+On desktop, choose **Open externally** from a writable SIFS file’s selection
+menu, or from its document view after saving your edits. Sinomo opens the
+file through a live, writable local mount when that mount covers the path.
+Otherwise it opens a working copy of the selected version (up to 32 MiB).
+For a managed working copy, set `SINOMO_EXTERNAL_EDITOR` to an editor
+executable to choose it explicitly. VS Code, VSCodium and Sublime Text CLI
+profiles use document waiting. On Windows the registered edit handler can
+also supply a process handle. The Open With chooser remains available when
+the association does not provide an edit handler. Opening the same active
+copy again preserves local edits and adds another tracked open.
+
+Use **External working copy → Working-copy status** to see the last sync result
+and local path in Files tasks. **Storage health → External working copies** lists
+active copies on this computer, including copies whose original file is no
+longer visible. Refresh the sheet to update their status. Closing the Files
+tab does not stop syncing.
+Local saves can remain pending while offline. If the remote version changes,
+Sinomo keeps the local file and stops publication on a version conflict.
+**Reveal working copy** opens its containing directory. **Keep a copy and
+reload remote** preserves the previous local file beside the working copy and
+loads the remote version; reopen or reload it in the external editor as needed.
+When all tracked documents or editor processes close, Sinomo checks the final
+bytes and removes the synchronized working file. For ordinary launches it
+also follows observable child processes. A fast launcher exit, a chooser
+handoff without a process handle, or an interrupted monitor keeps the path
+available. Close the document and choose **Finish external editing** to
+release it manually, or let Sinomo reclaim it on its first run in a later
+verified OS boot. Reopening Sinomo during the same boot preserves ambiguous
+opens. Offline edits and conflicts remain recoverable until synchronization
+succeeds. Preserved conflict copies remain available. Deleting the working
+file in the editor does not delete the SIFS object.
+
 Select a Sinomo file or folder to manage its availability. The primary choices
 are to inherit the folder default, keep copies available across devices, or
 wait for every configured copy before publishing. Replica thresholds, zones,

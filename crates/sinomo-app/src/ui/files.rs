@@ -1317,6 +1317,8 @@ pub struct FilesState {
     pending_history_request_id: Option<u64>,
     pending_history_more_request_id: Option<u64>,
     pending_history_preview_request_id: Option<u64>,
+    document_external_task: Option<u64>,
+    external_edit_sessions: Vec<crate::external_edit::Summary>,
     storage_center_open: bool,
     storage_center_revision: u64,
     storage_center_loading: bool,
@@ -1500,6 +1502,7 @@ enum FilesDialogStructure {
         saving: bool,
         save_error: Option<String>,
         save_warning: Option<String>,
+        external_edit_notice: Option<String>,
         confirmation: bool,
     },
     Action {
@@ -1823,6 +1826,7 @@ impl FilesStructureKey {
                 saving: document.is_some_and(|document| document.saving),
                 save_error: document.and_then(|document| document.save_error.clone()),
                 save_warning: document.and_then(|document| document.save_warning.clone()),
+                external_edit_notice: state.document_external_notice(),
                 confirmation: state.document_close_confirmation,
             }
         } else if let Some(prompt) = &state.action_prompt {
@@ -2044,6 +2048,8 @@ impl FilesState {
             pending_history_request_id: None,
             pending_history_more_request_id: None,
             pending_history_preview_request_id: None,
+            document_external_task: None,
+            external_edit_sessions: Vec::new(),
             storage_center_open: false,
             storage_center_revision: 0,
             storage_center_loading: false,
@@ -2968,6 +2974,14 @@ impl FilesState {
 
     fn apply_worker_result(&mut self, result: FilesWorkerResult) -> bool {
         match result {
+            FilesWorkerResult::ExternalEdit { request_id, result } => {
+                let (state, detail) = match result {
+                    Ok(detail) => (FilesTaskState::Completed, detail),
+                    Err(error) => (FilesTaskState::Failed, error),
+                };
+                self.finish_task(request_id, state, detail);
+                true
+            }
             FilesWorkerResult::UiExtensionCatalog(result) => {
                 self.ui_preview_catalog_refresh_pending = false;
                 let Ok(catalog) = result else {
@@ -3445,7 +3459,11 @@ impl FilesState {
                 self.history_revision = self.history_revision.wrapping_add(1);
                 true
             }
-            FilesWorkerResult::StorageOverview { request_id, result } => {
+            FilesWorkerResult::StorageOverview {
+                request_id,
+                result,
+                sessions,
+            } => {
                 if self.pending_storage_center_request_id != Some(request_id)
                     || !self.storage_center_open
                 {
@@ -3453,6 +3471,7 @@ impl FilesState {
                 }
                 self.pending_storage_center_request_id = None;
                 self.storage_center_loading = false;
+                self.external_edit_sessions = sessions;
                 match result {
                     Ok(overview) => {
                         self.storage_overview = Some(overview);
@@ -4320,6 +4339,7 @@ impl FilesState {
         title: String,
         waker: Option<sui::UiHandle>,
     ) {
+        self.document_external_task = None;
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
@@ -4380,6 +4400,7 @@ impl FilesState {
             return;
         }
         document.text = value;
+        self.document_external_task = None;
         document.save_error = None;
         self.attachment_error = None;
     }
@@ -6632,6 +6653,64 @@ impl FilesState {
         }
     }
 
+    fn document_external_notice(&self) -> Option<String> {
+        let id = self.document_external_task?;
+        let task = self.tasks.iter().find(|task| task.id == id)?;
+        Some(format!("{} · {}", task.title, task.detail))
+    }
+
+    fn start_external_edit(
+        &mut self,
+        path: String,
+        action: crate::external_edit::Action,
+        waker: Option<sui::UiHandle>,
+    ) {
+        self.start_external_edit_target(path, None, action, waker);
+    }
+    fn start_external_edit_target(
+        &mut self,
+        path: String,
+        session: Option<String>,
+        action: crate::external_edit::Action,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = request_id.wrapping_add(1);
+        if self.document.as_ref().is_some_and(|doc| doc.source == FilesSourceKind::Sifs && doc.path == path) {
+            self.document_external_task = Some(request_id);
+        }
+        self.tasks.insert(
+            0,
+            FilesTask {
+                id: request_id,
+                source: FilesSourceKind::Sifs,
+                title: action.label().into(),
+                detail: path.clone(),
+                state: FilesTaskState::Running,
+                progress: None,
+            },
+        );
+        self.trim_tasks();
+        if !self.operations_sender().is_some_and(|tx| {
+            tx.send(FilesWorkerCommand::ExternalEdit {
+                request_id,
+                path,
+                session,
+                action,
+            })
+            .is_ok()
+        }) {
+            self.finish_task(
+                request_id,
+                FilesTaskState::Failed,
+                "Files worker unavailable".into(),
+            );
+        }
+    }
+
     fn start_operation(
         &mut self,
         operation: FilesOperation,
@@ -7139,6 +7218,10 @@ fn sifs_health_probe(browser: &SifsBrowser) -> (Option<SifsHealthSummary>, Optio
 }
 
 enum FilesWorkerResult {
+    ExternalEdit {
+        request_id: u64,
+        result: Result<String, String>,
+    },
     UiExtensionCatalog(Result<sinomo_runtime::module::UiExtensionCatalogResponse, String>),
     LiveUpdate(FilesLiveUpdate),
     List {
@@ -7238,6 +7321,7 @@ enum FilesWorkerResult {
     },
     StorageOverview {
         request_id: u64,
+        sessions: Vec<crate::external_edit::Summary>,
         result: Result<FilesStorageOverview, String>,
     },
 }
@@ -7248,6 +7332,12 @@ enum FilesLiveUpdate {
 }
 
 enum FilesWorkerCommand {
+    ExternalEdit {
+        request_id: u64,
+        path: String,
+        session: Option<String>,
+        action: crate::external_edit::Action,
+    },
     List {
         request_id: u64,
         source: FilesSourceKind,
@@ -7535,6 +7625,24 @@ fn files_worker_loop(
             &mut open_error,
         );
         match command {
+            FilesWorkerCommand::ExternalEdit {
+                request_id,
+                path,
+                session,
+                action,
+            } => {
+                let result = if let Some(key) = session {
+                    crate::external_edit::act_on_session(&data_dir, &key, action)
+                } else {
+                    daemon_address
+                        .as_deref()
+                        .ok_or_else(|| "A SIFS connection is required".to_string())
+                        .and_then(|address| {
+                            crate::external_edit::act(&data_dir, address, &path, action)
+                        })
+                };
+                let _ = result_tx.send(FilesWorkerResult::ExternalEdit { request_id, result });
+            }
             FilesWorkerCommand::List {
                 request_id,
                 source,
@@ -8067,7 +8175,11 @@ fn files_worker_loop(
                     (None, Some(error)) => Err(error.clone()),
                     (None, None) => Err("DFS storage health service did not start".to_string()),
                 };
-                let _ = result_tx.send(FilesWorkerResult::StorageOverview { request_id, result });
+                let _ = result_tx.send(FilesWorkerResult::StorageOverview {
+                    request_id,
+                    result,
+                    sessions: crate::external_edit::active(&data_dir),
+                });
             }
             FilesWorkerCommand::PlacementPreview {
                 request_id,
@@ -16924,6 +17036,7 @@ fn open_cluster_tab(shared: &Shared) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileContextAction {
+    ExternalEdit(crate::external_edit::Action),
     Open,
     OpenInNewTab,
     AttachToChat,
@@ -16967,6 +17080,7 @@ enum FileContextAction {
 impl FileContextAction {
     fn label(self, source: FilesSourceKind) -> String {
         match self {
+            Self::ExternalEdit(action) => action.label(),
             Self::Open => "Open",
             Self::OpenInNewTab => "Open in new tab",
             Self::AttachToChat => "Attach to current chat",
@@ -17017,7 +17131,7 @@ impl FileContextAction {
 
     fn group(self) -> u8 {
         match self {
-            Self::Open | Self::OpenInNewTab | Self::AttachToChat => 0,
+            Self::ExternalEdit(_) | Self::Open | Self::OpenInNewTab | Self::AttachToChat => 0,
             Self::Copy
             | Self::CopySelected
             | Self::Transfer
@@ -17059,6 +17173,13 @@ impl FileContextAction {
         let can_read = files.loaded && !files.loading && files.error.is_none();
         let can_modify = files.can_modify_current_location();
         match self {
+            Self::ExternalEdit(_) => {
+                !cfg!(target_os = "android")
+                    && files.source == FilesSourceKind::Sifs
+                    && files
+                        .selected_entry()
+                        .is_some_and(|e| !e.is_dir && !e.is_link)
+            }
             Self::Move
             | Self::MoveSelected
             | Self::Rename
@@ -17173,6 +17294,15 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
     let mut actions = Vec::with_capacity(18);
     actions.push(FileContextAction::Open);
     actions.push(FileContextAction::OpenInNewTab);
+    if !cfg!(target_os = "android")
+        && files.source == FilesSourceKind::Sifs
+        && !entry.is_dir
+        && !entry.is_link
+    {
+        actions.push(FileContextAction::ExternalEdit(
+            crate::external_edit::Action::Open,
+        ));
+    }
     if !entry.is_dir {
         actions.push(FileContextAction::AttachToChat);
     }
@@ -17271,6 +17401,32 @@ fn selection_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntr
     };
     let mut entries = vec![action_entry(FileContextAction::Open, files, false)];
     entries.push(action_entry(FileContextAction::OpenInNewTab, files, false));
+    if !cfg!(target_os = "android")
+        && files.source == FilesSourceKind::Sifs
+        && !entry.is_dir
+        && !entry.is_link
+    {
+        use crate::external_edit::Action;
+        entries.push(action_entry(
+            FileContextAction::ExternalEdit(Action::Open),
+            files,
+            false,
+        ));
+        entries.push(FileContextMenuEntry::submenu(
+            "External working copy",
+            [
+                Action::Status,
+                Action::Reveal,
+                Action::Retry,
+                Action::Reload,
+                Action::Finish,
+            ]
+            .into_iter()
+            .map(|action| action_entry(FileContextAction::ExternalEdit(action), files, false))
+            .collect(),
+            false,
+        ));
+    }
     if !entry.is_dir {
         entries.push(action_entry(FileContextAction::AttachToChat, files, false));
     }
@@ -17921,6 +18077,17 @@ where
 
 fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx: &mut EventCtx) {
     match action {
+        FileContextAction::ExternalEdit(action) => {
+            let waker = shared.borrow().waker.clone();
+            let mut files = shared.files_mut();
+            if let Some(entry) = files.selected_entry().cloned()
+                && !entry.is_dir
+                && !entry.is_link
+                && files.source == FilesSourceKind::Sifs
+            {
+                files.start_external_edit(entry.path, action, waker);
+            }
+        }
         FileContextAction::OpenInNewTab => {
             let selected = shared.files().selected_entry().cloned();
             if let Some(entry) = selected {
@@ -21851,6 +22018,9 @@ fn document_detail_text(shared: &Shared) -> String {
             ),
         };
     }
+    if let Some(notice) = files.document_external_notice() {
+        return notice;
+    }
     if let Some(reason) = &document.read_only_reason {
         return reason.clone();
     }
@@ -21993,6 +22163,32 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                         drop(files);
                         request_files_overlay_rebuild(ctx);
                     }));
+            }
+            if !cfg!(target_os = "android") && document.source == FilesSourceKind::Sifs {
+                let action = s.clone();
+                let enabled = s.clone();
+                let path = document.path.clone();
+                row =
+                    row.with_child(toolbar_tooltip(
+                        "Open externally",
+                        IconButton::new(IconGlyph::Monitor, "Open externally")
+                            .theme_when(clone_reader(&r))
+                            .enabled_when(move || {
+                                enabled.files().document.as_ref().is_some_and(|doc| {
+                                    doc.editable() && !doc.saving && !doc.dirty()
+                                })
+                            })
+                            .on_press_with_ctx(move |ctx| {
+                                let waker = action.borrow().waker.clone();
+                                action.files_mut().start_external_edit(
+                                    path.clone(),
+                                    crate::external_edit::Action::Open,
+                                    waker,
+                                );
+                                request_files_overlay_rebuild(ctx);
+                            }),
+                        &r,
+                    ));
             }
             WidgetPod::new(row)
         })
@@ -23312,10 +23508,52 @@ fn files_storage_center_body(
     let files = shared.files();
     let loading = files.storage_center_loading;
     let error = files.storage_center_error.clone();
+    let sessions = files.external_edit_sessions.clone();
     let overview = files.storage_overview.clone();
     drop(files);
 
     let mut content = Stack::vertical().alignment(Alignment::Stretch).gap(12.0);
+    let has_content = overview.is_some() || !sessions.is_empty();
+    if !sessions.is_empty() {
+        use crate::external_edit::Action;
+        let mut list = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
+        for session in sessions {
+            let mut actions = Flex::horizontal().wrap(FlexWrap::Wrap).gap(5.0);
+            for action in [
+                Action::Open,
+                Action::Reveal,
+                Action::Retry,
+                Action::Reload,
+                Action::Finish,
+            ] {
+                let s = shared.clone();
+                let key = session.key.clone();
+                let path = session.path.clone();
+                actions = actions.with_child(
+                    sui::Button::new(action.label())
+                        .appearance(ButtonAppearance::Outline)
+                        .theme_when(clone_reader(reader))
+                        .on_press_with_ctx(move |ctx| {
+                            let waker = s.borrow().waker.clone();
+                            s.files_mut().start_external_edit_target(
+                                path.clone(),
+                                Some(key.clone()),
+                                action,
+                                waker,
+                            );
+                            request_files_overlay_rebuild(ctx);
+                        }),
+                );
+            }
+            list = list
+                .with_child(Label::new(session.path).theme_when(clone_reader(reader)))
+                .with_child(Label::new(session.status).theme_when(clone_reader(reader)))
+                .with_child(actions);
+        }
+        content = content.with_child(
+            PanelSection::new("External working copies", list).theme_when(clone_reader(reader)),
+        );
+    }
     if let Some(overview) = overview.as_ref() {
         let status = &overview.status;
         let attention = status.pending_repair_count > 0
@@ -23437,7 +23675,7 @@ fn files_storage_center_body(
             .theme_when(clone_reader(reader)),
         );
     }
-    if loading && overview.is_some() {
+    if loading && has_content {
         content = content.with_child(
             StatusBadge::new("Refreshing storage health...")
                 .icon(IconGlyph::Hourglass)
@@ -23445,7 +23683,7 @@ fn files_storage_center_body(
                 .theme_when(clone_reader(reader)),
         );
     }
-    if let Some(error) = error.clone().filter(|_| overview.is_some()) {
+    if let Some(error) = error.clone().filter(|_| has_content) {
         content = content.with_child(
             StatusBadge::new(error)
                 .icon(IconGlyph::Alert)
@@ -23470,7 +23708,7 @@ fn files_storage_center_body(
     .name("Storage health overview")
     .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true);
-    let selected = if overview.is_some() {
+    let selected = if has_content {
         2
     } else if loading {
         0
@@ -26420,6 +26658,39 @@ mod tests {
     }
 
     #[test]
+    fn external_edit_storage_health_can_manage_a_copy_without_a_selected_file() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.storage_center_open = true;
+            files.storage_center_error = Some("Daemon unavailable".into());
+            files.worker_tx = Some(tx.clone());
+            files.operations_tx = Some(tx);
+            files.external_edit_sessions.push(crate::external_edit::Summary {
+                key: "a".repeat(64), path: "/services/note.txt".into(), status: "Offline · local changes retained".into(),
+            });
+        }
+        let reader: ThemeReader = { let shared = shared.clone(); Rc::new(move || shared.theme()) };
+        let runtime = sui::Application::new().window(sui::WindowBuilder::new()
+            .title("External working copies").root(FilesDialogHost::new(SizedBox::new(), shared.clone(), reader))).build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window.root().dispatch_event(Event::Window(WindowEvent::Resized(Size::new(560.0, 720.0))))?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+        assert!(window.get_by_text("External working copies").count()? > 0);
+        window.capture_screenshot()?.write_png(std::env::temp_dir().join("sinomo-external-edit-sessions.png"))?;
+        window.get_by_role(sui::SemanticsRole::Button).with_name("Retry synchronization").click()?;
+        let FilesWorkerCommand::ExternalEdit { path, session, action, .. } = rx.try_recv().unwrap() else { panic!("expected local working-copy command") };
+        assert_eq!(path, "/services/note.txt");
+        assert_eq!(session.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(action, crate::external_edit::Action::Retry);
+        Ok(())
+    }
+
+    #[test]
     fn storage_health_uses_its_own_bounded_worker_request() {
         let backend = Backend::local_fallback();
         let mut files = FilesState::new(&backend);
@@ -26437,6 +26708,7 @@ mod tests {
         let overview = test_storage_overview();
         assert!(
             files.apply_worker_result(FilesWorkerResult::StorageOverview {
+                sessions: Vec::new(),
                 request_id,
                 result: Ok(overview.clone()),
             })
@@ -36776,6 +37048,24 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        #[cfg(not(target_os = "android"))]
+        {
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Open selection actions")
+                .click()?;
+            window
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Open externally")
+                .click()?;
+            let FilesWorkerCommand::ExternalEdit { path, action, .. } =
+                rx.try_recv().expect("external editor request")
+            else {
+                panic!("wrong worker command")
+            };
+            assert_eq!(path, "/services/artifact.txt");
+            assert_eq!(action, crate::external_edit::Action::Open);
+        }
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")

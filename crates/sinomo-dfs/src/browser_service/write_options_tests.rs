@@ -1467,3 +1467,83 @@ fn write_configuration_browser_unavailable_native_floor_fails_before_parent_or_f
     drop(backend);
     runtime.close().unwrap();
 }
+
+#[test]
+fn durable_external_edit_reconciles_exact_receipt_and_fences_stale_generations() {
+    use crate::{
+        DaemonDfsBrowserDurableReplaceOutcome as Outcome,
+        DaemonDfsBrowserDurableReplaceRequest as Request,
+    };
+    let (native, nodes) = native_browser_runtime("external-edit", 1);
+    let data = Arc::new(native.data_dir(&nodes[0]).clone());
+    let backend =
+        DfsBrowserBackend::for_component_data_dir(data, &native.runtime_handle()).unwrap();
+    let path = "/services/external-edit/example.txt";
+    backend
+        .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+            path: path.into(),
+            bytes: b"base".to_vec(),
+        })
+        .unwrap();
+    let base = backend
+        .stat(crate::DaemonDfsBrowserStatRequest {
+            path: path.into(),
+            max_staleness_millis: 0,
+        })
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let bytes = b"changed";
+    let mut request = Request {
+        expected_node_id: nodes[0].to_string(),
+        path: path.into(),
+        expected_object_id: base.object_id,
+        expected_version: base.version,
+        operation_id: "external-edit-save-1".into(),
+        content_hash: format!("blake3:{}", blake3::hash(bytes).to_hex()),
+        size_bytes: bytes.len() as u64,
+        bytes: None,
+    };
+    let mut changed = false;
+    let mut wrong_node = request.clone();
+    wrong_node.expected_node_id = "different-node".into();
+    assert!(matches!(
+        backend.durable_replace(wrong_node, &mut changed).unwrap(),
+        Outcome::Unknown { .. }
+    ));
+    assert!(matches!(
+        backend
+            .durable_replace(request.clone(), &mut changed)
+            .unwrap(),
+        Outcome::NotApplied
+    ));
+    assert!(!changed);
+    request.bytes = Some(bytes.to_vec());
+    let Outcome::Applied { receipt, .. } = backend
+        .durable_replace(request.clone(), &mut changed)
+        .unwrap()
+    else {
+        panic!("expected committed version")
+    };
+    assert!(changed);
+    for payload in [None, Some(bytes.to_vec())] {
+        changed = false;
+        request.bytes = payload;
+        let Outcome::Applied {
+            receipt: replayed, ..
+        } = backend
+            .durable_replace(request.clone(), &mut changed)
+            .unwrap()
+        else {
+            panic!("missing replay receipt")
+        };
+        assert_eq!(replayed, receipt);
+        assert!(!changed);
+    }
+    request.operation_id = "external-edit-save-2".into();
+    assert!(matches!(
+        backend.durable_replace(request, &mut changed).unwrap(),
+        Outcome::Conflict { .. }
+    ));
+    assert!(!changed);
+}

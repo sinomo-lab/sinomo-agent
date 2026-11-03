@@ -6,6 +6,7 @@
 //! process on desktop so the UI stays daemon-backed without linking the daemon host into the GUI.
 
 pub mod backend;
+pub mod external_edit;
 pub mod metrics;
 mod mobile_runtime;
 mod native_picker;

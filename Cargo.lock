@@ -9847,8 +9847,11 @@ version = "0.1.0"
 dependencies = [
  "android-build",
  "blake3",
+ "fs2",
  "image",
  "jni 0.22.4",
+ "libc",
+ "notify",
  "percent-encoding",
  "pulldown-cmark 0.13.6",
  "rfd",
@@ -9868,10 +9871,12 @@ dependencies = [
  "sinomo-ui-testing",
  "sinomo-video",
  "syntect",
+ "sysinfo",
  "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
