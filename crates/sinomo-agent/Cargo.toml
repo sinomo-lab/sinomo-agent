@@ -29,6 +29,7 @@ sinomo-product-profile = { path = "../sinomo-product-profile" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
+sinomo-subagents = { path = "../../modules/agent/subagents" }
 sinomo-runtime = { workspace = true, features = ["dfs-test-support"] }
 sinomo-lm = { path = "../sinomo-lm", features = ["scripted-provider"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

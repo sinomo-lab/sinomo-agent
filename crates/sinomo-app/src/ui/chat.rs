@@ -19794,6 +19794,10 @@ fn main_column(
     .collapse(Axis::Vertical);
     let body = Flex::vertical()
         .align_items(Alignment::Stretch)
+        .with_child(super::session_panels::ConversationPanels::new(
+            shared.clone(),
+            Rc::clone(reader),
+        ))
         .with_child(media)
         .with_item(transcript, FlexItem::flex(1.0).min_height(0.0));
     MeasuredBottomDock::new(body, composer(shared, reader, selection))
@@ -20386,6 +20390,17 @@ pub fn view(shared: Shared) -> impl Widget {
     let offline =
         DaemonOfflinePanel::new(&shared, &reader, "Chat offline", CHAT_OFFLINE_SUMMARY).build();
     daemon_gate(&shared, ChatView::new(shared.clone()), offline)
+}
+
+pub(crate) fn module_panel_context(
+    shared: &Shared,
+) -> (String, Option<String>, Option<sui::UiHandle>) {
+    let chat = shared.chat();
+    (
+        chat.session_id.clone(),
+        chat.daemon_address.clone(),
+        chat.ui_waker.clone(),
+    )
 }
 
 #[cfg(test)]

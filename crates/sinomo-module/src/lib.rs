@@ -1,5 +1,6 @@
 //! Module registry, routing, loader state, and native module host glue.
 
+pub mod sessions;
 mod settings_store;
 
 mod active_component;

@@ -9816,11 +9816,21 @@ dependencies = [
  "sinomo-memory",
  "sinomo-product-profile",
  "sinomo-runtime",
+ "sinomo-subagents",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sinomo-agent-timeline"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-module-api",
 ]
 
 [[package]]
@@ -10504,6 +10514,7 @@ name = "sinomo-module-api"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sinomo-object",
  "thiserror 2.0.20",
 ]
@@ -10891,6 +10902,15 @@ dependencies = [
  "sinomo-testdir",
  "thiserror 2.0.20",
  "tracing",
+]
+
+[[package]]
+name = "sinomo-subagents"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-module-api",
 ]
 
 [[package]]

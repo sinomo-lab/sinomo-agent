@@ -48,6 +48,25 @@ pub(crate) fn ui_extension_catalog_at_address(
     response.decode_body().map_err(|error| error.to_string())
 }
 
+pub(crate) fn session_panel_at_address(
+    address: &str,
+    request: &sinomo_runtime::module_api::panels::SessionPanelRequest,
+) -> Result<sinomo_runtime::module_api::panels::PanelRenderResponse, String> {
+    let rpc = ObjectRpcRequest::encode_body(
+        sinomo_runtime::module_api::panels::PANEL_ROUTE,
+        "session-modules",
+        request,
+    )
+    .map_err(|e| e.to_string())?;
+    let response = DaemonApiClient::at_address(address)
+        .with_timeout(UI_EXTENSION_CATALOG_TIMEOUT)
+        .call_request(&rpc)
+        .map_err(|e| e.to_string())?;
+    let response = response.decode_body().map_err(|e| e.to_string())?;
+    sinomo_runtime::module_api::panels::validate_response(&response)?;
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

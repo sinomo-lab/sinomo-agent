@@ -4,10 +4,14 @@
 //! can depend on it without inheriting any dynamic loader, sandbox, Wasm, or
 //! service implementation dependency.
 
+pub mod agent;
 pub mod cli;
 mod component;
 mod extension;
+pub mod host;
 pub mod observe;
+pub mod panels;
+pub mod sessions;
 mod ui;
 
 pub use component::*;

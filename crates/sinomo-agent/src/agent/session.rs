@@ -23,6 +23,10 @@ use std::collections::BTreeSet;
 pub struct AgentSession {
     pub session_id: SessionId,
     pub role: AgentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<super::AgentSubagentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<sinomo_runtime::module_api::sessions::SessionRelationship>,
     /// Monotonic logical revision of private/model execution state. This lets
     /// device-local and roaming snapshots distinguish queue/control updates
     /// that do not append a transcript item.
@@ -65,6 +69,8 @@ impl AgentSession {
         Self {
             session_id,
             role,
+            subagent: None,
+            relationship: None,
             state_revision: 0,
             agent_definition_key: None,
             workspace_binding: None,

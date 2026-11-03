@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 enum Behavior {
+    Quick,
+    Async,
     Block,
     Probe,
     Fail,
@@ -22,6 +24,29 @@ enum Behavior {
     Nested,
 }
 
+struct Provider;
+impl AgentSessionToolProvider for Provider {
+    fn definition(&self) -> sinomo_runtime::module_api::agent::SessionToolDefinition {
+        sinomo_subagents::definition()
+    }
+    fn translate(
+        &self,
+        input: serde_json::Value,
+    ) -> Result<sinomo_runtime::module_api::agent::SessionCommand, AgentError> {
+        let mut command =
+            sinomo_subagents::translate(input).map_err(|detail| AgentError::Runtime { detail })?;
+        if let sinomo_runtime::module_api::agent::SessionCommand::Create {
+            name,
+            idle_timeout_secs,
+            ..
+        } = &mut command
+            && name == "short-lived-test"
+        {
+            *idle_timeout_secs = 1;
+        }
+        Ok(command)
+    }
+}
 struct Model {
     spawn_from_model: bool,
     behavior: Behavior,
@@ -167,7 +192,18 @@ impl InteractionModel for Model {
                     ));
                 }
                 Behavior::Long => return Ok(response(request, "界".repeat(30_000), vec![])),
-                Behavior::Block | Behavior::Nested => {}
+                Behavior::Async => {
+                    if !request
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("detached child work finished"))
+                    {
+                        let mut work = call("read_file", serde_json::json!({}));
+                        work.r#async = true;
+                        return Ok(response(request, "start async work".into(), vec![work]));
+                    }
+                }
+                Behavior::Quick | Behavior::Block | Behavior::Nested => {}
             }
         }
         if nested_branch {
@@ -255,6 +291,7 @@ fn harness(
     let runtime = AgentSessionRuntime::new(
         Agent::new(model, "test", "test")
             .with_config(config)
+            .with_session_tool_provider(Arc::new(Provider))
             .with_tool_surface(surface)
             .with_tool_registry(registry.clone()),
         session,
@@ -453,6 +490,18 @@ fn child_resources_survive_parent_registry_reconfiguration() {
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     h.release.store(true, Ordering::SeqCst);
     wait(&h, &child.id);
+    assert!(
+        weak.upgrade().is_some(),
+        "idle reusable child keeps inherited resources"
+    );
+    h.runtime
+        .subagents()
+        .dispose(&h.input.session.session_id, &child.id)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while weak.upgrade().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(weak.upgrade().is_none());
 }
 
@@ -483,7 +532,8 @@ fn child_handles_are_owned_and_disposable() {
     assert!(
         manager
             .inspect(&h.input.session.session_id, &child.id)
-            .is_err()
+            .unwrap()
+            .archived
     );
 }
 
@@ -517,7 +567,7 @@ fn cancellation_is_one_way_and_does_not_cancel_siblings() {
 }
 
 #[test]
-fn last_parent_runtime_release_cancels_and_reclaims_children() {
+fn detaching_parent_retains_children_until_discard_or_expiry() {
     let h = setup(Behavior::Block);
     let child = spawn(&h);
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -532,7 +582,12 @@ fn last_parent_runtime_release_cancels_and_reclaims_children() {
         AgentSubagentStatus::Running
     );
     drop(clone);
-    assert!(h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
+    assert_eq!(manager.list(&h.input.session.session_id).len(), 1);
+    h.release.store(true, Ordering::SeqCst);
+    assert!(!h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
+    manager
+        .dispose(&h.input.session.session_id, &child.id)
+        .unwrap();
     assert!(manager.list(&h.input.session.session_id).is_empty());
     assert!(
         manager
@@ -608,7 +663,7 @@ fn aborting_parent_cancels_children_between_turns() {
 }
 
 #[test]
-fn children_can_spawn_descendants_and_reclaim_them_on_completion() {
+fn children_can_spawn_descendants_with_inherited_parent_identity() {
     let h = setup(Behavior::Nested);
     let branch = spawn(&h);
     let first = h.started.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -616,7 +671,12 @@ fn children_can_spawn_descendants_and_reclaim_them_on_completion() {
     assert_eq!(first, branch.session_id);
     assert_ne!(leaf, branch.session_id);
     assert_eq!(wait(&h, &branch.id).status, AgentSubagentStatus::Completed);
-    assert!(h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
+    h.release.store(true, Ordering::SeqCst);
+    assert!(!h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
+    h.runtime
+        .subagents()
+        .dispose(&h.input.session.session_id, &branch.id)
+        .unwrap();
     let requests = h.requests.lock().unwrap();
     let leaf_request = requests
         .iter()
@@ -666,14 +726,15 @@ fn parent_turn_deadline_reaches_children_after_parent_answer() {
 }
 
 #[test]
-fn replacing_parent_session_releases_old_children_and_rebinds_tool() {
+fn replacing_parent_session_isolates_old_children_and_rebinds_tool() {
     let mut h = setup(Behavior::Block);
     let old = spawn(&h);
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     let mut replacement = h.runtime.session_snapshot().unwrap();
     replacement.session_id = SessionId::generate();
     h.runtime.replace_session(replacement.clone()).unwrap();
-    assert!(h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
+    h.release.store(true, Ordering::SeqCst);
+    assert!(!h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
     assert!(
         h.runtime
             .subagents()
@@ -748,4 +809,207 @@ fn interrupting_parent_cancels_children_from_previous_turns() {
     );
     assert_eq!(wait(&h, &child.id).status, AgentSubagentStatus::Cancelled);
     h.runtime.join_active_turn().unwrap();
+}
+
+#[test]
+fn message_reuses_the_child_session_and_notifies_parent_each_turn() {
+    let h = setup(Behavior::Quick);
+    let child = spawn(&h);
+    wait(&h, &child.id);
+    let before = h
+        .runtime
+        .subagents()
+        .session_snapshot(&h.input.session.session_id, &child.id)
+        .unwrap();
+    assert!(!before.transcript.is_empty());
+    let sent=h.registry.execute(&h.input.session,0,0,&call("subagents",serde_json::json!({"action":"message","id":child.session_id,"message":"Do a second task"})));
+    assert_eq!(sent.status, AgentToolStatus::Succeeded);
+    let receipt: sinomo_runtime::module_api::sessions::SessionCommandReceipt =
+        serde_json::from_value(sent.output).unwrap();
+    assert!(receipt.accepted);
+    assert_eq!(
+        receipt.session_id.as_deref(),
+        Some(child.session_id.as_str())
+    );
+    let after = wait(&h, &child.id);
+    assert_eq!(after.session_id, child.session_id);
+    assert_eq!(after.status, AgentSubagentStatus::Completed);
+    let session = h
+        .runtime
+        .subagents()
+        .session_snapshot(&h.input.session.session_id, &child.id)
+        .unwrap();
+    assert!(session.transcript.items.len() > before.transcript.items.len());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut updates = Vec::new();
+    while updates.len() < 2 && Instant::now() < deadline {
+        updates.extend(h.runtime.take_async_updates());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(updates.len(), 2);
+    assert!(updates.iter().all(|u| u.kind == "agent.subagent.completed"
+        && u.result_ref.as_deref() == Some(child.session_id.as_str())));
+    h.runtime
+        .subagents()
+        .dispose(&h.input.session.session_id, &child.id)
+        .unwrap();
+    assert!(
+        h.runtime
+            .subagents()
+            .list(&h.input.session.session_id)
+            .is_empty()
+    );
+    assert_eq!(
+        h.runtime
+            .subagents()
+            .search(&h.input.session.session_id, true)
+            .len(),
+        1
+    );
+    assert!(
+        h.runtime
+            .subagents()
+            .message(&h.input.session.session_id, child.id.as_str(), "revive")
+            .is_err()
+    );
+    assert!(
+        !h.runtime
+            .subagents()
+            .session_snapshot(&h.input.session.session_id, &child.id)
+            .unwrap()
+            .transcript
+            .is_empty()
+    );
+}
+
+#[test]
+fn children_message_parent_and_siblings_but_cannot_cancel_siblings() {
+    let h = setup(Behavior::Quick);
+    let first = spawn(&h);
+    let second = spawn(&h);
+    wait(&h, &first.id);
+    wait(&h, &second.id);
+    let manager = h.runtime.subagents();
+    manager
+        .message(&first.session_id, "parent", "findings for parent")
+        .unwrap();
+    assert!(
+        h.runtime
+            .session_snapshot()
+            .unwrap()
+            .follow_up_queue
+            .iter()
+            .any(|m| m.message.contains("findings for parent"))
+    );
+    manager
+        .message(
+            &first.session_id,
+            second.id.as_str(),
+            "findings for sibling",
+        )
+        .unwrap();
+    assert_eq!(wait(&h, &second.id).status, AgentSubagentStatus::Completed);
+    assert!(manager.cancel(&first.session_id, &second.id).is_err());
+    assert!(
+        manager
+            .session_snapshot(&first.session_id, &second.id)
+            .is_ok()
+    );
+    manager
+        .dispose(&h.input.session.session_id, &first.id)
+        .unwrap();
+    manager
+        .dispose(&h.input.session.session_id, &second.id)
+        .unwrap();
+}
+
+#[test]
+fn idle_expiry_archives_without_a_list_or_inspect_call() {
+    let h = setup(Behavior::Quick);
+    let result = h.registry.execute(
+        &h.input.session,
+        0,
+        0,
+        &call(
+            "subagents",
+            serde_json::json!({"action":"spawn","name":"short-lived-test","task":"short task"}),
+        ),
+    );
+    assert_eq!(result.status, AgentToolStatus::Succeeded);
+    let child: AgentSubagentSnapshot =
+        serde_json::from_value(result.output["subagent"].clone()).unwrap();
+    wait(&h, &child.id);
+    std::thread::sleep(Duration::from_millis(1300));
+    let manager = h.runtime.subagents();
+    assert!(
+        manager
+            .inspect(&h.input.session.session_id, &child.id)
+            .unwrap()
+            .archived
+    );
+    assert!(manager.list(&h.input.session.session_id).is_empty());
+    assert!(
+        !manager
+            .session_snapshot(&h.input.session.session_id, &child.id)
+            .unwrap()
+            .transcript
+            .is_empty()
+    );
+}
+
+struct DelayedChildTool {
+    release: Mutex<mpsc::Receiver<()>>,
+}
+impl AgentTool for DelayedChildTool {
+    fn descriptor(&self) -> AgentToolDescriptor {
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            "read_file",
+            "delayed work",
+            false,
+        ))
+    }
+    fn execute(&self, _: AgentToolRequest<'_>) -> AgentToolResult {
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        AgentToolResult::succeeded(
+            "detached child work finished",
+            serde_json::json!({"done":true}),
+        )
+    }
+}
+#[test]
+fn child_runtime_continues_after_its_detached_tool_finishes() {
+    let (release_tx, release_rx) = mpsc::channel();
+    let h = harness(
+        Behavior::Async,
+        false,
+        AgentToolRegistry::new().with_tool(DelayedChildTool {
+            release: Mutex::new(release_rx),
+        }),
+        AgentToolSurface::default_for_role(AgentRole::Main),
+    );
+    let child = spawn(&h);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while h.requests.lock().unwrap().len() < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let before = h.requests.lock().unwrap().len();
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while h.requests.lock().unwrap().len() == before && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        h.requests.lock().unwrap().len() > before,
+        "child must consume the existing runtime completion queue"
+    );
+    wait(&h, &child.id);
+    h.runtime
+        .subagents()
+        .dispose(&h.input.session.session_id, &child.id)
+        .unwrap();
 }

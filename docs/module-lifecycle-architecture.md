@@ -889,9 +889,10 @@ R2 and application crates cross into these foundations through
     scans or standalone host-adapter crates.
 17. Module UI contributions use bounded, versioned extension-point payloads;
     modules never load Rust/SUI widgets, patch rendered child indexes, or name
-    unvalidated transport routes in the app. Custom surfaces execute only as
-    verified isolated UI components and the app renders their validated last
-    complete frame.
+    unvalidated transport routes in the app. Executable custom surfaces run only
+    as verified isolated UI components. Declarative panels may supply bounded
+    drawing data through a scoped daemon service; the app validates and renders
+    that data without executing provider code.
 18. A module may affect existing behavior only through a typed, versioned
     extension point declared by the subsystem that owns that behavior.
 19. Extension-point composition, ordering, failure handling, and final

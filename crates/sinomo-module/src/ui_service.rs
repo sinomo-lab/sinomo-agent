@@ -161,6 +161,33 @@ pub fn ui_extension_catalog_route() -> ServiceRoute {
     .observable("module.ui.catalog", "read")
 }
 
+/// Resolve the same compiled UI catalog used by the daemon. Standalone
+/// native-artifact tooling has no resident host and builds a temporary snapshot.
+pub fn ui_extension_catalog_for_host(
+    data_dir_root: &Path,
+    request: &UiExtensionCatalogRequest,
+) -> Result<UiExtensionCatalogResponse, String> {
+    if let Some(host) = crate::process_module_host(data_dir_root)? {
+        let generation = host.generations.active_snapshot();
+        ui_extension_catalog_response_with_registry(
+            &generation.module_registry,
+            &generation.extension_registry,
+            request,
+            data_dir_root,
+        )
+    } else {
+        let mut builder = crate::ModuleRegistry::builder();
+        for registration in crate::module_registrations_for_host(data_dir_root)? {
+            builder = builder.register(registration).map_err(|e| e.to_string())?;
+        }
+        let registry = builder.try_build().map_err(|e| e.to_string())?;
+        let snapshots =
+            crate::ModuleRegistrySnapshotStore::new(registry).map_err(|e| e.to_string())?;
+        let snapshot = snapshots.active_snapshot().map_err(|e| e.to_string())?;
+        ui_extension_catalog_response(snapshot.as_ref(), request, data_dir_root)
+    }
+}
+
 pub fn ui_extension_catalog_response(
     snapshot: &ModuleRegistrySnapshot,
     request: &UiExtensionCatalogRequest,

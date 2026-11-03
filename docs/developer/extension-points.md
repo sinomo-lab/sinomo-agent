@@ -156,6 +156,44 @@ A tool should:
 
 Prompts and skills can request a tool but cannot grant it more authority.
 
+Native modules access sessions through `sinomo-module-api::sessions::SessionClient`
+and the invocation-scoped host-service bridge owned by `sinomo-module`.
+Declare the exact `sinomo.sessions` interface version and `sessions.access`
+operation in the component requirements. The host checks those declarations
+before dispatch and supplies a `SessionAccess` implementation bound to the actual
+caller or selected conversation. Modules cannot choose their caller identity or
+expand that grant by supplying another session id.
+
+The session API supports scoped discovery, inspection, paged journal activity,
+channel messages and explicitly granted lifecycle commands. Read-only panel
+invocations cannot mutate sessions. Lifecycle commands accept canonical session
+IDs and return a common acknowledgement; tool-specific handles remain aliases.
+Related sessions use ordinary relationship
+metadata, so consumers need no dependency on a subagent provider. Tool discovery
+and input parsing are separate from session access; the subagent tool uses this
+same bridge for its effects.
+
+A native provider exports the optional `sinomo_module_invoke_with_host_v1` entrypoint
+to receive the borrowed invocation host. The ordinary ABI v2 layout and entrypoint
+remain supported. Extended providers use the invocation host for per-call access;
+the module-wide v2 callback slot is not bound during extended invocations.
+The shared native binding uses the resident module generation and invocation
+leases when hosted, so retained bindings reject calls after drain begins. Concurrent
+invocations share an executable lease without keeping idle agent sessions pinned.
+Host calls are synchronous and their buffers must be freed by
+the supplied host allocator; never retain the handle, transfer it to a worker, or
+pass Rust runtime pointers or credentials across the ABI. Missing services,
+undeclared operations and unsupported interface versions fail closed.
+
+The [subagent module](../../modules/agent/subagents/Cargo.toml) demonstrates tool
+commands; the [timeline module](../../modules/agent/timeline/README.md) demonstrates
+read-only queries from a UI provider. Compiling either dylib does not activate it.
+Default bundle inclusion requires an updated, validly signed distribution profile.
+
+```sh
+cargo test -p sinomo-agent --test native_subagents --test agent_timeline
+```
+
 ## Language-Model Providers
 
 Provider integrations implement the provider-neutral language-model contract,
@@ -280,6 +318,21 @@ fixture twice in one process; the Iroh fixture also creates and unregisters its
 real network-vtable instance twice.
 
 ## Application UI
+
+The `sinomo.app.conversation.panels` slot accepts module-owned declarative panels
+in both chats and channels. A contribution supplies a label and logical
+`sinomo.ui.session-panel` service. The owning session service resolves the current
+provider, grants access only to that conversation's sessions, and invokes it on a
+worker. The provider owns layout, selection and view state; the app renders its
+validated drawing document and accessibility nodes using the existing frame
+renderer. No native module code is loaded into the graphical process.
+
+These read-only drawing documents are bounded to 2 MiB and cannot contain host
+effect requests. They are data contributions, distinct from executable isolated
+Wasm widgets. Discovery, refresh and render requests stay off the UI thread;
+provider withdrawal clears the panel. Catalog generation changes retire the
+selected view, and invocation checks reject stale or missing providers.
+
 
 Use declarative contributions for ordinary actions, panels, settings, status
 items, and host-native views. When a surface must draw content that stock

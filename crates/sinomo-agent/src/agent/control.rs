@@ -1171,7 +1171,7 @@ where
 {
     pub(super) agent: Arc<Agent<M>>,
     pub(super) state: Arc<Mutex<AgentSessionRuntimeState>>,
-    subagent_scope: Arc<AgentSubagentScope>,
+    pub(super) subagent_scope: Arc<AgentSubagentScope>,
 }
 
 impl<M> Clone for AgentSessionRuntime<M>
@@ -1243,6 +1243,14 @@ impl AgentRuntimeStorage {
     where
         M: InteractionModel,
     {
+        if agent.session_tools.is_none()
+            && let Some(data_dir) = &self.durable_data_dir
+        {
+            match super::NativeAgentSessionTools::resolve_shared(data_dir) {
+                Ok(provider) => agent = agent.with_session_tool_provider(provider),
+                Err(error) => tracing::debug!(%error, "native session tools unavailable"),
+            }
+        }
         if agent.memory_retriever.is_none()
             && let Some(retriever) = &self.memory_retriever
         {
@@ -1313,7 +1321,7 @@ where
 
     pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
         let subagent_scope = agent.subagent_scope(session.clone());
-        Self {
+        let runtime = Self {
             agent,
             subagent_scope,
             state: Arc::new(Mutex::new(AgentSessionRuntimeState {
@@ -1326,7 +1334,9 @@ where
                 async_updates: Vec::new(),
                 detached_cancellation: AgentCancellationToken::new(),
             })),
-        }
+        };
+        runtime.bind_session_messages();
+        runtime
     }
 
     pub fn submit_op(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError> {
@@ -1472,6 +1482,8 @@ where
         state.in_flight_input_ids.clear();
         state.runtime_events.clear();
         state.completed_turns.clear();
+        drop(state);
+        self.bind_session_messages();
         Ok(())
     }
 
@@ -1724,8 +1736,10 @@ where
 
     /// Stop the session's detached tool calls.
     pub fn cancel_detached_tools(&self) {
-        if let Ok(state) = self.state.lock() {
-            state.detached_cancellation.cancel();
+        if let Ok(mut state) = self.state.lock() {
+            // Existing calls retain the cancelled token; later turns get a
+            // fresh scope when this reusable session starts more work.
+            std::mem::take(&mut state.detached_cancellation).cancel();
         }
     }
 
@@ -2319,6 +2333,9 @@ impl AgentSessionRuntimeState {
             completed_session.abort = live_abort;
         }
         completed_session.pause = live_pause;
+        // Lifecycle metadata is host-owned and can be archived during a turn.
+        // A late turn snapshot must not resurrect a discarded child.
+        completed_session.subagent = live_session.subagent.clone();
         if live_state_revision > base_state_revision {
             completed_session.state_revision = completed_session
                 .state_revision
@@ -2513,7 +2530,18 @@ fn detached_call_completed(session_id: &SessionId, update: crate::AsyncTaskUpdat
     });
 }
 
-fn detached_calls_running(session_id: &SessionId) -> usize {
+/// Deliver host-originated session updates without changing the count of
+/// independently executing detached tool calls.
+pub(super) fn queue_session_update(session_id: &SessionId, update: crate::AsyncTaskUpdate) {
+    with_detached_work(|work| {
+        work.entry(session_id.clone())
+            .or_default()
+            .completions
+            .push(update)
+    });
+}
+
+pub(super) fn detached_calls_running(session_id: &SessionId) -> usize {
     with_detached_work(|work| work.get(session_id).map_or(0, |session| session.running))
 }
 
@@ -2558,6 +2586,29 @@ mod shutdown_tests {
         ) -> Result<sinomo_lm::LanguageModelResponse, sinomo_lm::LanguageModelError> {
             panic!("shutdown must not start a model turn");
         }
+    }
+
+    #[test]
+    fn session_notifications_do_not_complete_unrelated_detached_tools() {
+        let id = SessionId::generate();
+        let update = AsyncTaskUpdate {
+            kind: "agent.subagent.completed".into(),
+            task_id: TaskId::generate(),
+            tool_call_id: None,
+            status: AsyncTaskStatus::Completed,
+            summary: "child finished".into(),
+            needs_user_attention: false,
+            result_ref: None,
+            next_action_hint: AsyncTaskNextAction::InspectResult,
+        };
+        detached_call_started(&id);
+        queue_session_update(&id, update.clone());
+        assert_eq!(detached_calls_running(&id), 1);
+        assert_eq!(take_detached_completions(&id), vec![update.clone()]);
+        assert_eq!(detached_calls_running(&id), 1);
+        detached_call_completed(&id, update.clone());
+        assert_eq!(detached_calls_running(&id), 0);
+        assert_eq!(take_detached_completions(&id), vec![update]);
     }
 
     #[test]

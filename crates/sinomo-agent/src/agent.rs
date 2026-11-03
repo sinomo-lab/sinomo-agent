@@ -6,6 +6,7 @@ mod context;
 mod control;
 mod model;
 mod session;
+mod session_tools;
 mod subagents;
 mod tool_execution;
 mod tool_output;
@@ -18,6 +19,7 @@ pub use context::*;
 pub use control::*;
 pub use model::*;
 pub use session::*;
+pub use session_tools::*;
 pub use subagents::*;
 pub use tool_execution::*;
 use tool_output::*;
@@ -982,10 +984,11 @@ pub struct Agent<M> {
     compactor: AgentCompactor,
     compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
     trace_store: Arc<dyn AgentTraceStore>,
-    session_store: Box<dyn AgentSessionStore>,
+    session_store: Arc<dyn AgentSessionStore>,
     trace_store_configured: bool,
     session_store_configured: bool,
     subagents: OnceLock<Arc<AgentSubagents>>,
+    session_tools: Option<Arc<dyn AgentSessionToolProvider>>,
     /// Active session turns whose items are journaled to the session store as
     /// they are produced, keyed by the interaction session the turn traces
     /// under. See `Agent::journal_item`.
@@ -1018,10 +1021,11 @@ impl<M: InteractionModel> Agent<M> {
                 CodexStyleAgentCompactionEngine::default(),
             ))),
             trace_store: Arc::new(NoopAgentTraceStore),
-            session_store: Box::new(NoopAgentSessionStore),
+            session_store: Arc::new(NoopAgentSessionStore),
             trace_store_configured: false,
             session_store_configured: false,
             subagents: OnceLock::new(),
+            session_tools: None,
             item_journals: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1162,7 +1166,7 @@ impl<M: InteractionModel> Agent<M> {
     }
 
     pub fn with_session_store<T: AgentSessionStore + 'static>(mut self, session_store: T) -> Self {
-        self.session_store = Box::new(session_store);
+        self.session_store = Arc::new(session_store);
         self.session_store_configured = true;
         self
     }

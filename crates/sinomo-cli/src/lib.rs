@@ -807,7 +807,20 @@ pub fn hosted_agent_chat_component_factory(
 ) -> Result<sinomo_runtime::daemon::DaemonComponentFactory, String> {
     let daemon_address = daemon_address.into();
     let factory = sinomo_runtime::module::StaticComponentFactory::new(
-        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION")),
+        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION"))
+            .with_offer(
+                sinomo_runtime::module_api::ServiceOffer::new(
+                    "sessions",
+                    sinomo_runtime::module_api::sessions::SESSION_INTERFACE,
+                    "1.0.0",
+                )
+                .with_operation(
+                    sinomo_runtime::module_api::ServiceOperationOffer::new(
+                        sinomo_runtime::module_api::sessions::SESSION_ACCESS,
+                    )
+                    .at_route(sinomo_runtime::module_api::panels::SESSION_ROUTE),
+                ),
+            ),
         move |context, scope| {
             let runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
             let control_host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =

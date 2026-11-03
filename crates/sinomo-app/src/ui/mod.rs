@@ -7,6 +7,7 @@ mod hover_tests;
 mod image_preview;
 mod markdown_attachments;
 mod module_widget;
+mod session_panels;
 mod tool_output;
 
 pub mod chat;

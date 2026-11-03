@@ -457,6 +457,20 @@ pub struct ModuleInvocationLease {
     inner: Arc<ModuleInvocationLeaseInner>,
 }
 
+impl ModuleInvocationLease {
+    pub(crate) fn ensure_active(&self) -> Result<(), ModuleInvocationLeaseError> {
+        let status = self.inner.registry.status(&self.inner.module_id)?;
+        if status.state == ModuleRuntimeLifecycleState::Active {
+            Ok(())
+        } else {
+            Err(ModuleInvocationLeaseError::Unavailable {
+                module_id: self.inner.module_id.clone(),
+                state: status.state,
+            })
+        }
+    }
+}
+
 struct ModuleInvocationLeaseInner {
     registry: ModuleInvocationLeaseRegistry,
     module_id: String,
@@ -519,6 +533,74 @@ pub enum ModuleRuntimeGenerationError {
     },
     #[error(transparent)]
     Invocation(#[from] ModuleInvocationLeaseError),
+}
+
+// Index the existing host-owned generation store, not a second activation
+// registry. Weak entries retain withdrawal after a host has stopped.
+fn process_hosts()
+-> &'static Mutex<BTreeMap<std::path::PathBuf, std::sync::Weak<ModuleRuntimeHost>>> {
+    static HOSTS: std::sync::OnceLock<
+        Mutex<BTreeMap<std::path::PathBuf, std::sync::Weak<ModuleRuntimeHost>>>,
+    > = std::sync::OnceLock::new();
+    HOSTS.get_or_init(Default::default)
+}
+fn host_key(root: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| {
+        if root.is_absolute() {
+            root.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(root)
+        }
+    })
+}
+pub(crate) fn bind_process_module_host(
+    root: &std::path::Path,
+    host: ModuleRuntimeHost,
+) -> Arc<ModuleRuntimeHost> {
+    let mut hosts = process_hosts().lock().expect("module host index poisoned");
+    let key = host_key(root);
+    if let Some(existing) = hosts.get(&key).and_then(std::sync::Weak::upgrade) {
+        assert!(
+            Arc::ptr_eq(&existing.generations.active, &host.generations.active),
+            "one data directory cannot have multiple live module runtime owners"
+        );
+        return existing;
+    }
+    let host = Arc::new(host);
+    hosts.insert(key, Arc::downgrade(&host));
+    host
+}
+pub fn process_module_host(
+    root: &std::path::Path,
+) -> Result<Option<Arc<ModuleRuntimeHost>>, String> {
+    let hosts = process_hosts()
+        .lock()
+        .map_err(|_| "module host index poisoned")?;
+    match hosts.get(&host_key(root)) {
+        None => Ok(None),
+        Some(host) => host
+            .upgrade()
+            .map(Some)
+            .ok_or_else(|| "module runtime host has stopped".into()),
+    }
+}
+/// Resident metadata is authoritative while a daemon hosts this data directory.
+/// Standalone tooling falls back to verified loader-state discovery.
+pub fn module_registrations_for_host(
+    root: &std::path::Path,
+) -> Result<Vec<crate::ModuleRegistration>, String> {
+    if let Some(host) = process_module_host(root)? {
+        Ok(host
+            .generations
+            .active_snapshot()
+            .module_registry
+            .registry()
+            .registrations()
+            .cloned()
+            .collect())
+    } else {
+        crate::active_native_dylib_module_registrations(root).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

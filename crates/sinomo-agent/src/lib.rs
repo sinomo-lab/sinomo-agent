@@ -6,6 +6,8 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod cli;
+pub mod session_access;
+pub mod session_panels;
 
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
