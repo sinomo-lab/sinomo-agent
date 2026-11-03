@@ -21,6 +21,7 @@
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
 mod diff;
+mod editor_surface;
 mod formats;
 mod paged;
 mod source_editor;
@@ -18535,6 +18536,11 @@ fn preview_card(
     if !loading && error.is_none() {
         if let Some((format, text)) = preview.and_then(|preview| preview.native_preview.as_ref()) {
             if let Some(widget) = formats::preview_widget(*format, text, reader) {
+                if *format == DocumentFormat::Json {
+                    return inspector_card(
+                        "Preview", SizedBox::new().height(260.).child(widget), reader, None,
+                    );
+                }
                 return inspector_card("Preview", SizedBox::new().height(260.0).child(
                     ScrollView::vertical(widget).viewport_width_hint(true)
                         .theme_when(clone_gray_scrollbar_reader(reader))), reader, None);
@@ -22261,6 +22267,9 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             if document.preview_open {
                 if let Some(preview) = formats::preview_widget(document.format, &document.text, &r)
                 {
+                    if document.format == DocumentFormat::Json {
+                        return WidgetPod::new(preview);
+                    }
                     return WidgetPod::new(
                         ScrollView::vertical(preview)
                             .name("File format preview")
@@ -22281,20 +22290,17 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                     style.line_height = theme.text.sm.line_height;
                     style
                 })
-                .padding(Insets::all(12.0))
                 .min_width(0.0)
-                .min_height(420.0)
+                .min_height(0.0)
                 .wrap(TextWrap::NoWrap)
                 .value(document.text.clone())
                 .on_change(move |value| editor_shared.files_mut().set_document_text(value));
             if !document.editable() {
                 editor = editor.read_only(true);
             }
-            WidgetPod::new(
-                Surface::field(editor)
-                    .theme_when(clone_reader(&r))
-                    .fill_width(true),
-            )
+            WidgetPod::new(editor_surface::EditorSurface::new(
+                editor, &r, sui::Signal::new(Default::default()), Insets::all(12.),
+            ))
         })
     };
     let modes = {

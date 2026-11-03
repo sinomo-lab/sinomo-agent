@@ -154,14 +154,16 @@ fn note(text: impl Into<String>, reader: &ThemeReader) -> WidgetPod {
 }
 
 fn text_preview(text: String, reader: &ThemeReader) -> WidgetPod {
-    WidgetPod::new(
-        TextSurface::new("formatted-document-preview")
-            .value(text)
-            .read_only(true)
-            .wrap(TextWrap::NoWrap)
-            .theme_when(clone_reader(reader))
-            .text_style_when(|theme| theme.mono_text_style(theme.palette.text)),
-    )
+    let mut text = TextSurface::new("formatted-document-preview")
+        .value(text)
+        .read_only(true)
+        .wrap(TextWrap::NoWrap)
+        .theme_when(clone_reader(reader))
+        .text_style_when(|theme| super::source_editor::mono(&theme));
+    text.set_selection(0, 0);
+    WidgetPod::new(super::editor_surface::EditorSurface::new(
+        text, reader, sui::Signal::new(Default::default()), sui::Insets::all(10.),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
