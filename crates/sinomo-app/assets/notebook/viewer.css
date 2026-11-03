@@ -1,0 +1,12 @@
+:root { color-scheme:light dark; font:15px/1.5 system-ui,sans-serif; --edge:#b9c1ca65; --soft:#8295ab16; --error:#c34942; }
+* {box-sizing:border-box} body {margin:0;background:Canvas;color:CanvasText}
+header {position:sticky;top:0;z-index:1;background:Canvas;border-bottom:1px solid var(--edge);padding:8px 16px;display:flex;gap:12px;align-items:center}
+header span,.label {color:GrayText;font-size:.84rem} button {margin-left:auto;font:inherit;cursor:pointer}
+main {max-width:1100px;margin:auto;padding:0 16px 32px}
+section {border-bottom:1px solid var(--edge);padding:14px 0;scroll-margin-top:52px;overflow-wrap:anywhere}
+.label {margin:0 0 5px;font-weight:600} pre {margin:0;overflow:auto;white-space:pre;tab-size:4;font:13px/1.55 ui-monospace,Consolas,monospace}
+.code, .raw {background:var(--soft);border-radius:4px;padding:9px 12px}
+.output {margin:8px 0 0;padding:4px 12px;border-left:2px solid var(--edge);overflow:auto}
+.error,.stderr {border-color:var(--error)} .error .label,.stderr .label {color:var(--error)} .error {scroll-margin-top:56px}
+img {max-width:100%;height:auto} table {border-collapse:collapse;font-variant-numeric:tabular-nums} td,th {border:1px solid var(--edge);padding:3px 8px;text-align:start}
+blockquote {border-left:3px solid var(--edge);padding-left:12px} .markdown>:first-child {margin-top:0} .markdown>:last-child {margin-bottom:0} [hidden]{display:none}

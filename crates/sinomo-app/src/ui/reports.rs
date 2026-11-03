@@ -1,4 +1,6 @@
 //! Native desktop report views and their read-only, directory-scoped resource origin.
+mod notebook;
+pub(super) const NOTEBOOK_MIME: &str = "application/x-ipynb+json";
 use super::files::FilesSourceKind;
 use cap_std::{ambient_authority, fs::Dir};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -138,6 +140,7 @@ impl Drop for Origin {
 }
 impl ReportHost {
     pub(super) fn widget(&self, report: Report) -> WidgetPod {
+        let notebook = report.mime == NOTEBOOK_MIME;
         let origin = match Origin::start(report) {
             Ok(v) => Rc::new(v),
             Err(e) => return WidgetPod::new(Label::new(format!("Cannot open report: {e}"))),
@@ -154,14 +157,29 @@ impl ReportHost {
                 let view = host
                     .borrow()
                     .url(&origin.url)
-                    .accessible_name("Report preview")
+                    .accessible_name(if notebook {
+                        "Notebook preview"
+                    } else {
+                        "Report preview"
+                    })
                     .configure(move |builder| {
                         let root = origin.url.rsplit_once('/').unwrap().0.to_owned() + "/";
+                        let builder = if notebook {
+                            builder
+                        } else {
+                            builder.with_javascript_disabled()
+                        };
+                        let entry = origin.url.clone();
                         builder
                             .with_clipboard(false)
                             .with_devtools(false)
-                            .with_javascript_disabled()
-                            .with_navigation_handler(move |url| url.starts_with(&root))
+                            .with_navigation_handler(move |url| {
+                                if notebook {
+                                    url.split('#').next() == Some(entry.as_str())
+                                } else {
+                                    url.starts_with(&root)
+                                }
+                            })
                             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
                             .with_download_started_handler(|_, _| false)
                     });
@@ -172,7 +190,7 @@ impl ReportHost {
     }
 }
 impl Origin {
-    fn start(report: Report) -> Result<Self, String> {
+    fn start(mut report: Report) -> Result<Self, String> {
         let server = Arc::new(Server::http("127.0.0.1:0").map_err(|e| e.to_string())?);
         let host = server.server_addr().to_string();
         let mut secret = [0u8; 24];
@@ -186,7 +204,11 @@ impl Origin {
         );
         let url = format!(
             "http://{host}{prefix}{}",
-            utf8_percent_encode(&report.name, NON_ALPHANUMERIC)
+            if report.mime == NOTEBOOK_MIME {
+                "notebook.html".into()
+            } else {
+                utf8_percent_encode(&report.name, NON_ALPHANUMERIC).to_string()
+            }
         );
         let closed = Arc::new(AtomicBool::new(false));
         let stop = closed.clone();
@@ -201,6 +223,11 @@ impl Origin {
                 } else {
                     None
                 };
+                if report.mime == NOTEBOOK_MIME
+                    && let Content::Bytes(data) = &mut report.content
+                {
+                    *data = notebook::page(data).into_bytes();
+                }
                 let mut browser = None;
                 while !stop.load(Ordering::Acquire) {
                     let Ok(req) = listen.recv() else { break };
@@ -397,9 +424,17 @@ fn serve(
             },
         )
     };
-    let primary = path == report.name;
-    let mime = if primary {
-        Cow::Borrowed(report.mime)
+    let notebook = report.mime == NOTEBOOK_MIME;
+    let primary = if notebook {
+        path == "notebook.html"
+    } else {
+        path == report.name
+    };
+    let renderer = notebook && path == notebook::SCRIPT_NAME;
+    let mime = if renderer {
+        Cow::Borrowed("text/javascript")
+    } else if primary {
+        Cow::Borrowed(if notebook { "text/html" } else { report.mime })
     } else {
         Cow::Owned(
             mime_guess::from_path(&path)
@@ -408,7 +443,9 @@ fn serve(
                 .to_owned(),
         )
     };
-    let resource = if primary {
+    let resource = if renderer {
+        Resource::Memory(notebook::SCRIPT.as_bytes())
+    } else if primary {
         match &report.content {
             Content::Bytes(data) => Resource::Memory(data),
             Content::LocalPdf(path, len, modified) => {
@@ -487,7 +524,9 @@ fn serve(
         header("Referrer-Policy", "no-referrer"),
         header("X-DNS-Prefetch-Control", "off"),
     ];
-    if mime != "application/pdf" {
+    if notebook && primary {
+        headers.push(header("Content-Security-Policy", &format!("default-src 'none'; script-src http://{host}{prefix}{}; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox allow-scripts allow-same-origin", notebook::SCRIPT_NAME)));
+    } else if mime != "application/pdf" {
         headers.push(header("Content-Security-Policy","default-src 'none'; script-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'; sandbox allow-same-origin"));
     }
     if range.is_some() {
@@ -642,6 +681,35 @@ mod tests {
         assert_eq!(body, bytes[65000..135001]);
     }
 
+    #[test]
+    fn notebook_origin_serves_only_the_bundled_script_as_executable_content() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = sinomo_testdir::TestDir::new("notebook-preview");
+        std::fs::write(dir.join(notebook::SCRIPT_NAME), "untrusted sibling script").unwrap();
+        let origin = Origin::start(Report {
+            source: FilesSourceKind::Local,
+            base: dir.to_string_lossy().into_owned(),
+            name: "failed-run.ipynb".into(),
+            mime: NOTEBOOK_MIME,
+            content: Content::Bytes(
+                include_bytes!("../../assets/notebook/testdata/failed-run.ipynb").to_vec(),
+            ),
+            runtime: runtime.handle().clone(),
+            address: None,
+        })
+        .unwrap();
+        let (status, body, headers) = get(&origin, None, None);
+        let page = String::from_utf8(body).unwrap();
+        assert_eq!(status, 200);
+        assert!(headers.contains("script-src http://127.0.0.1:"));
+        assert!(!headers.contains("script-src 'unsafe-inline'"));
+        assert!(headers.contains("default-src 'none'"));
+        assert!(!page.contains("</script><script>window.injectionRan"));
+        assert!(page.contains(r"\u003ch1>Evaluation run"));
+        let (status, script, _) = get(&origin, Some(notebook::SCRIPT_NAME), None);
+        assert_eq!(status, 200);
+        assert_eq!(script, notebook::SCRIPT.as_bytes());
+    }
     #[test]
     fn report_pdf_serves_full_and_partial_responses() {
         let runtime = tokio::runtime::Runtime::new().unwrap();

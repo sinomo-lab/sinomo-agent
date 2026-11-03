@@ -32,6 +32,7 @@ pub(super) enum DocumentFormat {
     Html,
     Svg,
     Pdf,
+    Notebook,
     Markdown,
     Json,
     Csv,
@@ -43,6 +44,7 @@ pub(super) enum DocumentFormat {
 impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::Notebook => "Jupyter notebook",
             Self::Html => "HTML",
             Self::Svg => "SVG",
             Self::Pdf => "PDF",
@@ -123,7 +125,8 @@ pub(super) fn text_format(path: &str) -> DocumentFormat {
         "html" | "htm" => DocumentFormat::Html,
         "svg" => DocumentFormat::Svg,
         "diff" | "patch" => DocumentFormat::Diff,
-        "json" | "ipynb" => DocumentFormat::Json,
+        "json" => DocumentFormat::Json,
+        "ipynb" => DocumentFormat::Notebook,
         "csv" => DocumentFormat::Csv,
         "tsv" | "tab" => DocumentFormat::Tsv,
         _ => DocumentFormat::log_format(path).unwrap_or(DocumentFormat::Text),
@@ -346,7 +349,7 @@ pub(super) fn preview_widget(
     reader: &ThemeReader,
 ) -> Option<PreviewWidget> {
     Some(PreviewWidget(match format {
-        DocumentFormat::Pdf
+        DocumentFormat::Notebook | DocumentFormat::Pdf
         | DocumentFormat::Html
         | DocumentFormat::Svg
         | DocumentFormat::Text

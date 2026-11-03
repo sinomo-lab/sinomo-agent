@@ -1961,9 +1961,12 @@ impl FilesState {
                 // Older checkpoints kept reports as plain text or binary drafts.
                 let restored_format = match document.format {
                     DocumentFormat::Text => match formats::text_format(&document.path) {
-                        f @ (DocumentFormat::Html | DocumentFormat::Svg) => Some(f),
+                        f @ (DocumentFormat::Html | DocumentFormat::Svg | DocumentFormat::Notebook) => Some(f),
                         _ => None,
                     },
+                    DocumentFormat::Json if formats::text_format(&document.path) == DocumentFormat::Notebook => {
+                        Some(DocumentFormat::Notebook)
+                    }
                     DocumentFormat::Hex if document.text.starts_with("25 50 44 46 2D") => Some(DocumentFormat::Pdf),
                     _ => None,
                 };
@@ -22387,6 +22390,7 @@ fn report_view(
         Content::Bytes(bytes)
     };
     let mime = match doc.format {
+        DocumentFormat::Notebook => super::reports::NOTEBOOK_MIME,
         DocumentFormat::Pdf => "application/pdf",
         DocumentFormat::Svg => "image/svg+xml",
         _ => "text/html",
@@ -22436,6 +22440,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 && matches!(
                     document.format,
                     DocumentFormat::Html | DocumentFormat::Svg | DocumentFormat::Pdf
+                        | DocumentFormat::Notebook
                 )
             {
                 #[cfg(all(
@@ -38410,6 +38415,7 @@ mod tests {
             ("notes.md", b"# Project notes\n\n**Ready** for review.\n\n- First item\n- Second item\n".to_vec()),
             ("data.json", br#"{"project":"Sinomo","ready":true,"count":3}"#.to_vec()),
             ("table.csv", b"name,description\nalpha,\"one,two\"\nbeta,three\n".to_vec()),
+            ("failed-run.ipynb", include_bytes!("../../assets/notebook/testdata/failed-run.ipynb").to_vec()),
             ("image.png", png.into_inner()),
         ];
         for width in [560.0, 1100.0] {
@@ -38486,6 +38492,53 @@ mod tests {
             normalized_path.parent().and_then(Path::file_name),
             Some(std::ffi::OsStr::new("folder"))
         );
+    }
+
+    #[test]
+    fn notebook_local_and_sifs_source_round_trip() {
+        let original =
+            include_str!("../../assets/notebook/testdata/failed-run.ipynb").replace('\n', "\r\n");
+        let original = format!("\u{feff}{original}");
+        let root = sinomo_testdir::TestDir::new("notebook-file");
+        let local = root.join("failed-run.IPYNB");
+        fs::write(&local, &original).unwrap();
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(&backend.data_dir).unwrap();
+        let path = "/failed-run.ipynb";
+        browser.write_file(path, original.as_bytes()).unwrap();
+        for load in [
+            load_local_text_document(local.to_str().unwrap(), FILE_DOCUMENT_MAX_BYTES).unwrap(),
+            load_sifs_text_document(&browser, path, FILE_DOCUMENT_MAX_BYTES).unwrap(),
+        ] {
+            assert_eq!(load.format, DocumentFormat::Notebook);
+            assert!(load.preview_open);
+            assert_eq!(
+                formats::document_bytes(load.format, &load.text).unwrap(),
+                original.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a disposable SIFS daemon"]
+    fn notebook_failed_run_from_live_sifs() {
+        let address = std::env::var("SINOMO_FILES_HISTORY_E2E_ADDRESS").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let browser = SifsBrowser::open_daemon_on_runtime(&address, rt.handle()).unwrap();
+        let path = format!(
+            "/notebook-{}/failed-run.ipynb",
+            sinomo_runtime::core::Id::generate()
+        );
+        browser
+            .create_dir_all(path.rsplit_once('/').unwrap().0)
+            .unwrap();
+        let original = include_bytes!("../../assets/notebook/testdata/failed-run.ipynb");
+        browser.write_file(&path, original).unwrap();
+        let load = load_sifs_text_document(&browser, &path, FILE_DOCUMENT_MAX_BYTES).unwrap();
+        assert_eq!(load.format, DocumentFormat::Notebook);
+        assert!(load.preview_open);
+        assert_eq!(load.text.as_bytes(), original);
+        println!("Notebook fixture {path}");
     }
 
     #[test]
