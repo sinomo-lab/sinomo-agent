@@ -1,6 +1,6 @@
 # Agent Usage Tracking
 
-Status: proposed.
+This document defines the acceptance contract for agent usage tracking.
 
 This plan adds durable, attributable accounting of agent work and a Usage view
 in the app's Cluster surface. It covers model provider requests, token and other
@@ -119,9 +119,12 @@ model request or tool call.
 
 ## Usage Ledger
 
-The usage ledger belongs to the agent runtime and is registered through the
-shared storage registry like other agent state. It follows the "events and
-traces" state class: append-oriented, durable, and node-local.
+Usage recording and retention belong to `sinomo-observe`. Agent and provider
+runtimes publish typed facts through Observe's producer boundary. The retained
+usage projection shares Observe's event writer, metrics recorder, collection
+policy, and storage registry; there is no separate agent-side metric store.
+Usage follows the "events and traces" state class: append-oriented, durable,
+and node-local.
 
 - Each node appends the records for work it performed. Records are never written
   to cluster KV, which holds only compact configuration.
@@ -168,8 +171,9 @@ Partial results stay visible as partial; they are never presented as complete.
 
 ### Live metrics
 
-Observe also receives bounded counters, such as model requests by provider and
-status, tokens by provider and unit, and tool calls by status. These feed the
+Observe's existing metrics recorder owns bounded counters, such as model
+requests by provider and status, tokens by provider and unit, and tool calls by
+status. These feed the
 Cluster Overview's agent activity charts and Explore. Agent, chat, model, tool,
 and skill breakdowns are not metric labels; those dimensions stay in the ledger.
 

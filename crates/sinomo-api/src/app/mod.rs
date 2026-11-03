@@ -8,3 +8,4 @@ pub mod chat;
 pub mod evolution;
 pub mod skill;
 pub mod update;
+pub mod usage;

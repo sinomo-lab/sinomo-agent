@@ -291,16 +291,7 @@ pub(crate) fn extract_text(value: &serde_json::Value) -> String {
 }
 
 pub(crate) fn extract_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
-    value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(serde_json::Value::as_u64),
-        output_tokens: usage
-            .get("completion_tokens")
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(serde_json::Value::as_u64),
-    })
+    crate::usage::openai(value)
 }
 
 pub(crate) fn extract_tool_calls(value: &serde_json::Value) -> Vec<LanguageModelToolCall> {

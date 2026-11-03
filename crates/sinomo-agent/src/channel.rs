@@ -3525,6 +3525,7 @@ mod tests {
                     usage: Some(LanguageModelUsage {
                         input_tokens: Some(1),
                         output_tokens: Some(1),
+                        ..Default::default()
                     }),
                 }),
                 Err(detail) => Err(LanguageModelError::ProviderInvocationFailed {

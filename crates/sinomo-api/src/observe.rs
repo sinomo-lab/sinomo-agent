@@ -223,3 +223,45 @@ mod log_tests {
         );
     }
 }
+
+pub mod recording;
+
+pub const OBSERVE_MAX_CONCURRENT_NODES: usize = 8;
+/// Shared collection policy for live metrics, logs and retained usage. It keeps
+/// target order and target identity even when a worker fails.
+pub async fn collect_bounded<Target, Observe, Fut, Response>(
+    targets: Vec<Target>,
+    observe: Observe,
+) -> Vec<(Target, Result<Response, String>)>
+where
+    Target: Clone + Send + 'static,
+    Observe: Fn(Target) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Response, String>> + Send + 'static,
+    Response: Send + 'static,
+{
+    let mut samples = Vec::with_capacity(targets.len());
+    for chunk in targets.chunks(OBSERVE_MAX_CONCURRENT_NODES) {
+        let jobs = chunk
+            .iter()
+            .cloned()
+            .map(|target| {
+                let work = target.clone();
+                let observe = observe.clone();
+                (
+                    target,
+                    tokio::spawn(async move { Box::pin(observe(work)).await }),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (target, job) in jobs {
+            samples.push((
+                target,
+                match job.await {
+                    Ok(value) => value,
+                    Err(error) => Err(format!("cluster observation task failed: {error}")),
+                },
+            ));
+        }
+    }
+    samples
+}

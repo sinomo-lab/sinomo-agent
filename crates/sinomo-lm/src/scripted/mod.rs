@@ -354,6 +354,7 @@ impl ScriptedReply {
         self.usage = Some(LanguageModelUsage {
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
+            ..Default::default()
         });
         self
     }

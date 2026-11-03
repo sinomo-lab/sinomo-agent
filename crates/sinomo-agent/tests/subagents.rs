@@ -23,6 +23,7 @@ enum Behavior {
 }
 
 struct Model {
+    usage_data: sinomo_runtime::local::SinomoDataDir,
     spawn_from_model: bool,
     behavior: Behavior,
     started: mpsc::Sender<SessionId>,
@@ -82,107 +83,120 @@ impl InteractionModel for Model {
         token: &AgentCancellationToken,
         _: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
-        self.requests.lock().unwrap().push(request.clone());
-        let step = request.metadata["step_index"].as_u64().unwrap();
-        if request
-            .metadata
-            .pointer("/run_context/task/kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("subagent")
-        {
+        let observation = sinomo_lm::usage::RequestObservation::new(
+            &self.usage_data,
+            &request.provider,
+            &request.model,
+            None,
+            request,
+        );
+        let result = (|| {
+            self.requests.lock().unwrap().push(request.clone());
+            let step = request.metadata["step_index"].as_u64().unwrap();
             if request
-                .messages
-                .iter()
-                .any(|message| message.content.contains("hold-parent"))
+                .metadata
+                .pointer("/run_context/task/kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("subagent")
             {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("hold-parent"))
+                {
+                    self.started
+                        .send(
+                            serde_json::from_value(request.metadata["session_id"].clone()).unwrap(),
+                        )
+                        .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !token.is_cancelled() {
+                        assert!(Instant::now() < deadline, "test did not cancel parent");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                let calls = if self.spawn_from_model && step == 0 {
+                    vec![
+                        call(
+                            "subagents",
+                            serde_json::json!({"action":"spawn", "name":"one", "task":"first task"}),
+                        ),
+                        call(
+                            "subagents",
+                            serde_json::json!({"action":"spawn", "name":"two", "task":"second task"}),
+                        ),
+                    ]
+                } else {
+                    vec![]
+                };
+                return Ok(response(request, "parent answer".into(), calls));
+            }
+            let nested_branch = matches!(self.behavior, Behavior::Nested)
+                && request.metadata["run_context"]["task"]["summary"] == "specific task";
+            if step == 0 {
                 self.started
                     .send(serde_json::from_value(request.metadata["session_id"].clone()).unwrap())
                     .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !token.is_cancelled() {
-                    assert!(Instant::now() < deadline, "test did not cancel parent");
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-            let calls = if self.spawn_from_model && step == 0 {
-                vec![
-                    call(
-                        "subagents",
-                        serde_json::json!({"action":"spawn", "name":"one", "task":"first task"}),
-                    ),
-                    call(
-                        "subagents",
-                        serde_json::json!({"action":"spawn", "name":"two", "task":"second task"}),
-                    ),
-                ]
-            } else {
-                vec![]
-            };
-            return Ok(response(request, "parent answer".into(), calls));
-        }
-        let nested_branch = matches!(self.behavior, Behavior::Nested)
-            && request.metadata["run_context"]["task"]["summary"] == "specific task";
-        if step == 0 {
-            self.started
-                .send(serde_json::from_value(request.metadata["session_id"].clone()).unwrap())
-                .unwrap();
-            if nested_branch {
-                return Ok(response(
-                    request,
-                    "delegating".into(),
-                    vec![call(
-                        "subagents",
-                        serde_json::json!({"action":"spawn", "task":"leaf task"}),
-                    )],
-                ));
-            }
-            if matches!(self.behavior, Behavior::Nested) {
-                self.leaf_started.store(true, Ordering::SeqCst);
-            }
-            if matches!(
-                self.behavior,
-                Behavior::Block | Behavior::Probe | Behavior::Nested
-            ) {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !self.release.load(Ordering::SeqCst) && !token.is_cancelled() {
-                    assert!(Instant::now() < deadline, "test did not release child");
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-            self.finished.send(token.is_cancelled()).unwrap();
-            match self.behavior {
-                Behavior::Fail => {
-                    return Err(LanguageModelError::ProviderInvocationFailed {
-                        provider: request.provider.clone(),
-                        model: request.model.clone(),
-                        detail: "child provider failure".into(),
-                    });
-                }
-                Behavior::Panic => panic!("child provider panic"),
-                Behavior::Probe => {
+                if nested_branch {
                     return Ok(response(
                         request,
-                        "checking inherited permission".into(),
-                        vec![call("probe", serde_json::json!({}))],
+                        "delegating".into(),
+                        vec![call(
+                            "subagents",
+                            serde_json::json!({"action":"spawn", "task":"leaf task"}),
+                        )],
                     ));
                 }
-                Behavior::Long => return Ok(response(request, "界".repeat(30_000), vec![])),
-                Behavior::Block | Behavior::Nested => {}
+                if matches!(self.behavior, Behavior::Nested) {
+                    self.leaf_started.store(true, Ordering::SeqCst);
+                }
+                if matches!(
+                    self.behavior,
+                    Behavior::Block | Behavior::Probe | Behavior::Nested
+                ) {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !self.release.load(Ordering::SeqCst) && !token.is_cancelled() {
+                        assert!(Instant::now() < deadline, "test did not release child");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                self.finished.send(token.is_cancelled()).unwrap();
+                match self.behavior {
+                    Behavior::Fail => {
+                        return Err(LanguageModelError::ProviderInvocationFailed {
+                            provider: request.provider.clone(),
+                            model: request.model.clone(),
+                            detail: "child provider failure".into(),
+                        });
+                    }
+                    Behavior::Panic => panic!("child provider panic"),
+                    Behavior::Probe => {
+                        return Ok(response(
+                            request,
+                            "checking inherited permission".into(),
+                            vec![call("probe", serde_json::json!({}))],
+                        ));
+                    }
+                    Behavior::Long => return Ok(response(request, "界".repeat(30_000), vec![])),
+                    Behavior::Block | Behavior::Nested => {}
+                }
             }
-        }
-        if nested_branch {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !self.leaf_started.load(Ordering::SeqCst) {
-                assert!(Instant::now() < deadline, "grandchild did not start");
-                std::thread::sleep(Duration::from_millis(2));
+            if nested_branch {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !self.leaf_started.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "grandchild did not start");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
             }
-        }
-        let text = if matches!(self.behavior, Behavior::Probe) {
-            request.messages.last().unwrap().content.clone()
-        } else {
-            "child answer".into()
-        };
-        Ok(response(request, text, vec![]))
+            let text = if matches!(self.behavior, Behavior::Probe) {
+                request.messages.last().unwrap().content.clone()
+            } else {
+                "child answer".into()
+            };
+            Ok(response(request, text, vec![]))
+        })();
+        observation.finish(&result, token.is_cancelled(), None, None);
+        result
     }
 }
 
@@ -194,6 +208,9 @@ struct Harness {
     finished: mpsc::Receiver<bool>,
     release: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<LanguageModelRequest>>>,
+    _usage_registration: sinomo_runtime::api::observe::recording::Registration,
+    usage_events: mpsc::Receiver<sinomo_runtime::api::observe::recording::Submission>,
+    _usage_root: sinomo_testdir::TestDir,
 }
 
 fn harness(
@@ -219,7 +236,14 @@ fn harness(
     let (finished_tx, finished) = mpsc::channel();
     let release = Arc::new(AtomicBool::new(false));
     let requests = Arc::new(Mutex::new(vec![]));
+    let usage_root = sinomo_testdir::TestDir::new("usage-subagents");
+    let usage_data = sinomo_runtime::local::SinomoDataDir::new(&usage_root);
+    let (usage_tx, usage_events) = mpsc::sync_channel(256);
+    let usage_registration =
+        sinomo_runtime::api::observe::recording::register(&usage_data, usage_tx);
+    registry.set_usage_data_dir(usage_data.clone());
     let model = Model {
+        usage_data,
         behavior,
         spawn_from_model,
         started: started_tx,
@@ -264,6 +288,9 @@ fn harness(
         .unwrap();
     runtime.join_active_turn().unwrap();
     Harness {
+        _usage_root: usage_root,
+        _usage_registration: usage_registration,
+        usage_events,
         runtime,
         registry,
         input,
@@ -345,6 +372,37 @@ fn model_spawns_parallel_children_through_the_registered_tool() {
         let result = wait(&h, &child.id);
         assert_eq!(result.status, AgentSubagentStatus::Completed);
         assert_eq!(result.result.as_deref(), Some("child answer"));
+    }
+    let usage = h
+        .usage_events
+        .try_iter()
+        .filter_map(|event| match event {
+            sinomo_runtime::api::observe::recording::Submission::Event(event) => {
+                serde_json::from_value::<sinomo_runtime::api::app::usage::UsageRecord>(
+                    event.payload,
+                )
+                .ok()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for child in &children {
+        let records = usage
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.event,
+                    sinomo_runtime::api::app::usage::UsageEvent::ModelRequest { .. }
+                ) && r.attribution.session.as_deref() == Some(child.session_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].attribution.parent_session.as_deref(),
+            Some(h.input.session.session_id.as_str())
+        );
+        assert_eq!(records[0].attribution.origin, "subagent");
+        assert!(records[0].attribution.operation.is_some());
     }
     let requests = h.requests.lock().unwrap();
     let child_request = requests

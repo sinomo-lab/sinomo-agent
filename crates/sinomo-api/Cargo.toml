@@ -12,6 +12,8 @@ include = ["src/**/*.rs", "Cargo.toml", "build.rs"]
 ring = "r1"
 
 [dependencies]
+metrics.workspace = true
+tracing.workspace = true
 blake3.workspace = true
 sinomo-module-api.workspace = true
 fs2.workspace = true

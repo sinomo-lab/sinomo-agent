@@ -230,6 +230,7 @@ pub fn run() -> sui::Result<()> {
     {
         tracing::warn!(%error, "workspace save failed");
     }
+    sinomo_client::api::observe::recording::shutdown_producers(std::time::Duration::from_secs(5));
     result
 }
 

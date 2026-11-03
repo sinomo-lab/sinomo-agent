@@ -377,10 +377,7 @@ fn completed_response(
             }
         }
     }
-    let usage = value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage["input_tokens"].as_u64(),
-        output_tokens: usage["output_tokens"].as_u64(),
-    });
+    let usage = crate::usage::openai(value);
     let items = calls
         .iter()
         .cloned()

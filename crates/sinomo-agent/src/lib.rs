@@ -2708,6 +2708,11 @@ fn parse_agent_interaction_state(value: &str) -> Option<AgentInteractionState> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct InteractionSession {
+    /// Conversation evidence supplied by the surface owner; never inferred from a surface label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant_id: Option<TaskId>,
     pub session_id: SessionId,
     pub node_id: NodeId,
     pub surface: InteractionSurface,
@@ -2716,6 +2721,8 @@ pub struct InteractionSession {
 impl InteractionSession {
     pub fn new(session_id: SessionId, node_id: NodeId, surface: InteractionSurface) -> Self {
         Self {
+            conversation_id: None,
+            participant_id: None,
             session_id,
             node_id,
             surface,
@@ -3034,6 +3041,7 @@ pub fn interaction_model_request<S: EventStore>(
         max_output_tokens: Some(800),
         response_format: LanguageModelResponseFormat::Text,
         metadata: serde_json::json!({
+            "usage_attribution": sinomo_runtime::api::app::usage::UsageAttribution { node: session.node_id.to_string(), session: Some(session.session_id.to_string()), chat: session.conversation_id.as_ref().map(ToString::to_string), turn: Some(message_event_id.to_string()), origin: "interactive_chat".into(), purpose: "agent_turn".into(), ..Default::default() },
             "loop": "interactive",
             "node_id": session.node_id,
             "session_id": session.session_id,

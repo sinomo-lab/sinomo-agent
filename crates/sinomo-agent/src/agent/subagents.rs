@@ -127,8 +127,10 @@ impl AgentSubagents {
             .links
             .caused_by
             .push(input.latest_event.event_id.clone());
+        let attribution = sinomo_lm::usage::current_attribution();
         event.payload["subagent"] = serde_json::json!({
             "id": id, "name": name, "parent_session_id": parent_session_id,
+            "parent_operation":attribution.operation,"parent_tool_call":attribution.tool_call,
         });
         input.latest_event = event;
         // Surface participation instructions belong to the parent's turn.
@@ -507,18 +509,18 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
                         child.config.run_context.task = Some(task);
                         let child = Arc::new(child);
                         Ok(Box::new(move |cancellation| {
-                            let _scope = child.subagent_scope(session);
-                            child.run_with_session_context_and_cancellation(
-                                &input,
-                                &AgentTranscript::new(),
-                                None,
-                                &[],
-                                &[],
-                                cancellation,
-                                AgentToolProgressSink::default(),
-                                AgentModelProgressSink::default(),
-                                &mut AgentTurnProgress::default(),
-                            )
+                            let _scope = child.subagent_scope(session.clone());
+                            let mut session = session;
+                            // Reuse operation identity and item provenance. The inherited
+                            // Noop session store keeps children non-resumable, as required.
+                            child
+                                .handle_op_with_cancellation(
+                                    &mut session,
+                                    super::AgentOp::start_turn(input),
+                                    cancellation,
+                                )?
+                                .run
+                                .ok_or_else(|| subagent_error("child turn did not produce a run"))
                         }))
                     }),
                 })

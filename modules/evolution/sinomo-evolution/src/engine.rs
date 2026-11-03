@@ -4260,6 +4260,7 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
                 max_output_tokens: None,
                 response_format: response_format.clone(),
                 metadata: serde_json::json!({
+                    "usage_attribution": sinomo_runtime::api::app::usage::UsageAttribution{origin:"evolution".into(),purpose:"mutation".into(),task:Some(packet.job_id.to_string()),operation:Some(packet.job_id.to_string()),..Default::default()},
                     "job_id": packet.job_id,
                     "candidate_workspace": workspace.path,
                     "direct_edit": direct_edit,
@@ -4272,7 +4273,11 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             // not bridge construction: a local operator can revoke consent
             // between model/tool rounds and the next host process must stop.
             self.authorize_provider_host_access(&info)?;
-            let response = self.provider.complete(&request)?;
+            let response = sinomo_lm::usage::complete_provider(
+                self.local_permission_data_dir.as_ref(),
+                &self.provider,
+                &request,
+            )?;
             let structured_output = parse_structured_mutation_output(&response.content);
             let tool_calls = if direct_edit {
                 Vec::new()
@@ -4671,6 +4676,7 @@ where
         let tool_registry = AgentToolRegistry::local_workspace_with_config(workspace_config);
         if let Some(data_dir) = &self.local_permission_data_dir {
             tool_registry.set_local_permission_data_dir(data_dir.root());
+            tool_registry.set_usage_data_dir(data_dir.clone());
             let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(
                 data_dir,
                 crate::EVOLUTION_IMPLEMENTER_AGENT_ID,

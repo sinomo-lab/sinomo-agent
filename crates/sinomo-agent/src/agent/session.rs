@@ -776,6 +776,16 @@ impl<M: InteractionModel> Agent<M> {
         let cancellation_token = cancellation_token.with_timeout_ms(op.timeout_ms);
         let op_id = op.op_id;
         let session_id = session.session_id.clone();
+        let _usage_scope = sinomo_lm::usage::enter_attribution(
+            sinomo_runtime::api::app::usage::UsageAttribution {
+                agent: Some(self.config.definition.key().to_string()),
+                session: Some(session_id.to_string()),
+                operation: Some(op_id.to_string()),
+                turn: op.action.is_turn().then(|| op_id.to_string()),
+                purpose: op.action.kind().into(),
+                ..Default::default()
+            },
+        );
         let mut events = Vec::new();
         let mut run = None;
 
@@ -1471,6 +1481,7 @@ impl<M: InteractionModel> Agent<M> {
                 .unwrap_or(DEFAULT_MANUAL_COMPACTION_RETAINED_ITEMS);
             let cancellation_token = AgentCancellationToken::new();
             let summary = self.compact_source_transcript(
+                &session.session_id,
                 &source_transcript,
                 reason.into(),
                 source_transcript.items.len(),
@@ -1516,6 +1527,7 @@ impl<M: InteractionModel> Agent<M> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn compact_source_transcript(
         &self,
+        session_id: &SessionId,
         source_transcript: &AgentTranscript,
         reason: String,
         token_estimate_before: usize,
@@ -1535,6 +1547,7 @@ impl<M: InteractionModel> Agent<M> {
         engine.compact(
             self.model.as_ref(),
             AgentCompactionRequest {
+                session_id,
                 config: &self.config,
                 projection_builder: &self.compactor,
                 source_transcript,

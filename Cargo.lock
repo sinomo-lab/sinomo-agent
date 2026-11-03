@@ -9829,6 +9829,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fs2",
+ "metrics",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -9839,6 +9840,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -10448,6 +10450,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-websockets",
+ "tracing",
  "webrtc",
 ]
 
@@ -10612,6 +10615,7 @@ dependencies = [
  "signal-hook",
  "sinomo-api",
  "sinomo-cli-registry",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-module",

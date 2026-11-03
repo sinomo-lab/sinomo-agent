@@ -649,7 +649,8 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
         let cancellation_for_cancel = Arc::clone(&cancellation_requested);
         Ok(AgentToolGatewayTask::new(
             move || {
-                execute_remote_tool(
+                let executing_node = target_node_id.clone();
+                let mut result = execute_remote_tool(
                     &tool,
                     &route,
                     &category,
@@ -659,7 +660,19 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
                     wait_operation_id,
                     start_transport,
                     &cancellation_for_wait,
-                )
+                );
+                let succeeded = result.status == super::AgentToolStatus::Succeeded;
+                let evidence = result.evidence.get_or_insert_with(|| {
+                    super::AgentToolEvidence::availability_only(true, "remote invocation")
+                });
+                if !evidence.metadata.is_object() {
+                    evidence.metadata = serde_json::json!({});
+                }
+                evidence.metadata["runtime"] = serde_json::json!("remote");
+                if succeeded {
+                    evidence.metadata["executing_node_id"] = serde_json::json!(executing_node);
+                }
+                result
             },
             move || {
                 cancellation_for_cancel.store(true, Ordering::SeqCst);

@@ -118,9 +118,9 @@ impl AnthropicProvider {
             temperature: None,
             max_output_tokens: Some(4),
             response_format: LanguageModelResponseFormat::Text,
-            metadata: serde_json::Value::Null,
+            metadata: serde_json::json!({"purpose":"provider_verification","loop":"provider_service"}),
         };
-        self.complete(&request).map(|_| ())
+        crate::usage::complete_provider(None, self, &request).map(|_| ())
     }
 }
 
@@ -187,6 +187,7 @@ impl LanguageModelProvider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("anthropic", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -232,6 +233,7 @@ impl LanguageModelProvider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("anthropic", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -499,6 +501,7 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
     let mut usage = LanguageModelUsage {
         input_tokens: None,
         output_tokens: None,
+        ..Default::default()
     };
     let mut finish_reason = None;
     let mut saw_usage = false;
@@ -529,12 +532,9 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
             .unwrap_or_default()
         {
             "message_start" => {
-                if let Some(input_tokens) = value
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                {
-                    usage.input_tokens = Some(input_tokens);
-                    saw_usage = true;
+                if let Some(u) = value.pointer("/message/usage").filter(|u| u.is_object()) {
+                    usage = crate::usage::anthropic(u);
+                    saw_usage = usage.reported();
                 }
             }
             "content_block_delta" => {
@@ -568,6 +568,7 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
                     .and_then(serde_json::Value::as_u64)
                 {
                     usage.output_tokens = Some(output_tokens);
+                    crate::usage::record_usage_report(&usage);
                     saw_usage = true;
                 }
                 if let Some(reason) = value

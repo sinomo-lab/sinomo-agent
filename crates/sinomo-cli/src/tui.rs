@@ -5565,6 +5565,7 @@ mod tui_tests {
                 usage: Some(sinomo_lm::LanguageModelUsage {
                     input_tokens: Some(7),
                     output_tokens: Some(3),
+                    ..Default::default()
                 }),
             })
         }
@@ -6145,6 +6146,7 @@ mod tui_tests {
             usage: sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(1234),
                 output_tokens: Some(56),
+                ..Default::default()
             },
         });
         state.apply_output(InteractionOutput::Line("sinomo: done".to_string()));
@@ -6995,6 +6997,7 @@ mod tui_tests {
             usage: sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(11),
                 output_tokens: Some(7),
+                ..Default::default()
             },
         });
 
@@ -8137,6 +8140,10 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
 
     pub fn session(&self) -> &InteractionSession {
         &self.session
+    }
+    pub(crate) fn set_conversation_id(&mut self, id: SessionId, participant: sinomo_agent::TaskId) {
+        self.session.conversation_id = Some(id);
+        self.session.participant_id = Some(participant);
     }
 }
 
@@ -10460,6 +10467,7 @@ where
             .map(str::to_string);
         let mut message_cause_event_id = event.event_id.clone();
         let mut explicit_skill_name = None;
+        let mut explicit_skill_usage = None;
 
         if let Some(args) = parse_slash_command(text)? {
             if let Some(output) =
@@ -10484,7 +10492,7 @@ where
                 }
                 let activated = interaction_event(
                     session,
-                    "interaction.skill.activated",
+                    "skill.activated",
                     serde_json::json!({
                         "input_event_id": event.event_id,
                         "skill": skill.name,
@@ -10496,6 +10504,26 @@ where
                 )
                 .caused_by(&event.event_id);
                 store.append(activated.clone())?;
+                explicit_skill_usage = Some(sinomo_lm::usage::record(
+                    sinomo_runtime::api::app::usage::UsageAttribution {
+                        node: session.node_id.to_string(),
+                        agent: Some(self.agent_definition.key().to_string()),
+                        session: Some(session.session_id.to_string()),
+                        chat: session.conversation_id.as_ref().map(ToString::to_string),
+                        caused_by: vec![event.event_id.to_string()],
+                        participant: session.participant_id.as_ref().map(ToString::to_string),
+                        origin: "interactive_chat".into(),
+                        purpose: "skill_activation".into(),
+                        ..Default::default()
+                    },
+                    sinomo_runtime::api::app::usage::UsageEvent::SkillActivated {
+                        skill: skill.name.clone(),
+                        version: skill.version.clone(),
+                        content_hash: skill.content_hash.clone(),
+                        trigger: "explicit_slash".into(),
+                        resource: None,
+                    },
+                ));
                 message_cause_event_id = activated.event_id;
                 explicit_skill_name = Some(skill.name);
             } else {
@@ -10540,17 +10568,29 @@ where
         .caused_by(&message.event_id);
         store.append(requested.clone())?;
 
-        let admission_cancellation = self.admission_cancellation.clone();
-        let runtime = self.ensure_runtime(session)?;
-        // An interrupted (paused) session resumes when a new message arrives.
-        if runtime.session_snapshot()?.is_paused() {
-            runtime.submit_op(AgentOp::unpause())?;
+        let submission = (|| {
+            let admission_cancellation = self.admission_cancellation.clone();
+            let runtime = self.ensure_runtime(session)?;
+            // An interrupted (paused) session resumes when a new message arrives.
+            if runtime.session_snapshot()?.is_paused() {
+                runtime.submit_op(AgentOp::unpause())?;
+            }
+            let op = AgentOp::start_turn(input);
+            let result = match admission_cancellation {
+                Some(cancellation) => runtime.submit_op_with_cancellation(op, cancellation)?,
+                None => runtime.submit_op(op)?,
+            };
+            Ok::<_, CliError>(result)
+        })();
+        if let Some(mut usage) = explicit_skill_usage {
+            usage.attribution.operation = submission
+                .as_ref()
+                .ok()
+                .and_then(|result| result.events.first().map(|e| e.op_id.to_string()));
+            usage.attribution.turn = usage.attribution.operation.clone();
+            self.tool_registry.submit_usage_record(usage);
         }
-        let op = AgentOp::start_turn(input);
-        let result = match admission_cancellation {
-            Some(cancellation) => runtime.submit_op_with_cancellation(op, cancellation)?,
-            None => runtime.submit_op(op)?,
-        };
+        let result = submission?;
         let queued = interaction_event(
             session,
             "interaction.main_agent.queued",
@@ -10622,6 +10662,7 @@ fn default_main_agent_chat_model_id() -> &'static str {
 
 #[cfg(feature = "native-models")]
 pub struct RustMiniCpmV46ChatModel {
+    data_dir: SinomoDataDir,
     model_dir: PathBuf,
     max_input_tokens_override: Option<usize>,
     max_output_tokens_override: Option<usize>,
@@ -10647,6 +10688,7 @@ impl RustMiniCpmV46ChatModel {
     ) -> Self {
         let model_dir = configured_rust_minicpm_v46_dir(data_dir, &runtime_config);
         Self {
+            data_dir: data_dir.clone(),
             model_dir,
             max_input_tokens_override: runtime_config.minicpm_v46.max_input_tokens,
             max_output_tokens_override: runtime_config.minicpm_v46.max_output_tokens,
@@ -10674,14 +10716,6 @@ impl RustMiniCpmV46ChatModel {
         f(guard.as_ref().expect("loaded model initialized"))
     }
 
-    fn generate(
-        &self,
-        loaded: &LoadedRustMiniCpmV46,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        self.generate_streaming(loaded, request, None)
-    }
-
     fn generate_streaming(
         &self,
         loaded: &LoadedRustMiniCpmV46,
@@ -10703,6 +10737,7 @@ impl RustMiniCpmV46ChatModel {
             usage: Some(sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(input_tokens as u64),
                 output_tokens: Some(output_tokens as u64),
+                ..Default::default()
             }),
         })
     }
@@ -11083,19 +11118,90 @@ impl InteractionModel for RustMiniCpmV46ChatModel {
         &self,
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
-        self.with_loaded(|loaded| self.generate(loaded, request))
+        self.complete_streaming_events_with_cancellation(
+            request,
+            &AgentCancellationToken::new(),
+            &mut |_| {},
+        )
     }
-
     fn complete_streaming(
         &self,
         request: &LanguageModelRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
-        on_delta("<sinomo_progress>loading native MiniCPM-V 4.6</sinomo_progress>");
-        self.with_loaded(|loaded| {
-            on_delta("<sinomo_progress>running prompt prefill</sinomo_progress>");
-            self.generate_streaming(loaded, request, Some(on_delta))
-        })
+        self.complete_streaming_events_with_cancellation(
+            request,
+            &AgentCancellationToken::new(),
+            &mut |event| {
+                if let LanguageModelStreamEvent::TextDelta { delta } = event {
+                    on_delta(&delta);
+                }
+            },
+        )
+    }
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let observation = sinomo_lm::usage::RequestObservation::new(
+            &self.data_dir,
+            &request.provider,
+            &request.model,
+            None,
+            request,
+        );
+        let started = std::time::Instant::now();
+        let mut first = None;
+        let generated = if cancellation.is_cancelled() {
+            Err(configured_model_cancelled_error(
+                request,
+                "before native inference",
+            ))
+        } else {
+            on_event(LanguageModelStreamEvent::Started {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+            });
+            self.with_loaded(|loaded| {
+                self.generate_streaming(
+                    loaded,
+                    request,
+                    Some(&mut |delta| {
+                        if !delta.is_empty() && first.is_none() {
+                            first = Some(started.elapsed().as_millis() as u64);
+                        }
+                        if !cancellation.is_cancelled() {
+                            on_event(LanguageModelStreamEvent::TextDelta {
+                                delta: delta.to_string(),
+                            });
+                        }
+                    }),
+                )
+            })
+        };
+        let units = generated.as_ref().ok().and_then(|r| r.usage.clone());
+        let result = if cancellation.is_cancelled() {
+            Err(configured_model_cancelled_error(
+                request,
+                "during native inference",
+            ))
+        } else {
+            generated
+        };
+        if let Some(usage) = &units {
+            on_event(LanguageModelStreamEvent::Usage {
+                usage: usage.clone(),
+            });
+        }
+        observation.finish(&result, cancellation.is_cancelled(), first, units);
+        if result.is_ok() {
+            on_event(LanguageModelStreamEvent::Finished {
+                finish_reason: None,
+            });
+        }
+        result
     }
 }
 

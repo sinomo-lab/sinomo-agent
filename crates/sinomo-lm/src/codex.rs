@@ -491,6 +491,7 @@ impl OpenAiResponsesCodexClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: CODEX_PROVIDER_ID.to_string(),
                 model: CODEX_DEFAULT_MODEL.to_string(),
@@ -545,6 +546,7 @@ impl OpenAiResponsesCodexClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: CODEX_PROVIDER_ID.to_string(),
                 model: CODEX_DEFAULT_MODEL.to_string(),
@@ -621,11 +623,13 @@ impl OpenAiResponsesCodexClient {
         let mut response = self.post_search_request(&tokens, &payload)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             tokens = self.refresh_chatgpt_tokens()?;
+            crate::usage::record_retry("credentials_refreshed");
             response = self.post_search_request(&tokens, &payload)?;
         }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(codex_search_error(format!(
                 "Codex web search failed: HTTP {status}: {body}"
             )));
@@ -639,6 +643,7 @@ impl OpenAiResponsesCodexClient {
             .unwrap_or_default()
             .to_string();
         Ok(OpenAiWebSearchResponse {
+            usage: crate::usage::openai(&value),
             model,
             text,
             sources: crate::openai::collect_web_search_sources(
@@ -687,11 +692,13 @@ impl OpenAiResponsesCodexClient {
         let mut response = self.post_image_request(&tokens, operation, &payload)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             tokens = self.refresh_chatgpt_tokens()?;
+            crate::usage::record_retry("credentials_refreshed");
             response = self.post_image_request(&tokens, operation, &payload)?;
         }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(codex_image_error(format!(
                 "Codex image {operation} failed: HTTP {status}: {body}"
             )));
@@ -735,6 +742,7 @@ impl OpenAiResponsesCodexClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(codex_auth_invocation_error(format!(
                 "Codex device code request failed: HTTP {status}: {body}"
             )));
@@ -790,6 +798,7 @@ impl OpenAiResponsesCodexClient {
         }
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(codex_auth_invocation_error(format!(
                 "Codex device authorization failed: HTTP {status}: {body}"
             )));
@@ -831,6 +840,7 @@ impl OpenAiResponsesCodexClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(codex_auth_invocation_error(format!(
                 "Codex token exchange failed: HTTP {status}: {body}"
             )));
@@ -879,6 +889,7 @@ impl OpenAiResponsesCodexClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("codex", &body);
             return Err(LanguageModelError::AuthenticationRequired {
                 provider: CODEX_PROVIDER_ID.to_string(),
                 detail: format!("Codex ChatGPT token refresh failed: HTTP {status}: {body}"),
@@ -943,9 +954,11 @@ impl CodexClient for OpenAiResponsesCodexClient {
         let worker_client = self.clone();
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
+        let retries = crate::usage::capture_retries();
         let worker = std::thread::Builder::new()
             .name("sinomo-codex-stream".to_string())
             .spawn(move || {
+                let _retries = crate::usage::enter_retries(retries);
                 let result = worker_client.complete_streaming_worker(
                     &url,
                     &request,
@@ -1084,6 +1097,7 @@ impl OpenAiResponsesCodexClient {
                             "after credential refresh",
                         ));
                     }
+                    crate::usage::record_retry("credentials_refreshed");
                 }
                 Ok(CodexHttpAttempt::Unauthorized) => {
                     return Err(LanguageModelError::AuthenticationRequired {
@@ -1101,6 +1115,7 @@ impl OpenAiResponsesCodexClient {
                     let delay = codex_stream_retry_backoff(transport_retries);
                     transport_retries += 1;
                     runtime.block_on(wait_for_codex_retry_backoff(request, cancellation, delay))?;
+                    crate::usage::record_retry("transport_before_output");
                 }
             }
         }
@@ -1717,9 +1732,9 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
             temperature: None,
             max_output_tokens: Some(8),
             response_format: LanguageModelResponseFormat::Text,
-            metadata: serde_json::Value::Null,
+            metadata: serde_json::json!({"purpose":"provider_verification","loop":"provider_service"}),
         };
-        self.complete(&request).map(|_| ())
+        crate::usage::complete_provider(None, self, &request).map(|_| ())
     }
 }
 
@@ -1806,7 +1821,11 @@ where
         }
         let tools = codex_tool_descriptors(self.tools.descriptors(), &request.tools);
 
-        for _ in 0..self.config.max_iterations {
+        let mut total_usage: Option<LanguageModelUsage> = None;
+        for iteration in 0..self.config.max_iterations {
+            if iteration > 0 {
+                crate::usage::next_usage_segment();
+            }
             if cancellation.is_cancelled() {
                 return Err(codex_cancelled_error(&model, "before model iteration"));
             }
@@ -1831,7 +1850,13 @@ where
                 cancellation,
                 on_event,
             )?;
+            if let Some(usage) = &response.usage {
+                total_usage.get_or_insert_with(Default::default).add(usage);
+            }
             if response.tool_calls.is_empty() {
+                if let Some(total) = &total_usage {
+                    crate::usage::logical_usage_total(total);
+                }
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
                     items: codex_language_model_response_items(
@@ -1842,7 +1867,7 @@ where
                     model,
                     content: response.content,
                     tool_calls: Vec::new(),
-                    usage: response.usage,
+                    usage: total_usage,
                 });
             }
 
@@ -1851,6 +1876,9 @@ where
                 .iter()
                 .any(|call| !self.tools.contains(&call.name))
             {
+                if let Some(total) = &total_usage {
+                    crate::usage::logical_usage_total(total);
+                }
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
                     items: codex_language_model_response_items(
@@ -1861,7 +1889,7 @@ where
                     model,
                     content: response.content,
                     tool_calls: codex_language_model_tool_calls(&response.tool_calls),
-                    usage: response.usage,
+                    usage: total_usage,
                 });
             }
 
@@ -2634,14 +2662,7 @@ fn parse_openai_responses_codex_response(value: &serde_json::Value) -> CodexMode
             )
         })
         .collect();
-    let usage = value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_u64),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_u64),
-    });
+    let usage = crate::usage::openai(value);
     if let Some(usage) = &usage {
         stream_events.push(LanguageModelStreamEvent::Usage {
             usage: usage.clone(),
@@ -3029,6 +3050,7 @@ fn parse_sse_event(
         object.insert("type".to_string(), serde_json::json!(kind));
     }
 
+    let _ = crate::usage::openai(value.get("response").unwrap_or(&value));
     Ok(Some(value))
 }
 
@@ -4068,6 +4090,7 @@ mod tests {
 
     #[test]
     fn codex_transport_refreshes_once_after_unauthorized_response() {
+        let usage_retries = crate::usage::RetryScope::enter();
         let paths = Arc::new(Mutex::new(Vec::new()));
         let server_paths = Arc::clone(&paths);
         let (base_url, server) = test_server(move |listener| {
@@ -4113,6 +4136,7 @@ mod tests {
                 .access_token,
             "refreshed-access"
         );
+        assert_eq!(usage_retries.count(), 1, "actual dispatched retries");
     }
 
     #[test]
@@ -4508,6 +4532,7 @@ mod tests {
 
     #[test]
     fn codex_transport_retries_before_semantic_stream_progress() {
+        let usage_retries = crate::usage::RetryScope::enter();
         // Only the second attempt is meant to trip the idle window, and it does so by sleeping well
         // past it — a direction a loaded machine can only make safer. The final attempt sends its
         // events in a single chunk rather than two, so there is no gap left between them for
@@ -4565,10 +4590,12 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, LanguageModelStreamEvent::Error { .. }))
         );
+        assert_eq!(usage_retries.count(), 2, "actual dispatched retries");
     }
 
     #[test]
     fn codex_transport_never_retries_after_semantic_stream_progress() {
+        let usage_retries = crate::usage::RetryScope::enter();
         // The probe below has to outlast any retry the client might make, or its absence proves
         // nothing: a retry arriving after a short probe window would look like no retry at all.
         let health_timeout = Duration::from_millis(300);
@@ -4623,10 +4650,12 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, LanguageModelStreamEvent::TextDelta { delta } if delta == "visible")
         }));
+        assert_eq!(usage_retries.count(), 0, "actual dispatched retries");
     }
 
     #[test]
     fn codex_transport_cancellation_stops_retry_backoff() {
+        let usage_retries = crate::usage::RetryScope::enter();
         let attempts = Arc::new(AtomicUsize::new(0));
         let server_attempts = Arc::clone(&attempts);
         let (first_attempt_sender, first_attempt_receiver) = mpsc::channel();
@@ -4686,6 +4715,7 @@ mod tests {
         server.join().expect("server thread");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(error.to_string().contains("cancelled"), "{error}");
+        assert_eq!(usage_retries.count(), 0, "actual dispatched retries");
     }
 
     #[test]

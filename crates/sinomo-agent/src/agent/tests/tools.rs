@@ -233,6 +233,7 @@ fn agent_records_provider_stream_reasoning_tool_usage_and_finish_events() {
                     usage: sinomo_lm::LanguageModelUsage {
                         input_tokens: Some(5),
                         output_tokens: Some(7),
+                        ..Default::default()
                     },
                 },
                 LanguageModelStreamEvent::Finished {

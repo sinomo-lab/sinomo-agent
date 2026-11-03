@@ -1057,6 +1057,87 @@ impl<M: InteractionModel> Agent<M> {
         self
     }
 
+    fn usage_attribution(
+        &self,
+        input: &AgentLoopInput,
+    ) -> sinomo_runtime::api::app::usage::UsageAttribution {
+        let (session, operation, caused_by) = self
+            .item_journals
+            .lock()
+            .ok()
+            .and_then(|journals| {
+                journals.get(&input.session.session_id).map(|journal| {
+                    (
+                        journal.store_session_id.to_string(),
+                        journal.origin.op_id.as_ref().map(ToString::to_string),
+                        journal
+                            .origin
+                            .caused_by
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                    )
+                })
+            })
+            .unwrap_or_else(|| {
+                (
+                    input.session.session_id.to_string(),
+                    None,
+                    vec![input.latest_event.event_id.to_string()],
+                )
+            });
+        sinomo_runtime::api::app::usage::UsageAttribution {
+            node: input.session.node_id.to_string(),
+            agent: Some(self.config.definition.key().to_string()),
+            session: Some(session),
+            turn: operation.clone(),
+            operation,
+            parent_session: input
+                .latest_event
+                .payload
+                .pointer("/subagent/parent_session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            parent_operation: input
+                .latest_event
+                .payload
+                .pointer("/subagent/parent_operation")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            parent_tool_call: input
+                .latest_event
+                .payload
+                .pointer("/subagent/parent_tool_call")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            participant: input
+                .session
+                .participant_id
+                .as_ref()
+                .map(ToString::to_string),
+            chat: input
+                .session
+                .conversation_id
+                .as_ref()
+                .map(ToString::to_string),
+            task: self
+                .config
+                .run_context
+                .task
+                .as_ref()
+                .map(|task| task.task_id.to_string()),
+            caused_by,
+            origin: if input.latest_event.payload.get("subagent").is_some() {
+                "subagent"
+            } else {
+                "agent"
+            }
+            .into(),
+            purpose: "agent_turn".into(),
+            ..Default::default()
+        }
+    }
+
     pub fn with_tool_registry(mut self, tools: AgentToolRegistry) -> Self {
         self.tools = tools;
         self
@@ -1085,6 +1166,18 @@ impl<M: InteractionModel> Agent<M> {
             ),
         })?;
         Ok(ExplicitAgentSkillContext {
+            version: skill.catalog_version.clone().unwrap_or_default(),
+            content_hash: skill.catalog_content_hash.clone().unwrap_or_else(|| {
+                blake3::hash(
+                    skill
+                        .embedded_text
+                        .as_deref()
+                        .unwrap_or_default()
+                        .as_bytes(),
+                )
+                .to_hex()
+                .to_string()
+            }),
             name: skill.id.clone(),
             description: skill.description.clone(),
             instructions: document.body,

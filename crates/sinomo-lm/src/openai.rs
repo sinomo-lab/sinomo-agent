@@ -84,6 +84,8 @@ pub struct OpenAiWebSearchSource {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct OpenAiWebSearchResponse {
+    #[serde(default)]
+    pub usage: Option<LanguageModelUsage>,
     pub model: String,
     pub text: String,
     pub sources: Vec<OpenAiWebSearchSource>,
@@ -104,6 +106,7 @@ pub struct OpenAiImageRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenAiImageResponse {
+    pub usage: Option<LanguageModelUsage>,
     pub model: String,
     pub bytes: Vec<u8>,
     pub media_type: String,
@@ -173,9 +176,9 @@ impl OpenAiProvider {
             temperature: None,
             max_output_tokens: Some(8),
             response_format: LanguageModelResponseFormat::Text,
-            metadata: serde_json::Value::Null,
+            metadata: serde_json::json!({"purpose":"provider_verification","loop":"provider_service"}),
         };
-        self.complete(&request).map(|_| ())
+        crate::usage::complete_provider(None, self, &request).map(|_| ())
     }
 
     pub fn web_search(
@@ -211,6 +214,7 @@ impl OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("openai", &body);
             return Err(openai_hosted_tool_error(
                 &model,
                 format!("OpenAI web search failed: HTTP {status}: {body}"),
@@ -219,7 +223,15 @@ impl OpenAiProvider {
         let value = response
             .json::<serde_json::Value>()
             .map_err(|source| openai_hosted_tool_error(&model, source))?;
+        let mut usage = extract_openai_usage(&value).unwrap_or_default();
+        usage.hosted_searches = value["output"].as_array().map(|items| {
+            items
+                .iter()
+                .filter(|item| item["type"] == "web_search_call")
+                .count() as u64
+        });
         Ok(OpenAiWebSearchResponse {
+            usage: Some(usage),
             model,
             text: extract_openai_response_text(&value),
             sources: extract_openai_web_search_sources(&value),
@@ -251,6 +263,7 @@ impl OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("openai", &body);
             return Err(openai_hosted_tool_error(
                 OPENAI_DEFAULT_IMAGE_MODEL,
                 format!("OpenAI image {operation} failed: HTTP {status}: {body}"),
@@ -365,6 +378,7 @@ impl LanguageModelProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("openai", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -382,14 +396,7 @@ impl LanguageModelProvider for OpenAiProvider {
         let content = extract_openai_response_text(&value);
         let tool_calls = extract_openai_tool_calls(&value);
         let items = openai_response_items(&value, Self::PROVIDER_ID, &model, &tool_calls);
-        let usage = value.get("usage").map(|usage| LanguageModelUsage {
-            input_tokens: usage
-                .get("input_tokens")
-                .and_then(serde_json::Value::as_u64),
-            output_tokens: usage
-                .get("output_tokens")
-                .and_then(serde_json::Value::as_u64),
-        });
+        let usage = crate::usage::openai(&value);
 
         Ok(LanguageModelResponse {
             provider: Self::PROVIDER_ID.to_string(),
@@ -431,6 +438,7 @@ impl LanguageModelProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("openai", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -755,6 +763,7 @@ pub(crate) fn image_response(
     provider: &str,
     model: &str,
 ) -> Result<OpenAiImageResponse, LanguageModelError> {
+    let _ = extract_openai_usage(value);
     let encoded = value
         .get("data")
         .and_then(serde_json::Value::as_array)
@@ -783,7 +792,16 @@ pub(crate) fn image_response(
         _ => "image/png",
     }
     .to_string();
+    let mut usage = extract_openai_usage(value).unwrap_or_default();
+    usage.generated_images = value["data"].as_array().map(|items| {
+        vec![crate::ImageUsage {
+            count: items.len() as u64,
+            size: value["size"].as_str().map(str::to_string),
+            quality: value["quality"].as_str().map(str::to_string),
+        }]
+    });
     Ok(OpenAiImageResponse {
+        usage: Some(usage),
         model: model.to_string(),
         bytes,
         media_type,
@@ -1068,6 +1086,7 @@ pub(crate) fn stream_openai_responses_response(
         {
             object.insert("type".to_string(), serde_json::json!(event_name));
         }
+        let _ = crate::usage::openai(value.get("response").unwrap_or(&value));
         match value
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -1251,14 +1270,7 @@ pub(crate) fn openai_response_items(
 }
 
 pub(crate) fn extract_openai_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
-    value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_u64),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_u64),
-    })
+    crate::usage::openai(value)
 }
 
 fn openai_responses_finish_reason(value: &serde_json::Value) -> Option<String> {

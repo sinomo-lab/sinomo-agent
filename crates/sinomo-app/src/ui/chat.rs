@@ -936,6 +936,7 @@ const REALTIME_BACKGROUND_AGENT_TOOL_DESCRIPTION: &str = "Send a user request to
 type StableRealtimeTurnWriter = Box<dyn FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send>;
 
 struct StableRealtimeChatProjection {
+    usage_attribution: sinomo_client::usage_contract::UsageAttribution,
     writer: Option<StableRealtimeTurnWriter>,
     text: StableRealtimeTextAccumulator,
 }
@@ -943,7 +944,15 @@ struct StableRealtimeChatProjection {
 impl StableRealtimeChatProjection {
     #[cfg(not(test))]
     fn new(client: sinomo_client::ChatHistoryClient, target: StableRealtimeChatTarget) -> Self {
-        Self::with_writer(move |turn| {
+        let usage_attribution = sinomo_client::usage_contract::UsageAttribution {
+            agent: Some(target.agent_key.clone()),
+            session: Some(target.agent_session_id.to_string()),
+            chat: Some(target.channel_id.to_string()),
+            origin: "app.realtime".into(),
+            purpose: "realtime_response".into(),
+            ..Default::default()
+        };
+        let mut projection = Self::with_writer(move |turn| {
             client
                 .append_agent(
                     sinomo_client::chat_contract::ChatHistoryAppendAgentRequest {
@@ -958,11 +967,14 @@ impl StableRealtimeChatProjection {
                     },
                 )
                 .map_err(|error| format!("persist realtime text to stable chat failed: {error}"))
-        })
+        });
+        projection.usage_attribution = usage_attribution;
+        projection
     }
 
     fn disabled() -> Self {
         Self {
+            usage_attribution: Default::default(),
             writer: None,
             text: StableRealtimeTextAccumulator::default(),
         }
@@ -972,6 +984,7 @@ impl StableRealtimeChatProjection {
         writer: impl FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send + 'static,
     ) -> Self {
         Self {
+            usage_attribution: Default::default(),
             writer: Some(Box::new(writer)),
             text: StableRealtimeTextAccumulator::default(),
         }
@@ -1833,6 +1846,7 @@ pub struct ChatState {
     agent_list_rx: Option<Receiver<AgentListWorkerResult>>,
     agents_loading: bool,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
+    usage_chat_rx: Option<Receiver<Result<SessionRef, String>>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
     session_list_slow_notice_shown: bool,
@@ -2186,6 +2200,7 @@ struct ComposerBarStructure {
     context_label: String,
     activity_label: String,
     activity_description: String,
+    usage_label: String,
     voice_link_hint: Option<String>,
     can_reuse_latest_answer: bool,
 }
@@ -2361,6 +2376,7 @@ impl ChatStructureKey {
                 context_label: context_overview_summary(chat),
                 activity_label: activity_button_label(chat).to_string(),
                 activity_description: activity_button_description(chat),
+                usage_label: usage_summary(chat).unwrap_or_else(|| "Usage".into()),
                 voice_link_hint: voice_link_hint(chat),
                 can_reuse_latest_answer: chat.can_reuse_latest_answer(),
             },
@@ -2668,6 +2684,7 @@ impl ChatState {
             agent_list_rx: None,
             agents_loading: defer_agent_load,
             session_list_rx: None,
+            usage_chat_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
             session_list_slow_notice_shown: false,
@@ -3560,8 +3577,9 @@ impl ChatState {
     }
 
     pub fn pump_activity_load(&mut self) -> bool {
+        let navigation_changed = self.pump_usage_chat();
         let Some(result) = self.activity_load_rx.as_ref().map(|rx| rx.try_recv()) else {
-            return false;
+            return navigation_changed;
         };
         let result = match result {
             Ok(result) => result,
@@ -4850,7 +4868,84 @@ impl ChatState {
 
     /// Open a stored chat/channel without blocking the UI thread. The transcript/timeline is read
     /// from SIFS on a worker thread, then applied by `pump_transcript_load`.
+    pub(crate) fn open_usage_chat(&mut self, id: &str) -> bool {
+        if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+            self.open_session(index);
+            return true;
+        }
+        let Some(daemon) = self.sifs_daemon.clone() else {
+            return false;
+        };
+        let id = id.to_string();
+        let waker = self.ui_waker.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("sinomo-usage-conversation".into())
+            .spawn(move || {
+                let result = daemon
+                    .history_client()
+                    .channel(&id)
+                    .map_err(|e| e.to_string())
+                    .and_then(|channel| {
+                        channel.ok_or_else(|| "Conversation is no longer retained".to_string())
+                    })
+                    .map(|channel| SessionRef {
+                        id: channel.id,
+                        title: channel.title,
+                        kind: match channel.kind {
+                            sinomo_client::chat_contract::ChatHistoryConversationKind::Chat => {
+                                ConversationKind::Chat
+                            }
+                            sinomo_client::chat_contract::ChatHistoryConversationKind::Channel => {
+                                ConversationKind::Channel
+                            }
+                        },
+                        updated_unix: 0,
+                        participant_count: channel.participants.len(),
+                        participant_names: channel
+                            .participants
+                            .into_iter()
+                            .map(|p| p.agent_name)
+                            .collect(),
+                    });
+                let _ = tx.send(result);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        if worker.is_ok() {
+            self.usage_chat_rx = Some(rx);
+            self.notice = Some("Opening conversation…".into());
+            true
+        } else {
+            false
+        }
+    }
+    fn pump_usage_chat(&mut self) -> bool {
+        let Some(result) = self.usage_chat_rx.as_ref().map(|rx| rx.try_recv()) else {
+            return false;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("Conversation loader stopped".into()),
+        };
+        self.usage_chat_rx = None;
+        match result {
+            Ok(session) => {
+                let id = session.id.clone();
+                self.upsert_session_ref(session);
+                if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+                    self.open_session(index);
+                }
+            }
+            Err(error) => self.notice = Some(error),
+        }
+        true
+    }
+
     fn open_session(&mut self, index: usize) {
+        self.usage_chat_rx = None;
         let Some(session) = self.sessions.get(index).cloned() else {
             return;
         };
@@ -9627,6 +9722,11 @@ async fn run_chat_media_call_async(
         ));
     }
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
+    config.usage_context = Some(sinomo_lm::RealtimeUsageContext {
+        data_dir: data_dir.as_ref().clone(),
+        attribution: stable_projection.usage_attribution.clone(),
+        account: "default".into(),
+    });
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
     authorize_chat_media_realtime_config(&data_dir, &mut config)?;
     if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
@@ -11134,7 +11234,6 @@ fn activity_button_description(chat: &ChatState) -> String {
     )
 }
 
-#[cfg(test)]
 fn usage_summary(chat: &ChatState) -> Option<String> {
     chat.usage.as_ref().map(|usage| {
         let output = usage
@@ -14221,7 +14320,6 @@ fn media_call_accessibility_summary(shared: &Shared) -> String {
     parts.join("; ")
 }
 
-#[cfg(test)]
 fn format_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f32 / 1_000_000.0)
@@ -14299,9 +14397,23 @@ fn activity_close_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
 }
 
 fn activity_popup_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let action = shared.clone();
+    let usage_button = sui::Button::new("Usage history")
+        .theme_when(clone_reader(reader))
+        .on_press(move || {
+            let chat = action.chat().session_id.clone();
+            crate::ui::cluster::open_usage(
+                &action,
+                sinomo_client::usage_contract::UsageFilter {
+                    chat: Some(chat),
+                    ..Default::default()
+                },
+            );
+        });
     Flex::horizontal()
         .align_items(Alignment::Center)
         .with_child(dialog_section_label(shared, "Activity"))
+        .with_child(usage_button)
         .spacer()
         .with_child(activity_close_button(shared, reader))
 }
@@ -19382,6 +19494,35 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         },
     );
 
+    let usage = composer_tooltip_button(
+        shared,
+        reader,
+        "chat usage indicator",
+        |bar| {
+            (
+                "Open retained usage for this conversation".to_string(),
+                bar.usage_label.clone(),
+            )
+        },
+        |s, r, text| {
+            let action = s.clone();
+            widgets::Boxed::new(
+                sui::Button::new(text)
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .theme_when(small_control_reader(r))
+                    .on_press(move || {
+                        let chat = action.chat().session_id.clone();
+                        crate::ui::cluster::open_usage(
+                            &action,
+                            sinomo_client::usage_contract::UsageFilter {
+                                chat: Some(chat),
+                                ..Default::default()
+                            },
+                        );
+                    }),
+            )
+        },
+    );
     let hint = {
         let text = chat_projection(shared, "chat composer voice hint", |snapshot| {
             snapshot
@@ -19510,6 +19651,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(hint)
         .with_child(context)
         .with_child(activity)
+        .with_child(usage)
         .with_child(use_answer)
         .with_child(action);
 

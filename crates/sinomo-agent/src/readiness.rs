@@ -4104,6 +4104,7 @@ fn check_model_metrics_smoke(workspace_root: &Path) -> AgentReadinessCheck {
             Some(sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(10),
                 output_tokens: Some(1),
+                ..Default::default()
             }),
         ),
         (
@@ -4117,6 +4118,7 @@ fn check_model_metrics_smoke(workspace_root: &Path) -> AgentReadinessCheck {
             Some(sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(20),
                 output_tokens: Some(2),
+                ..Default::default()
             }),
         ),
     ]);

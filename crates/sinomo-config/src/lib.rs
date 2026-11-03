@@ -100,6 +100,10 @@ pub struct ConfigNumberRange {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigSchema {
+    /// Declarative relationships between optional unsigned fields. Missing/null
+    /// means unbounded, which is useful for independent retention horizons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_u64_orders: Vec<ConfigOptionalU64Order>,
     pub name: String,
     pub description: String,
     pub value: ConfigSchemaValue,
@@ -112,6 +116,7 @@ impl ConfigSchema {
         value: ConfigSchemaValue,
     ) -> Self {
         Self {
+            optional_u64_orders: Vec::new(),
             name: name.into(),
             description: description.into(),
             value,
@@ -131,7 +136,33 @@ impl ConfigSchema {
     }
 
     pub fn validate(&self, key: &ConfigKey, value: &Value) -> Result<(), ConfigError> {
-        validate_schema_value(key, &self.value, value, "$")
+        validate_schema_value(key, &self.value, value, "$")?;
+        for order in &self.optional_u64_orders {
+            let lower = value.pointer(&order.lower).and_then(Value::as_u64);
+            let upper = value.pointer(&order.upper).and_then(Value::as_u64);
+            if upper.is_some_and(|upper| lower.is_none_or(|lower| lower > upper)) {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    detail: format!(
+                        "{} must be at least {} (null or missing means unbounded)",
+                        order.upper, order.lower
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn with_optional_u64_order(
+        mut self,
+        lower: impl Into<String>,
+        upper: impl Into<String>,
+    ) -> Self {
+        self.optional_u64_orders.push(ConfigOptionalU64Order {
+            lower: lower.into(),
+            upper: upper.into(),
+        });
+        self
     }
 
     /// Validate the schema declaration itself, independently from any one
@@ -142,8 +173,54 @@ impl ConfigSchema {
         if self.name.trim().is_empty() {
             return invalid_schema_declaration(key, "$", "schema name cannot be empty");
         }
+        for order in &self.optional_u64_orders {
+            if !order.lower.starts_with('/')
+                || !order.upper.starts_with('/')
+                || order.lower == order.upper
+            {
+                return invalid_schema_declaration(
+                    key,
+                    "$",
+                    "ordered fields must be distinct JSON pointers",
+                );
+            }
+            for pointer in [&order.lower, &order.upper] {
+                let mut schema = &self.value;
+                for token in pointer.trim_start_matches('/').split('/') {
+                    let name = token.replace("~1", "/").replace("~0", "~");
+                    let ConfigSchemaValue::Object { fields, .. } = schema else {
+                        return invalid_schema_declaration(
+                            key,
+                            pointer,
+                            "ordered fields must reference declared unsigned integer fields",
+                        );
+                    };
+                    schema = &fields
+                        .iter()
+                        .find(|field| field.name == name)
+                        .ok_or_else(|| ConfigError::InvalidValue {
+                            key: key.to_string(),
+                            detail: format!("unknown ordered field {pointer}"),
+                        })?
+                        .value;
+                }
+                if !matches!(schema, ConfigSchemaValue::U64 { .. }) {
+                    return invalid_schema_declaration(
+                        key,
+                        pointer,
+                        "ordered fields must reference unsigned integer fields",
+                    );
+                }
+            }
+        }
         validate_schema_value_declaration(key, &self.value, "$")
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ConfigOptionalU64Order {
+    pub lower: String,
+    pub upper: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

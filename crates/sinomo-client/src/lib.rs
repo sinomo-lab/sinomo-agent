@@ -107,3 +107,7 @@ mod dependency_tests {
         }
     }
 }
+
+pub mod usage;
+pub use sinomo_runtime::api::app::usage as usage_contract;
+pub use usage::UsageClient;
