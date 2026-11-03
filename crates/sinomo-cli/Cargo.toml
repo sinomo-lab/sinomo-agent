@@ -60,6 +60,7 @@ notify.workspace = true
 fs2.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 sinomo-runtime = { workspace = true, features = ["cluster-test-support", "network-test-support", "dfs-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 wat = "1.253.0"

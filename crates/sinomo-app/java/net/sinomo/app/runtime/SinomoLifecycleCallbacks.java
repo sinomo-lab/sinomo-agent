@@ -27,6 +27,10 @@ public final class SinomoLifecycleCallbacks implements
         Application.ActivityLifecycleCallbacks,
         View.OnApplyWindowInsetsListener,
         ViewTreeObserver.OnWindowFocusChangeListener {
+    public SinomoVideoEncoder openVideoEncoder(int width, int height, int fps) throws Exception {
+        return new SinomoVideoEncoder(width, height, fps);
+    }
+
     private final Activity activity;
     private boolean registered;
     private boolean observingOperatingConditions;

@@ -392,6 +392,7 @@ fn run_live(
         kind.capture_route(),
         MEDIA_CATEGORY,
         &DesktopStreamRequest {
+        transport: sinomo_video::codec::VideoTransport::Image,
             session_id: capture_id.clone(),
             frames_per_second: 20,
             include_cursor: case.raw(),

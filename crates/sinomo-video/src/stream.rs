@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 pub const VIDEO_STREAM_VERSION: u32 = 1;
+pub const H264_STREAM_VERSION: u32 = 2;
+use crate::codec::VideoTransport;
 pub const MAX_ENCODED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 4096;
 
@@ -42,6 +44,10 @@ pub struct VideoFrameMetadata {
     pub format: RealtimeVideoFrameFormat,
     #[serde(default)]
     pub coordinate_grid: bool,
+    #[serde(default)]
+    pub transport: VideoTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_sequence: Option<u64>,
 }
 
 /// BGRA desktop textures go directly into the existing media encoder. Other
@@ -96,6 +102,8 @@ pub fn encode_sample(
         source_height: sample.height,
         format: encoded.format,
         coordinate_grid: config.coordinate_grid,
+        transport: VideoTransport::Image,
+        packet_sequence: None,
     };
     Ok((metadata, encoded))
 }
@@ -190,12 +198,31 @@ pub fn desktop_capture_body(
     duration: Duration,
     cancelled: Arc<AtomicBool>,
 ) -> (ObjectRpcBodySource, tokio::task::JoinHandle<()>) {
+    desktop_capture_body_with_transport(
+        capture,
+        encoding,
+        duration,
+        cancelled,
+        VideoTransport::Image,
+    )
+}
+
+pub fn desktop_capture_body_with_transport(
+    capture: impl DesktopFrameSource + 'static,
+    encoding: RealtimeVideoInputConfig,
+    duration: Duration,
+    cancelled: Arc<AtomicBool>,
+    transport: VideoTransport,
+) -> (ObjectRpcBodySource, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let failure = Arc::new(Mutex::new(None));
     let terminal = failure.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + duration;
         let mut sequence = 0;
+        let mut packet_sequence = 0;
+        let mut hardware = None;
+        let mut output_size = None;
         let mut next_encode = Instant::now();
         let encode_interval = encoding.model_frame_interval().unwrap_or(Duration::ZERO);
         let result = (|| -> Result<(), String> {
@@ -223,12 +250,68 @@ pub fn desktop_capture_body(
                     continue;
                 };
                 sequence = sample.sequence;
-                let (mut metadata, encoded) = encode_sample(&sample, &encoding)?;
+                let frame_started = Instant::now();
+                let (mut metadata, bytes) = if transport == VideoTransport::H264 {
+                    let frame = realtime_frame(&sample)?;
+                    let max = encoding.max_dimension.unwrap_or(1920).clamp(2, 1920);
+                    let scale = f64::from(max)
+                        / f64::from(frame.width.max(frame.height)).max(f64::from(max));
+                    let size = (
+                        (((f64::from(frame.width) * scale).ceil() as u32 + 1) & !1).clamp(2, 1920),
+                        (((f64::from(frame.height) * scale).ceil() as u32 + 1) & !1).clamp(2, 1920),
+                    );
+                    crate::codec::dimensions(size.0, size.1)?;
+                    if output_size != Some(size) {
+                        if output_size.is_some() {
+                            return Err("H264 source geometry changed; reopen stream".into());
+                        }
+                        let fps = if encode_interval.is_zero() {
+                            30
+                        } else {
+                            (1.0 / encode_interval.as_secs_f64())
+                                .round()
+                                .clamp(1.0, 60.0) as u32
+                        };
+                        hardware = Some(crate::codec::encoder(size.0, size.1, fps)?);
+                        output_size = Some(size);
+                    }
+                    let bytes = hardware.as_mut().unwrap().encode(&frame)?;
+                    (
+                        VideoFrameMetadata {
+                            identity: None,
+                            tiles: Vec::new(),
+                            sequence: sample.sequence,
+                            timestamp_ns: sample.timestamp_ns,
+                            duration_ns: sample.duration_ns,
+                            captured_at_unix_ms: sample.captured_at_unix_ms,
+                            width: size.0,
+                            height: size.1,
+                            source_width: sample.width,
+                            source_height: sample.height,
+                            format: encoding.frame_format,
+                            coordinate_grid: false,
+                            transport,
+                            packet_sequence: Some(packet_sequence),
+                        },
+                        Arc::<[u8]>::from(bytes),
+                    )
+                } else {
+                    let (metadata, encoded) = encode_sample(&sample, &encoding)?;
+                    (metadata, encoded.image)
+                };
+                capture.check_active().map_err(|error| error.to_string())?;
+                if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                packet_sequence += 1;
                 metadata.identity = capture.identity();
                 metadata.tiles = capture.tiles();
-                next_encode = Instant::now() + encode_interval;
-                match sender.try_send(record(&metadata, &encoded.image)?) {
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                next_encode = frame_started + encode_interval;
+                match sender.try_send(record(&metadata, &bytes)?) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        return Err("video producer lost reserved queue capacity".into());
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
@@ -298,7 +381,7 @@ impl AsyncRead for VideoBodyReader {
 
 /// Incremental reader usable with any routed object-RPC body. The returned frame
 /// can be passed straight to RealtimeSession::send_encoded_video_frame.
-pub async fn read_frame<R: AsyncRead + Unpin>(
+async fn read_packet<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> io::Result<Option<(VideoFrameMetadata, RealtimeEncodedVideoFrameInput)>> {
     let mut first = [0u8; 1];
@@ -334,6 +417,173 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     Ok(Some((metadata, frame)))
 }
 
+/// Legacy stateless image reader rejects dependent compressed video.
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<(VideoFrameMetadata, RealtimeEncodedVideoFrameInput)>> {
+    let frame = read_packet(reader).await?;
+    if frame
+        .as_ref()
+        .is_some_and(|(m, _)| m.transport != VideoTransport::Image)
+    {
+        return Err(io::Error::other("use VideoStreamReader for H264 transport"));
+    }
+    Ok(frame)
+}
+
+/// A received frame stays in pixels after video decoding. Image conversion is
+/// deferred until a model actually consumes it, not performed for dropped previews.
+#[derive(Clone)]
+pub enum ReceivedFrame {
+    Image(RealtimeEncodedVideoFrameInput),
+    Pixels(RealtimeVideoFrameInput),
+}
+impl ReceivedFrame {
+    pub fn into_model_image(
+        self,
+        format: RealtimeVideoFrameFormat,
+    ) -> io::Result<RealtimeEncodedVideoFrameInput> {
+        match self {
+            Self::Image(frame) => Ok(frame),
+            Self::Pixels(frame) => sinomo_lm::encode_realtime_video_frame(
+                &frame,
+                &RealtimeVideoInputConfig {
+                    max_dimension: None,
+                    frame_format: format,
+                    ..Default::default()
+                },
+            )
+            .map_err(io::Error::other),
+        }
+    }
+}
+
+/// Owns reference frames across reads. Decode every access unit before publishing
+/// a latest image; dropping compressed P frames would corrupt later frames.
+#[derive(Default)]
+pub struct VideoStreamReader {
+    decoder: Option<openh264::decoder::Decoder>,
+    previous: Option<u64>,
+    geometry: Option<(u32, u32)>,
+    transport: Option<VideoTransport>,
+    next_packet: u64,
+    pub last_wire_bytes: usize,
+    pub last_decode_us: u128,
+}
+impl VideoStreamReader {
+    pub async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> io::Result<Option<(VideoFrameMetadata, RealtimeEncodedVideoFrameInput)>> {
+        let Some((metadata, frame)) = self.read_decoded(reader).await? else {
+            return Ok(None);
+        };
+        let format = metadata.format;
+        let frame = tokio::task::spawn_blocking(move || frame.into_model_image(format))
+            .await
+            .map_err(io::Error::other)??;
+        Ok(Some((metadata, frame)))
+    }
+    pub async fn read_decoded<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> io::Result<Option<(VideoFrameMetadata, ReceivedFrame)>> {
+        let Some((metadata, frame)) = read_packet(reader).await? else {
+            return Ok(None);
+        };
+        let mut state = std::mem::take(self);
+        let (state, result) = tokio::task::spawn_blocking(move || {
+            let result = state.decode_packet(metadata, frame);
+            (state, result)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        *self = state;
+        result.map(Some)
+    }
+    fn decode_packet(
+        &mut self,
+        metadata: VideoFrameMetadata,
+        frame: RealtimeEncodedVideoFrameInput,
+    ) -> io::Result<(VideoFrameMetadata, ReceivedFrame)> {
+        self.last_wire_bytes = frame.image.len();
+        let started = Instant::now();
+        if self
+            .previous
+            .is_some_and(|previous| metadata.sequence <= previous)
+        {
+            return Err(io::Error::other("video sequence did not advance"));
+        }
+        if self
+            .transport
+            .is_some_and(|value| value != metadata.transport)
+        {
+            return Err(io::Error::other("video transport changed within a stream"));
+        }
+        self.transport = Some(metadata.transport);
+        self.previous = Some(metadata.sequence);
+        let frame = match metadata.transport {
+            VideoTransport::Image => ReceivedFrame::Image(frame),
+            VideoTransport::Auto => return Err(io::Error::other("unnegotiated video transport")),
+            VideoTransport::H264 => {
+                crate::codec::dimensions(metadata.width, metadata.height)
+                    .map_err(io::Error::other)?;
+                if self
+                    .geometry
+                    .is_some_and(|size| size != (metadata.width, metadata.height))
+                {
+                    return Err(io::Error::other("H264 geometry changed within a stream"));
+                }
+                self.geometry = Some((metadata.width, metadata.height));
+                if metadata.packet_sequence != Some(self.next_packet) {
+                    return Err(io::Error::other("H264 packet sequence gap"));
+                }
+                crate::codec::validate_access_unit(
+                    &frame.image,
+                    metadata.width,
+                    metadata.height,
+                    self.next_packet == 0,
+                )
+                .map_err(io::Error::other)?;
+                self.next_packet += 1;
+                if self.decoder.is_none() {
+                    self.decoder =
+                        Some(openh264::decoder::Decoder::new().map_err(io::Error::other)?);
+                }
+                use openh264::formats::YUVSource;
+                let decoded = self
+                    .decoder
+                    .as_mut()
+                    .unwrap()
+                    .decode(&frame.image)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| {
+                        io::Error::other("H264 access unit did not produce one frame")
+                    })?;
+                if decoded.dimensions() != (metadata.width as usize, metadata.height as usize) {
+                    return Err(io::Error::other(
+                        "H264 decoded dimensions do not match metadata",
+                    ));
+                }
+                let mut rgb = vec![0; metadata.width as usize * metadata.height as usize * 3];
+                decoded.write_rgb8(&mut rgb);
+                let mut input = RealtimeVideoFrameInput::new(
+                    rgb.into(),
+                    RealtimeVideoPixelFormat::Rgb8,
+                    metadata.width,
+                    metadata.height,
+                    metadata.width as usize * 3,
+                    metadata.sequence,
+                );
+                input.timestamp_ms = frame.timestamp_ms;
+                ReceivedFrame::Pixels(input)
+            }
+        };
+        self.last_decode_us = started.elapsed().as_micros();
+        Ok((metadata, frame))
+    }
+}
+
 /// Model transport remains owned by Sinomo's existing realtime session.
 pub async fn forward_to_realtime<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -341,8 +591,9 @@ pub async fn forward_to_realtime<R: AsyncRead + Unpin>(
     max_frames: u64,
 ) -> Result<u64, String> {
     let mut sent = 0;
+    let mut decoder = VideoStreamReader::default();
     while sent < max_frames {
-        let Some((_, frame)) = read_frame(reader).await.map_err(|e| e.to_string())? else {
+        let Some((_, frame)) = decoder.read(reader).await.map_err(|e| e.to_string())? else {
             break;
         };
         session
@@ -355,10 +606,11 @@ pub async fn forward_to_realtime<R: AsyncRead + Unpin>(
 }
 
 type ReceivedVideoFrame = (VideoFrameMetadata, RealtimeEncodedVideoFrameInput);
+type DecodedVideoFrame = (VideoFrameMetadata, ReceivedFrame);
 /// A bounded latest-frame consumer, suitable for duplex audio/video call loops.
 /// Dropping it cancels only its logical media RPC, not the shared connection.
 pub struct RemoteVideoSource {
-    latest: Arc<Mutex<Option<ReceivedVideoFrame>>>,
+    latest: Arc<Mutex<Option<DecodedVideoFrame>>>,
     failure: Arc<Mutex<Option<String>>>,
     worker: tokio::task::JoinHandle<()>,
 }
@@ -371,8 +623,9 @@ impl RemoteVideoSource {
         let worker = tokio::spawn(async move {
             let mut body = body.cancel_on_drop();
             let mut previous = None;
+            let mut decoder = VideoStreamReader::default();
             loop {
-                match read_frame(&mut body).await {
+                match decoder.read_decoded(&mut body).await {
                     Ok(Some(frame))
                         if previous.is_none_or(|sequence| frame.0.sequence > sequence) =>
                     {
@@ -407,7 +660,15 @@ impl RemoteVideoSource {
         {
             return Err(error.clone());
         }
-        Ok(self.latest.lock().unwrap_or_else(|e| e.into_inner()).take())
+        let latest = self.latest.lock().unwrap_or_else(|e| e.into_inner()).take();
+        latest
+            .map(|(metadata, frame)| {
+                let image = frame
+                    .into_model_image(metadata.format)
+                    .map_err(|e| e.to_string())?;
+                Ok((metadata, image))
+            })
+            .transpose()
     }
 }
 impl Drop for RemoteVideoSource {
@@ -419,6 +680,91 @@ impl Drop for RemoteVideoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn h264_records() -> Vec<(VideoFrameMetadata, Vec<u8>)> {
+        use openh264::{
+            encoder::Encoder,
+            formats::{RgbSliceU8, YUVBuffer},
+        };
+        let mut encoder = Encoder::new().unwrap();
+        (0..4)
+            .map(|index| {
+                let rgb = [20 + index as u8 * 20, 100, 200].repeat(64 * 64);
+                let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (64, 64)));
+                let bytes = encoder.encode(&yuv).unwrap().to_vec();
+                (
+                    VideoFrameMetadata {
+                        identity: None,
+                        tiles: Vec::new(),
+                        sequence: index * 2 + 1,
+                        timestamp_ns: index * 100_000_000,
+                        duration_ns: 100_000_000,
+                        captured_at_unix_ms: 1,
+                        width: 64,
+                        height: 64,
+                        source_width: 64,
+                        source_height: 64,
+                        format: RealtimeVideoFrameFormat::Png,
+                        coordinate_grid: false,
+                        transport: VideoTransport::H264,
+                        packet_sequence: Some(index),
+                    },
+                    bytes,
+                )
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn h264_decodes_dependent_frames_before_latest_image_and_rejects_loss() {
+        let frames = h264_records();
+        let mut decoder = VideoStreamReader::default();
+        for (metadata, bytes) in &frames {
+            let record = record(metadata, bytes).unwrap();
+            let (received, image) = decoder.read(&mut record.as_slice()).await.unwrap().unwrap();
+            assert_eq!(received.sequence, metadata.sequence);
+            assert_eq!(image::load_from_memory(&image.image).unwrap().width(), 64);
+            assert_eq!(decoder.last_wire_bytes, bytes.len());
+        }
+        let mut decoder = VideoStreamReader::default();
+        decoder
+            .read(&mut record(&frames[0].0, &frames[0].1).unwrap().as_slice())
+            .await
+            .unwrap();
+        assert!(
+            decoder
+                .read(&mut record(&frames[2].0, &frames[2].1).unwrap().as_slice())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("sequence gap")
+        );
+        assert!(
+            read_frame(&mut record(&frames[0].0, &frames[0].1).unwrap().as_slice())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn h264_rejects_missing_configuration_and_lying_geometry() {
+        let frames = h264_records();
+        let mut metadata = frames[1].0.clone();
+        metadata.packet_sequence = Some(0);
+        assert!(
+            VideoStreamReader::default()
+                .read(&mut record(&metadata, &frames[1].1).unwrap().as_slice())
+                .await
+                .is_err()
+        );
+        let mut metadata = frames[0].0.clone();
+        metadata.width = 128;
+        assert!(
+            VideoStreamReader::default()
+                .read(&mut record(&metadata, &frames[0].1).unwrap().as_slice())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("SPS")
+        );
+    }
     #[tokio::test]
     async fn remote_source_accepts_a_native_camera_starting_at_sequence_zero() {
         let sample = NativeVideoSample {
@@ -623,6 +969,8 @@ mod tests {
             source_height: 1,
             format: RealtimeVideoFrameFormat::Png,
             coordinate_grid: true,
+            transport: VideoTransport::Image,
+            packet_sequence: None,
         };
         let bytes = record(&metadata, &[1, 2, 3]).unwrap();
         let mut reader = bytes.as_slice();

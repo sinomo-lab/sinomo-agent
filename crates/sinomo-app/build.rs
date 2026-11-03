@@ -51,6 +51,7 @@ fn build_android_lifecycle_java() {
     fs::create_dir_all(&classes_out_dir).expect("create Android Java classes directory");
     JavaBuild::new()
         .file(java_path)
+        .file("java/net/sinomo/app/runtime/SinomoVideoEncoder.java")
         .class_path(&android_jar)
         .classes_out_dir(&classes_out_dir)
         .java_source_version(8)
