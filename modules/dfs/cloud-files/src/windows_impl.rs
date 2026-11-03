@@ -7123,6 +7123,9 @@ fn open_sifs_service(
         &local_node_id,
         control_plane.as_ref(),
     )?;
+    // With a daemon peer the endpoint delegates namespace work to Main and
+    // keeps no local metadata store.
+    let delegates_to_main = daemon_peer.is_some();
     let mut service = NetworkedDfsService::new(
         DfsCloudFilesEndpointTransport::new(
             local_node_id,
@@ -7134,11 +7137,16 @@ fn open_sifs_service(
     if let Some(control_plane) = control_plane.as_ref() {
         service = service.with_control_plane(control_plane.clone());
     }
-    let metadata = open_metadata_backend(&data_dir, &cluster_paths, control_plane.as_ref())?;
-    let mut service = service
-        .with_boxed_metadata_backend_lazy(metadata)
-        .map_err(error("dfs"))?;
-    service.bootstrap_distributed_sifs().map_err(error("dfs"))?;
+    let service = if delegates_to_main {
+        service.into_main_sifs_client().map_err(error("dfs"))?
+    } else {
+        let metadata = open_metadata_backend(&data_dir, &cluster_paths, control_plane.as_ref())?;
+        let mut service = service
+            .with_boxed_metadata_backend_lazy(metadata)
+            .map_err(error("dfs"))?;
+        service.bootstrap_distributed_sifs().map_err(error("dfs"))?;
+        service
+    };
     Ok(OpenedSifsService {
         service,
         replica_candidates,

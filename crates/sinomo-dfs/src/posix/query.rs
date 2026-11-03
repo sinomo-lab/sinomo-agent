@@ -193,7 +193,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(prefetched)
     }
 
+    /// A caller delegating to its Main keeps no local metadata store, so a
+    /// local read cannot answer it; such a caller uses the distributed reads.
+    pub(super) fn ensure_local_view_readable(&self, path: &str) -> Result<()> {
+        if self.transport.delegates_local_namespace_authority() && self.control_plane.is_some() {
+            return Err(DfsPosixError::Dfs(crate::DfsError::Distributed {
+                message: format!(
+                    "{path}: a caller delegating to its Main has no local metadata view; use the distributed read"
+                ),
+            }));
+        }
+        Ok(())
+    }
+
     pub fn posix_readlink(&self, path: &str) -> Result<String> {
+        self.ensure_local_view_readable(path)?;
         let path = self.resolve_existing_posix_path(path, false)?;
         let object = self
             .lookup_sifs_path(&path)?
@@ -265,6 +279,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -276,6 +291,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Resolve the same local namespace target as stat without projecting content
     /// size or link counts. Mutation admission still revalidates these hints.
     pub(crate) fn posix_object_metadata_hint(&self, path: &str) -> Result<DfsObjectMetadata> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = service.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -373,6 +389,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -420,6 +437,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// This stricter surface exists for capability boundaries that must reject
     /// all link records before performing a follow operation.
     pub fn posix_namespace_lstat(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
@@ -526,6 +544,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir(&self, path: &str) -> Result<Vec<DfsDirEntry>> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let path = service.resolve_existing_posix_path(path, true)?;
             service.posix_collect_resolved_dir(&path)
@@ -573,6 +592,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let path = service.resolve_existing_posix_path(path, true)?;
             service.posix_list_resolved_dir_page(&path, after, max_entries)
