@@ -16,6 +16,7 @@ tests for that.
 | [Node health, device monitoring, and DFS storage locations](device-health-and-dfs-storage-locations.md) | Partially implemented: DFS storage-health sampling, aggregate advertisement, and host resource evidence landed; general node health, additional content locations, storage management, and app surfaces remain proposed. |
 | [Agent session placement and workspace projection](agent-session-placement-and-workspaces.md) | Active; lifecycle client, VFS file I/O, and cluster chat hosting are done; remote placement, migration, sandbox CAS, and grant audit remain. |
 | [Agent session activity and unified channels](agent-session-activity-and-unified-channels.md) | Active; phases 1–5 are implemented and recorded in the agent-system architecture; concurrent participants, participant live control, dotted events, and detached subagents remain. |
+| [Agent usage tracking](agent-usage-tracking.md) | Proposed: durable usage ledger, cost estimation, display-only budgets, and the Cluster Usage view. |
 | [Formal verification roadmap](formal-verification-roadmap.md) | Active backlog; network slices retired with the legacy transport; post-V7 Rust test restoration and native whole-shard conformance are open. |
 | [System architecture proposal](system-architecture-proposal.md) | Historical and superseded by the current architecture. |
 
