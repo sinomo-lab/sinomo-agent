@@ -146,8 +146,29 @@ opt-level = 2
 [profile.dev.package.tracing-subscriber]
 opt-level = 2
 
-[profile.android-debug-small]
+# Keep the Android media hot path representative while retaining debugging,
+# assertions and observability for the rest of the application.
+[profile.android-debug]
 inherits = "dev"
+
+[profile.android-debug.package.image]
+opt-level = 2
+
+[profile.android-debug.package.sinomo-lm]
+opt-level = 2
+
+# Image decoding uses zune's JPEG codec and shared bitstream helpers.
+[profile.android-debug.package.zune-jpeg]
+opt-level = 2
+
+[profile.android-debug.package.zune-core]
+opt-level = 2
+
+[profile.android-debug.package.sinomo-app-use-module]
+opt-level = 2
+
+[profile.android-debug-small]
+inherits = "android-debug"
 debug = 0
 strip = "debuginfo"
 

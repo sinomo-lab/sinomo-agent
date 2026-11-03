@@ -11,6 +11,17 @@ A = packager.ANDROID
 
 
 class ManifestBoundaryTests(unittest.TestCase):
+    def test_debug_override_is_explicit_and_release_stays_non_debuggable(self):
+        with tempfile.TemporaryDirectory() as work:
+            source = Path(work) / "base.xml"
+            source.write_text('<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="net.sinomo.app"><application android:debuggable="false"/></manifest>')
+            release = Path(work) / "release.xml"
+            debug = Path(work) / "debug.xml"
+            packager.merge_manifest(source, release)
+            packager.merge_manifest(source, debug, debuggable=True)
+            self.assertEqual(ET.parse(release).getroot().find("application").get(A + "debuggable"), "false")
+            self.assertEqual(ET.parse(debug).getroot().find("application").get(A + "debuggable"), "true")
+
     def test_preserves_host_identity_and_keeps_os_services_guarded(self):
         with tempfile.TemporaryDirectory() as work:
             source = Path(work) / "base.xml"

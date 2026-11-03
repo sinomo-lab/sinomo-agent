@@ -37,9 +37,13 @@ if [[ "${has_profile}" -eq 0 ]]; then
   args=(--profile android-debug-small "${args[@]}")
 fi
 
-if [[ "${profile_name}" == "android-debug-small" ]]; then
-  debug_keystore="${CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE:-${target_dir}/android-debug.keystore}"
-  debug_keystore_password="${CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE_PASSWORD:-android}"
+if [[ "${profile_name}" == "android-debug-small" || "${profile_name}" == "android-debug" ]]; then
+  signing_profile="${profile_name^^}"
+  signing_profile="${signing_profile//-/_}"
+  keystore_var="CARGO_APK_${signing_profile}_KEYSTORE"
+  password_var="CARGO_APK_${signing_profile}_KEYSTORE_PASSWORD"
+  debug_keystore="${!keystore_var:-${target_dir}/android-debug.keystore}"
+  debug_keystore_password="${!password_var:-android}"
 
   if [[ ! -f "${debug_keystore}" ]]; then
     mkdir -p "$(dirname "${debug_keystore}")"
@@ -55,8 +59,8 @@ if [[ "${profile_name}" == "android-debug-small" ]]; then
       -noprompt
   fi
 
-  export CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE="${debug_keystore}"
-  export CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE_PASSWORD="${debug_keystore_password}"
+  export "${keystore_var}=${debug_keystore}"
+  export "${password_var}=${debug_keystore_password}"
 fi
 
 status=0
@@ -73,17 +77,22 @@ if [[ "${status}" -eq 0 ]]; then
   if [[ "${signing_profile}" == "DEV" && -z "${!password_var:-}" ]]; then
     export CARGO_APK_DEV_KEYSTORE_PASSWORD="android"
   fi
+  package_args=()
+  if [[ "${profile_name}" == "android-debug" || "${profile_name}" == "android-debug-small" ]]; then
+    package_args+=(--debuggable)
+  fi
   # Use the same key as cargo-apk; never silently change the APK signer.
   python3 modules/desktop/app-use/android/package.py \
     "${target_dir}/${profile_name}/apk/sinomo-app.apk" \
     --keystore "${!keystore_var:-${HOME}/.android/debug.keystore}" \
-    --password-env "${password_var}" || status=$?
+    --password-env "${password_var}" "${package_args[@]}" || status=$?
 fi
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
   chown -R "${HOST_UID}:${HOST_GID}" \
     "${target_dir}/android-debug.keystore" \
     "${target_dir}/android-debug-small/apk" \
+    "${target_dir}/android-debug/apk" \
     "${target_dir}/debug/apk" \
     "${target_dir}/release/apk" \
     "${target_dir}/aarch64-linux-android" \

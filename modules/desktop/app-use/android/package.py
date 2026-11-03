@@ -19,13 +19,15 @@ ET.register_namespace("android", ANDROID[1:-1])
 SOURCE = Path(__file__).resolve().parent
 
 
-def merge_manifest(source, destination):
+def merge_manifest(source, destination, debuggable=False):
     tree = ET.parse(source)
     root = tree.getroot()
     application = root.find("application")
     if application is None or root.get("package") != "net.sinomo.app":
         raise ValueError("expected the generated net.sinomo.app manifest")
     application.set(ANDROID + "hasCode", "true")
+    if debuggable:
+        application.set(ANDROID + "debuggable", "true")
     fragment = ET.parse(SOURCE / "manifest.xml").getroot()
     for permission in fragment.findall("uses-permission"):
         if not any(p.get(ANDROID + "name") == permission.get(ANDROID + "name") for p in root.findall("uses-permission")):
@@ -46,7 +48,7 @@ def signers(tools, apk):
     return {line.strip() for line in result.splitlines() if "certificate SHA-256 digest:" in line}
 
 
-def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archives=()):
+def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archives=(), debuggable=False):
     if not apk.is_file() or not manifest.is_file() or not keystore.is_file():
         raise ValueError("APK, generated manifest and existing signing keystore are required")
     if password_env not in os.environ:
@@ -58,7 +60,7 @@ def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archi
     with tempfile.TemporaryDirectory(prefix="app-use-", dir=apk.parent) as temporary:
         work = Path(temporary)
         merged = work / "AndroidManifest.xml"
-        merge_manifest(manifest, merged)
+        merge_manifest(manifest, merged, debuggable=debuggable)
         target_sdk = ET.parse(merged).getroot().find("uses-sdk").get(ANDROID + "targetSdkVersion")
         android_jar = sdk / "platforms" / f"android-{target_sdk}" / "android.jar"
         classes = work / "classes"
@@ -115,12 +117,14 @@ def main():
     parser.add_argument("--alias", help="key alias, only needed for keystores with multiple entries")
     parser.add_argument("--java-archive", type=Path, action="append", default=[],
                         help="additional application JAR to merge into the APK's DEX")
+    parser.add_argument("--debuggable", action="store_true",
+                        help="enable Android debugging for an explicitly selected development build")
     args = parser.parse_args()
     if args.sdk is None:
         parser.error("--sdk or ANDROID_HOME is required")
     manifest = args.manifest or args.apk.parent / "AndroidManifest.xml"
     package(args.apk.resolve(), manifest.resolve(), args.sdk, args.sdk / "build-tools" / args.build_tools,
-            args.keystore, args.password_env, args.alias, args.java_archive)
+            args.keystore, args.password_env, args.alias, args.java_archive, args.debuggable)
 
 
 if __name__ == "__main__":
