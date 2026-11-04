@@ -190,7 +190,37 @@ enum HostCommand {
         command: wire::ChatSessionCommand,
         admission: HostAdmission,
     },
+    /// Something the worker waits on changed; it checks its state again.
+    Wake,
     Shutdown,
+}
+
+/// The worker's only wake input besides commands: a [`HostCommand::Wake`] on
+/// its own command channel, so one blocking receive waits for both. At most
+/// one wake is queued; the worker checks its state after taking it.
+#[derive(Clone)]
+struct HostWake {
+    queued: Arc<AtomicBool>,
+    commands: Sender<HostCommand>,
+}
+
+impl HostWake {
+    fn new(commands: Sender<HostCommand>) -> Self {
+        Self {
+            queued: Arc::new(AtomicBool::new(false)),
+            commands,
+        }
+    }
+
+    fn wake(&self) {
+        if !self.queued.swap(true, Ordering::SeqCst) {
+            let _ = self.commands.send(HostCommand::Wake);
+        }
+    }
+
+    fn taken(&self) {
+        self.queued.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Something a chat host or view can deliver chat events to.
@@ -434,6 +464,12 @@ impl Drop for ChatHost {
 }
 
 impl ChatHost {
+    /// Stop admitting commands. The worker, woken, drains live work and exits.
+    fn stop(&self) {
+        self.alive.store(false, Ordering::Release);
+        self.activity.wake();
+    }
+
     fn enqueue(
         &self,
         origin: String,
@@ -606,6 +642,8 @@ impl ChatView {
 #[derive(Clone)]
 struct HostActivity {
     state: Arc<Mutex<HostActivityState>>,
+    /// Wakes the worker when activity it does not observe itself changes.
+    wake: Option<HostWake>,
 }
 
 struct HostActivityState {
@@ -635,6 +673,20 @@ impl HostActivity {
                 session_id: None,
                 participant_work: false,
             })),
+            wake: None,
+        }
+    }
+
+    fn with_wake(wake: HostWake) -> Self {
+        Self {
+            wake: Some(wake),
+            ..Self::new()
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            wake.wake();
         }
     }
 
@@ -1161,8 +1213,9 @@ impl HostedChatService {
         let completion = HostCompletion::default();
         let ready = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
-        let activity = HostActivity::new();
         let (command_tx, command_rx) = channel();
+        let wake = HostWake::new(command_tx.clone());
+        let activity = HostActivity::with_wake(wake.clone());
         let storage = local::AgentChatSifsStorage::new(
             environment.data_dir.clone(),
             self.daemon_address.clone(),
@@ -1182,10 +1235,11 @@ impl HostedChatService {
             ready: ready.clone(),
             alive: alive.clone(),
             activity: activity.clone(),
+            wake,
             host_readiness: Arc::clone(&self.host_readiness),
         };
         self.spawn_worker(format!("sinomo-chat-{chat_id}"), move || {
-            chat_host_worker(context, command_rx)
+            chat_host_worker(context, command_rx, open_chat_host)
         })?;
         Ok(ChatHost {
             command_tx,
@@ -1962,7 +2016,7 @@ impl HostedChatService {
                         reason: "chat ownership moved to another node".into(),
                     });
                 }
-                host.alive.store(false, Ordering::Release);
+                host.stop();
             }
         }
         // Event following can move to an observed owner without claiming execution.
@@ -2506,6 +2560,7 @@ struct ChatHostContext {
     ready: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     activity: HostActivity,
+    wake: HostWake,
     host_readiness: Arc<ChatHostReadiness>,
 }
 
@@ -2531,7 +2586,17 @@ fn admit_host_command(
 
 /// Runs one chat: the only runtime for it on this node. Commands from every
 /// view of the chat execute here in order, and events go to all of them.
-fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>) {
+///
+/// The worker acts only on events: a command, a wake from the chat's
+/// sessions (a detached call completing, a turn worker or subagent
+/// finishing, a control changing what a session may continue with), a stop
+/// of this host, or its warm-idle deadline. Each check below follows
+/// watching the sessions and precedes blocking, so no change is missed.
+fn chat_host_worker(
+    context: ChatHostContext,
+    command_rx: Receiver<HostCommand>,
+    open: impl FnOnce(&ChatHostOpening<'_>) -> Option<local::AgentChat>,
+) {
     let ChatHostContext {
         service,
         lifecycle,
@@ -2546,6 +2611,7 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
         ready,
         alive,
         activity,
+        wake,
         host_readiness,
     } = context;
     struct WorkerLife(Arc<AtomicBool>, HostCompletion);
@@ -2563,7 +2629,7 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
             text: message.text,
         })
         .collect::<Vec<_>>();
-    let Some(mut chat) = open_chat_host(&ChatHostOpening {
+    let Some(mut chat) = open(&ChatHostOpening {
         chat_id: &chat_id,
         history: &history,
         data_dir: &data_dir,
@@ -2587,11 +2653,27 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
     if let Ok(state) = chat.control_state() {
         fanout.push(wire::ChatEvent::ControlState(control_state(state)));
     }
+    let session_waker = {
+        let wake = wake.clone();
+        sinomo_agent::AgentSessionWaker::new(move || wake.wake())
+    };
+    // Commands that arrive while a stopped host drains stay unstarted; their
+    // journal entries remain pending for recovery.
+    let mut unstarted = Vec::new();
+    // Set when the host could not go dormant at its deadline: it then waits
+    // for the next wake or command instead of retrying at once.
+    let mut dormancy_refused = false;
+    let mut continuation_retry: Option<(Instant, Duration)> = None;
     loop {
+        // The chat's sessions can change with any command; watch them before
+        // every check.
+        chat.watch_sessions(&session_waker);
         if !alive.load(Ordering::Acquire) {
             // Keep the runtime registration, tools and mounts owned until
             // cancelled turns/subagents have actually finished. Component
             // draining joins this worker and retains it on a deadline miss.
+            // Their turn workers, detached calls and subagents wake it as
+            // they finish.
             let idle = SessionId::from_str(&chat.session_id())
                 .ok()
                 .is_some_and(|session| {
@@ -2604,72 +2686,111 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
             if idle {
                 break;
             }
-            std::thread::sleep(ASYNC_CONTINUATION_POLL);
+            match command_rx.recv() {
+                Ok(HostCommand::Wake) => wake.taken(),
+                Ok(command @ HostCommand::Run { .. }) => unstarted.push(command),
+                Ok(HostCommand::Shutdown) => {}
+                Err(_) => break,
+            }
             continue;
         }
-        let (origin, journal, command, _admission) = match command_rx
-            .recv_timeout(ASYNC_CONTINUATION_POLL)
+        activity.set_participant_work(chat.has_participant_work());
+        // Background tool calls that completed while the chat was idle
+        // continue the session: the agent posts on its own. A failed attempt
+        // is retried after a bounded backoff while its completions wait.
+        let async_updates = chat.has_async_updates();
+        if !async_updates {
+            continuation_retry = None;
+        }
+        if async_updates
+            && continuation_retry.is_none_or(|(retry_at, _)| Instant::now() >= retry_at)
         {
+            activity.begin();
+            let result =
+                sinomo_runtime::rollout::acquire_runtime_work_until(&data_dir.root(), || {
+                    !alive.load(Ordering::Acquire)
+                })
+                .map(|_work| run_async_continuation(&mut chat, &fanout));
+            activity.end(SessionId::from_str(&chat.session_id()).ok());
+            let continued = result.unwrap_or_else(|error| {
+                fanout.push(wire::ChatEvent::Error {
+                    session_id: Some(chat.session_id()),
+                    error,
+                });
+                false
+            });
+            // Only completions still waiting are retried.
+            continuation_retry = (!continued && chat.has_async_updates()).then(|| {
+                let delay = continuation_retry.map_or(ASYNC_CONTINUATION_RETRY, |(_, delay)| {
+                    (delay * 2).min(CHAT_HOST_WARM_IDLE)
+                });
+                (Instant::now() + delay, delay)
+            });
+        }
+        let idle = activity.idle_for(&runtime_control);
+        if !dormancy_refused && idle.is_some_and(|idle| idle >= CHAT_HOST_WARM_IDLE) {
+            let gate = lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(host) = service.begin_dormancy(&chat_id, &alive) {
+                if let Err(error) = chat.release_runtime_control() {
+                    service.abort_dormancy(&chat_id, host);
+                    activity.touch();
+                    tracing::warn!(%chat_id, %error, "release idle chat runtime failed");
+                } else {
+                    drop(chat);
+                    // Stop renewing. Its existing lease expires normally;
+                    // the record remains only as a last-host routing hint.
+                    if let Ok(session_id) = SessionId::from_str(&chat_id)
+                        && let Ok(response) = runtime_control.resume_or_persisted(
+                            &sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir),
+                            AgentSessionResumeRequest { session_id },
+                        )
+                    {
+                        fanout.push(wire::ChatEvent::ControlState(control_resume_state(
+                            response,
+                        )));
+                    }
+                    drop(host);
+                    drop(gate);
+                    return;
+                }
+            } else {
+                dormancy_refused = true;
+            }
+            continue;
+        }
+        // A busy host waits for the wake that ends its work; an idle one at
+        // most until its warm-idle deadline, recomputed after every wake.
+        let deadline = [
+            idle.map(|idle| CHAT_HOST_WARM_IDLE.saturating_sub(idle))
+                .filter(|remaining| !remaining.is_zero()),
+            continuation_retry
+                .map(|(retry_at, _)| retry_at.saturating_duration_since(Instant::now())),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let received = match deadline {
+            Some(timeout) => command_rx.recv_timeout(timeout),
+            None => command_rx
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        dormancy_refused = false;
+        let (origin, journal, command, _admission) = match received {
             Ok(HostCommand::Run {
                 origin,
                 journal,
                 command,
                 admission,
             }) => (origin, journal, command, admission),
-            Ok(HostCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                activity.set_participant_work(chat.has_participant_work());
-                // Background tool calls that completed while the chat was
-                // idle continue the session: the agent posts on its own.
-                if chat.has_async_updates() {
-                    activity.begin();
-                    let result = sinomo_runtime::rollout::acquire_runtime_work_until(
-                        &data_dir.root(),
-                        || !alive.load(Ordering::Acquire),
-                    )
-                    .map(|_work| run_async_continuation(&mut chat, &fanout));
-                    activity.end(SessionId::from_str(&chat.session_id()).ok());
-                    if let Err(error) = result {
-                        fanout.push(wire::ChatEvent::Error {
-                            session_id: Some(chat.session_id()),
-                            error,
-                        });
-                    }
-                }
-                if activity
-                    .idle_for(&runtime_control)
-                    .is_some_and(|idle| idle >= CHAT_HOST_WARM_IDLE)
-                {
-                    let gate = lifecycle
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(host) = service.begin_dormancy(&chat_id, &alive) {
-                        if let Err(error) = chat.release_runtime_control() {
-                            service.abort_dormancy(&chat_id, host);
-                            activity.touch();
-                            tracing::warn!(%chat_id, %error, "release idle chat runtime failed");
-                        } else {
-                            drop(chat);
-                            // Stop renewing. Its existing lease expires normally;
-                            // the record remains only as a last-host routing hint.
-                            if let Ok(session_id) = SessionId::from_str(&chat_id)
-                                && let Ok(response) = runtime_control.resume_or_persisted(
-                                    &sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir),
-                                    AgentSessionResumeRequest { session_id },
-                                )
-                            {
-                                fanout.push(wire::ChatEvent::ControlState(control_resume_state(
-                                    response,
-                                )));
-                            }
-                            drop(host);
-                            drop(gate);
-                            return;
-                        }
-                    }
-                }
+            Ok(HostCommand::Wake) => {
+                wake.taken();
                 continue;
             }
+            Ok(HostCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
         };
         if _admission
             .cancellation()
@@ -2876,12 +2997,15 @@ fn open_chat_host(opening: &ChatHostOpening<'_>) -> Option<local::AgentChat> {
     None
 }
 
-/// How often an idle chat host checks for completed background work.
-const ASYNC_CONTINUATION_POLL: Duration = Duration::from_millis(250);
+/// First delay before a failed continuation of completed background work is
+/// attempted again; it doubles up to the warm-idle grace while it keeps
+/// failing.
+const ASYNC_CONTINUATION_RETRY: Duration = Duration::from_secs(1);
 
 /// Run the turns that continue a chat after its background tool calls
 /// completed, framed like a user turn so every view shows it streaming.
-fn run_async_continuation(chat: &mut local::AgentChat, events: &dyn ChatEventSink) {
+/// False when the continuation failed.
+fn run_async_continuation(chat: &mut local::AgentChat, events: &dyn ChatEventSink) -> bool {
     let session_id = chat.session_id();
     events.push(wire::ChatEvent::TurnStarted {
         session_id: session_id.clone(),
@@ -2891,6 +3015,7 @@ fn run_async_continuation(chat: &mut local::AgentChat, events: &dyn ChatEventSin
             events.push(event);
         }
     });
+    let continued = result.is_ok();
     if let Err(error) = result {
         events.push(wire::ChatEvent::Error {
             session_id: Some(session_id.clone()),
@@ -2898,6 +3023,7 @@ fn run_async_continuation(chat: &mut local::AgentChat, events: &dyn ChatEventSin
         });
     }
     events.push(wire::ChatEvent::TurnDone { session_id });
+    continued
 }
 
 fn run_worker_command(
@@ -5170,7 +5296,7 @@ mod tests {
         let origins = [shared_commands.try_recv(), shared_commands.try_recv()].map(|command| {
             match command.unwrap() {
                 HostCommand::Run { origin, .. } => origin,
-                HostCommand::Shutdown => panic!("unexpected shutdown"),
+                HostCommand::Wake | HostCommand::Shutdown => panic!("unexpected stop"),
             }
         });
         assert_eq!(origins, ["view-a".to_string(), "view-b".to_string()]);
@@ -5705,7 +5831,7 @@ mod tests {
             .unwrap();
         let origin = match commands_a.lock().unwrap()[&chat].try_recv().unwrap() {
             HostCommand::Run { origin, .. } => origin,
-            HostCommand::Shutdown => panic!("unexpected shutdown"),
+            HostCommand::Wake | HostCommand::Shutdown => panic!("unexpected stop"),
         };
         assert!(origin.ends_with("/view-b"), "{origin}");
 
@@ -5891,6 +6017,9 @@ mod async_events_tests;
 
 #[cfg(test)]
 mod dormancy_tests;
+
+#[cfg(test)]
+mod wake_tests;
 
 fn dormant_peer_not_owner() -> wire::ChatPeerEventsResponse {
     wire::ChatPeerEventsResponse {

@@ -244,12 +244,12 @@ pub use local_membership::{
     refresh_local_daemon_membership_from_disk_async,
 };
 pub use local_state_store::{
-    materialize_cluster_remote_endpoints_async,
+    materialize_cluster_remote_endpoints_async, notify_local_cluster_state_changed,
     project_committed_cluster_raft_config, read_cluster_consensus_state, read_cluster_state,
     read_cluster_state_async, read_cluster_state_cached, read_cluster_state_cached_async,
     read_cluster_state_cached_shared, read_cluster_state_without_kv,
     read_cluster_state_without_kv_async, read_cluster_state_without_kv_cached_shared,
-    write_cluster_state, write_cluster_state_async,
+    subscribe_local_cluster_state_changes, write_cluster_state, write_cluster_state_async,
 };
 pub use maintenance_reactor::{
     ClusterMaintenanceFuture, ClusterMaintenanceReactorConfig, ClusterMaintenanceReactorHost,

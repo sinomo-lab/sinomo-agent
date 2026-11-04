@@ -1405,6 +1405,11 @@ where
             .manager
             .set_session(&state.control.session);
         state.append_control_runtime_events(&result.events);
+        // An unpause releases held completions and a removed input can end
+        // the work keeping a host resident, whichever path submitted it.
+        if result.accepted {
+            wake_session(&state.control.session.session_id);
+        }
         Ok(result)
     }
 
@@ -2050,7 +2055,9 @@ where
                     detail: format!("persist agent control history failed: {error}"),
                 });
             }
+            let finished_session_id = state.control.session.session_id.clone();
             drop(state);
+            wake_session(&finished_session_id);
             session_persistence?;
             control_persistence?;
             outcome.map(|_| ())
@@ -2477,15 +2484,105 @@ pub(super) fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleS
     }
 }
 
-/// Detached calls in this process, per session. A host can rebuild a
-/// session's runtime (for a model, agent, or workspace change) while its
-/// detached calls run, so their count and completions belong to the session
-/// rather than to the runtime that started them. The session's records stay
-/// the durable source; this carries only what happens in this process.
+/// Wakes the host of agent sessions when their work changes: a detached call
+/// completes, a turn worker exits, a subagent finishes, or an accepted control
+/// changes what a session may continue with. A host watches each session it
+/// hosts, then checks the session, then blocks, so no change is missed.
+/// Dropping the last clone stops every watch.
+#[derive(Clone)]
+pub struct AgentSessionWaker(Arc<SessionWaker>);
+
+struct SessionWaker {
+    wake: Box<dyn Fn() + Send + Sync>,
+    watched: Mutex<BTreeSet<SessionId>>,
+}
+
+impl Drop for SessionWaker {
+    fn drop(&mut self) {
+        let watched = std::mem::take(
+            self.watched
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        // Never dropped under the map lock: wakes release their strong
+        // references after it.
+        with_detached_work(|work| {
+            for session_id in watched {
+                if let Some(session) = work.get_mut(&session_id) {
+                    session.wakers.retain(|waker| waker.strong_count() > 0);
+                    if session.is_empty() {
+                        work.remove(&session_id);
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl AgentSessionWaker {
+    /// `wake` runs on the thread that changed the session, possibly while it
+    /// holds the session's locks: it only signals, and never blocks or calls
+    /// back into an agent runtime.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(SessionWaker {
+            wake: Box::new(wake),
+            watched: Mutex::new(BTreeSet::new()),
+        }))
+    }
+
+    /// Wake on every later change of `session_id`'s work. Repeating it for a
+    /// session already watched has no effect.
+    pub fn watch(&self, session_id: &SessionId) {
+        if !self
+            .0
+            .watched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.clone())
+        {
+            return;
+        }
+        with_detached_work(|work| {
+            work.entry(session_id.clone())
+                .or_default()
+                .wakers
+                .push(Arc::downgrade(&self.0));
+        });
+    }
+}
+
+/// Detached calls in this process, per session, and the hosts watching the
+/// session. A host can rebuild a session's runtime (for a model, agent, or
+/// workspace change) while its detached calls run, so their count and
+/// completions belong to the session rather than to the runtime that started
+/// them. The session's records stay the durable source; this carries only
+/// what happens in this process.
 #[derive(Default)]
 struct DetachedSessionWork {
     running: usize,
     completions: Vec<crate::AsyncTaskUpdate>,
+    wakers: Vec<std::sync::Weak<SessionWaker>>,
+}
+
+impl DetachedSessionWork {
+    /// Wake the watching hosts. The returned references are dropped by the
+    /// caller after the map lock, where a host's last reference may unwatch.
+    #[must_use]
+    fn wake(&mut self) -> Vec<Arc<SessionWaker>> {
+        let wakers = self
+            .wakers
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        for waker in &wakers {
+            (waker.wake)();
+        }
+        wakers
+    }
+
+    fn is_empty(&self) -> bool {
+        self.running == 0 && self.completions.is_empty() && self.wakers.is_empty()
+    }
 }
 
 static DETACHED_WORK: std::sync::LazyLock<
@@ -2501,16 +2598,30 @@ fn with_detached_work<T>(
     update(&mut work)
 }
 
+/// Tell the hosts watching `session_id` that its work changed.
+pub(super) fn wake_session(session_id: &SessionId) {
+    let woken = with_detached_work(|work| {
+        work.get_mut(session_id)
+            .map(DetachedSessionWork::wake)
+            .unwrap_or_default()
+    });
+    drop(woken);
+}
+
 fn detached_call_started(session_id: &SessionId) {
     with_detached_work(|work| work.entry(session_id.clone()).or_default().running += 1);
 }
 
 fn detached_call_completed(session_id: &SessionId, update: crate::AsyncTaskUpdate) {
-    with_detached_work(|work| {
+    let woken = with_detached_work(|work| {
         let session = work.entry(session_id.clone()).or_default();
         session.running = session.running.saturating_sub(1);
         session.completions.push(update);
+        // Under the map lock: a host that watched before this push is woken,
+        // and one that watches after it finds the completion when it checks.
+        session.wake()
     });
+    drop(woken);
 }
 
 fn detached_calls_running(session_id: &SessionId) -> usize {
@@ -2523,7 +2634,7 @@ fn take_detached_completions(session_id: &SessionId) -> Vec<crate::AsyncTaskUpda
             return Vec::new();
         };
         let completions = std::mem::take(&mut session.completions);
-        if session.running == 0 {
+        if session.is_empty() {
             work.remove(session_id);
         }
         completions
@@ -2610,5 +2721,43 @@ mod shutdown_tests {
             "a live worker cannot disappear from shutdown accounting"
         );
         runtime.lock_state().unwrap().turn_worker_running = false;
+    }
+
+    #[test]
+    fn a_session_waker_wakes_once_per_change_until_its_host_drops_it() {
+        let session_id = SessionId::generate();
+        let runtime = AgentSessionRuntime::new(
+            Agent::new(NoModelCalls, "fixture", "fixture"),
+            AgentSession::new(session_id.clone(), AgentRole::Main),
+        );
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let waker = AgentSessionWaker::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        waker.watch(&session_id);
+        waker.clone().watch(&session_id);
+        runtime.submit_op(AgentOp::pause("held")).unwrap();
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        detached_call_started(&session_id);
+        detached_call_completed(&session_id, interrupted_update());
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(take_detached_completions(&session_id).len(), 1);
+
+        drop(waker);
+        runtime.submit_op(AgentOp::unpause()).unwrap();
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            !with_detached_work(|work| work.contains_key(&session_id)),
+            "a session nobody watches keeps no entry"
+        );
+    }
+
+    fn interrupted_update() -> AsyncTaskUpdate {
+        crate::agent::tool_execution::interrupted_detached_update(
+            TaskId::generate(),
+            TaskId::generate(),
+            "fixture",
+        )
     }
 }

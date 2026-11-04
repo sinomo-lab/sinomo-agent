@@ -245,7 +245,7 @@ impl HostedChatService {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = HostTime::now();
                     return Ok(hosts);
                 }
-                host.alive.store(false, Ordering::Release);
+                host.stop();
                 if let Ok(session_id) = SessionId::from_str(chat_id) {
                     let _ = self.runtime_control.cancel(AgentSessionCancelRequest {
                         session_id,
@@ -311,7 +311,7 @@ impl HostedChatService {
         else {
             unreachable!()
         };
-        host.alive.store(false, Ordering::Release);
+        host.stop();
         Some(host)
     }
 
@@ -454,6 +454,10 @@ impl Drop for HostAdmission {
                     .is_none_or(|mine| turn.as_ptr() != Arc::as_ptr(mine))
         });
         state.last_active = HostTime::now();
+        drop(state);
+        // A concurrent control ends here: the worker recomputes its idle
+        // deadline and checks what the control changed.
+        self.activity.wake();
     }
 }
 impl HostActivity {

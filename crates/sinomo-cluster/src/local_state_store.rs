@@ -46,6 +46,26 @@ static CLUSTER_STATES: LazyLock<Mutex<HashMap<PathBuf, ClusterStateCacheEntry>>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static LOCAL_CLUSTER_STATES: LazyLock<Mutex<HashMap<PathBuf, LocalClusterStateCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static LOCAL_CLUSTER_STATE_GENERATION: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::Sender::new(0));
+
+/// Follow the process-local generation of the durable local cluster state.
+///
+/// Every state write in this process advances it after the file is replaced,
+/// and hosts advance it when another process reports or is seen replacing the
+/// file. Mark the current generation seen before reading the state; a write
+/// after that read then always wakes the receiver. It carries no state and
+/// grants no authority.
+pub fn subscribe_local_cluster_state_changes() -> tokio::sync::watch::Receiver<u64> {
+    LOCAL_CLUSTER_STATE_GENERATION.subscribe()
+}
+
+/// Advance the local cluster state generation for a replacement this
+/// process's writers did not perform.
+pub fn notify_local_cluster_state_changed() {
+    LOCAL_CLUSTER_STATE_GENERATION
+        .send_modify(|generation| *generation = generation.wrapping_add(1));
+}
 
 #[derive(Clone)]
 struct ClusterStateCacheEntry {
@@ -494,6 +514,7 @@ pub async fn read_cluster_state_async(
 fn finish_cluster_state_write(paths: &ClusterPaths, state: &ClusterBootstrapState) {
     invalidate_cluster_state_cache(paths);
     record_current_cluster_kv_reader_node_id_cache(paths, state.local_node_id.clone());
+    notify_local_cluster_state_changed();
 }
 
 /// Writes a state while its caller holds the local-state mutation lock.
@@ -947,6 +968,25 @@ mod tests {
             }
             assert!(!remote_endpoint_projection_changed(&previous, &rejected), "case {change}");
         }
+    }
+
+    #[test]
+    fn local_state_writes_advance_the_local_state_generation() {
+        let root = sinomo_testdir::TestDir::new("local_state_generation");
+        let data = SinomoDataDir::new(&root);
+        data.ensure_root_layout().unwrap();
+        let paths = ClusterPaths::new(&data);
+        paths.ensure().unwrap();
+        let mut changes = subscribe_local_cluster_state_changes();
+        changes.borrow_and_update();
+        write_cluster_state(&paths, &test_state("local_state_generation")).unwrap();
+        assert!(
+            changes.has_changed().unwrap(),
+            "a waiter that read before the write is woken"
+        );
+        changes.borrow_and_update();
+        notify_local_cluster_state_changed();
+        assert!(changes.has_changed().unwrap());
     }
 
     #[test]

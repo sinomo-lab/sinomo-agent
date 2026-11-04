@@ -27,7 +27,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicU8, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 #[cfg(test)]
 use std::thread;
@@ -1521,6 +1521,175 @@ where
     }
 }
 
+/// Re-read interval standing in for the state directory watch only when it
+/// could not be installed.
+const DAEMON_ORPHAN_CLUSTER_STATE_FALLBACK_REREAD: Duration = Duration::from_secs(5);
+
+/// Follows the durable local cluster state while the control loop has no
+/// cluster identity. In-process writers and the maintenance-refresh RPC
+/// advance the process-local cluster state generation; a watch of the state
+/// file's directory, held only while orphaned, advances it when another
+/// process replaces the file. A coarse re-read stands in for that watch only
+/// when it cannot be installed.
+struct DaemonOrphanedClusterState {
+    cluster_paths: sinomo_core::network::ClusterPaths,
+    changes: tokio::sync::watch::Receiver<u64>,
+    watch: Option<DaemonClusterStateDirectoryWatch>,
+    watch_failed: bool,
+}
+
+struct DaemonClusterStateDirectoryWatch {
+    _watcher: notify::RecommendedWatcher,
+    /// The directory watch ended with its directory or a watcher error.
+    retired: Arc<AtomicBool>,
+    #[cfg(test)]
+    observed: Arc<AtomicU64>,
+}
+
+impl DaemonOrphanedClusterState {
+    fn new(cluster_paths: sinomo_core::network::ClusterPaths) -> Self {
+        Self {
+            cluster_paths,
+            changes: sinomo_core::cluster::subscribe_local_cluster_state_changes(),
+            watch: None,
+            watch_failed: false,
+        }
+    }
+
+    /// Register the reverse logical-stream dispatcher once the local cluster
+    /// state names this node; until then, watch for that state.
+    fn register(
+        &mut self,
+        affinity: sinomo_core::network::DestinationProcessAffinity,
+    ) -> Result<Option<sinomo_core::network::RoutedStreamIncoming>, DaemonError> {
+        // Seen before the read: a later write always wakes `changed`.
+        self.changes.borrow_and_update();
+        let mut node_id = self.local_node_id()?;
+        if node_id.is_none() && !self.watching() {
+            self.watch = None;
+            match daemon_cluster_state_directory_watch(&self.cluster_paths) {
+                Ok(watch) => {
+                    self.watch = Some(watch);
+                    self.watch_failed = false;
+                }
+                Err(error) => {
+                    if !self.watch_failed {
+                        tracing::warn!(
+                            "cannot watch local cluster state; re-reading it every {:?} while this daemon has no cluster identity: {error}",
+                            DAEMON_ORPHAN_CLUSTER_STATE_FALLBACK_REREAD
+                        );
+                    }
+                    self.watch_failed = true;
+                }
+            }
+            // A replacement that landed before the watch existed.
+            node_id = self.local_node_id()?;
+        }
+        let Some(node_id) = node_id else {
+            return Ok(None);
+        };
+        self.watch = None;
+        Ok(Some(
+            sinomo_core::network::register_routed_stream_incoming_with_process_affinity(
+                node_id, affinity,
+            )?,
+        ))
+    }
+
+    fn watching(&self) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(|watch| !watch.retired.load(Ordering::Acquire))
+    }
+
+    fn local_node_id(&self) -> Result<Option<NodeId>, DaemonError> {
+        match sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths) {
+            Ok(state) => Ok(Some(state.local_node_id)),
+            Err(sinomo_core::network::NetworkError::ClusterOrphan) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Resolves when the local cluster state may have changed since the last
+    /// [`Self::register`].
+    async fn changed(&mut self) {
+        let fallback = self.watch_failed;
+        let changes = &mut self.changes;
+        let changed = async {
+            // The generation's sender is process-global and never dropped.
+            if changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        if fallback {
+            let _ =
+                tokio::time::timeout(DAEMON_ORPHAN_CLUSTER_STATE_FALLBACK_REREAD, changed).await;
+        } else {
+            changed.await;
+        }
+    }
+}
+
+fn daemon_cluster_state_directory_watch(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+) -> Result<DaemonClusterStateDirectoryWatch, DaemonError> {
+    // Writers replace the state by atomic rename, which retires a watch on
+    // the file itself; the directory's watch observes every replacement.
+    cluster_paths.ensure()?;
+    let directory = cluster_paths.root.clone();
+    let state_path = cluster_paths.state.clone();
+    let retired = Arc::new(AtomicBool::new(false));
+    let callback_retired = Arc::clone(&retired);
+    let callback_directory = directory.clone();
+    #[cfg(test)]
+    let observed = Arc::new(AtomicU64::new(0));
+    #[cfg(test)]
+    let callback_observed = Arc::clone(&observed);
+    let mut watcher = notify::recommended_watcher(
+        move |result: Result<notify::Event, notify::Error>| match result {
+            Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
+            Ok(event) => {
+                let retires = event.paths.iter().any(|path| path == &callback_directory);
+                if retires {
+                    callback_retired.store(true, Ordering::Release);
+                }
+                if retires || event.paths.iter().any(|path| path == &state_path) {
+                    #[cfg(test)]
+                    callback_observed.fetch_add(1, Ordering::AcqRel);
+                    sinomo_core::cluster::notify_local_cluster_state_changed();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %state_path.display(),
+                    "local cluster state watcher failed: {error}"
+                );
+                callback_retired.store(true, Ordering::Release);
+                sinomo_core::cluster::notify_local_cluster_state_changed();
+            }
+        },
+    )
+    .map_err(|source| DaemonError::Network {
+        address: cluster_paths.state.display().to_string(),
+        detail: format!("cannot watch local cluster state: {source}"),
+    })?;
+    notify::Watcher::watch(
+        &mut watcher,
+        &directory,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .map_err(|source| DaemonError::Network {
+        address: directory.display().to_string(),
+        detail: format!("cannot watch local cluster state directory: {source}"),
+    })?;
+    Ok(DaemonClusterStateDirectoryWatch {
+        _watcher: watcher,
+        retired,
+        #[cfg(test)]
+        observed,
+    })
+}
+
 pub async fn run_daemon_control_accept_loop(
     listener: sinomo_core::network::AsyncDaemonControlListener,
     paths: DaemonPaths,
@@ -1537,17 +1706,8 @@ pub async fn run_daemon_control_accept_loop(
     } else {
         sinomo_core::network::DestinationProcessAffinity::MainDaemon
     };
-    let mut routed_stream_incoming =
-        match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
-            Ok(state) => Some(
-                sinomo_core::network::register_routed_stream_incoming_with_process_affinity(
-                    state.local_node_id,
-                    reverse_affinity,
-                )?,
-            ),
-            Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
-            Err(error) => return Err(error.into()),
-        };
+    let mut orphaned = DaemonOrphanedClusterState::new(cluster_paths);
+    let mut routed_stream_incoming = orphaned.register(reverse_affinity)?;
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -1558,15 +1718,7 @@ pub async fn run_daemon_control_accept_loop(
         // becomes visible so a persistent carrier cannot observe a clustered
         // endpoint with no service sink.
         if routed_stream_incoming.is_none() {
-            match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
-                Ok(state) => {
-                    routed_stream_incoming = Some(
-                        sinomo_core::network::register_routed_stream_incoming_with_process_affinity(state.local_node_id, reverse_affinity)?,
-                    );
-                }
-                Err(sinomo_core::network::NetworkError::ClusterOrphan) => {}
-                Err(error) => return Err(error.into()),
-            }
+            routed_stream_incoming = orphaned.register(reverse_affinity)?;
         }
         tokio::select! {
             biased;
@@ -1578,7 +1730,7 @@ pub async fn run_daemon_control_accept_loop(
                     Err(_) => break,
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)), if routed_stream_incoming.is_none() => {
+            () = orphaned.changed(), if routed_stream_incoming.is_none() => {
                 continue;
             }
             routed = async {
@@ -3898,6 +4050,88 @@ mod tests {
             .expect("maintenance task");
 
         assert_eq!(result, None);
+    }
+
+    fn orphaned_daemon_fixture(
+        name: &str,
+    ) -> (
+        sinomo_testdir::TestDir,
+        sinomo_core::network::ClusterPaths,
+        sinomo_core::ClusterBootstrapState,
+    ) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let cluster_paths =
+            cluster_paths_from_daemon_paths(&DaemonPaths::new(&data_dir)).expect("cluster paths");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::generate(),
+            "late identity",
+            NodeId::generate(),
+            "node",
+            "pk-node",
+            OffsetDateTime::now_utc(),
+        );
+        (root, cluster_paths, state)
+    }
+
+    #[tokio::test]
+    async fn orphaned_control_loop_registers_an_identity_written_later_in_process() {
+        let (_root, cluster_paths, state) =
+            orphaned_daemon_fixture("sinomo-daemon-orphan-in-process-identity");
+        let affinity = sinomo_core::network::DestinationProcessAffinity::MainDaemon;
+        let mut orphaned = DaemonOrphanedClusterState::new(cluster_paths.clone());
+        assert!(orphaned.register(affinity).expect("orphan read").is_none());
+        assert!(
+            orphaned.watching(),
+            "an orphaned loop watches for its identity"
+        );
+
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        tokio::time::timeout(Duration::from_secs(5), orphaned.changed())
+            .await
+            .expect("the write wakes the orphaned loop");
+        let incoming = orphaned.register(affinity).expect("register");
+        assert!(
+            incoming.is_some(),
+            "the late identity registers its dispatcher"
+        );
+        assert!(orphaned.watch.is_none(), "a registered loop stops watching");
+        assert!(
+            sinomo_core::network::register_routed_stream_incoming_with_process_affinity(
+                state.local_node_id.clone(),
+                affinity,
+            )
+            .is_err(),
+            "the loop owns the node's dispatcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_control_loop_registers_an_identity_another_process_wrote() {
+        let (_root, cluster_paths, state) =
+            orphaned_daemon_fixture("sinomo-daemon-orphan-external-identity");
+        let affinity = sinomo_core::network::DestinationProcessAffinity::Any;
+        let mut orphaned = DaemonOrphanedClusterState::new(cluster_paths.clone());
+        assert!(orphaned.register(affinity).expect("orphan read").is_none());
+        let observed = Arc::clone(&orphaned.watch.as_ref().expect("state watch").observed);
+
+        // Another process replaces the file atomically; no writer in this
+        // process advances the local generation for it.
+        sinomo_core::network::write_object_file(&cluster_paths.state, &state)
+            .expect("external write");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while observed.load(Ordering::Acquire) == 0 {
+                orphaned.changed().await;
+            }
+        })
+        .await
+        .expect("the state directory watch saw the replacement");
+        let incoming = orphaned.register(affinity).expect("register");
+        assert!(
+            incoming.is_some(),
+            "the late identity registers its dispatcher"
+        );
     }
 
     #[test]

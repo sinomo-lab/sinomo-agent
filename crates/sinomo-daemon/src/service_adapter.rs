@@ -806,6 +806,9 @@ impl crate::host_api::DaemonOperationsHost for DaemonOperationsServiceHost {
     }
 
     fn cluster_maintenance_refresh_requested(&self, traceparent: Option<String>) {
+        // Local writers in other processes request this refresh after
+        // replacing the cluster state this daemon follows.
+        sinomo_core::cluster::notify_local_cluster_state_changed();
         crate::control::request_daemon_cluster_maintenance(
             crate::control::DaemonClusterMaintenanceReason::ManualBroad,
         );

@@ -488,6 +488,30 @@ fn child_handles_are_owned_and_disposable() {
 }
 
 #[test]
+fn a_host_watching_the_parent_is_woken_when_its_child_finishes() {
+    let h = setup(Behavior::Block);
+    let (woken_tx, woken) = mpsc::channel();
+    let waker = AgentSessionWaker::new(move || {
+        let _ = woken_tx.send(());
+    });
+    waker.watch(&h.input.session.session_id);
+    let child = spawn(&h);
+    h.started.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        h.runtime.has_live_work().unwrap(),
+        "a running child keeps the parent's host"
+    );
+    h.release.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.runtime.has_live_work().unwrap() {
+        woken
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the finished child woke the parent's host");
+    }
+    assert_eq!(wait(&h, &child.id).status, AgentSubagentStatus::Completed);
+}
+
+#[test]
 fn cancellation_is_one_way_and_does_not_cancel_siblings() {
     let h = setup(Behavior::Block);
     let parent_token = AgentCancellationToken::new();

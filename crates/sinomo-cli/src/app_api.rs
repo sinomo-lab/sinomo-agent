@@ -4981,6 +4981,15 @@ impl AgentChat {
             .any(|runtime| runtime.handler().has_live_work())
     }
 
+    /// Wake `waker` when the work of this chat's agent sessions changes: the
+    /// chat's own and those of the channel participants with a runtime.
+    pub(crate) fn watch_sessions(&self, waker: &sinomo_agent::AgentSessionWaker) {
+        waker.watch(&self.runtime.session().session_id);
+        for runtime in self.participant_runtimes.values() {
+            waker.watch(&runtime.session().session_id);
+        }
+    }
+
     /// Note the channel participants whose sessions recorded detached tool
     /// calls the session has not continued with. A restarted or reopened
     /// channel has no participant runtimes until they speak, so these are

@@ -195,6 +195,10 @@ impl AgentSubagents {
                     Err(error) => snapshot.error = Some(error.to_string()),
                 }
                 worker_child.changed.notify_all();
+                let parent_session_id = snapshot.parent_session_id.clone();
+                drop(snapshot);
+                // The parent's host may be waiting for its children to finish.
+                super::control::wake_session(&parent_session_id);
             })
             .map_err(|error| subagent_error(format!("could not start subagent: {error}")))?;
         // The worker owns execution resources until it really exits. Disposal

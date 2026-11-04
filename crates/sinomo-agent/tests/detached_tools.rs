@@ -118,14 +118,7 @@ fn async_call_detaches_and_its_completion_continues_the_session() {
     assert_eq!(model.request_count(), 2);
 
     release_tx.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !runtime.has_async_updates() {
-        assert!(
-            Instant::now() < deadline,
-            "the detached call never completed"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_update(&runtime);
     let updates = runtime.take_async_updates();
     assert_eq!(updates.len(), 1);
     let update = updates[0].clone();
@@ -178,15 +171,57 @@ fn async_call_runs_inline_without_a_host_to_continue_the_session() {
     model.assert_finished();
 }
 
-fn wait_for_update(runtime: &AgentSessionRuntime<ScriptedProvider>) {
+/// A host's view of a session: woken on each change of its work.
+fn watching(session_id: &SessionId) -> (AgentSessionWaker, mpsc::Receiver<()>) {
+    let (woken_tx, woken) = mpsc::channel();
+    let waker = AgentSessionWaker::new(move || {
+        let _ = woken_tx.send(());
+    });
+    waker.watch(session_id);
+    (waker, woken)
+}
+
+/// Checks `ready` after each wake, as a host does, instead of polling.
+fn await_wake(woken: &mpsc::Receiver<()>, what: &str, ready: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !runtime.has_async_updates() {
-        assert!(
-            Instant::now() < deadline,
-            "the detached call never completed"
-        );
-        std::thread::sleep(Duration::from_millis(10));
+    while !ready() {
+        woken
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| panic!("no wake: {what}"));
     }
+}
+
+fn wait_for_update(runtime: &AgentSessionRuntime<ScriptedProvider>) {
+    let (_waker, woken) = watching(&runtime.session_snapshot().unwrap().session_id);
+    await_wake(&woken, "the detached call never completed", || {
+        runtime.has_async_updates()
+    });
+}
+
+#[test]
+fn a_watching_host_is_woken_as_the_turn_and_its_detached_call_finish() {
+    let (release_tx, release_rx) = mpsc::channel();
+    let session = AgentSession::new(SessionId::generate(), AgentRole::Main);
+    let turn_input = input(session.session_id.clone());
+    let (_waker, woken) = watching(&session.session_id);
+    let runtime = AgentSessionRuntime::new(
+        agent(ScriptedProvider::new(async_tool_then_answer()), release_rx),
+        session,
+    );
+
+    runtime.submit_op(AgentOp::start_turn(turn_input)).unwrap();
+    await_wake(&woken, "the turn worker exited", || {
+        runtime.active_turn().unwrap().is_none()
+    });
+    assert!(
+        runtime.has_live_work().unwrap(),
+        "the detached call outlives the turn"
+    );
+    release_tx.send(()).unwrap();
+    await_wake(&woken, "the detached call completed", || {
+        !runtime.has_live_work().unwrap()
+    });
+    assert!(runtime.has_async_updates());
 }
 
 /// Runs a turn whose `async` call completes, without continuing with it.
@@ -322,7 +357,12 @@ fn a_paused_session_holds_its_completions_until_resumed() {
     runtime.submit_op(AgentOp::pause("user paused")).unwrap();
     assert!(!runtime.has_async_updates());
     assert!(runtime.take_async_updates().is_empty());
+    // Unpausing from any control path wakes the host to continue.
+    let (_waker, woken) = watching(&session.session_id);
     runtime.submit_op(AgentOp::unpause()).unwrap();
+    woken
+        .try_recv()
+        .expect("the unpause woke the session's host");
     assert_eq!(runtime.take_async_updates().len(), 1);
 }
 

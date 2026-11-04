@@ -69,8 +69,8 @@ Open follow-ups are the gaps listed under each phase.
   the call, so a runtime rebuilt for a model, agent, or workspace change
   collects it; a continuation consumes its completion when accepted, so a
   rebuild cannot continue the session twice. Detached work and queued
-  completions count as running work, so the host is not released. An idle
-  chat host polls for completions (every 250 ms) and runs
+  completions count as running work, so the host is not released. Each
+  completion wakes the idle chat host, which runs
   `AgentChat::continue_async_updates`:
   the participant takes a turn with the update as input
   (`AgentChannelRuntime::continue_with_async_update`, gated by
