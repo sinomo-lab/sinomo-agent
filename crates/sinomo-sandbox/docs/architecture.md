@@ -72,6 +72,30 @@ control root so publishing a generation cannot orphan them. Lock anchors live
 outside the instance subtree so destroy and recreate cannot evade a live
 lifecycle lease on the previous generation.
 
+### Lifecycle Recovery
+
+Recovery of an interrupted authoritative transaction is event-triggered; the
+component never lists `/services/sandbox/control` or runs a recovery cadence.
+Before writing a fence, a transaction records two obligations naming its node
+and lifecycle lease session: a node-local wake marker under
+`<data-dir>/daemon/sandbox-lifecycle-recovery/pending/` and a compact cluster-KV
+index entry at `/sandbox/pending/<sandbox_id>`. Both are retired when the fence
+clears, or when the transaction fails without leaving a fence. A fence is then
+finished, always under the exclusive lifecycle lease, when:
+
+- a lease-holding mutation opens the sandbox; a transaction finishes a
+  different pending operation first and continues its own pending operation
+  through its idempotent path;
+- a status, list or read request reports the fence, which schedules one
+  background recovery;
+- the component host becomes ready, for the node's own wake markers;
+- committed membership drops the node named by an index entry, for that
+  node's entries; the live node that wins the lease finishes them.
+
+Fences written without these obligations, for example by older binaries,
+recover through the access paths. Lease contention defers recovery to the
+holder with a bounded follow-up that spans one advisory-lock lease.
+
 Toolchains use:
 
 ```text

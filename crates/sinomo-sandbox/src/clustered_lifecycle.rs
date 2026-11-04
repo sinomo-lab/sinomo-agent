@@ -63,12 +63,47 @@ pub enum ClusteredSandboxLeaseError {
     },
 }
 
+impl ClusteredSandboxLeaseError {
+    /// Classify an acquisition that failed only because another session holds
+    /// the lease or the lease authority is warming. The fence is untouched in
+    /// both cases; warming carries the authority's own retry time.
+    pub fn deferral(&self) -> Option<ClusteredSandboxRecoveryAttempt> {
+        let Self::Acquire { source, .. } = self else {
+            return None;
+        };
+        match source {
+            DfsRenewableLeaseError::WouldBlock { .. } | DfsRenewableLeaseError::Busy { .. } => {
+                Some(ClusteredSandboxRecoveryAttempt::Deferred {
+                    retry_after_unix_nanos: None,
+                })
+            }
+            DfsRenewableLeaseError::AuthorityWarming {
+                retry_after_unix_nanos,
+            } => Some(ClusteredSandboxRecoveryAttempt::Deferred {
+                retry_after_unix_nanos: Some(*retry_after_unix_nanos),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of one event-triggered lifecycle recovery attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusteredSandboxRecoveryAttempt {
+    /// Any pending fence is finished and this attempt retired its obligations.
+    Settled,
+    /// Another session holds the lifecycle lease, or its authority is still
+    /// warming. The fence and its obligations are untouched.
+    Deferred { retry_after_unix_nanos: Option<u64> },
+}
+
 /// Renewable DFS lease plus the cancellation fence observed by long-running
 /// sandbox store mutations.
 pub struct ClusteredSandboxExecutionLease<T: DfsMessageTransport + Send + 'static> {
     lease: Option<DfsRenewableExclusiveLease<T>>,
     loss_monitor: Option<std::thread::JoinHandle<()>>,
     cancellation: SandboxCancellationToken,
+    session_id: String,
 }
 
 impl<T: DfsMessageTransport + Send + 'static> ClusteredSandboxExecutionLease<T> {
@@ -77,6 +112,7 @@ impl<T: DfsMessageTransport + Send + 'static> ClusteredSandboxExecutionLease<T> 
         cancellation: SandboxCancellationToken,
     ) -> Result<Self, ClusteredSandboxLeaseError> {
         let status = lease.status();
+        let session_id = lease.session_id().0.clone();
         let monitor_cancellation = cancellation.clone();
         let loss_monitor = std::thread::Builder::new()
             .name("sinomo-sandbox-lease-loss".to_string())
@@ -90,7 +126,13 @@ impl<T: DfsMessageTransport + Send + 'static> ClusteredSandboxExecutionLease<T> 
             lease: Some(lease),
             loss_monitor: Some(loss_monitor),
             cancellation,
+            session_id,
         })
+    }
+
+    /// DFS advisory-lock session holding this lifecycle lease.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub fn ensure_held(&self) -> Result<(), DfsRenewableLeaseError> {
@@ -145,6 +187,25 @@ where
     fn cancellation_token(&self) -> SandboxCancellationToken {
         self.cancellation_token()
     }
+
+    fn session_id(&self) -> &str {
+        self.session_id()
+    }
+}
+
+/// Acquire the exclusive lifecycle lease and start its loss monitor.
+pub fn start_clustered_sandbox_lifecycle_lease<T>(
+    lease_dfs: NetworkedDfsService<T>,
+    sandbox_id: &SandboxId,
+    replica_candidates: &[NodeId],
+) -> Result<ClusteredSandboxExecutionLease<T>, ClusteredSandboxLeaseError>
+where
+    T: DfsMessageTransport + Send + 'static,
+{
+    let raw_lease =
+        acquire_clustered_sandbox_lifecycle_lease(lease_dfs, sandbox_id, replica_candidates)?;
+    ensure_clustered_sandbox_lifecycle_lease(&raw_lease, sandbox_id, "before pending settlement")?;
+    ClusteredSandboxExecutionLease::start(raw_lease, SandboxCancellationToken::new())
 }
 
 pub fn acquire_clustered_sandbox_lifecycle_lease<T>(
@@ -259,20 +320,30 @@ pub trait ClusteredSandboxLifecycleHooks {
         durability: SandboxAuditDurability,
     ) -> Result<(), Self::Error>;
 
-    /// Clear the node-local wake marker after authoritative state has settled.
-    /// Implementations intentionally make this best effort: a stale marker
-    /// causes a safe recovery recheck and must not make a committed mutation
-    /// appear retryable.
+    /// Retire the node-local wake marker and the cluster-KV pending-fence
+    /// index entry after authoritative state has settled. Implementations
+    /// intentionally make this best effort: a stale obligation causes a safe
+    /// recovery recheck and must not make a committed mutation appear
+    /// retryable.
     fn clear_authoritative_recovery_pending(
         &mut self,
         sandbox_id: &SandboxId,
         context: &'static str,
     );
 
+    /// Durably record an authoritative transaction's obligations before its
+    /// fence can exist: the node-local wake marker and the cluster-KV index
+    /// entry naming this node and lease session. Failure aborts the
+    /// transaction before any fence is written.
     fn mark_authoritative_recovery_pending(
         &mut self,
-        sandbox_id: &SandboxId,
+        record: &SandboxPendingFenceRecord,
     ) -> Result<(), Self::Error>;
+
+    /// Take over the obligations of a pending fence this lease holder is about
+    /// to finish, so a crash during recovery leaves it with this node. Best
+    /// effort: the previous index entry remains a valid recovery trigger.
+    fn claim_authoritative_recovery(&mut self, record: &SandboxPendingFenceRecord);
 
     fn invalid(&mut self, detail: String) -> Self::Error;
 
@@ -288,6 +359,7 @@ pub trait ClusteredSandboxLifecycleHooks {
 pub trait ClusteredSandboxLifecycleLease<E> {
     fn ensure_held(&self, sandbox_id: &SandboxId, phase: &str) -> Result<(), E>;
     fn cancellation_token(&self) -> SandboxCancellationToken;
+    fn session_id(&self) -> &str;
 }
 
 /// Owner-side clustered sandbox state machine.
@@ -295,10 +367,42 @@ pub struct ClusteredSandboxLifecycleRuntime<'a, H> {
     hooks: &'a mut H,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Lifecycle operation requested under the sandbox lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusteredSandboxOperationKind {
+    /// Ordinary lease-holding mutation. Any pending authoritative transaction
+    /// is finished first.
     Mutation,
-    AuthoritativeTransaction,
+    /// Authoritative transaction that publishes a reconciliation fence.
+    AuthoritativeTransaction(SandboxAuthoritativeTransaction),
+}
+
+/// Authoritative lifecycle transaction requested by a caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SandboxAuthoritativeTransaction {
+    Create,
+    ResumeCheckpoint { checkpoint_id: SandboxCheckpointId },
+    Reboot,
+    Destroy,
+}
+
+impl SandboxAuthoritativeTransaction {
+    /// Whether this request continues `pending` through its own idempotent
+    /// resume path. Any other pending operation is finished before it starts.
+    pub fn resumes(&self, pending: &SandboxAuthoritativeMutationOperation) -> bool {
+        match (self, pending) {
+            (Self::Create, SandboxAuthoritativeMutationOperation::Create)
+            | (Self::Reboot, SandboxAuthoritativeMutationOperation::Reboot { .. })
+            | (Self::Destroy, SandboxAuthoritativeMutationOperation::Destroy) => true,
+            (
+                Self::ResumeCheckpoint { checkpoint_id },
+                SandboxAuthoritativeMutationOperation::ResumeCheckpoint {
+                    checkpoint_id: pending,
+                },
+            ) => checkpoint_id == pending,
+            _ => false,
+        }
+    }
 }
 
 impl<'a, H> ClusteredSandboxLifecycleRuntime<'a, H>
@@ -309,14 +413,17 @@ where
         Self { hooks }
     }
 
+    /// Take the sandbox lease and settle any pending authoritative
+    /// transaction before the requested operation starts. A mutation finishes
+    /// whatever is pending; a transaction finishes only a different pending
+    /// operation and otherwise continues its own through its idempotent path.
     pub fn open_operation<T>(
         &mut self,
         lease_dfs: NetworkedDfsService<T>,
         dfs: NetworkedDfsService<T>,
         replica_candidates: Vec<NodeId>,
         sandbox_id: &SandboxId,
-        kind: ClusteredSandboxOperationKind,
-        recover_existing: bool,
+        kind: &ClusteredSandboxOperationKind,
     ) -> Result<
         (
             ClusteredSandboxExecutionLease<T>,
@@ -328,25 +435,53 @@ where
     where
         T: DfsMessageTransport + Send + 'static,
     {
-        let raw_lease =
-            acquire_clustered_sandbox_lifecycle_lease(lease_dfs, sandbox_id, &replica_candidates)?;
-        ensure_clustered_sandbox_lifecycle_lease(
-            &raw_lease,
-            sandbox_id,
-            "before pending settlement",
-        )?;
         let lease =
-            ClusteredSandboxExecutionLease::start(raw_lease, SandboxCancellationToken::new())?;
+            start_clustered_sandbox_lifecycle_lease(lease_dfs, sandbox_id, &replica_candidates)?;
         let mut store =
             SifsSandboxInstanceStore::new(dfs).with_replica_candidates(replica_candidates.clone());
-        if recover_existing {
-            self.recover_authoritative(&lease, &mut store, sandbox_id)?;
-        }
+        let transaction = match kind {
+            ClusteredSandboxOperationKind::Mutation => None,
+            ClusteredSandboxOperationKind::AuthoritativeTransaction(transaction) => {
+                Some(transaction)
+            }
+        };
+        self.recover_authoritative_except(&lease, &mut store, sandbox_id, transaction)?;
         lease.ensure_held_for(sandbox_id, "after pending settlement")?;
-        if kind == ClusteredSandboxOperationKind::AuthoritativeTransaction {
-            self.hooks.mark_authoritative_recovery_pending(sandbox_id)?;
+        if transaction.is_some() {
+            self.hooks
+                .mark_authoritative_recovery_pending(&SandboxPendingFenceRecord {
+                    sandbox_id: sandbox_id.clone(),
+                    node_id: store.dfs.node_id().clone(),
+                    session_id: lease.session_id().to_string(),
+                })?;
         }
         Ok((lease, store, replica_candidates))
+    }
+
+    /// One event-triggered recovery: take the lease and finish whatever is
+    /// pending. Lease contention defers without touching the fence.
+    pub fn recover_operation<T>(
+        &mut self,
+        lease_dfs: NetworkedDfsService<T>,
+        dfs: NetworkedDfsService<T>,
+        replica_candidates: Vec<NodeId>,
+        sandbox_id: &SandboxId,
+    ) -> Result<ClusteredSandboxRecoveryAttempt, H::Error>
+    where
+        T: DfsMessageTransport + Send + 'static,
+    {
+        let lease = match start_clustered_sandbox_lifecycle_lease(
+            lease_dfs,
+            sandbox_id,
+            &replica_candidates,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => return error.deferral().ok_or_else(|| error.into()),
+        };
+        let mut store =
+            SifsSandboxInstanceStore::new(dfs).with_replica_candidates(replica_candidates);
+        self.recover_authoritative(&lease, &mut store, sandbox_id)?;
+        Ok(ClusteredSandboxRecoveryAttempt::Settled)
     }
 
     pub fn http_fetch_to_file<T, L, N>(
@@ -979,6 +1114,54 @@ where
         T: DfsMessageTransport,
         L: ClusteredSandboxLifecycleLease<H::Error>,
     {
+        self.recover_authoritative_except(lease, store, sandbox_id, None)
+    }
+
+    /// After a failed transaction, retire the obligations it recorded when no
+    /// fence was left behind. A remaining fence keeps them for its recovery.
+    pub fn retire_unfenced_obligations<T, L>(
+        &mut self,
+        lease: &L,
+        store: &mut SifsSandboxInstanceStore<T>,
+        sandbox_id: &SandboxId,
+    ) where
+        T: DfsMessageTransport,
+        L: ClusteredSandboxLifecycleLease<H::Error>,
+    {
+        if lease
+            .ensure_held(sandbox_id, "before failed transaction settlement")
+            .is_err()
+        {
+            return;
+        }
+        match store.load_allow_pending_reconciliation(sandbox_id) {
+            Ok(manifest) if manifest.pending_reconciliation.is_some() => {}
+            Ok(_)
+            | Err(SandboxStoreError::NotFound { .. })
+            | Err(SandboxStoreError::LegacyLayout { .. }) => self
+                .hooks
+                .clear_authoritative_recovery_pending(sandbox_id, "transaction left no fence"),
+            Err(error) => tracing::debug!(
+                sandbox_id = %sandbox_id,
+                %error,
+                "failed sandbox transaction keeps its recovery obligations"
+            ),
+        }
+    }
+
+    /// Finish the pending authoritative transaction unless `requested`
+    /// resumes it itself. The caller holds the sandbox lease.
+    fn recover_authoritative_except<T, L>(
+        &mut self,
+        lease: &L,
+        store: &mut SifsSandboxInstanceStore<T>,
+        sandbox_id: &SandboxId,
+        requested: Option<&SandboxAuthoritativeTransaction>,
+    ) -> Result<(), H::Error>
+    where
+        T: DfsMessageTransport,
+        L: ClusteredSandboxLifecycleLease<H::Error>,
+    {
         lease.ensure_held(sandbox_id, "before authoritative transaction recovery")?;
         let node_id = store.dfs.node_id().clone();
         let manifest = match store.load_allow_pending_reconciliation(sandbox_id) {
@@ -996,6 +1179,20 @@ where
                 .clear_authoritative_recovery_pending(sandbox_id, "recovery already settled");
             return Ok(());
         };
+        if requested.is_some_and(|requested| requested.resumes(&pending.operation)) {
+            return Ok(());
+        }
+        if !matches!(
+            pending.operation,
+            SandboxAuthoritativeMutationOperation::UnsupportedLegacyCommandTransaction
+        ) {
+            self.hooks
+                .claim_authoritative_recovery(&SandboxPendingFenceRecord {
+                    sandbox_id: sandbox_id.clone(),
+                    node_id: node_id.clone(),
+                    session_id: lease.session_id().to_string(),
+                });
+        }
         match pending.operation {
             SandboxAuthoritativeMutationOperation::UnsupportedLegacyCommandTransaction => {
                 return Err(self.hooks.invalid(format!(

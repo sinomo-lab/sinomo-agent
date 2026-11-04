@@ -5,11 +5,11 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
     for (relative_path, reason) in [
         (
             "daemon/sandbox-lifecycle-recovery",
-            "durable clustered sandbox lifecycle recovery markers and sweep state",
+            "durable clustered sandbox lifecycle recovery markers",
         ),
         (
             "shadow-daemon/sandbox-lifecycle-recovery",
-            "legacy shadow-hosted sandbox lifecycle recovery markers and sweep state",
+            "legacy shadow-hosted sandbox lifecycle recovery markers",
         ),
         (
             "sandbox/cache/toolchains",

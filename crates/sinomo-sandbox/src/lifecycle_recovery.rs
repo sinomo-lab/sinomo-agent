@@ -1,15 +1,41 @@
 use crate::SandboxId;
+use serde::{Deserialize, Serialize};
+use sinomo_core::kv::{ClusterKvCommittedDelta, KvEventKind};
+use sinomo_core::node::NodeId;
 use sinomo_core::storage::durable_file::{self, DurableAtomicFileOptions, DurableFileError};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 const PENDING_DIR: &str = "pending";
-#[cfg(test)]
-const SAFETY_SWEEP_STAMP: &str = "last-safety-sweep";
 const PENDING_MARKER_CONTENT: &[u8] = b"sinomo-sandbox-authoritative-recovery-pending-v1\n";
-pub const SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Cluster-KV prefix of the pending authoritative-fence index.
+pub const SANDBOX_PENDING_FENCE_KV_PREFIX: &str = "/sandbox/pending/";
+
+/// Committed membership records; see `sinomo_core::node::cluster_member_key`.
+pub(crate) const CLUSTER_MEMBER_KV_PREFIX: &str = "/cluster/members/";
+
+pub fn sandbox_pending_fence_key(sandbox_id: &SandboxId) -> String {
+    format!("{SANDBOX_PENDING_FENCE_KV_PREFIX}{sandbox_id}")
+}
+
+/// Compact cluster-KV index entry for one pending authoritative sandbox
+/// fence. It names the node and lifecycle lease session that published the
+/// fence so another node can take over the obligation when membership drops
+/// that node. The fence itself remains the authoritative manifest in SIFS.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxPendingFenceRecord {
+    pub sandbox_id: SandboxId,
+    pub node_id: NodeId,
+    pub session_id: String,
+}
+
+/// Whether a committed cluster-KV delta removes a cluster member record.
+pub fn committed_delta_removes_cluster_member(delta: &ClusterKvCommittedDelta) -> bool {
+    delta.events.iter().any(|event| {
+        matches!(event.kind, KvEventKind::Delete) && event.key.starts_with(CLUSTER_MEMBER_KV_PREFIX)
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxLifecycleRecoveryError {
@@ -17,25 +43,17 @@ pub enum SandboxLifecycleRecoveryError {
     Io { path: String, detail: String },
 }
 
+/// Node-local wake markers for authoritative sandbox transactions this node
+/// started or took over. They are read once when the component host becomes
+/// ready; there is no recurring discovery.
 #[derive(Clone, Debug)]
 pub struct SandboxLifecycleRecoveryState {
     root: PathBuf,
-    safety_sweep_interval: Duration,
-    last_safety_sweep: Arc<Mutex<Option<u64>>>,
 }
 
 impl SandboxLifecycleRecoveryState {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            safety_sweep_interval: SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL,
-            last_safety_sweep: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn with_safety_sweep_interval(mut self, interval: Duration) -> Self {
-        self.safety_sweep_interval = interval;
-        self
+        Self { root: root.into() }
     }
 
     pub fn root(&self) -> &Path {
@@ -120,53 +138,8 @@ impl SandboxLifecycleRecoveryState {
         Ok(sandbox_ids)
     }
 
-    pub fn record_safety_sweep(
-        &self,
-        now_unix_nanos: u64,
-    ) -> Result<(), SandboxLifecycleRecoveryError> {
-        // Cadence is owned by the live recovery worker, not durable work.
-        // Pending recovery markers remain durable and independent of this hint.
-        *self
-            .last_safety_sweep
-            .lock()
-            .map_err(|_| self.cadence_lock_error())? = Some(now_unix_nanos);
-        Ok(())
-    }
-
-    pub fn safety_sweep_due_or_initialize(
-        &self,
-        now_unix_nanos: u64,
-    ) -> Result<bool, SandboxLifecycleRecoveryError> {
-        let Some(last_sweep_unix_nanos) = *self
-            .last_safety_sweep
-            .lock()
-            .map_err(|_| self.cadence_lock_error())?
-        else {
-            // A new component owner must inspect real pending state. An old
-            // on-disk cadence stamp neither suppresses startup nor grants work.
-            return Ok(true);
-        };
-        if last_sweep_unix_nanos > now_unix_nanos {
-            return Ok(true);
-        }
-        let interval_nanos =
-            u64::try_from(self.safety_sweep_interval.as_nanos()).unwrap_or(u64::MAX);
-        Ok(now_unix_nanos.saturating_sub(last_sweep_unix_nanos) >= interval_nanos)
-    }
-
-    pub fn run_due_recovery<E, F>(&self, now_unix_nanos: u64, scan: F) -> Result<usize, E>
-    where
-        E: From<SandboxLifecycleRecoveryError>,
-        F: FnOnce(BTreeSet<SandboxId>) -> Result<usize, E>,
-    {
-        let marked_sandbox_ids = self.pending_sandbox_ids()?;
-        let safety_sweep_due = self.safety_sweep_due_or_initialize(now_unix_nanos)?;
-        if marked_sandbox_ids.is_empty() && !safety_sweep_due {
-            return Ok(0);
-        }
-        let recovered = scan(marked_sandbox_ids)?;
-        self.record_safety_sweep(now_unix_nanos)?;
-        Ok(recovered)
+    pub fn is_authoritative_recovery_pending(&self, sandbox_id: &SandboxId) -> bool {
+        self.pending_marker_path(sandbox_id).is_file()
     }
 
     fn pending_dir(&self) -> PathBuf {
@@ -175,18 +148,6 @@ impl SandboxLifecycleRecoveryState {
 
     fn pending_marker_path(&self, sandbox_id: &SandboxId) -> PathBuf {
         self.pending_dir().join(sandbox_id.as_str())
-    }
-
-    #[cfg(test)]
-    fn sweep_stamp_path(&self) -> PathBuf {
-        self.root.join(SAFETY_SWEEP_STAMP)
-    }
-
-    fn cadence_lock_error(&self) -> SandboxLifecycleRecoveryError {
-        SandboxLifecycleRecoveryError::Io {
-            path: self.root.display().to_string(),
-            detail: "sandbox lifecycle sweep cadence lock is poisoned".into(),
-        }
     }
 
     fn ensure_dirs(&self) -> Result<(), SandboxLifecycleRecoveryError> {
@@ -221,74 +182,32 @@ fn io_error(path: &Path, source: std::io::Error) -> SandboxLifecycleRecoveryErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::kv::{KvEvent, KvRevision};
+    use std::sync::Arc;
 
     #[test]
-    fn empty_safety_sweeps_do_not_rewrite_durable_state() {
-        let root = sinomo_testdir::TestDir::new("sandbox-empty-safety-sweep");
+    fn pending_markers_are_durable_obligations_until_cleared() {
+        let root = sinomo_testdir::TestDir::new("sandbox-pending-markers");
         let state = SandboxLifecycleRecoveryState::new(root.path());
-        let mut scans = 0;
-        let first = 1_000_000_000;
-        state
-            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(first, |pending| {
-                assert!(pending.is_empty());
-                scans += 1;
-                Ok(0)
-            })
-            .unwrap();
-        let stamp = state.sweep_stamp_path();
-        let before = std::fs::read(&stamp).ok();
-        let before_mark = std::fs::metadata(&stamp)
-            .ok()
-            .map(|m| m.modified().unwrap());
-        let next =
-            first + u64::try_from(SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos()).unwrap();
-        state
-            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(next, |pending| {
-                assert!(pending.is_empty());
-                scans += 1;
-                Ok(0)
-            })
-            .unwrap();
-        assert_eq!(scans, 2, "the existing safety sweep still runs when due");
-        assert_eq!(
-            std::fs::read(&stamp).ok(),
-            before,
-            "elapsed time and an empty completed sweep do not renew durable state"
+        assert!(state.pending_sandbox_ids().unwrap().is_empty());
+        assert!(
+            !root.path().join(PENDING_DIR).exists(),
+            "reading an absent marker folder creates no state"
         );
-        assert_eq!(
-            std::fs::metadata(&stamp)
-                .ok()
-                .map(|m| m.modified().unwrap()),
-            before_mark
-        );
-        state
-            .clone()
-            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(next + 1, |_| {
-                panic!("clones of the same owner must retain the completed sweep cadence")
-            })
-            .unwrap();
-    }
-    #[test]
-    fn pending_markers_remain_durable_and_override_shared_cadence() {
-        let root = sinomo_testdir::TestDir::new("sandbox-pending-cadence");
-        let state = SandboxLifecycleRecoveryState::new(root.path());
         let id = SandboxId::generate();
-        state.record_safety_sweep(100).unwrap();
         state.mark_authoritative_recovery_pending(&id).unwrap();
         let marker = state.pending_marker_path(&id);
         let before = std::fs::read(&marker).unwrap();
-        for now in [101, 102] {
-            state
-                .clone()
-                .run_due_recovery::<SandboxLifecycleRecoveryError, _>(now, |pending| {
-                    assert_eq!(pending, BTreeSet::from([id.clone()]));
-                    Ok(0)
-                })
-                .unwrap();
+        assert!(state.is_authoritative_recovery_pending(&id));
+        for _ in 0..2 {
+            assert_eq!(
+                state.clone().pending_sandbox_ids().unwrap(),
+                BTreeSet::from([id.clone()])
+            );
             assert_eq!(
                 std::fs::read(&marker).unwrap(),
                 before,
-                "a successful scan cannot clear the actual recovery obligation"
+                "reading the marker folder cannot clear the actual recovery obligation"
             );
         }
         let restarted = SandboxLifecycleRecoveryState::new(root.path());
@@ -297,39 +216,52 @@ mod tests {
             BTreeSet::from([id.clone()])
         );
         restarted.clear_authoritative_recovery_pending(&id).unwrap();
+        restarted.clear_authoritative_recovery_pending(&id).unwrap();
         assert!(!marker.exists());
+        assert!(restarted.pending_sandbox_ids().unwrap().is_empty());
     }
 
     #[test]
-    fn failed_scan_stays_due_and_clock_rollback_keeps_existing_behavior() {
-        let root = sinomo_testdir::TestDir::new("sandbox-failed-cadence");
+    fn foreign_marker_folder_entries_fail_closed() {
+        let root = sinomo_testdir::TestDir::new("sandbox-pending-markers-invalid");
         let state = SandboxLifecycleRecoveryState::new(root.path());
-        let error = state.run_due_recovery::<SandboxLifecycleRecoveryError, _>(100, |_| {
-            Err(SandboxLifecycleRecoveryError::Io {
-                path: "controlled".into(),
-                detail: "scan failed".into(),
-            })
-        });
-        assert!(error.is_err());
-        assert!(state.safety_sweep_due_or_initialize(101).unwrap());
-        state.record_safety_sweep(101).unwrap();
-        assert!(!state.safety_sweep_due_or_initialize(102).unwrap());
-        assert!(state.safety_sweep_due_or_initialize(100).unwrap());
-        assert!(!state.sweep_stamp_path().exists());
-    }
-
-    #[test]
-    fn new_owner_scans_without_rewriting_or_trusting_legacy_cadence() {
-        let root = sinomo_testdir::TestDir::new("sandbox-new-owner-cadence");
-        let state = SandboxLifecycleRecoveryState::new(root.path());
-        let legacy = b"9000000000000000000";
-        std::fs::write(state.sweep_stamp_path(), legacy).unwrap();
         state
-            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(100, |_| Ok(0))
+            .mark_authoritative_recovery_pending(&SandboxId::generate())
             .unwrap();
-        assert!(!state.clone().safety_sweep_due_or_initialize(101).unwrap());
-        let restarted = SandboxLifecycleRecoveryState::new(root.path());
-        assert!(restarted.safety_sweep_due_or_initialize(101).unwrap());
-        assert_eq!(std::fs::read(state.sweep_stamp_path()).unwrap(), legacy);
+        std::fs::create_dir(root.path().join(PENDING_DIR).join("nested")).unwrap();
+        assert!(
+            state.pending_sandbox_ids().is_err(),
+            "an unrecognized marker entry is uncertainty, not an empty obligation set"
+        );
+    }
+
+    #[test]
+    fn only_member_record_deletes_signal_a_membership_drop() {
+        let delta = |key: &str, kind: KvEventKind| ClusterKvCommittedDelta {
+            revision: KvRevision(7),
+            compacted_revision: KvRevision(0),
+            events: Arc::new(vec![KvEvent {
+                revision: KvRevision(7),
+                key: key.to_string(),
+                kind,
+            }]),
+            final_key_states: Arc::new(Vec::new()),
+        };
+        assert!(committed_delta_removes_cluster_member(&delta(
+            "/cluster/members/node-gone",
+            KvEventKind::Delete
+        )));
+        assert!(!committed_delta_removes_cluster_member(&delta(
+            "/cluster/members/node-joined",
+            KvEventKind::Put { value: Vec::new() }
+        )));
+        assert!(!committed_delta_removes_cluster_member(&delta(
+            "/cluster/endpoints/node-gone/route",
+            KvEventKind::Delete
+        )));
+        assert!(!committed_delta_removes_cluster_member(&delta(
+            &sandbox_pending_fence_key(&SandboxId::generate()),
+            KvEventKind::Delete
+        )));
     }
 }

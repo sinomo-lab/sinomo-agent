@@ -488,31 +488,6 @@ impl<T: DfsMessageTransport> SifsSandboxInstanceStore<T> {
         Ok(manifest)
     }
 
-    pub fn list_pending_authoritative_manifests(
-        &mut self,
-    ) -> Result<Vec<SandboxInstanceManifest>, SandboxStoreError> {
-        let control_root = format!("{SIFS_SANDBOX_ROOT}/control");
-        let entries = match self.dfs.posix_list_dir_distributed(&control_root) {
-            Ok(entries) => entries,
-            Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. }) => {
-                return Ok(Vec::new());
-            }
-            Err(error) => return Err(sandbox_store_error_from_dfs(control_root, error)),
-        };
-        let mut manifests = Vec::new();
-        for entry in entries {
-            let Ok(sandbox_id) = SandboxId::new(entry.name) else {
-                continue;
-            };
-            let manifest = self.load_allow_pending_reconciliation(&sandbox_id)?;
-            if manifest.pending_reconciliation.is_some() {
-                manifests.push(manifest);
-            }
-        }
-        manifests.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
-        Ok(manifests)
-    }
-
     pub fn save_manifest(
         &mut self,
         manifest: &SandboxInstanceManifest,

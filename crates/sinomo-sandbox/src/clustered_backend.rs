@@ -1,7 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sinomo_core::events::EventStore as _;
 use sinomo_core::local::SinomoDataDir;
@@ -10,11 +10,15 @@ use sinomo_core::service::{ClusterAccess, ServiceContext, ServiceError};
 
 use crate::*;
 
+mod recovery;
 #[cfg(test)]
-mod quiet_discovery;
+mod recovery_tests;
+
+pub use recovery::*;
+#[cfg(test)]
+pub(crate) use recovery::{register_test_recovery_scheduler, test_recovery_scheduler};
 
 const SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR: &str = "daemon/sandbox-lifecycle-recovery";
-pub const SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 
 type ClusteredDfsService = sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>;
 type ClusteredInstanceStore = SifsSandboxInstanceStore<sinomo_dfs::DfsNodeTransport>;
@@ -25,11 +29,22 @@ type ClusteredExecutionLease = ClusteredSandboxExecutionLease<sinomo_dfs::DfsNod
 /// backend.
 pub struct ComponentSandboxBackendFactory {
     runtime: Option<tokio::runtime::Handle>,
+    lifecycle_recovery: Option<SandboxLifecycleRecoveryScheduler>,
 }
 
 impl ComponentSandboxBackendFactory {
     pub fn new(runtime: Option<tokio::runtime::Handle>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            lifecycle_recovery: None,
+        }
+    }
+
+    /// Route fences observed by status and file reads to the component's
+    /// recovery worker.
+    pub fn with_lifecycle_recovery(mut self, scheduler: SandboxLifecycleRecoveryScheduler) -> Self {
+        self.lifecycle_recovery = Some(scheduler);
+        self
     }
 }
 
@@ -43,11 +58,15 @@ impl SandboxBackendFactory for ComponentSandboxBackendFactory {
                 "clustered sandbox backend requires the component runtime".to_string(),
             )
         })?;
-        Ok(Box::new(ClusteredSandboxBackend::new(
+        let mut backend = ClusteredSandboxBackend::new(
             Arc::clone(&ctx.data_dir),
             Arc::clone(cluster),
             Some(runtime),
-        )))
+        );
+        if let Some(scheduler) = &self.lifecycle_recovery {
+            backend = backend.with_lifecycle_recovery(scheduler.clone());
+        }
+        Ok(Box::new(backend))
     }
 }
 
@@ -57,6 +76,10 @@ pub struct ClusteredSandboxBackend {
     cluster: Arc<dyn ClusterAccess>,
     runtime: Option<tokio::runtime::Handle>,
     recovery: SandboxLifecycleRecoveryState,
+    lifecycle_recovery: Option<SandboxLifecycleRecoveryScheduler>,
+    /// Exact pending-fence index values this backend published, so settling
+    /// its own transaction retires precisely that entry.
+    published_fence_index: Arc<Mutex<BTreeMap<SandboxId, Vec<u8>>>>,
 }
 
 impl ClusteredSandboxBackend {
@@ -73,13 +96,180 @@ impl ClusteredSandboxBackend {
             cluster,
             runtime,
             recovery,
+            lifecycle_recovery: None,
+            published_fence_index: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
+    pub fn with_lifecycle_recovery(mut self, scheduler: SandboxLifecycleRecoveryScheduler) -> Self {
+        self.lifecycle_recovery = Some(scheduler);
+        self
+    }
+
     fn recovery_state(&self) -> SandboxLifecycleRecoveryState {
-        // The component's existing task clones this backend for each tick.
-        // Keep one cadence for that owner instead of reconstructing it per call.
         self.recovery.clone()
+    }
+
+    /// Hand a fence observed by a read-only request to the recovery worker.
+    /// The request itself still reports the fence.
+    fn schedule_recovery_for_observed_fence<R>(
+        &self,
+        sandbox_id: &SandboxId,
+        result: &Result<R, SandboxBackendError>,
+    ) {
+        if let Err(SandboxBackendError::Store(SandboxStoreError::ReconciliationPending { .. })) =
+            result
+            && let Some(scheduler) = &self.lifecycle_recovery
+        {
+            scheduler.recover_observed(sandbox_id.clone());
+        }
+    }
+
+    fn block_on_cluster<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> Result<F::Output, SandboxBackendError> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            SandboxBackendError::Other(
+                "clustered sandbox lifecycle obligations require the component runtime".to_string(),
+            )
+        })?;
+        if let Ok(current) = tokio::runtime::Handle::try_current() {
+            if matches!(
+                current.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return Ok(tokio::task::block_in_place(|| runtime.block_on(future)));
+            }
+            return Err(SandboxBackendError::Other(
+                "clustered sandbox lifecycle obligations cannot block a current-thread Tokio runtime"
+                    .to_string(),
+            ));
+        }
+        Ok(runtime.block_on(future))
+    }
+
+    /// sinomo:kv-consistency: Publish a pending authoritative sandbox fence before the fence exists so a live node can finish it when membership drops this node.
+    fn publish_pending_fence_index(
+        &self,
+        record: &SandboxPendingFenceRecord,
+    ) -> Result<(), SandboxBackendError> {
+        let key = sandbox_pending_fence_key(&record.sandbox_id);
+        let value = sinomo_core::kv::encode_kv_value(record)
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
+        let request = sinomo_core::kv::KvTxnRequest::generated(sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![sinomo_core::kv::KvOp::Put {
+                key,
+                value: value.clone(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        self.block_on_cluster(self.cluster.kv_commit_compact_async(request))?
+            .map_err(|error| {
+                SandboxBackendError::Other(format!(
+                    "publish sandbox {} pending-fence index: {error}",
+                    record.sandbox_id
+                ))
+            })?;
+        self.published_fence_index
+            .lock()
+            .map_err(|_| {
+                SandboxBackendError::Other("sandbox pending-fence index lock poisoned".to_string())
+            })?
+            .insert(record.sandbox_id.clone(), value);
+        Ok(())
+    }
+
+    /// sinomo:kv-consistency: Retire a settled sandbox fence's index entry only while it still holds the value this lease holder published or observed.
+    fn retire_pending_fence_index(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<(), SandboxBackendError> {
+        let key = sandbox_pending_fence_key(sandbox_id);
+        let published = self
+            .published_fence_index
+            .lock()
+            .map_err(|_| {
+                SandboxBackendError::Other("sandbox pending-fence index lock poisoned".to_string())
+            })?
+            .remove(sandbox_id);
+        let expected = match published {
+            Some(value) => value,
+            None => {
+                let Some(entry) = self
+                    .cluster
+                    .kv_get_local(&key)
+                    .map_err(|error| SandboxBackendError::Other(error.to_string()))?
+                    .value
+                else {
+                    return Ok(());
+                };
+                entry.value
+            }
+        };
+        let request = sinomo_core::kv::KvTxnRequest::generated(sinomo_core::kv::KvTxn {
+            compares: vec![sinomo_core::kv::KvCompare::ValueEquals {
+                key: key.clone(),
+                value: expected,
+            }],
+            success: vec![sinomo_core::kv::KvOp::Delete { key }],
+            failure: Vec::new(),
+        });
+        self.block_on_cluster(self.cluster.kv_commit_compact_async(request))?
+            .map(|_| ())
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))
+    }
+
+    /// sinomo:kv-consistency: Decide which indexed fences a departed member left behind from quorum-confirmed membership and index reads; a lagging local view could miss them.
+    fn orphaned_pending_fences(
+        &self,
+    ) -> Result<Vec<SandboxPendingFenceRecord>, SandboxBackendError> {
+        let local_node_id = sinomo_core::cluster::read_cluster_state_without_kv(
+            &sinomo_core::network::ClusterPaths::new(self.data_dir.as_ref()),
+        )
+        .map_err(|error| SandboxBackendError::Other(error.to_string()))?
+        .local_node_id;
+        let members = self
+            .block_on_cluster(
+                self.cluster
+                    .kv_range_prefix_authoritative_async(CLUSTER_MEMBER_KV_PREFIX.to_string()),
+            )?
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))?
+            .value
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .decode::<sinomo_core::ClusterMemberRecord>()
+                    .map(|member| member.node_id)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
+        let mut orphaned = Vec::new();
+        for entry in self
+            .block_on_cluster(
+                self.cluster.kv_range_prefix_authoritative_async(
+                    SANDBOX_PENDING_FENCE_KV_PREFIX.to_string(),
+                ),
+            )?
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))?
+            .value
+        {
+            let record = entry
+                .decode::<SandboxPendingFenceRecord>()
+                .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
+            if entry.key != sandbox_pending_fence_key(&record.sandbox_id) {
+                return Err(SandboxBackendError::Other(format!(
+                    "sandbox pending-fence index entry {} names sandbox {}",
+                    entry.key, record.sandbox_id
+                )));
+            }
+            if record.node_id != local_node_id && !members.contains(&record.node_id) {
+                orphaned.push(record);
+            }
+        }
+        Ok(orphaned)
     }
 
     fn load_policy_config(&self) -> Result<SandboxClusterPolicyConfig, SandboxBackendError> {
@@ -179,13 +369,9 @@ impl ClusteredSandboxBackend {
         Ok((dfs, candidates))
     }
 
-    fn open_operation(
+    fn open_lifecycle_services(
         &self,
-        sandbox_id: &SandboxId,
-        kind: ClusteredSandboxOperationKind,
-        recover_existing: bool,
-    ) -> Result<(ClusteredExecutionLease, ClusteredInstanceStore, Vec<NodeId>), SandboxBackendError>
-    {
+    ) -> Result<(ClusteredDfsService, ClusteredDfsService, Vec<NodeId>), SandboxBackendError> {
         let content = self.open_content_store()?;
         let lease_dfs = self.open_dfs_service_with_content(content.clone())?;
         let replica_candidates = sinomo_dfs::runtime_host::dfs_runtime_replica_candidates(
@@ -193,6 +379,16 @@ impl ClusteredSandboxBackend {
             lease_dfs.node_id(),
         );
         let dfs = self.open_dfs_service_with_content(content)?;
+        Ok((lease_dfs, dfs, replica_candidates))
+    }
+
+    fn open_operation(
+        &self,
+        sandbox_id: &SandboxId,
+        kind: &ClusteredSandboxOperationKind,
+    ) -> Result<(ClusteredExecutionLease, ClusteredInstanceStore, Vec<NodeId>), SandboxBackendError>
+    {
+        let (lease_dfs, dfs, replica_candidates) = self.open_lifecycle_services()?;
         let mut hooks = self.hooks();
         ClusteredSandboxLifecycleRuntime::new(&mut hooks).open_operation(
             lease_dfs,
@@ -200,7 +396,6 @@ impl ClusteredSandboxBackend {
             replica_candidates,
             sandbox_id,
             kind,
-            recover_existing,
         )
     }
 
@@ -209,23 +404,51 @@ impl ClusteredSandboxBackend {
         sandbox_id: &SandboxId,
     ) -> Result<(ClusteredExecutionLease, ClusteredInstanceStore, Vec<NodeId>), SandboxBackendError>
     {
-        self.open_operation(
-            sandbox_id,
-            ClusteredSandboxOperationKind::Mutation,
-            cfg!(feature = "wasix-runtime"),
-        )
+        self.open_operation(sandbox_id, &ClusteredSandboxOperationKind::Mutation)
     }
 
     fn open_transaction(
         &self,
         sandbox_id: &SandboxId,
+        transaction: SandboxAuthoritativeTransaction,
     ) -> Result<(ClusteredExecutionLease, ClusteredInstanceStore, Vec<NodeId>), SandboxBackendError>
     {
         self.open_operation(
             sandbox_id,
-            ClusteredSandboxOperationKind::AuthoritativeTransaction,
-            false,
+            &ClusteredSandboxOperationKind::AuthoritativeTransaction(transaction),
         )
+    }
+
+    /// One event-triggered recovery attempt: finish whatever authoritative
+    /// transaction is pending for `sandbox_id` under its lifecycle lease.
+    pub fn recover_lifecycle_operation(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> Result<ClusteredSandboxRecoveryAttempt, SandboxBackendError> {
+        let (lease_dfs, dfs, replica_candidates) = self.open_lifecycle_services()?;
+        let mut hooks = self.hooks();
+        ClusteredSandboxLifecycleRuntime::new(&mut hooks).recover_operation(
+            lease_dfs,
+            dfs,
+            replica_candidates,
+            sandbox_id,
+        )
+    }
+
+    /// Sandboxes this node marked before an authoritative fence could exist.
+    pub fn marked_lifecycle_operations(&self) -> Result<BTreeSet<SandboxId>, SandboxBackendError> {
+        self.recovery_state()
+            .pending_sandbox_ids()
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))
+    }
+
+    /// Indexed pending fences whose publishing node is no longer a member.
+    pub fn orphaned_lifecycle_operations(&self) -> Result<Vec<SandboxId>, SandboxBackendError> {
+        Ok(self
+            .orphaned_pending_fences()?
+            .into_iter()
+            .map(|record| record.sandbox_id)
+            .collect())
     }
 
     fn toolchain_store(
@@ -233,88 +456,6 @@ impl ClusteredSandboxBackend {
     ) -> Result<SifsSandboxToolchainStore<sinomo_dfs::DfsNodeTransport>, SandboxBackendError> {
         let (dfs, candidates) = self.open_dfs_service_with_candidates()?;
         Ok(SifsSandboxToolchainStore::new(dfs).with_replica_candidates(candidates))
-    }
-
-    pub fn run_lifecycle_recovery_tick(&self) -> Result<usize, SandboxBackendError> {
-        let now_unix_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or_default();
-        self.recovery_state()
-            .run_due_recovery(now_unix_nanos, |marked_sandbox_ids| {
-                self.run_lifecycle_recovery_scan(marked_sandbox_ids)
-                    .map_err(|error| crate::SandboxLifecycleRecoveryError::Io {
-                        path: self.data_dir.root().display().to_string(),
-                        detail: error.to_string(),
-                    })
-            })
-            .map_err(|error| SandboxBackendError::Other(error.to_string()))
-    }
-
-    fn discover_lifecycle_recovery(
-        &self,
-        content: sinomo_dfs::LocalContentStore,
-    ) -> Result<(Vec<NodeId>, Vec<SandboxInstanceManifest>), SandboxBackendError> {
-        // Discovery is observational even when no sandbox has ever existed.
-        // Only the actual candidates enter the ordinary recovery writer.
-        let dfs = sinomo_dfs::runtime_host::open_dfs_runtime_inspection_service_with_content(
-            &self.data_dir,
-            self.runtime.as_ref(),
-            content,
-        )
-        .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
-        let replica_candidates =
-            sinomo_dfs::runtime_host::dfs_runtime_replica_candidates(&self.data_dir, dfs.node_id());
-        let mut store = SifsSandboxInstanceStore::new(dfs);
-        let pending = store.list_pending_authoritative_manifests()?;
-        Ok((replica_candidates, pending))
-    }
-
-    fn run_lifecycle_recovery_scan(
-        &self,
-        marked_sandbox_ids: BTreeSet<SandboxId>,
-    ) -> Result<usize, SandboxBackendError> {
-        let content = self.open_content_store()?;
-        let (replica_candidates, pending_manifests) =
-            self.discover_lifecycle_recovery(content.clone())?;
-
-        let pending_sandbox_ids = pending_manifests
-            .into_iter()
-            .map(|manifest| manifest.sandbox_id)
-            .collect::<BTreeSet<_>>();
-        let mut candidates = marked_sandbox_ids;
-        for sandbox_id in &pending_sandbox_ids {
-            self.recovery_state()
-                .mark_authoritative_recovery_pending(sandbox_id)
-                .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
-            candidates.insert(sandbox_id.clone());
-        }
-
-        let mut recovered = 0_usize;
-        for sandbox_id in candidates {
-            let lease_dfs = self.open_dfs_service_with_content(content.clone())?;
-            let recovery_dfs = self.open_dfs_service_with_content(content.clone())?;
-            let mut hooks = self.hooks();
-            match ClusteredSandboxLifecycleRuntime::new(&mut hooks).open_operation(
-                lease_dfs,
-                recovery_dfs,
-                replica_candidates.clone(),
-                &sandbox_id,
-                ClusteredSandboxOperationKind::Mutation,
-                true,
-            ) {
-                Ok(_) if pending_sandbox_ids.contains(&sandbox_id) => {
-                    recovered = recovered.saturating_add(1)
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    %error,
-                    "authoritative sandbox transaction remains fenced for retry"
-                ),
-            }
-        }
-        Ok(recovered)
     }
 }
 
@@ -346,16 +487,41 @@ impl ClusteredSandboxLifecycleHooks for ClusteredSandboxBackendHooks<'_> {
         self.backend
             .recovery_state()
             .clear_authoritative_recovery_pending_best_effort(sandbox_id, context);
+        if let Err(error) = self.backend.retire_pending_fence_index(sandbox_id) {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                context,
+                %error,
+                "failed to retire settled sandbox pending-fence index entry"
+            );
+        }
     }
 
     fn mark_authoritative_recovery_pending(
         &mut self,
-        sandbox_id: &SandboxId,
+        record: &SandboxPendingFenceRecord,
     ) -> Result<(), Self::Error> {
         self.backend
             .recovery_state()
-            .mark_authoritative_recovery_pending(sandbox_id)
+            .mark_authoritative_recovery_pending(&record.sandbox_id)
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
+        self.backend.publish_pending_fence_index(record)
+    }
+
+    fn claim_authoritative_recovery(&mut self, record: &SandboxPendingFenceRecord) {
+        let result = self
+            .backend
+            .recovery_state()
+            .mark_authoritative_recovery_pending(&record.sandbox_id)
             .map_err(|error| SandboxBackendError::Other(error.to_string()))
+            .and_then(|()| self.backend.publish_pending_fence_index(record));
+        if let Err(error) = result {
+            tracing::warn!(
+                sandbox_id = %record.sandbox_id,
+                %error,
+                "recovering a sandbox fence without taking over its recovery obligations"
+            );
+        }
     }
 
     fn invalid(&mut self, detail: String) -> Self::Error {
@@ -388,19 +554,27 @@ impl SandboxBackend for ClusteredSandboxBackend {
             .sandbox_id
             .clone()
             .unwrap_or_else(SandboxId::generate);
-        let (lease, mut store, _) = self.open_transaction(&sandbox_id)?;
+        let (lease, mut store, _) =
+            self.open_transaction(&sandbox_id, SandboxAuthoritativeTransaction::Create)?;
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks)
-            .create(&lease, &mut store, sandbox_id, request)
+        let mut runtime = ClusteredSandboxLifecycleRuntime::new(&mut hooks);
+        let result = runtime.create(&lease, &mut store, sandbox_id.clone(), request);
+        if result.is_err() {
+            runtime.retire_unfenced_obligations(&lease, &mut store, &sandbox_id);
+        }
+        result
     }
 
     fn status(
         &mut self,
         request: SandboxStatusRequest,
     ) -> Result<SandboxStatusResponse, SandboxBackendError> {
+        let sandbox_id = request.sandbox_id.clone();
         let mut store = SifsSandboxInstanceStore::new(self.open_dfs_service()?);
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks).status(&mut store, request)
+        let result = ClusteredSandboxLifecycleRuntime::new(&mut hooks).status(&mut store, request);
+        self.schedule_recovery_for_observed_fence(&sandbox_id, &result);
+        result
     }
 
     fn update(
@@ -425,45 +599,76 @@ impl SandboxBackend for ClusteredSandboxBackend {
         &mut self,
         request: SandboxResumeRequest,
     ) -> Result<SandboxResumeResponse, SandboxBackendError> {
-        let (lease, mut store, _) = self.open_transaction(&request.sandbox_id)?;
+        let sandbox_id = request.sandbox_id.clone();
+        let (lease, mut store, _) = self.open_transaction(
+            &sandbox_id,
+            SandboxAuthoritativeTransaction::ResumeCheckpoint {
+                checkpoint_id: request.checkpoint_id.clone(),
+            },
+        )?;
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks).resume(&lease, &mut store, request)
+        let mut runtime = ClusteredSandboxLifecycleRuntime::new(&mut hooks);
+        let result = runtime.resume(&lease, &mut store, request);
+        if result.is_err() {
+            runtime.retire_unfenced_obligations(&lease, &mut store, &sandbox_id);
+        }
+        result
     }
 
     fn reboot(
         &mut self,
         request: SandboxRebootRequest,
     ) -> Result<SandboxRebootResponse, SandboxBackendError> {
-        let (lease, mut store, _) = self.open_transaction(&request.sandbox_id)?;
+        let sandbox_id = request.sandbox_id.clone();
+        let (lease, mut store, _) =
+            self.open_transaction(&sandbox_id, SandboxAuthoritativeTransaction::Reboot)?;
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks).reboot(&lease, &mut store, request)
+        let mut runtime = ClusteredSandboxLifecycleRuntime::new(&mut hooks);
+        let result = runtime.reboot(&lease, &mut store, request);
+        if result.is_err() {
+            runtime.retire_unfenced_obligations(&lease, &mut store, &sandbox_id);
+        }
+        result
     }
 
     fn destroy(
         &mut self,
         request: SandboxDestroyRequest,
     ) -> Result<SandboxDestroyResponse, SandboxBackendError> {
-        let (lease, mut store, _) = self.open_transaction(&request.sandbox_id)?;
+        let sandbox_id = request.sandbox_id.clone();
+        let (lease, mut store, _) =
+            self.open_transaction(&sandbox_id, SandboxAuthoritativeTransaction::Destroy)?;
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks).destroy(&lease, &mut store, request)
+        let mut runtime = ClusteredSandboxLifecycleRuntime::new(&mut hooks);
+        let result = runtime.destroy(&lease, &mut store, request);
+        if result.is_err() {
+            runtime.retire_unfenced_obligations(&lease, &mut store, &sandbox_id);
+        }
+        result
     }
 
     fn list(
         &mut self,
         request: SandboxListRequest,
     ) -> Result<SandboxListResponse, SandboxBackendError> {
+        let sandbox_id = request.sandbox_id.clone();
         let store = SifsSandboxInstanceStore::new(self.open_dfs_service()?);
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks).list(store, request)
+        let result = ClusteredSandboxLifecycleRuntime::new(&mut hooks).list(store, request);
+        self.schedule_recovery_for_observed_fence(&sandbox_id, &result);
+        result
     }
 
     fn read(
         &mut self,
         request: SandboxReadRequest,
     ) -> Result<SandboxReadResponse, SandboxBackendError> {
+        let sandbox_id = request.sandbox_id.clone();
         let store = SifsSandboxInstanceStore::new(self.open_dfs_service()?);
         let mut hooks = self.hooks();
-        ClusteredSandboxLifecycleRuntime::new(&mut hooks).read(store, request)
+        let result = ClusteredSandboxLifecycleRuntime::new(&mut hooks).read(store, request);
+        self.schedule_recovery_for_observed_fence(&sandbox_id, &result);
+        result
     }
 
     fn write(

@@ -188,57 +188,42 @@ pub fn component_factory()
     );
     Ok(
         sinomo_module::StaticComponentFactory::new(descriptor, |context, scope| {
-            let backend: Arc<dyn SandboxBackendFactory> = Arc::new(
-                crate::ComponentSandboxBackendFactory::new(context.runtime().cloned()),
-            );
-            scope.set_services(
-                register_services_with_factory(ServiceRegistryBuilder::default(), backend).build(),
-            );
+            let mut backend =
+                crate::ComponentSandboxBackendFactory::new(context.runtime().cloned());
             if let (Some(runtime), Some(cluster)) =
                 (context.runtime().cloned(), context.cluster_access())
             {
-                let recovery = crate::ClusteredSandboxBackend::new(
-                    context.data_dir().clone().into(),
+                // Recovery is event-triggered: host readiness recovers this
+                // node's own marked work once, committed membership drops
+                // hand over indexed fences, and observed fences are passed
+                // in by read-only requests.
+                let data_dir: Arc<sinomo_core::local::SinomoDataDir> =
+                    context.data_dir().clone().into();
+                let (scheduler, worker) = crate::sandbox_lifecycle_recovery(
+                    Arc::clone(&data_dir),
                     cluster,
-                    Some(runtime.clone()),
+                    runtime.clone(),
                 );
-                let mut shutdown = scope.shutdown_receiver();
+                #[cfg(test)]
+                crate::clustered_backend::register_test_recovery_scheduler(
+                    data_dir.root(),
+                    &scheduler,
+                );
+                let ready = scheduler.clone();
+                scope.on_host_ready(move || ready.recover_marked());
+                let membership =
+                    crate::subscribe_sandbox_membership_recovery(&data_dir, scheduler.clone());
+                scope.defer(move || drop(membership));
                 scope.own_task(
                     "Sandbox lifecycle recovery",
-                    runtime.spawn(async move {
-                        loop {
-                            let recovery = recovery.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                recovery.run_lifecycle_recovery_tick()
-                            })
-                            .await
-                            {
-                                Ok(Ok(recovered)) if recovered > 0 => tracing::info!(
-                                    recovered,
-                                    "recovered pending Sandbox lifecycle operations"
-                                ),
-                                Ok(Ok(_)) => {}
-                                Ok(Err(error)) => tracing::warn!(
-                                    %error,
-                                    "Sandbox lifecycle maintenance failed"
-                                ),
-                                Err(error) => tracing::warn!(
-                                    %error,
-                                    "Sandbox lifecycle maintenance task failed"
-                                ),
-                            }
-                            tokio::select! {
-                                _ = tokio::time::sleep(crate::SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL) => {}
-                                changed = shutdown.changed() => {
-                                    if changed.is_err() || *shutdown.borrow() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }),
+                    runtime.spawn(worker.run(scope.shutdown_receiver())),
                 );
+                backend = backend.with_lifecycle_recovery(scheduler);
             }
+            let backend: Arc<dyn SandboxBackendFactory> = Arc::new(backend);
+            scope.set_services(
+                register_services_with_factory(ServiceRegistryBuilder::default(), backend).build(),
+            );
             Ok(())
         })?
         .with_config_definitions(register_component_config_definitions)
