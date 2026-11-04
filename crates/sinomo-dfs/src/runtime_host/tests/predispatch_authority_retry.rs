@@ -237,8 +237,7 @@ impl RetryFixture {
                         }
                         state.refresh_entered.notify_one();
                     }
-                    DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { .. }
-                    | DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted { .. }
+                    DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted { .. }
                     | DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh { .. }
@@ -337,9 +336,6 @@ impl RetryFixture {
                                 ));
                             }
                         }
-                    }
-                    DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { .. } => {
-                        state.native_prefix_reads.fetch_add(1, Ordering::SeqCst);
                     }
                     DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh {
                         owner: "message",
@@ -449,7 +445,6 @@ fn commit_current_configuration_delta(
 struct RetryObservations {
     selections: AtomicUsize,
     refreshes: AtomicUsize,
-    native_prefix_reads: AtomicUsize,
     injected_provider_edges: AtomicUsize,
     planning_attempts: Mutex<Vec<usize>>,
     planning_outcomes: Mutex<Vec<(usize, DaemonDfsPublishPlanningAttemptOutcome)>>,
@@ -619,13 +614,12 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
         );
         if seen.selections.load(Ordering::SeqCst) != 3 {
             eprintln!(
-                "native provider churn boundary: root={} result={result:?} selections={} refreshes={} executions={} completed={} prefix_reads={} generation={} storage_generation={}",
+                "native provider churn boundary: root={} result={result:?} selections={} refreshes={} executions={} completed={} generation={} storage_generation={}",
                 f.data_dir.root().display(),
                 seen.selections.load(Ordering::SeqCst),
                 seen.refreshes.load(Ordering::SeqCst),
                 seen.executions.load(Ordering::SeqCst),
                 seen.completed_executions.load(Ordering::SeqCst),
-                seen.native_prefix_reads.load(Ordering::SeqCst),
                 f._authority.generation(),
                 f._authority.storage_generation(),
             );
@@ -674,11 +668,6 @@ fn provider_delta_after_first_fence(changed_attempts: usize) {
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&f.data_dir),
         opens
-    );
-    assert_eq!(
-        seen.native_prefix_reads.load(Ordering::SeqCst),
-        0,
-        "this request's authority refresh must use the retained contiguous view"
     );
     // Release cloned owners before proving that no durable read effects exist.
     drop(primary);
@@ -1310,10 +1299,6 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
     let local = f.local.clone();
     let hook: Arc<DaemonDfsPreDispatchTestHook> = Arc::new(move |point, command, preflight| {
         match point {
-            DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { .. } => {
-                assert!(command.is_none());
-                state.native_prefix_reads.fetch_add(1, Ordering::SeqCst);
-            }
             DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted { replan } => {
                 assert!(command.is_none());
                 state.planning_attempts.lock().unwrap().push(replan);
@@ -1539,11 +1524,6 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&f.data_dir),
         opens
-    );
-    assert_eq!(
-        seen.native_prefix_reads.load(Ordering::SeqCst),
-        0,
-        "this planner invocation must not issue a native authority refresh read"
     );
     drop(primary);
     drop(exact);

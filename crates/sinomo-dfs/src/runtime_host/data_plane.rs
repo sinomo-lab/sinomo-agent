@@ -1588,26 +1588,12 @@ pub(crate) fn with_daemon_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsMessage
     cluster_paths: &ClusterPaths,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> NetworkedDfsService<T> {
-    with_daemon_dfs_control_plane_seeded_on_runtime(service, cluster_paths, runtime, None)
-}
-
-pub(super) fn with_daemon_dfs_control_plane_seeded_on_runtime<
-    T: sinomo_dfs::DfsMessageTransport,
->(
-    service: NetworkedDfsService<T>,
-    cluster_paths: &ClusterPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-    authoritative_prefix: Option<sinomo_dfs::DfsAuthoritativePrefixProjection>,
-) -> NetworkedDfsService<T> {
     let Some(runtime) = runtime else {
         return service;
     };
     if cluster_paths.state.exists() {
-        let mut control_plane = DaemonDfsControlPlaneKvClient::new_seeded_on_runtime(
-            cluster_paths,
-            runtime,
-            authoritative_prefix,
-        );
+        let mut control_plane =
+            DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(cluster_paths, runtime);
         let service =
             with_daemon_dfs_placement_environment(service, cluster_paths, &mut control_plane);
         service.with_boxed_control_plane(

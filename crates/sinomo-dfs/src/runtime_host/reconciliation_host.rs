@@ -757,11 +757,9 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
                 expected_node_id,
                 Some(&runtime),
             )?;
-            let generation = authority.generation();
-            let shards = authority.cached_metadata_shards(
-                &crate::sifs_file_system_id(),
-                authority.projection_generation(),
-            )?;
+            let snapshot = authority.configuration_snapshot();
+            let generation = snapshot.generation();
+            let shards = snapshot.metadata_shards(&crate::sifs_file_system_id())?;
             shards
                 .filter(|shards| {
                     shards
@@ -843,9 +841,9 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
                 let current_state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(
                     &task_cluster_paths,
                 )?;
-                let current_shards = authority.cached_metadata_shards(
-                    &crate::sifs_file_system_id(), authority.projection_generation(),
-                )?;
+                let current_shards = authority
+                    .configuration_snapshot()
+                    .metadata_shards(&crate::sifs_file_system_id())?;
                 if current_state.cluster_id != state.cluster_id
                     || current_state.local_node_id != state.local_node_id
                     || crate::default_cluster_sifs_owner(&current_state) == current_state.local_node_id

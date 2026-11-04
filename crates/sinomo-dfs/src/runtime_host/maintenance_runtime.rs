@@ -316,11 +316,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     .await
     {
         Ok(true) => {
-            let committed_revision = advertisement_control_plane
-                .projection
-                .lock()
-                .map_err(|_| advertisement_control_plane.projection_lock_error())?
-                .revision;
+            let committed_revision = advertisement_control_plane.observed_revision();
             initial_metadata_authority_preflight
                 .authority
                 .require_authoritative_revision(committed_revision);

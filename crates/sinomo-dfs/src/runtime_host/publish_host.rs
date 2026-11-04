@@ -437,14 +437,9 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
         Some(runtime),
     )
     .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
-    let preflight = warm_daemon_dfs_metadata_authority_before_deadline(
-        authority,
-        deadline,
-        #[cfg(test)]
-        None,
-    )
-    .await
-    .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
+    let preflight = warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline)
+        .await
+        .map_err(|error| format!("DFS metadata lanes lack authority projection: {error}"))?;
     let authoritative = preflight
         .authority
         .retained_complete_prefix_for_generation(preflight.generation)
@@ -658,8 +653,6 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                 runtime.clone(),
                 Arc::clone(&data_owner_lock),
                 deadline,
-                #[cfg(test)]
-                invocation_hook.as_ref(),
             ),
         )
         .await;
@@ -892,8 +885,6 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
         runtime,
         data_owner_lock,
         tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-        #[cfg(test)]
-        None,
     )
     .await
     .map(|(peer, _)| peer)
@@ -907,7 +898,6 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
     deadline: tokio::time::Instant,
-    #[cfg(test)] invocation_hook: Option<&Arc<super::message_host::DaemonDfsPreDispatchTestHook>>,
 ) -> Result<
     (
         DaemonDfsMessagePeerSnapshot,
@@ -933,27 +923,12 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
             Some(&runtime),
         )
         .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        let observe_read = |prefix| {
-            if let Some(hook) = invocation_hook {
-                hook(
-                    super::message_host::DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead {
-                        prefix,
-                    },
-                    None,
-                    None,
-                )
-                .expect("actual planner native read observer");
-            }
-        };
-        let metadata_authority_preflight = warm_daemon_dfs_metadata_authority_before_deadline(
-            authority,
-            deadline,
-            #[cfg(test)]
-            invocation_hook.map(|_| &observe_read as &(dyn Fn(&'static str) + Send + Sync)),
-        )
-        .await
-        .map_err(|error| format!("DFS metadata publish authority preflight failed: {error}"))?;
+        let metadata_authority_preflight =
+            warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline)
+                .await
+                .map_err(|error| {
+                    format!("DFS metadata publish authority preflight failed: {error}")
+                })?;
         if daemon_dfs_message_cache_exact_admission_is_current(
             &data_dir,
             &cluster_paths,

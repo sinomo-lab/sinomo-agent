@@ -311,17 +311,18 @@ impl DfsSourceAdoptionActor {
             if *self.shutdown.borrow() || self.shutdown.has_changed().is_err() {
                 return Err(error("fresh job owner is closed"));
             }
-            let configs = self
-                .authority
-                .cached_metadata_shards(
-                    &offer.job_config.file_system_id,
-                    self.authority.projection_generation(),
-                )
+            // One publication supplies the shard fence and its routing rows.
+            let snapshot = self.authority.configuration_snapshot();
+            let configs = snapshot
+                .metadata_shards(&offer.job_config.file_system_id)
                 .map_err(error)?
                 .ok_or_else(|| error("fresh original job configuration unavailable"))?;
-            let generation = self.authority.shard_projection_state(
-                &offer.job_config.file_system_id,
-                &crate::DfsMetadataShardId::new(&offer.job_config.shard_id),
+            let generation = (
+                snapshot.generation(),
+                snapshot.contains_shard_key(
+                    &offer.job_config.file_system_id,
+                    &crate::DfsMetadataShardId::new(&offer.job_config.shard_id),
+                ),
             );
             if !generation.1
                 || offer.job_config.primary_node_id != self.node

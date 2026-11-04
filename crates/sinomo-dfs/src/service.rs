@@ -89,6 +89,65 @@ impl Service for DfsRepairRetryService {
     }
 }
 
+/// Local-node read of the component's published configuration snapshot.
+/// Out-of-process clients call it after `dfs.configuration.published` and
+/// after every (re)subscription; it never starts a configuration read. A
+/// publication that is withdrawn, pending or not floor-checked right now is
+/// answered as `Pending`: the next publication is announced.
+struct DfsConfigurationSnapshotService {
+    authority: Arc<crate::DfsMetadataAuthorityRuntime>,
+}
+
+impl Service for DfsConfigurationSnapshotService {
+    fn name(&self) -> &'static str {
+        "dfs-configuration-snapshot"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE]
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![dfs_service_route(crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE)]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let authority = Arc::clone(&self.authority);
+        Box::pin(async move {
+            let _: crate::DfsConfigurationSnapshotRequest =
+                ctx.decode_request_body_bounded(&request, 1024).await?;
+            let checked = tokio::task::spawn_blocking(move || {
+                // The same native floor check that admits in-process writes.
+                let checked = authority.checked_configuration_snapshot();
+                (checked, authority.configuration_snapshot())
+            })
+            .await
+            .map_err(|source| {
+                ServiceError::Service(format!("DFS configuration snapshot task failed: {source}"))
+            })?;
+            let response = match checked {
+                (Ok(Some(snapshot)), _) => match snapshot.to_wire() {
+                    Some(snapshot) => crate::DfsConfigurationSnapshotResponse::Published { snapshot },
+                    None => crate::DfsConfigurationSnapshotResponse::Pending {
+                        publication: snapshot.publication(),
+                    },
+                },
+                (Ok(None), current) => crate::DfsConfigurationSnapshotResponse::Pending {
+                    publication: current.publication(),
+                },
+                (Err(error), current) => {
+                    tracing::debug!(%error, "DFS configuration snapshot is not floor-checked");
+                    crate::DfsConfigurationSnapshotResponse::Pending {
+                        publication: current.publication(),
+                    }
+                }
+            };
+            ctx.respond_value(crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE, response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
 struct DfsMetricExporterService;
 
 struct DfsMountedMutationHandoffService {
@@ -348,6 +407,7 @@ fn component_factory_with_selected_layout(
             .with_offer(dfs_metric_exporter_offer())
             .publish_event(crate::runtime_host::dfs_namespace_event_publication())
             .publish_event(crate::runtime_host::dfs_placement_event_publication())
+            .publish_event(crate::runtime_host::dfs_configuration_event_publication())
             .subscribe_event(crate::runtime_host::host_cluster_control_subscription())
             .subscribe_event(crate::runtime_host::host_connectivity_subscription());
     let caller = descriptor.clone();
@@ -514,6 +574,24 @@ fn component_factory_with_selected_layout(
                     }),
                 };
 
+                if let Some(authority) = metadata_authority.as_ref() {
+                    builder = builder.register(DfsConfigurationSnapshotService {
+                        authority: Arc::clone(authority),
+                    });
+                    if let Ok(state) =
+                        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)
+                    {
+                        scope.own_task(
+                            "DFS configuration publication events",
+                            runtime.spawn(crate::runtime_host::publish_dfs_configuration_events(
+                                events.clone(),
+                                Arc::clone(authority),
+                                state.local_node_id.clone(),
+                                scope.shutdown_receiver(),
+                            )),
+                        );
+                    }
+                }
                 let browser: Arc<dyn crate::DfsBrowserServiceHost> =
                     Arc::new(crate::runtime_host::RuntimeDfsBrowserServiceHost::new(
                         paths,
@@ -1597,6 +1675,7 @@ mod tests {
             crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
             crate::DFS_CORE_COMPONENT_ACCESS_ROUTE,
             crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE,
             DFS_METRIC_EXPORT_ROUTE,
         ] {
             assert!(registry.owns(route), "missing actual core route {route}");
@@ -1615,7 +1694,7 @@ mod tests {
                 "feature route remains core-owned {route}"
             );
         }
-        assert_eq!(factory.descriptor().event_publications.len(), 2);
+        assert_eq!(factory.descriptor().event_publications.len(), 3);
         assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
         drop(registry);
         runtime

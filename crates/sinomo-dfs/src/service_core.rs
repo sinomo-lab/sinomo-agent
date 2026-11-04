@@ -368,6 +368,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
+    /// The configuration this service's control plane holds for the current
+    /// operation, or `None` without a control plane or publication.
+    /// sinomo:kv-configuration: Borrow the control plane's published configuration snapshot without starting a KV read of its own.
+    pub fn published_configuration_snapshot(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::DfsConfigurationSnapshot>>, DfsError> {
+        match self.control_plane.as_ref() {
+            Some(control_plane) => control_plane
+                .configuration_snapshot()
+                .map_err(DfsError::from),
+            None => Ok(None),
+        }
+    }
+
     /// Initialize a caller that delegates namespace work to its node's Main.
     /// It keeps no local metadata store: Main alone owns and recovers the
     /// node's shards, reads go to their authorities and writes to Main. This

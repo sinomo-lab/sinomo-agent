@@ -2331,6 +2331,14 @@ fn initial_epoch_binding_accepts_a_coherent_cut_before_an_unrelated_refresh() {
     changed.version = DfsVersion::generate();
     changed.mode = 0o600;
     let payload = namespace_payload(&config, &current, changed.clone(), "initial-binding-current-cut");
+    // Borrow the fixture's control plane before this case holds an effect
+    // admission: the borrow waits for the mounted owners' current startup
+    // work, which itself needs admission.
+    let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation(
+        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(&config.primary_node_id)),
+        &runtime.runtime_handle(),
+    ).unwrap();
+    let control = runtime.shared_control_plane().unwrap();
     let execution_guard = service.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
         file_system_id: payload.file_system_id.clone(), shard_id: payload.shard_id.clone(),
         owner_epoch: payload.owner_epoch, operation_id: payload.operation_id.clone(),
@@ -2339,11 +2347,6 @@ fn initial_epoch_binding_accepts_a_coherent_cut_before_an_unrelated_refresh() {
     let scope = service.metadata_backend().unwrap()
         .publication_owner_scope(&digest.file_system_id, &digest.shard_id).unwrap();
     let execution = service.publication_execution.current().expect("actual native effect admission");
-    let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation(
-        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(&config.primary_node_id)),
-        &runtime.runtime_handle(),
-    ).unwrap();
-    let control = runtime.shared_control_plane().unwrap();
     let update = std::sync::Arc::clone(&authority);
     let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
     let recorded = std::sync::Arc::clone(&observed);

@@ -181,7 +181,6 @@ struct State {
     original_control_commits: Vec<NativeOriginalControlCommitObservationV1>,
     content_receipts: Vec<NativeContentReceiptObservationV1>,
     configuration_cuts: Vec<NativeConfigurationCutObservationV1>,
-    metadata_cache_cuts: Vec<NativeMetadataCacheCutV1>,
     authoritative_reads: Vec<NativeAuthoritativeRead>,
     guard_events: Vec<NativeGuardEventV1>,
     bytes: usize,
@@ -203,7 +202,6 @@ impl State {
             .saturating_add(self.guard_events.len())
             .saturating_add(self.content_receipts.len())
             .saturating_add(self.configuration_cuts.len())
-            .saturating_add(self.metadata_cache_cuts.len())
             .saturating_add(self.pending_boundary_packets)
     }
 }
@@ -393,7 +391,6 @@ impl NativeShardTraceCapture {
             guard_events: &'a [NativeGuardEventV1],
             content_receipts: &'a [NativeContentReceiptObservationV1],
             configuration_cuts: &'a [NativeConfigurationCutObservationV1],
-            metadata_cache_cuts: &'a [NativeMetadataCacheCutV1],
             closed: bool,
             actual_owner_stopped: bool,
             in_flight: String,
@@ -417,7 +414,6 @@ impl NativeShardTraceCapture {
                 guard_events: &state.guard_events,
                 content_receipts: &state.content_receipts,
                 configuration_cuts: &state.configuration_cuts,
-                metadata_cache_cuts: &state.metadata_cache_cuts,
                 closed: state.closed,
                 actual_owner_stopped,
                 in_flight: state.in_flight.to_string(),
@@ -979,7 +975,6 @@ impl NativeShardTraceCapture {
             actual_original_control_commits: &'a [NativeOriginalControlCommitObservationV1],
             actual_content_receipts: &'a [NativeContentReceiptObservationV1],
             actual_configuration_cuts: &'a [NativeConfigurationCutObservationV1],
-            actual_metadata_cache_cuts: &'a [NativeMetadataCacheCutV1],
             actual_control_decodes: Vec<NativeControlDecodeV1>,
             actual_request_value_decodes: Vec<NativeRequestValueDecodeV1<'a>>,
             unavailable: &'static [&'static str],
@@ -1039,11 +1034,6 @@ impl NativeShardTraceCapture {
                     .iter()
                     .map(move |entry| (&cut.owner_ordinal, entry))
             })
-            .chain(state.metadata_cache_cuts.iter().flat_map(|cut| {
-                cut.entries
-                    .iter()
-                    .map(move |entry| (&cut.owner_ordinal, entry))
-            }))
             .chain(state.authoritative_reads.iter().flat_map(|read| {
                 read.read
                     .value
@@ -1141,7 +1131,6 @@ impl NativeShardTraceCapture {
                 actual_original_control_commits: &state.original_control_commits,
                 actual_content_receipts: &state.content_receipts,
                 actual_configuration_cuts: &state.configuration_cuts,
-                actual_metadata_cache_cuts: &state.metadata_cache_cuts,
                 actual_control_decodes,
                 actual_request_value_decodes,
                 unavailable: &[
@@ -1247,20 +1236,6 @@ pub(crate) fn record_configuration_cut(
     }
 }
 
-#[derive(Clone)]
-struct NativeMetadataCacheContext {
-    capture: Weak<Capture>,
-    scope: crate::DfsPreparedOperationScope,
-}
-thread_local! {
-    static METADATA_CACHE_CONTEXT: std::cell::RefCell<Option<NativeMetadataCacheContext>> = const { std::cell::RefCell::new(None) };
-}
-pub(crate) struct NativeMetadataCacheContextLease(Option<NativeMetadataCacheContext>);
-impl Drop for NativeMetadataCacheContextLease {
-    fn drop(&mut self) {
-        METADATA_CACHE_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.take());
-    }
-}
 pub(crate) fn has_root_interest(root: &Path, owner: &Arc<DfsDataOwnerLock>) -> bool {
     CAPTURES.get().is_some_and(|registry| {
         registry
@@ -1283,343 +1258,6 @@ pub(crate) fn has_root_interest(root: &Path, owner: &Arc<DfsDataOwnerLock>) -> b
                         .closed
             })
     })
-}
-pub(crate) fn enter_metadata_cache_context(
-    root: &Path,
-    owner: &Arc<DfsDataOwnerLock>,
-    scope: &crate::DfsPreparedOperationScope,
-) -> NativeMetadataCacheContextLease {
-    let capture = CAPTURES.get().and_then(|registry| {
-        registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find(|capture| {
-                capture.mount.root == root
-                    && capture.shard == scope.shard_id
-                    && !*capture.mount.shutdown.borrow()
-                    && capture
-                        .mount
-                        .owner
-                        .upgrade()
-                        .is_some_and(|actual| Arc::ptr_eq(&actual, owner))
-            })
-    });
-    let context = capture.map(|capture| NativeMetadataCacheContext {
-        capture: Arc::downgrade(&capture),
-        scope: scope.clone(),
-    });
-    NativeMetadataCacheContextLease(METADATA_CACHE_CONTEXT.with(|slot| slot.replace(context)))
-}
-#[derive(Debug, Serialize)]
-struct NativeMetadataCacheCutV1 {
-    owner_label: String,
-    owner_ordinal: String,
-    actual_preparation_scope: Option<crate::DfsPreparedOperationScope>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    actual_consumption_scope: Option<NativeControlConsumptionScopeV1>,
-    prefix: &'static str,
-    cached_revision: Option<String>,
-    required_revision: String,
-    projection_generation: String,
-    entries: Vec<sinomo_core::kv::KvEntry>,
-    original_native_provenance:
-        Option<crate::metadata_authority_runtime::NativeMetadataCacheEvidenceV1>,
-    provenance_loss_count: String,
-}
-pub(crate) fn record_metadata_cache_cut(
-    generation: u64,
-    revision: Option<sinomo_core::kv::KvRevision>,
-    required: sinomo_core::kv::KvRevision,
-    entries: &[sinomo_core::kv::KvEntry],
-    provenance: Option<&crate::metadata_authority_runtime::NativeMetadataCacheEvidenceV1>,
-    provenance_loss_count: u64,
-) {
-    let context = METADATA_CACHE_CONTEXT.with(|slot| slot.borrow().clone());
-    let Some(context) = context else {
-        return;
-    };
-    let Some(capture) = context.capture.upgrade() else {
-        return;
-    };
-    let mut state = capture.state.lock().unwrap_or_else(|e| e.into_inner());
-    if state.closed {
-        return;
-    }
-    let size = entries
-        .iter()
-        .map(|entry| entry.key.len().saturating_add(entry.value.len()))
-        .sum::<usize>();
-    let provenance_size = provenance.map_or(0, |e| e.retained_bytes());
-    if state.packet_count() >= MAX_PACKETS
-        || state
-            .bytes
-            .saturating_add(size)
-            .saturating_add(provenance_size)
-            > MAX_BYTES
-    {
-        state.dropped = state.dropped.saturating_add(1);
-        return;
-    }
-    let Some(ordinal) = state.next_ordinal.checked_add(1) else {
-        state.dropped = state.dropped.saturating_add(1);
-        return;
-    };
-    state.next_ordinal = ordinal;
-    state.bytes = state
-        .bytes
-        .saturating_add(size)
-        .saturating_add(provenance_size);
-    state.metadata_cache_cuts.push(NativeMetadataCacheCutV1 {
-        owner_label: capture.mount.label.clone(),
-        owner_ordinal: ordinal.to_string(),
-        actual_preparation_scope: Some(context.scope),
-        actual_consumption_scope: None,
-        prefix: crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX,
-        cached_revision: revision.map(|revision| revision.0.to_string()),
-        required_revision: required.0.to_string(),
-        projection_generation: generation.to_string(),
-        entries: entries.to_vec(),
-        original_native_provenance: provenance.cloned(),
-        provenance_loss_count: provenance_loss_count.to_string(),
-    });
-}
-
-/// The normal CP consumer's actual scope, separate from a prepared operation.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum NativeControlConsumptionScopeV1 {
-    RetainedPrefixSeed {
-        prefix: &'static str,
-    },
-    RetainedKeysReturned {
-        keys: Vec<String>,
-        values: Vec<Option<sinomo_core::kv::KvEntry>>,
-    },
-    RetainedPrefixReturned {
-        prefix: String,
-        entries: Vec<sinomo_core::kv::KvEntry>,
-    },
-}
-#[derive(Debug)]
-pub(crate) struct NativeRetainedMetadataSeed {
-    root: PathBuf,
-    owner: Weak<DfsDataOwnerLock>,
-    captures: Vec<Weak<Capture>>,
-    pub(crate) projection_generation: u64,
-    pub(crate) revision: sinomo_core::kv::KvRevision,
-    required: sinomo_core::kv::KvRevision,
-    pub(crate) entries: Vec<sinomo_core::kv::KvEntry>,
-    provenance: Option<crate::metadata_authority_runtime::NativeMetadataCacheEvidenceV1>,
-    provenance_loss_count: u64,
-}
-struct NativeRetainedSeedContext {
-    root: PathBuf,
-    owner: Weak<DfsDataOwnerLock>,
-    captures: Vec<Weak<Capture>>,
-    seed: Arc<Mutex<Option<Arc<NativeRetainedMetadataSeed>>>>,
-}
-thread_local! {
-    static RETAINED_SEED_CONTEXT: std::cell::RefCell<Option<NativeRetainedSeedContext>> =
-        const { std::cell::RefCell::new(None) };
-}
-struct NativeRetainedSeedContextRestore(Option<NativeRetainedSeedContext>);
-impl Drop for NativeRetainedSeedContextRestore {
-    fn drop(&mut self) {
-        RETAINED_SEED_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.take());
-    }
-}
-/// Wrap only the already-required normal load. No read or owner is acquired.
-pub(crate) fn capture_retained_metadata_seed<T>(
-    root: &Path,
-    owner: &Arc<DfsDataOwnerLock>,
-    load: impl FnOnce() -> T,
-) -> (T, Option<Arc<NativeRetainedMetadataSeed>>) {
-    let captures = CAPTURES.get().map_or_else(Vec::new, |registry| {
-        registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|capture| {
-                capture.mount.root == root
-                    && !*capture.mount.shutdown.borrow()
-                    && capture
-                        .mount
-                        .owner
-                        .upgrade()
-                        .is_some_and(|actual| Arc::ptr_eq(&actual, owner))
-            })
-            .map(|capture| Arc::downgrade(&capture))
-            .collect::<Vec<_>>()
-    });
-    if captures.is_empty() {
-        return (load(), None);
-    }
-    let seed = Arc::new(Mutex::new(None));
-    let context = NativeRetainedSeedContext {
-        root: root.to_path_buf(),
-        owner: Arc::downgrade(owner),
-        captures,
-        seed: Arc::clone(&seed),
-    };
-    let _restore = NativeRetainedSeedContextRestore(
-        RETAINED_SEED_CONTEXT.with(|slot| slot.replace(Some(context))),
-    );
-    let result = load();
-    let observed = seed.lock().unwrap_or_else(|e| e.into_inner()).take();
-    (result, observed)
-}
-/// Copy the exact projection and provenance while its normal mutex is held.
-pub(crate) fn retain_metadata_seed_observation(
-    generation: u64,
-    revision: sinomo_core::kv::KvRevision,
-    required: sinomo_core::kv::KvRevision,
-    entries: &[sinomo_core::kv::KvEntry],
-    provenance: Option<&crate::metadata_authority_runtime::NativeMetadataCacheEvidenceV1>,
-    provenance_loss_count: u64,
-) {
-    RETAINED_SEED_CONTEXT.with(|slot| {
-        let borrowed = slot.borrow();
-        let Some(context) = borrowed.as_ref() else {
-            return;
-        };
-        let bytes = entries
-            .iter()
-            .fold(0usize, |n, e| {
-                n.saturating_add(e.key.len()).saturating_add(e.value.len())
-            })
-            .saturating_add(provenance.map_or(0, |p| p.retained_bytes()));
-        if bytes > MAX_BYTES {
-            for capture in context.captures.iter().filter_map(Weak::upgrade) {
-                let mut state = capture.state.lock().unwrap_or_else(|e| e.into_inner());
-                if !state.closed {
-                    state.dropped = state.dropped.saturating_add(1);
-                }
-            }
-            return;
-        }
-        *context.seed.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(Arc::new(NativeRetainedMetadataSeed {
-                root: context.root.clone(),
-                owner: context.owner.clone(),
-                captures: context.captures.clone(),
-                projection_generation: generation,
-                revision,
-                required,
-                entries: entries.to_vec(),
-                provenance: provenance.cloned(),
-                provenance_loss_count,
-            }));
-    });
-}
-/// Emit only an actually accepted seed or successful cached return.
-pub(crate) fn record_retained_control_use(
-    root: &Path,
-    owner: &Arc<DfsDataOwnerLock>,
-    seed: &NativeRetainedMetadataSeed,
-    scope: NativeControlConsumptionScopeV1,
-) {
-    if seed.root != root
-        || !seed
-            .owner
-            .upgrade()
-            .is_some_and(|actual| Arc::ptr_eq(&actual, owner))
-    {
-        return;
-    }
-    for capture in seed.captures.iter().filter_map(Weak::upgrade) {
-        if capture.mount.root != root
-            || *capture.mount.shutdown.borrow()
-            || !capture
-                .mount
-                .owner
-                .upgrade()
-                .is_some_and(|actual| Arc::ptr_eq(&actual, owner))
-        {
-            continue;
-        }
-        let segment = capture.shard.0.trim_matches('/').replace('/', "_");
-        let applies = match &scope {
-            NativeControlConsumptionScopeV1::RetainedPrefixSeed { prefix } => {
-                *prefix == crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX
-            }
-            NativeControlConsumptionScopeV1::RetainedKeysReturned { keys, .. } => {
-                keys.iter().any(|key| {
-                    let parts = key.split('/').collect::<Vec<_>>();
-                    parts.len() == 6
-                        && parts[1] == "dfs"
-                        && parts[2] == "filesystems"
-                        && !parts[3].is_empty()
-                        && parts[5] == segment
-                        && matches!(
-                            parts[4],
-                            "metadata-shards"
-                                | "metadata-membership-handoffs"
-                                | "metadata-operation-floors"
-                                | "metadata-head-watermarks"
-                        )
-                })
-            }
-            NativeControlConsumptionScopeV1::RetainedPrefixReturned { prefix, .. } => {
-                prefix == crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX
-            }
-        };
-        if !applies {
-            continue;
-        }
-        let mut state = capture.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed {
-            continue;
-        }
-        let size = seed
-            .entries
-            .iter()
-            .fold(0usize, |n, e| {
-                n.saturating_add(e.key.len()).saturating_add(e.value.len())
-            })
-            .saturating_add(seed.provenance.as_ref().map_or(0, |p| p.retained_bytes()))
-            .saturating_add(match &scope {
-                NativeControlConsumptionScopeV1::RetainedKeysReturned { keys, values } => keys
-                    .iter()
-                    .fold(0usize, |n, k| n.saturating_add(k.len()))
-                    .saturating_add(values.iter().flatten().fold(0usize, |n, e| {
-                        n.saturating_add(e.key.len()).saturating_add(e.value.len())
-                    })),
-                NativeControlConsumptionScopeV1::RetainedPrefixReturned { prefix, entries } => {
-                    prefix
-                        .len()
-                        .saturating_add(entries.iter().fold(0usize, |n, e| {
-                            n.saturating_add(e.key.len()).saturating_add(e.value.len())
-                        }))
-                }
-                NativeControlConsumptionScopeV1::RetainedPrefixSeed { prefix } => prefix.len(),
-            });
-        if state.packet_count() >= MAX_PACKETS || state.bytes.saturating_add(size) > MAX_BYTES {
-            state.dropped = state.dropped.saturating_add(1);
-            continue;
-        }
-        let Some(ordinal) = state.next_ordinal.checked_add(1) else {
-            state.dropped = state.dropped.saturating_add(1);
-            continue;
-        };
-        state.next_ordinal = ordinal;
-        state.bytes = state.bytes.saturating_add(size);
-        state.metadata_cache_cuts.push(NativeMetadataCacheCutV1 {
-            owner_label: capture.mount.label.clone(),
-            owner_ordinal: ordinal.to_string(),
-            actual_preparation_scope: None,
-            actual_consumption_scope: Some(scope.clone()),
-            prefix: crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX,
-            cached_revision: Some(seed.revision.0.to_string()),
-            required_revision: seed.required.0.to_string(),
-            projection_generation: seed.projection_generation.to_string(),
-            entries: seed.entries.clone(),
-            original_native_provenance: seed.provenance.clone(),
-            provenance_loss_count: seed.provenance_loss_count.to_string(),
-        });
-    }
 }
 
 #[derive(Debug, Serialize)]

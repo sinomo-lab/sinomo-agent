@@ -3377,6 +3377,47 @@ impl DfsTestRuntime {
                 .map_err(|error| error.to_string())
         }))
     }
+    /// Drive `node`'s published configuration up to every commit made before
+    /// this call: one ReadIndex fixes the committed revision, then the
+    /// node's publication is awaited (a watch, not a re-read) until it
+    /// reaches that revision. Out-of-process clients read this publication.
+    pub fn wait_published_configuration_current(&self, node: &NodeId) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let paths = ClusterPaths::new(self.data_dir(node));
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .map_err(|error| error.to_string())?;
+        let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation_for_identity(
+            &paths,
+            &state.cluster_id,
+            &state.local_node_id,
+            Some(executor().handle()),
+        )
+        .map_err(|error| error.to_string())?;
+        let cluster = Arc::clone(&self.authority);
+        run_unit(Box::pin(async move {
+            let committed = tokio::time::timeout_at(
+                deadline,
+                cluster.kv_range_prefix_authoritative_async("/dfs/filesystems/".into()),
+            )
+            .await
+            .map_err(|_| "committed-revision ReadIndex reached its network deadline".to_string())?
+            .map_err(|error| error.to_string())?
+            .authority
+            .revision;
+            let mut published = authority.subscribe_configuration_snapshot();
+            tokio::time::timeout_at(
+                deadline,
+                published.wait_for(|snapshot| {
+                    snapshot.revision().is_some_and(|revision| revision >= committed)
+                }),
+            )
+            .await
+            .map_err(|_| format!("published configuration did not reach revision {}", committed.0))?
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        }))
+    }
+
     fn wait_startup_completion(&self) -> Result<(), String> {
         self.wait_startup_completion_with_budget(None, None)
     }
@@ -3669,13 +3710,17 @@ impl DfsTestRuntime {
             Some(Arc::clone(&self.kv_peers)),
             Some(carrier.clone()),
         );
+        // Mounted clients opened on this node subscribe to the component's own
+        // bus, as they do to the daemon event stream it is bridged to.
+        let event_bus = ComponentEventBus::default();
+        crate::mounted_sifs::register_mounted_sifs_test_event_bus(&data_dir, Some(event_bus.clone()));
         let context = ComponentContext::new(data_dir.clone())
             .with_host_role(ComponentHostRole::Embedded)
             .with_runtime(executor().handle().clone())
             .with_node_resources(self.nodes[node].resources.clone())
             .with_cluster_access(Arc::clone(&cluster))
             .with_object_rpc_transport(carrier)
-            .with_event_bus(ComponentEventBus::default());
+            .with_event_bus(event_bus);
         let mut reconciler = ComponentReconciler::new(context, ServiceRegistry::default());
         let factories = self.node_component_factories(true, node)?;
         reconciler
@@ -5508,7 +5553,9 @@ impl DfsTestRuntime {
         observe_owner("before-mounted-context-drop");
         // Stop invalidates this borrow before endpoint/lifecycle withdrawal.
         // Reopen constructs a new context from that actual mounted generation.
-        self.nodes.get_mut(node).unwrap().mounted_context.take();
+        if let Some(context) = self.nodes.get_mut(node).unwrap().mounted_context.take() {
+            crate::mounted_sifs::register_mounted_sifs_test_event_bus(context.data_dir(), None);
+        }
         observe_owner("after-mounted-context-drop");
         self.nodes[node]
             .kv_available
@@ -5878,6 +5925,11 @@ impl DfsControlPlaneKvClient for ProbedNormalControlPlane {
         // Preserve the actual native async view/capability and its futures.
         // Async transactions are deliberately outside this sync probe's count.
         self.inner.async_client()
+    }
+    fn configuration_snapshot(
+        &self,
+    ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, sinomo_core::kv::KvError> {
+        self.inner.configuration_snapshot()
     }
     fn write_configuration_projection(
         &self,

@@ -105,8 +105,18 @@ All visible writes serialize through the responsible owner or metadata-shard
 primary.
 
 KV access on DFS operation paths is explicit. Namespace routing and policy reads
-reuse the existing retained configuration projections; peer routing and connection
-health remain owned by the network layer.
+use the one configuration snapshot the metadata authority publishes from native
+proofs and committed deltas. An operation takes that snapshot once for its
+shards, filesystem policy, members and providers, and its commit point is fenced
+only by that snapshot's generation. Processes outside the daemon consume the
+same publication: the local DFS component announces each change as a typed
+`dfs.configuration.published` event and serves its current floor-checked
+snapshot on request. A long-lived client such as mounted SIFS holds the snapshot
+it fetched after the newest announcement and none while its subscription is
+down; a one-shot command reads it once per operation. Neither keeps its own
+configuration cache or refresh loop, and keys outside the published scopes are
+read through ReadIndex. Peer routing and connection health remain owned by the
+network layer.
 
 Content eligibility joins authorized cluster membership, compatible filesystem
 providers and explicit content acceptance from one coherent configuration.

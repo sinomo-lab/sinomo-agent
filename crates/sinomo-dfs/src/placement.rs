@@ -8495,6 +8495,12 @@ mod admitted_placement_coordinator_native_tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.write_configuration_readiness()
         }
+        fn configuration_snapshot(
+            &self,
+        ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, sinomo_core::kv::KvError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.configuration_snapshot()
+        }
         fn write_configuration_projection(
             &self,
         ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, sinomo_core::kv::KvError>

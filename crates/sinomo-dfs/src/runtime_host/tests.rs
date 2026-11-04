@@ -1192,9 +1192,9 @@ fn daemon_metadata_authority_uses_one_exact_read_without_snapshot_refresh() {
         "one validation must issue one exact-key-set ReadIndex"
     );
     assert_eq!(
-        client.full_snapshot_refresh_calls.load(Ordering::SeqCst),
+        client.authoritative_prefix_calls.load(Ordering::SeqCst),
         0,
-        "exact authority validation must not fetch a full authoritative snapshot first"
+        "exact authority validation must not fetch an authoritative prefix first"
     );
 
     let mut async_client =
@@ -1220,7 +1220,7 @@ fn daemon_metadata_authority_uses_one_exact_read_without_snapshot_refresh() {
     );
     assert_eq!(
         async_client
-            .full_snapshot_refresh_calls
+            .authoritative_prefix_calls
             .load(Ordering::SeqCst),
         0
     );
@@ -4037,14 +4037,13 @@ fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapsh
     );
     assert_eq!(
         sinomo_dfs::DfsControlPlaneKvClient::range_prefix(&client, &prefix)
-            .expect("repeat cached authoritative prefix"),
+            .expect("repeat bounded authoritative prefix"),
         authoritative,
-        "a validated prefix must remain a compact per-client projection"
     );
     assert_eq!(
-        client.full_snapshot_refresh_calls.load(Ordering::SeqCst),
-        0,
-        "bounded prefix authority must not fetch a complete snapshot"
+        client.authoritative_prefix_calls.load(Ordering::SeqCst),
+        2,
+        "an unowned client retains nothing: each prefix read is one bounded ReadIndex"
     );
 
     let async_client =
@@ -4057,9 +4056,9 @@ fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapsh
     assert_eq!(async_authoritative, authoritative);
     assert_eq!(
         async_client
-            .full_snapshot_refresh_calls
+            .authoritative_prefix_calls
             .load(Ordering::SeqCst),
-        0,
+        1,
     );
     let _ = take_daemon_dfs_test_authoritative_prefix_call_count(&cluster_paths);
 
@@ -12132,110 +12131,6 @@ fn daemon_owned_dfs_clients_reuse_and_track_shared_metadata_authority_generation
     native.close().unwrap();
 }
 
-#[test]
-fn daemon_dfs_async_client_preserves_newer_exact_proof_while_retained_authority_catches_up() {
-    let root = temp_root("daemon-dfs-client-newer-than-retained-authority");
-    let data_dir = SinomoDataDir::new(root.join("data"));
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let runtime = daemon_test_runtime("daemon-dfs-client-newer-than-retained-authority");
-    let authority = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
-    let key = "/dfs/filesystems/test/metadata-shards/root".to_string();
-    let stable_value = b"stable-authority".to_vec();
-    assert!(
-        authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
-            &default_dfs_reactor_test_snapshot(1, vec![(key.clone(), stable_value.clone())],)
-        ),)
-    );
-    let topology_generation = authority.generation();
-
-    let client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime.handle());
-    let mut client = client;
-    client.retained_metadata_authority = Some(Arc::clone(&authority));
-    let newer_entry = KvEntry {
-        key: key.clone(),
-        value: stable_value.clone(),
-        create_revision: KvRevision(1),
-        modify_revision: KvRevision(2),
-        version: KvVersion(2),
-        lease_id: None,
-    };
-    {
-        let mut projection = client.projection.lock().expect("client projection");
-        projection.revision = KvRevision(2);
-        projection
-            .exact_entries
-            .insert(key.clone(), Some(newer_entry.clone()));
-    }
-
-    let observed = runtime
-        .block_on(sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(
-            &client, &key,
-        ))
-        .expect("newer exact proof must remain usable")
-        .expect("newer exact entry");
-    assert_eq!(observed, newer_entry);
-    assert_eq!(
-        client.authoritative_exact_set_calls.load(Ordering::Acquire),
-        0,
-        "a covered newer exact proof must not issue another ReadIndex",
-    );
-    let retained = authority.debug_snapshot();
-    assert_eq!(retained.revision, None);
-    assert_eq!(
-        retained.required_revision,
-        KvRevision(2),
-        "the lagging shared projection must still fail closed and request catch-up",
-    );
-    assert!(retained.topology_comparison_baseline);
-    assert_eq!(
-        authority.generation(),
-        topology_generation,
-        "revision catch-up must not manufacture a historical topology generation",
-    );
-    assert!(
-        authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
-            &default_dfs_reactor_test_snapshot(2, vec![(key.clone(), stable_value)],)
-        ),)
-    );
-    assert_eq!(
-        authority.generation(),
-        topology_generation,
-        "an equal replacement topology must restore readiness without reopening resident lanes",
-    );
-
-    let changed_value = b"changed-authority".to_vec();
-    {
-        let mut projection = client.projection.lock().expect("client projection");
-        projection.revision = KvRevision(3);
-        projection.exact_entries.insert(
-            key.clone(),
-            Some(KvEntry {
-                key: key.clone(),
-                value: changed_value.clone(),
-                create_revision: KvRevision(1),
-                modify_revision: KvRevision(3),
-                version: KvVersion(3),
-                lease_id: None,
-            }),
-        );
-    }
-    runtime
-        .block_on(sinomo_dfs::AsyncDfsControlPlaneKvClient::get_async(
-            &client, &key,
-        ))
-        .expect("changed newer exact proof must remain usable");
-    assert!(
-        authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
-            &default_dfs_reactor_test_snapshot(3, vec![(key, changed_value)],)
-        ),)
-    );
-    assert_eq!(
-        authority.generation(),
-        topology_generation + 1,
-        "a changed replacement topology must advance the resident generation after comparison",
-    );
-}
-
 struct DeferredDfsAuthorityHost {
     runtime: tokio::runtime::Handle,
     response: Mutex<
@@ -12778,7 +12673,11 @@ fn daemon_dfs_decoded_shards_follow_proofs_without_repeated_materialization() {
             vec![shard.clone()],
         );
     }
-    assert_eq!(authority.projection_materialization_count(), 1);
+    assert_eq!(
+        authority.projection_materialization_count(),
+        0,
+        "decoded shards come from the publication without copying its prefix"
+    );
     assert_eq!(client.authoritative_prefix_calls.load(Ordering::Acquire), 0);
     let generation = authority.generation();
     // An unrelated committed revision must not cancel an admitted recovery.
@@ -12836,6 +12735,8 @@ fn daemon_dfs_clients_bound_a_stalled_authority_refresh() {
         reads: AtomicUsize::new(0),
     });
     authority.attach_host(host.clone());
+    // The edge that starts the shared read; the client only waits for it.
+    authority.request_authoritative_refresh();
     let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime.handle());
     client.retained_metadata_authority = Some(Arc::clone(&authority));
     let error = runtime
@@ -12863,7 +12764,7 @@ fn daemon_dfs_clients_bound_a_stalled_authority_refresh() {
 }
 
 #[test]
-fn daemon_dfs_metadata_authority_refresh_handoff_does_not_refetch() {
+fn daemon_dfs_metadata_authority_waiter_observes_a_publication_without_refetch() {
     let root = temp_root("daemon-dfs-authority-refresh-handoff");
     let data_dir = SinomoDataDir::new(root.join("data"));
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -12873,35 +12774,21 @@ fn daemon_dfs_metadata_authority_refresh_handoff_does_not_refetch() {
         .expect("metadata authority host");
     assert!(authority.attach_host(host));
 
-    let reached_before_claim = Arc::new(tokio::sync::Notify::new());
-    let release_claim = Arc::new(tokio::sync::Notify::new());
-    authority.install_refresh_before_claim_hook(Some((
-        Arc::clone(&reached_before_claim),
-        Arc::clone(&release_claim),
-    )));
     let expected_generation = authority.generation();
+    let published = authority.subscribe_configuration_snapshot();
     let waiter_authority = Arc::clone(&authority);
     let waiter = runtime.spawn(async move {
         waiter_authority
-            .ensure_complete_prefix_for_generation_async(
-                expected_generation,
-                #[cfg(test)]
-                None,
-            )
+            .ensure_complete_prefix_for_generation_async(expected_generation)
             .await
     });
-    runtime.block_on(reached_before_claim.notified());
-
-    // Model a refresh completing in the narrow interval between the
-    // waiter's retained read and CAS. The waiter must observe this proof
-    // before issuing another ReadIndex.
+    // A waiter subscribes to the publication; it never claims a refresh.
     assert!(
         authority.install_authoritative_projection(test_dfs_authoritative_prefix_projection(
             &default_dfs_reactor_test_snapshot(1, Vec::new(),)
         ),)
     );
-    release_claim.notify_one();
-
+    assert!(published.has_changed().unwrap());
     assert!(
         runtime
             .block_on(waiter)
@@ -12912,12 +12799,12 @@ fn daemon_dfs_metadata_authority_refresh_handoff_does_not_refetch() {
     assert_eq!(
         authority.projection_materialization_count(),
         0,
-        "singleflight handoff readiness must not clone the retained prefix",
+        "publication readiness must not clone the retained prefix",
     );
     assert_eq!(
         take_daemon_dfs_test_authoritative_prefix_call_count(&cluster_paths),
         0,
-        "a completed singleflight handoff must not issue a second bounded ReadIndex",
+        "a waiter must not issue a bounded ReadIndex",
     );
 }
 
@@ -17388,7 +17275,7 @@ fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
 }
 
 #[test]
-fn daemon_smoke_revalidates_a_concurrently_advanced_metadata_cache() {
+fn daemon_smoke_uses_one_snapshot_across_a_concurrent_provider_update() {
     let local =
         crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-smoke-coherent-cut", 1)
             .remove(0);
@@ -17414,19 +17301,14 @@ fn daemon_smoke_revalidates_a_concurrently_advanced_metadata_cache() {
     crate::smoke::SMOKE_CONFIGURATION_CAPTURED.with(|hook| {
         assert!(hook.borrow().is_none());
         *hook.borrow_mut() = Some(Box::new(move || {
-            super::control_plane::AFTER_CACHED_METADATA_SYNC.with(|slot| {
-                assert!(slot.borrow().is_none());
-                *slot.borrow_mut() = Some(Box::new(move || {
-                    control.with_client(|kv| {
-                        let mut store = sinomo_dfs::DfsControlPlaneStore::new(kv.as_mut());
-                        let mut advertisement =
-                            store.content_service(&changed_node).unwrap().unwrap();
-                        advertisement.advertisement_generation += 1;
-                        store.advertise_content_service(&advertisement).unwrap();
-                    });
-                    observed.store(true, Ordering::SeqCst);
-                }));
+            // A real provider update after smoke took its one snapshot.
+            control.with_client(|kv| {
+                let mut store = sinomo_dfs::DfsControlPlaneStore::new(kv.as_mut());
+                let mut advertisement = store.content_service(&changed_node).unwrap().unwrap();
+                advertisement.advertisement_generation += 1;
+                store.advertise_content_service(&advertisement).unwrap();
             });
+            observed.store(true, Ordering::SeqCst);
         }));
     });
     let (peer, _) = fixture.peer_transports(&local).unwrap();

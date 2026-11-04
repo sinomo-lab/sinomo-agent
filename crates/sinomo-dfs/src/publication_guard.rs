@@ -19,6 +19,9 @@ thread_local! {
     /// Observe a genuine configuration update after the initial binding cut.
     /// The hook supplies no configuration, execution owner or publication proof.
     pub(crate) static INITIAL_BINDING_AFTER_CUT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// Observe a genuine configuration update after an effect operation took
+    /// its publication snapshot and before its admission completes.
+    pub(crate) static EFFECT_ADMISSION_AFTER_CUT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Actual backend identity. This is a lock index, never author permission.
@@ -217,51 +220,50 @@ impl DfsPublicationExecutionProvider {
                 "initial epoch owner/storage generation changed".into(),
             ));
         }
-        let binding = self.authority.with_current_publication_configuration(
-            &digest.file_system_id,
-            |generation, shards, filesystem| {
-                let mismatch = if filesystem
-                    .as_ref()
-                    .is_none_or(|filesystem| filesystem.file_system_id != digest.file_system_id)
-                {
-                    Some("filesystem")
-                } else if !scope.matches(digest) {
-                    Some("physical-scope")
-                } else if expected.file_system_id != digest.file_system_id {
-                    Some("filesystem-id")
-                } else if expected.shard_id != digest.shard_id.0 {
-                    Some("shard-id")
-                } else if expected.epoch != digest.owner_epoch {
-                    Some("owner-epoch")
-                } else if !shards.iter().any(|shard| shard == expected) {
-                    Some("selected-shard")
-                } else if self.authority.storage_generation() != self.storage_generation {
-                    Some("storage-generation")
-                } else if self.authority.projection_generation() != generation {
-                    Some("projection-generation")
-                } else {
-                    None
-                };
-                if let Some(reason) = mismatch {
-                    #[cfg(any(test, feature = "test-support"))]
-                    eprintln!(
-                        "NATIVE_INITIAL_EPOCH_BINDING_REJECTED branch={reason} root={:?} digest={digest:?} expected={expected:?} cached_shards={shards:?} sampled_projection={generation} projection_at_log={} expected_storage={} storage_at_log={}",
-                        scope.root(), self.authority.projection_generation(),
-                        self.storage_generation, self.authority.storage_generation(),
-                    );
-                    #[cfg(not(any(test, feature = "test-support")))]
-                    let _ = reason;
-                    return Err(MetadataBackendError::Serde(
-                        "initial epoch differs from the coherent configuration".into(),
-                    ));
-                }
-                Ok(())
-            },
-        )
-        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
-        .ok_or_else(|| {
-            MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
-        })?;
+        // One publication supplies the filesystem and shard rows checked here.
+        let snapshot = self.authority.configuration_snapshot();
+        let (shards, filesystem) = snapshot
+            .publication_configuration(&digest.file_system_id)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
+            })?;
+        let mismatch = if filesystem
+            .as_ref()
+            .is_none_or(|filesystem| filesystem.file_system_id != digest.file_system_id)
+        {
+            Some("filesystem")
+        } else if !scope.matches(digest) {
+            Some("physical-scope")
+        } else if expected.file_system_id != digest.file_system_id {
+            Some("filesystem-id")
+        } else if expected.shard_id != digest.shard_id.0 {
+            Some("shard-id")
+        } else if expected.epoch != digest.owner_epoch {
+            Some("owner-epoch")
+        } else if !shards.iter().any(|shard| shard == expected) {
+            Some("selected-shard")
+        } else if snapshot.storage_generation() != self.storage_generation {
+            Some("storage-generation")
+        } else {
+            None
+        };
+        let binding = match mismatch {
+            Some(reason) => {
+                #[cfg(any(test, feature = "test-support"))]
+                eprintln!(
+                    "NATIVE_INITIAL_EPOCH_BINDING_REJECTED branch={reason} root={:?} digest={digest:?} expected={expected:?} cached_shards={shards:?} snapshot_projection={} expected_storage={} snapshot_storage={}",
+                    scope.root(), snapshot.projection_generation(),
+                    self.storage_generation, snapshot.storage_generation(),
+                );
+                #[cfg(not(any(test, feature = "test-support")))]
+                let _ = reason;
+                Err(MetadataBackendError::Serde(
+                    "initial epoch differs from the coherent configuration".into(),
+                ))
+            }
+            None => Ok(()),
+        };
         #[cfg(test)]
         {
             let hook = INITIAL_BINDING_AFTER_CUT.with(|slot| slot.borrow_mut().take());
@@ -286,28 +288,29 @@ impl DfsPublicationExecutionProvider {
         node: &sinomo_core::node::NodeId,
         deadline: Option<std::time::Instant>,
     ) -> std::result::Result<Arc<DfsPublicationExecutionOwners>, crate::DfsError> {
-        if self.authority.storage_generation() != self.storage_generation {
+        // The provider retains this physical backend generation. Ordinary
+        // proof updates do not replace that backend; each operation instead
+        // takes one current publication and revalidates it after admission.
+        let snapshot = self.authority.configuration_snapshot();
+        if snapshot.storage_generation() != self.storage_generation {
             return Err(crate::DfsError::Metadata {
                 message:
                     "publication storage configuration advanced; release the service before reopening"
                         .into(),
             });
         }
-        // The provider retains this physical backend generation. Ordinary
-        // proof updates do not replace that backend; each operation
-        // instead captures and revalidates the actual current authority cut.
-        #[cfg(any(test, feature = "test-support"))]
-        let _native_cache_context = crate::native_shard_trace::enter_metadata_cache_context(
-            &self.data_root,
-            &self.data_owner,
-            scope,
-        );
-        let (_, shards, filesystem_config) = self
-            .authority
-            .cached_current_publication_configuration(&scope.file_system_id)?
+        let (shards, filesystem_config) = snapshot
+            .publication_configuration(&scope.file_system_id)?
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "publication configuration is not current".into(),
             })?;
+        #[cfg(test)]
+        {
+            let hook = EFFECT_ADMISSION_AFTER_CUT.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let filesystem_config = filesystem_config.ok_or_else(|| crate::DfsError::Metadata {
             message: "publication filesystem configuration is unavailable".into(),
         })?;
@@ -356,16 +359,15 @@ impl DfsPublicationExecutionProvider {
             self.runtime.block_on(future)?
         };
         // Admission can wait across ordinary watermark/proof publication.
-        // Rebind to one actual current cache cut, preserving every semantic
-        // configuration row selected before the wait. A missing cut cannot
-        // authorize work, and structural changes still require reopening.
-        let current = self
-            .authority
-            .cached_current_publication_configuration(&scope.file_system_id)?;
-        if self.authority.storage_generation() != self.storage_generation
+        // Rebind to the publication current after that wait, preserving every
+        // semantic configuration row selected before it. A withdrawn scope
+        // cannot authorize work, and structural changes still require reopening.
+        let current = self.authority.configuration_snapshot();
+        if current.storage_generation() != self.storage_generation
             || current
+                .publication_configuration(&scope.file_system_id)?
                 .as_ref()
-                .is_none_or(|(_, current_shards, current_filesystem)| {
+                .is_none_or(|(current_shards, current_filesystem)| {
                     current_shards
                         .iter()
                         .find(|current| current.shard_id == scope.shard_id.0)
@@ -441,17 +443,16 @@ impl DfsPublicationExecutionProvider {
         {
             return Err(invalid());
         }
-        let (generation, shards, filesystem) = self
-            .authority
-            .cached_current_publication_configuration(&expected.file_system_id)
+        let snapshot = self.authority.configuration_snapshot();
+        let (shards, filesystem) = snapshot
+            .publication_configuration(&expected.file_system_id)
             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
             .ok_or_else(invalid)?;
         if filesystem
             .as_ref()
             .is_none_or(|filesystem| filesystem.file_system_id != expected.file_system_id)
             || !shards.iter().any(|shard| shard == expected)
-            || self.authority.storage_generation() != self.storage_generation
-            || self.authority.projection_generation() != generation
+            || snapshot.storage_generation() != self.storage_generation
         {
             return Err(invalid());
         }
@@ -621,8 +622,14 @@ impl NativeRepairProducerAdmission {
             message: "native Repair custody producer configuration or physical owner advanced"
                 .into(),
         };
-        if self.provider.authority.generation() != self.authority_generation
-            || self.provider.authority.storage_generation() != self.provider.storage_generation
+        // One floor-checked publication. Its generation is the only
+        // configuration fence; selection is checked against that same value.
+        let snapshot = self
+            .provider
+            .authority
+            .current_write_configuration_snapshot()?;
+        if snapshot.generation() != self.authority_generation
+            || snapshot.storage_generation() != self.provider.storage_generation
             || !self
                 .provider
                 .data_owner
@@ -635,10 +642,6 @@ impl NativeRepairProducerAdmission {
         {
             return Err(invalid());
         }
-        let snapshot = self
-            .provider
-            .authority
-            .current_original_repair_configuration(&self.assignment.file_system_id)?;
         let object = self
             .material
             .original
@@ -646,19 +649,20 @@ impl NativeRepairProducerAdmission {
             .object_metadata
             .as_ref()
             .ok_or_else(invalid)?;
+        let (shards, filesystem) = snapshot
+            .publication_configuration(&self.assignment.file_system_id)?
+            .ok_or_else(invalid)?;
         let selected = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
             &self.assignment.file_system_id,
-            &snapshot.shards,
+            &shards,
             &object.path,
         )?
         .ok_or_else(invalid)?;
         if selected != self.assignment
             || selected.primary_node_id != self.material.original.source_node_id
-            || snapshot
-                .filesystem
+            || filesystem
                 .as_ref()
                 .is_none_or(|fs| fs.file_system_id != self.assignment.file_system_id)
-            || self.provider.authority.generation() != self.authority_generation
         {
             return Err(invalid());
         }
@@ -726,22 +730,16 @@ impl VerifiedOriginalRepairHistoryRead {
             || receiver != &material.original.target_node_id || !assignment.replica_node_ids.contains(receiver)
         { return Err(invalid()); }
         let head = command.object_metadata.as_ref().ok_or_else(invalid)?;
-        let view = authority.write_configuration_projection()?.ok_or_else(invalid)?;
-        let key = crate::file_system_config_key(&command.file_system_id);
-        let filesystem = view.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key))
-            .ok_or_else(invalid)?.decode::<crate::DfsFileSystemConfig>()?;
-        let shards = view.entries(&crate::metadata_shards_prefix(&command.file_system_id)).ok_or_else(invalid)?
-            .iter().map(|entry| entry.decode::<crate::DfsMetadataShardConfig>()).collect::<std::result::Result<Vec<_>, _>>()?;
+        // One floor-checked publication supplies the filesystem and shard rows.
+        let snapshot = authority.write_configuration_snapshot()?.ok_or_else(invalid)?;
+        let (shards, filesystem) = snapshot.publication_configuration(&command.file_system_id)?.ok_or_else(invalid)?;
+        let filesystem = filesystem.ok_or_else(invalid)?;
         let selected = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &shards, &head.path)?.ok_or_else(invalid)?;
         if filesystem.file_system_id != command.file_system_id || head.file_system_id != command.file_system_id
             || head.object_id != command.object_id || &selected != assignment
             || &selected.primary_node_id != requester || !selected.replica_node_ids.contains(receiver)
         { return Err(invalid()); }
-        let generation = authority.with_current_publication_configuration(&command.file_system_id, |generation, current_shards, current_fs| {
-            (current_fs.as_ref() == Some(&filesystem)
-                && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &current_shards, &head.path)
-                    .is_ok_and(|current| current.as_ref() == Some(&selected))).then_some(generation)
-        })?.flatten().ok_or_else(invalid)?;
+        let generation = snapshot.projection_generation();
         Ok((filesystem, generation))
     }
 
@@ -777,9 +775,7 @@ pub(crate) struct NativeContentOnlyRepairAdmission {
     shard: crate::DfsMetadataShardConfig,
     filesystem: crate::DfsFileSystemConfig,
     receiver: sinomo_core::node::NodeId,
-    projection_generation: u64,
     authority_generation: u64,
-    configuration_origin: Arc<crate::DfsWriteConfigurationProjection>,
     content_identity: crate::content_store::ReceivedRepairFixtureIdentity,
     immutable_policy: crate::DfsReplicationPolicy,
 }
@@ -790,12 +786,10 @@ impl NativeContentOnlyRepairAdmission {
         self.provider.validate_content_only_repair_owner(&self.execution, &self.owner)?;
         let content_identity = self.provider.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
         if content_identity != self.content_identity { return Err(crate::DfsError::Metadata { message: "native content-only Repair physical content expectation changed".into() }); }
-        let (shard, filesystem, projection_generation, configuration) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver, &self.immutable_policy)?;
-        let authority_generation = self.provider.authority.generation();
-        let same_proof_origin = configuration.has_same_native_proof_origin(&self.configuration_origin);
-        if shard != self.shard || filesystem != self.filesystem || projection_generation < self.projection_generation
-            || !same_proof_origin
-            || authority_generation != self.authority_generation {
+        let (shard, filesystem, snapshot) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver, &self.immutable_policy)?;
+        // The admitted publication generation is the only configuration fence.
+        if shard != self.shard || filesystem != self.filesystem
+            || snapshot.generation() != self.authority_generation {
             #[cfg(any(test, feature = "test-support"))]
             {
                 use std::io::Write as _;
@@ -803,36 +797,18 @@ impl NativeContentOnlyRepairAdmission {
                 // A diagnostic write failure must preserve the original error.
                 let _ = writeln!(
                     std::io::stderr().lock(),
-                    "NATIVE_ORIGINAL_REPAIR_CONFIGURATION_CHANGED request={} intent={} receiver={} shard_equal={} filesystem_equal={} projection_expected={} projection_current={} authority_expected={} authority_current={} same_native_proof_origin={} revision_expected={} revision_current={}",
+                    "NATIVE_ORIGINAL_REPAIR_CONFIGURATION_CHANGED request={} intent={} receiver={} shard_equal={} filesystem_equal={} authority_expected={} authority_current={} revision_current={:?}",
                     material.original.command.request_id,
                     material.original.command.intent_id,
                     self.receiver,
                     shard == self.shard,
                     filesystem == self.filesystem,
-                    self.projection_generation,
-                    projection_generation,
                     self.authority_generation,
-                    authority_generation,
-                    same_proof_origin,
-                    self.configuration_origin.revision().0,
-                    configuration.revision().0,
+                    snapshot.generation(),
+                    snapshot.revision(),
                 );
             }
             return Err(crate::DfsError::Metadata { message: "native content-only Repair configuration advanced".into() });
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if projection_generation > self.projection_generation {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "NATIVE_ORIGINAL_REPAIR_CONTIGUOUS_CONFIGURATION request={} projection_expected={} projection_current={} authority={} same_native_proof_origin=true revision_expected={} revision_current={}",
-                material.original.command.request_id,
-                self.projection_generation,
-                projection_generation,
-                authority_generation,
-                self.configuration_origin.revision().0,
-                configuration.revision().0,
-            );
         }
         Ok(())
     }
@@ -933,21 +909,17 @@ impl DfsPublicationExecutionProvider {
         Ok(())
     }
 
-    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, immutable_policy: &crate::DfsReplicationPolicy) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, u64, Arc<crate::DfsWriteConfigurationProjection>), crate::DfsError> {
+    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, immutable_policy: &crate::DfsReplicationPolicy) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, Arc<crate::DfsConfigurationSnapshot>), crate::DfsError> {
         material.validate()?;
         crate::service_repair::ensure_repair_content_not_forbidden(receiver, immutable_policy, "selected receiver")?;
         let command = &material.original.command;
         let error = || crate::DfsError::Metadata { message: "content-only Repair has no exact current nonauthoring native configuration".into() };
         // This is the existing observed-consensus-floor check, with no new KV
-        // read/hydration. The legacy publication cache alone cannot certify it.
-        let snapshot = self.authority.current_original_repair_configuration(&command.file_system_id)?;
-        let view = &snapshot.view;
-        let key = crate::file_system_config_key(&command.file_system_id);
-        let filesystem = view.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key))
-            .ok_or_else(error)?.decode::<crate::DfsFileSystemConfig>()?;
+        // read/hydration. Every row below comes from this one publication.
+        let snapshot = self.authority.current_write_configuration_snapshot()?;
+        let (shards, filesystem) = snapshot.publication_configuration(&command.file_system_id)?.ok_or_else(error)?;
+        let filesystem = filesystem.ok_or_else(error)?;
         crate::service_repair::ensure_repair_content_hard_prohibitions(receiver, object, immutable_policy, &filesystem, "selected receiver")?;
-        let shards = view.entries(&crate::metadata_shards_prefix(&command.file_system_id)).ok_or_else(error)?
-            .iter().map(|entry| entry.decode::<crate::DfsMetadataShardConfig>()).collect::<std::result::Result<Vec<_>, _>>()?;
         let shard = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &shards, &object.path)?
             .ok_or_else(error)?;
         if filesystem.file_system_id != command.file_system_id
@@ -958,26 +930,16 @@ impl DfsPublicationExecutionProvider {
             || command.authority_shard.as_ref() != Some(&shard)
             || command.object_metadata.as_ref().is_none_or(|head| head.file_system_id != object.file_system_id || head.object_id != object.object_id || head.path != object.path)
         { return Err(error()); }
-        // These owned inputs came from one configuration -> projection locked
-        // capture. Every policy/semantic check runs after those locks release.
-        if snapshot.filesystem.as_ref() != Some(&filesystem)
-            || !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &command.file_system_id, &snapshot.shards, &object.path,
-            ).is_ok_and(|selected| selected.as_ref() == Some(&shard))
-        {
-            return Err(error());
-        }
-        Ok((shard, filesystem, snapshot.projection_generation, snapshot.view))
+        Ok((shard, filesystem, snapshot))
     }
 
     pub(crate) fn admit_content_only_original_repair(self: &Arc<Self>, execution: Arc<DfsPublicationExecutionOwners>, owner: DfsPublicationOwnerScope, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, intent: &crate::DfsWriteIntentRecord) -> std::result::Result<NativeContentOnlyRepairAdmission, crate::DfsError> {
         let intent = crate::service_repair::checked_selected_original_intent(material, receiver, Some(intent))?;
         crate::service_repair::ensure_repair_content_not_forbidden(receiver, &intent.policy, "selected receiver")?;
         self.validate_content_only_repair_owner(&execution, &owner)?;
-        let authority_generation = self.authority.generation();
         let content_identity = self.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
-        let (shard, filesystem, projection_generation, configuration_origin) = self.content_only_repair_configuration(material, object, receiver, &intent.policy)?;
-        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), projection_generation, authority_generation, configuration_origin, content_identity, immutable_policy: intent.policy.clone() };
+        let (shard, filesystem, snapshot) = self.content_only_repair_configuration(material, object, receiver, &intent.policy)?;
+        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), authority_generation: snapshot.generation(), content_identity, immutable_policy: intent.policy.clone() };
         admission.revalidate(material)?;
         Ok(admission)
     }
@@ -1618,36 +1580,22 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             {
                 return Err(invalid());
             }
-            let authority_generation = provider.authority.generation();
-            // This validates the existing resident native floor and continuous
-            // configuration before borrowing the cache-only publication cut.
-            let view = provider.authority.write_configuration_projection()
+            // One floor-checked publication supplies the filesystem policy and
+            // the shard route.
+            let snapshot = provider.authority.write_configuration_snapshot()
                 .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
                 .ok_or_else(invalid)?;
             let expected = crate::DfsFileSystemConfig::from(file_system);
-            let key = crate::file_system_config_key(&payload.file_system_id);
-            let actual = view.entries(&key)
-                .and_then(|entries| entries.iter().find(|entry| entry.key == key))
-                .ok_or_else(invalid)?
-                .decode::<crate::DfsFileSystemConfig>()
-                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
-            if actual != expected {
-                return Err(invalid());
-            }
-            let projection_generation = provider.authority.with_current_publication_configuration(
-                &payload.file_system_id,
-                |generation, shards, current| {
-                    (current.as_ref() == Some(&expected)
-                        && shards.iter().any(|shard| shard.shard_id == payload.shard_id.0
-                            && shard.primary_node_id == self.node_id
-                            && shard.epoch == payload.owner_epoch))
-                        .then_some(generation)
-                },
-            ).map_err(|error| MetadataBackendError::Serde(error.to_string()))?
-                .flatten().ok_or_else(invalid)?;
-            if provider.authority.generation() != authority_generation
-                || provider.authority.projection_generation() != projection_generation
-                || provider.authority.storage_generation() != provider.storage_generation
+            let (shards, actual) = snapshot.publication_configuration(&payload.file_system_id)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+                .ok_or_else(invalid)?;
+            // Every row comes from this one snapshot, so no generation
+            // re-check is needed; the commit point keeps its own fences.
+            if actual.as_ref() != Some(&expected)
+                || !shards.iter().any(|shard| shard.shard_id == payload.shard_id.0
+                    && shard.primary_node_id == self.node_id
+                    && shard.epoch == payload.owner_epoch)
+                || snapshot.storage_generation() != provider.storage_generation
             {
                 return Err(invalid());
             }

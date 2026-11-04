@@ -1,11 +1,5 @@
 use super::*;
 
-const DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS: usize = 8;
-#[cfg(test)]
-std::thread_local! {
-    pub(super) static AFTER_CACHED_METADATA_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-}
-
 #[cfg(test)]
 #[derive(Debug)]
 pub(super) enum DaemonDfsTestAuthoritativeExactSetOutcome {
@@ -13,37 +7,34 @@ pub(super) enum DaemonDfsTestAuthoritativeExactSetOutcome {
     Entries(Vec<Option<KvEntry>>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DaemonDfsRetainedMetadataSync {
-    Current,
-    ClientProjectionNewer,
+/// What one daemon client can borrow from the process-wide publication.
+enum DaemonDfsPublishedConfiguration {
+    /// This client has no retained owner; every read is a ReadIndex request.
+    Unowned,
+    /// A coherent publication is not available yet.
+    Pending,
+    Ready(Arc<sinomo_dfs::DfsConfigurationSnapshot>),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonDfsControlPlaneKvClient {
     pub(super) cluster_paths: ClusterPaths,
     pub(super) runtime: tokio::runtime::Handle,
-    /// Compact exact/prefix scopes established by daemon-owned ReadIndex
-    /// requests. The derived materialized checkpoint is deliberately never
-    /// admitted into this correctness-sensitive view.
-    pub(super) projection: Arc<Mutex<DaemonDfsAuthoritativeProjection>>,
-    /// Daemon-owned DFS clients borrow the process-wide, delta-maintained
-    /// `/dfs/filesystems/` authority certificate. The observed generation is
-    /// shared with cloned client handles, so a warm read pays one atomic load
-    /// and never takes the retained projection's mutex. A retained prefix
-    /// change or gap advances the shared projection generation and forces one
-    /// bounded local reseed before this client can use DFS state again.
+    /// Daemon-owned DFS clients read the process-wide published configuration
+    /// snapshot for its complete scopes. Every other key is one bounded
+    /// ReadIndex request, and nothing read through this client is retained.
     pub(super) retained_metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
     pub(super) write_configuration_projection_required: bool,
-    pub(super) retained_metadata_projection_generation: Arc<AtomicU64>,
+    /// Highest revision this client or its clones observed through its own
+    /// ReadIndex reads or commits. A publication older than it cannot answer
+    /// this client's later reads, so they stay monotonic.
+    pub(super) observed_revision: Arc<AtomicU64>,
     /// Cached and short-lived services normally retain only a weak capability;
     /// their surrounding blocking task owns the strong guard. This prevents a
     /// static message cache from pinning an old daemon's OS lock after shutdown.
     pub(super) data_owner_lock: Option<Weak<DaemonDataOwnerLock>>,
     /// Sandbox services may outlive the handler which opened them, so those
     /// services explicitly retain the strong capability for their lifetime.
-    #[cfg(test)]
-    pub(super) full_snapshot_refresh_calls: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(super) authoritative_exact_set_calls: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -64,13 +55,10 @@ impl DaemonDfsControlPlaneKvClient {
         Self {
             cluster_paths: cluster_paths.clone(),
             runtime: runtime.clone(),
-            projection: Arc::new(Mutex::new(DaemonDfsAuthoritativeProjection::default())),
             retained_metadata_authority: None,
             write_configuration_projection_required: false,
-            retained_metadata_projection_generation: Arc::new(AtomicU64::new(0)),
+            observed_revision: Arc::new(AtomicU64::new(0)),
             data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
-            #[cfg(test)]
-            full_snapshot_refresh_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_exact_set_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -93,37 +81,6 @@ impl DaemonDfsControlPlaneKvClient {
         client
     }
 
-    pub(super) fn new_seeded_on_runtime(
-        cluster_paths: &ClusterPaths,
-        runtime: &tokio::runtime::Handle,
-        authoritative_prefix: Option<sinomo_dfs::DfsAuthoritativePrefixProjection>,
-    ) -> Self {
-        let client = Self::new_daemon_client_on_runtime(cluster_paths, runtime);
-        let Some(authoritative_prefix) = authoritative_prefix else {
-            return client;
-        };
-        if !authoritative_prefix.is_complete() {
-            return client;
-        }
-        let (entries, revision, _) = authoritative_prefix.into_parts();
-        let Ok(mut projection) = client.projection.lock() else {
-            return client;
-        };
-        projection.revision = revision;
-        projection
-            .prefix_entries
-            .insert(DAEMON_DFS_METADATA_AUTHORITY_PREFIX.to_string(), entries);
-        if !projection.fits_resource_bounds() {
-            projection.clear_scopes();
-        }
-        // The caller's seed may have raced a topology generation change after
-        // it was captured. Force the first read to compare it with the shared
-        // generation before admitting any cached value.
-        client.invalidate_retained_metadata_authority_seed();
-        drop(projection);
-        client
-    }
-
     pub(super) fn discover_retained_metadata_authority(
         cluster_paths: &ClusterPaths,
         runtime: &tokio::runtime::Handle,
@@ -138,235 +95,6 @@ impl DaemonDfsControlPlaneKvClient {
         .ok()
     }
 
-    pub(super) fn retained_metadata_authority_covers_key(&self, key: &str) -> bool {
-        self.retained_metadata_authority.is_some()
-            && key.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
-    }
-
-    pub(super) fn retained_metadata_authority_covers_prefix(&self, prefix: &str) -> bool {
-        self.retained_metadata_authority.is_some()
-            && prefix.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
-    }
-
-    pub(super) fn retained_metadata_authority_is_current(&self) -> bool {
-        self.retained_metadata_authority
-            .as_ref()
-            .is_some_and(|authority| {
-                self.retained_metadata_projection_generation
-                    .load(Ordering::Acquire)
-                    == authority.projection_generation()
-            })
-    }
-
-    pub(super) fn invalidate_retained_metadata_authority_seed(&self) {
-        self.retained_metadata_projection_generation
-            .store(0, Ordering::Release);
-    }
-
-    /// Import the daemon's already-authorized DFS prefix into this client's
-    /// private compact view. The hot path is an atomic generation comparison;
-    /// only a cold client or a committed topology change clones the bounded
-    /// retained prefix. A client can already hold a newer exact/prefix
-    /// ReadIndex proof while the shared committed-delta observer is catching
-    /// up. Preserve that newer proof and request one shared refresh; callers
-    /// may use covered private scopes and issue one bounded direct read only
-    /// for a scope the newer projection does not cover.
-    #[tracing::instrument(
-        target = "sinomo.perf",
-        level = "trace",
-        name = "dfs.control_plane.authority_sync",
-        skip_all,
-        fields(stage = "dfs.control_plane.authority_sync")
-    )]
-    pub(super) fn synchronize_retained_metadata_authority(
-        &self,
-    ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
-        if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
-            return Ok(synchronized);
-        }
-        // Browser/restore workers are synchronous, but a missing certificate
-        // must join the shared ReadIndex before this operation reads metadata.
-        // No private projection lock is held across the runtime bridge.
-        block_on_dfs_cluster_future(&self.runtime, async {
-            Ok(self.synchronize_retained_metadata_authority_async().await)
-        })?
-    }
-
-    async fn synchronize_retained_metadata_authority_async(
-        &self,
-    ) -> Result<DaemonDfsRetainedMetadataSync, KvError> {
-        if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
-            return Ok(synchronized);
-        }
-        let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
-            self.superseded_authority_error("missing retained DFS metadata authority")
-        })?;
-        let refresh = async {
-            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-                let generation = authority.generation();
-                // One in-flight shared refresh owns the proof. Its completion
-                // can change topology or be superseded by a newer revision;
-                // replan against the resulting generation, never the old one.
-                let proof = authority
-                    .ensure_complete_prefix_for_generation_async(
-                        generation,
-                        #[cfg(test)]
-                        None,
-                    )
-                    .await;
-                if proof.is_some() && self.write_configuration_projection_required {
-                    // The filesystem prefix publishes before the shared
-                    // content/provider bundle. Join that same owner within
-                    // this synchronization's original timeout and replan cap.
-                    authority
-                        .ensure_write_configuration_ready_async()
-                        .await
-                        .map_err(|error| KvError::AuthorityUnavailable {
-                            detail: error.to_string(),
-                        })?;
-                }
-                if let Some(synchronized) = self.try_synchronize_retained_configuration()? {
-                    return Ok(synchronized);
-                }
-            }
-            Err(KvError::AuthorityUnavailable {
-                detail: format!(
-                    "daemon DFS retained metadata authority generation {} is not ready after bounded refresh",
-                    authority.generation(),
-                ),
-            })
-        };
-        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, refresh)
-            .await
-            .map_err(|_| KvError::AuthorityUnavailable {
-                detail: format!(
-                    "daemon DFS retained metadata authority generation {} is not ready: refresh deadline elapsed",
-                    authority.generation(),
-                ),
-            })?
-    }
-
-    /// sinomo:kv-configuration: A daemon client requiring the shared configuration may lend its compact prefix only after the same retained bundle is ready at the native floor.
-    fn try_synchronize_retained_configuration(
-        &self,
-    ) -> Result<Option<DaemonDfsRetainedMetadataSync>, KvError> {
-        let synchronized = self.try_synchronize_retained_metadata_authority()?;
-        if synchronized.is_some() && self.write_configuration_projection_required {
-            let authority = self.retained_metadata_authority.as_ref().ok_or_else(|| {
-                self.superseded_authority_error("missing required write configuration owner")
-            })?;
-            if matches!(
-                authority.write_configuration_readiness().map_err(|error| {
-                    KvError::AuthorityUnavailable {
-                        detail: error.to_string(),
-                    }
-                })?,
-                crate::DfsWriteConfigurationReadiness::Pending
-            ) {
-                return Ok(None);
-            }
-        }
-        Ok(synchronized)
-    }
-
-    fn try_synchronize_retained_metadata_authority(
-        &self,
-    ) -> Result<Option<DaemonDfsRetainedMetadataSync>, KvError> {
-        let Some(authority) = self.retained_metadata_authority.as_ref() else {
-            return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
-        };
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let projection_generation = authority.projection_generation();
-            if self
-                .retained_metadata_projection_generation
-                .load(Ordering::Acquire)
-                == projection_generation
-            {
-                return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
-            }
-            let authority_generation = authority.generation();
-            #[cfg(any(test, feature = "test-support"))]
-            let (authoritative_prefix, native_seed) = if let (Some(root), Some(owner)) =
-                (self.cluster_paths.root.parent(), self.data_owner_lock())
-            {
-                crate::native_shard_trace::capture_retained_metadata_seed(root, &owner, || {
-                    authority.load_complete_prefix_for_generation(authority_generation)
-                })
-            } else {
-                (
-                    authority.load_complete_prefix_for_generation(authority_generation),
-                    None,
-                )
-            };
-            #[cfg(not(any(test, feature = "test-support")))]
-            let authoritative_prefix =
-                authority.load_complete_prefix_for_generation(authority_generation);
-            let Some(authoritative_prefix) = authoritative_prefix else {
-                self.invalidate_retained_metadata_authority_seed();
-                return Ok(None);
-            };
-            if authority.generation() != authority_generation
-                || authority.projection_generation() != projection_generation
-            {
-                continue;
-            }
-            let (entries, revision, _) = authoritative_prefix.into_parts();
-            let mut projection = self
-                .projection
-                .lock()
-                .map_err(|_| self.projection_lock_error())?;
-            if projection.revision > revision {
-                let required_revision = projection.revision;
-                drop(projection);
-                authority.require_authoritative_revision(required_revision);
-                self.invalidate_retained_metadata_authority_seed();
-                return Ok(Some(DaemonDfsRetainedMetadataSync::ClientProjectionNewer));
-            }
-            projection.clear_scopes();
-            projection.revision = revision;
-            projection
-                .prefix_entries
-                .insert(DAEMON_DFS_METADATA_AUTHORITY_PREFIX.to_string(), entries);
-            if !projection.fits_resource_bounds() {
-                projection.clear_scopes();
-                drop(projection);
-                self.invalidate_retained_metadata_authority_seed();
-                return Err(KvError::ResourceExhausted {
-                    operation: "daemon DFS retained metadata authority projection".to_string(),
-                    requested_bytes: DFS_AUTHORITY_PROJECTION_MAX_BYTES.saturating_add(1),
-                });
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                projection.native_retained_seed = native_seed.filter(|seed| {
-                    seed.revision == revision
-                        && seed.projection_generation == projection_generation
-                        && projection
-                            .prefix_entries
-                            .get(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
-                            == Some(&seed.entries)
-                });
-            }
-            self.retained_metadata_projection_generation
-                .store(projection_generation, Ordering::Release);
-            drop(projection);
-            if authority.generation() == authority_generation
-                && authority.projection_generation() == projection_generation
-            {
-                #[cfg(any(test, feature = "test-support"))]
-                self.record_native_retained_use(
-                    crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedPrefixSeed {
-                        prefix: DAEMON_DFS_METADATA_AUTHORITY_PREFIX,
-                    },
-                    None,
-                );
-                return Ok(Some(DaemonDfsRetainedMetadataSync::Current));
-            }
-            self.invalidate_retained_metadata_authority_seed();
-        }
-        Err(self.superseded_authority_error("shared retained DFS metadata prefix"))
-    }
-
     pub(super) fn discover_data_owner_lock(
         cluster_paths: &ClusterPaths,
     ) -> Option<Arc<DaemonDataOwnerLock>> {
@@ -376,45 +104,6 @@ impl DaemonDfsControlPlaneKvClient {
             .map(SinomoDataDir::new)
             .map(|data_dir| DaemonPaths::new(&data_dir))
             .and_then(|paths| daemon_dfs_data_owner_lock(&paths).ok().flatten())
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn record_native_retained_use(
-        &self,
-        scope: crate::native_shard_trace::NativeControlConsumptionScopeV1,
-        expected: Option<(u64, KvRevision)>,
-    ) {
-        let (Some(root), Some(owner)) = (self.cluster_paths.root.parent(), self.data_owner_lock())
-        else {
-            return;
-        };
-        if !crate::native_shard_trace::has_root_interest(root, &owner) {
-            return;
-        }
-        let Ok(projection) = self.projection.lock() else {
-            return;
-        };
-        if expected.is_some_and(|(generation, revision)| {
-            projection.generation != generation || projection.revision != revision
-        }) {
-            return;
-        }
-        let Some(seed) = projection.native_retained_seed.as_ref() else {
-            return;
-        };
-        if seed.revision != projection.revision
-            || self
-                .retained_metadata_projection_generation
-                .load(Ordering::Acquire)
-                != seed.projection_generation
-            || projection
-                .prefix_entries
-                .get(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
-                != Some(&seed.entries)
-        {
-            return;
-        }
-        crate::native_shard_trace::record_retained_control_use(root, &owner, seed, scope);
     }
 
     pub(super) fn data_owner_lock(&self) -> Option<Arc<DaemonDataOwnerLock>> {
@@ -429,91 +118,227 @@ impl DaemonDfsControlPlaneKvClient {
             })
     }
 
-    pub(super) fn projection_lock_error(&self) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.root.display().to_string(),
-            detail: "DFS authoritative KV projection lock is poisoned".to_string(),
+    /// Highest revision this client or one of its clones read or committed.
+    pub(super) fn observed_revision(&self) -> KvRevision {
+        KvRevision(self.observed_revision.load(Ordering::Acquire))
+    }
+
+    fn observe_revision(&self, revision: KvRevision) {
+        self.observed_revision
+            .fetch_max(revision.0, Ordering::AcqRel);
+    }
+
+    fn authority_unavailable(error: impl std::fmt::Display) -> KvError {
+        KvError::AuthorityUnavailable {
+            detail: error.to_string(),
         }
     }
 
-    pub(super) fn begin_authoritative_generation(&self) -> Result<(), KvError> {
-        self.invalidate_retained_metadata_authority_seed();
-        self.projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?
-            .begin_generation();
-        Ok(())
+    /// sinomo:kv-configuration: Lend the process-wide published configuration only after its native authority floor check.
+    fn published_configuration(&self) -> Result<DaemonDfsPublishedConfiguration, KvError> {
+        let Some(authority) = self.retained_metadata_authority.as_ref() else {
+            return Ok(DaemonDfsPublishedConfiguration::Unowned);
+        };
+        let snapshot = if self.write_configuration_projection_required {
+            authority
+                .checked_configuration_snapshot()
+                .map_err(Self::authority_unavailable)?
+        } else {
+            Some(authority.configuration_snapshot())
+        };
+        Ok(match snapshot {
+            Some(snapshot) if snapshot.revision().is_some() => {
+                DaemonDfsPublishedConfiguration::Ready(snapshot)
+            }
+            _ => DaemonDfsPublishedConfiguration::Pending,
+        })
     }
 
-    pub(super) fn begin_authoritative_generation_at_revision(
+    /// Wait for the shared publication under one network deadline. Every edge
+    /// that withdrew it already requested the shared refresh; this client
+    /// never starts one.
+    async fn wait_for_published_configuration(
         &self,
-        revision: KvRevision,
-    ) -> Result<(), KvError> {
-        self.projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?
-            .begin_generation_at_revision(revision);
-        Ok(())
+    ) -> Result<Option<Arc<sinomo_dfs::DfsConfigurationSnapshot>>, KvError> {
+        let Some(authority) = self.retained_metadata_authority.as_ref() else {
+            return Ok(None);
+        };
+        let mut published = authority.subscribe_configuration_snapshot();
+        let wait = async {
+            loop {
+                match self.published_configuration()? {
+                    DaemonDfsPublishedConfiguration::Unowned => return Ok(None),
+                    DaemonDfsPublishedConfiguration::Ready(snapshot) => return Ok(Some(snapshot)),
+                    DaemonDfsPublishedConfiguration::Pending => {}
+                }
+                if published.changed().await.is_err() {
+                    return Err(KvError::AuthorityUnavailable {
+                        detail: "daemon DFS configuration publication closed".into(),
+                    });
+                }
+            }
+        };
+        let host = dfs_runtime_host_for_cluster_paths(&self.cluster_paths).ok();
+        let stopped = async {
+            match host.as_ref() {
+                Some(host) => host.wait_for_shutdown().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            ready = tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, wait) => {
+                ready.map_err(|_| KvError::AuthorityUnavailable {
+                    detail: format!(
+                        "daemon DFS retained metadata authority generation {} is not ready: refresh deadline elapsed",
+                        authority.generation(),
+                    ),
+                })?
+            }
+            () = stopped => Err(KvError::AuthorityUnavailable {
+                detail: "daemon DFS component is stopping".into(),
+            }),
+        }
     }
 
-    pub(super) fn entry_read_plan(
+    fn snapshot_for_read(
         &self,
-        key: &str,
-    ) -> Result<(u64, KvRevision, Option<Option<KvEntry>>), KvError> {
-        let projection = self
-            .projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?;
-        Ok((
-            projection.generation,
-            projection.revision,
-            projection.cached_entry(key),
-        ))
+    ) -> Result<Option<Arc<sinomo_dfs::DfsConfigurationSnapshot>>, KvError> {
+        match self.published_configuration()? {
+            DaemonDfsPublishedConfiguration::Unowned => Ok(None),
+            DaemonDfsPublishedConfiguration::Ready(snapshot) => Ok(Some(snapshot)),
+            // Browser/restore workers are synchronous, but a filesystem read
+            // must wait for the shared publication. No lock is held here.
+            DaemonDfsPublishedConfiguration::Pending => {
+                block_on_dfs_cluster_future(&self.runtime, async {
+                    Ok(self.wait_for_published_configuration().await)
+                })?
+            }
+        }
     }
 
-    pub(super) fn entries_read_plan(
+    async fn snapshot_for_read_async(
         &self,
-        keys: &[String],
-    ) -> Result<(u64, KvRevision, Option<Vec<Option<KvEntry>>>), KvError> {
-        let projection = self
-            .projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?;
-        Ok((
-            projection.generation,
-            projection.revision,
-            projection.cached_entries(keys),
-        ))
+    ) -> Result<Option<Arc<sinomo_dfs::DfsConfigurationSnapshot>>, KvError> {
+        match self.published_configuration()? {
+            DaemonDfsPublishedConfiguration::Unowned => Ok(None),
+            DaemonDfsPublishedConfiguration::Ready(snapshot) => Ok(Some(snapshot)),
+            DaemonDfsPublishedConfiguration::Pending => {
+                self.wait_for_published_configuration().await
+            }
+        }
     }
 
-    #[tracing::instrument(
-        target = "sinomo.perf",
-        level = "trace",
-        name = "dfs.control_plane.prefix_cache",
-        skip_all,
-        fields(stage = "dfs.control_plane.prefix_cache")
-    )]
-    pub(super) fn prefix_read_plan(
+    fn may_cover(&self, prefix: &str) -> bool {
+        self.retained_metadata_authority.is_some()
+            && if self.write_configuration_projection_required {
+                crate::write_configuration_projection::DFS_WRITE_CONFIGURATION_PREFIXES
+                    .iter()
+                    .any(|scope| prefix.starts_with(scope))
+            } else {
+                prefix.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
+            }
+    }
+
+    fn covers(&self, snapshot: &sinomo_dfs::DfsConfigurationSnapshot, prefix: &str) -> bool {
+        snapshot.entries(prefix).is_some()
+            && snapshot
+                .revision()
+                .is_some_and(|revision| revision >= self.observed_revision())
+    }
+
+    /// This client already observed a newer committed revision than the
+    /// shared publication. For the filesystem scope that is a possible
+    /// catch-up edge for the publication. Either way this read is answered by
+    /// its own ReadIndex.
+    fn behind_observed_revision(
+        &self,
+        snapshot: &sinomo_dfs::DfsConfigurationSnapshot,
+        prefix: &str,
+    ) -> bool {
+        let observed = self.observed_revision();
+        if snapshot
+            .revision()
+            .is_none_or(|revision| revision >= observed)
+        {
+            return false;
+        }
+        if prefix.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX)
+            && let Some(authority) = self.retained_metadata_authority.as_ref()
+        {
+            authority.observe_client_revision(observed);
+        }
+        true
+    }
+
+    /// The publication answering a read inside its complete scopes. A
+    /// filesystem read waits for a pending publication; other scopes use an
+    /// already ready one and otherwise issue their own ReadIndex request.
+    fn covering_snapshot(
         &self,
         prefix: &str,
-    ) -> Result<(u64, KvRevision, Option<Vec<KvEntry>>), KvError> {
-        let projection = self
-            .projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?;
-        Ok((
-            projection.generation,
-            projection.revision,
-            projection.cached_prefix(prefix),
-        ))
+    ) -> Result<Option<Arc<sinomo_dfs::DfsConfigurationSnapshot>>, KvError> {
+        if !self.may_cover(prefix) {
+            return Ok(None);
+        }
+        let snapshot = if prefix.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX) {
+            self.snapshot_for_read()?
+        } else {
+            match self.published_configuration()? {
+                DaemonDfsPublishedConfiguration::Ready(snapshot) => Some(snapshot),
+                _ => None,
+            }
+        };
+        Ok(snapshot.filter(|snapshot| {
+            !self.behind_observed_revision(snapshot, prefix) && self.covers(snapshot, prefix)
+        }))
     }
 
-    pub(super) fn merge_authoritative_entries(
+    async fn covering_snapshot_async(
         &self,
-        generation: u64,
+        prefix: &str,
+    ) -> Result<Option<Arc<sinomo_dfs::DfsConfigurationSnapshot>>, KvError> {
+        if !self.may_cover(prefix) {
+            return Ok(None);
+        }
+        let snapshot = if prefix.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX) {
+            self.snapshot_for_read_async().await?
+        } else {
+            match self.published_configuration()? {
+                DaemonDfsPublishedConfiguration::Ready(snapshot) => Some(snapshot),
+                _ => None,
+            }
+        };
+        Ok(snapshot.filter(|snapshot| {
+            !self.behind_observed_revision(snapshot, prefix) && self.covers(snapshot, prefix)
+        }))
+    }
+
+    fn published_entries(
+        snapshot: &sinomo_dfs::DfsConfigurationSnapshot,
         keys: &[String],
-        read: &sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>,
-    ) -> Result<bool, KvError> {
+    ) -> Vec<Option<KvEntry>> {
+        keys.iter()
+            .map(|key| snapshot.entry(key).flatten().cloned())
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn injected_operation_floor_read_error(&self, key: &str) -> Option<KvError> {
+        self.retained_metadata_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                crate::test_runtime::native_operation_floor_read_is_denied(authority.as_ref(), key)
+            })
+            .then(|| KvError::Io {
+                path: self.cluster_paths.root.display().to_string(),
+                detail: "resident Raft view changed after ReadIndex quorum; retry the read (injected native operation-floor return)".into(),
+            })
+    }
+
+    fn checked_exact_set(
+        keys: &[String],
+        read: sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
         if keys.len() != read.value.len() {
             return Err(KvError::Serialization {
                 detail: format!(
@@ -532,55 +357,13 @@ impl DaemonDfsControlPlaneKvClient {
                 });
             }
         }
-        let mut projection = self
-            .projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?;
-        let revision = read.authority.revision;
-        if projection.generation != generation || revision < projection.revision {
-            return Ok(false);
-        }
-        if revision > projection.revision {
-            self.invalidate_retained_metadata_authority_seed();
-            projection.clear_scopes();
-            projection.revision = revision;
-        }
-        for (key, entry) in keys.iter().zip(&read.value) {
-            projection.exact_entries.insert(key.clone(), entry.clone());
-        }
-        if !projection.fits_resource_bounds() {
-            self.invalidate_retained_metadata_authority_seed();
-            projection.clear_scopes();
-            for (key, entry) in keys.iter().zip(&read.value) {
-                projection.exact_entries.insert(key.clone(), entry.clone());
-            }
-        }
-        if !projection.fits_resource_bounds() {
-            self.invalidate_retained_metadata_authority_seed();
-            projection.clear_scopes();
-            return Err(KvError::ResourceExhausted {
-                operation: "daemon DFS authoritative exact-key projection".to_string(),
-                requested_bytes: keys.iter().zip(&read.value).fold(
-                    0_usize,
-                    |bytes, (key, entry)| {
-                        bytes.saturating_add(key.len()).saturating_add(
-                            entry.as_ref().map_or(0, |entry| {
-                                entry.key.len().saturating_add(entry.value.len())
-                            }),
-                        )
-                    },
-                ),
-            });
-        }
-        Ok(true)
+        Ok(read.value)
     }
 
-    pub(super) fn merge_authoritative_prefix(
-        &self,
-        generation: u64,
+    fn checked_prefix(
         prefix: &str,
         read: &sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
-    ) -> Result<bool, KvError> {
+    ) -> Result<(), KvError> {
         if let Some(entry) = read
             .value
             .iter()
@@ -593,42 +376,7 @@ impl DaemonDfsControlPlaneKvClient {
                 ),
             });
         }
-        let mut projection = self
-            .projection
-            .lock()
-            .map_err(|_| self.projection_lock_error())?;
-        let revision = read.authority.revision;
-        if projection.generation != generation || revision < projection.revision {
-            return Ok(false);
-        }
-        if revision > projection.revision {
-            self.invalidate_retained_metadata_authority_seed();
-            projection.clear_scopes();
-            projection.revision = revision;
-        }
-        projection
-            .prefix_entries
-            .insert(prefix.to_string(), read.value.clone());
-        if !projection.fits_resource_bounds() {
-            self.invalidate_retained_metadata_authority_seed();
-            projection.clear_scopes();
-            projection
-                .prefix_entries
-                .insert(prefix.to_string(), read.value.clone());
-        }
-        if !projection.fits_resource_bounds() {
-            self.invalidate_retained_metadata_authority_seed();
-            projection.clear_scopes();
-            return Err(KvError::ResourceExhausted {
-                operation: "daemon DFS authoritative prefix projection".to_string(),
-                requested_bytes: read.value.iter().fold(prefix.len(), |bytes, entry| {
-                    bytes
-                        .saturating_add(entry.key.len())
-                        .saturating_add(entry.value.len())
-                }),
-            });
-        }
-        Ok(true)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -668,10 +416,12 @@ impl DaemonDfsControlPlaneKvClient {
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
         let cluster = self.cluster_access()?;
-        block_on_dfs_cluster_future(
+        let read = block_on_dfs_cluster_future(
             &self.runtime,
             cluster.kv_get_authoritative_exact_set_async(keys.to_vec()),
-        )
+        )?;
+        self.observe_revision(read.authority.revision);
+        Ok(read)
     }
 
     #[tracing::instrument(
@@ -693,7 +443,7 @@ impl DaemonDfsControlPlaneKvClient {
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
         let cluster = self.cluster_access()?;
-        block_on_dfs_cluster_future(&self.runtime, async move {
+        let read = block_on_dfs_cluster_future(&self.runtime, async move {
             tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
                 cluster.kv_get_authoritative_exact_set_async(keys.to_vec()),
@@ -704,7 +454,9 @@ impl DaemonDfsControlPlaneKvClient {
                     "DFS authoritative exact-set read exceeded its deadline".to_string(),
                 )
             })?
-        })
+        })?;
+        self.observe_revision(read.authority.revision);
+        Ok(read)
     }
 
     #[tracing::instrument(
@@ -741,7 +493,10 @@ impl DaemonDfsControlPlaneKvClient {
         if let Err(error) = &result {
             span.record("error", tracing::field::display(error));
         }
-        result
+        let read = result?;
+        Self::checked_prefix(prefix, &read)?;
+        self.observe_revision(read.authority.revision);
+        Ok(read)
     }
 
     async fn fetch_authoritative_entries_async(
@@ -754,10 +509,13 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
-        self.cluster_access()?
+        let read = self
+            .cluster_access()?
             .kv_get_authoritative_exact_set_async(keys)
             .await
-            .map_err(dfs_cluster_service_error)
+            .map_err(dfs_cluster_service_error)?;
+        self.observe_revision(read.authority.revision);
+        Ok(read)
     }
 
     async fn fetch_authoritative_entries_before_async(
@@ -772,7 +530,7 @@ impl DaemonDfsControlPlaneKvClient {
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
         let cluster = self.cluster_access()?;
-        tokio::time::timeout_at(
+        let read = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             cluster.kv_get_authoritative_exact_set_async(keys),
         )
@@ -780,7 +538,9 @@ impl DaemonDfsControlPlaneKvClient {
         .map_err(|_| KvError::AuthorityUnavailable {
             detail: "DFS authoritative exact-set read exceeded its deadline".to_string(),
         })?
-        .map_err(dfs_cluster_service_error)
+        .map_err(dfs_cluster_service_error)?;
+        self.observe_revision(read.authority.revision);
+        Ok(read)
     }
 
     async fn fetch_authoritative_prefix_async(
@@ -793,19 +553,14 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         }
-        self.cluster_access()?
-            .kv_range_prefix_authoritative_async(prefix)
+        let read = self
+            .cluster_access()?
+            .kv_range_prefix_authoritative_async(prefix.clone())
             .await
-            .map_err(dfs_cluster_service_error)
-    }
-
-    pub(super) fn superseded_authority_error(&self, scope: &str) -> KvError {
-        KvError::AuthorityUnavailable {
-            detail: format!(
-                "daemon DFS authoritative projection for {scope:?} was superseded by {} consecutive generation changes",
-                DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS,
-            ),
-        }
+            .map_err(dfs_cluster_service_error)?;
+        Self::checked_prefix(&prefix, &read)?;
+        self.observe_revision(read.authority.revision);
+        Ok(read)
     }
 }
 
@@ -978,6 +733,19 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         Some(self)
     }
 
+    fn configuration_snapshot(
+        &self,
+    ) -> Result<Option<Arc<sinomo_dfs::DfsConfigurationSnapshot>>, KvError> {
+        match self.published_configuration()? {
+            DaemonDfsPublishedConfiguration::Unowned => Ok(None),
+            DaemonDfsPublishedConfiguration::Ready(snapshot) => Ok(Some(snapshot)),
+            DaemonDfsPublishedConfiguration::Pending => Err(KvError::AuthorityUnavailable {
+                detail: "DFS write configuration is awaiting a coherent authoritative projection"
+                    .into(),
+            }),
+        }
+    }
+
     fn write_configuration_projection(
         &self,
     ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, KvError> {
@@ -1001,91 +769,44 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 detail: "daemon write configuration owner is unavailable".into(),
             });
         };
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let generation = authority.generation();
-            let readiness = authority.write_configuration_readiness().map_err(|error| {
-                KvError::AuthorityUnavailable {
-                    detail: error.to_string(),
-                }
-            })?;
-            if matches!(
-                &readiness,
-                crate::DfsWriteConfigurationReadiness::Ready(Some(_))
-            ) {
-                if !matches!(
-                    self.try_synchronize_retained_metadata_authority()?,
-                    Some(DaemonDfsRetainedMetadataSync::Current)
-                ) {
-                    return Ok(crate::DfsWriteConfigurationReadiness::Pending);
-                }
-                if authority.generation() != generation {
-                    // A complete committed delta can change the generation
-                    // during the floor read without withdrawing configuration.
-                    // Re-read that same owner's cut and validate its native
-                    // floor again; never lend the superseded view or turn this
-                    // local observation race into an unavailable projection.
-                    continue;
-                }
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            if let crate::DfsWriteConfigurationReadiness::Ready(Some(view)) = &readiness {
-                if let Some(root) = self.cluster_paths.root.parent() {
-                    crate::native_shard_trace::record_configuration_cut(
-                        root,
-                        self.data_owner_lock().as_ref(),
-                        view,
-                        generation,
-                    );
-                }
-            }
-            return Ok(readiness);
+        let Some(snapshot) = authority
+            .checked_configuration_snapshot()
+            .map_err(Self::authority_unavailable)?
+        else {
+            return Ok(crate::DfsWriteConfigurationReadiness::Pending);
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        if let (Some(view), Some(root)) = (
+            snapshot.write_configuration(),
+            self.cluster_paths.root.parent(),
+        ) {
+            crate::native_shard_trace::record_configuration_cut(
+                root,
+                self.data_owner_lock().as_ref(),
+                view,
+                snapshot.generation(),
+            );
         }
-        Ok(crate::DfsWriteConfigurationReadiness::Pending)
+        Ok(crate::DfsWriteConfigurationReadiness::Ready(
+            snapshot.write_configuration().cloned(),
+        ))
     }
 
     fn cached_metadata_shards(
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Option<Vec<crate::DfsMetadataShardConfig>>, KvError> {
-        let Some(authority) = self.retained_metadata_authority.as_ref() else {
+        let prefix = crate::metadata_shards_prefix(file_system_id);
+        let Some(snapshot) = self.covering_snapshot(&prefix)? else {
             return Ok(None);
         };
-        if self.synchronize_retained_metadata_authority()? != DaemonDfsRetainedMetadataSync::Current
-        {
-            return Ok(None);
-        }
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let generation = self
-                .retained_metadata_projection_generation
-                .load(Ordering::Acquire);
-            #[cfg(test)]
-            {
-                let hook = AFTER_CACHED_METADATA_SYNC.with(|slot| slot.borrow_mut().take());
-                if let Some(hook) = hook {
-                    hook();
-                }
-            }
-            let shards = authority.cached_metadata_shards(file_system_id, generation)?;
-            if authority.projection_generation() == generation {
-                return Ok(shards);
-            }
-            // A complete committed delta can advance between synchronization
-            // and the indexed read. Rebind only an already-complete local cut;
-            // do not restart the original synchronization's I/O or timeout.
-            if self.try_synchronize_retained_configuration()?
-                != Some(DaemonDfsRetainedMetadataSync::Current)
-            {
-                return Ok(None);
-            }
-        }
-        Err(self.superseded_authority_error("cached metadata shard index"))
+        snapshot.metadata_shards(file_system_id)
     }
 
     fn refresh_latest(&mut self) -> Result<(), KvError> {
-        // Invalidate only this client's compact view. The next requested exact
-        // key or prefix establishes a fresh bounded ReadIndex projection; a
-        // refresh must never import the complete materialized checkpoint.
-        self.begin_authoritative_generation()
+        // Nothing read through this client is retained. Published scopes are
+        // already current, and every other key is its own ReadIndex request.
+        Ok(())
     }
 
     fn placement_authority_process_identity(
@@ -1132,138 +853,37 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
 
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         let keys = [key.to_string()];
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let retained = self.retained_metadata_authority_covers_key(key);
-            let retained_sync = retained
-                .then(|| self.synchronize_retained_metadata_authority())
-                .transpose()?
-                .unwrap_or(DaemonDfsRetainedMetadataSync::Current);
-            let (generation, _minimum_revision, cached) = self.entry_read_plan(key)?;
-            if let Some(cached) = cached {
-                if retained
-                    && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                    && !self.retained_metadata_authority_is_current()
-                {
-                    self.invalidate_retained_metadata_authority_seed();
-                    continue;
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                if self
-                    .retained_metadata_authority
-                    .as_ref()
-                    .is_some_and(|authority| {
-                        crate::test_runtime::native_operation_floor_read_is_denied(
-                            authority.as_ref(),
-                            key,
-                        )
-                    })
-                {
-                    return Err(KvError::Io {
-                        path: self.cluster_paths.root.display().to_string(),
-                        detail: "resident Raft view changed after ReadIndex quorum; retry the read (injected native operation-floor return)".into(),
-                    });
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                    self.record_native_retained_use(
-                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.to_vec(), values: vec![cached.clone()] },
-                        Some((generation, _minimum_revision)),
-                    );
-                }
-                return Ok(cached);
-            }
-            if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                // A complete retained prefix proves both presence and absence.
-                // A miss here means another operation replaced the private
-                // projection after synchronization; reseed instead of issuing
-                // an independent exact-key ReadIndex.
-                self.invalidate_retained_metadata_authority_seed();
-                continue;
-            }
-            let read = self.fetch_authoritative_entries(&keys)?;
-            if self.merge_authoritative_entries(generation, &keys, &read)? {
-                #[cfg(any(test, feature = "test-support"))]
-                if self
-                    .retained_metadata_authority
-                    .as_ref()
-                    .is_some_and(|authority| {
-                        crate::test_runtime::native_operation_floor_read_is_denied(
-                            authority.as_ref(),
-                            key,
-                        )
-                    })
-                {
-                    return Err(KvError::Io {
-                        path: self.cluster_paths.root.display().to_string(),
-                        detail: "resident Raft view changed after ReadIndex quorum; retry the read (injected native operation-floor return)".into(),
-                    });
-                }
-                return Ok(read.value.into_iter().next().flatten());
-            }
+        let value = match self.covering_snapshot(key)? {
+            Some(snapshot) => Self::published_entries(&snapshot, &keys),
+            None => Self::checked_exact_set(&keys, self.fetch_authoritative_entries(&keys)?)?,
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(error) = self.injected_operation_floor_read_error(key) {
+            return Err(error);
         }
-        Err(self.superseded_authority_error(key))
+        Ok(value.into_iter().next().flatten())
     }
 
     fn get_consistent(&self, keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let retained = keys
-                .iter()
-                .any(|key| self.retained_metadata_authority_covers_key(key));
-            let retained_sync = retained
-                .then(|| self.synchronize_retained_metadata_authority())
-                .transpose()?
-                .unwrap_or(DaemonDfsRetainedMetadataSync::Current);
-            let (generation, _minimum_revision, cached) = self.entries_read_plan(keys)?;
-            if let Some(cached) = cached {
-                if retained
-                    && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                    && !self.retained_metadata_authority_is_current()
-                {
-                    self.invalidate_retained_metadata_authority_seed();
-                    continue;
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                    self.record_native_retained_use(
-                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.to_vec(), values: cached.clone() },
-                        Some((generation, _minimum_revision)),
-                    );
-                }
-                return Ok(cached);
-            }
-            if retained
-                && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                && keys
-                    .iter()
-                    .all(|key| self.retained_metadata_authority_covers_key(key))
-            {
-                self.invalidate_retained_metadata_authority_seed();
-                continue;
-            }
-            let read = self.fetch_authoritative_entries(keys)?;
-            if self.merge_authoritative_entries(generation, keys, &read)? {
-                return Ok(read.value);
-            }
+        // One publication or one exact-set ReadIndex pins every key together.
+        let Some(first) = keys.first() else {
+            return Ok(Vec::new());
+        };
+        if let Some(snapshot) = self.covering_snapshot(first)?
+            && keys.iter().all(|key| self.covers(&snapshot, key))
+        {
+            return Ok(Self::published_entries(&snapshot, keys));
         }
-        Err(self.superseded_authority_error("consistent exact-key set"))
+        Self::checked_exact_set(keys, self.fetch_authoritative_entries(keys)?)
     }
 
     fn get_authoritative_consistent(
         &mut self,
         keys: &[String],
     ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        // An operation-bound authority check never reuses an older generation.
-        // It performs one exact-key-set ReadIndex and publishes only that
-        // bounded response into the new projection.
-        self.begin_authoritative_generation()?;
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let (generation, _minimum_revision, _) = self.entries_read_plan(keys)?;
-            let read = self.fetch_authoritative_entries(keys)?;
-            if self.merge_authoritative_entries(generation, keys, &read)? {
-                return Ok(read.value);
-            }
-        }
-        Err(self.superseded_authority_error("operation-bound exact-key set"))
+        // An operation-bound authority check is one exact-key-set ReadIndex,
+        // returned directly to its caller.
+        Self::checked_exact_set(keys, self.fetch_authoritative_entries(keys)?)
     }
 
     fn get_authoritative_consistent_before(
@@ -1276,93 +896,45 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 detail: "metadata shard authority read deadline elapsed".to_string(),
             });
         }
-        self.begin_authoritative_generation()?;
         #[cfg(test)]
         if let Some(result) = self.take_test_authoritative_exact_set_outcome(deadline) {
             return result;
         }
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            if Instant::now() >= deadline {
-                return Err(KvError::AuthorityUnavailable {
-                    detail: "metadata shard authority read deadline elapsed".to_string(),
-                });
-            }
-            let (generation, _minimum_revision, _) = self.entries_read_plan(keys)?;
-            let read = self.fetch_authoritative_entries_before(keys, deadline)?;
-            if self.merge_authoritative_entries(generation, keys, &read)? {
-                #[cfg(any(test, feature = "test-support"))]
-                if let Some(data_root) = self.cluster_paths.root.parent() {
-                    crate::native_shard_trace::record_authoritative_read(
-                        data_root,
-                        self.data_owner_lock().as_ref(),
-                        keys,
-                        &read,
-                        generation,
-                    );
-                }
-                return Ok(read.value);
-            }
+        let read = self.fetch_authoritative_entries_before(keys, deadline)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(data_root) = self.cluster_paths.root.parent() {
+            crate::native_shard_trace::record_authoritative_read(
+                data_root,
+                self.data_owner_lock().as_ref(),
+                keys,
+                &read,
+                self.retained_metadata_authority
+                    .as_ref()
+                    .map_or(0, |authority| authority.generation()),
+            );
         }
-        Err(self.superseded_authority_error("operation-bound exact-key set"))
+        Self::checked_exact_set(keys, read)
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let retained = self.retained_metadata_authority_covers_prefix(prefix);
-            let retained_sync = retained
-                .then(|| self.synchronize_retained_metadata_authority())
-                .transpose()?
-                .unwrap_or(DaemonDfsRetainedMetadataSync::Current);
-            let (generation, _minimum_revision, cached) = self.prefix_read_plan(prefix)?;
-            if let Some(cached) = cached {
-                if retained
-                    && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                    && !self.retained_metadata_authority_is_current()
-                {
-                    self.invalidate_retained_metadata_authority_seed();
-                    continue;
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                    self.record_native_retained_use(
-                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedPrefixReturned { prefix: prefix.to_string(), entries: cached.clone() },
-                        Some((generation, _minimum_revision)),
-                    );
-                }
-                return Ok(cached);
-            }
-            if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                self.invalidate_retained_metadata_authority_seed();
-                continue;
-            }
-            let read = self.fetch_authoritative_prefix(prefix)?;
-            if self.merge_authoritative_prefix(generation, prefix, &read)? {
-                return Ok(read.value);
-            }
+        if let Some(snapshot) = self.covering_snapshot(prefix)? {
+            return Ok(snapshot.entries(prefix).unwrap_or_default().to_vec());
         }
-        Err(self.superseded_authority_error(prefix))
+        Ok(self.fetch_authoritative_prefix(prefix)?.value)
     }
 
     fn range_prefix_authoritative(
         &mut self,
         prefix: &str,
     ) -> Result<sinomo_dfs::DfsAuthoritativePrefixProjection, KvError> {
-        // Destructive callers must never inherit an older retained prefix
-        // certificate. Start a fresh generation and cross exactly one bounded
-        // prefix ReadIndex (apart from a concurrent-generation replan).
-        self.begin_authoritative_generation()?;
-        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-            let (generation, _minimum_revision, _) = self.prefix_read_plan(prefix)?;
-            let read = self.fetch_authoritative_prefix(prefix)?;
-            if self.merge_authoritative_prefix(generation, prefix, &read)? {
-                return sinomo_dfs::DfsAuthoritativePrefixProjection::complete(
-                    prefix,
-                    read.value,
-                    read.authority.revision,
-                );
-            }
-        }
-        Err(self.superseded_authority_error("operation-bound prefix"))
+        // Destructive callers never inherit a published prefix certificate.
+        // Exactly one bounded prefix ReadIndex is returned to the caller.
+        let read = self.fetch_authoritative_prefix(prefix)?;
+        sinomo_dfs::DfsAuthoritativePrefixProjection::complete(
+            prefix,
+            read.value,
+            read.authority.revision,
+        )
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -1409,7 +981,7 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
             }
         }
-        self.begin_authoritative_generation_at_revision(response.revision)?;
+        self.observe_revision(response.revision);
         Ok(response)
     }
 
@@ -1445,7 +1017,7 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
                 notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
             }
         }
-        self.begin_authoritative_generation_at_revision(response.revision)?;
+        self.observe_revision(response.revision);
         Ok((
             response,
             Some(crate::DfsNativeTxnCommit { request, result }),
@@ -1454,52 +1026,20 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
 }
 
 impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
-    fn refresh_latest_async<'a>(&'a mut self) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, ()> {
-        let result = self.begin_authoritative_generation();
-        Box::pin(async move { result })
-    }
-
     fn get_async<'a>(
         &'a self,
         key: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
         Box::pin(async move {
             let keys = vec![key.to_string()];
-            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-                let retained = self.retained_metadata_authority_covers_key(key);
-                let retained_sync = if retained {
-                    self.synchronize_retained_metadata_authority_async().await?
-                } else {
-                    DaemonDfsRetainedMetadataSync::Current
-                };
-                let (generation, _minimum_revision, cached) = self.entry_read_plan(key)?;
-                if let Some(cached) = cached {
-                    if retained
-                        && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                        && !self.retained_metadata_authority_is_current()
-                    {
-                        self.invalidate_retained_metadata_authority_seed();
-                        continue;
-                    }
-                    #[cfg(any(test, feature = "test-support"))]
-                    if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                        self.record_native_retained_use(
-                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.clone(), values: vec![cached.clone()] },
-                        Some((generation, _minimum_revision)),
-                    );
-                    }
-                    return Ok(cached);
-                }
-                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                    self.invalidate_retained_metadata_authority_seed();
-                    continue;
-                }
-                let read = self.fetch_authoritative_entries_async(keys.clone()).await?;
-                if self.merge_authoritative_entries(generation, &keys, &read)? {
-                    return Ok(read.value.into_iter().next().flatten());
-                }
-            }
-            Err(self.superseded_authority_error(key))
+            let value = match self.covering_snapshot_async(key).await? {
+                Some(snapshot) => Self::published_entries(&snapshot, &keys),
+                None => Self::checked_exact_set(
+                    &keys,
+                    self.fetch_authoritative_entries_async(keys.clone()).await?,
+                )?,
+            };
+            Ok(value.into_iter().next().flatten())
         })
     }
 
@@ -1508,48 +1048,16 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         keys: Vec<String>,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
         Box::pin(async move {
-            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-                let retained = keys
-                    .iter()
-                    .any(|key| self.retained_metadata_authority_covers_key(key));
-                let retained_sync = if retained {
-                    self.synchronize_retained_metadata_authority_async().await?
-                } else {
-                    DaemonDfsRetainedMetadataSync::Current
-                };
-                let (generation, _minimum_revision, cached) = self.entries_read_plan(&keys)?;
-                if let Some(cached) = cached {
-                    if retained
-                        && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                        && !self.retained_metadata_authority_is_current()
-                    {
-                        self.invalidate_retained_metadata_authority_seed();
-                        continue;
-                    }
-                    #[cfg(any(test, feature = "test-support"))]
-                    if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                        self.record_native_retained_use(
-                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedKeysReturned { keys: keys.clone(), values: cached.clone() },
-                        Some((generation, _minimum_revision)),
-                    );
-                    }
-                    return Ok(cached);
-                }
-                if retained
-                    && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                    && keys
-                        .iter()
-                        .all(|key| self.retained_metadata_authority_covers_key(key))
-                {
-                    self.invalidate_retained_metadata_authority_seed();
-                    continue;
-                }
-                let read = self.fetch_authoritative_entries_async(keys.clone()).await?;
-                if self.merge_authoritative_entries(generation, &keys, &read)? {
-                    return Ok(read.value);
-                }
+            let Some(first) = keys.first() else {
+                return Ok(Vec::new());
+            };
+            if let Some(snapshot) = self.covering_snapshot_async(first).await?
+                && keys.iter().all(|key| self.covers(&snapshot, key))
+            {
+                return Ok(Self::published_entries(&snapshot, &keys));
             }
-            Err(self.superseded_authority_error("consistent exact-key set"))
+            let read = self.fetch_authoritative_entries_async(keys.clone()).await?;
+            Self::checked_exact_set(&keys, read)
         })
     }
 
@@ -1557,17 +1065,9 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         &'a mut self,
         keys: Vec<String>,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
-        let generation_result = self.begin_authoritative_generation();
         Box::pin(async move {
-            generation_result?;
-            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-                let (generation, _minimum_revision, _) = self.entries_read_plan(&keys)?;
-                let read = self.fetch_authoritative_entries_async(keys.clone()).await?;
-                if self.merge_authoritative_entries(generation, &keys, &read)? {
-                    return Ok(read.value);
-                }
-            }
-            Err(self.superseded_authority_error("operation-bound exact-key set"))
+            let read = self.fetch_authoritative_entries_async(keys.clone()).await?;
+            Self::checked_exact_set(&keys, read)
         })
     }
 
@@ -1583,28 +1083,15 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                 })
             });
         }
-        let generation_result = self.begin_authoritative_generation();
         Box::pin(async move {
-            generation_result?;
             #[cfg(test)]
             if let Some(result) = self.take_test_authoritative_exact_set_outcome(deadline) {
                 return result;
             }
-            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-                if Instant::now() >= deadline {
-                    return Err(KvError::AuthorityUnavailable {
-                        detail: "metadata shard authority read deadline elapsed".to_string(),
-                    });
-                }
-                let (generation, _minimum_revision, _) = self.entries_read_plan(&keys)?;
-                let read = self
-                    .fetch_authoritative_entries_before_async(keys.clone(), deadline)
-                    .await?;
-                if self.merge_authoritative_entries(generation, &keys, &read)? {
-                    return Ok(read.value);
-                }
-            }
-            Err(self.superseded_authority_error("operation-bound exact-key set"))
+            let read = self
+                .fetch_authoritative_entries_before_async(keys.clone(), deadline)
+                .await?;
+            Self::checked_exact_set(&keys, read)
         })
     }
 
@@ -1613,43 +1100,13 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         prefix: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
         Box::pin(async move {
-            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
-                let retained = self.retained_metadata_authority_covers_prefix(prefix);
-                let retained_sync = if retained {
-                    self.synchronize_retained_metadata_authority_async().await?
-                } else {
-                    DaemonDfsRetainedMetadataSync::Current
-                };
-                let (generation, _minimum_revision, cached) = self.prefix_read_plan(prefix)?;
-                if let Some(cached) = cached {
-                    if retained
-                        && retained_sync == DaemonDfsRetainedMetadataSync::Current
-                        && !self.retained_metadata_authority_is_current()
-                    {
-                        self.invalidate_retained_metadata_authority_seed();
-                        continue;
-                    }
-                    #[cfg(any(test, feature = "test-support"))]
-                    if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                        self.record_native_retained_use(
-                        crate::native_shard_trace::NativeControlConsumptionScopeV1::RetainedPrefixReturned { prefix: prefix.to_string(), entries: cached.clone() },
-                        Some((generation, _minimum_revision)),
-                    );
-                    }
-                    return Ok(cached);
-                }
-                if retained && retained_sync == DaemonDfsRetainedMetadataSync::Current {
-                    self.invalidate_retained_metadata_authority_seed();
-                    continue;
-                }
-                let read = self
-                    .fetch_authoritative_prefix_async(prefix.to_string())
-                    .await?;
-                if self.merge_authoritative_prefix(generation, prefix, &read)? {
-                    return Ok(read.value);
-                }
+            if let Some(snapshot) = self.covering_snapshot_async(prefix).await? {
+                return Ok(snapshot.entries(prefix).unwrap_or_default().to_vec());
             }
-            Err(self.superseded_authority_error(prefix))
+            Ok(self
+                .fetch_authoritative_prefix_async(prefix.to_string())
+                .await?
+                .value)
         })
     }
 
@@ -1711,7 +1168,7 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                     notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
                 }
             }
-            self.begin_authoritative_generation_at_revision(response.revision)?;
+            self.observe_revision(response.revision);
             Ok(response)
         })
     }
@@ -1726,9 +1183,7 @@ pub(crate) async fn test_retained_client_configuration_sync(
         DaemonDfsControlPlaneKvClient::new_on_runtime(paths, &tokio::runtime::Handle::current());
     client.retained_metadata_authority = Some(authority);
     client.write_configuration_projection_required = true;
-    client
-        .synchronize_retained_metadata_authority_async()
-        .await?;
+    client.wait_for_published_configuration().await?;
     sinomo_dfs::DfsControlPlaneKvClient::write_configuration_projection(&client).map(|_| ())
 }
 

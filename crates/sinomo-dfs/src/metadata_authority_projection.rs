@@ -43,7 +43,7 @@ pub fn dfs_metadata_authority_key_is_exact(key: &str) -> bool {
     ) || dfs_metadata_file_system_config_key_is_exact(key)
 }
 
-fn dfs_metadata_file_system_config_key_is_exact(key: &str) -> bool {
+pub(crate) fn dfs_metadata_file_system_config_key_is_exact(key: &str) -> bool {
     key.strip_prefix("/dfs/filesystems/")
         .and_then(|suffix| suffix.strip_suffix("/config"))
         .is_some_and(|file_system_id| !file_system_id.is_empty() && !file_system_id.contains('/'))

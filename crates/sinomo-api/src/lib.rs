@@ -43,6 +43,7 @@ pub use idle_stats::{
 pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
 
 pub use dfs::browser_api::*;
+pub use dfs::configuration::{DFS_CONFIGURATION_PUBLISHED_EVENT_KIND, DfsConfigurationPublication};
 pub use status::{
     DaemonBuildInfo, DaemonClusterStatus, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     SINOMO_APP_DAEMON_BINARY_ENV, SINOMO_APP_DAEMON_LAUNCH_ID_ENV,
@@ -105,6 +106,14 @@ impl DaemonEventSubscribeRequest {
             } else {
                 vec![path_prefix]
             },
+        }
+    }
+
+    /// Subscribe to the local DFS component's configuration publications.
+    pub fn for_dfs_configuration() -> Self {
+        Self {
+            event_kind_prefixes: vec![DFS_CONFIGURATION_PUBLISHED_EVENT_KIND.to_string()],
+            path_prefixes: Vec::new(),
         }
     }
 

@@ -45,9 +45,38 @@ fn promoted_services_primary_fetches_new_create_from_outside_replica_plan() {
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     policy.required_node_ids = selected.clone();
     policy.forbidden_node_ids = vec![requester.clone()];
-    runtime
+    let placement_job = runtime
         .apply_placement_policy(&requester, path, DfsPlacementScope::Subtree, policy)
         .unwrap();
+    // Drive the rule's own reconciliation job to completion before the
+    // measured create, so that create never races the job's scan.
+    let control = runtime.shared_control_plane().unwrap();
+    let job_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let state = control
+            .with_client(|kv| {
+                sinomo_dfs::DfsControlPlaneStore::new(kv.as_mut()).placement_reconciliation(
+                    &placement_job.file_system_id,
+                    &placement_job.job_id,
+                )
+            })
+            .unwrap()
+            .map(|job| job.state);
+        if state == Some(sinomo_dfs::DfsPlacementReconciliationState::Completed) {
+            break;
+        }
+        assert!(
+            Instant::now() < job_deadline,
+            "the placement rule's reconciliation job did not complete: {state:?}"
+        );
+        runtime
+            .maintenance_tick(
+                &requester,
+                job_deadline.saturating_duration_since(Instant::now()),
+            )
+            .expect("ordinary owner maintenance drives the placement job");
+    }
+    drop(control);
     let after = runtime
         .reassign_metadata_shard(
             &before.file_system_id,

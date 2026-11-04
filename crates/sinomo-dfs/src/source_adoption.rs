@@ -342,10 +342,10 @@ impl DfsSourceAdoptionActor {
         if offer.source_node_id != self.node || offer.source_config.primary_node_id != self.node {
             return Err(error("source is not the actual current metadata primary"));
         }
-        let generation = self.authority.projection_generation();
         let cfgs = self
             .authority
-            .cached_metadata_shards(&offer.source_config.file_system_id, generation)
+            .configuration_snapshot()
+            .metadata_shards(&offer.source_config.file_system_id)
             .map_err(error)?
             .ok_or_else(|| error("source configuration projection unavailable"))?;
         if !cfgs.iter().any(|cfg| cfg == &offer.source_config)
@@ -455,6 +455,7 @@ impl DfsSourceAdoptionActor {
             }
         };
         let actor = self.clone();
+        let wait_host = Arc::clone(&host);
         let task = self.runtime.spawn_blocking(move || {
             struct Reset(Arc<DfsSourceAdoptionActor>);
             impl Drop for Reset {
@@ -465,17 +466,21 @@ impl DfsSourceAdoptionActor {
                 }
             }
             let _reset = Reset(actor.clone());
-            // Join the existing native projection owner before this finite
-            // outcome pass reads routing. A remount can retain real captures
-            // while its current authoritative projection is still completing.
+            // Wait for the shared publication before this finite outcome pass
+            // reads routing. A remount can retain real captures while its
+            // current authoritative projection is still completing.
             let generation = actor.authority.generation();
-            let _ = actor.runtime.block_on(
-                actor.authority.ensure_complete_prefix_for_generation_async(
-                    generation,
-                    #[cfg(test)]
-                    None,
-                ),
-            );
+            actor.runtime.block_on(async {
+                tokio::select! {
+                    _ = tokio::time::timeout(
+                        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                        actor
+                            .authority
+                            .ensure_complete_prefix_for_generation_async(generation),
+                    ) => {}
+                    () = wait_host.wait_for_shutdown() => {}
+                }
+            });
             let current_generation = actor.authority.generation();
             let current_revision = actor
                 .authority
@@ -522,10 +527,10 @@ impl DfsSourceAdoptionActor {
             let Some((scope, hash, digest)) = claim else {
                 continue;
             };
-            let generation = self.authority.projection_generation();
             let cfgs = self
                 .authority
-                .cached_metadata_shards(&scope.file_system_id, generation)
+                .configuration_snapshot()
+                .metadata_shards(&scope.file_system_id)
                 .map_err(error)?
                 .ok_or_else(|| error("native outcome routing unavailable"))?;
             let target = cfgs
@@ -1073,10 +1078,8 @@ impl DfsSourceAdoptionActor {
         }
         let configs = self
             .authority
-            .cached_metadata_shards(
-                &offer.target_config.file_system_id,
-                self.authority.projection_generation(),
-            )
+            .configuration_snapshot()
+            .metadata_shards(&offer.target_config.file_system_id)
             .map_err(error)?
             .ok_or_else(|| error("actual target configuration unavailable"))?;
         if !configs.contains(&offer.target_config) {
@@ -1288,20 +1291,18 @@ impl DfsSourceAdoptionActor {
             scope.shard_id.clone(),
         )?;
         let owner = crate::runtime_host::publication_runtime_owner(&root).map_err(error)?;
-        let current_projection = self.authority.projection_generation();
-        let configurations = self
-            .authority
-            .cached_metadata_shards(&scope.file_system_id, current_projection)
+        // One publication supplies both the shard fence and its routing.
+        let snapshot = self.authority.configuration_snapshot();
+        let configurations = snapshot
+            .metadata_shards(&scope.file_system_id)
             .map_err(error)?;
         if before != after
             || current_scope != terminal.scope
             || owner
                 .as_ref()
                 .is_none_or(|owner| !Arc::ptr_eq(owner, &self._owner))
-            || self
-                .authority
-                .shard_projection_state(&scope.file_system_id, &scope.shard_id)
-                != (terminal.generation, true)
+            || snapshot.generation() != terminal.generation
+            || !snapshot.contains_shard_key(&scope.file_system_id, &scope.shard_id)
             || configurations
                 .as_ref()
                 .is_none_or(|configurations| !configurations.contains(current))
@@ -1332,10 +1333,10 @@ impl DfsSourceAdoptionActor {
                 "native outcome query changed authenticated source/scope",
             ));
         }
-        let projection = self.authority.projection_generation();
         let cfgs = self
             .authority
-            .cached_metadata_shards(&scope.file_system_id, projection)
+            .configuration_snapshot()
+            .metadata_shards(&scope.file_system_id)
             .map_err(error)?
             .ok_or_else(|| error("native target outcome configuration unavailable"))?;
         let cfg = cfgs

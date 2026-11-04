@@ -1236,6 +1236,18 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
         None
     }
 
+    /// The host's published configuration snapshot, after its native floor
+    /// check, for one operation. Callers use this same value for shard
+    /// routing, filesystem policy, members and providers. `None` means the
+    /// client has no published configuration and keeps its ordinary reads.
+    /// This method must never initiate a KV read or hydrate a resident backend.
+    /// sinomo:kv-configuration: Borrow the host-owned published configuration snapshot after its native authority floor check.
+    fn configuration_snapshot(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::DfsConfigurationSnapshot>>, KvError> {
+        Ok(None)
+    }
+
     /// One already-published, coherent configuration for ordinary write policy
     /// and provider selection. Hosts which do not own this projection retain
     /// the existing configuration-read behavior through the compatibility seam.
@@ -1244,7 +1256,9 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     fn write_configuration_projection(
         &self,
     ) -> Result<Option<std::sync::Arc<crate::DfsWriteConfigurationProjection>>, KvError> {
-        Ok(None)
+        Ok(self
+            .configuration_snapshot()?
+            .and_then(|snapshot| snapshot.write_configuration().cloned()))
     }
 
     /// Typed rejection before any parent or write intent is prepared. This
@@ -1341,9 +1355,12 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     /// publication fence. `None` retains the ordinary configuration-read path.
     fn cached_metadata_shards(
         &self,
-        _file_system_id: &DfsFileSystemId,
+        file_system_id: &DfsFileSystemId,
     ) -> Result<Option<Vec<DfsMetadataShardConfig>>, KvError> {
-        Ok(None)
+        match self.configuration_snapshot()? {
+            Some(snapshot) => snapshot.metadata_shards(file_system_id),
+            None => Ok(None),
+        }
     }
 
     /// Establish one authoritative, complete view of a bounded prefix.

@@ -4,8 +4,10 @@
 pub mod lifecycle;
 pub use lifecycle::*;
 pub mod attachments;
+pub mod configuration;
 pub mod control_plane;
 pub use attachments::*;
+pub use configuration::*;
 pub use control_plane::*;
 pub mod discovery;
 pub use discovery::*;

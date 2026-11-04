@@ -5,20 +5,23 @@
 
 use sinomo_core::ClusterBootstrapState;
 use sinomo_core::cluster::ClusterKvPathsExt;
-use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse};
+#[cfg(test)]
+use sinomo_core::kv::KvSnapshot;
+use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterPaths, NetworkError, ObjectRpcCall, ObjectRpcResponse, ObjectRpcResult,
 };
 use sinomo_core::node::NodeId;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::node_transport::collect_dfs_incoming_body_sync;
 use crate::{
-    AsyncDfsPeerTransport, DfsCommittedWork, DfsControlPlaneKvClient, DfsError,
+    AsyncDfsPeerTransport, DfsCommittedWork, DfsConfigurationPublication, DfsControlPlaneKvClient,
+    DfsError,
     DfsMessageTransport, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor, DfsNodeAdvertisement,
     DfsNodeId, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPosixError, DfsRepairAttemptRecord, NetworkedDfsService,
@@ -67,14 +70,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 }
-
-const MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES: usize =
-    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
-const MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_ENTRIES: usize =
-    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
-const MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_PAYLOAD_BYTES: usize =
-    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES;
-const MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS: usize = 8;
 
 fn mounted_sifs_authority_deadline_error() -> KvError {
     KvError::AuthorityUnavailable {
@@ -186,8 +181,9 @@ pub fn open_mounted_sifs_service_with_cancellation(
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let control_plane = if cluster_state.is_some() {
         Some(Box::new(MountedSifsControlPlaneKvClient::new_authoritative(
-            cluster_paths.clone(),
+            &data_dir,
             Arc::clone(&sync_peer_transport),
+            Arc::clone(&async_peer_transport),
         )) as Box<dyn DfsControlPlaneKvClient>)
     } else {
         None
@@ -241,8 +237,9 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane_
         mounted_sifs_cluster_context(&data_dir)?;
     let control_plane = if cluster_state.is_some() {
         Some(Box::new(MountedSifsControlPlaneKvClient::new_authoritative(
-            cluster_paths.clone(),
+            &data_dir,
             Arc::clone(&sync_peer_transport),
+            Arc::clone(&async_peer_transport),
         )) as Box<dyn DfsControlPlaneKvClient>)
     } else {
         None
@@ -530,11 +527,12 @@ pub fn discover_mounted_sifs_content_replica_candidates(
     }
     let _state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DfsError::from_network)?;
-    let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(MountedSifsPeerTransport {
-        cluster_paths: cluster_paths.clone(),
-    });
-    let control_plane =
-        MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths, peer_transport);
+    let peer_transport = Arc::new(MountedSifsPeerTransport { cluster_paths });
+    let control_plane = MountedSifsControlPlaneKvClient::new_authoritative(
+        data_dir,
+        peer_transport.clone(),
+        peer_transport,
+    );
     discover_mounted_sifs_content_replica_candidates_with_control_plane(&control_plane)
 }
 
@@ -546,22 +544,6 @@ fn mounted_sifs_materialized_snapshot(
         .kv_paths()
         .local_cache()
         .cached_snapshot_arc_if_present()
-}
-
-#[cfg(test)]
-fn mounted_sifs_required_materialized_snapshot(
-    cluster_paths: &ClusterPaths,
-) -> Result<Arc<KvSnapshot>, DfsError> {
-    mounted_sifs_materialized_snapshot(cluster_paths)
-        .map_err(DfsError::from)?
-        .ok_or_else(|| {
-            DfsError::from(KvError::AuthorityUnavailable {
-                detail: format!(
-                    "clustered mounted SIFS requires the daemon materialized KV projection at {}",
-                    cluster_paths.kv_paths().snapshot.display(),
-                ),
-            })
-        })
 }
 
 fn mounted_sifs_content_replica_candidates(
@@ -709,13 +691,18 @@ mod tests {
         MissingSubmittedDigest,
         InvalidAuthority,
         StaleAuthorityRevision,
-        StalePostCommitRead,
-        FailSecondPostCommitRead,
         MissingAuthoritativeEntry,
         WrongAuthoritativeEntryKey,
         OutOfPrefixAuthoritativeEntry,
         UnknownExactSetRoute,
         FailedExactSetRoute,
+    }
+
+    /// One scripted reply of the local daemon's configuration route.
+    #[derive(Clone, Debug)]
+    enum MountedConfigurationReply {
+        Response(crate::DfsConfigurationSnapshotResponse),
+        UnknownRoute,
     }
 
     #[derive(Debug)]
@@ -727,6 +714,9 @@ mod tests {
         routes: Mutex<Vec<String>>,
         options: Mutex<Vec<DfsObjectRpcSendOptions>>,
         authoritative_entry_calls: AtomicUsize,
+        /// Replies in order; the last one repeats.
+        configuration: Mutex<std::collections::VecDeque<MountedConfigurationReply>>,
+        configuration_calls: AtomicUsize,
     }
 
     impl ScriptedMountedKvTransport {
@@ -739,6 +729,40 @@ mod tests {
                 routes: Mutex::new(Vec::new()),
                 options: Mutex::new(Vec::new()),
                 authoritative_entry_calls: AtomicUsize::new(0),
+                configuration: Mutex::new(std::collections::VecDeque::new()),
+                configuration_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_configuration(
+            self,
+            replies: impl IntoIterator<Item = MountedConfigurationReply>,
+        ) -> Self {
+            *self.configuration.lock().expect("configuration replies") =
+                replies.into_iter().collect();
+            self
+        }
+
+        fn configuration_reply(&self) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.configuration_calls.fetch_add(1, Ordering::SeqCst);
+            let reply = {
+                let mut replies = self.configuration.lock().expect("configuration replies");
+                if replies.len() > 1 {
+                    replies.pop_front()
+                } else {
+                    replies.front().cloned()
+                }
+            };
+            match reply.expect("scripted configuration reply") {
+                MountedConfigurationReply::Response(response) => Ok(ObjectRpcResult::value(
+                    ObjectRpcResponse::encode_body(crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE, &response)
+                        .expect("encode configuration reply"),
+                )),
+                MountedConfigurationReply::UnknownRoute => Err(DfsPeerTransportError::from_network(
+                    NetworkError::UnknownRoute {
+                        route: crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE.to_string(),
+                    },
+                )),
             }
         }
 
@@ -777,6 +801,9 @@ mod tests {
             options: DfsObjectRpcSendOptions,
         ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             assert_eq!(target_node_id, &self.local_node_id);
+            if call.request.route == crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE {
+                return self.configuration_reply();
+            }
             self.options.lock().expect("options").push(options);
             let route = call.request.route.clone();
             self.routes.lock().expect("routes").push(route.clone());
@@ -844,24 +871,9 @@ mod tests {
                             &request.body,
                         )
                         .expect("decode mounted exact-entry read");
-                    let entry_call = self
-                        .authoritative_entry_calls
+                    self.authoritative_entry_calls
                         .fetch_add(1, Ordering::SeqCst);
-                    if matches!(
-                        self.fault,
-                        MountedTxnResponseFault::FailSecondPostCommitRead
-                    ) && entry_call == 1
-                    {
-                        return Err(DfsPeerTransportError::new(
-                            "injected second post-commit authority-read failure",
-                        ));
-                    }
-                    let read_revision =
-                        if matches!(self.fault, MountedTxnResponseFault::StalePostCommitRead) {
-                            KvRevision(8)
-                        } else {
-                            KvRevision(9)
-                        };
+                    let read_revision = KvRevision(9);
                     let response_key = if matches!(
                         self.fault,
                         MountedTxnResponseFault::WrongAuthoritativeEntryKey
@@ -1000,117 +1012,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct BlockingMountedKvTransport {
-        local_node_id: NodeId,
-        calls: AtomicUsize,
-        routes: Mutex<Vec<String>>,
-        first_call_entered: Mutex<Option<mpsc::Sender<()>>>,
-        release_first_call: (Mutex<bool>, Condvar),
-    }
-
-    impl BlockingMountedKvTransport {
-        fn new(local_node_id: NodeId) -> (Self, mpsc::Receiver<()>) {
-            let (first_call_entered, entered) = mpsc::channel();
-            (
-                Self {
-                    local_node_id,
-                    calls: AtomicUsize::new(0),
-                    routes: Mutex::new(Vec::new()),
-                    first_call_entered: Mutex::new(Some(first_call_entered)),
-                    release_first_call: (Mutex::new(false), Condvar::new()),
-                },
-                entered,
-            )
-        }
-
-        fn release_first_call(&self) {
-            let (released, wake) = &self.release_first_call;
-            *released.lock().expect("release first call") = true;
-            wake.notify_all();
-        }
-
-        fn routes(&self) -> Vec<String> {
-            self.routes.lock().expect("routes").clone()
-        }
-
-        fn authority(revision: KvRevision) -> sinomo_core::kv::KvAuthorityProof {
-            sinomo_core::kv::KvAuthorityProof {
-                term: 4,
-                commit_index: revision.0.saturating_add(10),
-                revision,
-                basis: sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
-                    voter_acks: 2,
-                    required_quorum: 2,
-                },
-            }
-        }
-    }
-
-    impl DfsPeerTransport for BlockingMountedKvTransport {
-        fn call_object_rpc(
-            &self,
-            target_node_id: &NodeId,
-            call: ObjectRpcCall,
-            _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-            assert_eq!(target_node_id, &self.local_node_id);
-            assert_eq!(
-                call.request.route,
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE
-            );
-            self.routes
-                .lock()
-                .expect("routes")
-                .push(call.request.route.clone());
-            let request = crate::node_transport::materialize_dfs_value_call_sync(call, 1024 * 1024)
-                .expect("materialize blocked authority request");
-            let request = sinomo_core::kv::decode_cluster_kv_authoritative_entry_rpc_request_body(
-                &request.body,
-            )
-            .expect("decode blocked authority request");
-            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call_index == 0 {
-                if let Some(entered) = self
-                    .first_call_entered
-                    .lock()
-                    .expect("first call entered")
-                    .take()
-                {
-                    entered.send(()).expect("report first authority call");
-                }
-                let (released, wake) = &self.release_first_call;
-                let mut released = released.lock().expect("release first call");
-                while !*released {
-                    released = wake.wait(released).expect("wait for first call release");
-                }
-            }
-            let revision = KvRevision(if call_index == 0 { 40 } else { 41 });
-            let value = if call_index == 0 {
-                b"stale-generation".to_vec()
-            } else {
-                b"fresh-generation".to_vec()
-            };
-            let payload = sinomo_core::kv::cluster_kv_authoritative_entry_response_rpc_payload(
-                &sinomo_core::kv::KvAuthoritativeRead {
-                    value: Some(KvEntry {
-                        key: request.key,
-                        value,
-                        create_revision: revision,
-                        modify_revision: revision,
-                        version: sinomo_core::kv::KvVersion(1),
-                        lease_id: None,
-                    }),
-                    authority: Self::authority(revision),
-                },
-            )
-            .expect("encode blocked authority response");
-            Ok(ObjectRpcResult::value(
-                ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
-            ))
-        }
-    }
-
-    #[derive(Debug)]
     struct TransitioningMountedKvTransport {
         local_node_id: NodeId,
         shard_key: String,
@@ -1191,6 +1092,367 @@ mod tests {
                 ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
             ))
         }
+    }
+
+    fn mounted_test_cluster(name: &str) -> (sinomo_testdir::TestDir, ClusterPaths, NodeId) {
+        let root = sinomo_testdir::TestDir::new(&format!("sinomo-mounted-sifs-{name}"));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node = NodeId::from_legacy_named(format!("node_mounted_sifs_{name}"))
+            .expect("local node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(format!("cluster_mounted_sifs_{name}"))
+                .expect("cluster id"),
+            "mounted SIFS test cluster",
+            local_node.clone(),
+            "local",
+            "public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        (root, cluster_paths, local_node)
+    }
+
+    /// A client whose feed has no subscription: every read is ReadIndex.
+    fn detached_client(
+        cluster_paths: ClusterPaths,
+        transport: Arc<dyn DfsPeerTransport>,
+    ) -> MountedSifsControlPlaneKvClient {
+        let shared = Arc::new(MountedSifsConfigurationShared::new());
+        shared.set(MountedSifsConfiguration::Disconnected);
+        let (stop, _) = tokio::sync::watch::channel(false);
+        MountedSifsControlPlaneKvClient::with_configuration(
+            cluster_paths,
+            transport,
+            Arc::new(MountedSifsConfigurationFeed { shared, stop }),
+        )
+    }
+
+    /// A client whose feed subscribes to `sessions` scripted streams in order.
+    fn scripted_client(
+        cluster_paths: ClusterPaths,
+        transport: Arc<ScriptedMountedKvTransport>,
+        sessions: usize,
+    ) -> (
+        MountedSifsControlPlaneKvClient,
+        Vec<tokio::sync::mpsc::UnboundedSender<MountedSifsConfigurationItem>>,
+    ) {
+        let (senders, receivers): (Vec<_>, std::collections::VecDeque<_>) = (0..sessions)
+            .map(|_| tokio::sync::mpsc::unbounded_channel())
+            .unzip();
+        let feed = MountedSifsConfigurationFeed::subscribe(
+            MountedSifsConfigurationEvents::Scripted(Arc::new(Mutex::new(receivers))),
+            MountedSifsConfigurationFetch {
+                cluster_paths: cluster_paths.clone(),
+                transport: transport.clone(),
+            },
+        );
+        (
+            MountedSifsControlPlaneKvClient::with_configuration(cluster_paths, transport, feed),
+            senders,
+        )
+    }
+
+    const MOUNTED_TEST_CONFIGURATION_KEY: &str = "/dfs/filesystems/mounted-test/config";
+
+    fn mounted_test_publication(generation: u64, revision: u64) -> DfsConfigurationPublication {
+        DfsConfigurationPublication {
+            generation,
+            projection_generation: generation,
+            storage_generation: 1,
+            revision: Some(KvRevision(revision)),
+        }
+    }
+
+    fn mounted_test_published(
+        generation: u64,
+        revision: u64,
+        value: &str,
+    ) -> MountedConfigurationReply {
+        MountedConfigurationReply::Response(crate::DfsConfigurationSnapshotResponse::Published {
+            snapshot: sinomo_api::dfs::DfsConfigurationSnapshotWire {
+                publication: mounted_test_publication(generation, revision),
+                filesystem_entries: vec![KvEntry {
+                    key: MOUNTED_TEST_CONFIGURATION_KEY.to_string(),
+                    value: value.as_bytes().to_vec(),
+                    create_revision: KvRevision(revision),
+                    modify_revision: KvRevision(revision),
+                    version: sinomo_core::kv::KvVersion(1),
+                    lease_id: None,
+                }],
+                write: None,
+            },
+        })
+    }
+
+    fn mounted_test_value(client: &MountedSifsControlPlaneKvClient) -> Vec<u8> {
+        client
+            .get(MOUNTED_TEST_CONFIGURATION_KEY)
+            .expect("published-scope read")
+            .expect("published-scope entry")
+            .value
+    }
+
+    #[test]
+    fn mounted_configuration_feed_serves_published_scopes_and_fetches_only_on_announcements() {
+        let (_root, cluster_paths, local_node) = mounted_test_cluster("configuration-feed");
+        let transport = Arc::new(
+            ScriptedMountedKvTransport::new(local_node, true, MountedTxnResponseFault::None)
+                .with_configuration([
+                    MountedConfigurationReply::Response(
+                        crate::DfsConfigurationSnapshotResponse::Pending {
+                            publication: DfsConfigurationPublication {
+                                revision: None,
+                                ..mounted_test_publication(1, 0)
+                            },
+                        },
+                    ),
+                    mounted_test_published(2, 8, "first"),
+                    mounted_test_published(3, 10, "second"),
+                ]),
+        );
+        let (client, sessions) = scripted_client(cluster_paths, transport.clone(), 1);
+        let shared = Arc::clone(&client.configuration.shared);
+
+        // Ready: one fetch. A pending daemon leaves every read on ReadIndex.
+        sessions[0].send(MountedSifsConfigurationItem::Ready).unwrap();
+        assert!(matches!(
+            shared.wait_for_transitions(1),
+            MountedSifsConfiguration::Pending(_)
+        ));
+        assert!(client.configuration_snapshot().unwrap().is_none());
+        assert_eq!(mounted_test_value(&client), b"authoritative");
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 1);
+
+        // The announced publication is fetched once and then answers its
+        // scopes without a KV request.
+        sessions[0]
+            .send(MountedSifsConfigurationItem::Published(mounted_test_publication(2, 8)))
+            .unwrap();
+        assert!(matches!(
+            shared.wait_for_transitions(2),
+            MountedSifsConfiguration::Published(_)
+        ));
+        let routes = transport.routes().len();
+        assert_eq!(mounted_test_value(&client), b"first");
+        assert_eq!(client.range_prefix("/dfs/filesystems/").unwrap().len(), 1);
+        assert_eq!(
+            client
+                .configuration_snapshot()
+                .unwrap()
+                .expect("held snapshot")
+                .generation(),
+            2
+        );
+        assert_eq!(transport.routes().len(), routes);
+
+        // An announcement of the held publication is not fetched; a newer one is.
+        sessions[0]
+            .send(MountedSifsConfigurationItem::Published(mounted_test_publication(2, 8)))
+            .unwrap();
+        sessions[0]
+            .send(MountedSifsConfigurationItem::Published(mounted_test_publication(3, 10)))
+            .unwrap();
+        shared.wait_for_transitions(3);
+        assert_eq!(mounted_test_value(&client), b"second");
+        assert_eq!(transport.configuration_calls.load(Ordering::SeqCst), 3);
+
+        // A lagged subscriber may have missed announcements: fetch once.
+        sessions[0].send(MountedSifsConfigurationItem::Lagged).unwrap();
+        shared.wait_for_transitions(4);
+        assert_eq!(transport.configuration_calls.load(Ordering::SeqCst), 4);
+
+        // Keys outside the published scopes cross ReadIndex on every read.
+        for _ in 0..2 {
+            client.get("/config/outside-published-scopes").unwrap();
+        }
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn mounted_configuration_feed_withdraws_on_stream_loss_and_refetches_after_resubscribing() {
+        let (_root, cluster_paths, local_node) = mounted_test_cluster("configuration-reconnect");
+        let transport = Arc::new(
+            ScriptedMountedKvTransport::new(local_node, true, MountedTxnResponseFault::None)
+                .with_configuration([mounted_test_published(2, 8, "held")]),
+        );
+        let (client, mut sessions) = scripted_client(cluster_paths, transport.clone(), 2);
+        let shared = Arc::clone(&client.configuration.shared);
+        sessions[0].send(MountedSifsConfigurationItem::Ready).unwrap();
+        shared.wait_for_transitions(1);
+        assert_eq!(mounted_test_value(&client), b"held");
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 0);
+
+        // Losing the stream withdraws the held snapshot at once.
+        drop(sessions.remove(0));
+        assert!(matches!(
+            shared.wait_for_transitions(2),
+            MountedSifsConfiguration::Disconnected
+        ));
+        assert_eq!(mounted_test_value(&client), b"authoritative");
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 1);
+
+        // The next subscription fetches once before it is used again.
+        sessions[0].send(MountedSifsConfigurationItem::Ready).unwrap();
+        assert!(matches!(
+            shared.wait_for_transitions(3),
+            MountedSifsConfiguration::Published(_)
+        ));
+        assert_eq!(transport.configuration_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(mounted_test_value(&client), b"held");
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mounted_configuration_feed_reports_an_older_daemon_as_a_typed_error() {
+        let (_root, cluster_paths, local_node) = mounted_test_cluster("configuration-unsupported");
+        let transport = Arc::new(
+            ScriptedMountedKvTransport::new(local_node, true, MountedTxnResponseFault::None)
+                .with_configuration([
+                    MountedConfigurationReply::UnknownRoute,
+                    mounted_test_published(2, 8, "upgraded"),
+                ]),
+        );
+        let (client, sessions) = scripted_client(cluster_paths, transport.clone(), 1);
+        let shared = Arc::clone(&client.configuration.shared);
+        sessions[0].send(MountedSifsConfigurationItem::Ready).unwrap();
+        assert!(matches!(
+            shared.wait_for_transitions(1),
+            MountedSifsConfiguration::Unsupported
+        ));
+        let error = client
+            .get(MOUNTED_TEST_CONFIGURATION_KEY)
+            .expect_err("an older daemon cannot answer a published scope");
+        assert!(crate::is_dfs_configuration_snapshot_unsupported(&error));
+        assert!(
+            crate::is_dfs_configuration_snapshot_unsupported(
+                &client.configuration_snapshot().expect_err("typed error")
+            )
+        );
+        assert_eq!(
+            transport.authoritative_entry_calls.load(Ordering::SeqCst),
+            0,
+            "no fallback configuration read replaces the missing route"
+        );
+        client.get("/config/outside-published-scopes").unwrap();
+        assert_eq!(transport.configuration_calls.load(Ordering::SeqCst), 1);
+
+        // An upgraded daemon announces its publication; that is fetched.
+        sessions[0]
+            .send(MountedSifsConfigurationItem::Published(mounted_test_publication(2, 8)))
+            .unwrap();
+        shared.wait_for_transitions(2);
+        assert_eq!(mounted_test_value(&client), b"upgraded");
+    }
+
+    #[test]
+    fn mounted_published_scope_write_reads_its_own_commit_until_a_newer_publication() {
+        let (_root, cluster_paths, local_node) = mounted_test_cluster("configuration-own-write");
+        let transport = Arc::new(
+            ScriptedMountedKvTransport::new(local_node, true, MountedTxnResponseFault::None)
+                .with_configuration([
+                    mounted_test_published(2, 8, "before"),
+                    mounted_test_published(3, 9, "committed"),
+                ]),
+        );
+        let (mut client, sessions) = scripted_client(cluster_paths, transport.clone(), 1);
+        let shared = Arc::clone(&client.configuration.shared);
+        sessions[0].send(MountedSifsConfigurationItem::Ready).unwrap();
+        shared.wait_for_transitions(1);
+        assert_eq!(mounted_test_value(&client), b"before");
+
+        client
+            .put(MOUNTED_TEST_CONFIGURATION_KEY.to_string(), b"committed".to_vec())
+            .expect("commit inside a published scope");
+        assert_eq!(
+            mounted_test_value(&client),
+            b"authoritative",
+            "a held snapshot older than this client's own commit does not answer it"
+        );
+        assert!(client.configuration_snapshot().unwrap().is_none());
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 1);
+
+        sessions[0]
+            .send(MountedSifsConfigurationItem::Published(mounted_test_publication(3, 9)))
+            .unwrap();
+        shared.wait_for_transitions(2);
+        assert_eq!(mounted_test_value(&client), b"committed");
+        assert_eq!(transport.authoritative_entry_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mounted_client_follows_component_configuration_announcements() {
+        let name = "native-mounted-configuration-announcements";
+        let (runtime, nodes) = crate::test_support::DfsTestRuntime::start_cluster(name, 1).unwrap();
+        let local_node = nodes[0].clone();
+        let data_dir = runtime.data_dir(&local_node).clone();
+        let (bus, _) = mounted_sifs_test_event_bus(&data_dir).expect("fixture component bus");
+        let mut announcements = bus.subscribe_host();
+        let (sync, asynchronous) = runtime.peer_transports(&local_node).unwrap();
+        let control = MountedSifsControlPlaneKvClient::new_authoritative(&data_dir, sync, asynchronous);
+        let before = control
+            .configuration_snapshot()
+            .unwrap()
+            .expect("the route serves the floor-checked publication");
+
+        let added = runtime
+            .bootstrap_empty_metadata_prefix("announced", "/announced")
+            .unwrap();
+        let shard_key = crate::metadata_shard_key(&added.file_system_id, &added.shard_id);
+
+        // The component announces the change on its event bus...
+        let announced = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+                    loop {
+                        let event = announcements.recv().await.expect("component bus");
+                        if event.envelope.kind.as_str()
+                            != crate::DFS_CONFIGURATION_PUBLISHED_EVENT_KIND
+                        {
+                            continue;
+                        }
+                        let publication: DfsConfigurationPublication =
+                            serde_json::from_value(event.envelope.payload.clone()).unwrap();
+                        if publication.advances_past(&before.publication()) {
+                            return event;
+                        }
+                    }
+                })
+                .await
+                .expect("configuration announcement")
+            });
+        assert_eq!(
+            announced.envelope.routing.scope,
+            sinomo_core::RoutingScope::Local
+        );
+        assert_eq!(announced.schema_id, crate::DFS_CONFIGURATION_EVENT_SCHEMA_ID);
+        assert!(
+            !announced.envelope.links.supersedes.is_empty(),
+            "each announcement supersedes the previous one"
+        );
+
+        // ...and the mounted client fetches it and answers from it.
+        control.configuration.shared.wait_until(|state| {
+            matches!(state, MountedSifsConfiguration::Published(snapshot)
+                if snapshot.entry(&shard_key).is_some_and(|entry| entry.is_some()))
+        });
+        let shards_prefix = format!(
+            "{}/",
+            crate::control_plane::metadata_shards_prefix(&added.file_system_id)
+        );
+        assert!(
+            control
+                .range_prefix(&shards_prefix)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.key == shard_key)
+        );
+        drop(control);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -1335,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_control_plane_does_not_trust_stale_critical_cache() {
+    fn out_of_scope_reads_cross_authority_and_never_trust_the_materialized_projection() {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-critical-cache-fence");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -1373,9 +1635,7 @@ mod tests {
             true,
             MountedTxnResponseFault::None,
         ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let client =
-            MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths, peer_transport);
+        let client = detached_client(cluster_paths, transport.clone());
 
         for _ in 0..2 {
             assert_eq!(
@@ -1389,8 +1649,8 @@ mod tests {
         }
         assert_eq!(
             transport.authoritative_entry_calls.load(Ordering::SeqCst),
-            1,
-            "the first critical read must cross authority and later reads reuse its scope"
+            2,
+            "a key outside the published scopes crosses authority on every read"
         );
     }
 
@@ -1417,11 +1677,7 @@ mod tests {
         let peer = Arc::new(RecordingMountedPeerTransport {
             targets: std::sync::Mutex::new(Vec::new()),
         });
-        let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
-        let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection");
-        let mut client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, snapshot);
+        let mut client = detached_client(cluster_paths, peer.clone());
 
         let response = client
             .txn(KvTxn {
@@ -1439,56 +1695,15 @@ mod tests {
     }
 
     #[test]
-    fn mounted_control_plane_txn_refreshes_only_the_executed_branch() {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-control-plane-ryw");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node =
-            NodeId::from_legacy_named("node_mounted_sifs_control_plane_ryw").expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_mounted_sifs_control_plane_ryw",
-            )
-            .expect("cluster id"),
-            "mounted SIFS control plane RYW",
-            local_node.clone(),
-            "local",
-            "public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-        let mut oversized = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection")
-            .as_ref()
-            .clone();
-        for index in 0..512 {
-            oversized.entries.push(KvEntry {
-                key: format!("/unrelated/{index:04}"),
-                value: vec![0; 32],
-                create_revision: oversized.revision,
-                modify_revision: oversized.revision,
-                version: sinomo_core::kv::KvVersion(1),
-                lease_id: None,
-            });
-        }
-        oversized.canonicalize();
-        let initial_snapshot = Arc::new(oversized);
-
+    fn mounted_control_plane_txn_fences_only_the_executed_branch() {
+        let (_root, cluster_paths, local_node) = mounted_test_cluster("txn-branch");
         for succeeded in [true, false] {
             let transport = Arc::new(ScriptedMountedKvTransport::new(
                 local_node.clone(),
                 succeeded,
                 MountedTxnResponseFault::None,
             ));
-            let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-            let mut client = MountedSifsControlPlaneKvClient::new(
-                cluster_paths.clone(),
-                peer_transport,
-                Arc::clone(&initial_snapshot),
-            );
+            let mut client = detached_client(cluster_paths.clone(), transport.clone());
             let response = client
                 .txn(KvTxn {
                     compares: vec![sinomo_core::kv::KvCompare::Missing {
@@ -1496,7 +1711,7 @@ mod tests {
                     }],
                     success: vec![
                         KvOp::Put {
-                            key: "/dfs/test/success".to_string(),
+                            key: "/dfs/filesystems/mounted-test/success".to_string(),
                             value: b"success".to_vec(),
                             lease_id: None,
                         },
@@ -1514,153 +1729,25 @@ mod tests {
 
             assert_eq!(response.succeeded, succeeded);
             assert_eq!(response.revision, KvRevision(9));
-            let cached = client.cached_snapshot().expect("bounded RYW projection");
-            let expected_key = if succeeded {
-                "/dfs/test/success"
-            } else {
-                "/dfs/test/failure"
-            };
-            let skipped_key = if succeeded {
-                "/dfs/test/failure"
-            } else {
-                "/dfs/test/success"
-            };
             assert_eq!(
-                cached.get(expected_key).map(|entry| entry.value.as_slice()),
-                Some(b"authoritative".as_slice()),
-                "the selected transaction branch must be visible before return"
+                transport.routes(),
+                vec![sinomo_core::kv::CLUSTER_KV_TXN_ROUTE.to_string()],
+                "a commit is not followed by a revalidation round"
             );
-            assert!(cached.get(skipped_key).is_none());
-            assert!(
-                cached.entries.len() < 8,
-                "exact mounted overlays must not clone the complete materialized keyspace"
+            assert_eq!(
+                client.scope_write_revision.load(AtomicOrdering::Acquire),
+                if succeeded { 9 } else { 0 },
+                "only the executed branch's published-scope write fences the held snapshot"
             );
-            let expected_routes = if succeeded {
-                vec![
-                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE.to_string(),
-                    sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                    sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE.to_string(),
-                ]
-            } else {
-                vec![
-                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE.to_string(),
-                    sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                ]
-            };
-            assert_eq!(transport.routes(), expected_routes);
-
-            client.refresh_latest().expect("repeat bounded refresh");
-            let refreshed = client.cached_snapshot().expect("repeated projection");
-            assert!(
-                Arc::ptr_eq(&cached, &refreshed),
-                "repeat refresh must not re-import or clone the daemon materialized snapshot"
-            );
+            assert_eq!(client.observed_revision.load(AtomicOrdering::Acquire), 9);
         }
     }
 
     #[test]
-    fn mounted_authoritative_scopes_cross_once_per_refresh_generation() {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-scope-generation");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node =
-            NodeId::from_legacy_named("node_mounted_sifs_scope_generation").expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_mounted_sifs_scope_generation",
-            )
-            .expect("cluster id"),
-            "mounted SIFS authority scope generation",
-            local_node.clone(),
-            "local",
-            "public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-        let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection");
-        let observational_entry = snapshot
-            .entries
-            .first()
-            .expect("cluster projection entry")
-            .clone();
-        let transport = Arc::new(ScriptedMountedKvTransport::new(
-            local_node,
-            true,
-            MountedTxnResponseFault::None,
-        ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, snapshot);
-
-        assert_eq!(
-            client
-                .get(&observational_entry.key)
-                .expect("initial observational point read"),
-            Some(observational_entry),
-        );
-        assert!(
-            transport.routes().is_empty(),
-            "initial mounted reads must remain observational"
-        );
-
-        for expected_generation in 1..=2 {
-            client
-                .refresh_latest()
-                .expect("advance mounted authority generation");
-            for _ in 0..16 {
-                assert!(
-                    client
-                        .get("/dfs/test/exact")
-                        .expect("reuse exact mounted authority scope")
-                        .is_some()
-                );
-            }
-            for _ in 0..16 {
-                assert!(
-                    client
-                        .range_prefix("/dfs/catalog/")
-                        .expect("reuse broad mounted prefix scope")
-                        .is_empty()
-                );
-            }
-            assert!(
-                client
-                    .range_prefix("/dfs/catalog/nested/")
-                    .expect("broad prefix covers a narrower prefix")
-                    .is_empty()
-            );
-            assert!(
-                client
-                    .get("/dfs/catalog/absent")
-                    .expect("broad prefix proves exact absence")
-                    .is_none()
-            );
-            assert_eq!(
-                transport.routes().len(),
-                expected_generation * 2,
-                "each reused exact scope must cross authority once per generation"
-            );
-        }
-        assert_eq!(
-            transport.routes(),
-            vec![
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE.to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn repeated_mounted_path_reads_reuse_the_metadata_shard_catalog_certificate() {
+    fn repeated_mounted_path_reads_use_the_published_shard_catalog() {
         struct ObservedPeer {
             inner: Arc<dyn DfsPeerTransport>,
-            ranges: AtomicUsize,
+            prefixes: Mutex<Vec<String>>,
         }
         impl DfsPeerTransport for ObservedPeer {
             fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
@@ -1675,7 +1762,12 @@ mod tests {
                 if call.request.route
                     == sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
                 {
-                    self.ranges.fetch_add(1, Ordering::SeqCst);
+                    let request =
+                        sinomo_core::kv::decode_cluster_kv_authoritative_range_prefix_rpc_request_body(
+                            &call.request.body,
+                        )
+                        .expect("decode prefix request");
+                    self.prefixes.lock().unwrap().push(request.prefix);
                 }
                 // Same actual owned native transport/request/result, no
                 // manufactured floor, response or route-specific behavior.
@@ -1700,11 +1792,12 @@ mod tests {
         let (sync, asynchronous) = runtime.peer_transports(&local_node).unwrap();
         let observed = Arc::new(ObservedPeer {
             inner: sync,
-            ranges: AtomicUsize::new(0),
+            prefixes: Mutex::new(Vec::new()),
         });
         let control = MountedSifsControlPlaneKvClient::new_authoritative(
-            ClusterPaths::new(&data_dir),
+            &data_dir,
             observed.clone(),
+            asynchronous.clone(),
         );
         let mut opened = open_mounted_sifs_service_with_peer_transports(
             data_dir,
@@ -1720,23 +1813,17 @@ mod tests {
                 .unwrap(),
             b"ordinary"
         );
-        let first = observed.ranges.load(Ordering::SeqCst);
-        assert!(
-            first > 0,
-            "the mount must establish real native prefix authority"
-        );
         let prefix = format!(
             "{}/",
             crate::control_plane::metadata_shards_prefix(&crate::sifs_file_system_id())
         );
+        let published = control
+            .configuration_snapshot()
+            .expect("published configuration")
+            .expect("the mount holds the component's published snapshot");
         assert!(
-            control
-                .snapshot
-                .lock()
-                .unwrap()
-                .validated_authoritative_prefixes
-                .contains(&prefix),
-            "the actual metadata-shard prefix must have a native read certificate"
+            published.entries(&prefix).is_some(),
+            "the published snapshot covers the metadata-shard catalog"
         );
         for _ in 0..8 {
             assert_eq!(
@@ -1747,106 +1834,19 @@ mod tests {
                 b"ordinary"
             );
         }
-        assert_eq!(
-            observed.ranges.load(Ordering::SeqCst),
-            first,
-            "warm ordinary reads reuse actual prefix certificates rather than issuing one ReadIndex per read"
+        assert!(
+            !observed
+                .prefixes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|requested| requested.starts_with(&prefix)),
+            "ordinary reads route from the published catalog instead of a ReadIndex per read"
         );
         drop(opened);
         drop(control);
         drop(observed);
         runtime.close().unwrap();
-    }
-
-    #[test]
-    fn stale_mounted_authority_response_cannot_repopulate_a_new_generation() {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-stale-generation");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node =
-            NodeId::from_legacy_named("node_mounted_sifs_stale_generation").expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_mounted_sifs_stale_generation",
-            )
-            .expect("cluster id"),
-            "mounted SIFS stale generation",
-            local_node.clone(),
-            "local",
-            "public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-        let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection");
-        let (transport, first_call_entered) = BlockingMountedKvTransport::new(local_node);
-        let transport = Arc::new(transport);
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, snapshot);
-        client
-            .refresh_latest()
-            .expect("begin first mounted authority generation");
-
-        let stale_reader = client.clone();
-        let stale_read = thread::spawn(move || {
-            stale_reader
-                .get("/dfs/test/generation-race")
-                .expect("complete stale-generation read")
-        });
-        first_call_entered
-            .recv_timeout(Duration::from_secs(5))
-            .expect("first authority read entered transport");
-        client
-            .refresh_latest()
-            .expect("advance generation while prior read is in flight");
-        transport.release_first_call();
-        assert_eq!(
-            stale_read
-                .join()
-                .expect("join stale-generation read")
-                .expect("replanned current-generation value")
-                .value,
-            b"fresh-generation"
-        );
-
-        {
-            let cache = client.snapshot.lock().expect("mounted projection cache");
-            assert_eq!(cache.authoritative_generation, Some(2));
-            assert_eq!(
-                cache
-                    .snapshot
-                    .get("/dfs/test/generation-race")
-                    .map(|entry| entry.value.as_slice()),
-                Some(b"fresh-generation".as_slice()),
-                "the reader must transparently replan into the current generation"
-            );
-            assert!(
-                cache
-                    .validated_authoritative_entries
-                    .contains("/dfs/test/generation-race"),
-                "only the replanned response may certify the scope"
-            );
-        }
-
-        assert_eq!(
-            client
-                .get("/dfs/test/generation-race")
-                .expect("revalidate in current generation")
-                .expect("current-generation value")
-                .value,
-            b"fresh-generation"
-        );
-        assert_eq!(
-            transport.routes(),
-            vec![
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-            ]
-        );
     }
 
     #[test]
@@ -1869,10 +1869,6 @@ mod tests {
             time::OffsetDateTime::now_utc(),
         );
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-        let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection");
 
         let expected = crate::DfsMetadataShardConfig {
             file_system_id: sinomo_core::Id::from_legacy_named(
@@ -1903,9 +1899,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             requested_keys: Mutex::new(Vec::new()),
         });
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, snapshot);
+        let mut client = detached_client(cluster_paths, transport.clone());
 
         assert!(
             !crate::DfsControlPlaneStore::new(&mut client)
@@ -1923,20 +1917,7 @@ mod tests {
             "one exact-key-set request must observe the transition coherently"
         );
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
-        let cache = client.snapshot.lock().expect("mounted projection cache");
-        assert_eq!(cache.snapshot.revision, KvRevision(51));
-        assert_eq!(
-            cache
-                .snapshot
-                .get(&shard_key)
-                .expect("coherent current shard")
-                .decode::<crate::DfsMetadataShardConfig>()
-                .expect("decode coherent current shard"),
-            current
-        );
-        assert!(cache.snapshot.get(&handoff_key).is_none());
-        assert!(cache.validated_authoritative_entries.contains(&shard_key));
-        assert!(cache.validated_authoritative_entries.contains(&handoff_key));
+        assert_eq!(client.observed_revision.load(AtomicOrdering::Acquire), 51);
     }
 
     #[test]
@@ -1969,15 +1950,7 @@ mod tests {
             true,
             MountedTxnResponseFault::UnknownExactSetRoute,
         ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client = MountedSifsControlPlaneKvClient::new(
-            cluster_paths.clone(),
-            peer_transport,
-            Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision(8))),
-        );
-        client
-            .refresh_latest()
-            .expect("begin mounted authority generation");
+        let client = detached_client(cluster_paths.clone(), transport.clone());
         client
             .get_consistent(&keys)
             .expect_err("an incompatible daemon must be upgraded");
@@ -1992,15 +1965,7 @@ mod tests {
             true,
             MountedTxnResponseFault::FailedExactSetRoute,
         ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client = MountedSifsControlPlaneKvClient::new(
-            cluster_paths,
-            peer_transport,
-            Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision(8))),
-        );
-        client
-            .refresh_latest()
-            .expect("begin strict mounted authority generation");
+        let client = detached_client(cluster_paths, transport.clone());
         let error = client
             .get_consistent(&keys)
             .expect_err("a transport failure must fail closed");
@@ -2014,134 +1979,6 @@ mod tests {
             vec![sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string()],
             "transport failure must not request a full snapshot"
         );
-    }
-
-    #[test]
-    fn mounted_authority_scope_markers_are_bounded() {
-        let mut cache = MountedSifsKvSnapshotCache {
-            snapshot: Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision::ZERO)),
-            authoritative_generation: None,
-            validated_authoritative_entries: BTreeSet::new(),
-            validated_authoritative_prefixes: BTreeSet::new(),
-            validated_authoritative_scope_bytes: 0,
-        };
-        cache.begin_authoritative_generation();
-        for index in 0..MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES.saturating_add(32) {
-            cache.mark_entry_validated(&format!("/dfs/exact/{index}"));
-            cache.mark_prefix_validated(&format!("/dfs/prefix/{index}/"));
-        }
-        assert_eq!(
-            cache
-                .validated_authoritative_entries
-                .len()
-                .saturating_add(cache.validated_authoritative_prefixes.len()),
-            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-            "the aggregate exact-scope certificate set must remain bounded"
-        );
-
-        cache.clear_authoritative_scopes();
-        let long_component = "x".repeat(4096);
-        for index in 0..MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES {
-            cache.mark_entry_validated(&format!("/dfs/byte-bounded/{index:04}/{long_component}"));
-        }
-        assert!(
-            cache.validated_authoritative_scope_bytes
-                <= MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_PAYLOAD_BYTES
-        );
-        assert!(
-            cache.authoritative_scope_count() < MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES,
-            "the aggregate byte bound must stop long absence certificates before the count bound"
-        );
-    }
-
-    #[test]
-    fn mounted_authority_projection_evicts_before_distinct_scope_capacity_growth() {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-projection-capacity");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node =
-            NodeId::from_legacy_named("node_mounted_sifs_projection_capacity").expect("node id");
-        let transport = Arc::new(ScriptedMountedKvTransport::new(
-            local_node,
-            true,
-            MountedTxnResponseFault::None,
-        ));
-
-        let mut snapshot = empty_mounted_sifs_kv_snapshot(KvRevision(1));
-        snapshot.entries = (0..MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_ENTRIES)
-            .map(|index| KvEntry {
-                key: format!("/dfs/capacity/{index:04}"),
-                value: vec![index as u8],
-                create_revision: KvRevision(1),
-                modify_revision: KvRevision(1),
-                version: sinomo_core::kv::KvVersion(1),
-                lease_id: None,
-            })
-            .collect();
-        snapshot.canonicalize();
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, Arc::new(snapshot));
-        {
-            let mut cache = client.snapshot.lock().expect("mounted projection cache");
-            cache.authoritative_generation = Some(1);
-            for index in 0..MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES {
-                cache.mark_entry_validated(&format!("/dfs/capacity/{index:04}"));
-            }
-        }
-
-        let new_key = "/dfs/capacity/overflow";
-        assert!(
-            client
-                .merge_authoritative_entry(
-                    new_key,
-                    &sinomo_core::kv::KvAuthoritativeRead {
-                        value: Some(KvEntry {
-                            key: new_key.to_string(),
-                            value: b"bounded".to_vec(),
-                            create_revision: KvRevision(2),
-                            modify_revision: KvRevision(2),
-                            version: sinomo_core::kv::KvVersion(1),
-                            lease_id: None,
-                        }),
-                        authority: transport.authority(KvRevision(2)),
-                    },
-                    1,
-                )
-                .expect("merge overflow scope")
-        );
-        let cache = client.snapshot.lock().expect("mounted projection cache");
-        assert_eq!(cache.snapshot.entries.len(), 1);
-        assert_eq!(cache.authoritative_scope_count(), 1);
-        assert!(
-            cache
-                .snapshot
-                .entries
-                .iter()
-                .all(|entry| cache.entry_is_validated(&entry.key)),
-            "every retained projection entry must have an exact or prefix certificate"
-        );
-        assert!(
-            cache
-                .snapshot
-                .entries
-                .len()
-                .saturating_add(cache.authoritative_scope_count())
-                <= MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_ENTRIES.saturating_mul(2),
-            "projection entries plus certificates must remain O(capacity)"
-        );
-        assert!(cache.validated_authoritative_entries.contains(new_key));
-        assert!(mounted_sifs_authoritative_projection_entries_fit(
-            &cache.snapshot.entries
-        ));
-        drop(cache);
-        assert!(matches!(
-            client
-                .authoritative_entry_read_plan("/dfs/capacity/0000")
-                .expect("plan evicted scope"),
-            MountedSifsKvReadPlan::Authoritative { .. }
-        ));
     }
 
     #[test]
@@ -2170,9 +2007,7 @@ mod tests {
             true,
             MountedTxnResponseFault::None,
         ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client =
-            MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths, peer_transport);
+        let mut client = detached_client(cluster_paths, transport.clone());
         let keys = vec!["/dfs/deadline/key".to_string()];
 
         let error = client
@@ -2229,270 +2064,28 @@ mod tests {
             true,
             MountedTxnResponseFault::WrongAuthoritativeEntryKey,
         ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport;
-        let mut exact_client = MountedSifsControlPlaneKvClient::new(
-            cluster_paths.clone(),
-            peer_transport,
-            Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision(8))),
-        );
-        exact_client
-            .refresh_latest()
-            .expect("begin exact authority generation");
+        let exact_client = detached_client(cluster_paths.clone(), transport);
         let error = exact_client
             .get("/dfs/requested/entry")
             .expect_err("a mismatched exact-key reply must be rejected");
         assert!(error.to_string().contains("returned entry"));
-        {
-            let cache = exact_client
-                .snapshot
-                .lock()
-                .expect("exact projection cache");
-            assert!(!cache.entry_is_validated("/dfs/requested/entry"));
-            assert!(cache.snapshot.get("/dfs/foreign/entry").is_none());
-        }
+        assert_eq!(
+            exact_client.observed_revision.load(AtomicOrdering::Acquire),
+            0,
+            "a rejected reply is not observed"
+        );
 
         let transport = Arc::new(ScriptedMountedKvTransport::new(
             local_node,
             true,
             MountedTxnResponseFault::OutOfPrefixAuthoritativeEntry,
         ));
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport;
-        let mut prefix_client = MountedSifsControlPlaneKvClient::new(
-            cluster_paths,
-            peer_transport,
-            Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision(8))),
-        );
-        prefix_client
-            .refresh_latest()
-            .expect("begin prefix authority generation");
+        let prefix_client = detached_client(cluster_paths, transport);
         let error = prefix_client
             .range_prefix("/dfs/requested/")
             .expect_err("an out-of-prefix reply must be rejected");
         assert!(error.to_string().contains("returned entry"));
-        let cache = prefix_client
-            .snapshot
-            .lock()
-            .expect("prefix projection cache");
-        assert!(!cache.prefix_is_validated("/dfs/requested/"));
-        assert!(cache.snapshot.get("/dfs/requested-sibling").is_none());
-    }
-
-    #[test]
-    fn mounted_txn_revalidates_only_mutated_scopes_in_the_current_generation() {
-        mounted_txn_scope_case(false);
-    }
-
-    #[test]
-    fn mounted_txn_exact_receipt_revalidates_mutated_scopes() {
-        mounted_txn_scope_case(true);
-    }
-
-    fn mounted_txn_scope_case(exact_receipt: bool) {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-txn-scope-invalidation");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node = NodeId::from_legacy_named("node_mounted_sifs_txn_scope_invalidation")
-            .expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_mounted_sifs_txn_scope_invalidation",
-            )
-            .expect("cluster id"),
-            "mounted SIFS transaction scope invalidation",
-            local_node.clone(),
-            "local",
-            "public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-        let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection");
-        let mut transport =
-            ScriptedMountedKvTransport::new(local_node, true, MountedTxnResponseFault::None);
-        transport.exact_receipt = exact_receipt;
-        let transport = Arc::new(transport);
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, snapshot);
-        client
-            .refresh_latest()
-            .expect("begin mounted authority generation");
-        client
-            .get("/dfs/test/affected")
-            .expect("validate affected key");
-        client
-            .get("/dfs/test/unaffected")
-            .expect("validate unaffected key");
-        client
-            .range_prefix("/dfs/other/")
-            .expect("validate unrelated prefix");
-        assert_eq!(transport.routes().len(), 3);
-
-        let response = client
-            .txn(KvTxn {
-                compares: Vec::new(),
-                success: vec![KvOp::Put {
-                    key: "/dfs/test/affected".to_string(),
-                    value: b"committed".to_vec(),
-                    lease_id: None,
-                }],
-                failure: Vec::new(),
-            })
-            .expect("commit affected mounted scope");
-        assert_eq!(response.revision, KvRevision(9));
-        assert_eq!(
-            transport.routes(),
-            vec![
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_TXN_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-            ],
-            "the transaction must revalidate only its executed mutation scope"
-        );
-
-        client
-            .get("/dfs/test/affected")
-            .expect("reuse revalidated affected key");
-        client
-            .get("/dfs/test/unaffected")
-            .expect("reuse unaffected key certificate");
-        client
-            .range_prefix("/dfs/other/")
-            .expect("reuse unrelated prefix certificate");
-        assert_eq!(
-            transport.routes().len(),
-            5,
-            "post-commit reads must reuse both the repaired and unaffected scopes"
-        );
-        let cached = client.cached_snapshot().expect("mounted exact projection");
-        assert_eq!(cached.revision, KvRevision(9));
-        assert_eq!(
-            cached
-                .get("/dfs/test/affected")
-                .expect("affected key in exact projection")
-                .modify_revision,
-            KvRevision(9),
-            "transaction revalidation must meet the commit revision"
-        );
-    }
-
-    #[test]
-    fn mounted_txn_failure_mid_revalidation_retires_every_committed_scope() {
-        mounted_txn_mid_revalidation_case(false);
-    }
-
-    #[test]
-    fn mounted_txn_exact_receipt_failure_retires_every_committed_scope() {
-        mounted_txn_mid_revalidation_case(true);
-    }
-
-    fn mounted_txn_mid_revalidation_case(exact_receipt: bool) {
-        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-txn-middle-read-failure");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data directory");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node = NodeId::from_legacy_named("node_mounted_sifs_txn_middle_read_failure")
-            .expect("local node");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_mounted_sifs_txn_middle_read_failure",
-            )
-            .expect("cluster id"),
-            "mounted SIFS transaction middle read failure",
-            local_node.clone(),
-            "local",
-            "public-key",
-            time::OffsetDateTime::now_utc(),
-        );
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-
-        let keys = [
-            "/dfs/test/txn-a".to_string(),
-            "/dfs/test/txn-b".to_string(),
-            "/dfs/test/txn-c".to_string(),
-        ];
-        let mut snapshot = empty_mounted_sifs_kv_snapshot(KvRevision(8));
-        snapshot.entries = keys
-            .iter()
-            .map(|key| KvEntry {
-                key: key.clone(),
-                value: b"stale".to_vec(),
-                create_revision: KvRevision(8),
-                modify_revision: KvRevision(8),
-                version: sinomo_core::kv::KvVersion(1),
-                lease_id: None,
-            })
-            .collect();
-        snapshot.canonicalize();
-        let mut transport = ScriptedMountedKvTransport::new(
-            local_node,
-            true,
-            MountedTxnResponseFault::FailSecondPostCommitRead,
-        );
-        transport.exact_receipt = exact_receipt;
-        let transport = Arc::new(transport);
-        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
-        let mut client =
-            MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, Arc::new(snapshot));
-        {
-            let mut cache = client.snapshot.lock().expect("mounted projection cache");
-            cache.authoritative_generation = Some(1);
-            for key in &keys {
-                cache.mark_entry_validated(key);
-            }
-        }
-
-        let error = client
-            .txn(KvTxn {
-                compares: Vec::new(),
-                success: keys
-                    .iter()
-                    .map(|key| KvOp::Put {
-                        key: key.clone(),
-                        value: b"committed".to_vec(),
-                        lease_id: None,
-                    })
-                    .collect(),
-                failure: Vec::new(),
-            })
-            .expect_err("second committed-scope read must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("injected second post-commit authority-read failure"),
-            "unexpected revalidation error: {error}"
-        );
-        {
-            let cache = client.snapshot.lock().expect("mounted projection cache");
-            assert!(cache.validated_authoritative_entries.contains(&keys[0]));
-            assert!(!cache.validated_authoritative_entries.contains(&keys[1]));
-            assert!(
-                !cache.validated_authoritative_entries.contains(&keys[2]),
-                "the unvisited third committed key must not retain its stale certificate"
-            );
-        }
-        assert_eq!(
-            client
-                .get(&keys[2])
-                .expect("unvisited key must cross authority")
-                .expect("authoritative third key")
-                .value,
-            b"authoritative"
-        );
-        assert_eq!(
-            transport.routes(),
-            vec![
-                sinomo_core::kv::CLUSTER_KV_TXN_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
-            ]
-        );
+        assert_eq!(prefix_client.observed_revision.load(AtomicOrdering::Acquire), 0);
     }
 
     #[test]
@@ -2524,10 +2117,6 @@ mod tests {
             time::OffsetDateTime::now_utc(),
         );
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("cluster KV state");
-        let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
-            .expect("materialized projection");
 
         for fault in [
             MountedTxnResponseFault::MismatchedRequestId,
@@ -2535,17 +2124,11 @@ mod tests {
             MountedTxnResponseFault::MissingSubmittedDigest,
             MountedTxnResponseFault::InvalidAuthority,
             MountedTxnResponseFault::StaleAuthorityRevision,
-            MountedTxnResponseFault::StalePostCommitRead,
         ] {
             let mut transport = ScriptedMountedKvTransport::new(local_node.clone(), true, fault);
             transport.exact_receipt = exact_receipt;
             let transport = Arc::new(transport);
-            let peer_transport: Arc<dyn DfsPeerTransport> = transport;
-            let mut client = MountedSifsControlPlaneKvClient::new(
-                cluster_paths.clone(),
-                peer_transport,
-                Arc::clone(&snapshot),
-            );
+            let mut client = detached_client(cluster_paths.clone(), transport);
             let result = client.txn(KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
@@ -2984,179 +2567,566 @@ mod tests {
     }
 }
 
+/// First delay before re-subscribing after the daemon event stream ended;
+/// it doubles up to [`MOUNTED_SIFS_CONFIGURATION_RESUBSCRIBE_MAX_DELAY`].
+/// This is a re-send timer, never a network deadline.
+const MOUNTED_SIFS_CONFIGURATION_RESUBSCRIBE_DELAY: Duration = Duration::from_millis(250);
+const MOUNTED_SIFS_CONFIGURATION_RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(5);
+/// Connect budget for the daemon event stream; the stream itself is
+/// long-lived and kept alive by session keepalives.
+const MOUNTED_SIFS_CONFIGURATION_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What a mounted client currently knows about the local daemon's published
+/// DFS configuration.
+#[derive(Clone, Debug)]
+enum MountedSifsConfiguration {
+    /// The first subscription has not settled yet.
+    Connecting,
+    /// No live event subscription: a held snapshot could miss a change, so
+    /// none is used until the next subscription has fetched again.
+    Disconnected,
+    /// Subscribed; the daemon has no coherent publication yet.
+    Pending(DfsConfigurationPublication),
+    /// Subscribed, and fetched after the newest announcement seen.
+    Published(Arc<crate::DfsConfigurationSnapshot>),
+    /// The local daemon predates the snapshot route.
+    Unsupported,
+}
+
+#[derive(Debug)]
+struct MountedSifsConfigurationShared {
+    state: Mutex<(MountedSifsConfiguration, u64)>,
+    settled: Condvar,
+}
+
+impl MountedSifsConfigurationShared {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((MountedSifsConfiguration::Connecting, 0)),
+            settled: Condvar::new(),
+        }
+    }
+
+    fn set(&self, configuration: MountedSifsConfiguration) {
+        if let Ok(mut state) = self.state.lock() {
+            state.0 = configuration;
+            state.1 = state.1.wrapping_add(1);
+        }
+        self.settled.notify_all();
+    }
+
+    fn held_publication(&self) -> Option<DfsConfigurationPublication> {
+        match &self.state.lock().ok()?.0 {
+            MountedSifsConfiguration::Published(snapshot) => Some(snapshot.publication()),
+            MountedSifsConfiguration::Pending(publication) => Some(*publication),
+            _ => None,
+        }
+    }
+
+    fn is_unsupported(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| matches!(state.0, MountedSifsConfiguration::Unsupported))
+    }
+
+    /// The current state. Only a use before the first subscription settled
+    /// waits, and only under one network deadline.
+    fn current(&self) -> MountedSifsConfiguration {
+        let Ok(mut state) = self.state.lock() else {
+            return MountedSifsConfiguration::Disconnected;
+        };
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while matches!(state.0, MountedSifsConfiguration::Connecting) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return MountedSifsConfiguration::Disconnected;
+            };
+            state = match self.settled.wait_timeout(state, remaining) {
+                Ok((state, _)) => state,
+                Err(_) => return MountedSifsConfiguration::Disconnected,
+            };
+        }
+        state.0.clone()
+    }
+
+    #[cfg(test)]
+    fn wait_until(
+        &self,
+        settled: impl Fn(&MountedSifsConfiguration) -> bool,
+    ) -> MountedSifsConfiguration {
+        let mut state = self.state.lock().expect("mounted configuration state");
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while !settled(&state.0) {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("mounted configuration deadline");
+            state = self
+                .settled
+                .wait_timeout(state, remaining)
+                .expect("mounted configuration state")
+                .0;
+        }
+        state.0.clone()
+    }
+
+    #[cfg(test)]
+    fn wait_for_transitions(&self, transitions: u64) -> MountedSifsConfiguration {
+        let mut state = self.state.lock().expect("mounted configuration state");
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while state.1 < transitions {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("mounted configuration transition deadline");
+            state = self
+                .settled
+                .wait_timeout(state, remaining)
+                .expect("mounted configuration state")
+                .0;
+        }
+        state.0.clone()
+    }
+}
+
+/// One stream item, already decoded from the daemon event stream.
+#[derive(Debug)]
+enum MountedSifsConfigurationItem {
+    Ready,
+    Published(DfsConfigurationPublication),
+    Lagged,
+}
+
+#[cfg(test)]
+type MountedSifsConfigurationItems =
+    tokio::sync::mpsc::UnboundedReceiver<MountedSifsConfigurationItem>;
+
+/// Where announcements come from: the local daemon's event stream, or, in
+/// fixtures that host the DFS component in process, that component's bus.
+#[derive(Clone)]
+enum MountedSifsConfigurationEvents {
+    Daemon(SinomoDataDir),
+    #[cfg(any(test, feature = "test-support"))]
+    Bus(SinomoDataDir),
+    /// Each subscription takes the next scripted session.
+    #[cfg(test)]
+    Scripted(Arc<Mutex<std::collections::VecDeque<MountedSifsConfigurationItems>>>),
+}
+
+impl MountedSifsConfigurationEvents {
+    fn for_data_dir(data_dir: &SinomoDataDir) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        if mounted_sifs_test_event_bus(data_dir).is_some() {
+            return Self::Bus(data_dir.clone());
+        }
+        Self::Daemon(data_dir.clone())
+    }
+
+    /// Deliver items until the subscription ends.
+    async fn subscribe(
+        &self,
+        items: tokio::sync::mpsc::UnboundedSender<MountedSifsConfigurationItem>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Daemon(data_dir) => {
+                mounted_sifs_daemon_configuration_events(data_dir, items).await
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Bus(data_dir) => {
+                // A stopped component ends the subscription, as a daemon
+                // restart ends its event stream.
+                let (bus, mut stopped) = mounted_sifs_test_event_bus(data_dir)
+                    .ok_or_else(|| "DFS component is not running".to_string())?;
+                let mut receiver = bus.subscribe_host();
+                if items.send(MountedSifsConfigurationItem::Ready).is_err() {
+                    return Ok(());
+                }
+                loop {
+                    let received = tokio::select! {
+                        received = receiver.recv() => received,
+                        _ = stopped.wait_for(|stopped| *stopped) => {
+                            return Err("DFS component stopped".into());
+                        }
+                    };
+                    let item = match received {
+                        Ok(event)
+                            if event.envelope.kind.as_str()
+                                == crate::DFS_CONFIGURATION_PUBLISHED_EVENT_KIND =>
+                        {
+                            mounted_sifs_configuration_item(event.envelope.payload.clone())
+                        }
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            MountedSifsConfigurationItem::Lagged
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err("DFS component event bus closed".into());
+                        }
+                    };
+                    if items.send(item).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            #[cfg(test)]
+            Self::Scripted(sessions) => {
+                let next = sessions.lock().expect("scripted sessions").pop_front();
+                let Some(mut session) = next else {
+                    return std::future::pending().await;
+                };
+                while let Some(item) = session.recv().await {
+                    if items.send(item).is_err() {
+                        return Ok(());
+                    }
+                }
+                Err("scripted configuration stream ended".into())
+            }
+        }
+    }
+}
+
+/// An undecodable announcement still means "changed".
+fn mounted_sifs_configuration_item(payload: serde_json::Value) -> MountedSifsConfigurationItem {
+    match serde_json::from_value(payload) {
+        Ok(publication) => MountedSifsConfigurationItem::Published(publication),
+        Err(_) => MountedSifsConfigurationItem::Lagged,
+    }
+}
+
+/// Subscribe to `dfs.configuration.published` on the local daemon's existing
+/// event stream. The authenticated local Main is resolved for each session.
+async fn mounted_sifs_daemon_configuration_events(
+    data_dir: &SinomoDataDir,
+    items: tokio::sync::mpsc::UnboundedSender<MountedSifsConfigurationItem>,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Handle::current();
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir))
+        .map_err(|error| error.to_string())?;
+    let address = match sinomo_api::probe_daemon_status_async(
+        &sinomo_api::DaemonPaths::new(data_dir),
+        sinomo_api::DAEMON_API_PROBE_TIMEOUT,
+        &runtime,
+    )
+    .await
+    {
+        sinomo_api::DaemonProbeStatus::Running(status)
+            if status.cluster.as_ref().is_some_and(|cluster| {
+                cluster.cluster_id == state.cluster_id
+                    && cluster.node_id == state.local_node_id
+                    && cluster.process == sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE
+            }) =>
+        {
+            status.address
+        }
+        _ => return Err("the local Main daemon is unavailable".into()),
+    };
+    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+        sinomo_api::DAEMON_EVENT_SUBSCRIBE_ROUTE,
+        sinomo_api::DAEMON_RPC_CATEGORY,
+        &sinomo_api::DaemonEventSubscribeRequest::for_dfs_configuration(),
+    )
+    .map_err(|error| error.to_string())?;
+    sinomo_api::send_daemon_rpc_stream_from_data_dir_async(
+        data_dir.clone(),
+        &address,
+        &request,
+        sinomo_core::network::DaemonRpcTimeouts::default()
+            .with_connect_timeout(Some(MOUNTED_SIFS_CONFIGURATION_STREAM_CONNECT_TIMEOUT)),
+        |response| {
+            response.error_detail()?;
+            let item = match response
+                .decode_body::<sinomo_api::DaemonEventStreamItem>()
+                .map_err(sinomo_api::DaemonApiError::from)?
+            {
+                sinomo_api::DaemonEventStreamItem::Ready { .. } => {
+                    MountedSifsConfigurationItem::Ready
+                }
+                sinomo_api::DaemonEventStreamItem::Event { event }
+                    if event.kind.as_str() == crate::DFS_CONFIGURATION_PUBLISHED_EVENT_KIND =>
+                {
+                    mounted_sifs_configuration_item(event.payload)
+                }
+                sinomo_api::DaemonEventStreamItem::Event { .. } => return Ok(true),
+                sinomo_api::DaemonEventStreamItem::Lagged { .. } => {
+                    MountedSifsConfigurationItem::Lagged
+                }
+            };
+            Ok(items.send(item).is_ok())
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// One local-node read of the current publication.
+#[derive(Clone)]
+struct MountedSifsConfigurationFetch {
+    cluster_paths: ClusterPaths,
+    transport: Arc<dyn AsyncDfsPeerTransport>,
+}
+
+impl MountedSifsConfigurationFetch {
+    async fn fetch(&self) -> Result<crate::DfsFetchedConfiguration, KvError> {
+        let unavailable = |detail: String| KvError::AuthorityUnavailable { detail };
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths)
+            .map_err(|error| unavailable(error.to_string()))?;
+        let call = crate::dfs_configuration_snapshot_call()?;
+        let result = self
+            .transport
+            .call_object_rpc_async(
+                &state.local_node_id,
+                call,
+                DfsObjectRpcSendOptions::default(),
+            )
+            .await
+            .map_err(|error| {
+                if error.is_unknown_route(crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE) {
+                    crate::dfs_configuration_snapshot_unsupported()
+                } else {
+                    unavailable(error.to_string())
+                }
+            })?;
+        let response = result
+            .into_materialized_value_response(
+                crate::dfs_configuration_snapshot_max_response_bytes(),
+            )
+            .await
+            .map_err(|error| match error {
+                NetworkError::UnknownRoute { .. } => {
+                    crate::dfs_configuration_snapshot_unsupported()
+                }
+                error => unavailable(error.to_string()),
+            })?;
+        crate::decode_dfs_configuration_snapshot_response(&response)
+    }
+}
+
+/// Re-subscribe for as long as the feed lives. A lost stream withdraws the
+/// held snapshot immediately; every new subscription fetches once after its
+/// `Ready` before announcements are acted on.
+async fn run_mounted_sifs_configuration_feed(
+    shared: Arc<MountedSifsConfigurationShared>,
+    events: MountedSifsConfigurationEvents,
+    fetch: MountedSifsConfigurationFetch,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut delay = MOUNTED_SIFS_CONFIGURATION_RESUBSCRIBE_DELAY;
+    loop {
+        let subscribed = tokio::select! {
+            subscribed = run_mounted_sifs_configuration_session(&shared, &events, &fetch) => subscribed,
+            _ = stop.wait_for(|stopped| *stopped) => return,
+        };
+        shared.set(MountedSifsConfiguration::Disconnected);
+        if subscribed {
+            delay = MOUNTED_SIFS_CONFIGURATION_RESUBSCRIBE_DELAY;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            _ = stop.wait_for(|stopped| *stopped) => return,
+        }
+        delay = delay
+            .saturating_mul(2)
+            .min(MOUNTED_SIFS_CONFIGURATION_RESUBSCRIBE_MAX_DELAY);
+    }
+}
+
+/// One subscription. Returns whether it became ready.
+async fn run_mounted_sifs_configuration_session(
+    shared: &MountedSifsConfigurationShared,
+    events: &MountedSifsConfigurationEvents,
+    fetch: &MountedSifsConfigurationFetch,
+) -> bool {
+    let (sender, mut items) = tokio::sync::mpsc::unbounded_channel();
+    let stream = events.subscribe(sender);
+    tokio::pin!(stream);
+    let mut ready = false;
+    loop {
+        let first = tokio::select! {
+            biased;
+            item = items.recv() => match item {
+                Some(item) => item,
+                None => return ready,
+            },
+            ended = &mut stream => {
+                if let Err(error) = ended {
+                    tracing::debug!(target: "sinomo.dfs.mounted", %error,
+                        "mounted SIFS configuration subscription ended");
+                }
+                return ready;
+            }
+        };
+        // Coalesce: one fetch answers every announcement already queued.
+        let mut refetch = false;
+        let mut newest = None;
+        for item in std::iter::once(first).chain(std::iter::from_fn(|| items.try_recv().ok())) {
+            match item {
+                MountedSifsConfigurationItem::Ready => {
+                    ready = true;
+                    refetch = true;
+                }
+                MountedSifsConfigurationItem::Lagged => refetch = true,
+                MountedSifsConfigurationItem::Published(publication) => {
+                    newest = Some(publication);
+                }
+            }
+        }
+        if !ready {
+            continue;
+        }
+        let advanced = newest.is_some_and(|publication| {
+            // An old daemon without the route announces nothing; a newer
+            // announcement means the route is served now.
+            shared.is_unsupported()
+                || shared
+                    .held_publication()
+                    .is_none_or(|held| publication.advances_past(&held))
+        });
+        if !refetch && !advanced {
+            continue;
+        }
+        match fetch.fetch().await {
+            Ok(crate::DfsFetchedConfiguration::Published(snapshot)) => {
+                shared.set(MountedSifsConfiguration::Published(snapshot));
+            }
+            Ok(crate::DfsFetchedConfiguration::Pending(publication)) => {
+                shared.set(MountedSifsConfiguration::Pending(publication));
+            }
+            Err(error) if crate::is_dfs_configuration_snapshot_unsupported(&error) => {
+                shared.set(MountedSifsConfiguration::Unsupported);
+            }
+            Err(error) => {
+                // End this session; the re-subscription fetches again.
+                tracing::debug!(target: "sinomo.dfs.mounted", %error,
+                    "mounted SIFS configuration fetch failed");
+                return ready;
+            }
+        }
+    }
+}
+
+/// Event-driven holder of the published configuration for one mounted
+/// client and its clones. Dropping the last clone ends its subscription.
+struct MountedSifsConfigurationFeed {
+    shared: Arc<MountedSifsConfigurationShared>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for MountedSifsConfigurationFeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MountedSifsConfigurationFeed")
+            .field("shared", &self.shared)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for MountedSifsConfigurationFeed {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+impl MountedSifsConfigurationFeed {
+    fn subscribe(
+        events: MountedSifsConfigurationEvents,
+        fetch: MountedSifsConfigurationFetch,
+    ) -> Arc<Self> {
+        let shared = Arc::new(MountedSifsConfigurationShared::new());
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task_shared = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name("sinomo-sifs-configuration".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(run_mounted_sifs_configuration_feed(
+                        task_shared,
+                        events,
+                        fetch,
+                        stopped,
+                    )),
+                    Err(error) => {
+                        tracing::warn!(%error, "mounted SIFS configuration feed has no runtime");
+                        task_shared.set(MountedSifsConfiguration::Disconnected);
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "mounted SIFS configuration feed could not start");
+            shared.set(MountedSifsConfiguration::Disconnected);
+        }
+        Arc::new(Self { shared, stop })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type MountedSifsTestEventBuses = std::collections::BTreeMap<
+    PathBuf,
+    (
+        sinomo_module::ComponentEventBus,
+        tokio::sync::watch::Sender<bool>,
+    ),
+>;
+
+#[cfg(any(test, feature = "test-support"))]
+fn mounted_sifs_test_event_buses() -> &'static Mutex<MountedSifsTestEventBuses> {
+    static BUSES: std::sync::OnceLock<Mutex<MountedSifsTestEventBuses>> =
+        std::sync::OnceLock::new();
+    BUSES.get_or_init(Default::default)
+}
+
+/// In-process fixtures host the DFS component without a daemon event
+/// stream; their mounted clients subscribe to that component's bus instead.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn register_mounted_sifs_test_event_bus(
+    data_dir: &SinomoDataDir,
+    bus: Option<sinomo_module::ComponentEventBus>,
+) {
+    if let Ok(mut buses) = mounted_sifs_test_event_buses().lock() {
+        let previous = match bus {
+            Some(bus) => buses.insert(
+                data_dir.root().to_path_buf(),
+                (bus, tokio::sync::watch::channel(false).0),
+            ),
+            None => buses.remove(&data_dir.root().to_path_buf()),
+        };
+        if let Some((_, stopped)) = previous {
+            let _ = stopped.send(true);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn mounted_sifs_test_event_bus(
+    data_dir: &SinomoDataDir,
+) -> Option<(
+    sinomo_module::ComponentEventBus,
+    tokio::sync::watch::Receiver<bool>,
+)> {
+    mounted_sifs_test_event_buses()
+        .lock()
+        .ok()?
+        .get(&data_dir.root().to_path_buf())
+        .map(|(bus, stopped)| (bus.clone(), stopped.subscribe()))
+}
+
+/// Out-of-process DFS control-plane client for mounted SIFS.
+///
+/// Reads inside the published configuration scopes use the snapshot the
+/// local daemon published, held by an event-driven feed. Every other read is
+/// one bounded ReadIndex request through the local daemon and is not
+/// retained; operation-bound fence reads always cross ReadIndex.
 #[derive(Clone)]
 pub struct MountedSifsControlPlaneKvClient {
     cluster_paths: ClusterPaths,
     peer_transport: Arc<dyn DfsPeerTransport>,
-    snapshot: Arc<Mutex<MountedSifsKvSnapshotCache>>,
-}
-
-#[derive(Debug)]
-struct MountedSifsKvSnapshotCache {
-    snapshot: Arc<KvSnapshot>,
-    /// `None` preserves the initial daemon-materialized observational view.
-    /// Every explicit refresh advances the generation and requires each exact
-    /// scope to cross one fresh authority barrier before it can be reused.
-    authoritative_generation: Option<u64>,
-    validated_authoritative_entries: BTreeSet<String>,
-    validated_authoritative_prefixes: BTreeSet<String>,
-    validated_authoritative_scope_bytes: usize,
-}
-
-impl MountedSifsKvSnapshotCache {
-    fn authoritative_scope_count(&self) -> usize {
-        self.validated_authoritative_entries
-            .len()
-            .saturating_add(self.validated_authoritative_prefixes.len())
-    }
-
-    fn clear_authoritative_scopes(&mut self) {
-        self.validated_authoritative_entries.clear();
-        self.validated_authoritative_prefixes.clear();
-        self.validated_authoritative_scope_bytes = 0;
-    }
-
-    fn can_admit_authoritative_scopes(
-        &self,
-        additional_count: usize,
-        additional_bytes: usize,
-    ) -> bool {
-        self.authoritative_scope_count()
-            .saturating_add(additional_count)
-            <= MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES
-            && self
-                .validated_authoritative_scope_bytes
-                .saturating_add(additional_bytes)
-                <= MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_PAYLOAD_BYTES
-    }
-
-    fn begin_authoritative_generation(&mut self) -> u64 {
-        if self.authoritative_generation.is_none() {
-            // Never retain the complete daemon projection once a caller asks
-            // for authoritative data. The compact private view is populated
-            // only by the exact keys and prefixes this mount actually reads.
-            self.snapshot = Arc::new(empty_mounted_sifs_kv_snapshot(self.snapshot.revision));
-        }
-        let generation = self
-            .authoritative_generation
-            .and_then(|generation| generation.checked_add(1))
-            .unwrap_or(1);
-        self.authoritative_generation = Some(generation);
-        self.clear_authoritative_scopes();
-        generation
-    }
-
-    fn ensure_authoritative_generation(&mut self) -> u64 {
-        match self.authoritative_generation {
-            Some(generation) => generation,
-            None => self.begin_authoritative_generation(),
-        }
-    }
-
-    fn entry_is_validated(&self, key: &str) -> bool {
-        self.validated_authoritative_entries.contains(key)
-            || self
-                .validated_authoritative_prefixes
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-    }
-
-    fn prefix_is_validated(&self, prefix: &str) -> bool {
-        self.validated_authoritative_prefixes
-            .iter()
-            .any(|validated| prefix.starts_with(validated))
-    }
-
-    fn invalidate_entry_scope(&mut self, key: &str) {
-        if self.validated_authoritative_entries.remove(key) {
-            self.validated_authoritative_scope_bytes = self
-                .validated_authoritative_scope_bytes
-                .saturating_sub(key.len());
-        }
-        let removed_prefix_bytes = self
-            .validated_authoritative_prefixes
-            .iter()
-            .filter(|prefix| key.starts_with(prefix.as_str()))
-            .map(String::len)
-            .sum::<usize>();
-        self.validated_authoritative_prefixes
-            .retain(|prefix| !key.starts_with(prefix));
-        self.validated_authoritative_scope_bytes = self
-            .validated_authoritative_scope_bytes
-            .saturating_sub(removed_prefix_bytes);
-    }
-
-    fn invalidate_prefix_scope(&mut self, prefix: &str) {
-        let removed_entry_bytes = self
-            .validated_authoritative_entries
-            .iter()
-            .filter(|key| key.starts_with(prefix))
-            .map(String::len)
-            .sum::<usize>();
-        self.validated_authoritative_entries
-            .retain(|key| !key.starts_with(prefix));
-        let removed_prefix_bytes = self
-            .validated_authoritative_prefixes
-            .iter()
-            .filter(|validated| {
-                validated.starts_with(prefix) || prefix.starts_with(validated.as_str())
-            })
-            .map(String::len)
-            .sum::<usize>();
-        self.validated_authoritative_prefixes
-            .retain(|validated| !validated.starts_with(prefix) && !prefix.starts_with(validated));
-        self.validated_authoritative_scope_bytes = self
-            .validated_authoritative_scope_bytes
-            .saturating_sub(removed_entry_bytes.saturating_add(removed_prefix_bytes));
-    }
-
-    fn mark_entry_validated(&mut self, key: &str) {
-        if self.validated_authoritative_entries.contains(key) {
-            return;
-        }
-        if self.can_admit_authoritative_scopes(1, key.len()) {
-            self.validated_authoritative_entries.insert(key.to_string());
-            self.validated_authoritative_scope_bytes = self
-                .validated_authoritative_scope_bytes
-                .saturating_add(key.len());
-        }
-    }
-
-    fn mark_prefix_validated(&mut self, prefix: &str) {
-        if self.validated_authoritative_prefixes.contains(prefix) {
-            return;
-        }
-        if self.can_admit_authoritative_scopes(1, prefix.len()) {
-            self.validated_authoritative_prefixes
-                .insert(prefix.to_string());
-            self.validated_authoritative_scope_bytes = self
-                .validated_authoritative_scope_bytes
-                .saturating_add(prefix.len());
-        }
-    }
-}
-
-fn mounted_sifs_authoritative_projection_entries_fit(entries: &[KvEntry]) -> bool {
-    if entries.len() > MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_ENTRIES {
-        return false;
-    }
-    entries
-        .iter()
-        .try_fold(0_usize, |payload_bytes, entry| {
-            payload_bytes.checked_add(entry.key.len().saturating_add(entry.value.len()))
-        })
-        .is_some_and(|payload_bytes| {
-            payload_bytes <= MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_PAYLOAD_BYTES
-        })
-}
-
-#[derive(Debug)]
-enum MountedSifsKvReadPlan<T> {
-    Cached(T),
-    Authoritative {
-        generation: u64,
-        minimum_revision: KvRevision,
-    },
+    configuration: Arc<MountedSifsConfigurationFeed>,
+    /// Highest revision this client or its clones read or committed through
+    /// the daemon. A ReadIndex reply below it is rejected.
+    observed_revision: Arc<AtomicU64>,
+    /// Highest revision at which this client committed a change inside a
+    /// published scope. An older held snapshot does not answer that scope,
+    /// so the client reads its own configuration writes.
+    scope_write_revision: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for MountedSifsControlPlaneKvClient {
@@ -3165,47 +3135,41 @@ impl std::fmt::Debug for MountedSifsControlPlaneKvClient {
             .debug_struct("MountedSifsControlPlaneKvClient")
             .field("cluster_paths", &self.cluster_paths)
             .field("peer_transport", &"dyn DfsPeerTransport")
+            .field("configuration", &self.configuration)
             .finish()
     }
 }
 
 impl MountedSifsControlPlaneKvClient {
-    /// Creates a compact private projection whose first read of each exact key
-    /// or prefix is established through the daemon's ReadIndex route. The
-    /// shared materialized snapshot is observational and is never used to seed
-    /// correctness-sensitive DFS control-plane state.
+    /// Subscribes to the local daemon's configuration announcements and
+    /// sends every request through `peer_transport` to the local node.
     pub fn new_authoritative(
-        cluster_paths: ClusterPaths,
+        data_dir: &SinomoDataDir,
         peer_transport: Arc<dyn DfsPeerTransport>,
+        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     ) -> Self {
-        let client = Self::new(
-            cluster_paths,
-            peer_transport,
-            Arc::new(empty_mounted_sifs_kv_snapshot(KvRevision::ZERO)),
+        let cluster_paths = ClusterPaths::new(data_dir);
+        let configuration = MountedSifsConfigurationFeed::subscribe(
+            MountedSifsConfigurationEvents::for_data_dir(data_dir),
+            MountedSifsConfigurationFetch {
+                cluster_paths: cluster_paths.clone(),
+                transport: async_peer_transport,
+            },
         );
-        client
-            .snapshot
-            .lock()
-            .expect("new mounted SIFS projection mutex")
-            .begin_authoritative_generation();
-        client
+        Self::with_configuration(cluster_paths, peer_transport, configuration)
     }
 
-    fn new(
+    fn with_configuration(
         cluster_paths: ClusterPaths,
         peer_transport: Arc<dyn DfsPeerTransport>,
-        snapshot: Arc<KvSnapshot>,
+        configuration: Arc<MountedSifsConfigurationFeed>,
     ) -> Self {
         Self {
             cluster_paths,
             peer_transport,
-            snapshot: Arc::new(Mutex::new(MountedSifsKvSnapshotCache {
-                snapshot,
-                authoritative_generation: None,
-                validated_authoritative_entries: BTreeSet::new(),
-                validated_authoritative_prefixes: BTreeSet::new(),
-                validated_authoritative_scope_bytes: 0,
-            })),
+            configuration,
+            observed_revision: Arc::new(AtomicU64::new(0)),
+            scope_write_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -3213,146 +3177,44 @@ impl MountedSifsControlPlaneKvClient {
         mounted_sifs_kv_io_error(&self.cluster_paths, source)
     }
 
-    #[cfg(test)]
-    fn cached_snapshot(&self) -> Result<Arc<KvSnapshot>, KvError> {
-        self.snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))
-            .map(|cache| Arc::clone(&cache.snapshot))
+    fn observe_revision(&self, revision: KvRevision) {
+        self.observed_revision
+            .fetch_max(revision.0, AtomicOrdering::AcqRel);
     }
 
-    fn begin_authoritative_refresh_generation(&self) -> Result<u64, KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        Ok(cache.begin_authoritative_generation())
-    }
-
-    fn ensure_authoritative_projection(&self) -> Result<u64, KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        Ok(cache.ensure_authoritative_generation())
-    }
-
-    fn authoritative_entry_read_plan(
+    /// The held publication, if it is current for this client's own writes.
+    /// An older daemon is a typed error; no other read path replaces it.
+    fn published_configuration(
         &self,
-        key: &str,
-    ) -> Result<MountedSifsKvReadPlan<Option<KvEntry>>, KvError> {
-        let cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        let cached = || cache.snapshot.get(key).cloned();
-        let Some(generation) = cache.authoritative_generation else {
-            return Ok(MountedSifsKvReadPlan::Cached(cached()));
+    ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, KvError> {
+        let snapshot = match self.configuration.shared.current() {
+            MountedSifsConfiguration::Published(snapshot) => snapshot,
+            MountedSifsConfiguration::Unsupported => {
+                return Err(crate::dfs_configuration_snapshot_unsupported());
+            }
+            MountedSifsConfiguration::Connecting
+            | MountedSifsConfiguration::Disconnected
+            | MountedSifsConfiguration::Pending(_) => return Ok(None),
         };
-        if cache.entry_is_validated(key) {
-            return Ok(MountedSifsKvReadPlan::Cached(cached()));
-        }
-        Ok(MountedSifsKvReadPlan::Authoritative {
-            generation,
-            minimum_revision: cache.snapshot.revision,
-        })
+        let floor = self.scope_write_revision.load(AtomicOrdering::Acquire);
+        let current = snapshot.revision().is_some_and(|revision| revision.0 >= floor)
+            && snapshot
+                .write_configuration()
+                .is_none_or(|write| write.revision().0 >= floor);
+        Ok(current.then_some(snapshot))
     }
 
-    fn authoritative_prefix_read_plan(
+    /// The publication answering a read inside its scopes.
+    fn covering_snapshot(
         &self,
-        prefix: &str,
-    ) -> Result<MountedSifsKvReadPlan<Vec<KvEntry>>, KvError> {
-        let cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        let cached = || {
-            cache
-                .snapshot
-                .range_prefix_limited(prefix, sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
-        };
-        let Some(generation) = cache.authoritative_generation else {
-            return cached().map(MountedSifsKvReadPlan::Cached);
-        };
-        if cache.prefix_is_validated(prefix) {
-            return cached().map(MountedSifsKvReadPlan::Cached);
+        key_or_prefix: &str,
+    ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, KvError> {
+        if !crate::dfs_configuration_scope_contains(key_or_prefix) {
+            return Ok(None);
         }
-        Ok(MountedSifsKvReadPlan::Authoritative {
-            generation,
-            minimum_revision: cache.snapshot.revision,
-        })
-    }
-
-    fn authoritative_read_minimum_revision(
-        &self,
-        requested: Option<KvRevision>,
-    ) -> Result<KvRevision, KvError> {
-        let cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        Ok(requested
-            .unwrap_or(KvRevision::ZERO)
-            .max(cache.snapshot.revision))
-    }
-
-    fn invalidate_authoritative_entry_scope(
-        &self,
-        generation: u64,
-        key: &str,
-    ) -> Result<(), KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        if cache.authoritative_generation == Some(generation) {
-            cache.invalidate_entry_scope(key);
-        }
-        Ok(())
-    }
-
-    fn invalidate_authoritative_prefix_scope(
-        &self,
-        generation: u64,
-        prefix: &str,
-    ) -> Result<(), KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        if cache.authoritative_generation == Some(generation) {
-            cache.invalidate_prefix_scope(prefix);
-        }
-        Ok(())
-    }
-
-    fn invalidate_authoritative_mutation_scopes(
-        &self,
-        generation: u64,
-        keys: &BTreeSet<&str>,
-        prefixes: &BTreeSet<&str>,
-        invalidate_all: bool,
-    ) -> Result<(), KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        if cache.authoritative_generation != Some(generation) {
-            return Ok(());
-        }
-        if invalidate_all {
-            // Lease revocation can delete any key attached to the lease, and
-            // the compact projection deliberately carries no lease index.
-            cache.clear_authoritative_scopes();
-            return Ok(());
-        }
-        for prefix in prefixes {
-            cache.invalidate_prefix_scope(prefix);
-        }
-        for key in keys {
-            cache.invalidate_entry_scope(key);
-        }
-        Ok(())
+        Ok(self
+            .published_configuration()?
+            .filter(|snapshot| snapshot.covering_revision(key_or_prefix).is_some()))
     }
 
     fn call_local_kv_rpc(
@@ -3408,25 +3270,27 @@ impl MountedSifsControlPlaneKvClient {
         Ok(response)
     }
 
-    fn read_authoritative_entry(
+    /// Accept a ReadIndex reply only at or after every revision this client
+    /// already observed.
+    fn accept_authoritative_revision(
         &self,
-        key: &str,
-        minimum_revision: Option<KvRevision>,
-        generation: u64,
-    ) -> Result<Option<sinomo_core::kv::KvAuthoritativeRead<Option<KvEntry>>>, KvError> {
-        let read = self.fetch_authoritative_entry(key, minimum_revision)?;
-        if !self.merge_authoritative_entry(key, &read, generation)? {
-            return Ok(None);
+        observed: KvRevision,
+        scope: &str,
+    ) -> Result<(), KvError> {
+        let minimum = self.observed_revision.load(AtomicOrdering::Acquire);
+        if observed.0 < minimum {
+            return Err(KvError::AuthorityUnavailable {
+                detail: format!(
+                    "authoritative mounted SIFS read for {scope:?} returned revision {}, below observed revision {minimum}",
+                    observed.0,
+                ),
+            });
         }
-        Ok(Some(read))
+        self.observe_revision(observed);
+        Ok(())
     }
 
-    fn fetch_authoritative_entry(
-        &self,
-        key: &str,
-        minimum_revision: Option<KvRevision>,
-    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Option<KvEntry>>, KvError> {
-        let minimum_revision = self.authoritative_read_minimum_revision(minimum_revision)?;
+    fn fetch_authoritative_entry(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         let payload = sinomo_core::kv::cluster_kv_authoritative_entry_rpc_payload(key)?;
         let route = payload.route;
         let call = ObjectRpcCall::value(sinomo_core::network::ObjectRpcRequest::from_encoded_body(
@@ -3436,7 +3300,6 @@ impl MountedSifsControlPlaneKvClient {
         ));
         let response = self.call_local_kv_rpc(call, route, 1024 * 1024)?;
         let read = sinomo_core::kv::decode_cluster_kv_authoritative_entry_rpc_body(&response.body)?;
-        self.ensure_authoritative_revision(read.authority.revision, Some(minimum_revision), key)?;
         if read.value.as_ref().is_some_and(|entry| entry.key != key) {
             return Err(KvError::Serialization {
                 detail: format!(
@@ -3445,33 +3308,21 @@ impl MountedSifsControlPlaneKvClient {
                 ),
             });
         }
-        Ok(read)
+        self.accept_authoritative_revision(read.authority.revision, key)?;
+        Ok(read.value)
     }
 
     fn fetch_authoritative_entries(
         &self,
         keys: &[String],
-        minimum_revision: KvRevision,
-    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
-        self.fetch_authoritative_entries_with_deadline(keys, minimum_revision, None)
-    }
-
-    fn fetch_authoritative_entries_before(
-        &self,
-        keys: &[String],
-        minimum_revision: KvRevision,
-        deadline: Instant,
-    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
-        self.fetch_authoritative_entries_with_deadline(keys, minimum_revision, Some(deadline))
-    }
-
-    fn fetch_authoritative_entries_with_deadline(
-        &self,
-        keys: &[String],
-        minimum_revision: KvRevision,
         deadline: Option<Instant>,
-    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
-        let minimum_revision = self.authoritative_read_minimum_revision(Some(minimum_revision))?;
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(mounted_sifs_authority_deadline_error());
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         sinomo_core::kv::validate_cluster_kv_authoritative_entries_request_keys(keys)?;
         let route = sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE;
         let call = ObjectRpcCall::encode_value(
@@ -3495,136 +3346,6 @@ impl MountedSifsControlPlaneKvClient {
             &response.body,
             keys,
         )?;
-        self.ensure_authoritative_revision(
-            read.authority.revision,
-            Some(minimum_revision),
-            "exact-key set",
-        )?;
-        Ok(read)
-    }
-
-    fn read_authoritative_prefix(
-        &self,
-        prefix: &str,
-        minimum_revision: Option<KvRevision>,
-        generation: u64,
-    ) -> Result<Option<sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>>, KvError> {
-        let minimum_revision = self.authoritative_read_minimum_revision(minimum_revision)?;
-        let payload = sinomo_core::kv::cluster_kv_authoritative_range_prefix_rpc_payload(prefix)?;
-        let route = payload.route;
-        let call = ObjectRpcCall::value(sinomo_core::network::ObjectRpcRequest::from_encoded_body(
-            payload.route,
-            payload.category,
-            payload.body,
-        ));
-        let response = self.call_local_kv_rpc(
-            call,
-            route,
-            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES.saturating_add(1024 * 1024),
-        )?;
-        let read =
-            sinomo_core::kv::decode_cluster_kv_authoritative_range_prefix_rpc_body(&response.body)?;
-        self.ensure_authoritative_revision(
-            read.authority.revision,
-            Some(minimum_revision),
-            prefix,
-        )?;
-        if let Some(entry) = read
-            .value
-            .iter()
-            .find(|entry| !entry.key.starts_with(prefix))
-        {
-            return Err(KvError::Serialization {
-                detail: format!(
-                    "authoritative mounted SIFS prefix read for {prefix:?} returned entry for {:?}",
-                    entry.key,
-                ),
-            });
-        }
-        if !self.merge_authoritative_prefix(prefix, &read, generation)? {
-            return Ok(None);
-        }
-        Ok(Some(read))
-    }
-
-    fn ensure_authoritative_revision(
-        &self,
-        observed: KvRevision,
-        minimum: Option<KvRevision>,
-        scope: &str,
-    ) -> Result<(), KvError> {
-        if minimum.is_some_and(|minimum| observed < minimum) {
-            return Err(KvError::AuthorityUnavailable {
-                detail: format!(
-                    "authoritative mounted SIFS read for {scope:?} returned revision {}, below committed revision {}",
-                    observed.0,
-                    minimum.expect("checked minimum").0,
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    fn merge_authoritative_entry(
-        &self,
-        key: &str,
-        read: &sinomo_core::kv::KvAuthoritativeRead<Option<KvEntry>>,
-        generation: u64,
-    ) -> Result<bool, KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        if cache.authoritative_generation != Some(generation)
-            || cache.snapshot.revision > read.authority.revision
-        {
-            return Ok(false);
-        }
-        let mut reset_projection = !cache.can_admit_authoritative_scopes(1, key.len());
-        let mut snapshot = if reset_projection {
-            empty_mounted_sifs_kv_snapshot(read.authority.revision)
-        } else {
-            cache.snapshot.as_ref().clone()
-        };
-        snapshot.entries.retain(|entry| entry.key != key);
-        if let Some(entry) = &read.value {
-            snapshot.entries.push(entry.clone());
-        }
-        snapshot.revision = read.authority.revision;
-        snapshot.canonicalize();
-        if !mounted_sifs_authoritative_projection_entries_fit(&snapshot.entries) {
-            reset_projection = true;
-            snapshot = empty_mounted_sifs_kv_snapshot(read.authority.revision);
-            if let Some(entry) = &read.value {
-                snapshot.entries.push(entry.clone());
-            }
-            snapshot.canonicalize();
-        }
-        snapshot.validate_resource_bounds()?;
-        if reset_projection {
-            cache.clear_authoritative_scopes();
-        }
-        if !mounted_sifs_authoritative_projection_entries_fit(&snapshot.entries) {
-            cache.snapshot = Arc::new(empty_mounted_sifs_kv_snapshot(read.authority.revision));
-            return Ok(true);
-        }
-        // A point read does not revalidate any prefix which used to cover it.
-        cache.invalidate_entry_scope(key);
-        cache.mark_entry_validated(key);
-        snapshot
-            .entries
-            .retain(|entry| cache.entry_is_validated(&entry.key));
-        cache.snapshot = Arc::new(snapshot);
-        Ok(true)
-    }
-
-    fn merge_authoritative_entries_at_one_revision(
-        &self,
-        keys: &[String],
-        read: &sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>,
-        generation: u64,
-    ) -> Result<bool, KvError> {
-        let revision = read.authority.revision;
         if keys.len() != read.value.len() {
             return Err(KvError::Serialization {
                 detail: format!(
@@ -3644,273 +3365,86 @@ impl MountedSifsControlPlaneKvClient {
                 });
             }
         }
-
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        if cache.authoritative_generation != Some(generation) || cache.snapshot.revision > revision
-        {
-            return Ok(false);
-        }
-        let requested_keys = keys.iter().map(String::as_str).collect::<BTreeSet<_>>();
-        let requested_key_bytes = requested_keys.iter().map(|key| key.len()).sum::<usize>();
-        let mut reset_projection =
-            !cache.can_admit_authoritative_scopes(requested_keys.len(), requested_key_bytes);
-        let mut snapshot = if reset_projection {
-            empty_mounted_sifs_kv_snapshot(revision)
-        } else {
-            cache.snapshot.as_ref().clone()
-        };
-        snapshot
-            .entries
-            .retain(|entry| !requested_keys.contains(entry.key.as_str()));
-        snapshot
-            .entries
-            .extend(read.value.iter().filter_map(Clone::clone));
-        snapshot.revision = revision;
-        snapshot.canonicalize();
-        if !mounted_sifs_authoritative_projection_entries_fit(&snapshot.entries) {
-            reset_projection = true;
-            snapshot = empty_mounted_sifs_kv_snapshot(revision);
-            snapshot
-                .entries
-                .extend(read.value.iter().filter_map(Clone::clone));
-            snapshot.canonicalize();
-        }
-        snapshot.validate_resource_bounds()?;
-        if reset_projection {
-            cache.clear_authoritative_scopes();
-        }
-        if !mounted_sifs_authoritative_projection_entries_fit(&snapshot.entries) {
-            cache.snapshot = Arc::new(empty_mounted_sifs_kv_snapshot(revision));
-            return Ok(true);
-        }
-        for key in keys {
-            // A point read does not revalidate any prefix which used to cover
-            // it, even when several point reads are committed atomically.
-            cache.invalidate_entry_scope(key);
-            cache.mark_entry_validated(key);
-        }
-        snapshot
-            .entries
-            .retain(|entry| cache.entry_is_validated(&entry.key));
-        cache.snapshot = Arc::new(snapshot);
-        Ok(true)
+        self.accept_authoritative_revision(read.authority.revision, "exact-key set")?;
+        Ok(read.value)
     }
 
-    fn read_authoritative_entries_consistently(
+    fn fetch_authoritative_prefix(
         &self,
-        keys: &[String],
-    ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        self.read_authoritative_entries_consistently_with_deadline(keys, None)
-    }
-
-    fn read_authoritative_entries_consistently_before(
-        &self,
-        keys: &[String],
-        deadline: Instant,
-    ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        self.read_authoritative_entries_consistently_with_deadline(keys, Some(deadline))
-    }
-
-    fn read_authoritative_entries_consistently_with_deadline(
-        &self,
-        keys: &[String],
-        deadline: Option<Instant>,
-    ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(mounted_sifs_authority_deadline_error());
-        }
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        if keys.len() > MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES {
-            return Err(KvError::ResourceExhausted {
-                operation: "mounted SIFS consistent exact-key read".to_string(),
-                requested_bytes: keys.len().saturating_mul(std::mem::size_of::<String>()),
-            });
-        }
-        let requested_key_bytes = keys
+        prefix: &str,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>, KvError> {
+        let payload = sinomo_core::kv::cluster_kv_authoritative_range_prefix_rpc_payload(prefix)?;
+        let route = payload.route;
+        let call = ObjectRpcCall::value(sinomo_core::network::ObjectRpcRequest::from_encoded_body(
+            payload.route,
+            payload.category,
+            payload.body,
+        ));
+        let response = self.call_local_kv_rpc(
+            call,
+            route,
+            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES.saturating_add(1024 * 1024),
+        )?;
+        let read =
+            sinomo_core::kv::decode_cluster_kv_authoritative_range_prefix_rpc_body(&response.body)?;
+        if let Some(entry) = read
+            .value
             .iter()
-            .fold(0_usize, |bytes, key| bytes.saturating_add(key.len()));
-        if requested_key_bytes > MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_PAYLOAD_BYTES {
-            return Err(KvError::ResourceExhausted {
-                operation: "mounted SIFS consistent exact-key request".to_string(),
-                requested_bytes: requested_key_bytes,
+            .find(|entry| !entry.key.starts_with(prefix))
+        {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "authoritative mounted SIFS prefix read for {prefix:?} returned entry for {:?}",
+                    entry.key,
+                ),
             });
         }
-
-        for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err(mounted_sifs_authority_deadline_error());
-            }
-            let (generation, minimum_revision) = {
-                let cache = self
-                    .snapshot
-                    .lock()
-                    .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-                let Some(generation) = cache.authoritative_generation else {
-                    return Ok(keys
-                        .iter()
-                        .map(|key| cache.snapshot.get(key).cloned())
-                        .collect());
-                };
-                (generation, cache.snapshot.revision)
-            };
-
-            let read = match deadline {
-                Some(deadline) => {
-                    self.fetch_authoritative_entries_before(keys, minimum_revision, deadline)?
-                }
-                None => self.fetch_authoritative_entries(keys, minimum_revision)?,
-            };
-            if !self.merge_authoritative_entries_at_one_revision(keys, &read, generation)? {
-                continue;
-            }
-            return Ok(read.value);
-        }
-
-        Err(self.superseded_authority_error("consistent exact-key set"))
-    }
-
-    fn merge_authoritative_prefix(
-        &self,
-        prefix: &str,
-        read: &sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
-        generation: u64,
-    ) -> Result<bool, KvError> {
-        let mut cache = self
-            .snapshot
-            .lock()
-            .map_err(|_| self.kv_error("mounted SIFS KV projection lock is poisoned"))?;
-        if cache.authoritative_generation != Some(generation)
-            || cache.snapshot.revision > read.authority.revision
-        {
-            return Ok(false);
-        }
-        let mut reset_projection = !cache.can_admit_authoritative_scopes(1, prefix.len());
-        let mut snapshot = if reset_projection {
-            empty_mounted_sifs_kv_snapshot(read.authority.revision)
-        } else {
-            cache.snapshot.as_ref().clone()
-        };
-        snapshot
-            .entries
-            .retain(|entry| !entry.key.starts_with(prefix));
-        snapshot.entries.extend(read.value.iter().cloned());
-        snapshot.revision = read.authority.revision;
-        snapshot.canonicalize();
-        if !mounted_sifs_authoritative_projection_entries_fit(&snapshot.entries) {
-            reset_projection = true;
-            snapshot = empty_mounted_sifs_kv_snapshot(read.authority.revision);
-            snapshot.entries.extend(read.value.iter().cloned());
-            snapshot.canonicalize();
-        }
-        snapshot.validate_resource_bounds()?;
-        if reset_projection {
-            cache.clear_authoritative_scopes();
-        }
-        if !mounted_sifs_authoritative_projection_entries_fit(&snapshot.entries) {
-            cache.snapshot = Arc::new(empty_mounted_sifs_kv_snapshot(read.authority.revision));
-            return Ok(true);
-        }
-        cache.invalidate_prefix_scope(prefix);
-        cache.mark_prefix_validated(prefix);
-        snapshot
-            .entries
-            .retain(|entry| cache.entry_is_validated(&entry.key));
-        cache.snapshot = Arc::new(snapshot);
-        Ok(true)
-    }
-
-    fn superseded_authority_error(&self, scope: &str) -> KvError {
-        KvError::AuthorityUnavailable {
-            detail: format!(
-                "authoritative mounted SIFS read for {scope:?} was superseded by {} consecutive projection changes",
-                MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS,
-            ),
-        }
-    }
-
-    fn revalidate_mutated_entry(
-        &self,
-        key: &str,
-        minimum_revision: KvRevision,
-    ) -> Result<(), KvError> {
-        for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
-            let generation = self.ensure_authoritative_projection()?;
-            self.invalidate_authoritative_entry_scope(generation, key)?;
-            if self
-                .read_authoritative_entry(key, Some(minimum_revision), generation)?
-                .is_some()
-            {
-                return Ok(());
-            }
-        }
-        Err(self.superseded_authority_error(key))
-    }
-
-    fn revalidate_mutated_prefix(
-        &self,
-        prefix: &str,
-        minimum_revision: KvRevision,
-    ) -> Result<(), KvError> {
-        for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
-            let generation = self.ensure_authoritative_projection()?;
-            self.invalidate_authoritative_prefix_scope(generation, prefix)?;
-            if self
-                .read_authoritative_prefix(prefix, Some(minimum_revision), generation)?
-                .is_some()
-            {
-                return Ok(());
-            }
-        }
-        Err(self.superseded_authority_error(prefix))
+        self.accept_authoritative_revision(read.authority.revision, prefix)?;
+        Ok(read)
     }
 }
 
 impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
-    fn refresh_latest(&mut self) -> Result<(), KvError> {
-        // Exact subsequent keys and prefixes establish their own bounded
-        // ReadIndex/barrier. Do not import a full snapshot or scan `/dfs/`.
-        self.begin_authoritative_refresh_generation().map(|_| ())
+    /// sinomo:kv-configuration: Lend the snapshot the local daemon floor-checked and published, as last announced on its event stream.
+    fn configuration_snapshot(
+        &self,
+    ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, KvError> {
+        self.published_configuration()
     }
 
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
-            match self.authoritative_entry_read_plan(key)? {
-                MountedSifsKvReadPlan::Cached(value) => return Ok(value),
-                MountedSifsKvReadPlan::Authoritative {
-                    generation,
-                    minimum_revision,
-                } => {
-                    if let Some(read) =
-                        self.read_authoritative_entry(key, Some(minimum_revision), generation)?
-                    {
-                        return Ok(read.value);
-                    }
-                }
-            }
+        if let Some(snapshot) = self.covering_snapshot(key)? {
+            return Ok(snapshot.entry(key).flatten().cloned());
         }
-        Err(self.superseded_authority_error(key))
+        self.fetch_authoritative_entry(key)
     }
 
     fn get_consistent(&self, keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
-        // One exact-set ReadIndex pins every key to the same committed view;
-        // publish the complete result into the generation cache atomically.
-        self.read_authoritative_entries_consistently(keys)
+        // One publication answers the set only when it covers every key;
+        // otherwise one exact-set ReadIndex pins every key to one revision.
+        if !keys.is_empty()
+            && keys
+                .iter()
+                .all(|key| crate::dfs_configuration_scope_contains(key))
+            && let Some(snapshot) = self.published_configuration()?
+            && keys
+                .iter()
+                .all(|key| snapshot.covering_revision(key).is_some())
+        {
+            return Ok(keys
+                .iter()
+                .map(|key| snapshot.entry(key).flatten().cloned())
+                .collect());
+        }
+        self.fetch_authoritative_entries(keys, None)
     }
 
     fn get_authoritative_consistent(
         &mut self,
         keys: &[String],
     ) -> Result<Vec<Option<KvEntry>>, KvError> {
-        // Operation-bound authority validation always starts a fresh bounded
-        // generation, then crosses exactly one exact-key-set ReadIndex. It
-        // must not import the complete cluster KV snapshot first.
-        self.begin_authoritative_refresh_generation()?;
-        self.read_authoritative_entries_consistently(keys)
+        // Operation-bound fences never inherit a publication.
+        self.fetch_authoritative_entries(keys, None)
     }
 
     fn get_authoritative_consistent_before(
@@ -3921,46 +3455,22 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         if Instant::now() >= deadline {
             return Err(mounted_sifs_authority_deadline_error());
         }
-        // The exact deadline covers generation reset, every replan, the
-        // primary exact-set route.
-        self.begin_authoritative_refresh_generation()?;
-        self.read_authoritative_entries_consistently_before(keys, deadline)
+        self.fetch_authoritative_entries(keys, Some(deadline))
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
-            match self.authoritative_prefix_read_plan(prefix)? {
-                MountedSifsKvReadPlan::Cached(value) => return Ok(value),
-                MountedSifsKvReadPlan::Authoritative {
-                    generation,
-                    minimum_revision,
-                } => {
-                    if let Some(read) =
-                        self.read_authoritative_prefix(prefix, Some(minimum_revision), generation)?
-                    {
-                        return Ok(read.value);
-                    }
-                }
-            }
+        if let Some(snapshot) = self.covering_snapshot(prefix)? {
+            return Ok(snapshot.entries(prefix).unwrap_or_default().to_vec());
         }
-        Err(self.superseded_authority_error(prefix))
+        Ok(self.fetch_authoritative_prefix(prefix)?.value)
     }
 
     fn range_prefix_authoritative(
         &mut self,
         prefix: &str,
     ) -> Result<crate::DfsAuthoritativePrefixProjection, KvError> {
-        for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
-            let generation = self.begin_authoritative_refresh_generation()?;
-            if let Some(read) = self.read_authoritative_prefix(prefix, None, generation)? {
-                return crate::DfsAuthoritativePrefixProjection::complete(
-                    prefix,
-                    read.value,
-                    read.authority.revision,
-                );
-            }
-        }
-        Err(self.superseded_authority_error("operation-bound prefix"))
+        let read = self.fetch_authoritative_prefix(prefix)?;
+        crate::DfsAuthoritativePrefixProjection::complete(prefix, read.value, read.authority.revision)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -4021,44 +3531,30 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             result.replayed_committed_request,
             response.revision,
         )?;
-
-        let generation = self.ensure_authoritative_projection()?;
+        self.observe_revision(response.revision);
         let executed = if response.succeeded {
             &request.txn.success
         } else {
             &request.txn.failure
         };
-        let mut refreshed_keys = BTreeSet::new();
-        let mut refreshed_prefixes = BTreeSet::new();
-        let mut invalidate_all = false;
-        for operation in executed {
-            match operation {
-                KvOp::Put { key, .. } | KvOp::Delete { key } => {
-                    refreshed_keys.insert(key.as_str());
-                }
-                KvOp::DeletePrefix { prefix } => {
-                    refreshed_prefixes.insert(prefix.as_str());
-                }
-                KvOp::LeaseRevoke { .. } => invalidate_all = true,
-                KvOp::LeaseGrant { .. } | KvOp::LeaseKeepAlive { .. } => {}
+        let touches_published_scope = executed.iter().any(|operation| match operation {
+            KvOp::Put { key, .. } | KvOp::Delete { key } => {
+                crate::dfs_configuration_scope_contains(key)
             }
-        }
-        self.invalidate_authoritative_mutation_scopes(
-            generation,
-            &refreshed_keys,
-            &refreshed_prefixes,
-            invalidate_all,
-        )?;
-        for key in refreshed_keys {
-            self.revalidate_mutated_entry(key, response.revision)?;
-        }
-        for prefix in refreshed_prefixes {
-            self.revalidate_mutated_prefix(prefix, response.revision)?;
+            KvOp::DeletePrefix { prefix } => crate::dfs_configuration_scopes_overlap(prefix),
+            // A revoked lease can delete leased keys inside any scope.
+            KvOp::LeaseRevoke { .. } => true,
+            KvOp::LeaseGrant { .. } | KvOp::LeaseKeepAlive { .. } => false,
+        });
+        if touches_published_scope {
+            self.scope_write_revision
+                .fetch_max(response.revision.0, AtomicOrdering::AcqRel);
         }
         Ok(response)
     }
 }
 
+#[cfg(test)]
 fn empty_mounted_sifs_kv_snapshot(revision: KvRevision) -> KvSnapshot {
     KvSnapshot {
         revision,

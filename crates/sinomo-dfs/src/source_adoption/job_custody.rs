@@ -235,10 +235,10 @@ impl DfsSourceAdoptionActor {
                 "original job capture has no actual current coordinator",
             ));
         }
-        let projection = self.authority.projection_generation();
         let configs = self
             .authority
-            .cached_metadata_shards(&job_config.file_system_id, projection)
+            .configuration_snapshot()
+            .metadata_shards(&job_config.file_system_id)
             .map_err(error)?
             .ok_or_else(|| error("original coordinator configuration unavailable"))?;
         if !configs.contains(&job_config)
@@ -307,16 +307,17 @@ impl DfsSourceAdoptionActor {
                 "original job inspection changed actual actor/session identity",
             ));
         }
-        let state = self.authority.shard_projection_state(
-            &offer.job_config.file_system_id,
-            &crate::DfsMetadataShardId::new(&offer.job_config.shard_id),
-        );
-        let configs = self
-            .authority
-            .cached_metadata_shards(
+        // One publication supplies the shard fence and its routing rows.
+        let snapshot = self.authority.configuration_snapshot();
+        let state = (
+            snapshot.generation(),
+            snapshot.contains_shard_key(
                 &offer.job_config.file_system_id,
-                self.authority.projection_generation(),
-            )
+                &crate::DfsMetadataShardId::new(&offer.job_config.shard_id),
+            ),
+        );
+        let configs = snapshot
+            .metadata_shards(&offer.job_config.file_system_id)
             .map_err(error)?
             .ok_or_else(|| error("original job configuration unavailable"))?;
         if !state.1

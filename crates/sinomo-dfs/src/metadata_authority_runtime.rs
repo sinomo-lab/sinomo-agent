@@ -1,75 +1,35 @@
+use crate::configuration_snapshot::{
+    DfsConfigurationSnapshot, DfsFileSystemConfigsByKey, DfsMetadataAuthorityScope,
+    file_system_configs_from_authority_entries,
+};
+use crate::metadata_authority_projection::DfsMetadataShardsByFileSystem;
 use crate::write_configuration_projection::{
     DFS_WRITE_CONFIGURATION_PREFIXES, DfsWriteConfigurationState,
 };
 use crate::{
     DfsAuthoritativePrefixProjection, DfsError, DfsFileSystemId, DfsMetadataReplicaShardContext,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceCommand,
-    dfs_metadata_authority_key_is_exact, metadata_replica_context_matches_authority_entries,
-    metadata_shard_index_from_authority_entries, namespace_command_matches_authority_index,
+    dfs_metadata_authority_key_is_exact, metadata_shard_index_from_authority_entries,
 };
 use sinomo_core::kv::{
     ClusterKvCommittedDelta, KvAuthorityProof, KvEntry, KvEvent, KvLocalRead, KvRevision,
     KvSnapshot,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    Arc, Mutex, OnceLock, Weak,
+    Arc, Mutex, MutexGuard, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 pub const DFS_METADATA_AUTHORITY_PREFIX: &str = "/dfs/filesystems/";
 
-#[cfg(test)]
-std::thread_local! {
-    static PUBLICATION_CONFIGURATION_BEFORE_LOCK:
-        std::cell::RefCell<Option<(usize, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct PublicationConfigurationBeforeLockGuard;
-
-#[cfg(test)]
-impl Drop for PublicationConfigurationBeforeLockGuard {
-    fn drop(&mut self) {
-        PUBLICATION_CONFIGURATION_BEFORE_LOCK.with(|slot| {
-            slot.borrow_mut().take();
-        });
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn install_publication_configuration_before_lock_hook(
-    skip_calls: usize,
-    hook: impl FnOnce() + 'static,
-) -> PublicationConfigurationBeforeLockGuard {
-    PUBLICATION_CONFIGURATION_BEFORE_LOCK.with(|slot| {
-        assert!(
-            slot.borrow_mut()
-                .replace((skip_calls, Box::new(hook)))
-                .is_none()
-        );
-    });
-    PublicationConfigurationBeforeLockGuard
-}
-
-#[cfg(test)]
-fn run_publication_configuration_before_lock_hook() {
-    let hook = PUBLICATION_CONFIGURATION_BEFORE_LOCK.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if let Some((skip, _)) = slot.as_mut() {
-            if *skip > 0 {
-                *skip -= 1;
-                return None;
-            }
-        }
-        slot.take().map(|(_, hook)| hook)
-    });
-    if let Some(hook) = hook {
-        hook();
-    }
-}
+/// A failed bounded refresh is re-sent at most this many consecutive times.
+const DFS_CONFIGURATION_REFRESH_RETRY_LIMIT: u32 = 5;
+/// First re-send delay; each later attempt doubles it.
+const DFS_CONFIGURATION_REFRESH_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 pub type DfsMetadataAuthorityReadFuture<'a> = Pin<
     Box<
@@ -120,19 +80,6 @@ pub trait DfsMetadataAuthorityHost: Send + Sync {
     fn authority_changed(&self);
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DfsMetadataAuthorityProjection {
-    revision: Option<KvRevision>,
-    required_revision: KvRevision,
-    topology_comparison_baseline: bool,
-    entries: Vec<KvEntry>,
-    metadata_shards_by_file_system: BTreeMap<String, Result<Vec<DfsMetadataShardConfig>, String>>,
-    #[cfg(any(test, feature = "test-support"))]
-    native_evidence: Option<NativeMetadataCacheEvidenceV1>,
-    #[cfg(any(test, feature = "test-support"))]
-    native_evidence_loss_count: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DfsMetadataAuthorityDeltaObservation {
     pub accepted: bool,
@@ -168,28 +115,28 @@ impl DfsMetadataAuthorityDeltaObservation {
     }
 }
 
-/// Process-resident DFS authority projection and generation state.
+/// Writer-side filesystem-scope projection and generation state.
 ///
-/// The embedding runtime supplies ReadIndex refresh and wake hooks. This owner
-/// component decides whether a proof or committed delta is complete, applies
-/// resource bounds, advances topology generations, and answers exact shard or
-/// namespace authority queries.
+/// This owner decides whether a proof or committed delta is complete, applies
+/// resource bounds and advances topology generations. It holds no lock: the
+/// runtime mutates it under its single configuration writer lock and
+/// publishes the result as one [`DfsConfigurationSnapshot`]. The entries and
+/// decoded indexes are shared with that publication, never copied beside it.
+#[derive(Debug)]
 pub struct DfsMetadataAuthorityState {
-    projection: Mutex<DfsMetadataAuthorityProjection>,
-    projection_generation: AtomicU64,
-    generation: AtomicU64,
-    storage_generation: AtomicU64,
+    revision: Option<KvRevision>,
+    required_revision: KvRevision,
+    /// A withdrawn scope retains its last entries only to compare topology
+    /// when the next complete proof arrives. They are never published.
+    topology_comparison_baseline: bool,
+    entries: Arc<Vec<KvEntry>>,
+    shards: Arc<DfsMetadataShardsByFileSystem>,
+    file_systems: Arc<DfsFileSystemConfigsByKey>,
+    generation: u64,
+    projection_generation: u64,
+    storage_generation: u64,
     #[cfg(any(test, feature = "test-support"))]
-    native_source: Mutex<
-        Option<(
-            std::path::PathBuf,
-            std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
-        )>,
-    >,
-    #[cfg(any(test, feature = "test-support"))]
-    projection_rebuild_count: AtomicU64,
-    #[cfg(any(test, feature = "test-support"))]
-    projection_materialization_count: AtomicU64,
+    projection_rebuild_count: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -198,9 +145,24 @@ struct DfsSingleNodeBootstrapAuthority {
     observed_revision: KvRevision,
 }
 
+/// Every configuration writer path holds this one lock while it mutates the
+/// write-configuration bootstrap/journal and the filesystem scope, then
+/// publishes their combined snapshot before releasing it.
+#[derive(Debug)]
+struct DfsConfigurationWriter {
+    write: DfsWriteConfigurationState,
+    metadata: DfsMetadataAuthorityState,
+}
+
+impl DfsConfigurationWriter {
+    fn snapshot(&self) -> DfsConfigurationSnapshot {
+        self.metadata.snapshot(self.write.snapshot())
+    }
+}
+
 pub struct DfsMetadataAuthorityRuntime {
-    state: DfsMetadataAuthorityState,
-    write_configuration: Mutex<DfsWriteConfigurationState>,
+    writer: Mutex<DfsConfigurationWriter>,
+    published: tokio::sync::watch::Sender<Arc<DfsConfigurationSnapshot>>,
     write_configuration_requested: AtomicBool,
     write_configuration_has_committed_config: AtomicBool,
     single_node_bootstrap_authority: Mutex<Option<DfsSingleNodeBootstrapAuthority>>,
@@ -214,16 +176,20 @@ pub struct DfsMetadataAuthorityRuntime {
     configuration_refresh_in_flight: AtomicBool,
     refresh_release_pending: AtomicBool,
     refresh_completion: tokio::sync::watch::Sender<u64>,
-    #[cfg(any(test, feature = "test-support"))]
-    refresh_before_claim: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    refresh_failures: std::sync::atomic::AtomicU32,
+    /// Unit fixtures that drive each refresh task by hand opt out of re-sends.
+    #[cfg(test)]
+    refresh_resend_disabled: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     refresh_count: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    projection_materialization_count: AtomicU64,
 }
 
 #[derive(Debug)]
 pub struct DfsMetadataAuthorityRuntimeRegistry<K> {
     name: &'static str,
-    runtimes: Mutex<BTreeMap<K, Weak<DfsMetadataAuthorityRuntime>>>,
+    runtimes: Mutex<std::collections::BTreeMap<K, Weak<DfsMetadataAuthorityRuntime>>>,
 }
 
 impl<K> DfsMetadataAuthorityRuntimeRegistry<K>
@@ -233,7 +199,7 @@ where
     pub fn new(name: &'static str) -> Self {
         Self {
             name,
-            runtimes: Mutex::new(BTreeMap::new()),
+            runtimes: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -260,24 +226,27 @@ where
     }
 }
 
-// Keep a missing publication distinct from a failed native floor read. A
-// refresh may publish between the observation and its caller's next lock.
+// Keep a missing publication distinct from a failed native floor read.
 enum DfsWriteConfigurationReadError {
     Pending(DfsError),
     Unavailable(DfsError),
 }
 
-/// Owned read inputs for the existing original-Repair validator, not an
-/// execution capability or a new native proof.
-pub(crate) struct DfsOriginalRepairConfigurationSnapshot {
-    pub(crate) view: Arc<crate::DfsWriteConfigurationProjection>,
-    pub(crate) projection_generation: u64,
-    pub(crate) shards: Vec<DfsMetadataShardConfig>,
-    pub(crate) filesystem: Option<crate::DfsFileSystemConfig>,
-}
 impl From<DfsError> for DfsWriteConfigurationReadError {
     fn from(error: DfsError) -> Self {
         Self::Unavailable(error)
+    }
+}
+
+fn writer_poisoned() -> DfsError {
+    DfsError::Network {
+        message: "DFS configuration writer lock poisoned".into(),
+    }
+}
+
+fn configuration_pending() -> DfsError {
+    DfsError::Network {
+        message: "DFS write configuration is awaiting a coherent authoritative projection".into(),
     }
 }
 
@@ -309,8 +278,10 @@ struct DfsWriteConfigurationRefreshOwner {
 
 impl Drop for DfsWriteConfigurationRefreshOwner {
     fn drop(&mut self) {
-        if let Ok(mut configuration) = self.runtime.write_configuration.lock() {
-            configuration.finish_refresh(self.token);
+        // A cancelled or failed owner leaves no publication: the published
+        // write configuration was already absent when this refresh began.
+        if let Ok(mut writer) = self.runtime.writer.lock() {
+            writer.write.finish_refresh(self.token);
         }
         self.runtime
             .configuration_refresh_in_flight
@@ -338,8 +309,11 @@ impl Default for DfsMetadataAuthorityRuntime {
 impl DfsMetadataAuthorityRuntime {
     pub fn new() -> Self {
         Self {
-            state: DfsMetadataAuthorityState::new(),
-            write_configuration: Mutex::new(DfsWriteConfigurationState::new()),
+            writer: Mutex::new(DfsConfigurationWriter {
+                write: DfsWriteConfigurationState::new(),
+                metadata: DfsMetadataAuthorityState::new(),
+            }),
+            published: tokio::sync::watch::channel(Arc::new(DfsConfigurationSnapshot::initial())).0,
             write_configuration_requested: AtomicBool::new(false),
             write_configuration_has_committed_config: AtomicBool::new(false),
             single_node_bootstrap_authority: Mutex::new(None),
@@ -353,23 +327,34 @@ impl DfsMetadataAuthorityRuntime {
             configuration_refresh_in_flight: AtomicBool::new(false),
             refresh_release_pending: AtomicBool::new(false),
             refresh_completion: tokio::sync::watch::channel(0).0,
-            #[cfg(any(test, feature = "test-support"))]
-            refresh_before_claim: Mutex::new(None),
+            refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            refresh_resend_disabled: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             refresh_count: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            projection_materialization_count: AtomicU64::new(0),
         }
     }
 
-    pub fn attach_host(&self, host: Arc<dyn DfsMetadataAuthorityHost>) -> bool {
+    /// Attach the refresh host. Once committed observations are also attached,
+    /// a newly attached host owns the initial bootstrap edge.
+    pub fn attach_host(self: &Arc<Self>, host: Arc<dyn DfsMetadataAuthorityHost>) -> bool {
         if host.supports_write_configuration_projection() {
             self.write_configuration_requested
                 .store(true, Ordering::Release);
         }
-        let Ok(mut attached) = self.host.lock() else {
-            return false;
+        let newly_attached = {
+            let Ok(mut attached) = self.host.lock() else {
+                return false;
+            };
+            let newly_attached = attached.is_none();
+            *attached = Some(host);
+            newly_attached
         };
-        let newly_attached = attached.is_none();
-        *attached = Some(host);
+        if newly_attached && self.observation_subscription.get().is_some() {
+            self.request_authoritative_refresh();
+        }
         newly_attached
     }
 
@@ -387,42 +372,56 @@ impl DfsMetadataAuthorityRuntime {
         self.snapshot_subscription.set(subscription)
     }
 
+    /// Committed observations make this runtime reactive. Attaching them is
+    /// the cold-start edge: the first bounded bootstrap begins only after
+    /// every later committed delta can reach its journal.
     pub fn attach_observation_subscription(
-        &self,
+        self: &Arc<Self>,
         subscription: sinomo_core::kv::KvCommittedObservationSubscription,
     ) -> Result<(), sinomo_core::kv::KvCommittedObservationSubscription> {
-        self.observation_subscription.set(subscription)
+        self.observation_subscription.set(subscription)?;
+        if self.host().is_some() {
+            self.request_authoritative_refresh();
+        }
+        Ok(())
+    }
+
+    /// Cheap load of the current publication. It performs no floor check;
+    /// write admission uses [`Self::checked_configuration_snapshot`].
+    pub fn configuration_snapshot(&self) -> Arc<DfsConfigurationSnapshot> {
+        Arc::clone(&self.published.borrow())
+    }
+
+    /// Every replacement of the published snapshot is one `changed` event.
+    pub fn subscribe_configuration_snapshot(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Arc<DfsConfigurationSnapshot>> {
+        self.published.subscribe()
     }
 
     pub fn generation(&self) -> u64 {
-        self.state.generation()
+        self.published.borrow().generation
     }
 
     pub fn projection_generation(&self) -> u64 {
-        self.state.projection_generation()
+        self.published.borrow().projection_generation
     }
 
     /// Physical metadata-store lifecycle. Authority proof and policy changes
     /// retain stores while continuing to advance the separate authority fence.
     pub fn storage_generation(&self) -> u64 {
-        self.state.storage_generation()
+        self.published.borrow().storage_generation
     }
 
     pub(crate) fn lifecycle_generations(&self) -> Result<(u64, u64), DfsError> {
-        self.state.lifecycle_generations()
+        // One publication carries both fences of a structural transition.
+        let snapshot = self.published.borrow();
+        Ok((snapshot.generation, snapshot.storage_generation))
     }
 
-    pub fn cached_metadata_shards(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        expected_projection_generation: u64,
-    ) -> Result<Option<Vec<DfsMetadataShardConfig>>, sinomo_core::kv::KvError> {
-        self.state
-            .cached_metadata_shards(file_system_id, expected_projection_generation)
-    }
-
-    /// Capture a current cache-only cut and its generation under the same
-    /// lock. Callers retain their later semantic and storage revalidation.
+    /// Shards and filesystem configuration from one current publication with
+    /// its projection generation. Callers retain their semantic and storage
+    /// revalidation.
     pub(crate) fn cached_current_publication_configuration(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -434,70 +433,37 @@ impl DfsMetadataAuthorityRuntime {
         )>,
         sinomo_core::kv::KvError,
     > {
-        self.with_current_publication_configuration(file_system_id, |generation, shards, config| {
-            (generation, shards, config)
-        })
+        let snapshot = self.configuration_snapshot();
+        Ok(snapshot
+            .publication_configuration(file_system_id)?
+            .map(|(shards, config)| (snapshot.projection_generation, shards, config)))
     }
 
-    /// Validate a cache-only configuration cut before its existing lock is
-    /// released. The callback must not wait or reenter the projection cache.
-    pub(crate) fn with_current_publication_configuration<R>(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        read: impl FnOnce(u64, Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>) -> R,
-    ) -> Result<Option<R>, sinomo_core::kv::KvError> {
-        self.state.with_current_publication_configuration(file_system_id, read)
-    }
-
-    /// Read the native floor before locking, then copy the current continuous
-    /// configuration and metadata cache together. No caller or floor callback
-    /// runs while the existing configuration -> projection locks are held.
-    pub(crate) fn current_original_repair_configuration(
+    /// The floor-checked publication when it carries a write configuration.
+    /// Pending readiness is an error and `None` is a ready host without one,
+    /// exactly as for [`Self::write_configuration_projection`].
+    pub(crate) fn write_configuration_snapshot(
         self: &Arc<Self>,
-        file_system_id: &DfsFileSystemId,
-    ) -> Result<DfsOriginalRepairConfigurationSnapshot, DfsError> {
-        let invalid = || DfsError::Metadata {
-            message: "original Repair configuration publication was withdrawn or replaced during capture".into(),
-        };
-        let checked = self.write_configuration_projection()?.ok_or_else(invalid)?;
-        let configuration = self.write_configuration.lock().map_err(|_| DfsError::Network {
-            message: "DFS write configuration projection lock poisoned".into(),
-        })?;
-        let view = configuration.snapshot().ok_or_else(invalid)?;
-        if !view.has_same_native_proof_origin(&checked) {
-            return Err(invalid());
-        }
-        let projection = self.state.projection.lock().map_err(|_| DfsError::Network {
-            message: "DFS metadata authority projection lock poisoned".into(),
-        })?;
-        if projection.revision != Some(view.revision())
-            || view.revision() < projection.required_revision
-        {
-            return Err(invalid());
-        }
-        let projection_generation = self.state.projection_generation();
-        let (shards, filesystem) = DfsMetadataAuthorityState::publication_configuration_values(
-            &projection,
-            file_system_id,
-        )?;
-        #[cfg(any(test, feature = "test-support"))]
-        crate::native_shard_trace::record_metadata_cache_cut(
-            projection_generation,
-            projection.revision,
-            projection.required_revision,
-            &projection.entries,
-            projection.native_evidence.as_ref(),
-            projection.native_evidence_loss_count,
-        );
-        let snapshot = DfsOriginalRepairConfigurationSnapshot {
-            view,
-            projection_generation,
-            shards,
-            filesystem,
-        };
-        drop(projection);
-        drop(configuration);
-        Ok(snapshot)
+    ) -> Result<Option<Arc<DfsConfigurationSnapshot>>, DfsError> {
+        let snapshot = self
+            .read_configuration_snapshot()
+            .map_err(|error| match error {
+                DfsWriteConfigurationReadError::Pending(error)
+                | DfsWriteConfigurationReadError::Unavailable(error) => error,
+            })?;
+        Ok(snapshot.write.is_some().then_some(snapshot))
+    }
+
+    /// The floor-checked publication with its complete write configuration.
+    /// Owned read input for one operation, not an execution capability.
+    pub(crate) fn current_write_configuration_snapshot(
+        self: &Arc<Self>,
+    ) -> Result<Arc<DfsConfigurationSnapshot>, DfsError> {
+        self.write_configuration_snapshot()?
+            .filter(|snapshot| snapshot.metadata.is_some())
+            .ok_or_else(|| DfsError::Metadata {
+                message: "original Repair configuration publication was withdrawn or replaced during capture".into(),
+            })
     }
 
     pub fn shard_projection_state(
@@ -505,32 +471,58 @@ impl DfsMetadataAuthorityRuntime {
         file_system_id: &DfsFileSystemId,
         shard_id: &DfsMetadataShardId,
     ) -> (u64, bool) {
-        self.state.shard_projection_state(file_system_id, shard_id)
+        let snapshot = self.configuration_snapshot();
+        (
+            snapshot.generation,
+            snapshot.contains_shard_key(file_system_id, shard_id),
+        )
     }
 
     pub fn namespace_read_stamp_state(
         &self,
         command: &DfsNamespaceCommand,
     ) -> Result<(u64, bool), DfsError> {
-        self.state.namespace_read_stamp_state(command)
+        let snapshot = self.configuration_snapshot();
+        Ok((
+            snapshot.generation,
+            snapshot.namespace_read_stamp_matches(command)?,
+        ))
     }
 
     pub fn replica_context_state(
         &self,
         context: &DfsMetadataReplicaShardContext,
     ) -> Result<(u64, bool), DfsError> {
-        self.state.replica_context_state(context)
+        self.replica_context_lifecycle_state(context)
+            .map(|((generation, _), matches)| (generation, matches))
     }
 
     pub(crate) fn replica_context_lifecycle_state(
         &self,
         context: &DfsMetadataReplicaShardContext,
     ) -> Result<((u64, u64), bool), DfsError> {
-        self.state.replica_context_lifecycle_state(context)
+        // The exact context and physical-store generation belong to the same
+        // publication. A provider/proof-only change need not replace a store.
+        let snapshot = self.configuration_snapshot();
+        Ok((
+            (snapshot.generation, snapshot.storage_generation),
+            snapshot.replica_context_matches(context)?,
+        ))
+    }
+
+    fn materialize_prefix(
+        &self,
+        snapshot: &DfsConfigurationSnapshot,
+    ) -> Option<DfsAuthoritativePrefixProjection> {
+        let prefix = snapshot.complete_prefix()?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.projection_materialization_count
+            .fetch_add(1, Ordering::AcqRel);
+        Some(prefix)
     }
 
     pub fn current_complete_prefix(self: &Arc<Self>) -> Option<DfsAuthoritativePrefixProjection> {
-        let retained = self.state.current_complete_prefix();
+        let retained = self.materialize_prefix(&self.configuration_snapshot());
         if retained.is_none() {
             self.request_authoritative_refresh();
         }
@@ -541,10 +533,12 @@ impl DfsMetadataAuthorityRuntime {
         self: &Arc<Self>,
         expected_generation: u64,
     ) -> Option<DfsAuthoritativePrefixProjection> {
-        let retained = self
-            .state
-            .retained_complete_prefix_for_generation(expected_generation);
-        if retained.is_none() && self.generation() == expected_generation {
+        let snapshot = self.configuration_snapshot();
+        if snapshot.generation != expected_generation {
+            return None;
+        }
+        let retained = self.materialize_prefix(&snapshot);
+        if retained.is_none() {
             self.request_authoritative_refresh();
         }
         retained
@@ -554,16 +548,20 @@ impl DfsMetadataAuthorityRuntime {
         &self,
         expected_generation: u64,
     ) -> Option<DfsAuthoritativePrefixProjection> {
-        self.state
-            .retained_complete_prefix_for_generation(expected_generation)
+        let snapshot = self.configuration_snapshot();
+        (snapshot.generation == expected_generation)
+            .then(|| self.materialize_prefix(&snapshot))
+            .flatten()
     }
 
     pub fn retained_complete_prefix_revision_for_generation(
         &self,
         expected_generation: u64,
     ) -> Option<KvRevision> {
-        self.state
-            .retained_complete_prefix_revision_for_generation(expected_generation)
+        let snapshot = self.published.borrow();
+        (snapshot.generation == expected_generation)
+            .then(|| snapshot.revision())
+            .flatten()
     }
 
     pub fn load_complete_prefix_for_generation(
@@ -574,7 +572,7 @@ impl DfsMetadataAuthorityRuntime {
     }
 
     pub fn current_complete_prefix_revision(self: &Arc<Self>) -> Option<KvRevision> {
-        let revision = self.state.current_complete_prefix_revision();
+        let revision = self.published.borrow().revision();
         if revision.is_none()
             || (self.write_configuration_requested.load(Ordering::Acquire)
                 && self.write_configuration_needs_refresh())
@@ -584,13 +582,39 @@ impl DfsMetadataAuthorityRuntime {
         revision
     }
 
+    fn writer(&self) -> Option<MutexGuard<'_, DfsConfigurationWriter>> {
+        self.writer.lock().ok()
+    }
+
+    /// Replace the publication with the writer's current state. Called by
+    /// every writer path before it releases the writer lock. An unchanged
+    /// state is not an event.
+    fn publish(&self, writer: &DfsConfigurationWriter) {
+        let candidate = writer.snapshot();
+        self.published.send_if_modified(|current| {
+            if current.same_publication(&candidate) {
+                return false;
+            }
+            *current = Arc::new(candidate);
+            true
+        });
+    }
+
     pub fn install_authoritative_projection(
         &self,
         projection: DfsAuthoritativePrefixProjection,
     ) -> bool {
-        let Some(authority_changed) = self.state.install_authoritative_projection(projection)
-        else {
-            return false;
+        let authority_changed = {
+            let Some(mut writer) = self.writer() else {
+                return false;
+            };
+            let Some(authority_changed) =
+                writer.metadata.install_authoritative_projection(projection)
+            else {
+                return false;
+            };
+            self.publish(&writer);
+            authority_changed
         };
         if authority_changed {
             self.host()
@@ -601,22 +625,53 @@ impl DfsMetadataAuthorityRuntime {
     }
 
     pub fn require_authoritative_revision(self: &Arc<Self>, revision: KvRevision) {
-        let refresh = match self.write_configuration.lock() {
-            Ok(mut configuration) => {
-                let refresh = self.state.require_authoritative_revision(revision);
-                // Withdraw both projections at the same boundary. Otherwise a
-                // service opener can accept the old configuration while the
-                // required metadata refresh is queued but has not been polled.
-                // Preserve a bootstrap already buffering this required floor.
-                if refresh && configuration.observed_revision() < revision {
-                    configuration.invalidate(revision);
-                }
-                refresh
+        let refresh = {
+            let Some(mut guard) = self.writer() else {
+                return;
+            };
+            let writer = &mut *guard;
+            let refresh = writer.metadata.require_authoritative_revision(revision);
+            // Withdraw both scopes at the same boundary. Otherwise a service
+            // opener can accept the old configuration while the required
+            // refresh is queued. Preserve a bootstrap already buffering it.
+            // Catch-up alone keeps the generation: only changed exact
+            // authority advances it when the refresh publishes.
+            if refresh && writer.write.observed_revision() < revision {
+                writer.write.invalidate(revision);
             }
-            Err(_) => self.state.require_authoritative_revision(revision),
+            self.publish(writer);
+            refresh
         };
         if refresh {
             self.request_authoritative_refresh();
+        }
+    }
+
+    /// A client observed `revision` through its own ReadIndex read or commit
+    /// while the publication is older. The committed observer delivers every
+    /// applied delta, so this is a catch-up edge only once the resident state
+    /// has applied past the publication: then a delta was missed. Otherwise
+    /// its delta is still arriving and no refresh is needed. A host without a
+    /// resident floor keeps the plain revision requirement.
+    pub fn observe_client_revision(self: &Arc<Self>, revision: KvRevision) {
+        let behind = || {
+            self.published
+                .borrow()
+                .revision()
+                .is_none_or(|published| published < revision)
+        };
+        if !behind() {
+            return;
+        }
+        let Some(host) = self.host() else {
+            return;
+        };
+        let applied = match host.write_configuration_floor() {
+            Ok(floor) => floor.revision >= revision,
+            Err(_) => true,
+        };
+        if applied && behind() {
+            self.require_authoritative_revision(revision);
         }
     }
 
@@ -660,42 +715,47 @@ impl DfsMetadataAuthorityRuntime {
         });
         let mut configuration_change = false;
         let mut configuration_became_ready = false;
-        let configuration_ready = self
-            .write_configuration
-            .lock()
-            .is_ok_and(|mut configuration| {
-                observation = self.state.observe_delta(delta);
-                let was_ready = configuration.snapshot().is_some();
-                let new_delta = delta.revision > configuration.observed_revision();
-                let ready = configuration.observe_delta(delta);
+        let configuration_ready = match self.writer() {
+            Some(mut guard) => {
+                let writer = &mut *guard;
+                observation = writer.metadata.observe_delta(delta);
+                let was_ready = writer.write.snapshot().is_some();
+                let new_delta = delta.revision > writer.write.observed_revision();
+                let ready = writer.write.observe_delta(delta);
                 configuration_became_ready = !was_ready && ready;
                 configuration_change = self.write_configuration_requested.load(Ordering::Acquire)
                     && ((new_delta && provider_configuration_touched) || (was_ready && !ready));
-                if let Some(published) = configuration.snapshot() {
-                    match self
-                        .state
+                let ready = if let Some(published) = writer.write.snapshot() {
+                    match writer
+                        .metadata
                         .install_write_configuration_projection(&published, configuration_change)
                     {
-                        Ok(authority_changed) => configuration_change |= authority_changed,
+                        Ok(authority_changed) => {
+                            configuration_change |= authority_changed;
+                            true
+                        }
                         Err(_) => {
                             if was_ready || configuration_change {
                                 configuration_change = true;
-                                let _ = self.state.advance_configuration_generation();
+                                writer.metadata.advance_configuration_generation();
                             }
-                            configuration.invalidate(delta.revision);
-                            return false;
+                            writer.write.invalidate(delta.revision);
+                            false
                         }
                     }
-                } else if configuration_change {
-                    // Provider and zone configuration fences authority but cannot
-                    // retire or reopen a physical metadata store.
-                    if self.state.advance_configuration_generation().is_err() {
-                        configuration.invalidate(delta.revision);
-                        return false;
+                } else {
+                    if configuration_change {
+                        // Provider and zone configuration fences authority but
+                        // cannot retire or reopen a physical metadata store.
+                        writer.metadata.advance_configuration_generation();
                     }
-                }
+                    ready
+                };
+                self.publish(writer);
                 ready
-            });
+            }
+            None => false,
+        };
         if let Ok(mut bootstrap) = self.single_node_bootstrap_authority.lock()
             && let Some(anchor) = bootstrap.as_mut()
         {
@@ -721,7 +781,7 @@ impl DfsMetadataAuthorityRuntime {
         }
         if configuration_became_ready && configuration_ready {
             // A coherent pending bundle can finish on a committed delta after
-            // its read owner has already returned. Wake its existing waiters.
+            // its read owner has already returned.
             self.refresh_completion
                 .send_modify(|generation| *generation = generation.saturating_add(1));
         }
@@ -765,20 +825,26 @@ impl DfsMetadataAuthorityRuntime {
             self.write_configuration_requested
                 .store(true, Ordering::Release);
         }
-        if self.write_configuration_requested.load(Ordering::Acquire)
-            && let Ok(mut configuration) = self.write_configuration.lock()
-        {
-            // A replacement snapshot cannot certify scope continuity. The
-            // existing shared refresh owner restores a complete configuration.
-            let behind = configuration.observed_revision() < snapshot.revision;
-            if behind {
-                if configuration.snapshot().is_some() {
-                    let _ = self.state.advance_configuration_generation();
+        let refresh = match self.writer() {
+            Some(mut guard) => {
+                let writer = &mut *guard;
+                if self.write_configuration_requested.load(Ordering::Acquire)
+                    && writer.write.observed_revision() < snapshot.revision
+                {
+                    // A replacement snapshot cannot certify scope continuity.
+                    // The shared refresh owner restores a complete configuration.
+                    if writer.write.snapshot().is_some() {
+                        writer.metadata.advance_configuration_generation();
+                    }
+                    writer.write.invalidate(snapshot.revision);
                 }
-                configuration.invalidate(snapshot.revision);
+                let refresh = writer.metadata.observe_snapshot(snapshot);
+                self.publish(writer);
+                refresh
             }
-        }
-        if self.state.observe_snapshot(snapshot) {
+            None => false,
+        };
+        if refresh {
             self.request_authoritative_refresh();
         }
         if self.write_configuration_requested.load(Ordering::Acquire)
@@ -799,10 +865,8 @@ impl DfsMetadataAuthorityRuntime {
         revision: Option<KvRevision>,
     ) -> DfsMetadataAuthorityDeltaObservation {
         let revision = revision.unwrap_or_else(|| {
-            self.state
-                .projection
-                .lock()
-                .map(|projection| projection.required_revision)
+            self.writer()
+                .map(|writer| writer.metadata.required_revision)
                 .unwrap_or(KvRevision::ZERO)
         });
         self.observe_discontinuity(revision)
@@ -812,22 +876,24 @@ impl DfsMetadataAuthorityRuntime {
         self: &Arc<Self>,
         revision: KvRevision,
     ) -> DfsMetadataAuthorityDeltaObservation {
-        let mut observation = match self.write_configuration.lock() {
-            Ok(mut configuration) => {
+        let mut observation = match self.writer() {
+            Some(mut guard) => {
+                let writer = &mut *guard;
                 DfsMetadataAuthorityState::advance(&self.discontinuity_generation);
-                let mut observation = self.state.observe_discontinuity(revision);
-                let configuration_was_ready = configuration.snapshot().is_some();
-                configuration.invalidate(revision);
+                let mut observation = writer.metadata.observe_discontinuity(revision);
+                let configuration_was_ready = writer.write.snapshot().is_some();
+                writer.write.invalidate(revision);
                 if configuration_was_ready {
-                    let _ = self.state.advance_configuration_generation();
+                    writer.metadata.advance_configuration_generation();
                     observation.authority_changed = true;
                     observation.proof_withdrawn = true;
                 }
+                self.publish(writer);
                 observation
             }
-            Err(_) => {
+            None => {
                 DfsMetadataAuthorityState::advance(&self.discontinuity_generation);
-                self.state.observe_discontinuity(revision)
+                DfsMetadataAuthorityDeltaObservation::invalidated(false)
             }
         };
         let bootstrap_withdrawn = self
@@ -855,15 +921,14 @@ impl DfsMetadataAuthorityRuntime {
     }
 
     fn write_configuration_needs_refresh(&self) -> bool {
-        self.write_configuration
-            .lock()
-            .is_ok_and(|configuration| configuration.needs_refresh())
+        self.writer()
+            .is_some_and(|writer| writer.write.needs_refresh())
     }
 
     fn handoff_pending_authoritative_refresh(self: &Arc<Self>) {
         if !self.refresh_in_flight.load(Ordering::Acquire)
             && self.refresh_requested.load(Ordering::Acquire)
-            && (self.state.current_complete_prefix_revision().is_none()
+            && (self.published.borrow().revision().is_none()
                 || (self.write_configuration_requested.load(Ordering::Acquire)
                     && self.write_configuration_needs_refresh()))
         {
@@ -876,9 +941,7 @@ impl DfsMetadataAuthorityRuntime {
             return;
         }
         self.refresh_in_flight.store(false, Ordering::Release);
-        // Reserve the latched successor before announcing completion. A
-        // waiter must distinguish an intermediate handoff from a terminal
-        // failed owner, without racing a newly queued configuration refresh.
+        // Reserve the latched successor before announcing completion.
         self.handoff_pending_authoritative_refresh();
         self.refresh_completion
             .send_modify(|generation| *generation = generation.saturating_add(1));
@@ -909,25 +972,37 @@ impl DfsMetadataAuthorityRuntime {
             && host.allows_unconfigured_single_node_write_configuration(&anchor.authority, &floor)
     }
 
-    /// Borrow one already-published configuration without reading or hydrating
-    /// KV. A detected authority transition wakes the existing refresh owner.
-    /// Unknown native authority fails closed.
-    /// sinomo:kv-configuration: Validate the retained configuration against the resident committed Raft configuration and higher-term fence.
+    /// Borrow the already-published write configuration without reading or
+    /// hydrating KV. A detected authority transition wakes the existing
+    /// refresh owner. Unknown native authority fails closed.
     pub fn write_configuration_projection(
         self: &Arc<Self>,
     ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
-        self.read_write_configuration()
+        self.read_configuration_snapshot()
+            .map(|snapshot| snapshot.write.clone())
             .map_err(|error| match error {
                 DfsWriteConfigurationReadError::Pending(error)
                 | DfsWriteConfigurationReadError::Unavailable(error) => error,
             })
     }
 
-    /// sinomo:kv-configuration: Check the existing resident native floor before lending a retained configuration cut.
-    fn read_write_configuration(
+    /// The current publication after its native floor check. `None` means a
+    /// coherent configuration is still pending; waiters subscribe instead.
+    pub fn checked_configuration_snapshot(
         self: &Arc<Self>,
-    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsWriteConfigurationReadError>
-    {
+    ) -> Result<Option<Arc<DfsConfigurationSnapshot>>, DfsError> {
+        match self.read_configuration_snapshot() {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(DfsWriteConfigurationReadError::Pending(_)) => Ok(None),
+            Err(DfsWriteConfigurationReadError::Unavailable(error)) => Err(error),
+        }
+    }
+
+    /// sinomo:kv-configuration: Check the existing resident native floor before lending one published configuration snapshot.
+    fn read_configuration_snapshot(
+        self: &Arc<Self>,
+    ) -> Result<Arc<DfsConfigurationSnapshot>, DfsWriteConfigurationReadError> {
+        let snapshot = self.configuration_snapshot();
         if !self.write_configuration_requested.load(Ordering::Acquire) {
             if self.host().is_some_and(|host| {
                 host.supports_write_configuration_projection()
@@ -938,30 +1013,22 @@ impl DfsMetadataAuthorityRuntime {
                 }
                 .into());
             }
-            return Ok(None);
+            return Ok(snapshot);
         }
         let host = self.host().ok_or_else(|| DfsError::Network {
             message: "DFS write configuration host is unavailable".into(),
         })?;
-        let view = self
-            .write_configuration
-            .lock()
-            .map_err(|_| DfsError::Network {
-                message: "DFS write configuration projection lock poisoned".into(),
-            })?
-            .snapshot();
-        let Some(view) = view else {
+        let Some(view) = snapshot.write.as_ref() else {
             if !self
                 .write_configuration_has_committed_config
                 .load(Ordering::Acquire)
                 && self.allows_verified_single_node_bootstrap(&host)
             {
-                return Ok(None);
+                return Ok(snapshot);
             }
-            return Err(DfsWriteConfigurationReadError::Pending(DfsError::Network {
-                message: "DFS write configuration is awaiting a coherent authoritative projection"
-                    .into(),
-            }));
+            return Err(DfsWriteConfigurationReadError::Pending(
+                configuration_pending(),
+            ));
         };
         #[cfg(any(test, feature = "test-support"))]
         if crate::test_runtime::native_configuration_floor_is_denied(self.as_ref()) {
@@ -973,20 +1040,19 @@ impl DfsMetadataAuthorityRuntime {
         }
         let floor = host.write_configuration_floor()?;
         if !view.matches_floor(&floor) {
-            let mut configuration =
-                self.write_configuration
-                    .lock()
-                    .map_err(|_| DfsError::Network {
-                        message: "DFS write configuration projection lock poisoned".into(),
-                    })?;
-            let invalidated = configuration
-                .snapshot()
-                .is_some_and(|current| !current.matches_floor(&floor));
-            if invalidated {
-                self.state.advance_configuration_generation()?;
-                configuration.invalidate(floor.revision);
-            }
-            drop(configuration);
+            let invalidated = {
+                let mut writer = self.writer().ok_or_else(writer_poisoned)?;
+                let invalidated = writer
+                    .write
+                    .snapshot()
+                    .is_some_and(|current| !current.matches_floor(&floor));
+                if invalidated {
+                    writer.metadata.advance_configuration_generation();
+                    writer.write.invalidate(floor.revision);
+                    self.publish(&writer);
+                }
+                invalidated
+            };
             if invalidated {
                 host.authority_changed();
                 self.request_authoritative_refresh();
@@ -996,14 +1062,16 @@ impl DfsMetadataAuthorityRuntime {
                     .into(),
             }));
         }
-        Ok(Some(view))
+        Ok(snapshot)
     }
 
     pub fn write_configuration_readiness(
         self: &Arc<Self>,
     ) -> Result<crate::DfsWriteConfigurationReadiness, DfsError> {
-        match self.read_write_configuration() {
-            Ok(view) => Ok(crate::DfsWriteConfigurationReadiness::Ready(view)),
+        match self.read_configuration_snapshot() {
+            Ok(snapshot) => Ok(crate::DfsWriteConfigurationReadiness::Ready(
+                snapshot.write.clone(),
+            )),
             Err(DfsWriteConfigurationReadError::Pending(_)) => {
                 Ok(crate::DfsWriteConfigurationReadiness::Pending)
             }
@@ -1011,98 +1079,61 @@ impl DfsMetadataAuthorityRuntime {
         }
     }
 
-    /// Preeffect cold/gap admission joins the same reactive owner as metadata
-    /// authority. Ready access performs only the existing native floor check.
-    /// The caller supplies its existing projection/RPC deadline around this
-    /// future; neither handoff nor a pending bundle creates another deadline.
-    pub async fn ensure_write_configuration_ready_async(self: &Arc<Self>) -> Result<(), DfsError> {
-        self.ensure_write_configuration_ready_with_pending_observer(
-            #[cfg(test)]
-            None,
-        )
-        .await
-    }
-
-    async fn ensure_write_configuration_ready_with_pending_observer(
+    /// Wait for a floor-checked publication. The caller supplies its existing
+    /// operation deadline around this future. Waiters never start a refresh:
+    /// every edge that withdraws or has not yet produced a publication has
+    /// already requested the shared bounded refresh.
+    pub async fn ready_configuration_snapshot_async(
         self: &Arc<Self>,
-        #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
-    ) -> Result<(), DfsError> {
-        self.ready_write_configuration_with_pending_observer(
-            #[cfg(test)]
-            pending_observer,
-        )
-        .await
-        .map(|_| ())
+    ) -> Result<Arc<DfsConfigurationSnapshot>, DfsError> {
+        let mut published = self.published.subscribe();
+        loop {
+            match self.read_configuration_snapshot() {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(DfsWriteConfigurationReadError::Unavailable(error)) => return Err(error),
+                Err(DfsWriteConfigurationReadError::Pending(_)) => {}
+            }
+            if published.changed().await.is_err() {
+                return Err(configuration_pending());
+            }
+        }
     }
 
-    /// Return the very cut whose native floor passed readiness. Borrowing it
-    /// again after this wait would race a later publication/refresh transition.
-    /// This immutable configuration is read input, not publication authority.
+    /// Preeffect cold/gap admission joins the same reactive publication as
+    /// metadata authority. Ready access performs only the native floor check.
+    pub async fn ensure_write_configuration_ready_async(self: &Arc<Self>) -> Result<(), DfsError> {
+        self.ready_configuration_snapshot_async().await.map(|_| ())
+    }
+
+    /// Return the very cut whose native floor passed readiness. This
+    /// immutable configuration is read input, not publication authority.
     pub(crate) async fn ready_write_configuration_projection_async(
         self: &Arc<Self>,
     ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
-        self.ready_write_configuration_with_pending_observer(
-            #[cfg(test)]
-            None,
-        )
-        .await
+        self.ready_configuration_snapshot_async()
+            .await
+            .map(|snapshot| snapshot.write.clone())
     }
 
-    async fn ready_write_configuration_with_pending_observer(
+    /// Wait until the filesystem scope is published for `expected_generation`
+    /// or that generation is superseded. The caller owns the deadline.
+    pub async fn ensure_complete_prefix_for_generation_async(
         self: &Arc<Self>,
-        #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
-    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
-        let mut completion = self.refresh_completion.subscribe();
-        let mut joined_owner = false;
+        expected_generation: u64,
+    ) -> Option<KvRevision> {
+        let mut published = self.published.subscribe();
         loop {
-            let error = match self.read_write_configuration() {
-                Ok(view) => return Ok(view),
-                Err(DfsWriteConfigurationReadError::Pending(error)) => error,
-                Err(DfsWriteConfigurationReadError::Unavailable(error)) => return Err(error),
-            };
-            #[cfg(test)]
-            if let Some(observer) = pending_observer {
-                observer();
-            }
-            let (missing, pending) = self
-                .write_configuration
-                .lock()
-                .map(|configuration| {
-                    (
-                        configuration.snapshot().is_none(),
-                        configuration.bootstrap_pending(),
-                    )
-                })
-                .map_err(|_| DfsError::Network {
-                    message: "DFS write configuration projection lock poisoned".into(),
-                })?;
-            if !missing {
-                // The observed missing publication completed before this
-                // check. Revalidate its actual native floor; do not return the
-                // stale Pending error or initiate another refresh owner.
-                // Yield so repeated concurrent transitions remain subject to
-                // the caller's original async deadline.
-                tokio::task::yield_now().await;
-                continue;
-            }
-            if self.refresh_in_flight.load(Ordering::Acquire) {
-                joined_owner = true;
-            } else if !pending {
-                if joined_owner {
-                    return Err(error);
+            {
+                let snapshot = published.borrow_and_update();
+                if snapshot.generation != expected_generation {
+                    return None;
                 }
-                // Missing configuration is the explicit preeffect recovery
-                // edge. Claim at most one owner, then join only its latched
-                // successors; an unsuccessful terminal owner is final.
-                joined_owner = true;
-                self.request_authoritative_refresh();
-                if !self.refresh_in_flight.load(Ordering::Acquire) {
-                    // A promptly completed owner may publish before this load.
-                    return self.write_configuration_projection();
+                if let Some(revision) = snapshot.revision() {
+                    return Some(revision);
                 }
             }
-            if completion.changed().await.is_err() {
-                return Err(error);
+            if published.changed().await.is_err() {
+                return None;
             }
         }
     }
@@ -1111,14 +1142,9 @@ impl DfsMetadataAuthorityRuntime {
         self: &Arc<Self>,
         host: &Arc<dyn DfsMetadataAuthorityHost>,
         mode: &'static str,
-        #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
     ) -> Option<KvRevision> {
         let discontinuity_generation = self.discontinuity_generation.load(Ordering::Acquire);
         if !self.write_configuration_requested.load(Ordering::Acquire) {
-            #[cfg(test)]
-            if let Some(observer) = native_read_observer {
-                observer(DFS_METADATA_AUTHORITY_PREFIX);
-            }
             return self.apply_read_result(
                 host.read_authoritative_prefix().await,
                 mode,
@@ -1126,17 +1152,16 @@ impl DfsMetadataAuthorityRuntime {
             );
         }
         let (token, discontinuity_generation) = {
-            let mut configuration = self.write_configuration.lock().ok()?;
+            let mut writer = self.writer()?;
             // Committed deltas can complete a pending bundle after this owner
-            // was queued. Recheck under the publication lock before beginning
-            // a refresh; an obsolete owner must not withdraw the completed cut.
-            if configuration.snapshot().is_some()
-                && let Some(revision) = self.state.current_complete_prefix_revision()
+            // was queued. An obsolete owner must not withdraw that publication.
+            if writer.write.snapshot().is_some()
+                && let Some(revision) = writer.metadata.revision
             {
                 return Some(revision);
             }
             (
-                configuration.begin_refresh(),
+                writer.write.begin_refresh(),
                 self.discontinuity_generation.load(Ordering::Acquire),
             )
         };
@@ -1150,10 +1175,6 @@ impl DfsMetadataAuthorityRuntime {
         crate::test_runtime::pause_native_configuration_rebuild(self.as_ref()).await;
         let mut authority_changed = false;
         let result = async {
-            #[cfg(test)]
-            if let Some(observer) = native_read_observer {
-                observer(DFS_WRITE_CONFIGURATION_PREFIXES[0]);
-            }
             let filesystem = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[0])
                 .await?;
@@ -1164,20 +1185,14 @@ impl DfsMetadataAuthorityRuntime {
                 revision,
             )
             .map_err(DfsError::from)?;
-            // Retain the valid filesystem proof immediately, but complete this
-            // bounded configuration bootstrap before waking topology owners.
-            // Otherwise initial discovery can cold-open a metadata generation
-            // while the foreground preflight still reads its other scopes.
+            // Retain the valid filesystem proof immediately. The write
+            // configuration stays unpublished until the bounded bootstrap
+            // completes, so service openers still wait for every scope.
             {
                 // A same-revision discontinuity can replace the underlying
-                // canonical view. Serialize this publication with withdrawal;
-                // a read started before that edge cannot restore readiness.
-                let _configuration =
-                    self.write_configuration
-                        .lock()
-                        .map_err(|_| DfsError::Network {
-                            message: "DFS write configuration projection lock poisoned".into(),
-                        })?;
+                // canonical view. A read started before that edge cannot
+                // restore readiness.
+                let mut writer = self.writer().ok_or_else(writer_poisoned)?;
                 if self.discontinuity_generation.load(Ordering::Acquire) != discontinuity_generation
                 {
                     return Err(DfsError::Network {
@@ -1186,25 +1201,11 @@ impl DfsMetadataAuthorityRuntime {
                                 .into(),
                     });
                 }
-                #[cfg(any(test, feature = "test-support"))]
-                if self.state.native_interest() {
-                    authority_changed |= self
-                        .state
-                        .install_native_observed_projection(metadata_projection, filesystem.clone())
-                        .unwrap_or(false);
-                } else {
-                    authority_changed |= self
-                        .state
-                        .install_authoritative_projection(metadata_projection)
-                        .unwrap_or(false);
-                }
-                #[cfg(not(any(test, feature = "test-support")))]
-                {
-                    authority_changed |= self
-                        .state
-                        .install_authoritative_projection(metadata_projection)
-                        .unwrap_or(false);
-                }
+                authority_changed |= writer
+                    .metadata
+                    .install_authoritative_projection(metadata_projection)
+                    .unwrap_or(false);
+                self.publish(&writer);
             }
             // The first native ReadIndex initializes the ordinary resident
             // owner. The floor access below itself never opens or replays KV.
@@ -1222,12 +1223,7 @@ impl DfsMetadataAuthorityRuntime {
                     &before,
                 )
             {
-                let _configuration =
-                    self.write_configuration
-                        .lock()
-                        .map_err(|_| DfsError::Network {
-                            message: "DFS write configuration projection lock poisoned".into(),
-                        })?;
+                let _writer = self.writer().ok_or_else(writer_poisoned)?;
                 if self.discontinuity_generation.load(Ordering::Acquire) != discontinuity_generation
                 {
                     return Err(DfsError::Network {
@@ -1251,24 +1247,12 @@ impl DfsMetadataAuthorityRuntime {
                     .store(false, Ordering::Release);
                 return Ok(revision);
             }
-            #[cfg(test)]
-            if let Some(observer) = native_read_observer {
-                observer(DFS_WRITE_CONFIGURATION_PREFIXES[1]);
-            }
             let content = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[1])
                 .await?;
-            #[cfg(test)]
-            if let Some(observer) = native_read_observer {
-                observer(DFS_WRITE_CONFIGURATION_PREFIXES[2]);
-            }
             let providers = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[2])
                 .await?;
-            #[cfg(test)]
-            if let Some(observer) = native_read_observer {
-                observer(DFS_WRITE_CONFIGURATION_PREFIXES[3]);
-            }
             let members = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[3])
                 .await?;
@@ -1282,12 +1266,8 @@ impl DfsMetadataAuthorityRuntime {
                         .into(),
                 });
             }
-            let mut configuration =
-                self.write_configuration
-                    .lock()
-                    .map_err(|_| DfsError::Network {
-                        message: "DFS write configuration projection lock poisoned".into(),
-                    })?;
+            let mut guard = self.writer().ok_or_else(writer_poisoned)?;
+            let writer = &mut *guard;
             if self.discontinuity_generation.load(Ordering::Acquire) != discontinuity_generation {
                 return Err(DfsError::Network {
                     message:
@@ -1295,24 +1275,24 @@ impl DfsMetadataAuthorityRuntime {
                             .into(),
                 });
             }
-            configuration
+            writer
+                .write
                 .install_bootstrap(token, [filesystem, content, providers, members], after)
                 .map_err(DfsError::from)?;
-            authority_changed |= if let Some(published) = configuration.snapshot() {
-                match self
-                    .state
+            if let Some(published) = writer.write.snapshot() {
+                match writer
+                    .metadata
                     .install_write_configuration_projection(&published, false)
                 {
-                    Ok(authority_changed) => authority_changed,
+                    Ok(changed) => authority_changed |= changed,
                     Err(error) => {
-                        configuration.invalidate(revision);
+                        writer.write.invalidate(revision);
+                        self.publish(writer);
                         return Err(error);
                     }
                 }
-            } else {
-                false
-            };
-            drop(configuration);
+            }
+            self.publish(writer);
             Ok(revision)
         }
         .await;
@@ -1325,74 +1305,6 @@ impl DfsMetadataAuthorityRuntime {
                 tracing::warn!(target: "sinomo.dfs.metadata_authority", %error,
                     "DFS write configuration refresh failed; authority remains fail-closed");
                 None
-            }
-        }
-    }
-
-    pub async fn ensure_complete_prefix_for_generation_async(
-        self: &Arc<Self>,
-        expected_generation: u64,
-        #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
-    ) -> Option<KvRevision> {
-        let mut completion = self.refresh_completion.subscribe();
-        let retained = self
-            .state
-            .retained_complete_prefix_revision_for_generation(expected_generation);
-        if retained.is_some() || self.generation() != expected_generation {
-            return retained;
-        }
-        let host = self.host()?;
-        #[cfg(any(test, feature = "test-support"))]
-        let before_claim = self
-            .refresh_before_claim
-            .lock()
-            .ok()
-            .and_then(|hook| hook.clone());
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some((reached, release)) = before_claim {
-            reached.notify_one();
-            release.notified().await;
-        }
-        if let Some(refresh_owner) = self.try_claim_refresh() {
-            self.refresh_requested.store(false, Ordering::Release);
-            let retained = self
-                .state
-                .retained_complete_prefix_revision_for_generation(expected_generation);
-            if retained.is_some() || self.generation() != expected_generation {
-                drop(refresh_owner);
-                return retained;
-            }
-            self.record_refresh();
-            let proof_revision = self
-                .refresh_authoritative_projection(
-                    &host,
-                    "async cold",
-                    #[cfg(test)]
-                    native_read_observer,
-                )
-                .await;
-            let refresh_required =
-                proof_revision.is_some_and(|revision| self.state.refresh_required_after(revision));
-            drop(refresh_owner);
-            if refresh_required {
-                self.request_authoritative_refresh();
-            }
-        }
-        loop {
-            let retained = self
-                .state
-                .retained_complete_prefix_revision_for_generation(expected_generation);
-            if retained.is_some() || self.generation() != expected_generation {
-                return retained;
-            }
-            if !self.refresh_in_flight.load(Ordering::Acquire) {
-                return None;
-            }
-            // Join only an existing owner, including a latched successor. The
-            // caller retains its original deadline; a terminal failed refresh
-            // never starts another read or invents an authority retry here.
-            if completion.changed().await.is_err() {
-                return None;
             }
         }
     }
@@ -1410,7 +1322,7 @@ impl DfsMetadataAuthorityRuntime {
             return;
         };
         self.refresh_requested.store(false, Ordering::Release);
-        if self.state.current_complete_prefix_revision().is_some()
+        if self.published.borrow().revision().is_some()
             && (!self.write_configuration_requested.load(Ordering::Acquire)
                 || !self.write_configuration_needs_refresh())
         {
@@ -1422,17 +1334,43 @@ impl DfsMetadataAuthorityRuntime {
         let task_host = Arc::clone(&host);
         host.spawn(Box::pin(async move {
             let proof_revision = runtime
-                .refresh_authoritative_projection(
-                    &task_host,
-                    "bounded",
-                    #[cfg(test)]
-                    None,
-                )
+                .refresh_authoritative_projection(&task_host, "bounded")
                 .await;
-            let refresh_required = proof_revision
-                .is_some_and(|revision| runtime.state.refresh_required_after(revision));
+            let refresh_required = proof_revision.is_some_and(|revision| {
+                runtime
+                    .writer()
+                    .is_some_and(|writer| writer.metadata.refresh_required_after(revision))
+            });
             drop(refresh_owner);
             if refresh_required {
+                runtime.request_authoritative_refresh();
+            } else if proof_revision.is_some() {
+                runtime.refresh_failures.store(0, Ordering::Release);
+            } else {
+                runtime.resend_failed_refresh(&task_host);
+            }
+        }));
+    }
+
+    /// A failed bounded refresh leaves the publication unavailable, and no
+    /// later committed edge is guaranteed to request another one. Re-send it
+    /// on a bounded doubling delay; a success resets the sequence and an
+    /// exhausted sequence waits for the next edge. Waiters keep their own
+    /// operation deadlines throughout.
+    fn resend_failed_refresh(self: &Arc<Self>, host: &Arc<dyn DfsMetadataAuthorityHost>) {
+        #[cfg(test)]
+        if self.refresh_resend_disabled.load(Ordering::Acquire) {
+            return;
+        }
+        let attempt = self.refresh_failures.fetch_add(1, Ordering::AcqRel);
+        if attempt >= DFS_CONFIGURATION_REFRESH_RETRY_LIMIT {
+            return;
+        }
+        let delay = DFS_CONFIGURATION_REFRESH_RETRY_DELAY.saturating_mul(1 << attempt);
+        let runtime = Arc::downgrade(self);
+        host.spawn(Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(runtime) = runtime.upgrade() {
                 runtime.request_authoritative_refresh();
             }
         }));
@@ -1446,8 +1384,6 @@ impl DfsMetadataAuthorityRuntime {
     ) -> Option<KvRevision> {
         match read {
             Ok(read) => {
-                #[cfg(any(test, feature = "test-support"))]
-                let native_read = self.state.native_interest().then(|| read.clone());
                 let revision = read.authority.revision;
                 match DfsAuthoritativePrefixProjection::complete(
                     DFS_METADATA_AUTHORITY_PREFIX,
@@ -1456,26 +1392,18 @@ impl DfsMetadataAuthorityRuntime {
                 ) {
                     Ok(projection) => {
                         let authority_changed = {
-                            let _configuration = self.write_configuration.lock().ok()?;
+                            let mut writer = self.writer()?;
                             if self.discontinuity_generation.load(Ordering::Acquire)
                                 != discontinuity_generation
                             {
                                 return None;
                             }
-                            #[cfg(any(test, feature = "test-support"))]
-                            if let Some(read) = native_read {
-                                self.state
-                                    .install_native_observed_projection(projection, read)
-                                    .unwrap_or(false)
-                            } else {
-                                self.state
-                                    .install_authoritative_projection(projection)
-                                    .unwrap_or(false)
-                            }
-                            #[cfg(not(any(test, feature = "test-support")))]
-                            self.state
+                            let changed = writer
+                                .metadata
                                 .install_authoritative_projection(projection)
-                                .unwrap_or(false)
+                                .unwrap_or(false);
+                            self.publish(&writer);
+                            changed
                         };
                         if authority_changed {
                             if let Some(host) = self.host() {
@@ -1521,12 +1449,17 @@ impl DfsMetadataAuthorityRuntime {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn projection_rebuild_count(&self) -> u64 {
-        self.state.projection_rebuild_count()
+        self.writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .metadata
+            .projection_rebuild_count()
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn projection_materialization_count(&self) -> u64 {
-        self.state.projection_materialization_count()
+        self.projection_materialization_count
+            .load(Ordering::Acquire)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1540,28 +1473,12 @@ impl DfsMetadataAuthorityRuntime {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn install_refresh_before_claim_hook(
-        &self,
-        hook: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
-    ) {
-        if let Ok(mut current) = self.refresh_before_claim.lock() {
-            *current = hook;
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
     pub fn debug_snapshot(&self) -> DfsMetadataAuthorityDebugSnapshot {
-        self.state.debug_snapshot()
-    }
-}
-
-impl std::fmt::Debug for DfsMetadataAuthorityState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DfsMetadataAuthorityState")
-            .field("generation", &self.generation())
-            .field("projection_generation", &self.projection_generation())
-            .finish_non_exhaustive()
+        self.writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .metadata
+            .debug_snapshot()
     }
 }
 
@@ -1574,340 +1491,120 @@ impl Default for DfsMetadataAuthorityState {
 impl DfsMetadataAuthorityState {
     pub fn new() -> Self {
         Self {
-            projection: Mutex::new(DfsMetadataAuthorityProjection {
-                revision: None,
-                required_revision: KvRevision::ZERO,
-                topology_comparison_baseline: false,
-                entries: Vec::new(),
-                metadata_shards_by_file_system: BTreeMap::new(),
-                #[cfg(any(test, feature = "test-support"))]
-                native_evidence: None,
-                #[cfg(any(test, feature = "test-support"))]
-                native_evidence_loss_count: 0,
-            }),
-            projection_generation: AtomicU64::new(1),
-            generation: AtomicU64::new(1),
-            storage_generation: AtomicU64::new(1),
+            revision: None,
+            required_revision: KvRevision::ZERO,
+            topology_comparison_baseline: false,
+            entries: Arc::new(Vec::new()),
+            shards: Arc::new(DfsMetadataShardsByFileSystem::new()),
+            file_systems: Arc::new(DfsFileSystemConfigsByKey::new()),
+            generation: 1,
+            projection_generation: 1,
+            storage_generation: 1,
             #[cfg(any(test, feature = "test-support"))]
-            native_source: Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            projection_rebuild_count: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-support"))]
-            projection_materialization_count: AtomicU64::new(0),
+            projection_rebuild_count: 0,
         }
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.generation
     }
 
     pub fn projection_generation(&self) -> u64 {
-        self.projection_generation.load(Ordering::Acquire)
+        self.projection_generation
     }
 
     pub fn storage_generation(&self) -> u64 {
-        self.storage_generation.load(Ordering::Acquire)
+        self.storage_generation
     }
 
-    fn lifecycle_generations(&self) -> Result<(u64, u64), DfsError> {
-        // A structural commit advances two fences under this lock. Capture
-        // them as one transition, never a new authority with old store owners.
-        let _projection = self.projection.lock().map_err(|_| DfsError::Network {
-            message: "DFS metadata authority projection lock poisoned".to_string(),
-        })?;
-        Ok((self.generation(), self.storage_generation()))
+    /// The publication of this scope beside the current write configuration.
+    pub(crate) fn snapshot(
+        &self,
+        write: Option<Arc<crate::DfsWriteConfigurationProjection>>,
+    ) -> DfsConfigurationSnapshot {
+        DfsConfigurationSnapshot {
+            generation: self.generation,
+            projection_generation: self.projection_generation,
+            storage_generation: self.storage_generation,
+            metadata: self.revision.map(|revision| DfsMetadataAuthorityScope {
+                revision,
+                entries: Arc::clone(&self.entries),
+                shards: Arc::clone(&self.shards),
+                file_systems: Arc::clone(&self.file_systems),
+            }),
+            write,
+        }
     }
 
     /// Shared write configuration changes fence retained clients and metadata
     /// admissions together, while preserving the physical store generation.
-    fn advance_configuration_generation(&self) -> Result<(), DfsError> {
-        let _projection = self.projection.lock().map_err(|_| DfsError::Network {
-            message: "DFS metadata authority projection lock poisoned".to_string(),
-        })?;
-        Self::advance(&self.generation);
-        Self::advance(&self.projection_generation);
-        Ok(())
+    fn advance_configuration_generation(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        self.projection_generation = self.projection_generation.saturating_add(1);
     }
 
-    /// Publish the shared view's complete filesystem scope and its authority
-    /// fence under the same lock. The caller still owns the configuration lock,
-    /// so a write cannot observe the shared view before this local rebind.
+    /// Publish the write configuration's complete filesystem scope and its
+    /// authority fence at the same writer step.
     fn install_write_configuration_projection(
-        &self,
+        &mut self,
         configuration: &crate::DfsWriteConfigurationProjection,
         configuration_changed: bool,
     ) -> Result<bool, DfsError> {
-        let prefix = DfsAuthoritativePrefixProjection::complete(
-            DFS_METADATA_AUTHORITY_PREFIX,
-            configuration.scopes[0].clone(),
-            configuration.revision,
-        )
-        .map_err(DfsError::from)?;
-        let mut observed = self.projection.lock().map_err(|_| DfsError::Network {
-            message: "DFS metadata authority projection lock poisoned".to_string(),
-        })?;
-        let authority_changed = self
-            .install_authoritative_projection_locked(&mut observed, prefix)
-            .ok_or_else(|| DfsError::Network {
-                message: "DFS shared write configuration predates its filesystem authority floor"
-                    .to_string(),
-            })?;
+        let predates = || DfsError::Network {
+            message: "DFS shared write configuration predates its filesystem authority floor"
+                .to_string(),
+        };
+        if configuration.revision < self.required_revision {
+            return Err(predates());
+        }
+        let authority_changed = if self
+            .revision
+            .is_some_and(|revision| configuration.revision <= revision)
+        {
+            // Committed replay already advanced this same scope.
+            false
+        } else {
+            let prefix = DfsAuthoritativePrefixProjection::complete(
+                DFS_METADATA_AUTHORITY_PREFIX,
+                configuration.scopes[0].clone(),
+                configuration.revision,
+            )
+            .map_err(DfsError::from)?;
+            self.install_authoritative_projection(prefix)
+                .ok_or_else(predates)?
+        };
         if configuration_changed {
-            Self::advance(&self.generation);
-            Self::advance(&self.projection_generation);
+            self.advance_configuration_generation();
         }
         Ok(authority_changed || configuration_changed)
-    }
-
-    /// Borrow the existing decoded authority index only while its complete
-    /// proof and the caller's configuration generation still match. Gaps and
-    /// concurrent changes must use the normal authoritative refresh path.
-    pub fn cached_metadata_shards(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        expected_projection_generation: u64,
-    ) -> Result<Option<Vec<DfsMetadataShardConfig>>, sinomo_core::kv::KvError> {
-        let projection =
-            self.projection
-                .lock()
-                .map_err(|_| sinomo_core::kv::KvError::AuthorityUnavailable {
-                    detail: "DFS metadata authority projection lock poisoned".to_string(),
-                })?;
-        if projection.revision.is_none()
-            || self.projection_generation() != expected_projection_generation
-        {
-            return Ok(None);
-        }
-        match projection
-            .metadata_shards_by_file_system
-            .get(file_system_id.as_str())
-        {
-            Some(Ok(shards)) => Ok(Some(shards.clone())),
-            Some(Err(detail)) => Err(sinomo_core::kv::KvError::Serialization {
-                detail: detail.clone(),
-            }),
-            None => Ok(Some(Vec::new())),
-        }
-    }
-
-    fn with_current_publication_configuration<R>(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        read: impl FnOnce(u64, Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>) -> R,
-    ) -> Result<Option<R>, sinomo_core::kv::KvError> {
-        #[cfg(test)]
-        run_publication_configuration_before_lock_hook();
-        let projection =
-            self.projection
-                .lock()
-                .map_err(|_| sinomo_core::kv::KvError::AuthorityUnavailable {
-                    detail: "DFS metadata authority projection lock poisoned".into(),
-                })?;
-        let current_projection_generation = self.projection_generation();
-        if projection.revision.is_none() {
-            #[cfg(test)]
-            eprintln!(
-                "NATIVE_PUBLICATION_CONFIGURATION_NOT_CURRENT branch=projection_unavailable filesystem={} current_generation={} revision={:?} required_revision={:?} thread={:?}",
-                file_system_id,
-                current_projection_generation,
-                projection.revision,
-                projection.required_revision,
-                std::thread::current().name(),
-            );
-            return Ok(None);
-        }
-        let (shards, config) = Self::publication_configuration_values(&projection, file_system_id)?;
-        #[cfg(any(test, feature = "test-support"))]
-        crate::native_shard_trace::record_metadata_cache_cut(
-            current_projection_generation,
-            projection.revision,
-            projection.required_revision,
-            &projection.entries,
-            projection.native_evidence.as_ref(),
-            projection.native_evidence_loss_count,
-        );
-        Ok(Some(read(current_projection_generation, shards, config)))
-    }
-
-    /// Pure decoding shared by the old locked callback and the owned original
-    /// Repair snapshot. The caller already owns the projection lock.
-    fn publication_configuration_values(
-        projection: &DfsMetadataAuthorityProjection,
-        file_system_id: &DfsFileSystemId,
-    ) -> Result<(Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>), sinomo_core::kv::KvError> {
-        let shards = match projection
-            .metadata_shards_by_file_system
-            .get(file_system_id.as_str())
-        {
-            Some(Ok(shards)) => shards.clone(),
-            Some(Err(detail)) => {
-                return Err(sinomo_core::kv::KvError::Serialization {
-                    detail: detail.clone(),
-                });
-            }
-            None => Vec::new(),
-        };
-        let key = crate::file_system_config_key(file_system_id);
-        let config = projection
-            .entries
-            .binary_search_by(|entry| entry.key.cmp(&key))
-            .ok()
-            .map(|index| projection.entries[index].decode::<crate::DfsFileSystemConfig>())
-            .transpose()?;
-        Ok((shards, config))
-    }
-
-    pub fn shard_projection_state(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        shard_id: &DfsMetadataShardId,
-    ) -> (u64, bool) {
-        let key = crate::metadata_shard_key(file_system_id, &shard_id.0);
-        let Ok(projection) = self.projection.lock() else {
-            return (self.generation(), false);
-        };
-        if projection.revision.is_none() {
-            return (self.generation(), false);
-        }
-        let contains_shard = projection
-            .entries
-            .binary_search_by(|entry| entry.key.as_str().cmp(key.as_str()))
-            .is_ok();
-        (self.generation(), contains_shard)
-    }
-
-    pub fn namespace_read_stamp_state(
-        &self,
-        command: &DfsNamespaceCommand,
-    ) -> Result<(u64, bool), DfsError> {
-        let projection = self.projection.lock().map_err(|_| DfsError::Network {
-            message: "DFS metadata authority projection lock poisoned".to_string(),
-        })?;
-        if projection.revision.is_none() {
-            return Ok((self.generation(), false));
-        }
-        let stamp_matches = namespace_command_matches_authority_index(
-            &projection.metadata_shards_by_file_system,
-            command,
-        )?;
-        Ok((self.generation(), stamp_matches))
-    }
-
-    pub fn replica_context_state(
-        &self,
-        context: &DfsMetadataReplicaShardContext,
-    ) -> Result<(u64, bool), DfsError> {
-        self.replica_context_lifecycle_state(context)
-            .map(|((generation, _), matches)| (generation, matches))
-    }
-
-    fn replica_context_lifecycle_state(
-        &self,
-        context: &DfsMetadataReplicaShardContext,
-    ) -> Result<((u64, u64), bool), DfsError> {
-        let projection = self.projection.lock().map_err(|_| DfsError::Network {
-            message: "DFS metadata authority projection lock poisoned".to_string(),
-        })?;
-        // The exact context and physical-store generation belong to the same
-        // observed cut. A provider/proof-only change need not replace a store.
-        let generations = (self.generation(), self.storage_generation());
-        if projection.revision.is_none() {
-            return Ok((generations, false));
-        }
-        let matches =
-            metadata_replica_context_matches_authority_entries(&projection.entries, context)?;
-        Ok((generations, matches))
-    }
-
-    pub fn retained_complete_prefix_for_generation(
-        &self,
-        expected_generation: u64,
-    ) -> Option<DfsAuthoritativePrefixProjection> {
-        self.projection.lock().ok().and_then(|projection| {
-            if self.generation() != expected_generation {
-                return None;
-            }
-            let revision = projection.revision?;
-            #[cfg(any(test, feature = "test-support"))]
-            self.projection_materialization_count
-                .fetch_add(1, Ordering::AcqRel);
-            let retained = DfsAuthoritativePrefixProjection::complete(
-                DFS_METADATA_AUTHORITY_PREFIX,
-                projection.entries.clone(),
-                revision,
-            )
-            .ok()?;
-            #[cfg(any(test, feature = "test-support"))]
-            crate::native_shard_trace::retain_metadata_seed_observation(
-                self.projection_generation(),
-                revision,
-                projection.required_revision,
-                &projection.entries,
-                projection.native_evidence.as_ref(),
-                projection.native_evidence_loss_count,
-            );
-            Some(retained)
-        })
-    }
-
-    pub fn retained_complete_prefix_revision_for_generation(
-        &self,
-        expected_generation: u64,
-    ) -> Option<KvRevision> {
-        self.projection.lock().ok().and_then(|projection| {
-            (self.generation() == expected_generation)
-                .then_some(projection.revision)
-                .flatten()
-        })
-    }
-
-    pub fn current_complete_prefix(&self) -> Option<DfsAuthoritativePrefixProjection> {
-        let generation = self.generation();
-        self.retained_complete_prefix_for_generation(generation)
-    }
-
-    pub fn current_complete_prefix_revision(&self) -> Option<KvRevision> {
-        self.projection
-            .lock()
-            .ok()
-            .and_then(|projection| projection.revision)
     }
 
     /// Install one complete bounded authoritative proof. `None` rejects the
     /// proof; `Some` reports whether exact topology changed.
     pub fn install_authoritative_projection(
-        &self,
+        &mut self,
         projection: DfsAuthoritativePrefixProjection,
     ) -> Option<bool> {
         if !projection.is_complete() {
             return None;
         }
-        let Ok(mut observed) = self.projection.lock() else {
-            return None;
-        };
-        self.install_authoritative_projection_locked(&mut observed, projection)
-    }
-
-    fn install_authoritative_projection_locked(
-        &self,
-        observed: &mut DfsMetadataAuthorityProjection,
-        projection: DfsAuthoritativePrefixProjection,
-    ) -> Option<bool> {
         let (entries, revision, _) = projection.into_parts();
-        if revision < observed.required_revision {
+        if revision < self.required_revision {
             return None;
         }
-        if observed
+        if self
             .revision
             .is_some_and(|observed_revision| revision <= observed_revision)
         {
             return Some(false);
         }
         #[cfg(any(test, feature = "test-support"))]
-        self.projection_rebuild_count.fetch_add(1, Ordering::AcqRel);
-        let replaced_valid_projection = observed.revision.is_some();
-        let projection_changed = !replaced_valid_projection || observed.entries != entries;
-        let authority_changed = observed
+        {
+            self.projection_rebuild_count = self.projection_rebuild_count.saturating_add(1);
+        }
+        let replaced_valid_projection = self.revision.is_some();
+        let projection_changed = !replaced_valid_projection || *self.entries != entries;
+        let authority_changed = self
             .entries
             .iter()
             .filter(|entry| dfs_metadata_authority_key_is_exact(&entry.key))
@@ -1916,94 +1613,81 @@ impl DfsMetadataAuthorityState {
                 .iter()
                 .filter(|entry| dfs_metadata_authority_key_is_exact(&entry.key))
                 .map(|entry| (&entry.key, &entry.value)));
-        if replaced_valid_projection || observed.topology_comparison_baseline {
+        if replaced_valid_projection || self.topology_comparison_baseline {
             if authority_changed {
-                Self::advance(&self.generation);
+                self.generation = self.generation.saturating_add(1);
             }
             if crate::metadata_authority_projection::metadata_storage_configuration_changed_in_projection(
-                &observed.entries,
+                &self.entries,
                 &entries,
             ) {
-                Self::advance(&self.storage_generation);
+                self.storage_generation = self.storage_generation.saturating_add(1);
             }
         }
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            observed.native_evidence = None;
-        }
-        observed.revision = Some(revision);
-        observed.required_revision = revision;
-        observed.topology_comparison_baseline = true;
-        observed.entries = entries;
-        Self::rebuild_metadata_shard_index_locked(observed);
+        self.revision = Some(revision);
+        self.required_revision = revision;
+        self.topology_comparison_baseline = true;
         if projection_changed {
-            Self::advance(&self.projection_generation);
+            self.replace_entries(entries);
+            self.projection_generation = self.projection_generation.saturating_add(1);
         }
         Some(authority_changed)
     }
 
+    fn replace_entries(&mut self, entries: Vec<KvEntry>) {
+        self.shards = Arc::new(metadata_shard_index_from_authority_entries(&entries));
+        self.file_systems = Arc::new(file_system_configs_from_authority_entries(&entries));
+        self.entries = Arc::new(entries);
+    }
+
     pub fn refresh_required_after(&self, proof_revision: KvRevision) -> bool {
-        self.projection.lock().is_ok_and(|projection| {
-            projection.revision.is_none() && projection.required_revision > proof_revision
-        })
+        self.revision.is_none() && self.required_revision > proof_revision
     }
 
     /// Require at least this authoritative revision, withdrawing readiness when
     /// necessary. Returns whether the host must request a new ReadIndex proof.
-    pub fn require_authoritative_revision(&self, required_revision: KvRevision) -> bool {
-        let Ok(mut projection) = self.projection.lock() else {
-            return false;
-        };
-        if projection
+    pub fn require_authoritative_revision(&mut self, required_revision: KvRevision) -> bool {
+        if self
             .revision
             .is_some_and(|revision| revision >= required_revision)
         {
             return false;
         }
-        self.invalidate_for_revision_catchup_locked(&mut projection, required_revision);
+        self.invalidate_for_revision_catchup(required_revision);
         true
     }
 
-    pub fn observe_snapshot(&self, snapshot: &KvSnapshot) -> bool {
-        let Ok(mut observed) = self.projection.lock() else {
-            return false;
-        };
-        if observed
+    pub fn observe_snapshot(&mut self, snapshot: &KvSnapshot) -> bool {
+        if self
             .revision
             .is_some_and(|revision| snapshot.revision <= revision)
             || snapshot
                 .prefix_entries(DFS_METADATA_AUTHORITY_PREFIX)
-                .eq(observed.entries.iter())
-            || (observed.revision.is_none() && snapshot.revision <= observed.required_revision)
+                .eq(self.entries.iter())
+            || (self.revision.is_none() && snapshot.revision <= self.required_revision)
         {
             return false;
         }
-        self.invalidate_for_revision_catchup_locked(&mut observed, snapshot.revision);
+        self.invalidate_for_revision_catchup(snapshot.revision);
         true
     }
 
     pub fn observe_discontinuity(
-        &self,
+        &mut self,
         revision: KvRevision,
     ) -> DfsMetadataAuthorityDeltaObservation {
-        let Ok(mut observed) = self.projection.lock() else {
-            return DfsMetadataAuthorityDeltaObservation::invalidated(false);
-        };
-        let proof_withdrawn = observed.revision.is_some();
-        self.invalidate_for_revision_catchup_locked(&mut observed, revision);
+        let proof_withdrawn = self.revision.is_some();
+        self.invalidate_for_revision_catchup(revision);
         DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn)
     }
 
     pub fn observe_delta(
-        &self,
+        &mut self,
         delta: &ClusterKvCommittedDelta,
     ) -> DfsMetadataAuthorityDeltaObservation {
-        let Ok(mut observed) = self.projection.lock() else {
-            return DfsMetadataAuthorityDeltaObservation::invalidated(false);
-        };
-        let proof_withdrawn = observed.revision.is_some();
-        let Some(previous_revision) = observed.revision else {
-            self.invalidate_for_revision_catchup_locked(&mut observed, delta.revision);
+        let proof_withdrawn = self.revision.is_some();
+        let Some(previous_revision) = self.revision else {
+            self.invalidate_for_revision_catchup(delta.revision);
             return DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn);
         };
         if delta.revision <= previous_revision {
@@ -2012,7 +1696,7 @@ impl DfsMetadataAuthorityState {
         if previous_revision < delta.compacted_revision
             || !kv_events_cover_revision_range(previous_revision, delta.revision, &delta.events)
         {
-            self.invalidate_for_revision_catchup_locked(&mut observed, delta.revision);
+            self.invalidate_for_revision_catchup(delta.revision);
             return DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn);
         }
 
@@ -2036,7 +1720,7 @@ impl DfsMetadataAuthorityState {
                             || entry.modify_revision > delta.revision)
                 })
             {
-                self.invalidate_for_revision_catchup_locked(&mut observed, delta.revision);
+                self.invalidate_for_revision_catchup(delta.revision);
                 return DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn);
             }
             if state.key.starts_with(DFS_METADATA_AUTHORITY_PREFIX) {
@@ -2044,173 +1728,108 @@ impl DfsMetadataAuthorityState {
             }
         }
         if relevant_event_keys != relevant_final_keys {
-            self.invalidate_for_revision_catchup_locked(&mut observed, delta.revision);
+            self.invalidate_for_revision_catchup(delta.revision);
             return DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn);
         }
 
+        // Copy-on-write: the published snapshot keeps the previous entries.
+        let mut next: Option<Vec<KvEntry>> = None;
         let mut authority_changed = false;
         let mut storage_changed = false;
-        let mut prefix_changed = false;
         for state in delta.final_key_states.iter() {
             if !state.key.starts_with(DFS_METADATA_AUTHORITY_PREFIX) {
                 continue;
             }
             let authority_key = dfs_metadata_authority_key_is_exact(&state.key);
-            let position = observed
-                .entries
-                .binary_search_by(|entry| entry.key.as_str().cmp(state.key.as_str()));
+            let current = next.as_ref().unwrap_or(self.entries.as_ref());
+            let position =
+                current.binary_search_by(|entry| entry.key.as_str().cmp(state.key.as_str()));
             storage_changed |=
                 crate::metadata_authority_projection::metadata_storage_configuration_changed(
                     &state.key,
-                    position.ok().map(|index| &observed.entries[index]),
+                    position.ok().map(|index| &current[index]),
                     state.entry.as_ref(),
                 );
             match (position, state.entry.as_ref()) {
                 (Ok(index), Some(entry)) => {
-                    if authority_key && observed.entries[index].value != entry.value {
+                    if authority_key && current[index].value != entry.value {
                         authority_changed = true;
                     }
-                    if observed.entries[index] != *entry {
-                        observed.entries[index] = entry.clone();
-                        prefix_changed = true;
+                    if current[index] != *entry {
+                        let entries = next.get_or_insert_with(|| self.entries.as_ref().clone());
+                        entries[index] = entry.clone();
                     }
                 }
                 (Err(index), Some(entry)) => {
-                    observed.entries.insert(index, entry.clone());
+                    let entries = next.get_or_insert_with(|| self.entries.as_ref().clone());
+                    entries.insert(index, entry.clone());
                     authority_changed |= authority_key;
-                    prefix_changed = true;
                 }
                 (Ok(index), None) => {
-                    observed.entries.remove(index);
+                    let entries = next.get_or_insert_with(|| self.entries.as_ref().clone());
+                    entries.remove(index);
                     authority_changed |= authority_key;
-                    prefix_changed = true;
                 }
                 (Err(_), None) => {}
             }
         }
-        if observed.entries.len() > sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES
-            || observed
-                .entries
-                .iter()
-                .try_fold(0_usize, |bytes, entry| {
-                    let bytes = bytes
-                        .checked_add(entry.key.len())?
-                        .checked_add(entry.value.len())?;
-                    (bytes <= sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES)
-                        .then_some(bytes)
-                })
-                .is_none()
+        if let Some(entries) = next.as_ref()
+            && (entries.len() > sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES
+                || entries
+                    .iter()
+                    .try_fold(0_usize, |bytes, entry| {
+                        let bytes = bytes
+                            .checked_add(entry.key.len())?
+                            .checked_add(entry.value.len())?;
+                        (bytes
+                            <= sinomo_core::kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES)
+                            .then_some(bytes)
+                    })
+                    .is_none())
         {
             tracing::warn!(
                 target: "sinomo.dfs.metadata_authority",
                 revision = delta.revision.0,
-                entry_count = observed.entries.len(),
+                entry_count = entries.len(),
                 "DFS metadata-authority delta exceeded bounded prefix limits; invalidating retained authority"
             );
-            self.invalidate_projection_locked(&mut observed, delta.revision);
+            self.invalidate_projection(delta.revision);
             return DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn);
         }
         if authority_changed {
-            Self::advance(&self.generation);
+            self.generation = self.generation.saturating_add(1);
         }
         if storage_changed {
-            Self::advance(&self.storage_generation);
+            self.storage_generation = self.storage_generation.saturating_add(1);
         }
-        if prefix_changed {
-            Self::advance(&self.projection_generation);
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if !self.native_interest() {
-            observed.native_evidence = None;
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(evidence) = observed.native_evidence.as_mut() {
-            let size = delta
-                .final_key_states
-                .iter()
-                .map(|state| {
-                    state
-                        .key
-                        .len()
-                        .saturating_add(state.entry.as_ref().map_or(0, |entry| entry.value.len()))
-                })
-                .sum::<usize>()
-                .saturating_add(
-                    delta
-                        .events
-                        .iter()
-                        .map(|event| {
-                            event.key.len().saturating_add(match &event.kind {
-                                sinomo_core::kv::KvEventKind::Put { value } => value.len(),
-                                _ => 0,
-                            })
-                        })
-                        .sum::<usize>(),
-                );
-            if evidence.deltas.len() >= 4096
-                || evidence.bytes.saturating_add(size) > 64 * 1024 * 1024
-            {
-                observed.native_evidence = None;
-                observed.native_evidence_loss_count =
-                    observed.native_evidence_loss_count.saturating_add(1);
-            } else {
-                evidence.bytes = evidence.bytes.saturating_add(size);
-                evidence.deltas.push(delta.clone());
-            }
-        }
-        observed.revision = Some(delta.revision);
-        observed.required_revision = delta.revision;
-        if prefix_changed {
-            Self::rebuild_metadata_shard_index_locked(&mut observed);
+        self.revision = Some(delta.revision);
+        self.required_revision = delta.revision;
+        if let Some(entries) = next {
+            self.replace_entries(entries);
+            self.projection_generation = self.projection_generation.saturating_add(1);
         }
         DfsMetadataAuthorityDeltaObservation::accepted(authority_changed)
     }
 
-    fn invalidate_projection_locked(
-        &self,
-        observed: &mut DfsMetadataAuthorityProjection,
-        required_revision: KvRevision,
-    ) {
-        let was_valid = observed.revision.take().is_some();
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            observed.native_evidence = None;
-        }
-        observed.required_revision = observed.required_revision.max(required_revision);
-        observed.topology_comparison_baseline = false;
-        observed.entries.clear();
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            observed.native_evidence = None;
-        }
-        observed.metadata_shards_by_file_system.clear();
+    fn invalidate_projection(&mut self, required_revision: KvRevision) {
+        let was_valid = self.revision.take().is_some();
+        self.required_revision = self.required_revision.max(required_revision);
+        self.topology_comparison_baseline = false;
+        self.replace_entries(Vec::new());
         if was_valid {
-            Self::advance(&self.projection_generation);
-            Self::advance(&self.generation);
-            Self::advance(&self.storage_generation);
+            self.projection_generation = self.projection_generation.saturating_add(1);
+            self.generation = self.generation.saturating_add(1);
+            self.storage_generation = self.storage_generation.saturating_add(1);
         }
     }
 
-    fn invalidate_for_revision_catchup_locked(
-        &self,
-        observed: &mut DfsMetadataAuthorityProjection,
-        required_revision: KvRevision,
-    ) {
-        let was_valid = observed.revision.take().is_some();
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            observed.native_evidence = None;
-        }
-        observed.required_revision = observed.required_revision.max(required_revision);
+    fn invalidate_for_revision_catchup(&mut self, required_revision: KvRevision) {
+        let was_valid = self.revision.take().is_some();
+        self.required_revision = self.required_revision.max(required_revision);
         if was_valid {
-            observed.topology_comparison_baseline = true;
-            Self::advance(&self.projection_generation);
+            self.topology_comparison_baseline = true;
+            self.projection_generation = self.projection_generation.saturating_add(1);
         }
-    }
-
-    fn rebuild_metadata_shard_index_locked(projection: &mut DfsMetadataAuthorityProjection) {
-        projection.metadata_shards_by_file_system =
-            metadata_shard_index_from_authority_entries(&projection.entries);
     }
 
     fn advance(generation: &AtomicU64) {
@@ -2219,29 +1838,45 @@ impl DfsMetadataAuthorityState {
         });
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn projection_rebuild_count(&self) -> u64 {
-        self.projection_rebuild_count.load(Ordering::Acquire)
+    /// Materialize the retained scope for the current generation.
+    pub fn current_complete_prefix(&self) -> Option<DfsAuthoritativePrefixProjection> {
+        self.snapshot(None).complete_prefix()
+    }
+
+    pub fn retained_complete_prefix_revision_for_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Option<KvRevision> {
+        (self.generation == expected_generation)
+            .then_some(self.revision)
+            .flatten()
+    }
+
+    pub fn shard_projection_state(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> (u64, bool) {
+        (
+            self.generation,
+            self.snapshot(None)
+                .contains_shard_key(file_system_id, shard_id),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn projection_materialization_count(&self) -> u64 {
-        self.projection_materialization_count
-            .load(Ordering::Acquire)
+    pub fn projection_rebuild_count(&self) -> u64 {
+        self.projection_rebuild_count
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn debug_snapshot(&self) -> DfsMetadataAuthorityDebugSnapshot {
-        let projection = self
-            .projection
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         DfsMetadataAuthorityDebugSnapshot {
-            revision: projection.revision,
-            required_revision: projection.required_revision,
-            topology_comparison_baseline: projection.topology_comparison_baseline,
-            entry_count: projection.entries.len(),
-            metadata_file_system_count: projection.metadata_shards_by_file_system.len(),
+            revision: self.revision,
+            required_revision: self.required_revision,
+            topology_comparison_baseline: self.topology_comparison_baseline,
+            entry_count: self.entries.len(),
+            metadata_file_system_count: self.shards.len(),
         }
     }
 }
@@ -2302,7 +1937,7 @@ mod tests {
 
     #[test]
     fn policy_deltas_advance_authority_without_replacing_metadata_stores() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let owner =
             sinomo_core::node::NodeId::from_legacy_named("storage_generation_owner").unwrap();
         let mut config = crate::DfsFileSystemConfig::from(&crate::distributed_sifs(owner));
@@ -2374,7 +2009,7 @@ mod tests {
 
     #[test]
     fn proof_deltas_keep_stores_while_structural_shard_changes_replace_them() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let shard_key = "/dfs/filesystems/sifs/metadata-shards/root";
         let proof_key = "/dfs/filesystems/sifs/metadata-head-watermarks/root";
         state
@@ -2414,7 +2049,7 @@ mod tests {
 
     #[test]
     fn replacement_proof_advances_only_changed_topology() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let key = "/dfs/filesystems/sifs/metadata-shards/root";
         assert_eq!(
             state.install_authoritative_projection(projection(1, vec![entry(key, b"v1", 1, 1)],)),
@@ -2443,7 +2078,7 @@ mod tests {
 
     #[test]
     fn gapped_policy_and_proof_refresh_retains_stores_but_not_stale_admission() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let owner = sinomo_core::node::NodeId::from_legacy_named("gap_policy_store_owner").unwrap();
         let mut config = crate::DfsFileSystemConfig::from(&crate::distributed_sifs(owner));
         config.subtree_policies.push(crate::DfsSubtreePolicy::new(
@@ -2519,7 +2154,7 @@ mod tests {
 
     #[test]
     fn gapped_structural_refresh_replaces_stores_only_after_authority_is_certified() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let key = "/dfs/filesystems/sifs/metadata-shards/root";
         state
             .install_authoritative_projection(projection(1, vec![entry(key, b"v1", 1, 1)]))
@@ -2561,7 +2196,7 @@ mod tests {
 
     #[test]
     fn gapped_delta_withdraws_readiness_but_retains_comparison_baseline() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let key = "/dfs/filesystems/sifs/metadata-shards/root";
         state
             .install_authoritative_projection(projection(1, vec![entry(key, b"v1", 1, 1)]))
@@ -2598,7 +2233,7 @@ mod tests {
 
     #[test]
     fn contiguous_noop_delta_advances_without_authoritative_refresh() {
-        let state = DfsMetadataAuthorityState::new();
+        let mut state = DfsMetadataAuthorityState::new();
         let key = "/dfs/filesystems/sifs/metadata-shards/root";
         state
             .install_authoritative_projection(projection(7, vec![entry(key, b"v1", 7, 1)]))
@@ -2644,81 +2279,5 @@ mod tests {
             runtime.try_claim_refresh().is_some(),
             "cancelled refresh ownership must not strand later consumers",
         );
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub(crate) struct NativeMetadataCacheEvidenceV1 {
-    pub original_read: sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
-    pub deltas: Vec<ClusterKvCommittedDelta>,
-    #[serde(skip)]
-    bytes: usize,
-}
-#[cfg(any(test, feature = "test-support"))]
-impl DfsMetadataAuthorityRuntime {
-    pub(crate) fn bind_native_observation_root(
-        &self,
-        root: std::path::PathBuf,
-        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
-    ) {
-        *self
-            .state
-            .native_source
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some((root, Arc::downgrade(owner)));
-    }
-}
-#[cfg(any(test, feature = "test-support"))]
-impl DfsMetadataAuthorityState {
-    fn native_interest(&self) -> bool {
-        self.native_source
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|(root, owner)| {
-                owner
-                    .upgrade()
-                    .is_some_and(|owner| crate::native_shard_trace::has_root_interest(root, &owner))
-            })
-    }
-    fn install_native_observed_projection(
-        &self,
-        projection: DfsAuthoritativePrefixProjection,
-        read: sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
-    ) -> Option<bool> {
-        if !projection.is_complete() {
-            return None;
-        }
-        let size = read
-            .value
-            .iter()
-            .map(|entry| entry.key.len().saturating_add(entry.value.len()))
-            .sum::<usize>();
-        let Ok(mut observed) = self.projection.lock() else {
-            return None;
-        };
-        let changed = self.install_authoritative_projection_locked(&mut observed, projection)?;
-        if size > 64 * 1024 * 1024 {
-            observed.native_evidence_loss_count =
-                observed.native_evidence_loss_count.saturating_add(1);
-            observed.native_evidence = None;
-            return Some(changed);
-        }
-        if observed.revision == Some(read.authority.revision) && observed.entries == read.value {
-            observed.native_evidence = Some(NativeMetadataCacheEvidenceV1 {
-                original_read: read,
-                deltas: Vec::new(),
-                bytes: size,
-            });
-        }
-        Some(changed)
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl NativeMetadataCacheEvidenceV1 {
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.bytes
     }
 }

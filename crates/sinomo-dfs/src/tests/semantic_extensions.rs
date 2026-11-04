@@ -606,7 +606,7 @@ fn contribution_rechecks_the_original_head_under_the_actual_writer() {
 }
 
 #[test]
-fn native_publication_takes_a_current_configuration_cut_under_the_cache_lock() {
+fn native_publication_takes_the_current_configuration_snapshot() {
     native_publication_configuration_cut(false);
 }
 
@@ -642,42 +642,49 @@ fn native_publication_configuration_cut(after_initial_cut: bool) {
     let update = Arc::clone(&authority);
     let update_control = control.clone();
     let fs = reference.file_system_id.clone();
-    let hook =
-        crate::metadata_authority_runtime::install_publication_configuration_before_lock_hook(
-            usize::from(after_initial_cut),
-            move || {
-                let generation = update.projection_generation();
-                let storage = update.storage_generation();
-                // Real configuration publication through this fixture's mounted
-                // Core. The hook supplies neither a cache value nor author proof.
-                update_control.with_client(|kv| {
-                    let mut store = DfsControlPlaneStore::new(kv.as_mut());
-                    let mut current = store.get_file_system_config(&fs).unwrap().unwrap();
-                    current.display_name.push_str("-native-current-cut");
-                    store.put_file_system_config(&current).unwrap();
-                });
-                crate::test_runtime::executor().block_on(async {
-                    tokio::time::timeout(
-                        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-                        update.ensure_write_configuration_ready_async(),
-                    )
-                    .await
-                    .unwrap()
-                    .unwrap();
-                });
-                let refreshed = update.projection_generation();
-                assert!(
-                    refreshed > generation,
-                    "actual committed configuration must advance its projection"
-                );
-                assert_eq!(
-                    update.storage_generation(),
-                    storage,
-                    "display name preserves physical storage custody"
-                );
-                *observed.lock().unwrap() = Some((generation, refreshed, storage));
-            },
+    let configuration_update = move || {
+        let generation = update.projection_generation();
+        let storage = update.storage_generation();
+        // Real configuration publication through this fixture's mounted Core.
+        // The hook supplies neither a snapshot value nor author proof.
+        update_control.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv.as_mut());
+            let mut current = store.get_file_system_config(&fs).unwrap().unwrap();
+            current.display_name.push_str("-native-current-cut");
+            store.put_file_system_config(&current).unwrap();
+        });
+        crate::test_runtime::executor().block_on(async {
+            tokio::time::timeout(
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                update.ensure_write_configuration_ready_async(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        });
+        let refreshed = update.projection_generation();
+        assert!(
+            refreshed > generation,
+            "actual committed configuration must advance its projection"
         );
+        assert_eq!(
+            update.storage_generation(),
+            storage,
+            "display name preserves physical storage custody"
+        );
+        *observed.lock().unwrap() = Some((generation, refreshed, storage));
+    };
+    if after_initial_cut {
+        crate::publication_guard::EFFECT_ADMISSION_AFTER_CUT.with(|slot| {
+            assert!(
+                slot.borrow_mut()
+                    .replace(Box::new(configuration_update))
+                    .is_none()
+            )
+        });
+    } else {
+        configuration_update();
+    }
     let result = dfs.apply_atomic_contribution(request);
     let current = read_version(&dfs, &reference);
     let observed = changed.lock().unwrap().clone();
@@ -687,15 +694,18 @@ fn native_publication_configuration_cut(after_initial_cut: bool) {
             "after_initial_cut": after_initial_cut, "actual_generations": observed,
             "result": format!("{:?}", result.as_ref().map(|_| ())),
             "before": before, "after": current,
-            "qualification": "Real mounted Core configuration update before the selected cache lock; no synthetic projection, epoch, acknowledgement or authority."
+            "qualification": "Real mounted Core configuration update before or after the effect operation's publication snapshot; no synthetic projection, epoch, acknowledgement or authority."
         })).unwrap(),
     ).unwrap();
-    drop(hook);
+    crate::publication_guard::EFFECT_ADMISSION_AFTER_CUT.with(|slot| slot.borrow_mut().take());
     drop(authority);
     drop(control);
     drop(dfs);
     runtime.close().unwrap();
-    assert!(observed.is_some(), "the actual cache boundary was reached");
+    assert!(
+        observed.is_some(),
+        "the actual snapshot boundary was reached"
+    );
     if after_initial_cut {
         assert!(matches!(result, Err(DfsError::Metadata { ref message })
             if message == "publication configuration advanced while effect admission queued"));

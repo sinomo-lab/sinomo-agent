@@ -127,8 +127,15 @@ pub(crate) fn run_cluster_dfs_smoke_with_runtime_client(
         .ok_or_else(|| DfsError::Metadata {
             message: "DFS smoke requires the actual mounted configuration client".into(),
         })?;
-    let projection = control_plane
-        .write_configuration_projection()?
+    // One published configuration supplies providers and shard routing.
+    let snapshot = control_plane
+        .configuration_snapshot()?
+        .ok_or_else(|| DfsError::Metadata {
+            message: "DFS smoke current configuration is not ready".into(),
+        })?;
+    let projection = snapshot
+        .write_configuration()
+        .cloned()
         .ok_or_else(|| DfsError::Metadata {
             message: "DFS smoke current configuration is not ready".into(),
         })?;
@@ -145,8 +152,8 @@ pub(crate) fn run_cluster_dfs_smoke_with_runtime_client(
     );
 
     let file_system = distributed_sifs(local_node_id.clone());
-    let metadata_shards = control_plane
-        .cached_metadata_shards(&file_system.file_system_id)?
+    let metadata_shards = snapshot
+        .metadata_shards(&file_system.file_system_id)?
         .ok_or_else(|| DfsError::Metadata {
             message: "DFS smoke current metadata topology is not ready".into(),
         })?;

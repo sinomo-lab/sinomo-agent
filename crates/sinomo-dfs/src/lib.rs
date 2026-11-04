@@ -54,6 +54,7 @@ mod maintenance_schedule;
 mod message_transport;
 mod metadata_ack_floor_log;
 mod metadata_api;
+mod configuration_snapshot;
 mod metadata_authority_projection;
 mod metadata_authority_runtime;
 mod storage_preparation;
@@ -241,6 +242,20 @@ pub use metadata_authority_runtime::{
     DfsMetadataAuthorityReadFuture, DfsMetadataAuthorityRuntime,
     DfsMetadataAuthorityRuntimeRegistry, DfsMetadataAuthorityState, DfsMetadataAuthorityTask,
 };
+pub use configuration_snapshot::{
+    DfsConfigurationSnapshot, DfsFetchedConfiguration, decode_dfs_configuration_snapshot_response,
+    dfs_configuration_scope_contains, dfs_configuration_scopes_overlap,
+    dfs_peer_node_ids_from_configuration,
+    dfs_configuration_snapshot_call, dfs_configuration_snapshot_max_response_bytes,
+    dfs_configuration_snapshot_unsupported, is_dfs_configuration_snapshot_unsupported,
+};
+pub use sinomo_api::dfs::configuration::{
+    DFS_CONFIGURATION_EVENT_SCHEMA_ID, DFS_CONFIGURATION_EVENT_SCHEMA_VERSION,
+    DFS_CONFIGURATION_PUBLISHED_EVENT_KIND, DFS_CONFIGURATION_READ_CAPABILITY,
+    DFS_CONFIGURATION_SNAPSHOT_ROUTE, DfsConfigurationPublication,
+    DfsConfigurationSnapshotRequest, DfsConfigurationSnapshotResponse,
+    DfsConfigurationSnapshotWire, DfsWriteConfigurationWire,
+};
 pub use performance_metrics::dfs_status_observe_metrics;
 pub(crate) use runtime_admission::{
     DfsMaintenanceForegroundPreemption, DfsMaintenancePreemptionOutcome, DfsMetadataLaneKey,
@@ -250,10 +265,7 @@ pub(crate) use runtime_admission::{
 };
 #[cfg(test)]
 pub(crate) use runtime_authority::dfs_metadata_prefix_probe_is_verification_only;
-pub(crate) use runtime_authority::{
-    DFS_AUTHORITY_PROJECTION_MAX_BYTES, DfsAuthoritativeProjectionCache,
-    dfs_metadata_replication_can_wait_for_maintenance,
-};
+pub(crate) use runtime_authority::dfs_metadata_replication_can_wait_for_maintenance;
 #[cfg(test)]
 pub(crate) use runtime_message::ingest_dfs_message_attachment;
 pub(crate) use runtime_message::{

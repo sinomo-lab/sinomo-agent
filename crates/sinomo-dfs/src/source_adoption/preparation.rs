@@ -902,10 +902,8 @@ impl DfsSourceAdoptionActor {
         }
         let configs = self
             .authority
-            .cached_metadata_shards(
-                &plan.job.file_system_id,
-                self.authority.projection_generation(),
-            )
+            .configuration_snapshot()
+            .metadata_shards(&plan.job.file_system_id)
             .map_err(error)?
             .ok_or_else(|| error("source preparation configuration unavailable"))?;
         if !configs.contains(&plan.job_config)

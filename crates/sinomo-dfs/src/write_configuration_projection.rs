@@ -40,15 +40,6 @@ impl DfsWriteConfigurationProjection {
         self.revision
     }
 
-    /// Contiguous replay keeps these native bootstrap inputs unchanged. This
-    /// relation is not permission: callers still need a fresh resident-floor
-    /// check, a stable current capture, and their native authority/store fences.
-    pub(crate) fn has_same_native_proof_origin(&self, previous: &Self) -> bool {
-        self.authority == previous.authority
-            && self.floor == previous.floor
-            && self.revision >= previous.revision
-    }
-
     /// Returns a complete borrowed range only inside one of the proven scopes.
     pub fn entries(&self, prefix: &str) -> Option<&[KvEntry]> {
         let scope = DFS_WRITE_CONFIGURATION_PREFIXES
@@ -58,6 +49,63 @@ impl DfsWriteConfigurationProjection {
         let start = entries.partition_point(|entry| entry.key.as_str() < prefix);
         let count = entries[start..].partition_point(|entry| entry.key.starts_with(prefix));
         Some(&entries[start..start + count])
+    }
+
+    /// Same scopes, proofs and floor; a revision-only replay is not a change.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        self.scopes == other.scopes
+            && self.authority == other.authority
+            && self.floor == other.floor
+    }
+
+    pub(crate) fn to_wire(&self) -> sinomo_api::dfs::DfsWriteConfigurationWire {
+        sinomo_api::dfs::DfsWriteConfigurationWire {
+            revision: self.revision,
+            scopes: self.scopes.to_vec(),
+            authority: self.authority.to_vec(),
+            floor: self.floor.clone(),
+        }
+    }
+
+    /// Rebuild a configuration the local daemon checked against its native
+    /// floor. Structure and bounds are validated here; the proofs are not
+    /// re-certified because the receiver has no resident consensus view.
+    pub(crate) fn from_wire(
+        wire: sinomo_api::dfs::DfsWriteConfigurationWire,
+    ) -> Result<Self, KvError> {
+        let malformed = || KvError::Serialization {
+            detail: "published DFS write configuration is malformed".to_string(),
+        };
+        let scopes: [Vec<KvEntry>; DFS_WRITE_CONFIGURATION_SCOPE_COUNT] =
+            wire.scopes.try_into().map_err(|_| malformed())?;
+        let authority: [KvAuthorityProof; DFS_WRITE_CONFIGURATION_SCOPE_COUNT] =
+            wire.authority.try_into().map_err(|_| malformed())?;
+        if authority.iter().any(|proof| proof.revision > wire.revision)
+            || wire
+                .floor
+                .value
+                .as_ref()
+                .is_none_or(|entry| entry.key != cluster_kv_raft_config_key())
+        {
+            return Err(malformed());
+        }
+        let mut validated = Vec::with_capacity(DFS_WRITE_CONFIGURATION_SCOPE_COUNT);
+        for (index, entries) in scopes.into_iter().enumerate() {
+            let scope = DfsAuthoritativePrefixProjection::complete(
+                DFS_WRITE_CONFIGURATION_PREFIXES[index],
+                entries,
+                wire.revision,
+            )?;
+            validated.push(scope.into_parts().0);
+        }
+        let view = Self {
+            revision: wire.revision,
+            scopes: validated.try_into().map_err(|_| malformed())?,
+            authority,
+            floor: wire.floor,
+        };
+        check_state_bounds(Some(&view), &VecDeque::new())?;
+        Ok(view)
     }
 
     /// This is an observed-floor check, not a new authority certificate.
@@ -111,10 +159,6 @@ impl DfsWriteConfigurationState {
 
     pub(crate) fn needs_refresh(&self) -> bool {
         self.published.is_none() && !self.bootstrap_active
-    }
-
-    pub(crate) fn bootstrap_pending(&self) -> bool {
-        self.published.is_none() && self.bootstrap_active
     }
 
     pub(crate) fn observed_revision(&self) -> KvRevision {

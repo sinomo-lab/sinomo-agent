@@ -55,6 +55,11 @@ fn routed_overwrite_does_not_widen_replication_before_main_planning() {
     runtime
         .apply_placement_policy(&primary, path, DfsPlacementScope::SelfOnly, placement)
         .unwrap();
+    // The requester reads policy from its own node's published configuration;
+    // let that publication reach the rule committed on the primary first.
+    runtime
+        .wait_published_configuration_current(&requester)
+        .unwrap();
     let mut writer = runtime.client(&requester).unwrap();
     let (_, _, policy) = writer
         .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, nodes.len())

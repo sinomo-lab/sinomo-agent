@@ -200,6 +200,11 @@ impl DfsControlPlaneKvClient for CountingDfsControlPlaneKvClient {
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         self.inner.refresh_latest()
     }
+    fn configuration_snapshot(
+        &self,
+    ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, KvError> {
+        self.inner.configuration_snapshot()
+    }
     fn write_configuration_projection(
         &self,
     ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, KvError> {

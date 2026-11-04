@@ -245,6 +245,11 @@ impl DfsMetadataAuthorityHost for NativeProjectionHost {
 
 fn attach(host: &Arc<NativeProjectionHost>) -> Arc<DfsMetadataAuthorityRuntime> {
     let runtime = Arc::new(DfsMetadataAuthorityRuntime::new());
+    // These cases run every queued refresh by hand; the bounded re-send of a
+    // failed refresh has its own case below.
+    runtime
+        .refresh_resend_disabled
+        .store(true, Ordering::Release);
     assert!(runtime.attach_host(host.clone()));
     runtime
 }
@@ -647,7 +652,7 @@ async fn write_configuration_runtime_gapped_history_cannot_reopen_bootstrap_afte
         "the existing metadata-only refresh reads one filesystem prefix"
     );
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
+        runtime.configuration_snapshot().revision(),
         Some(KvRevision(3)),
         "the filesystem watermark advances despite missing config history"
     );
@@ -909,11 +914,7 @@ async fn write_configuration_same_generation_waiters_join_latched_refresh_succes
     let changed = host.set_configuration(11);
     runtime.observe_delta(&configuration_delta(11, Some(changed)));
     assert_eq!(runtime.generation(), generation);
-    let mut metadata = Box::pin(runtime.ensure_complete_prefix_for_generation_async(
-        generation,
-        #[cfg(test)]
-        None,
-    ));
+    let mut metadata = Box::pin(runtime.ensure_complete_prefix_for_generation_async(generation));
     let mut configuration = Box::pin(runtime.ensure_write_configuration_ready_async());
     require_pending(metadata.as_mut()).await;
     require_pending(configuration.as_mut()).await;
@@ -937,11 +938,7 @@ async fn write_configuration_same_generation_waiters_join_latched_refresh_succes
         .unwrap();
     assert_eq!(
         runtime
-            .ensure_complete_prefix_for_generation_async(
-                generation,
-                #[cfg(test)]
-                None,
-            )
+            .ensure_complete_prefix_for_generation_async(generation)
             .await,
         Some(KvRevision(11))
     );
@@ -954,22 +951,23 @@ async fn write_configuration_same_generation_waiters_join_latched_refresh_succes
 }
 
 #[tokio::test]
-async fn write_configuration_terminal_native_failure_does_not_retry_shared_owner() {
+async fn write_configuration_terminal_native_failure_leaves_waiters_to_their_deadline() {
     let host = NativeProjectionHost::new(true);
     // The native host's malformed scope must be rejected before any retained
     // filesystem proof or configuration readiness can be published.
     host.inputs.lock().unwrap().scopes[0].push(fixture_entry("/outside/dfs-scope", vec![1], 10));
     let runtime = attach(&host);
     let generation = runtime.generation();
-    assert_eq!(
-        runtime
-            .ensure_complete_prefix_for_generation_async(
-                generation,
-                #[cfg(test)]
-                None,
-            )
-            .await,
-        None
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            runtime.ensure_complete_prefix_for_generation_async(generation),
+        )
+        .await
+        .is_err(),
+        "a rejected proof publishes nothing; the waiter keeps its own deadline"
     );
     assert_eq!(runtime.generation(), generation);
     assert_eq!(host.read_count(), 1);
@@ -981,9 +979,19 @@ async fn write_configuration_terminal_native_failure_does_not_retry_shared_owner
     let runtime = attach(&host);
     let mut configuration = Box::pin(runtime.ensure_write_configuration_ready_async());
     require_pending(configuration.as_mut()).await;
-    assert_eq!(host.queued_count(), 1);
+    assert_eq!(
+        host.queued_count(),
+        0,
+        "a waiter never claims a refresh owner"
+    );
+    runtime.request_authoritative_refresh();
     host.run_next().await;
-    assert!(configuration.await.is_err());
+    require_pending(configuration.as_mut()).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), configuration)
+            .await
+            .is_err()
+    );
     assert_eq!(host.read_count(), 1);
     assert_eq!(host.spawned.load(Ordering::Acquire), 1);
     assert_eq!(
@@ -994,7 +1002,7 @@ async fn write_configuration_terminal_native_failure_does_not_retry_shared_owner
 }
 
 #[tokio::test]
-async fn write_configuration_cancelled_bootstrap_missing_view_joins_one_needed_owner() {
+async fn write_configuration_cancelled_bootstrap_waits_for_the_next_refresh_edge() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     host.content_gate.armed.store(true, Ordering::Release);
@@ -1026,6 +1034,12 @@ async fn write_configuration_cancelled_bootstrap_missing_view_joins_one_needed_o
     );
     let mut configuration = Box::pin(runtime.ensure_write_configuration_ready_async());
     require_pending(configuration.as_mut()).await;
+    assert_eq!(
+        host.queued_count(),
+        0,
+        "a waiter never claims a refresh owner"
+    );
+    runtime.request_authoritative_refresh();
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
     configuration.await.unwrap();
@@ -1115,7 +1129,8 @@ async fn write_configuration_pending_bundle_publication_wakes_existing_readiness
         )
     );
     {
-        let mut configuration = runtime.write_configuration.lock().unwrap();
+        let mut writer_guard = runtime.writer.lock().unwrap();
+        let configuration = &mut writer_guard.write;
         let token = configuration.begin_refresh();
         assert!(
             !configuration
@@ -1163,7 +1178,7 @@ async fn write_configuration_refresh_release_waits_for_token_in_both_cancellatio
         let host = NativeProjectionHost::new(true);
         let runtime = attach(&host);
         let owner = runtime.try_claim_refresh().unwrap();
-        let token = runtime.write_configuration.lock().unwrap().begin_refresh();
+        let token = runtime.writer.lock().unwrap().write.begin_refresh();
         runtime
             .configuration_refresh_in_flight
             .store(true, Ordering::Release);
@@ -1225,8 +1240,6 @@ async fn write_configuration_background_warm_budget_is_not_restarted_by_owner_ha
         crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
             Arc::clone(&runtime),
             deadline,
-            #[cfg(test)]
-            None,
         ),
     );
     require_pending(warm.as_mut()).await;
@@ -1253,8 +1266,6 @@ async fn write_configuration_background_warm_budget_is_not_restarted_by_owner_ha
     crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
         Arc::clone(&runtime),
         tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-        #[cfg(test)]
-        None,
     )
     .await
     .unwrap();
@@ -1266,37 +1277,42 @@ async fn write_configuration_background_warm_budget_is_not_restarted_by_owner_ha
 }
 
 #[tokio::test]
-async fn write_configuration_background_warm_timeout_releases_its_owned_bootstrap_token() {
+async fn write_configuration_background_warm_timeout_leaves_the_shared_refresh_running() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     host.content_gate.armed.store(true, Ordering::Release);
+    runtime.request_authoritative_refresh();
+    let refresh = tokio::spawn(host.take_task().unwrap());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(15);
-    let mut warm = Box::pin(
-        crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
-            Arc::clone(&runtime),
-            deadline,
-            #[cfg(test)]
-            None,
-        ),
+    let warm = crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
+        Arc::clone(&runtime),
+        deadline,
     );
-    require_pending(warm.as_mut()).await;
-    host.content_gate.entered.notified().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        host.content_gate.entered.notified(),
+    )
+    .await
+    .unwrap();
     let error = warm.await.unwrap_err();
     assert!(error.to_string().contains("projection deadline elapsed"));
-    assert!(!runtime.refresh_in_flight.load(Ordering::Acquire));
     assert!(
-        !runtime
-            .configuration_refresh_in_flight
-            .load(Ordering::Acquire)
+        runtime.refresh_in_flight.load(Ordering::Acquire),
+        "a waiter's deadline does not cancel the shared refresh owner"
     );
+    host.content_gate.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!runtime.refresh_in_flight.load(Ordering::Acquire));
     assert!(!runtime.refresh_release_pending.load(Ordering::Acquire));
     assert_eq!(host.queued_count(), 0);
-    let mut readiness = Box::pin(runtime.ensure_write_configuration_ready_async());
-    require_pending(readiness.as_mut()).await;
-    assert_eq!(host.queued_count(), 1);
-    host.run_next().await;
-    readiness.await.unwrap();
-    assert!(!runtime.refresh_in_flight.load(Ordering::Acquire));
+    runtime
+        .ensure_write_configuration_ready_async()
+        .await
+        .unwrap();
+    assert_eq!(host.read_count(), DFS_WRITE_CONFIGURATION_PREFIXES.len());
 }
 
 #[tokio::test]
@@ -1331,14 +1347,7 @@ async fn equal_revision_discontinuity_withdraws_proofs_once_and_recovers() {
         None,
         "an unchanged revision cannot certify unseen committed observation history"
     );
-    assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
-    );
+    assert!(runtime.writer.lock().unwrap().write.snapshot().is_none());
     assert!(matches!(
         runtime.write_configuration_readiness().unwrap(),
         crate::DfsWriteConfigurationReadiness::Pending
@@ -1398,14 +1407,7 @@ async fn discontinuity_during_native_read_rejects_old_bootstrap_and_hands_off() 
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(host.spawned.load(Ordering::Acquire), 1);
     assert_eq!(host.queued_count(), 0);
-    assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
-    );
+    assert!(runtime.writer.lock().unwrap().write.snapshot().is_none());
     assert_eq!(
         runtime.retained_complete_prefix_revision_for_generation(runtime.generation()),
         None
@@ -1416,14 +1418,7 @@ async fn discontinuity_during_native_read_rejects_old_bootstrap_and_hands_off() 
         .await
         .expect("old owner completed after the controlled native read released")
         .unwrap();
-    assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
-    );
+    assert!(runtime.writer.lock().unwrap().write.snapshot().is_none());
     assert_eq!(
         runtime.retained_complete_prefix_revision_for_generation(runtime.generation()),
         None,
@@ -1474,19 +1469,14 @@ async fn terminal_native_failure_after_discontinuity_does_not_spin() {
     require_pending(readiness.as_mut()).await;
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
-    let error = tokio::time::timeout(std::time::Duration::from_secs(1), readiness)
-        .await
-        .expect("the existing waiter receives the terminal native failure")
-        .expect_err("an unavailable native floor cannot restore configuration proof");
-    assert!(matches!(error, DfsError::Network { .. }));
+    // An unavailable native floor cannot restore configuration proof. The
+    // waiter keeps waiting under its own deadline; nothing retries for it.
     assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
+        tokio::time::timeout(std::time::Duration::from_millis(20), readiness)
+            .await
+            .is_err()
     );
+    assert!(runtime.writer.lock().unwrap().write.snapshot().is_none());
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(host.read_count(), reads + 1);
     assert_eq!(host.spawned.load(Ordering::Acquire), 2);
@@ -1512,6 +1502,12 @@ async fn zero_revision_discontinuity_requires_fresh_native_bootstrap_certificate
     let runtime = attach(&host);
     let mut initial = Box::pin(runtime.ensure_write_configuration_ready_async());
     require_pending(initial.as_mut()).await;
+    assert_eq!(
+        host.queued_count(),
+        0,
+        "a waiter never claims a refresh owner"
+    );
+    runtime.request_authoritative_refresh();
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
     initial.await.unwrap();
@@ -1613,7 +1609,7 @@ async fn required_revision_withdraws_configuration_before_queued_refresh_runs() 
     // The normal owner is queued but has not yet polled its refresh body. A
     // synchronous caller must not open on the previous configuration here.
     runtime.require_authoritative_revision(KvRevision(11));
-    assert_eq!(runtime.state.current_complete_prefix_revision(), None);
+    assert_eq!(runtime.configuration_snapshot().revision(), None);
     assert!(matches!(
         runtime.write_configuration_readiness().unwrap(),
         crate::DfsWriteConfigurationReadiness::Pending
@@ -1631,7 +1627,7 @@ async fn required_revision_withdraws_configuration_before_queued_refresh_runs() 
     let current = runtime.write_configuration_projection().unwrap().unwrap();
     assert_eq!(current.revision, KvRevision(11));
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
+        runtime.configuration_snapshot().revision(),
         Some(KvRevision(11))
     );
     assert_eq!(
@@ -1660,7 +1656,7 @@ async fn native_host_preflight_joins_configuration_after_first_prefix_is_publish
     .await
     .unwrap();
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
+        runtime.configuration_snapshot().revision(),
         Some(KvRevision(10))
     );
     assert!(matches!(
@@ -1672,7 +1668,6 @@ async fn native_host_preflight_joins_configuration_after_first_prefix_is_publish
         crate::runtime_host::warm_daemon_dfs_metadata_authority_before_deadline(
             Arc::clone(&runtime),
             deadline,
-            None,
         ),
     );
     require_pending(preflight.as_mut()).await;
@@ -1684,7 +1679,7 @@ async fn native_host_preflight_joins_configuration_after_first_prefix_is_publish
         .unwrap()
         .unwrap();
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
+        runtime.configuration_snapshot().revision(),
         Some(KvRevision(10))
     );
     assert!(matches!(
@@ -1720,7 +1715,7 @@ async fn admission_fence_rejects_partial_configuration_after_same_generation_ref
     .await
     .unwrap();
     let paused_generation = runtime.generation();
-    let prefix = runtime.state.current_complete_prefix_revision();
+    let prefix = runtime.configuration_snapshot().revision();
     let pending = matches!(
         runtime.write_configuration_readiness().unwrap(),
         crate::DfsWriteConfigurationReadiness::Pending
@@ -1751,42 +1746,6 @@ async fn admission_fence_rejects_partial_configuration_after_same_generation_ref
 }
 
 #[tokio::test]
-async fn configuration_published_between_pending_read_and_waiter_check_is_revalidated() {
-    let host = NativeProjectionHost::new(true);
-    let runtime = attach(&host);
-    runtime.request_authoritative_refresh();
-    host.run_next().await;
-    let original = runtime.write_configuration_projection().unwrap().unwrap();
-    let generation = runtime.generation();
-    let reads = host.read_count();
-    let publications = host.spawned.load(Ordering::Acquire);
-    // Retain the actual four-prefix native publication. Deliver it at the
-    // precise read/check boundary, as the existing refresh owner can do.
-    let published = Mutex::new(Some(std::mem::take(
-        &mut *runtime.write_configuration.lock().unwrap(),
-    )));
-    let publish = || {
-        if let Some(configuration) = published.lock().unwrap().take() {
-            *runtime.write_configuration.lock().unwrap() = configuration;
-        }
-    };
-    let result = runtime
-        .ensure_write_configuration_ready_with_pending_observer(Some(&publish))
-        .await;
-    assert!(published.lock().unwrap().is_none());
-    assert_eq!(host.read_count(), reads);
-    assert_eq!(host.spawned.load(Ordering::Acquire), publications);
-    assert_eq!(runtime.generation(), generation);
-    assert!(Arc::ptr_eq(
-        &original,
-        &runtime.write_configuration_projection().unwrap().unwrap()
-    ));
-    result.expect(
-        "a concurrently completed native publication must replace the earlier pending observation",
-    );
-}
-
-#[tokio::test]
 async fn retained_control_client_joins_configuration_after_early_filesystem_prefix() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
@@ -1800,7 +1759,7 @@ async fn retained_control_client_joins_configuration_after_early_filesystem_pref
     .await
     .unwrap();
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
+        runtime.configuration_snapshot().revision(),
         Some(KvRevision(10))
     );
     assert!(matches!(
@@ -1870,7 +1829,8 @@ async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
         )
     );
     {
-        let mut configuration = runtime.write_configuration.lock().unwrap();
+        let mut writer_guard = runtime.writer.lock().unwrap();
+        let configuration = &mut writer_guard.write;
         let token = configuration.begin_refresh();
         assert!(
             !configuration
@@ -1914,7 +1874,7 @@ async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
         "the withdrawn standalone prefix requires the full bundle rebind"
     );
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
+        runtime.configuration_snapshot().revision(),
         Some(KvRevision(11))
     );
     let ready = runtime.write_configuration_projection().unwrap().unwrap();
@@ -1954,7 +1914,7 @@ async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
 }
 
 #[tokio::test]
-async fn retained_control_client_revalidates_a_ready_generation_changed_during_floor_read() {
+async fn retained_control_client_lends_the_checked_snapshot_and_fences_on_its_generation() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
@@ -2011,16 +1971,27 @@ async fn retained_control_client_revalidates_a_ready_generation_changed_during_f
     let paths = sinomo_core::network::ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(
         directory.path(),
     ));
+    // The publication that passed the floor check is lent unchanged; the
+    // provider delta published during that check advanced the generation, so
+    // an operation fenced on this snapshot cannot commit.
     let view = crate::runtime_host::test_retained_client_configuration_projection(
         Arc::clone(&runtime),
         &paths,
     )
-    .expect(
-        "a complete changed generation must be revalidated within the existing local replan bound",
-    )
+    .unwrap()
     .unwrap();
-    assert_eq!(view.revision(), KvRevision(11));
-    let entry = &view.entries(DFS_WRITE_CONFIGURATION_PREFIXES[1]).unwrap()[0];
+    assert_eq!(view.revision(), KvRevision(10));
+    assert!(runtime.generation() > generation);
+    let current = crate::runtime_host::test_retained_client_configuration_projection(
+        Arc::clone(&runtime),
+        &paths,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(current.revision(), KvRevision(11));
+    let entry = &current
+        .entries(DFS_WRITE_CONFIGURATION_PREFIXES[1])
+        .unwrap()[0];
     let advertisement: crate::DfsNodeAdvertisement = entry.decode().unwrap();
     assert_eq!(
         advertisement.zone.as_deref(),
@@ -2028,8 +1999,8 @@ async fn retained_control_client_revalidates_a_ready_generation_changed_during_f
     );
     assert_eq!(
         host.read_count(),
-        3,
-        "revalidation uses the already-owned complete bundle"
+        DFS_WRITE_CONFIGURATION_PREFIXES.len(),
+        "a contiguous delta needs no new native read"
     );
     assert_eq!(host.queued_count(), 0);
     host.inputs.lock().unwrap().floor_unavailable = true;
@@ -2077,19 +2048,20 @@ fn original_repair_fixture_filesystem_put(
 }
 
 #[tokio::test]
-async fn original_repair_contiguous_same_value_filesystem_delta_keeps_native_origin() {
+async fn write_snapshot_contiguous_same_value_filesystem_delta_keeps_the_generation() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
     let mut entry = host.inputs.lock().unwrap().scopes[0][0].clone();
     let filesystem: crate::DfsFileSystemConfig = entry.decode().unwrap();
-    let before = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
+    let before = runtime.current_write_configuration_snapshot().unwrap();
+    let (before_shards, before_filesystem) = before
+        .publication_configuration(&filesystem.file_system_id)
+        .unwrap()
         .unwrap();
-    assert_eq!(before.filesystem.as_ref(), Some(&filesystem));
-    assert!(before.shards.is_empty());
-    let authority_generation = runtime.generation();
+    assert_eq!(before_filesystem.as_ref(), Some(&filesystem));
+    assert!(before_shards.is_empty());
     let storage_generation = runtime.storage_generation();
     let reads = host.read_count();
     let original_value = entry.value.clone();
@@ -2097,62 +2069,52 @@ async fn original_repair_contiguous_same_value_filesystem_delta_keeps_native_ori
     entry.version = KvVersion(2);
     let observation = original_repair_fixture_filesystem_put(&host, &runtime, entry, 11);
     assert!(observation.accepted && !observation.authority_changed);
-    let current = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    assert_eq!(current.view.revision(), KvRevision(11));
-    assert!(!Arc::ptr_eq(&current.view, &before.view));
+    let current = runtime.current_write_configuration_snapshot().unwrap();
+    let view = current.write_configuration().unwrap();
+    assert_eq!(view.revision(), KvRevision(11));
+    assert_eq!(current.revision(), Some(KvRevision(11)));
+    assert!(!Arc::ptr_eq(view, before.write_configuration().unwrap()));
     assert_eq!(
-        current
-            .view
-            .entries(&crate::file_system_config_key(&filesystem.file_system_id))
+        view.entries(&crate::file_system_config_key(&filesystem.file_system_id))
             .unwrap()[0]
             .value,
         original_value
     );
-    assert!(current.view.has_same_native_proof_origin(&before.view));
-    assert!(
-        !before.view.has_same_native_proof_origin(&current.view),
-        "native origin relation also rejects revision regression"
-    );
-    assert_eq!(current.filesystem.as_ref(), Some(&filesystem));
-    assert_eq!(current.shards, before.shards);
-    assert!(current.projection_generation > before.projection_generation);
     assert_eq!(
-        current.projection_generation,
-        runtime.projection_generation()
+        current
+            .publication_configuration(&filesystem.file_system_id)
+            .unwrap()
+            .unwrap(),
+        (before_shards, before_filesystem)
     );
+    assert!(current.projection_generation() > before.projection_generation());
     assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
-        Some(current.view.revision())
+        current.generation(),
+        before.generation(),
+        "unchanged exact authority keeps the commit-point fence"
     );
-    assert_eq!(runtime.generation(), authority_generation);
+    assert_eq!(current.generation(), runtime.generation());
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(
-        before.view.revision(),
+        before.write_configuration().unwrap().revision(),
         KvRevision(10),
-        "the earlier owned snapshot remains immutable"
+        "the earlier snapshot remains immutable"
     );
     assert_eq!(
         host.read_count(),
         reads,
-        "contiguous replay uses the actual retained four-prefix proof"
+        "contiguous replay uses the retained four-prefix proof"
     );
     assert_eq!(host.queued_count(), 0);
 }
 
 #[tokio::test]
-async fn original_repair_required_revision_rebootstrap_changes_origin_with_equal_scope_data() {
+async fn write_snapshot_required_revision_rebootstrap_keeps_the_generation_for_equal_authority() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let filesystem: crate::DfsFileSystemConfig =
-        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let before = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    let authority_generation = runtime.generation();
+    let before = runtime.current_write_configuration_snapshot().unwrap();
     let storage_generation = runtime.storage_generation();
     let reads = host.read_count();
     {
@@ -2163,42 +2125,25 @@ async fn original_repair_required_revision_rebootstrap_changes_origin_with_equal
         inputs.floor.applied_index = 111;
     }
     runtime.require_authoritative_revision(KvRevision(11));
-    assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
-    );
-    assert!(
-        runtime
-            .current_original_repair_configuration(&filesystem.file_system_id)
-            .is_err()
-    );
+    assert!(runtime.writer.lock().unwrap().write.snapshot().is_none());
+    assert!(runtime.current_write_configuration_snapshot().is_err());
     assert_eq!(
         runtime.generation(),
-        authority_generation,
-        "required revision alone does not create a new authority generation"
+        before.generation(),
+        "revision catch-up alone does not create a new authority generation"
     );
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
-    let current = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
+    let current = runtime.current_write_configuration_snapshot().unwrap();
+    let view = current.write_configuration().unwrap();
     assert_eq!(
-        current.view.scopes, before.view.scopes,
+        view.scopes,
+        before.write_configuration().unwrap().scopes,
         "all final semantic configuration data is exactly equal"
     );
-    assert_eq!(current.filesystem, before.filesystem);
-    assert_eq!(current.shards, before.shards);
-    assert_eq!(current.view.revision(), KvRevision(11));
-    assert!(
-        !current.view.has_same_native_proof_origin(&before.view),
-        "strictly newer required native reads are a different origin"
-    );
-    assert!(current.projection_generation > before.projection_generation);
-    assert_eq!(runtime.generation(), authority_generation);
+    assert_eq!(view.revision(), KvRevision(11));
+    assert_eq!(current.generation(), before.generation());
+    assert!(current.projection_generation() > before.projection_generation());
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(
         host.read_count(),
@@ -2208,37 +2153,37 @@ async fn original_repair_required_revision_rebootstrap_changes_origin_with_equal
 }
 
 #[tokio::test]
-async fn original_repair_capture_rejects_withdrawal_during_its_final_floor_read() {
+async fn write_snapshot_withdrawn_during_its_floor_read_is_rejected_by_the_next_capture() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let filesystem: crate::DfsFileSystemConfig =
-        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let before = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    let authority_generation = runtime.generation();
+    let before = runtime.current_write_configuration_snapshot().unwrap();
     let weak = Arc::downgrade(&runtime);
     *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
         weak.upgrade()
             .unwrap()
             .require_authoritative_revision(KvRevision(11));
     }));
-    // Preserve the old-ID control's observed ordinary API window: an Arc can
-    // be cloned before a floor callback withdraws the actual publication.
-    let returned_old = runtime.write_configuration_projection().unwrap().unwrap();
-    assert!(Arc::ptr_eq(&returned_old, &before.view));
+    // The snapshot that passed the floor check is lent unchanged; the
+    // withdrawal during that check is visible to the next capture, which
+    // every revalidation takes before it dispatches an effect.
+    let checked = runtime.current_write_configuration_snapshot().unwrap();
+    assert!(Arc::ptr_eq(
+        checked.write_configuration().unwrap(),
+        before.write_configuration().unwrap()
+    ));
+    assert!(runtime.writer.lock().unwrap().write.snapshot().is_none());
+    let error = runtime
+        .current_write_configuration_snapshot()
+        .expect_err("a withdrawn publication rejects the next capture");
     assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
+        error
+            .to_string()
+            .contains("awaiting a coherent authoritative projection"),
+        "{error}"
     );
-    assert!(runtime.projection_generation() > before.projection_generation);
-    assert_eq!(runtime.generation(), authority_generation);
+    assert_eq!(runtime.generation(), checked.generation());
     {
         let mut inputs = host.inputs.lock().unwrap();
         inputs.authority.revision = KvRevision(11);
@@ -2247,57 +2192,26 @@ async fn original_repair_capture_rejects_withdrawal_during_its_final_floor_read(
         inputs.floor.applied_index = 111;
     }
     host.run_next().await;
-    let current = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    let weak = Arc::downgrade(&runtime);
-    *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
-        weak.upgrade()
-            .unwrap()
-            .require_authoritative_revision(KvRevision(12));
-    }));
-    // The retained case ID now exercises the real single-floor snapshot API.
-    // It must reject current None rather than lend its earlier checked Arc.
-    let error = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .err()
-        .expect("withdrawn current publication must reject owned capture");
-    assert!(
-        error
-            .to_string()
-            .contains("withdrawn or replaced during capture"),
-        "{error}"
-    );
-    assert!(
-        runtime
-            .write_configuration
-            .lock()
-            .unwrap()
-            .snapshot()
-            .is_none()
-    );
-    assert!(runtime.projection_generation() > current.projection_generation);
-    assert_eq!(runtime.generation(), authority_generation);
+    let current = runtime.current_write_configuration_snapshot().unwrap();
+    assert_eq!(current.generation(), runtime.generation());
+    assert_eq!(current.revision(), Some(KvRevision(11)));
     assert_eq!(
         host.read_count(),
         2 * DFS_WRITE_CONFIGURATION_PREFIXES.len()
     );
-    assert_eq!(host.queued_count(), 1);
-    host.discard_queued();
+    assert_eq!(host.queued_count(), 0);
 }
 
 #[tokio::test]
-async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
+async fn write_snapshot_contiguous_policy_aba_keeps_the_authority_fence() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
     let original_entry = host.inputs.lock().unwrap().scopes[0][0].clone();
     let original: crate::DfsFileSystemConfig = original_entry.decode().unwrap();
-    let before = runtime
-        .current_original_repair_configuration(&original.file_system_id)
-        .unwrap();
-    let authority_generation = runtime.generation();
+    let before = runtime.current_write_configuration_snapshot().unwrap();
+    let authority_generation = before.generation();
     let storage_generation = runtime.storage_generation();
     assert!(
         crate::runtime_host::test_retained_authority_admission_is_ready(
@@ -2323,16 +2237,22 @@ async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
     entry.modify_revision = KvRevision(12);
     entry.version = KvVersion(3);
     assert!(original_repair_fixture_filesystem_put(&host, &runtime, entry, 12).authority_changed);
-    let current = runtime
-        .current_original_repair_configuration(&original.file_system_id)
-        .unwrap();
-    assert_eq!(current.filesystem.as_ref(), Some(&original));
-    assert_eq!(current.shards, before.shards);
-    assert!(
-        current.view.has_same_native_proof_origin(&before.view),
-        "contiguous native origin alone is deliberately not permission"
+    let current = runtime.current_write_configuration_snapshot().unwrap();
+    assert_eq!(
+        current
+            .publication_configuration(&original.file_system_id)
+            .unwrap()
+            .unwrap(),
+        before
+            .publication_configuration(&original.file_system_id)
+            .unwrap()
+            .unwrap(),
+        "the policy returned to its original value"
     );
-    assert!(runtime.generation() > changed_generation);
+    assert!(
+        current.generation() > changed_generation,
+        "an A-B-A policy change cannot reuse the original fence"
+    );
     assert!(
         !crate::runtime_host::test_retained_authority_admission_is_ready(
             &runtime,
@@ -2346,7 +2266,7 @@ async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
         )
     );
     assert_eq!(
-        current.projection_generation,
+        current.projection_generation(),
         runtime.projection_generation()
     );
     assert_eq!(runtime.storage_generation(), storage_generation);
@@ -2355,38 +2275,28 @@ async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
 }
 
 #[tokio::test]
-async fn original_repair_equal_revision_discontinuity_keeps_the_authority_fence() {
+async fn write_snapshot_equal_revision_discontinuity_keeps_the_authority_fence() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let filesystem: crate::DfsFileSystemConfig =
-        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let before = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    let authority_generation = runtime.generation();
+    let before = runtime.current_write_configuration_snapshot().unwrap();
+    let authority_generation = before.generation();
     let storage_generation = runtime.storage_generation();
     let gap = runtime.observe_discontinuity(KvRevision(10));
     assert!(gap.proof_withdrawn && gap.authority_changed);
     assert!(runtime.generation() > authority_generation);
-    assert!(
-        runtime
-            .current_original_repair_configuration(&filesystem.file_system_id)
-            .is_err()
-    );
+    assert!(runtime.current_write_configuration_snapshot().is_err());
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
-    let current = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    assert_eq!(current.view.scopes, before.view.scopes);
-    assert_eq!(current.view.revision(), before.view.revision());
-    assert_eq!(current.filesystem, before.filesystem);
-    assert_eq!(current.shards, before.shards);
-    // Same-revision native fixture fields can be equal after rebootstrap; the
-    // independently retained discontinuity authority fence is still required.
-    assert!(current.view.has_same_native_proof_origin(&before.view));
+    let current = runtime.current_write_configuration_snapshot().unwrap();
+    assert_eq!(
+        current.write_configuration().unwrap().scopes,
+        before.write_configuration().unwrap().scopes
+    );
+    assert_eq!(current.revision(), before.revision());
+    // Equal scope data after a rebootstrap still carries the newer fence.
+    assert!(current.generation() > authority_generation);
     assert!(
         !crate::runtime_host::test_retained_authority_admission_is_ready(
             &runtime,
@@ -2400,7 +2310,7 @@ async fn original_repair_equal_revision_discontinuity_keeps_the_authority_fence(
         )
     );
     assert_eq!(
-        current.projection_generation,
+        current.projection_generation(),
         runtime.projection_generation()
     );
     assert_eq!(runtime.storage_generation(), storage_generation);
@@ -2412,22 +2322,16 @@ async fn original_repair_equal_revision_discontinuity_keeps_the_authority_fence(
 }
 
 #[tokio::test]
-async fn original_repair_atomic_capture_uses_contiguous_current_view_during_floor_read() {
+async fn write_snapshot_capture_lends_the_checked_publication_during_contiguous_progress() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let filesystem: crate::DfsFileSystemConfig =
-        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let before = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
+    let before = runtime.current_write_configuration_snapshot().unwrap();
     let authority_generation = runtime.generation();
     let storage_generation = runtime.storage_generation();
     let reads = host.read_count();
     let spawned = host.spawned.load(Ordering::Acquire);
-    let published = Arc::new(Mutex::new(None));
-    let observed = Arc::clone(&published);
     let weak_runtime = Arc::downgrade(&runtime);
     let weak_host = Arc::downgrade(&host);
     *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
@@ -2438,43 +2342,20 @@ async fn original_repair_atomic_capture_uses_contiguous_current_view_during_floo
         entry.version = KvVersion(2);
         let delta = original_repair_fixture_filesystem_put(&host, &runtime, entry, 11);
         assert!(delta.accepted && !delta.authority_changed);
-        *observed.lock().unwrap() = runtime.write_configuration.lock().unwrap().snapshot();
     }));
-    // This calls the real API once. Its initial floor read executes the actual
-    // committed delta, after the older checked Arc was cloned but before the
-    // configuration -> projection owned capture. No retry or new read is used.
-    let current = runtime
-        .current_original_repair_configuration(&filesystem.file_system_id)
-        .unwrap();
-    let published = published
-        .lock()
-        .unwrap()
-        .take()
-        .expect("actual delta published its current Arc");
-    assert!(Arc::ptr_eq(&current.view, &published));
-    assert!(!Arc::ptr_eq(&current.view, &before.view));
-    assert_eq!(current.view.revision(), KvRevision(11));
-    assert_eq!(
-        current
-            .view
-            .entries(&crate::file_system_config_key(&filesystem.file_system_id))
-            .unwrap()[0]
-            .modify_revision,
-        KvRevision(11)
-    );
-    assert!(current.view.has_same_native_proof_origin(&before.view));
-    assert_eq!(current.filesystem.as_ref(), Some(&filesystem));
-    assert_eq!(current.shards, before.shards);
-    assert!(current.projection_generation > before.projection_generation);
-    assert_eq!(
-        current.projection_generation,
-        runtime.projection_generation()
-    );
-    assert_eq!(
-        runtime.state.current_complete_prefix_revision(),
-        Some(current.view.revision())
-    );
+    // One call, one floor read. The contiguous delta published during that
+    // read replaces the publication without changing exact authority, so the
+    // lent snapshot keeps the current commit-point fence.
+    let checked = runtime.current_write_configuration_snapshot().unwrap();
+    assert!(Arc::ptr_eq(
+        checked.write_configuration().unwrap(),
+        before.write_configuration().unwrap()
+    ));
+    let current = runtime.configuration_snapshot();
+    assert_eq!(current.revision(), Some(KvRevision(11)));
+    assert_eq!(checked.generation(), current.generation());
     assert_eq!(runtime.generation(), authority_generation);
+    assert!(current.projection_generation() > checked.projection_generation());
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert!(host.floor_observer.lock().unwrap().is_none());
     assert_eq!(
@@ -2484,4 +2365,48 @@ async fn original_repair_atomic_capture_uses_contiguous_current_view_during_floo
     );
     assert_eq!(host.spawned.load(Ordering::Acquire), spawned);
     assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn failed_refresh_is_resent_on_a_bounded_delay_until_it_succeeds() {
+    let host = NativeProjectionHost::new(true);
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    let runtime = Arc::new(DfsMetadataAuthorityRuntime::new());
+    assert!(runtime.attach_host(host.clone()));
+    let mut ready = Box::pin(runtime.ensure_write_configuration_ready_async());
+    require_pending(ready.as_mut()).await;
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    // The failed refresh queued one bounded re-send, not a refresh.
+    assert_eq!(host.queued_count(), 1);
+    assert_eq!(runtime.authority_refresh_count(), 1);
+    host.inputs.lock().unwrap().floor_unavailable = false;
+    host.run_next().await;
+    assert_eq!(runtime.authority_refresh_count(), 2);
+    assert_eq!(host.queued_count(), 1);
+    host.run_next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        host.queued_count(),
+        0,
+        "a success ends the re-send sequence"
+    );
+    assert_eq!(runtime.refresh_failures.load(Ordering::Acquire), 0);
+
+    // An unavailable floor stays unavailable: the sequence is bounded.
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    runtime.observe_discontinuity(KvRevision(10));
+    let mut refreshes = 0;
+    while host.queued_count() > 0 {
+        host.run_next().await;
+        refreshes += 1;
+        assert!(refreshes < 64, "re-sends must stop");
+    }
+    assert_eq!(
+        runtime.refresh_failures.load(Ordering::Acquire),
+        DFS_CONFIGURATION_REFRESH_RETRY_LIMIT + 1
+    );
 }

@@ -646,7 +646,7 @@ impl DfsRuntimeHost {
         }
     }
 
-    async fn wait_for_shutdown(&self) {
+    pub(crate) async fn wait_for_shutdown(&self) {
         // Register before reading the flag so shutdown cannot be lost between
         // that read and the first poll. The flag also covers children started
         // after shutdown; notification alone is not retained for those children.
@@ -1920,6 +1920,111 @@ pub(crate) fn dfs_placement_event_publication() -> sinomo_module::ComponentEvent
     )
 }
 
+pub(crate) fn dfs_configuration_event_publication() -> sinomo_module::ComponentEventPublication {
+    sinomo_module::ComponentEventPublication::new(
+        crate::DFS_CONFIGURATION_PUBLISHED_EVENT_KIND,
+        crate::DFS_CONFIGURATION_EVENT_SCHEMA_ID,
+        crate::DFS_CONFIGURATION_EVENT_SCHEMA_VERSION,
+    )
+}
+
+/// Announce each change of the published configuration on the component
+/// event bus, which the daemon bridges to `/daemon/events/subscribe`. A
+/// replacement that only replays unrelated later revisions is not announced.
+/// The current publication is announced once at start, so a subscriber that
+/// fetched before this task ran still learns about it.
+pub(crate) async fn publish_dfs_configuration_events(
+    client: ComponentEventClient,
+    authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    origin_node_id: sinomo_core::Id,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let publication = dfs_configuration_event_publication();
+    let mut published = authority.subscribe_configuration_snapshot();
+    let mut announced: Option<(Arc<sinomo_dfs::DfsConfigurationSnapshot>, sinomo_core::Id)> = None;
+    loop {
+        let current = Arc::clone(&published.borrow_and_update());
+        if announced
+            .as_ref()
+            .is_none_or(|(previous, _)| !previous.same_configuration_content(&current))
+        {
+            let event_id = sinomo_core::Id::generate();
+            let previous = announced.as_ref().map(|(_, event_id)| event_id.clone());
+            publish_dfs_configuration_event(
+                &client,
+                &publication,
+                &origin_node_id,
+                &current,
+                &event_id,
+                previous,
+            )
+            .await;
+            announced = Some((current, event_id));
+        }
+        tokio::select! {
+            changed = published.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn publish_dfs_configuration_event(
+    client: &ComponentEventClient,
+    publication: &sinomo_module::ComponentEventPublication,
+    origin_node_id: &sinomo_core::Id,
+    snapshot: &sinomo_dfs::DfsConfigurationSnapshot,
+    event_id: &sinomo_core::Id,
+    supersedes: Option<sinomo_core::Id>,
+) {
+    let stamp = snapshot.publication();
+    let payload = match serde_json::to_value(stamp) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, "DFS configuration event payload could not be encoded");
+            return;
+        }
+    };
+    let mut envelope = sinomo_core::EventEnvelope::new(
+        event_id.clone(),
+        time::OffsetDateTime::now_utc(),
+        origin_node_id.clone(),
+        sinomo_core::Source::new("component/sinomo-dfs").expect("static DFS event source"),
+        sinomo_core::EventKind::new(publication.kind.clone()).expect("static DFS event kind"),
+        sinomo_core::Salience::new(0.1).expect("static DFS event salience"),
+        sinomo_core::Confidence::new(1.0).expect("static DFS event confidence"),
+        sinomo_core::RoutingMetadata::new(
+            sinomo_core::RoutingScope::Local,
+            sinomo_core::LatencyClass::Reactive,
+            sinomo_core::PrivacyClass::Derived,
+        ),
+    )
+    .with_payload(payload);
+    // Provenance: the committed revision this publication reflects, and the
+    // route that serves its content.
+    if let Some(revision) = stamp.revision {
+        envelope.evidence.refs.push(sinomo_core::EvidenceRef::new(
+            format!("sinomo-kv:revision/{}", revision.0),
+            sinomo_core::EvidenceKind::Other,
+        ));
+    }
+    envelope
+        .links
+        .related_to
+        .push(crate::DFS_CONFIGURATION_SNAPSHOT_ROUTE.to_string());
+    envelope.links.supersedes.extend(supersedes);
+    if let Err(error) = client.publish(publication, envelope).await {
+        tracing::warn!(%error, "DFS configuration event publication failed");
+    }
+}
+
 pub(crate) fn host_cluster_control_subscription() -> sinomo_module::ComponentEventSubscription {
     sinomo_module::ComponentEventSubscription::new(
         sinomo_module::COMPONENT_HOST_CLUSTER_CONTROL_CHANGED_EVENT_KIND,
@@ -2126,7 +2231,16 @@ pub(crate) async fn bootstrap_publication_execution_provider(
     )?;
     // Bootstrap has written its assignment before this shared configuration
     // join. It retains the existing global admission; no nested permit is taken.
-    authority.ensure_write_configuration_ready_async().await?;
+    // The wait ends with the component or the network deadline.
+    tokio::select! {
+        ready = tokio::time::timeout(
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            authority.ensure_write_configuration_ready_async(),
+        ) => ready.map_err(|_| error(
+            "bootstrap publication configuration deadline elapsed".into(),
+        ))??,
+        () = host.wait_for_shutdown() => {}
+    }
     if host.shutting_down.is_cancelled() {
         return Err(error(
             "bootstrap publication runtime host is stopping".into(),
@@ -2149,7 +2263,7 @@ pub fn open_dfs_runtime_service_with_content(
         data_dir,
         runtime,
         content,
-        DfsRuntimeServiceScope::Caller { read_only: false },
+        DfsRuntimeServiceScope::Caller,
     )
 }
 
@@ -2187,28 +2301,11 @@ pub(crate) fn open_dfs_runtime_service_on_local_shard_copy(
     )
 }
 
-/// Open an observational client using the existing native configuration and
-/// authenticated owner transport. Metadata inspection does not acquire a
-/// writable backend, rebind a primary, bootstrap namespaces or ingest replicas.
-/// Actual recovery effects must use the ordinary mutable opener.
-pub fn open_dfs_runtime_inspection_service_with_content(
-    data_dir: &SinomoDataDir,
-    runtime: Option<&tokio::runtime::Handle>,
-    content: LocalContentStore,
-) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    open_dfs_runtime_service_for_use(
-        data_dir,
-        runtime,
-        content,
-        DfsRuntimeServiceScope::Caller { read_only: true },
-    )
-}
-
 /// The metadata a runtime service opens.
 #[derive(Clone, Copy)]
 enum DfsRuntimeServiceScope<'a> {
     /// A caller delegating to its Main keeps no local metadata store.
-    Caller { read_only: bool },
+    Caller,
     /// A bounded Core effect on the exact locally owned primary shard.
     OwnedShard(&'a crate::DfsMetadataShardConfig),
     /// Selected local recovery of this node's own copy of a shard.
@@ -2222,9 +2319,8 @@ fn open_dfs_runtime_service_for_use(
     content: LocalContentStore,
     scope: DfsRuntimeServiceScope<'_>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    let read_only = matches!(scope, DfsRuntimeServiceScope::Caller { read_only: true });
     let effect = match scope {
-        DfsRuntimeServiceScope::Caller { .. } => None,
+        DfsRuntimeServiceScope::Caller => None,
         DfsRuntimeServiceScope::OwnedShard(shard) => Some(shard),
         #[cfg(any(test, feature = "test-support"))]
         DfsRuntimeServiceScope::LocalShardCopy(shard) => Some(shard),
@@ -2251,12 +2347,22 @@ fn open_dfs_runtime_service_for_use(
     .map_err(|error| DfsRuntimeError::Parse {
         detail: error.to_string(),
     })?;
-    // Join configuration before any service/backend mutation or effect admission.
+    // Join configuration before any service/backend mutation or effect
+    // admission. The wait ends with the component or the network deadline.
     let configuration = block_on_dfs_cluster_future(&provider_runtime, async {
-        authority
-            .ready_write_configuration_projection_async()
-            .await
-            .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+        tokio::select! {
+            ready = tokio::time::timeout(
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                authority.ready_write_configuration_projection_async(),
+            ) => ready
+                .map_err(|_| sinomo_core::service::ServiceError::Service(
+                    "native DFS service configuration deadline elapsed".into(),
+                ))?
+                .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string())),
+            () = host.wait_for_shutdown() => Err(sinomo_core::service::ServiceError::Service(
+                "native DFS service runtime host is stopping".into(),
+            )),
+        }
     })
     .map_err(|error| DfsRuntimeError::Parse {
         detail: error.to_string(),
@@ -2337,17 +2443,13 @@ fn open_dfs_runtime_service_for_use(
         }
         None => None,
     };
-    let publication_provider = if read_only {
-        None
-    } else {
-        Some(crate::DfsPublicationExecutionProvider::from_runtime(
-            data_dir.root(),
-            owner,
-            daemon_dfs_mutation_scheduler(data_dir)?,
-            authority,
-            provider_runtime.clone(),
-        ))
-    };
+    let publication_provider = crate::DfsPublicationExecutionProvider::from_runtime(
+        data_dir.root(),
+        owner,
+        daemon_dfs_mutation_scheduler(data_dir)?,
+        authority,
+        provider_runtime.clone(),
+    );
     let cancellation = host.shutting_down.clone();
     let transport = if effect.is_none() {
         data_plane::daemon_dfs_client_node_transport(
@@ -2377,11 +2479,9 @@ fn open_dfs_runtime_service_for_use(
             data_dir,
             &state.local_node_id,
         ));
-    if let Some(publication_provider) = publication_provider {
-        service
-            .publication_provider
-            .retain_runtime_provider(publication_provider);
-    }
+    service
+        .publication_provider
+        .retain_runtime_provider(publication_provider);
     let service = service.with_boxed_control_plane(control_plane);
     let (Some(metadata), Some(expected)) = (metadata, effect) else {
         // Main alone owns, recovers and rebinds the node's shards.
@@ -2479,8 +2579,6 @@ use sinomo_dfs::{
     observe_default_dfs_reconciliation,
 };
 use sinomo_dfs::{
-    DFS_AUTHORITY_PROJECTION_MAX_BYTES,
-    DfsAuthoritativeProjectionCache as DaemonDfsAuthoritativeProjection,
     DfsCommittedEffects as DaemonDfsMessageCommittedEdges, DfsCommittedWorkTracker,
     DfsCrossShardNamespaceLockRegistry, DfsDataPlaneHost, DfsDataPlaneHostError,
     DfsDataPlaneHostFuture, DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions,
@@ -3315,13 +3413,13 @@ pub(crate) use component_runtime::mount_dfs_runtime_tasks;
 use control_plane::recover_prior_process_default_dfs_placement_authority_from_observation;
 #[cfg(test)]
 use control_plane::*;
-pub(crate) use control_plane::{
-    DaemonDfsControlPlaneKvClient, break_glass_recover_dfs_placement_authority_permit,
-    inspect_dfs_placement_authority_permit, recover_removed_node_dfs_placement_authority_permit,
-};
 #[cfg(test)]
 pub(crate) use control_plane::{
     test_retained_client_configuration_projection, test_retained_client_configuration_sync,
+};
+pub(crate) use control_plane::{
+    DaemonDfsControlPlaneKvClient, break_glass_recover_dfs_placement_authority_permit,
+    inspect_dfs_placement_authority_permit, recover_removed_node_dfs_placement_authority_permit,
 };
 
 mod data_plane;
@@ -3347,7 +3445,6 @@ pub use deferred_work_test::{DfsTestDeferredResponseCapture, DfsTestDeferredResp
 mod storage_import;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use data_plane::daemon_dfs_node_transport;
-use data_plane::with_daemon_dfs_control_plane_seeded_on_runtime;
 #[cfg(test)]
 use data_plane::*;
 pub(crate) use data_plane::{

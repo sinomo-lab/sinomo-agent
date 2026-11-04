@@ -62,10 +62,6 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     ReplicaAdmissionReleased {
         released: bool,
     },
-    /// Native prefix call made by this invocation's actual refresh owner.
-    AuthorityNativePrefixRead {
-        prefix: &'static str,
-    },
     /// Entry into the original bounded outer publication attempt.
     PublishPlanningAttemptStarted {
         replan: usize,
@@ -1194,15 +1190,6 @@ pub(crate) fn daemon_dfs_metadata_authority_generation_for_identity(
         local_node_id: local_node_id.to_string(),
     };
     let (generation, created) = daemon_dfs_metadata_authority_generations().runtime(key)?;
-    #[cfg(any(test, feature = "test-support"))]
-    if let (Some(root), Some(owner)) = (
-        cluster_paths.root.parent(),
-        DaemonDfsControlPlaneKvClient::discover_data_owner_lock(cluster_paths),
-    ) {
-        // Bind the existing mounted owner before any caller can warm this
-        // generation. Observation retains the same read; it schedules no read.
-        generation.bind_native_observation_root(root.to_path_buf(), &owner);
-    }
     if let Some(host) = daemon_dfs_metadata_authority_host(cluster_paths, runtime) {
         let _ = generation.attach_host(host);
     }
@@ -1712,12 +1699,11 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
         sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         detached_send_runtime.detached_state(),
     );
-    let service = with_daemon_dfs_control_plane_seeded_on_runtime(
+    let service = with_daemon_dfs_control_plane_on_runtime(
         NetworkedDfsService::new(transport, content)
             .with_cross_shard_namespace_lock_registry(cross_shard_namespace_locks),
         cluster_paths,
         Some(runtime),
-        authoritative_prefix,
     );
     let mut service = match resident_metadata_scope.as_ref() {
         Some(scope) => match scope {
@@ -2335,13 +2321,7 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_identity_async(
         local_node_id,
         Some(runtime),
     )?;
-    warm_daemon_dfs_metadata_authority_before_deadline(
-        authority_generation,
-        deadline,
-        #[cfg(test)]
-        None,
-    )
-    .await
+    warm_daemon_dfs_metadata_authority_before_deadline(authority_generation, deadline).await
 }
 
 /// The caller owns one projection budget across native reads, generation
@@ -2349,23 +2329,14 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_identity_async(
 pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
     deadline: tokio::time::Instant,
-    #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
-    warm_daemon_dfs_metadata_projection_before_deadline(
-        authority_generation,
-        deadline,
-        true,
-        #[cfg(test)]
-        native_read_observer,
-    )
-    .await
+    warm_daemon_dfs_metadata_projection_before_deadline(authority_generation, deadline, true).await
 }
 
 async fn warm_daemon_dfs_metadata_projection_before_deadline(
     authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
     deadline: tokio::time::Instant,
     require_write_configuration: bool,
-    #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let timeout_authority = Arc::clone(&authority_generation);
     let expected_generation = authority_generation.generation();
@@ -2373,9 +2344,7 @@ async fn warm_daemon_dfs_metadata_projection_before_deadline(
     for replan in 0..=2 {
         let expected_generation = authority_generation.generation();
         let proof = authority_generation
-            .ensure_complete_prefix_for_generation_async(expected_generation,
-    #[cfg(test)] native_read_observer,
-)
+            .ensure_complete_prefix_for_generation_async(expected_generation)
             .await;
         if proof.is_some() && require_write_configuration {
             // The shared refresh publishes its filesystem prefix before the
@@ -2425,14 +2394,7 @@ pub(super) async fn warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
         &peer_snapshot.local_node_id,
         Some(runtime),
     )?;
-    warm_daemon_dfs_metadata_projection_before_deadline(
-        authority,
-        deadline,
-        false,
-        #[cfg(test)]
-        None,
-    )
-    .await
+    warm_daemon_dfs_metadata_projection_before_deadline(authority, deadline, false).await
 }
 
 pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
@@ -2465,32 +2427,8 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
         Some(runtime),
     )?;
     #[cfg(test)]
-    let read_hook = observed_command.and_then(|_| {
-        cluster_paths
-            .root
-            .parent()
-            .and_then(|root| daemon_dfs_pre_dispatch_test_hook(&SinomoDataDir::new(root)))
-    });
-    #[cfg(test)]
-    let observe_read = |prefix| {
-        if let Some(hook) = read_hook.as_ref() {
-            hook(
-                DaemonDfsPreDispatchTestPoint::AuthorityNativePrefixRead { prefix },
-                observed_command,
-                None,
-            )
-            .expect("actual invocation native read observer");
-        }
-    };
-    warm_daemon_dfs_metadata_authority_before_deadline(
-        authority,
-        deadline,
-        #[cfg(test)]
-        read_hook
-            .as_ref()
-            .map(|_| &observe_read as &(dyn Fn(&'static str) + Send + Sync)),
-    )
-    .await
+    let _ = observed_command;
+    warm_daemon_dfs_metadata_authority_before_deadline(authority, deadline).await
 }
 
 /// Open the default-DFS lifecycle backend from an already completed authority
@@ -5099,10 +5037,12 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         })?;
         daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
             .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)?;
-        let projection_generation = preflight.authority.projection_generation();
+        // Route from one publication; the retained-authority check below is
+        // the generation fence before admission.
         let shards = preflight
             .authority
-            .cached_metadata_shards(
+            .configuration_snapshot()
+            .metadata_shards(
                 &match &command.routed_message.message {
                     sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) => {
                         response.file_system_id.clone()
@@ -5116,7 +5056,6 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
                         .into());
                     }
                 },
-                projection_generation,
             )?
             .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
                 message: "owned repair completion current configuration projection is unavailable"
@@ -5128,12 +5067,6 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
             &peer_snapshot.local_node_id,
             &shards,
         )?;
-        if preflight.authority.projection_generation() != projection_generation {
-            return Err(sinomo_dfs::DfsError::Metadata {
-                message: "owned repair completion configuration changed before admission".into(),
-            }
-            .into());
-        }
         daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
             .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)?;
     }
