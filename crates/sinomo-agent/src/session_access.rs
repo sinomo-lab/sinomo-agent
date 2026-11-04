@@ -206,7 +206,6 @@ impl SessionAccess for AgentSessionAccess {
         }
         let members = self.members()?;
         match request {
-            SessionRequest::Start { .. } => Err("this session grant cannot launch workers".into()),
             SessionRequest::Messages {
                 after_sequence,
                 limit,

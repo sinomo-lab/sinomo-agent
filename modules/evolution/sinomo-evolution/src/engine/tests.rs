@@ -6905,16 +6905,23 @@ fn failing_verification_command() -> &'static str {
 #[test]
 fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
     use sinomo_agent::{AgentSessionHost, FileAgentSessionStore};
-    use sinomo_module_api::sessions::{SessionRequest, SessionService};
+    use sinomo_module_api::sessions::{SessionCommand, SessionRequest, SessionService};
     struct Host {
         sessions: Arc<AgentSessionHost>,
     }
     impl SessionService for Host {
         fn request(&self, request: &SessionRequest) -> Result<serde_json::Value, String> {
             match request {
-                SessionRequest::Start { worker } => {
+                SessionRequest::Command {
+                    command:
+                        SessionCommand::Create {
+                            instructions,
+                            worker: Some(worker),
+                            ..
+                        },
+                } => {
                     assert_eq!(worker.agent_id, crate::EVOLUTION_IMPLEMENTER_AGENT_ID);
-                    assert!(worker.instructions.contains("Candidate Workspace"));
+                    assert!(instructions.contains("Candidate Workspace"));
                     let model = FakeInteractionModel::new([
                         r#"{"response_mode":"answer","text":"host completed candidate","tool_calls":[],"next_state":"listening"}"#,
                     ]);
@@ -6925,7 +6932,7 @@ fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
                         InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
                     );
                     let input = AgentLoopInput {
-                        latest_event: user_interaction_input_event(&session, &worker.instructions),
+                        latest_event: user_interaction_input_event(&session, instructions),
                         session,
                         transient_system_context: None,
                         async_update: None,
@@ -6939,6 +6946,7 @@ fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
                                 agent,
                                 input,
                                 sinomo_agent::AgentCancellationToken::new(),
+                                86400,
                             )
                             .map_err(|e| e.to_string())?,
                     )

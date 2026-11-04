@@ -1,5 +1,6 @@
 //! Tool policy and command translation. Execution stays in the host agent runtime.
 use serde::Deserialize;
+use sinomo_module_api::sessions::SessionCommand;
 use sinomo_module_api::{agent::*, *};
 
 const PROMPT: &str = "You are a temporary subagent working for a parent agent. Complete the assigned work, coordinate shared resources, and return concrete findings and verification. You may message your parent using the subagents tool with id parent. Your final answer is delivered to your parent.";
@@ -64,7 +65,7 @@ fn wait_default() -> u64 {
     1000
 }
 
-pub fn translate(input: serde_json::Value) -> Result<SessionCommand, String> {
+pub fn command_for_action(input: serde_json::Value) -> Result<SessionCommand, String> {
     if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > 128 * 1024 {
         return Err("session tool input exceeds 128 KiB".into());
     }
@@ -79,6 +80,7 @@ pub fn translate(input: serde_json::Value) -> Result<SessionCommand, String> {
                 instructions: task,
                 prompt: format!("{PROMPT}\n\n{prompt}"),
                 idle_timeout_secs: 86400,
+                worker: None,
             }
         }
         Action::List { archived } => SessionCommand::List { archived },
@@ -99,11 +101,7 @@ pub fn translate(input: serde_json::Value) -> Result<SessionCommand, String> {
 }
 
 pub fn descriptor() -> NativeModuleDescriptor {
-    let operations = [
-        SESSION_TOOLS_DESCRIBE,
-        SESSION_TOOLS_TRANSLATE,
-        SESSION_TOOLS_EXECUTE,
-    ];
+    let operations = [SESSION_TOOLS_DESCRIBE, SESSION_TOOLS_EXECUTE];
     NativeModuleDescriptor {
         module_id: "module.subagents".into(),
         module_version: env!("CARGO_PKG_VERSION").into(),
@@ -136,7 +134,7 @@ pub fn descriptor() -> NativeModuleDescriptor {
         },
         component: ComponentDescriptor::new("module.subagents", env!("CARGO_PKG_VERSION"))
             .with_display_name("Subagents")
-            .require(ServiceRequirement::new(sinomo_module_api::sessions::SESSION_INTERFACE,"1.0.0").with_operation(sinomo_module_api::sessions::SESSION_ACCESS))
+            .require(ServiceRequirement::new(sinomo_module_api::sessions::SESSION_INTERFACE,sinomo_module_api::sessions::SESSION_VERSION).with_operation(sinomo_module_api::sessions::SESSION_ACCESS))
             .with_offer(
                 ServiceOffer::new(
                     "agent-session-tools",
@@ -144,7 +142,6 @@ pub fn descriptor() -> NativeModuleDescriptor {
                     SESSION_TOOLS_VERSION,
                 )
                 .with_operation(ServiceOperationOffer::new(SESSION_TOOLS_DESCRIBE))
-                .with_operation(ServiceOperationOffer::new(SESSION_TOOLS_TRANSLATE))
                 .with_operation(ServiceOperationOffer::new(SESSION_TOOLS_EXECUTE)),
             ),
     }
@@ -203,10 +200,6 @@ pub extern "C" fn sinomo_module_invoke(
             Ok(NativeModuleRequest::Invoke(request)) => {
                 let result = match request.operation.as_str() {
                     SESSION_TOOLS_DESCRIBE => encode_sobj(&definition()).map_err(|e| e.to_string()),
-                    SESSION_TOOLS_TRANSLATE => decode_sobj(&request.payload_sobj)
-                        .map_err(|e| e.to_string())
-                        .and_then(translate)
-                        .and_then(|command| encode_sobj(&command).map_err(|e| e.to_string())),
                     _ => Err("unsupported session tool operation".into()),
                 };
                 match result {
@@ -264,8 +257,9 @@ pub extern "C" fn sinomo_module_invoke_with_host_v1(
             return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
         };
         let result = std::panic::catch_unwind(|| -> Result<NativeModuleResponse, String> {
-            let command =
-                translate(decode_sobj(&invocation.payload_sobj).map_err(|e| e.to_string())?)?;
+            let command = command_for_action(
+                decode_sobj(&invocation.payload_sobj).map_err(|e| e.to_string())?,
+            )?;
             let client = unsafe { sinomo_module_api::sessions::SessionClient::new(&host) };
             let value: serde_json::Value = if let SessionCommand::Wait { id, timeout_ms } = command
             {
@@ -319,18 +313,20 @@ mod tests {
     fn contract_and_policy() {
         descriptor().component.validate().unwrap();
         assert!(
-            translate(serde_json::json!({"action":"spawn","task":"work","permissions":[]}))
-                .is_err()
+            command_for_action(
+                serde_json::json!({"action":"spawn","task":"work","permissions":[]})
+            )
+            .is_err()
         );
         assert!(matches!(
-            translate(serde_json::json!({"action":"spawn","task":"work"})).unwrap(),
+            command_for_action(serde_json::json!({"action":"spawn","task":"work"})).unwrap(),
             SessionCommand::Create {
                 idle_timeout_secs: 86400,
                 ..
             }
         ));
         assert!(matches!(
-            translate(serde_json::json!({"action":"list"})).unwrap(),
+            command_for_action(serde_json::json!({"action":"list"})).unwrap(),
             SessionCommand::List { archived: false }
         ));
     }

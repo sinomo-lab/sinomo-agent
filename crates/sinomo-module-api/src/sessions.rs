@@ -2,15 +2,12 @@
 //! mutation grants are supplied by the host, never by a module request.
 use serde::{Deserialize, Serialize};
 pub const SESSION_INTERFACE: &str = "sinomo.sessions";
-pub const SESSION_VERSION: &str = "1.0.0";
+pub const SESSION_VERSION: &str = "2.0.0";
 pub const SESSION_ACCESS: &str = "sessions.access";
 pub const MAX_SESSION_PAGE: usize = 256;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum SessionRequest {
-    Start {
-        worker: SessionWorkerRequest,
-    },
     List {
         #[serde(default)]
         include_archived: bool,
@@ -43,6 +40,8 @@ pub enum SessionCommand {
         instructions: String,
         prompt: String,
         idle_timeout_secs: u64,
+        #[serde(default)]
+        worker: Option<SessionWorkerBinding>,
     },
     List {
         archived: bool,
@@ -149,12 +148,11 @@ pub struct SessionCommandReceipt {
 /// storage and executors; no runtime implementation crosses the native ABI.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionWorkerRequest {
+pub struct SessionWorkerBinding {
     pub agent_id: String,
     pub provider: String,
     pub model: String,
     pub workspace: String,
-    pub instructions: String,
     #[serde(default)]
     pub context: Vec<serde_json::Value>,
     pub max_steps: Option<usize>,
@@ -176,4 +174,7 @@ impl SessionService for SessionClient<'_> {
 pub struct SessionWorkerProfile {
     /// Paths relative to SinomoDataDir; workspace admission remains host-owned.
     pub workspace_roots: Vec<String>,
+    /// Capability names from the agent tool contract. Empty grants are rejected.
+    pub capabilities: Vec<String>,
+    pub max_steps: Option<usize>,
 }

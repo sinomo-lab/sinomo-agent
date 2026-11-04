@@ -50,7 +50,13 @@ fn module_root_uses_common_lifecycle_without_a_subagent_provider() {
         tool_specs: vec![],
     };
     let root = host
-        .start("module.test", agent, input, AgentCancellationToken::new())
+        .start(
+            "module.test",
+            agent,
+            input,
+            AgentCancellationToken::new(),
+            86400,
+        )
         .unwrap();
     assert!(root.parent_session_id.is_none());
     let id = root.session_id.to_string();

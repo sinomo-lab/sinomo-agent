@@ -2722,6 +2722,18 @@ fn configured_provider_permission_error(
     }
 }
 
+/// Inspect the selected transport before admitting a scoped agent worker. This
+/// uses the same provider construction as invocation and performs no model call.
+pub fn configured_model_provider_info(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    model: &str,
+    account: Option<&ProviderAccountConfig>,
+    working_dir: Option<PathBuf>,
+) -> Result<LanguageModelProviderInfo, LanguageModelError> {
+    Ok(configured_model_provider(data_dir, provider, model, account, working_dir)?.info())
+}
+
 fn configured_model_provider(
     data_dir: &SinomoDataDir,
     provider: &str,

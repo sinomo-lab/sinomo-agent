@@ -67,8 +67,8 @@ impl NativeAgentSessionTools {
             unsafe { ActiveNativeComponent::resolve_shared(data_dir.root(), &Self::requirement()) }
                 .map_err(|e| error(e.to_string()))?;
         let mut tools = Self::from_component(provider)?;
-        // This provider translates commands; no executable code is needed
-        // during child turns. Release the mapping between calls so module
+        // Tool code is needed only during an invocation. Release the mapping
+        // between calls so module
         // withdrawal/replacement never waits for idle agent sessions.
         tools
             .provider

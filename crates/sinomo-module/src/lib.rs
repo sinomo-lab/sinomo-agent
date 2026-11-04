@@ -1465,6 +1465,8 @@ impl ModuleSurfaces {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModuleAgentDefinitionExport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<sinomo_module_api::sessions::SessionWorkerProfile>,
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1491,6 +1493,7 @@ impl ModuleAgentDefinitionExport {
         system_prompt: impl Into<String>,
     ) -> Self {
         Self {
+            worker: None,
             id: id.into(),
             name: name.into(),
             description: String::new(),
@@ -3730,6 +3733,7 @@ fn native_descriptor_surfaces_to_module_surfaces(
         if let Some(strategy_id) = &definition.compaction_strategy_id {
             export = export.with_compaction_strategy(strategy_id.clone());
         }
+        export.worker = definition.worker.clone();
         surfaces = surfaces.with_agent_definition(export);
     }
     for resource in &descriptor.surfaces.declarative_resources {
@@ -4750,7 +4754,10 @@ fn write_native_dylib_module_file(
         use std::os::unix::fs::PermissionsExt;
         if let Err(source) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
             let _ = fs::remove_file(&tmp_path);
-            return Err(NativeDylibModuleInstallError::Io { path: tmp_path.display().to_string(), detail: source.to_string() });
+            return Err(NativeDylibModuleInstallError::Io {
+                path: tmp_path.display().to_string(),
+                detail: source.to_string(),
+            });
         }
     }
     fs::rename(&tmp_path, path).map_err(|source| NativeDylibModuleInstallError::Io {

@@ -1,7 +1,7 @@
 //! Host-owned managed sessions. Native providers supply tool policy, never a model loop.
 use super::*;
 use crate::{AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate};
-use sinomo_runtime::module_api::agent::SessionCommand;
+use sinomo_runtime::module_api::sessions::SessionCommand;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Weak};
 use std::time::{Duration, Instant};
@@ -191,6 +191,7 @@ impl AgentSessionHost {
         mut agent: Agent<M>,
         input: AgentLoopInput,
         cancellation: AgentCancellationToken,
+        idle_timeout_secs: u64,
     ) -> Result<ManagedSessionSnapshot, AgentError> {
         if self.lock().closing || cancellation.is_cancelled() {
             return Err(session_error("session admission stopped"));
@@ -203,7 +204,7 @@ impl AgentSessionHost {
             operation_id: None,
             session_id: session_id.clone(),
             root_session_id: session_id.clone(),
-            name: agent.config.definition.id.clone(),
+            name: agent.config.definition.name.clone(),
             task: input.latest_event.payload.to_string(),
             prompt: String::new(),
             status: ManagedSessionStatus::Running,
@@ -214,10 +215,11 @@ impl AgentSessionHost {
             error: None,
             archived: false,
             last_activity_unix: now(),
-            idle_timeout_secs: IDLE_SECONDS,
+            idle_timeout_secs: idle_timeout_secs.clamp(1, IDLE_SECONDS),
         };
         let mut session = AgentSession::new(session_id, agent.config.definition.role.clone());
         session.managed = Some(snapshot.clone());
+        session.workspace_binding = agent.config.run_context.workspace.clone();
         agent.session_store = self.store.clone();
         agent.session_store_configured = true;
         agent.session_host = OnceLock::from(self.clone());
@@ -1296,6 +1298,7 @@ impl AgentSessionHost {
                 instructions,
                 prompt,
                 idle_timeout_secs,
+                worker: None,
             } => self.spawn_with_prompt(
                 caller,
                 &name,
@@ -1304,6 +1307,13 @@ impl AgentSessionHost {
                 idle_timeout_secs,
                 cancellation,
             )?,
+            SessionCommand::Create {
+                worker: Some(_), ..
+            } => {
+                return Err(session_error(
+                    "worker profiles require a module-owned session grant",
+                ));
+            }
             SessionCommand::List { archived } => {
                 return Ok(serde_json::json!({"subagents": self.search(caller, archived)}));
             }

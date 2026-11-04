@@ -39,6 +39,7 @@ impl AgentToolSurface {
 
     pub fn for_definition(definition: &AgentDefinition) -> Self {
         Self::default_for_role(definition.role.clone())
+            .with_allowed_capabilities(definition.tool_surface.allowed_capabilities.iter().cloned())
             .with_allowed_tools(definition.tool_surface.allow_tools.iter().cloned())
             .with_denied_tools(definition.tool_surface.deny_tools.iter().cloned())
     }

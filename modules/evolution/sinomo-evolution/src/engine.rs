@@ -30,8 +30,6 @@ use sinomo_agent::{
     InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
     user_interaction_input_event,
 };
-#[cfg(test)]
-use sinomo_lm::LanguageModelResponse;
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
     CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
@@ -4578,20 +4576,25 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
                 .request(&request)
                 .map_err(|detail| MutationModelError::Agent { detail })
         };
-        let started = call(SessionRequest::Start {
-            worker: SessionWorkerRequest {
-                agent_id: crate::EVOLUTION_IMPLEMENTER_AGENT_ID.into(),
-                provider: self.provider.clone(),
-                model: self.model.clone(),
-                workspace: workspace.path.to_string_lossy().into_owned(),
+        let started = call(SessionRequest::Command {
+            command: SessionCommand::Create {
+                name: "Candidate implementer".into(),
                 instructions: render_agent_mutation_prompt(packet, workspace),
-                context: vec![
-                    serde_json::to_value(evolution_agent_context_attachment(packet, bundle))
-                        .map_err(|e| MutationModelError::Serialization {
-                            detail: e.to_string(),
-                        })?,
-                ],
-                max_steps: self.max_steps,
+                prompt: String::new(),
+                idle_timeout_secs: 86400,
+                worker: Some(SessionWorkerBinding {
+                    agent_id: crate::EVOLUTION_IMPLEMENTER_AGENT_ID.into(),
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    workspace: workspace.path.to_string_lossy().into_owned(),
+                    context: vec![
+                        serde_json::to_value(evolution_agent_context_attachment(packet, bundle))
+                            .map_err(|e| MutationModelError::Serialization {
+                                detail: e.to_string(),
+                            })?,
+                    ],
+                    max_steps: self.max_steps,
+                }),
             },
         })?;
         let id = started["session_id"]

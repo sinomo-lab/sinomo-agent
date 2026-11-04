@@ -792,7 +792,10 @@ prompt. The host session service owns execution, session state, inherited author
 cancellation and persistence for both delegated children and module-owned workers.
 Native modules receive scoped access to that service; they do not retain runtime
 implementations or borrowed invocation handles. Evolution uses the service
-independently of the interactive subagents module. A missing or disabled provider leaves
+independently of the interactive subagents module. Modules launch workers from
+explicitly exported capability profiles and workspace grants. The host validates
+those grants before constructing a worker, and tool execution enforces them;
+role prompts cannot expand authority. A missing or disabled provider leaves
 ordinary agent chat available without the delegation tool.
 
 Subagents inherit the parent's model, package identity, tool surface, runtime

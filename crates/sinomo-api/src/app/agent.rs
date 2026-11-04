@@ -241,6 +241,8 @@ fn default_agent_recall_tools() -> Vec<AgentToolSpec> {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolSurfaceDefinition {
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
     pub visible_toolsets: Vec<String>,
     pub allow_tools: Vec<String>,
     pub deny_tools: Vec<String>,

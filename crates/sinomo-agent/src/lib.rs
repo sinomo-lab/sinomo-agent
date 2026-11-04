@@ -719,6 +719,8 @@ pub enum AgentPackageSource {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolSurfaceDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_capabilities: Vec<AgentToolCapability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_toolsets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tools: Vec<String>,
@@ -2142,6 +2144,29 @@ impl AgentDefinition {
         definition.description = export.description.clone();
         definition.skills = export.skills.clone();
         definition.tool_surface.visible_toolsets = export.visible_toolsets.clone();
+        if let Some(profile) = &export.worker {
+            definition.tool_surface.allowed_capabilities = profile
+                .capabilities
+                .iter()
+                .map(|name| {
+                    serde_json::from_value(serde_json::Value::String(name.clone())).map_err(|_| {
+                        AgentDefinitionValidationError::InvalidToolSurfaceEntry {
+                            id: export.id.clone(),
+                            field: "allowed_capabilities".into(),
+                            value: name.clone(),
+                        }
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            if definition.tool_surface.allowed_capabilities.is_empty() {
+                return Err(AgentDefinitionValidationError::InvalidToolSurfaceEntry {
+                    id: export.id.clone(),
+                    field: "allowed_capabilities".into(),
+                    value: "empty worker profile".into(),
+                });
+            }
+            definition.runtime_limits.max_steps = profile.max_steps;
+        }
         definition.context.pipeline_id = export
             .context_pipeline_id
             .clone()

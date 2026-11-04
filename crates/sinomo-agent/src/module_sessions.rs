@@ -73,7 +73,16 @@ struct ModuleSessions {
 impl sessions::SessionAccess for ModuleSessions {
     fn request(&self, request: SessionRequest) -> Result<serde_json::Value, String> {
         match request {
-            SessionRequest::Start { worker } => {
+            SessionRequest::Command {
+                command:
+                    SessionCommand::Create {
+                        name,
+                        instructions,
+                        prompt,
+                        idle_timeout_secs,
+                        worker: Some(worker),
+                    },
+            } => {
                 let export = self
                     .descriptor
                     .surfaces
@@ -81,9 +90,16 @@ impl sessions::SessionAccess for ModuleSessions {
                     .iter()
                     .find(|a| a.id == worker.agent_id)
                     .ok_or("worker is not exported by this module")?;
-                if worker.instructions.trim().is_empty()
-                    || worker.instructions.len() > 128 * 1024
+                if instructions.trim().is_empty()
+                    || instructions.len() > 128 * 1024
                     || worker.context.len() > 32
+                    || name.trim().is_empty()
+                    || name.len() > 1024
+                    || prompt.len() > 64 * 1024
+                    || serde_json::to_vec(&worker.context)
+                        .map_err(|e| e.to_string())?
+                        .len()
+                        > 256 * 1024
                 {
                     return Err("invalid worker input".into());
                 }
@@ -94,6 +110,7 @@ impl sessions::SessionAccess for ModuleSessions {
                     .worker
                     .as_ref()
                     .ok_or("agent is not exported as a hosted worker")?;
+                let (capabilities, max_steps) = validate_worker_profile(profile, &worker)?;
                 let mut admitted = false;
                 for root in &profile.workspace_roots {
                     let path = Path::new(root);
@@ -122,6 +139,19 @@ impl sessions::SessionAccess for ModuleSessions {
                 if !workspace.is_dir() || !admitted {
                     return Err("worker workspace is outside the module grant".into());
                 }
+                let provider_info = sinomo_lm::configured_model_provider_info(
+                    &self.data_dir,
+                    &worker.provider,
+                    &worker.model,
+                    None,
+                    Some(workspace.clone()),
+                )
+                .map_err(|e| e.to_string())?;
+                if provider_info.invocation == sinomo_lm::LanguageModelInvocation::Process
+                    || provider_info.host_access == sinomo_lm::LanguageModelHostAccess::Unrestricted
+                {
+                    return Err("hosted worker profiles require a provider with host-mediated tools; this provider can execute outside the worker grant".into());
+                }
                 let export: ModuleAgentDefinitionExport = serde_json::from_value(
                     serde_json::to_value(export).map_err(|e| e.to_string())?,
                 )
@@ -132,16 +162,27 @@ impl sessions::SessionAccess for ModuleSessions {
                     &self.descriptor.module_id,
                     &self.descriptor.module_version,
                 );
+                definition.name = name;
+                definition.system_prompt.push_str(&format!("\n\n{prompt}"));
+                let surface = AgentToolSurface::for_definition(&definition)
+                    .with_allowed_capabilities(capabilities.clone());
                 let interaction = InteractionSession::new(
                     SessionId::generate(),
                     NodeId::generate(),
                     InteractionSurface::new("module.worker", InteractionSurfaceKind::CommandLine),
                 );
-                let storage = AgentStoragePaths::from_data_dir(&self.data_dir);
-                let workspace_config = local_workspace::LocalWorkspaceAgentConfig::new(&workspace)
-                    .allowing_shell_commands(true)
-                    .allowing_file_writes(true)
-                    .with_agent_storage(&storage, &interaction.session_id);
+                let mut workspace_config =
+                    local_workspace::LocalWorkspaceAgentConfig::new(&workspace)
+                        .allowing_shell_commands(
+                            capabilities.contains(&AgentToolCapability::ExecuteProcess),
+                        )
+                        .allowing_file_writes(
+                            capabilities.contains(&AgentToolCapability::WriteWorkspace),
+                        )
+                        .with_data_dir_evidence(&self.data_dir, &interaction.session_id);
+                if !capabilities.contains(&AgentToolCapability::ExecuteProcess) {
+                    workspace_config = workspace_config.disabling_git_tools();
+                }
                 let sandbox =
                     sinomo_runtime::sandbox::SandboxLifecycleClient::in_process_at_runtime_root(
                         &workspace_config.sandbox_runtime_root,
@@ -168,8 +209,18 @@ impl sessions::SessionAccess for ModuleSessions {
                         &worker.model,
                         None,
                     ));
-                if let Some(steps) = worker.max_steps {
+                if let Some(steps) = max_steps {
                     config = config.with_max_steps(steps);
+                }
+                if let Some(workspace) = &mut config.run_context.workspace {
+                    workspace.write_policy = Some(
+                        if capabilities.contains(&AgentToolCapability::WriteWorkspace) {
+                            "read_write"
+                        } else {
+                            "read_only"
+                        }
+                        .into(),
+                    );
                 }
                 config.visible_toolsets.push("coding_advanced".into());
                 let mut specs = config.definition.tools.clone();
@@ -180,6 +231,13 @@ impl sessions::SessionAccess for ModuleSessions {
                     "Edit workspace files with a scoped patch",
                     true,
                 ));
+                let available: std::collections::BTreeSet<_> = tools
+                    .descriptors()
+                    .into_iter()
+                    .filter(|d| surface.evaluate_descriptor(d).allowed)
+                    .map(|d| d.spec.name)
+                    .collect();
+                specs.retain(|spec| available.contains(&spec.name));
                 let model = ModuleWorkerModel {
                     data_dir: self.data_dir.clone(),
                     provider: worker.provider.clone(),
@@ -188,11 +246,12 @@ impl sessions::SessionAccess for ModuleSessions {
                 };
                 let agent = Agent::new(model, &worker.provider, &worker.model)
                     .with_config(config)
+                    .with_tool_surface(surface)
                     .with_tool_registry(tools);
                 let agent = AgentRuntimeStorage::from_data_dir(&self.data_dir)
                     .apply_to_agent(agent, &interaction.session_id);
                 let input = AgentLoopInput {
-                    latest_event: user_interaction_input_event(&interaction, &worker.instructions),
+                    latest_event: user_interaction_input_event(&interaction, &instructions),
                     session: interaction,
                     transient_system_context: None,
                     async_update: None,
@@ -211,6 +270,7 @@ impl sessions::SessionAccess for ModuleSessions {
                         agent,
                         input,
                         AgentCancellationToken::from_parent_signal(self.cancellation.signal()),
+                        idle_timeout_secs,
                     )
                     .map_err(|e| e.to_string())?;
                 serde_json::to_value(snapshot).map_err(|e| e.to_string())
@@ -322,6 +382,8 @@ mod tests {
         );
         worker.worker = Some(SessionWorkerProfile {
             workspace_roots: vec!["workers/jobs".into()],
+            capabilities: vec!["read_workspace".into()],
+            max_steps: Some(4),
         });
         descriptor.surfaces.agent_definitions = vec![worker];
         let cancellation = NativeModuleOperationCancellationToken::new();
@@ -333,15 +395,20 @@ mod tests {
             interface_id: SESSION_INTERFACE.into(),
             interface_version: SESSION_VERSION.into(),
             operation: SESSION_ACCESS.into(),
-            payload_sobj: encode_sobj(&SessionRequest::Start {
-                worker: SessionWorkerRequest {
-                    agent_id: agent.into(),
-                    provider: "scripted".into(),
-                    model: "scripted".into(),
-                    workspace: workspace.display().to_string(),
+            payload_sobj: encode_sobj(&SessionRequest::Command {
+                command: SessionCommand::Create {
+                    name: "Worker".into(),
                     instructions: "do the task".into(),
-                    context: vec![],
-                    max_steps: Some(2),
+                    prompt: String::new(),
+                    idle_timeout_secs: 86400,
+                    worker: Some(SessionWorkerBinding {
+                        agent_id: agent.into(),
+                        provider: "scripted".into(),
+                        model: "scripted".into(),
+                        workspace: workspace.display().to_string(),
+                        context: vec![],
+                        max_steps: Some(2),
+                    }),
                 },
             })
             .unwrap(),
@@ -358,6 +425,25 @@ mod tests {
                 .host_service(&request("worker", temp.path()))
                 .unwrap_err()
                 .contains("outside")
+        );
+        let mut process = request("worker", &temp.path().join("workers/jobs/candidate"));
+        let mut command: SessionRequest = decode_sobj(&process.payload_sobj).unwrap();
+        if let SessionRequest::Command {
+            command:
+                SessionCommand::Create {
+                    worker: Some(worker),
+                    ..
+                },
+        } = &mut command
+        {
+            worker.provider = sinomo_lm::CodexCliProvider::PROVIDER_ID.into();
+        }
+        process.payload_sobj = encode_sobj(&command).unwrap();
+        assert!(
+            access
+                .host_service(&process)
+                .unwrap_err()
+                .contains("host-mediated tools")
         );
         let list = HostServiceRequest {
             interface_id: SESSION_INTERFACE.into(),
@@ -377,5 +463,76 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+fn validate_worker_profile(
+    profile: &SessionWorkerProfile,
+    worker: &SessionWorkerBinding,
+) -> Result<(Vec<AgentToolCapability>, Option<usize>), String> {
+    if profile.capabilities.is_empty() || profile.capabilities.len() > 64 {
+        return Err("worker profile requires explicit capabilities".into());
+    }
+    let capabilities = profile
+        .capabilities
+        .iter()
+        .map(|name| {
+            serde_json::from_value(serde_json::Value::String(name.clone()))
+                .map_err(|_| format!("unknown worker capability {name}"))
+        })
+        .collect::<Result<Vec<AgentToolCapability>, String>>()?;
+    if capabilities.contains(&AgentToolCapability::ExecuteProcess)
+        && !capabilities.contains(&AgentToolCapability::WriteWorkspace)
+    {
+        return Err("command execution requires a writable workspace grant".into());
+    }
+    if worker.max_steps == Some(0)
+        || profile.max_steps == Some(0)
+        || matches!((worker.max_steps, profile.max_steps), (Some(requested), Some(limit)) if requested > limit)
+    {
+        return Err("worker step limit exceeds its profile".into());
+    }
+    Ok((capabilities, worker.max_steps.or(profile.max_steps)))
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn invalid_profile_grants_and_budget_escalation_are_rejected() {
+        let mut profile = SessionWorkerProfile {
+            workspace_roots: vec!["work".into()],
+            capabilities: vec!["read_workspace".into()],
+            max_steps: Some(4),
+        };
+        let mut worker = SessionWorkerBinding {
+            agent_id: "worker".into(),
+            provider: "scripted".into(),
+            model: "scripted".into(),
+            workspace: "/work".into(),
+            context: vec![],
+            max_steps: None,
+        };
+        assert_eq!(
+            validate_worker_profile(&profile, &worker).unwrap().1,
+            Some(4)
+        );
+        worker.max_steps = Some(5);
+        assert!(
+            validate_worker_profile(&profile, &worker)
+                .unwrap_err()
+                .contains("step limit")
+        );
+        worker.max_steps = None;
+        profile.capabilities.push("execute_process".into());
+        assert!(
+            validate_worker_profile(&profile, &worker)
+                .unwrap_err()
+                .contains("writable workspace")
+        );
+        profile.capabilities = vec!["invented_privilege".into()];
+        assert!(validate_worker_profile(&profile, &worker).is_err());
+        profile.capabilities.clear();
+        assert!(validate_worker_profile(&profile, &worker).is_err());
     }
 }

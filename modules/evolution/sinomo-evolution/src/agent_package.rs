@@ -92,7 +92,7 @@ pub fn evolution_agent_definition() -> AgentDefinition {
 }
 
 pub fn evolution_implementer_agent_definition() -> AgentDefinition {
-    AgentDefinition::custom(
+    let mut definition = AgentDefinition::custom(
         EVOLUTION_IMPLEMENTER_AGENT_ID,
         AgentRole::Deliberation,
         EVOLUTION_IMPLEMENTER_PROMPT,
@@ -103,11 +103,14 @@ pub fn evolution_implementer_agent_definition() -> AgentDefinition {
     .with_package_provenance(AgentPackageProvenance::module(
         contract::EVOLUTION_MODULE_ID,
         env!("CARGO_PKG_VERSION"),
-    ))
+    ));
+    definition.tool_surface.allowed_capabilities =
+        worker_capabilities(EVOLUTION_IMPLEMENTER_AGENT_ID);
+    definition
 }
 
 pub fn evolution_proposer_agent_definition() -> AgentDefinition {
-    AgentDefinition::custom(
+    let mut definition = AgentDefinition::custom(
         EVOLUTION_PROPOSER_AGENT_ID,
         AgentRole::Deliberation,
         EVOLUTION_PROPOSER_PROMPT,
@@ -118,11 +121,13 @@ pub fn evolution_proposer_agent_definition() -> AgentDefinition {
     .with_package_provenance(AgentPackageProvenance::module(
         contract::EVOLUTION_MODULE_ID,
         env!("CARGO_PKG_VERSION"),
-    ))
+    ));
+    definition.tool_surface.allowed_capabilities = worker_capabilities(EVOLUTION_PROPOSER_AGENT_ID);
+    definition
 }
 
 pub fn evolution_evaluator_agent_definition() -> AgentDefinition {
-    AgentDefinition::custom(
+    let mut definition = AgentDefinition::custom(
         EVOLUTION_EVALUATOR_AGENT_ID,
         AgentRole::Deliberation,
         EVOLUTION_EVALUATOR_PROMPT,
@@ -133,7 +138,10 @@ pub fn evolution_evaluator_agent_definition() -> AgentDefinition {
     .with_package_provenance(AgentPackageProvenance::module(
         contract::EVOLUTION_MODULE_ID,
         env!("CARGO_PKG_VERSION"),
-    ))
+    ));
+    definition.tool_surface.allowed_capabilities =
+        worker_capabilities(EVOLUTION_EVALUATOR_AGENT_ID);
+    definition
 }
 
 pub(crate) fn evolution_agent_exports() -> Vec<NativeModuleAgentDefinition> {
@@ -201,9 +209,23 @@ fn agent_export(
     for toolset in EVOLUTION_DEFAULT_TOOLSETS {
         export = export.with_visible_toolset(*toolset);
     }
-    export.worker = Some(sinomo_module_api::sessions::SessionWorkerProfile {
-        workspace_roots: vec!["evolution/jobs".into()],
-    });
+    if id != EVOLUTION_AGENT_ID {
+        let capabilities = worker_capabilities(id)
+            .iter()
+            .map(|capability| {
+                serde_json::to_value(capability)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        export.worker = Some(sinomo_module_api::sessions::SessionWorkerProfile {
+            workspace_roots: vec!["evolution/jobs".into()],
+            capabilities,
+            max_steps: None,
+        });
+    }
     export
 }
 
@@ -325,5 +347,77 @@ mod tests {
         assert_eq!(exports[1].id, EVOLUTION_PROPOSER_AGENT_ID);
         assert_eq!(exports[2].id, EVOLUTION_IMPLEMENTER_AGENT_ID);
         assert_eq!(exports[3].id, EVOLUTION_EVALUATOR_AGENT_ID);
+    }
+}
+
+fn worker_capabilities(id: &str) -> Vec<sinomo_agent::AgentToolCapability> {
+    use sinomo_agent::AgentToolCapability::*;
+    let mut capabilities = vec![ReadWorkspace, ReadMemory];
+    if id == EVOLUTION_IMPLEMENTER_AGENT_ID {
+        capabilities.extend([
+            WriteWorkspace,
+            ExecuteProcess,
+            InspectVersionControl,
+            WriteMemory,
+            ManageBackgroundTask,
+        ]);
+    }
+    capabilities
+}
+
+#[cfg(test)]
+mod worker_profile_tests {
+    use super::*;
+    use sinomo_agent::{AgentToolCapability, AgentToolSurface};
+    #[test]
+    fn evaluator_and_proposer_restrict_effects_in_native_and_normal_agent_packages() {
+        for definition in [
+            evolution_proposer_agent_definition(),
+            evolution_evaluator_agent_definition(),
+        ] {
+            let surface = AgentToolSurface::for_definition(&definition);
+            assert!(
+                surface
+                    .tools
+                    .allowed_capabilities
+                    .contains(&AgentToolCapability::ReadWorkspace)
+            );
+            assert!(
+                !surface
+                    .tools
+                    .allowed_capabilities
+                    .contains(&AgentToolCapability::WriteWorkspace)
+            );
+            assert!(
+                !surface
+                    .tools
+                    .allowed_capabilities
+                    .contains(&AgentToolCapability::ExecuteProcess)
+            );
+            assert!(
+                !surface
+                    .tools
+                    .allowed_capabilities
+                    .contains(&AgentToolCapability::InspectVersionControl)
+            );
+        }
+        for export in evolution_agent_exports() {
+            if export.id == EVOLUTION_AGENT_ID {
+                assert!(export.worker.is_none());
+                continue;
+            }
+            let profile = export.worker.as_ref().unwrap();
+            assert_eq!(
+                profile.capabilities.contains(&"write_workspace".into()),
+                export.id == EVOLUTION_IMPLEMENTER_AGENT_ID
+            );
+            let projected: sinomo_runtime::module::ModuleAgentDefinitionExport =
+                serde_json::from_value(serde_json::to_value(&export).unwrap()).unwrap();
+            let definition = AgentDefinition::try_from_module_export(&projected).unwrap();
+            assert_eq!(
+                definition.tool_surface.allowed_capabilities,
+                worker_capabilities(&export.id)
+            );
+        }
     }
 }

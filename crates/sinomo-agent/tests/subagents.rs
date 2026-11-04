@@ -34,9 +34,9 @@ impl AgentSessionToolProvider for Provider {
         input: serde_json::Value,
         sessions: Arc<dyn sinomo_runtime::module::sessions::SessionAccess>,
     ) -> Result<serde_json::Value, AgentError> {
-        let mut command =
-            sinomo_subagents::translate(input).map_err(|detail| AgentError::Runtime { detail })?;
-        if let sinomo_runtime::module_api::agent::SessionCommand::Create {
+        let mut command = sinomo_subagents::command_for_action(input)
+            .map_err(|detail| AgentError::Runtime { detail })?;
+        if let sinomo_runtime::module_api::sessions::SessionCommand::Create {
             name,
             idle_timeout_secs,
             ..
@@ -1110,4 +1110,42 @@ fn module_capability_denial_blocks_subagent_tool_execution() {
         item, AgentItem::ToolResult { tool_name: Some(name), status: AgentToolStatus::Blocked, .. }
             if name == "subagents"
     )));
+}
+
+#[test]
+fn inherited_session_grant_cannot_select_a_module_worker_profile() {
+    use sinomo_runtime::module_api::sessions::{
+        SessionCommand, SessionRequest, SessionWorkerBinding,
+    };
+    let h = setup(Behavior::Quick);
+    let access = h
+        .runtime
+        .sessions()
+        .session_access(&h.input.session.session_id, AgentCancellationToken::new())
+        .unwrap();
+    let denied = access
+        .request(SessionRequest::Command {
+            command: SessionCommand::Create {
+                name: "override".into(),
+                instructions: "work".into(),
+                prompt: String::new(),
+                idle_timeout_secs: 86400,
+                worker: Some(SessionWorkerBinding {
+                    agent_id: "evolution-implementer".into(),
+                    provider: "fake".into(),
+                    model: "fake".into(),
+                    workspace: "/".into(),
+                    context: vec![],
+                    max_steps: None,
+                }),
+            },
+        })
+        .unwrap_err();
+    assert!(denied.contains("module-owned session grant"), "{denied}");
+    assert!(
+        h.runtime
+            .sessions()
+            .list(&h.input.session.session_id)
+            .is_empty()
+    );
 }

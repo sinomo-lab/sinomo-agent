@@ -173,6 +173,16 @@ metadata, so consumers need no dependency on a subagent provider. Tool discovery
 and input parsing are separate from session access; the subagent tool uses this
 same bridge for its effects.
 
+The common creation command inherits its bound caller when no worker binding is
+supplied. A module-owned grant can instead select one of that module's exported
+worker profiles and a workspace within the profile's declared roots. Those roots
+are relative to `SinomoDataDir`; the host validates the canonical path, capability
+names and step limits before admission. Requests cannot supply capability grants.
+The runtime enforces the selected capabilities and preserves them in delegated
+children. Command execution requires a writable workspace grant. Providers that
+can execute outside host-mediated tools, including process-backed coding
+providers, are rejected for hosted workers before execution.
+
 A native provider exports the optional `sinomo_module_invoke_with_host_v1` entrypoint
 to receive the borrowed invocation host. The ordinary ABI v2 layout and entrypoint
 remain supported. Extended providers use the invocation host for per-call access;

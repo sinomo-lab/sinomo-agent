@@ -116,17 +116,6 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
         };
         assert_eq!(definition.name, "subagents");
         assert!(definition.skill.contains("24 hours"));
-        let command = provider
-            .invoke_sobj::<_, SessionCommand>(
-                SESSION_TOOLS_TRANSLATE,
-                &serde_json::json!({"action":"list"}),
-                None,
-            )
-            .unwrap();
-        assert!(matches!(
-            command,
-            ActiveNativeComponentResponse::Value(SessionCommand::List { archived: false })
-        ));
         assert!(provider.unload().shutdown_ok);
     }
     let descriptor = descriptor.unwrap();

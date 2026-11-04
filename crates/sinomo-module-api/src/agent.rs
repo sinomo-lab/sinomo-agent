@@ -1,11 +1,10 @@
-//! Native session tools return typed intentions; the agent host retains final
-//! authority, session storage, model execution and cancellation ownership.
+//! Native tool and skill declarations. Tool execution uses scoped host services;
+//! the host retains session state, model execution and cancellation ownership.
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_TOOLS_INTERFACE: &str = "sinomo.agent.session-tools";
 pub const SESSION_TOOLS_VERSION: &str = "2.0.0";
 pub const SESSION_TOOLS_DESCRIBE: &str = "agent.session-tools.describe";
-pub const SESSION_TOOLS_TRANSLATE: &str = "agent.session-tools.translate";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionToolDefinition {
@@ -20,5 +19,4 @@ pub struct SessionToolDefinition {
     pub skill: String,
 }
 
-pub use crate::sessions::SessionCommand;
 pub const SESSION_TOOLS_EXECUTE: &str = "agent.session-tools.execute";
