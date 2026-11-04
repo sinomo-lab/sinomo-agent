@@ -1474,8 +1474,9 @@ fn native_authority_held_reply_deadline_case(
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    // The two short probe budgets are not the enclosing operation deadline.
-    // A held real reply must remain pending while that original budget remains.
+    // The hedge intervals are not network deadlines. A held real reply, and
+    // the held reply of its routed hedge, stay pending while the original
+    // operation budget remains.
     if cancel_probe {
         cancellation.cancel();
     }
@@ -1518,6 +1519,292 @@ fn native_authority_held_reply_deadline_case(
         }
     }
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_authority_stalled_direct_upload_gets_its_body_over_the_routed_path() {
+    use crate::test_support::DfsTestFaultAction;
+    // The direct prepare never leaves the primary: its upload makes no
+    // progress, so an unconfirmed hedge leads to the body travelling routed.
+    let case = native_authority_direct_fault_case(
+        "native-authority-stalled-direct",
+        Some(DfsTestFaultAction::PauseBeforeDispatch),
+        None,
+    );
+    assert!(case.result.is_ok(), "{:?}", case.result);
+    let first_body = case
+        .routed_sends
+        .iter()
+        .position(|(target, frames)| target == &case.replica && *frames > 0)
+        .unwrap_or_else(|| {
+            panic!(
+                "a stalled direct upload gets its body routed: {:?}",
+                case.routed_sends
+            )
+        });
+    assert!(
+        case.routed_sends[..first_body]
+            .iter()
+            .filter(|(target, _)| target == &case.replica)
+            .count()
+            >= 2,
+        "the body follows empty hedges that found no upload progress: {:?}",
+        case.routed_sends
+    );
+    assert_eq!(
+        case.routed_sends
+            .iter()
+            .filter(|(target, frames)| target == &case.replica && *frames > 0)
+            .count(),
+        1,
+        "the body travels routed once: {:?}",
+        case.routed_sends
+    );
+    assert!(
+        case.elapsed < std::time::Duration::from_secs(5),
+        "the stalled upload is recovered within the operation deadline: {:?}",
+        case.elapsed
+    );
+}
+
+#[test]
+fn native_authority_fast_direct_prepare_sends_nothing_routed() {
+    let case = native_authority_direct_fault_case("native-authority-fast-direct", None, None);
+    assert!(case.result.is_ok(), "{:?}", case.result);
+    assert!(
+        case.routed_sends.is_empty(),
+        "a prompt direct ACK needs no hedge or routed body: {:?}",
+        case.routed_sends
+    );
+    assert!(case.direct_completed);
+}
+
+#[test]
+fn native_authority_failed_direct_prepare_is_resent_over_the_routed_path() {
+    use crate::test_support::DfsTestFaultAction;
+    let case = native_authority_direct_fault_case(
+        "native-authority-failed-direct",
+        Some(|_| DfsTestFaultAction::BudgetExhausted),
+        None,
+    );
+    assert!(case.result.is_ok(), "{:?}", case.result);
+    assert!(
+        case.routed_sends
+            .iter()
+            .any(|(target, frames)| target == &case.replica && *frames > 0),
+        "a failed direct prepare gets its body over the routed path: {:?}",
+        case.routed_sends
+    );
+}
+
+#[test]
+fn native_authority_cancellation_ends_a_slow_direct_wait_at_once() {
+    use crate::test_support::DfsTestFaultAction;
+    use std::time::{Duration, Instant};
+    let cancellation = DfsCancellationFlag::new();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let case = native_authority_direct_fault_case_with(
+        "native-authority-cancel-slow-direct",
+        Some(DfsTestFaultAction::PauseBeforeDispatch),
+        None,
+        Some(cancellation.clone()),
+        |owner_dispatched| {
+            // The round is waiting on its paused direct prepare, before any
+            // hedge interval has elapsed.
+            assert!(owner_dispatched);
+            *observed.lock().unwrap() = Some(Instant::now());
+            cancellation.cancel();
+        },
+    );
+    let cancelled_at = observed.lock().unwrap().expect("cancellation was raised");
+    let latency = case.finished_at.saturating_duration_since(cancelled_at);
+    assert!(
+        case.result
+            .as_ref()
+            .is_err_and(|error| error.contains("cancel")),
+        "cancellation must stay explicit: {:?}",
+        case.result
+    );
+    assert!(
+        latency < Duration::from_millis(100),
+        "a registered cancellation ends the wait at once, well under the hedge interval: {latency:?}"
+    );
+}
+
+struct NativeAuthorityDirectFaultCase {
+    result: Result<(), String>,
+    replica: NodeId,
+    routed_sends: Vec<(NodeId, usize)>,
+    direct_completed: bool,
+    elapsed: std::time::Duration,
+    finished_at: std::time::Instant,
+}
+
+/// Apply `action` to the primary's direct metadata prepare for one replica and
+/// report the routed authority sends and whether the direct call completed. A
+/// paused call is released after `release_after`, or once the operation has
+/// finished when that is `None`.
+fn native_authority_direct_fault_case(
+    name: &str,
+    action: Option<
+        fn(std::sync::Arc<tokio::sync::Semaphore>) -> crate::test_support::DfsTestFaultAction,
+    >,
+    release_after: Option<std::time::Duration>,
+) -> NativeAuthorityDirectFaultCase {
+    native_authority_direct_fault_case_with(name, action, release_after, None, |_| {})
+}
+
+fn native_authority_direct_fault_case_with(
+    name: &str,
+    action: Option<
+        fn(std::sync::Arc<tokio::sync::Semaphore>) -> crate::test_support::DfsTestFaultAction,
+    >,
+    release_after: Option<std::time::Duration>,
+    cancellation: Option<DfsCancellationFlag>,
+    on_dispatched: impl FnOnce(bool),
+) -> NativeAuthorityDirectFaultCase {
+    use crate::test_support::{DfsTestFaultRule, DfsTestRpcOrigin, DfsTestRpcPhase};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let (runtime, mut requester, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    let path = "/services/authority-direct-fault";
+    let original = requester
+        .posix_write_file(
+            path,
+            b"unchanged content",
+            DfsWriteOptions::replicated_eventual(vec![shard.primary_node_id.clone()]),
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let mut object = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    object.accessed_at_unix_nanos += 1;
+    let primary = shard.primary_node_id.clone();
+    let replica = shard.replica_node_ids.last().unwrap().clone();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    struct Release(Arc<tokio::sync::Semaphore>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.add_permits(64);
+        }
+    }
+    let release = Release(Arc::clone(&gate));
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    if let Some(action) = action {
+        runtime.install_fault(DfsTestFaultRule {
+            source: Some(primary.clone()),
+            target: Some(replica.clone()),
+            route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+            call_id: None,
+            origin: Some(DfsTestRpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: action(Arc::clone(&gate)),
+        });
+    }
+    let routed = owner
+        .transport
+        .observe_metadata_authority_routed_sends_for_test();
+    if let Some(cancellation) = cancellation {
+        owner.add_cancellation(cancellation);
+    }
+    owner
+        .transport
+        .set_operation_deadline(Some(Instant::now() + Duration::from_secs(5)));
+    let started = Instant::now();
+    let worker = std::thread::spawn(move || {
+        let result = owner
+            .add_object_metadata(object)
+            .map_err(|error| error.to_string());
+        (result, Instant::now())
+    });
+    let dispatched = Instant::now() + Duration::from_secs(2);
+    let mut owner_dispatched = false;
+    while !owner_dispatched && !worker.is_finished() && Instant::now() < dispatched {
+        owner_dispatched = runtime.rpc_observations().iter().any(|o| {
+            o.source == primary
+                && o.target == replica
+                && o.route == DFS_METADATA_JOURNAL_BATCH_ROUTE
+                && o.phase == DfsTestRpcPhase::BeforeDispatch
+        });
+        std::thread::yield_now();
+    }
+    on_dispatched(owner_dispatched);
+    if let Some(release_after) = release_after {
+        std::thread::sleep(release_after);
+        drop(release);
+        let (result, finished_at) = worker.join().unwrap();
+        return finish_native_authority_direct_fault_case(
+            runtime,
+            primary,
+            replica,
+            routed,
+            result,
+            started,
+            finished_at,
+        );
+    }
+    let (result, finished_at) = worker.join().unwrap();
+    drop(release);
+    finish_native_authority_direct_fault_case(
+        runtime,
+        primary,
+        replica,
+        routed,
+        result,
+        started,
+        finished_at,
+    )
+}
+
+fn finish_native_authority_direct_fault_case(
+    runtime: crate::test_support::DfsTestRuntime,
+    primary: NodeId,
+    replica: NodeId,
+    routed: std::sync::Arc<std::sync::Mutex<Vec<(NodeId, usize)>>>,
+    result: Result<(), String>,
+    started: std::time::Instant,
+    finished_at: std::time::Instant,
+) -> NativeAuthorityDirectFaultCase {
+    use crate::test_support::DfsTestRpcPhase;
+    use std::time::Duration;
+    runtime.clear_faults();
+    let observations = runtime.rpc_observations();
+    let direct = observations
+        .iter()
+        .filter(|o| {
+            o.source == primary
+                && o.target == replica
+                && o.route == DFS_METADATA_JOURNAL_BATCH_ROUTE
+        })
+        .collect::<Vec<_>>();
+    assert!(!direct.is_empty(), "the direct prepare was attempted");
+    for observation in &direct {
+        assert!(
+            observation
+                .options
+                .overall_timeout()
+                .is_some_and(|timeout| timeout >= Duration::from_secs(1)),
+            "the direct prepare's network deadline is the operation deadline: {:?}",
+            observation.options
+        );
+    }
+    let direct_completed = direct.iter().any(|o| o.phase == DfsTestRpcPhase::Completed);
+    let routed_sends = routed.lock().unwrap().clone();
+    runtime.close().unwrap();
+    NativeAuthorityDirectFaultCase {
+        result,
+        replica,
+        routed_sends,
+        direct_completed,
+        elapsed: finished_at.saturating_duration_since(started),
+        finished_at,
+    }
 }
 
 #[test]
@@ -3799,7 +4086,9 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
         )
         .is_some()
     });
-    let replica_delivery = Arc::new(tokio::sync::Semaphore::new(0));
+    // Direct metadata journal delivery from the primary to this replica fails.
+    // Its authority prepares then travel over the routed path, as for any
+    // failed direct call, while ordinary journal publication stays undelivered.
     cluster
         ._runtime
         .install_fault(crate::test_runtime::FaultRule {
@@ -3809,19 +4098,17 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
             call_id: None,
             origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
             remaining_hits: 32,
-            action: crate::test_runtime::FaultAction::PauseBeforeDispatch(Arc::clone(
-                &replica_delivery,
-            )),
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
     // Advance the actual primary through the current kernel while delivery to
-    // this requester is paused. The third live metadata member supplies the
+    // this requester is failing. The third live metadata member supplies the
     // genuine recovery-majority evidence; no replica table is rewritten.
     cluster
         .services_primary
         .posix_mkdir_all(&format!("{parent_path}/authority-advance"))
         .expect("real authoritative parent advance");
     // The requester delegates to its Main and keeps no store: the stale parent
-    // is its node's replica, whose journal delivery is paused.
+    // is its node's replica, whose journal delivery is failing.
     let stale_parent_version = super::cross_shard::node_store_object_at(
         &cluster._runtime,
         &cluster.replica_node,
@@ -3949,7 +4236,6 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
         "the normal browser resolves the current owner before preparing its one bulk command"
     );
     _runtime.clear_faults();
-    replica_delivery.add_permits(64);
     drop(current_owner);
     drop(bulk_capture);
     drop(services_primary);

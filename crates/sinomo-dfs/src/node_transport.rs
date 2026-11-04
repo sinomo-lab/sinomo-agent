@@ -30,7 +30,9 @@ use crate::{
     DfsBlobTransferResult, DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
     DfsDirectReadClientResponse, DfsDirectReadRequest, DfsError, DfsMessageCommand,
     DfsMessageProcessReport, DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport,
-    DfsMessageTransportFuture, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchDirectGroup,
+    DfsMessageTransportFuture, DfsMetadataAuthorityFanout, DfsMetadataAuthorityFanoutEvent,
+    DfsMetadataAuthorityFanoutSignal, DfsMetadataAuthorityFanoutWorkers,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchDirectGroup,
     DfsMetadataJournalBatchResponse, DfsNetworkMessage, DfsOutboundAttachment, DfsReadResponse,
     DfsRoutedCall, DfsRoutedMessage, DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity,
     DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
@@ -199,14 +201,16 @@ const DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT: usize = 2;
 /// A healthy metadata-authority proof is deliberately all-member rather than
 /// quorum based. Start one bounded cluster-sized wave so a six-node shard does
 /// not serialize required acknowledgements behind the best-effort checkpoint
-/// cap and then needlessly fall back to cluster KV.
+/// cap and then needlessly fall back to cluster KV. Blocking authority calls,
+/// direct and routed, also share this many detached threads per transport; a
+/// call that finds no free thread uses its ordinary routed send.
 const DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT: usize = 8;
 /// Keep one slow checkpoint replica from holding a served mutation lane.
 const DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
-/// Large namespace prepares use segmented value bodies, but direct fan-out is
-/// only an optimization before the exact operation-bound cluster-quorum fence.
-/// Bound a wedged sibling independently so it cannot add five seconds before
-/// the safe fallback even starts.
+/// Whole-call budget when authority-probe commands use the best-effort batch
+/// API. Authority rounds start their calls with
+/// `start_metadata_authority_fanout` instead, where every call carries the
+/// operation deadline as its network deadline.
 const DFS_METADATA_AUTHORITY_DIRECT_FANOUT_BUDGET: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
@@ -1380,6 +1384,7 @@ struct DfsPreparedMetadataJournalBatchRpc {
     next_after_sequence: u64,
     authority_fanout: bool,
     replayable_call: Arc<ObjectRpcReplayableCall>,
+    upload_progress: Option<sinomo_core::network::ObjectRpcBodyProgress>,
     options: DfsObjectRpcSendOptions,
 }
 
@@ -1389,6 +1394,18 @@ struct DfsBorrowedMetadataJournalBatchDirectGroup<'a> {
 }
 
 impl DfsPreparedMetadataJournalBatchRpc {
+    fn trace_context(&self) -> DfsDirectMetadataJournalTraceContext {
+        dfs_perf_trace_enabled().then(|| {
+            (
+                Instant::now(),
+                self.target_node_id.clone(),
+                self.shard_id.clone(),
+                self.next_after_sequence,
+                self.authority_fanout,
+            )
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn begin_native_attempt(
         &self,
@@ -1401,7 +1418,10 @@ impl DfsPreparedMetadataJournalBatchRpc {
         )
     }
     fn call(&self) -> Result<ObjectRpcCall, NetworkError> {
-        Ok(self.replayable_call.call())
+        Ok(match &self.upload_progress {
+            Some(progress) => self.replayable_call.call_with_progress(progress),
+            None => self.replayable_call.call(),
+        })
     }
 
     fn finish(
@@ -1491,6 +1511,8 @@ pub struct DfsNodeTransport {
     test_metadata_direct_probe: Option<DfsTestMetadataDirectRpcProbe>,
     #[cfg(test)]
     test_routed_call_attempts: Option<Arc<StdAtomicUsize>>,
+    #[cfg(test)]
+    test_metadata_authority_routed_sends: Option<Arc<std::sync::Mutex<Vec<(NodeId, usize)>>>>,
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
@@ -1511,8 +1533,40 @@ pub struct DfsNodeTransport {
     blocking_metadata_fanout_workers: Arc<StdAtomicUsize>,
     next_content_root_catalog_frame_id: Arc<AtomicU64>,
     operation_deadline: Option<Instant>,
+    incoming_wait_interrupt: Arc<DfsIncomingWaitInterrupt>,
     #[cfg(any(test, feature = "test-support"))]
     test_drain_counter: Option<Arc<std::sync::Mutex<usize>>>,
+}
+
+/// Lets a waker end a [`DfsMessageTransport::wait_for_incoming`] that has no
+/// arrival signal of its own. One interruption is retained until a wait
+/// consumes it, so a wake raised just before the wait starts is not lost.
+#[derive(Debug, Default)]
+struct DfsIncomingWaitInterrupt {
+    interrupted: std::sync::Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+impl DfsIncomingWaitInterrupt {
+    fn wait(&self, timeout: Duration) {
+        let interrupted = self
+            .interrupted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut interrupted, _) = self
+            .ready
+            .wait_timeout_while(interrupted, timeout, |interrupted| !*interrupted)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *interrupted = false;
+    }
+
+    fn interrupt(&self) {
+        *self
+            .interrupted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.ready.notify_all();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2280,6 +2334,8 @@ impl Clone for DfsNodeTransport {
             test_metadata_direct_probe: self.test_metadata_direct_probe.clone(),
             #[cfg(test)]
             test_routed_call_attempts: self.test_routed_call_attempts.clone(),
+            #[cfg(test)]
+            test_metadata_authority_routed_sends: self.test_metadata_authority_routed_sends.clone(),
             local_node_id: self.local_node_id.clone(),
             known_remote_nodes: self.known_remote_nodes.clone(),
             incoming_messages: if self.served_message.is_some() {
@@ -2307,6 +2363,8 @@ impl Clone for DfsNodeTransport {
             blocking_metadata_fanout_workers: self.blocking_metadata_fanout_workers.clone(),
             next_content_root_catalog_frame_id: self.next_content_root_catalog_frame_id.clone(),
             operation_deadline: self.operation_deadline,
+            // Waits belong to one transport; a clone has its own.
+            incoming_wait_interrupt: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             test_drain_counter: self.test_drain_counter.clone(),
         }
@@ -2722,6 +2780,8 @@ impl DfsNodeTransport {
             test_metadata_direct_probe: None,
             #[cfg(test)]
             test_routed_call_attempts: None,
+            #[cfg(test)]
+            test_metadata_authority_routed_sends: None,
             local_node_id,
             known_remote_nodes,
             incoming_messages: VecDeque::new(),
@@ -2744,6 +2804,7 @@ impl DfsNodeTransport {
             // source across read-only transport forks.
             next_content_root_catalog_frame_id: Arc::new(AtomicU64::new(1_u64 << 63)),
             operation_deadline: None,
+            incoming_wait_interrupt: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             test_drain_counter: None,
         }
@@ -4861,6 +4922,94 @@ fn trace_direct_metadata_journal_fanout_peer_outcome(
     }
 }
 
+/// Perform one prepared direct metadata journal call and decode its typed reply.
+async fn call_direct_metadata_journal_rpc_async(
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    prepared: DfsPreparedMetadataJournalBatchRpc,
+) -> Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError> {
+    let trace_context = prepared.trace_context();
+    let outcome = match prepared.call() {
+        Ok(call) => {
+            #[cfg(any(test, feature = "test-support"))]
+            let native_attempt = prepared.begin_native_attempt(&call.request.route);
+            let rpc_response = peer_transport
+                .call_object_rpc_async(&prepared.target_node_id, call, prepared.options)
+                .await;
+            prepared.finish(
+                rpc_response,
+                #[cfg(any(test, feature = "test-support"))]
+                native_attempt,
+            )
+        }
+        Err(error) => Err(error),
+    };
+    trace_direct_metadata_journal_fanout_call(trace_context, &outcome);
+    outcome
+}
+
+fn call_direct_metadata_journal_rpc_blocking(
+    peer_transport: &dyn DfsPeerTransport,
+    prepared: DfsPreparedMetadataJournalBatchRpc,
+) -> Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError> {
+    let trace_context = prepared.trace_context();
+    let outcome = match prepared.call() {
+        Ok(call) => {
+            #[cfg(any(test, feature = "test-support"))]
+            let native_attempt = prepared.begin_native_attempt(&call.request.route);
+            let rpc_response =
+                peer_transport.call_object_rpc(&prepared.target_node_id, call, prepared.options);
+            prepared.finish(
+                rpc_response,
+                #[cfg(any(test, feature = "test-support"))]
+                native_attempt,
+            )
+        }
+        Err(error) => Err(error),
+    };
+    trace_direct_metadata_journal_fanout_call(trace_context, &outcome);
+    outcome
+}
+
+type DfsDirectMetadataJournalTraceContext =
+    Option<(Instant, NodeId, crate::DfsMetadataShardId, u64, bool)>;
+
+fn trace_direct_metadata_journal_fanout_call(
+    trace_context: DfsDirectMetadataJournalTraceContext,
+    outcome: &Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError>,
+) {
+    if let Some((started_at, target_node_id, shard_id, sequence, authority)) = trace_context {
+        trace_direct_metadata_journal_fanout_peer_outcome(
+            &target_node_id,
+            &shard_id,
+            sequence,
+            authority,
+            started_at,
+            outcome,
+        );
+    }
+}
+
+/// One detached blocking metadata fan-out thread. The count is shared by every
+/// transport clone, so stalled peers cannot accumulate unbounded threads.
+struct BlockingFanoutWorkerSlot(Arc<StdAtomicUsize>);
+
+impl BlockingFanoutWorkerSlot {
+    fn try_acquire(in_flight: Arc<StdAtomicUsize>, max_inflight: usize) -> Option<Self> {
+        in_flight
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
+                (active < max_inflight).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self(in_flight))
+    }
+}
+
+impl Drop for BlockingFanoutWorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
 async fn send_direct_metadata_journal_fanout_async(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     prepared: Vec<DfsPreparedMetadataJournalBatchRpc>,
@@ -4880,50 +5029,7 @@ async fn send_direct_metadata_journal_fanout_async(
             };
             let peer_transport = Arc::clone(&peer_transport);
             workers.spawn(
-                async move {
-                    let trace_context = dfs_perf_trace_enabled().then(|| {
-                        (
-                            Instant::now(),
-                            prepared.target_node_id.clone(),
-                            prepared.shard_id.clone(),
-                            prepared.next_after_sequence,
-                            prepared.authority_fanout,
-                        )
-                    });
-                    let outcome = match prepared.call() {
-                        Ok(call) => {
-                            #[cfg(any(test, feature = "test-support"))]
-                            let native_attempt = prepared.begin_native_attempt(&call.request.route);
-                            let rpc_response = peer_transport
-                                .call_object_rpc_async(
-                                    &prepared.target_node_id,
-                                    call,
-                                    prepared.options,
-                                )
-                                .await;
-                            prepared.finish(
-                                rpc_response,
-                                #[cfg(any(test, feature = "test-support"))]
-                                native_attempt,
-                            )
-                        }
-                        Err(error) => Err(error),
-                    };
-                    if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
-                        trace_context
-                    {
-                        trace_direct_metadata_journal_fanout_peer_outcome(
-                            &target_node_id,
-                            &shard_id,
-                            sequence,
-                            authority,
-                            started_at,
-                            &outcome,
-                        );
-                    }
-                    outcome
-                }
-                .in_current_span(),
+                call_direct_metadata_journal_rpc_async(peer_transport, prepared).in_current_span(),
             );
         }
         if workers.is_empty() {
@@ -4978,25 +5084,6 @@ fn send_direct_metadata_journal_fanout_blocking(
     let canceled = Arc::new(AtomicBool::new(false));
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
 
-    struct BlockingFanoutWorkerSlot(Arc<StdAtomicUsize>);
-
-    impl BlockingFanoutWorkerSlot {
-        fn try_acquire(in_flight: Arc<StdAtomicUsize>, max_inflight: usize) -> Option<Self> {
-            in_flight
-                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
-                    (active < max_inflight).then_some(active + 1)
-                })
-                .ok()
-                .map(|_| Self(in_flight))
-        }
-    }
-
-    impl Drop for BlockingFanoutWorkerSlot {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, AtomicOrdering::AcqRel);
-        }
-    }
-
     let mut spawned_workers = 0usize;
     for worker_index in 0..worker_count {
         let Some(worker_slot) =
@@ -5024,44 +5111,7 @@ fn send_direct_metadata_journal_fanout_blocking(
                 let Some(prepared) = prepared else {
                     break;
                 };
-                let trace_context = dfs_perf_trace_enabled().then(|| {
-                    (
-                        Instant::now(),
-                        prepared.target_node_id.clone(),
-                        prepared.shard_id.clone(),
-                        prepared.next_after_sequence,
-                        prepared.authority_fanout,
-                    )
-                });
-                let outcome = match prepared.call() {
-                    Ok(call) => {
-                        #[cfg(any(test, feature = "test-support"))]
-                        let native_attempt = prepared.begin_native_attempt(&call.request.route);
-                        let rpc_response = peer_transport.call_object_rpc(
-                            &prepared.target_node_id,
-                            call,
-                            prepared.options,
-                        );
-                        prepared.finish(
-                            rpc_response,
-                            #[cfg(any(test, feature = "test-support"))]
-                            native_attempt,
-                        )
-                    }
-                    Err(error) => Err(error),
-                };
-                if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
-                    trace_context
-                {
-                    trace_direct_metadata_journal_fanout_peer_outcome(
-                        &target_node_id,
-                        &shard_id,
-                        sequence,
-                        authority,
-                        started_at,
-                        &outcome,
-                    );
-                }
+                let outcome = call_direct_metadata_journal_rpc_blocking(&*peer_transport, prepared);
                 if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
                     break;
                 }
@@ -5109,6 +5159,316 @@ fn send_direct_metadata_journal_fanout_blocking(
         ));
     }
     responses
+}
+
+/// Workers behind one in-flight metadata authority fan-out.
+///
+/// Async calls run as runtime tasks and end with the fan-out. A blocking call
+/// cannot be interrupted: it keeps one shared worker slot until it returns,
+/// which its network deadline (the fan-out deadline) bounds.
+struct DfsNodeMetadataAuthorityFanoutWorkers {
+    connect_timeout: Duration,
+    mode: DfsNodeMetadataAuthorityFanoutMode,
+}
+
+enum DfsNodeMetadataAuthorityFanoutMode {
+    Async {
+        runtime: tokio::runtime::Handle,
+        peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+        sender: Option<AsyncDfsMessageSender>,
+        direct_slots: Arc<tokio::sync::Semaphore>,
+        tasks: Vec<tokio::task::AbortHandle>,
+    },
+    Blocking {
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        sender: Option<DfsMessageSender>,
+        worker_slots: Arc<StdAtomicUsize>,
+    },
+}
+
+/// Reports exactly one fan-out event per started call, including a call whose
+/// worker ends without producing a result.
+struct DfsMetadataAuthorityFanoutCompletion {
+    events: Option<std::sync::mpsc::Sender<DfsMetadataAuthorityFanoutSignal>>,
+    target_node_id: NodeId,
+    routed: bool,
+}
+
+impl DfsMetadataAuthorityFanoutCompletion {
+    fn new(
+        events: &std::sync::mpsc::Sender<DfsMetadataAuthorityFanoutSignal>,
+        target_node_id: NodeId,
+        routed: bool,
+    ) -> Self {
+        Self {
+            events: Some(events.clone()),
+            target_node_id,
+            routed,
+        }
+    }
+
+    fn direct(mut self, result: Result<DfsMetadataJournalBatchResponse, NetworkError>) {
+        if let Some(events) = self.events.take() {
+            let _ = events.send(Some(DfsMetadataAuthorityFanoutEvent::Direct {
+                target_node_id: self.target_node_id.clone(),
+                result,
+            }));
+        }
+    }
+
+    fn routed(mut self, result: Result<Vec<DfsRoutedMessage>, NetworkError>) {
+        if let Some(events) = self.events.take() {
+            let _ = events.send(Some(DfsMetadataAuthorityFanoutEvent::Routed {
+                target_node_id: self.target_node_id.clone(),
+                result,
+            }));
+        }
+    }
+}
+
+impl Drop for DfsMetadataAuthorityFanoutCompletion {
+    fn drop(&mut self) {
+        let Some(events) = self.events.take() else {
+            return;
+        };
+        let target_node_id = self.target_node_id.clone();
+        let error = NetworkError::Io {
+            operation: format!("DFS metadata authority call to {target_node_id}"),
+            detail: "fan-out worker ended without a result".to_string(),
+        };
+        let _ = events.send(Some(if self.routed {
+            DfsMetadataAuthorityFanoutEvent::Routed {
+                target_node_id,
+                result: Err(error),
+            }
+        } else {
+            DfsMetadataAuthorityFanoutEvent::Direct {
+                target_node_id,
+                result: Err(error),
+            }
+        }));
+    }
+}
+
+fn metadata_authority_fanout_deadline_error(target_node_id: &NodeId) -> NetworkError {
+    NetworkError::Io {
+        operation: format!("DFS metadata authority call to {target_node_id}"),
+        detail: "DFS operation deadline expired".to_string(),
+    }
+}
+
+fn spawn_metadata_authority_fanout_thread(task: impl FnOnce() + Send + 'static) {
+    let task = sinomo_core::service::observed_blocking_task("dfs.metadata.fanout", task);
+    // A failed spawn drops the task; its completion reports the failure.
+    let _ = std::thread::Builder::new()
+        .name("dfs-metadata-authority-fanout".to_string())
+        .spawn(task);
+}
+
+impl DfsNodeMetadataAuthorityFanoutWorkers {
+    /// Start one direct call. Returns `false` when no blocking worker slot is
+    /// free, leaving that target without a direct route for this round.
+    fn start_direct(
+        &mut self,
+        mut prepared: DfsPreparedMetadataJournalBatchRpc,
+        deadline: Instant,
+        events: &std::sync::mpsc::Sender<DfsMetadataAuthorityFanoutSignal>,
+    ) -> bool {
+        let target_node_id = prepared.target_node_id.clone();
+        match &mut self.mode {
+            DfsNodeMetadataAuthorityFanoutMode::Async {
+                runtime,
+                peer_transport,
+                direct_slots,
+                tasks,
+                ..
+            } => {
+                let completion =
+                    DfsMetadataAuthorityFanoutCompletion::new(events, target_node_id, false);
+                let peer_transport = Arc::clone(peer_transport);
+                let direct_slots = Arc::clone(direct_slots);
+                let task = runtime.spawn(
+                    async move {
+                        let call = async {
+                            let _slot = direct_slots.acquire_owned().await.map_err(|_| {
+                                metadata_authority_fanout_deadline_error(&prepared.target_node_id)
+                            })?;
+                            let remaining = deadline
+                                .checked_duration_since(Instant::now())
+                                .filter(|remaining| !remaining.is_zero())
+                                .ok_or_else(|| {
+                                    metadata_authority_fanout_deadline_error(
+                                        &prepared.target_node_id,
+                                    )
+                                })?;
+                            prepared.options.overall_timeout = Some(remaining);
+                            call_direct_metadata_journal_rpc_async(peer_transport, prepared).await
+                        };
+                        let result =
+                            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(metadata_authority_fanout_deadline_error(
+                                        &completion.target_node_id,
+                                    ))
+                                });
+                        completion.direct(result.map(|(_, response)| response));
+                    }
+                    .in_current_span(),
+                );
+                tasks.push(task.abort_handle());
+                true
+            }
+            DfsNodeMetadataAuthorityFanoutMode::Blocking {
+                peer_transport,
+                worker_slots,
+                ..
+            } => {
+                let Some(worker_slot) = BlockingFanoutWorkerSlot::try_acquire(
+                    Arc::clone(worker_slots),
+                    DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT,
+                ) else {
+                    dfs_perf_trace(format_args!(
+                        "direct-metadata-journal-fanout-blocking-worker-cap active={}",
+                        worker_slots.load(AtomicOrdering::Acquire)
+                    ));
+                    return false;
+                };
+                let completion =
+                    DfsMetadataAuthorityFanoutCompletion::new(events, target_node_id, false);
+                let peer_transport = Arc::clone(peer_transport);
+                spawn_metadata_authority_fanout_thread(move || {
+                    let _worker_slot = worker_slot;
+                    let result = match deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                    {
+                        Some(remaining) => {
+                            prepared.options.overall_timeout = Some(remaining);
+                            call_direct_metadata_journal_rpc_blocking(&*peer_transport, prepared)
+                        }
+                        None => Err(metadata_authority_fanout_deadline_error(
+                            &prepared.target_node_id,
+                        )),
+                    };
+                    completion.direct(result.map(|(_, response)| response));
+                });
+                true
+            }
+        }
+    }
+}
+
+impl DfsMetadataAuthorityFanoutWorkers for DfsNodeMetadataAuthorityFanoutWorkers {
+    fn start_routed(
+        &mut self,
+        message: DfsRoutedMessage,
+        deadline: Instant,
+        events: &std::sync::mpsc::Sender<DfsMetadataAuthorityFanoutSignal>,
+    ) -> Result<(), DfsRoutedMessage> {
+        let target_node_id = message.target_node_id.clone();
+        let operation = format!("send DFS message to {target_node_id}");
+        let options = DfsObjectRpcSendOptions::new(self.connect_timeout);
+        match &mut self.mode {
+            DfsNodeMetadataAuthorityFanoutMode::Async {
+                runtime,
+                sender,
+                tasks,
+                ..
+            } => {
+                let Some(sender) = sender.clone() else {
+                    return Err(message);
+                };
+                let completion =
+                    DfsMetadataAuthorityFanoutCompletion::new(events, target_node_id, true);
+                let task = runtime.spawn(
+                    async move {
+                        let call = async {
+                            let options =
+                                DfsNodeTransport::clamp_send_options_to_operation_deadline(
+                                    options,
+                                    Some(deadline),
+                                    operation,
+                                )?;
+                            send_dfs_routed_message_to_peer_async(
+                                sender,
+                                options,
+                                message.target_node_id.clone(),
+                                message,
+                            )
+                            .await
+                        };
+                        let result =
+                            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(metadata_authority_fanout_deadline_error(
+                                        &completion.target_node_id,
+                                    ))
+                                });
+                        completion.routed(result);
+                    }
+                    .in_current_span(),
+                );
+                tasks.push(task.abort_handle());
+                Ok(())
+            }
+            DfsNodeMetadataAuthorityFanoutMode::Blocking {
+                sender,
+                worker_slots,
+                ..
+            } => {
+                let Some(sender) = sender.clone() else {
+                    return Err(message);
+                };
+                let Some(worker_slot) = BlockingFanoutWorkerSlot::try_acquire(
+                    Arc::clone(worker_slots),
+                    DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT,
+                ) else {
+                    dfs_perf_trace(format_args!(
+                        "direct-metadata-journal-fanout-blocking-worker-cap active={}",
+                        worker_slots.load(AtomicOrdering::Acquire)
+                    ));
+                    return Err(message);
+                };
+                let completion =
+                    DfsMetadataAuthorityFanoutCompletion::new(events, target_node_id, true);
+                // The routed sender records native attempts from its calling
+                // thread; carry the caller's observation interest to the worker.
+                #[cfg(any(test, feature = "test-support"))]
+                let native_context = crate::native_shard_trace::rpc_attempt_context();
+                spawn_metadata_authority_fanout_thread(move || {
+                    let _worker_slot = worker_slot;
+                    #[cfg(any(test, feature = "test-support"))]
+                    let _native_context =
+                        crate::native_shard_trace::enter_rpc_attempt_context(native_context);
+                    let result = DfsNodeTransport::clamp_send_options_to_operation_deadline(
+                        options,
+                        Some(deadline),
+                        operation,
+                    )
+                    .and_then(|options| {
+                        send_dfs_routed_message_to_peer(
+                            sender,
+                            options,
+                            message.target_node_id.clone(),
+                            message,
+                        )
+                    });
+                    completion.routed(result);
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        if let DfsNodeMetadataAuthorityFanoutMode::Async { tasks, .. } = &mut self.mode {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
 }
 
 impl DfsNodeTransport {
@@ -5397,7 +5757,6 @@ impl DfsNodeTransport {
     fn send_metadata_journal_batches_direct_inner(
         &mut self,
         requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
-        response_timeout_after_encoding: Option<Duration>,
     ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
         let mut groups = Vec::<DfsBorrowedMetadataJournalBatchDirectGroup<'_>>::new();
         for (target_node_id, command) in requests {
@@ -5410,34 +5769,103 @@ impl DfsNodeTransport {
                 });
             }
         }
-        self.send_borrowed_metadata_journal_batch_groups_direct_inner(
-            &groups,
-            response_timeout_after_encoding,
-        )
+        self.send_borrowed_metadata_journal_batch_groups_direct_inner(&groups)
     }
 
-    fn send_grouped_metadata_journal_batches_direct_inner(
-        &mut self,
-        groups: &[DfsMetadataJournalBatchDirectGroup],
-        response_timeout_after_encoding: Option<Duration>,
-    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-        let groups = groups
+    /// Validate every target and encode each group once. Returns `None` when
+    /// `deadline` expires before every call is prepared.
+    fn prepare_metadata_journal_batch_rpcs(
+        &self,
+        groups: &[DfsBorrowedMetadataJournalBatchDirectGroup<'_>],
+        deadline: Instant,
+    ) -> Result<Option<Vec<DfsPreparedMetadataJournalBatchRpc>>, NetworkError> {
+        let request_count = groups
             .iter()
-            .map(|group| DfsBorrowedMetadataJournalBatchDirectGroup {
-                target_node_ids: group.target_node_ids.iter().collect(),
-                command: &group.command,
-            })
-            .collect::<Vec<_>>();
-        self.send_borrowed_metadata_journal_batch_groups_direct_inner(
-            &groups,
-            response_timeout_after_encoding,
-        )
+            .map(|group| group.target_node_ids.len())
+            .sum::<usize>();
+        let mut prepared = Vec::with_capacity(request_count);
+        let mut distinct_value_count = 0usize;
+        let mut encoded_value_bytes = 0usize;
+        for group in groups {
+            if group.target_node_ids.is_empty() {
+                continue;
+            }
+            for target_node_id in &group.target_node_ids {
+                if *target_node_id == &self.local_node_id
+                    || !self.known_remote_nodes.contains(*target_node_id)
+                {
+                    dfs_perf_trace(format_args!(
+                        "direct-metadata-journal-target-unavailable local={} target={} known={:?}",
+                        self.local_node_id, target_node_id, self.known_remote_nodes,
+                    ));
+                    return Err(NetworkError::UnknownNode {
+                        node_id: (*target_node_id).clone(),
+                    });
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            #[cfg(test)]
+            {
+                let delay = take_metadata_direct_encoding_test_delay();
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let replayable_call = Arc::new(dfs_metadata_journal_batch_replayable_rpc_call(
+                group.command,
+            )?);
+            #[cfg(any(test, feature = "test-support"))]
+            let native_attempt_context = crate::native_shard_trace::rpc_attempt_context();
+            #[cfg(any(test, feature = "test-support"))]
+            let native_command = native_attempt_context
+                .as_ref()
+                .map(|_| Arc::new(group.command.clone()));
+            distinct_value_count = distinct_value_count.saturating_add(1);
+            encoded_value_bytes =
+                encoded_value_bytes.saturating_add(replayable_call.encoded_value_bytes());
+            for target_node_id in &group.target_node_ids {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                let options = self.current_send_options(format!(
+                    "send direct DFS metadata journal batch to {target_node_id}"
+                ))?;
+                prepared.push(DfsPreparedMetadataJournalBatchRpc {
+                    #[cfg(any(test, feature = "test-support"))]
+                    native_attempt_context: native_attempt_context.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    native_command: native_command.clone(),
+                    #[cfg(test)]
+                    test_probe: self.test_metadata_direct_probe.clone(),
+                    target_node_id: (*target_node_id).clone(),
+                    request_id: group.command.request_id.clone(),
+                    shard_id: group.command.batch.shard_id.clone(),
+                    next_after_sequence: group.command.batch.next_after_sequence,
+                    authority_fanout: group.command.authority_probe.is_some(),
+                    replayable_call: Arc::clone(&replayable_call),
+                    upload_progress: None,
+                    options,
+                });
+            }
+        }
+        dfs_perf_trace(format_args!(
+            "direct-metadata-journal-fanout-encoding authority={} requests={} distinct_values={} encoded_bytes={}",
+            !prepared.is_empty() && prepared.iter().all(|request| request.authority_fanout),
+            prepared.len(),
+            distinct_value_count,
+            encoded_value_bytes,
+        ));
+        Ok(Some(prepared))
     }
 
     fn send_borrowed_metadata_journal_batch_groups_direct_inner(
         &mut self,
         groups: &[DfsBorrowedMetadataJournalBatchDirectGroup<'_>],
-        response_timeout_after_encoding: Option<Duration>,
     ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
         let peer_transport = self.peer_transport.as_ref().cloned();
         let async_peer_transport = self.async_peer_transport.as_ref().cloned();
@@ -5463,110 +5891,18 @@ impl DfsNodeTransport {
         } else {
             DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET
         };
-        let legacy_fanout_deadline = Instant::now()
+        // This best-effort batch API keeps one whole-method budget covering
+        // local preparation and the peer replies. An installed operation
+        // deadline can only shorten it.
+        let fanout_deadline = Instant::now()
             .checked_add(fanout_budget)
             .unwrap_or_else(Instant::now);
-        // Existing checkpoint callers retain their historical whole-method
-        // budget. Authority callers use the duration-aware entry point: their
-        // already-installed operation deadline bounds local preparation, while
-        // the shorter peer-response budget begins only after encoding below.
-        let preparation_deadline = match response_timeout_after_encoding {
-            Some(_) => self.operation_deadline,
-            None => Some(
-                self.operation_deadline
-                    .map_or(legacy_fanout_deadline, |deadline| {
-                        deadline.min(legacy_fanout_deadline)
-                    }),
-            ),
-        };
-        let mut prepared = Vec::with_capacity(request_count);
-        let mut distinct_value_count = 0usize;
-        let mut encoded_value_bytes = 0usize;
-        for group in groups {
-            if group.target_node_ids.is_empty() {
-                continue;
-            }
-            for target_node_id in &group.target_node_ids {
-                if *target_node_id == &self.local_node_id
-                    || !self.known_remote_nodes.contains(*target_node_id)
-                {
-                    dfs_perf_trace(format_args!(
-                        "direct-metadata-journal-target-unavailable local={} target={} known={:?}",
-                        self.local_node_id, target_node_id, self.known_remote_nodes,
-                    ));
-                    return Err(NetworkError::UnknownNode {
-                        node_id: (*target_node_id).clone(),
-                    });
-                }
-                if preparation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Ok(Some(Vec::new()));
-                }
-            }
-            #[cfg(test)]
-            {
-                let delay = take_metadata_direct_encoding_test_delay();
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
-            }
-            if preparation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(Some(Vec::new()));
-            }
-            let replayable_call = Arc::new(dfs_metadata_journal_batch_replayable_rpc_call(
-                group.command,
-            )?);
-            #[cfg(any(test, feature = "test-support"))]
-            let native_attempt_context = crate::native_shard_trace::rpc_attempt_context();
-            #[cfg(any(test, feature = "test-support"))]
-            let native_command = native_attempt_context
-                .as_ref()
-                .map(|_| Arc::new(group.command.clone()));
-            distinct_value_count = distinct_value_count.saturating_add(1);
-            encoded_value_bytes =
-                encoded_value_bytes.saturating_add(replayable_call.encoded_value_bytes());
-            for target_node_id in &group.target_node_ids {
-                if preparation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Ok(Some(Vec::new()));
-                }
-                let options = self.current_send_options(format!(
-                    "send direct DFS metadata journal batch to {target_node_id}"
-                ))?;
-                prepared.push(DfsPreparedMetadataJournalBatchRpc {
-                    #[cfg(any(test, feature = "test-support"))]
-                    native_attempt_context: native_attempt_context.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    native_command: native_command.clone(),
-                    #[cfg(test)]
-                    test_probe: self.test_metadata_direct_probe.clone(),
-                    target_node_id: (*target_node_id).clone(),
-                    request_id: group.command.request_id.clone(),
-                    shard_id: group.command.batch.shard_id.clone(),
-                    next_after_sequence: group.command.batch.next_after_sequence,
-                    authority_fanout: group.command.authority_probe.is_some(),
-                    replayable_call: Arc::clone(&replayable_call),
-                    options,
-                });
-            }
-        }
-        dfs_perf_trace(format_args!(
-            "direct-metadata-journal-fanout-encoding authority={} requests={} distinct_values={} encoded_bytes={}",
-            authority_fanout,
-            prepared.len(),
-            distinct_value_count,
-            encoded_value_bytes,
-        ));
-
-        let response_deadline = match response_timeout_after_encoding {
-            Some(response_timeout) => Instant::now()
-                .checked_add(response_timeout)
-                .unwrap_or_else(Instant::now),
-            None => legacy_fanout_deadline,
-        };
         let deadline = self
             .operation_deadline
-            .map_or(response_deadline, |deadline| {
-                deadline.min(response_deadline)
-            });
+            .map_or(fanout_deadline, |deadline| deadline.min(fanout_deadline));
+        let Some(mut prepared) = self.prepare_metadata_journal_batch_rpcs(groups, deadline)? else {
+            return Ok(Some(Vec::new()));
+        };
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(Some(Vec::new()));
         };
@@ -5608,6 +5944,75 @@ impl DfsNodeTransport {
             max_inflight,
         );
         Ok(Some(responses))
+    }
+
+    fn start_metadata_authority_fanout_inner(
+        &mut self,
+        groups: &[DfsMetadataJournalBatchDirectGroup],
+        deadline: Instant,
+    ) -> Result<Option<DfsMetadataAuthorityFanout>, NetworkError> {
+        let mode = match (
+            self.async_peer_transport.as_ref(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            (Some(peer_transport), Ok(runtime))
+                if matches!(
+                    runtime.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                DfsNodeMetadataAuthorityFanoutMode::Async {
+                    runtime,
+                    peer_transport: Arc::clone(peer_transport),
+                    sender: self.async_sender.clone(),
+                    direct_slots: Arc::new(tokio::sync::Semaphore::new(
+                        DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT,
+                    )),
+                    tasks: Vec::new(),
+                }
+            }
+            _ => {
+                let Some(peer_transport) = self.peer_transport.as_ref() else {
+                    return Ok(None);
+                };
+                DfsNodeMetadataAuthorityFanoutMode::Blocking {
+                    peer_transport: Arc::clone(peer_transport),
+                    sender: self.sender.clone(),
+                    worker_slots: Arc::clone(&self.blocking_metadata_fanout_workers),
+                }
+            }
+        };
+        let groups = groups
+            .iter()
+            .map(|group| DfsBorrowedMetadataJournalBatchDirectGroup {
+                target_node_ids: group.target_node_ids.iter().collect(),
+                command: &group.command,
+            })
+            .collect::<Vec<_>>();
+        let prepared = self.prepare_metadata_journal_batch_rpcs(&groups, deadline)?;
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let mut workers = DfsNodeMetadataAuthorityFanoutWorkers {
+            connect_timeout: self.connect_timeout,
+            mode,
+        };
+        let mut direct_calls = BTreeMap::new();
+        // An expired preparation starts no call; the caller's deadline check
+        // then ends the round.
+        for mut prepared in prepared.into_iter().flatten() {
+            let target_node_id = prepared.target_node_id.clone();
+            let upload_progress = sinomo_core::network::ObjectRpcBodyProgress::new();
+            prepared.upload_progress = Some(upload_progress.clone());
+            if workers.start_direct(prepared, deadline, &events_tx) {
+                direct_calls.insert(target_node_id, upload_progress);
+            }
+        }
+        Ok(Some(DfsMetadataAuthorityFanout::new(
+            deadline,
+            direct_calls,
+            events_tx,
+            events,
+            Box::new(workers),
+        )))
     }
 }
 
@@ -5731,6 +6136,21 @@ impl DfsMessageTransport for DfsNodeTransport {
             self.response_registrations.remove(canonical);
         }
     }
+    fn incoming_wait_waker(&self) -> Option<crate::service_state::DfsCancellationWaker> {
+        let interrupt = Arc::downgrade(&self.incoming_wait_interrupt);
+        let inbox = self
+            .response_inbox
+            .as_ref()
+            .map(|inbox| inbox.interrupt_waker());
+        Some(Arc::new(move || {
+            if let Some(interrupt) = interrupt.upgrade() {
+                interrupt.interrupt();
+            }
+            if let Some(inbox) = &inbox {
+                inbox();
+            }
+        }))
+    }
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         if self.served_message.is_some() {
             // Preserve the existing served transport's default wait contract.
@@ -5738,7 +6158,7 @@ impl DfsMessageTransport for DfsNodeTransport {
                 return Ok(true);
             }
             if !timeout.is_zero() {
-                std::thread::sleep(timeout);
+                self.incoming_wait_interrupt.wait(timeout);
             }
             return Ok(
                 DfsMessageTransport::pending_incoming_count(self)?.is_some_and(|count| count > 0)
@@ -5751,7 +6171,7 @@ impl DfsMessageTransport for DfsNodeTransport {
             return inbox.wait(timeout);
         }
         if !timeout.is_zero() {
-            std::thread::sleep(timeout);
+            self.incoming_wait_interrupt.wait(timeout);
         }
         Ok(self.owned_incoming_count()? > 0)
     }
@@ -5903,21 +6323,64 @@ impl DfsMessageTransport for DfsNodeTransport {
         &mut self,
         requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
     ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-        self.send_metadata_journal_batches_direct_inner(requests, None)
+        self.send_metadata_journal_batches_direct_inner(requests)
     }
-    fn send_metadata_journal_batches_direct_with_response_timeout(
-        &mut self,
-        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
-        response_timeout: Duration,
-    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-        self.send_metadata_journal_batches_direct_inner(requests, Some(response_timeout))
-    }
-    fn send_grouped_metadata_journal_batches_direct_with_response_timeout(
+    fn start_metadata_authority_fanout(
         &mut self,
         groups: &[DfsMetadataJournalBatchDirectGroup],
-        response_timeout: Duration,
-    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-        self.send_grouped_metadata_journal_batches_direct_inner(groups, Some(response_timeout))
+        deadline: Instant,
+    ) -> Result<Option<DfsMetadataAuthorityFanout>, NetworkError> {
+        self.start_metadata_authority_fanout_inner(groups, deadline)
+    }
+    fn send_routed_message_on_metadata_authority_fanout(
+        &mut self,
+        fanout: &mut DfsMetadataAuthorityFanout,
+        message: DfsRoutedMessage,
+    ) -> Result<Option<DfsRoutedMessage>, NetworkError> {
+        let target_node_id = message.target_node_id.clone();
+        // Local delivery and served-caller returns keep their ordinary send.
+        if target_node_id == self.local_node_id
+            || self.served_message.as_ref().is_some_and(|served| {
+                served.return_node_id.as_ref() == Some(&target_node_id)
+                    && dfs_network_message_can_return_to_served_caller(
+                        &message.message,
+                        served.caller_fetch_before_reply,
+                    )
+            })
+        {
+            return Ok(Some(message));
+        }
+        self.validate_routed_message_target(&target_node_id, &message, true)?;
+        #[cfg(test)]
+        let observed = match &message.message {
+            DfsNetworkMessage::MetadataJournalBatch(command) => self
+                .test_metadata_authority_routed_sends
+                .clone()
+                .map(|sends| (sends, command.batch.journal_frames.len())),
+            _ => None,
+        };
+        let returned = fanout.start_routed(message).err();
+        #[cfg(test)]
+        if returned.is_none()
+            && let Some((sends, frames)) = observed
+        {
+            sends
+                .lock()
+                .expect("authority routed send observations")
+                .push((target_node_id, frames));
+        }
+        Ok(returned)
+    }
+    fn deliver_metadata_authority_fanout_replies(
+        &mut self,
+        messages: Vec<DfsRoutedMessage>,
+    ) -> Result<(), NetworkError> {
+        // Same custody as the replies returned by an ordinary routed send.
+        for message in messages {
+            let target_node_id = message.target_node_id.clone();
+            self.send_routed_message_to_peer(&target_node_id, message, false)?;
+        }
+        Ok(())
     }
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         let mut messages = self
@@ -7754,44 +8217,600 @@ mod tests {
         );
     }
 
+    /// Direct metadata and routed DFS message peer. Only the direct metadata
+    /// route is slowed; routed calls answer at once with an applied reply.
+    struct AuthorityFanoutPeer {
+        direct_delays: BTreeMap<NodeId, Duration>,
+        failed_direct: BTreeSet<NodeId>,
+        active: AtomicUsize,
+        direct_timeouts: Mutex<Vec<(NodeId, Option<Duration>)>>,
+        routed_targets: Mutex<Vec<NodeId>>,
+    }
+
+    impl AuthorityFanoutPeer {
+        fn new(direct_delays: Vec<(NodeId, Duration)>, failed_direct: Vec<NodeId>) -> Arc<Self> {
+            Arc::new(Self {
+                direct_delays: direct_delays.into_iter().collect(),
+                failed_direct: failed_direct.into_iter().collect(),
+                active: AtomicUsize::new(0),
+                direct_timeouts: Mutex::new(Vec::new()),
+                routed_targets: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn applied(command: &DfsMetadataJournalBatchCommand) -> DfsMetadataJournalBatchResponse {
+            DfsMetadataJournalBatchResponse {
+                request_id: command.request_id.clone(),
+                shard_id: command.batch.shard_id.clone(),
+                next_after_sequence: command.batch.next_after_sequence,
+                applied_entries: command.batch.journal_frames.len(),
+                verified_prefix_only: false,
+                verified_authority_probe_id: None,
+                result: crate::DfsMetadataJournalBatchResult::Applied,
+            }
+        }
+
+        fn delay(&self, target_node_id: &NodeId, call: &ObjectRpcCall) -> Duration {
+            if call.request.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE {
+                self.direct_delays
+                    .get(target_node_id)
+                    .copied()
+                    .unwrap_or_default()
+            } else {
+                Duration::ZERO
+            }
+        }
+
+        fn respond(
+            &self,
+            target_node_id: &NodeId,
+            call: ObjectRpcCall,
+            options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            let error = |source: NetworkError| DfsPeerTransportError::new(source.to_string());
+            let request = materialize_dfs_value_call_sync(call, usize::MAX)?;
+            if request.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE {
+                self.direct_timeouts
+                    .lock()
+                    .expect("direct timeouts")
+                    .push((target_node_id.clone(), options.overall_timeout));
+                if self.failed_direct.contains(target_node_id) {
+                    return Err(DfsPeerTransportError::new(format!(
+                        "injected direct failure for {target_node_id}"
+                    )));
+                }
+                let command: DfsMetadataJournalBatchCommand =
+                    request.decode_body().map_err(error)?;
+                return ObjectRpcResponse::encode_body(&request.route, &Self::applied(&command))
+                    .map(ObjectRpcResult::value)
+                    .map_err(error);
+            }
+            self.routed_targets
+                .lock()
+                .expect("routed targets")
+                .push(target_node_id.clone());
+            let command: DfsMessageCommand = request.decode_body().map_err(error)?;
+            let DfsNetworkMessage::MetadataJournalBatch(batch) = &command.routed_message.message
+            else {
+                return Err(DfsPeerTransportError::new("unexpected routed message"));
+            };
+            let reply = DfsRoutedMessage {
+                source_node_id: target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: command.routed_message.frame_id,
+                message_id: command.routed_message.message_id,
+                message: DfsNetworkMessage::MetadataJournalBatchResponse(Self::applied(batch)),
+            };
+            ObjectRpcResponse::encode_body(
+                &request.route,
+                &DfsMessageResponse {
+                    request_id: command.request_id,
+                    outbound_messages: vec![reply],
+                },
+            )
+            .map(ObjectRpcResult::value)
+            .map_err(error)
+        }
+    }
+
+    impl DfsPeerTransport for AuthorityFanoutPeer {
+        fn call_object_rpc(
+            &self,
+            target_node_id: &NodeId,
+            call: ObjectRpcCall,
+            options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let _active = MetadataFanoutActiveGuard(&self.active);
+            std::thread::sleep(self.delay(target_node_id, &call));
+            self.respond(target_node_id, call, options)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for AuthorityFanoutPeer {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target_node_id: &'a NodeId,
+            call: ObjectRpcCall,
+            options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            Box::pin(async move {
+                self.active.fetch_add(1, Ordering::SeqCst);
+                let _active = MetadataFanoutActiveGuard(&self.active);
+                tokio::time::sleep(self.delay(target_node_id, &call)).await;
+                self.respond(target_node_id, call, options)
+            })
+        }
+    }
+
+    fn authority_fanout_groups(
+        local_node_id: &NodeId,
+        targets: &[NodeId],
+    ) -> Vec<DfsMetadataJournalBatchDirectGroup> {
+        let (_, command) = test_metadata_fanout_requests(local_node_id, targets)
+            .into_iter()
+            .next()
+            .expect("one shared command");
+        vec![DfsMetadataJournalBatchDirectGroup::new(
+            targets.to_vec(),
+            command,
+        )]
+    }
+
+    /// Collect every direct reply with its arrival time after `started`.
+    fn authority_fanout_direct_replies(
+        fanout: &mut DfsMetadataAuthorityFanout,
+        started: Instant,
+    ) -> Vec<(
+        NodeId,
+        Result<DfsMetadataJournalBatchResponse, NetworkError>,
+        Duration,
+    )> {
+        let mut replies = Vec::new();
+        while let Some(event) = fanout.next_event(fanout.deadline()) {
+            let DfsMetadataAuthorityFanoutEvent::Direct {
+                target_node_id,
+                result,
+            } = event
+            else {
+                panic!("only direct calls were started: {event:?}");
+            };
+            replies.push((target_node_id, result, started.elapsed()));
+        }
+        replies
+    }
+
+    fn assert_slow_direct_call_outlives_hedge_interval(
+        peer: &AuthorityFanoutPeer,
+        replies: &[(
+            NodeId,
+            Result<DfsMetadataJournalBatchResponse, NetworkError>,
+            Duration,
+        )],
+        slow: &NodeId,
+    ) {
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert!(
+            replies.iter().all(|(_, result, _)| result.is_ok()),
+            "{replies:?}"
+        );
+        let (_, _, slow_elapsed) = replies
+            .iter()
+            .find(|(target, _, _)| target == slow)
+            .expect("slow direct reply");
+        assert!(
+            *slow_elapsed >= Duration::from_millis(600),
+            "a direct call slower than the hedge interval must still complete"
+        );
+        for (target, timeout) in peer.direct_timeouts.lock().unwrap().iter() {
+            assert!(
+                timeout.is_some_and(|timeout| timeout >= Duration::from_secs(4)),
+                "{target} network deadline must be the operation deadline: {timeout:?}"
+            );
+        }
+    }
+
     #[test]
-    fn metadata_peer_budget_starts_after_replayable_encoding() {
-        let local = node_id("node_metadata_authority_encode_budget_n1");
-        let targets = vec![node_id("node_metadata_authority_encode_budget_n2")];
-        let peer = Arc::new(MetadataFanoutPeerTransport {
-            active: AtomicUsize::new(0),
-            max_active: AtomicUsize::new(0),
-            failed_target: None,
-            slow_target: None,
-            fast_delay: Duration::from_millis(5),
-            slow_delay: Duration::from_millis(5),
-        });
-        let sync_peer: Arc<dyn DfsPeerTransport> = peer;
+    fn blocking_authority_fanout_keeps_slow_direct_calls_until_the_operation_deadline() {
+        let local = node_id("node_authority_fanout_blocking_n1");
+        let fast = node_id("node_authority_fanout_blocking_n2");
+        let slow = node_id("node_authority_fanout_blocking_n3");
+        let peer =
+            AuthorityFanoutPeer::new(vec![(slow.clone(), Duration::from_millis(600))], vec![]);
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
         let mut transport = DfsNodeTransport::new_with_peer_transport_for_nodes(
             local.clone(),
-            targets.clone(),
+            [fast.clone(), slow.clone()],
             sync_peer,
             Duration::from_secs(2),
         );
-        let operation_deadline = Instant::now() + Duration::from_millis(500);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport.set_operation_deadline(Some(deadline));
+        let started = Instant::now();
+
+        let mut fanout = transport
+            .start_metadata_authority_fanout(
+                &authority_fanout_groups(&local, &[fast.clone(), slow.clone()]),
+                deadline,
+            )
+            .expect("authority fan-out")
+            .expect("blocking peer retained");
+        assert!(fanout.has_direct_call(&fast) && fanout.has_direct_call(&slow));
+        let replies = authority_fanout_direct_replies(&mut fanout, started);
+
+        assert_eq!(fanout.in_flight(), 0);
+        assert_slow_direct_call_outlives_hedge_interval(&peer, &replies, &slow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_authority_fanout_keeps_slow_direct_calls_until_the_operation_deadline() {
+        let local = node_id("node_authority_fanout_async_n1");
+        let fast = node_id("node_authority_fanout_async_n2");
+        let slow = node_id("node_authority_fanout_async_n3");
+        let peer =
+            AuthorityFanoutPeer::new(vec![(slow.clone(), Duration::from_millis(600))], vec![]);
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            [fast.clone(), slow.clone()],
+            sync_peer,
+            async_peer,
+            Duration::from_secs(2),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport.set_operation_deadline(Some(deadline));
+        let started = Instant::now();
+
+        let mut fanout = transport
+            .start_metadata_authority_fanout(
+                &authority_fanout_groups(&local, &[fast.clone(), slow.clone()]),
+                deadline,
+            )
+            .expect("authority fan-out")
+            .expect("async peer retained");
+        let replies = authority_fanout_direct_replies(&mut fanout, started);
+
+        assert_slow_direct_call_outlives_hedge_interval(&peer, &replies, &slow);
+    }
+
+    #[test]
+    fn authority_network_deadline_is_not_restarted_after_replayable_encoding() {
+        let local = node_id("node_metadata_authority_encode_budget_n1");
+        let target = node_id("node_metadata_authority_encode_budget_n2");
+        let peer = AuthorityFanoutPeer::new(Vec::new(), Vec::new());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            [target.clone()],
+            sync_peer,
+            Duration::from_secs(2),
+        );
+        let operation_deadline = Instant::now() + Duration::from_millis(1_500);
         transport.set_operation_deadline(Some(operation_deadline));
         DFS_METADATA_DIRECT_ENCODING_TEST_DELAY.with(|delay| delay.set(Duration::from_millis(75)));
 
         let started = Instant::now();
-        let responses = transport
-            .send_metadata_journal_batches_direct_with_response_timeout(
-                &test_metadata_fanout_requests(&local, &targets),
-                Duration::from_millis(40),
+        let mut fanout = transport
+            .start_metadata_authority_fanout(
+                &authority_fanout_groups(&local, std::slice::from_ref(&target)),
+                operation_deadline,
             )
-            .expect("deadline-bounded metadata authority fan-out")
+            .expect("authority fan-out")
             .expect("blocking peer retained");
-
-        assert_eq!(responses.len(), 1);
         assert!(
             started.elapsed() >= Duration::from_millis(75),
-            "the test must exercise local work longer than the peer budget"
+            "the test must exercise local encoding before dispatch"
+        );
+        let replies = authority_fanout_direct_replies(&mut fanout, started);
+
+        assert!(matches!(replies.as_slice(), [(_, Ok(_), _)]), "{replies:?}");
+        let (_, observed) = peer.direct_timeouts.lock().unwrap()[0].clone();
+        let observed = observed.expect("authority calls carry a network deadline");
+        assert!(
+            observed <= Duration::from_millis(1_425),
+            "encoding must not restart the operation's network deadline: {observed:?}"
+        );
+        assert!(
+            observed >= Duration::from_secs(1),
+            "no shorter network deadline may replace the operation deadline: {observed:?}"
         );
         assert_eq!(transport.operation_deadline(), Some(operation_deadline));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_authority_fanout_ends_calls_at_a_shorter_caller_deadline() {
+        let local = node_id("node_authority_fanout_caller_deadline_n1");
+        let target = node_id("node_authority_fanout_caller_deadline_n2");
+        let peer = AuthorityFanoutPeer::new(vec![(target.clone(), Duration::from_secs(5))], vec![]);
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            [target.clone()],
+            sync_peer,
+            async_peer,
+            Duration::from_secs(2),
+        );
+        let deadline = Instant::now() + Duration::from_millis(300);
+        transport.set_operation_deadline(Some(deadline));
+        let started = Instant::now();
+
+        let mut fanout = transport
+            .start_metadata_authority_fanout(
+                &authority_fanout_groups(&local, std::slice::from_ref(&target)),
+                deadline,
+            )
+            .expect("authority fan-out")
+            .expect("async peer retained");
+        let event = fanout.next_event(deadline + Duration::from_secs(2));
+
+        assert!(
+            matches!(
+                &event,
+                Some(DfsMetadataAuthorityFanoutEvent::Direct { result: Err(_), .. })
+            ),
+            "{event:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            peer.direct_timeouts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, timeout)| {
+                    timeout.is_some_and(|timeout| timeout <= Duration::from_millis(300))
+                }),
+            "the caller's shorter deadline wins"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_an_async_authority_fanout_abandons_its_calls() {
+        let local = node_id("node_authority_fanout_drop_n1");
+        let target = node_id("node_authority_fanout_drop_n2");
+        let peer = AuthorityFanoutPeer::new(vec![(target.clone(), Duration::from_secs(5))], vec![]);
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            [target.clone()],
+            sync_peer,
+            async_peer,
+            Duration::from_secs(2),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        transport.set_operation_deadline(Some(deadline));
+        let fanout = transport
+            .start_metadata_authority_fanout(
+                &authority_fanout_groups(&local, std::slice::from_ref(&target)),
+                deadline,
+            )
+            .expect("authority fan-out")
+            .expect("async peer retained");
+        let entered = Instant::now() + Duration::from_secs(2);
+        while peer.active.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < entered, "direct call did not start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        drop(fanout);
+
+        let abandoned = Instant::now() + Duration::from_secs(2);
+        while peer.active.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < abandoned,
+                "dropping the fan-out must abandon its in-flight call"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[test]
+    fn authority_fanout_routed_call_reports_its_replies_as_one_event() {
+        let local = node_id("node_authority_fanout_routed_n1");
+        let target = node_id("node_authority_fanout_routed_n2");
+        let peer =
+            AuthorityFanoutPeer::new(vec![(target.clone(), Duration::from_millis(600))], vec![]);
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            [target.clone()],
+            sync_peer,
+            Duration::from_secs(2),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport.set_operation_deadline(Some(deadline));
+        let groups = authority_fanout_groups(&local, std::slice::from_ref(&target));
+        let mut fanout = transport
+            .start_metadata_authority_fanout(&groups, deadline)
+            .expect("authority fan-out")
+            .expect("blocking peer retained");
+        let mut command = groups[0].command.clone();
+        command.request_id = "authority-fanout-routed-hedge".into();
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: target.clone(),
+            frame_id: 41,
+            message_id: 41,
+            message: DfsNetworkMessage::MetadataJournalBatch(command),
+        };
+
+        assert!(
+            transport
+                .send_routed_message_on_metadata_authority_fanout(&mut fanout, message)
+                .expect("routed fan-out call")
+                .is_none(),
+            "the routed call runs beside the slow direct call"
+        );
+        assert_eq!(fanout.in_flight(), 2);
+        let Some(DfsMetadataAuthorityFanoutEvent::Routed {
+            target_node_id,
+            result,
+        }) = fanout.next_event(deadline)
+        else {
+            panic!("the routed reply arrives before the slow direct reply");
+        };
+        assert_eq!(target_node_id, target);
+        transport
+            .deliver_metadata_authority_fanout_replies(result.expect("routed reply"))
+            .expect("ordinary reply custody");
+        let delivered = transport.drain_incoming_messages().unwrap();
+        assert!(
+            matches!(delivered.as_slice(), [DfsRoutedMessage {
+                message: DfsNetworkMessage::MetadataJournalBatchResponse(response),
+                ..
+            }] if response.request_id == "authority-fanout-routed-hedge"),
+            "{delivered:?}"
+        );
+        assert!(matches!(
+            fanout.next_event(deadline),
+            Some(DfsMetadataAuthorityFanoutEvent::Direct { result: Ok(_), .. })
+        ));
+        assert_eq!(*peer.routed_targets.lock().unwrap(), vec![target]);
+    }
+
+    /// Receives a direct metadata prepare one 16 KiB chunk at a time.
+    struct SlowUploadPeer {
+        chunk_delay: Duration,
+    }
+
+    impl DfsPeerTransport for SlowUploadPeer {
+        fn call_object_rpc(
+            &self,
+            _target_node_id: &NodeId,
+            _call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            Err(DfsPeerTransportError::new("slow upload peer is async only"))
+        }
+    }
+
+    impl AsyncDfsPeerTransport for SlowUploadPeer {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            _target_node_id: &'a NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            Box::pin(async move {
+                let error = |source: std::io::Error| DfsPeerTransportError::new(source.to_string());
+                let (mut incoming, producer) = call
+                    .into_test_incoming(&tokio::runtime::Handle::current())
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                let mut body = Vec::new();
+                while let Some(chunk) = incoming.body.next_chunk().await.map_err(error)? {
+                    body.extend_from_slice(&chunk);
+                    drop(chunk);
+                    tokio::time::sleep(self.chunk_delay).await;
+                }
+                let _ = producer.await;
+                let command: DfsMetadataJournalBatchCommand = SinomoObjectCodec::network_frame()
+                    .decode(&body)
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                ObjectRpcResponse::encode_body(
+                    &incoming.request.route,
+                    &AuthorityFanoutPeer::applied(&command),
+                )
+                .map(ObjectRpcResult::value)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_direct_upload_reports_advancing_progress_between_hedges() {
+        let local = node_id("node_authority_fanout_slow_upload_n1");
+        let target = node_id("node_authority_fanout_slow_upload_n2");
+        let peer = Arc::new(SlowUploadPeer {
+            chunk_delay: Duration::from_millis(40),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer;
+        let mut transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            [target.clone()],
+            sync_peer,
+            async_peer,
+            Duration::from_secs(2),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        transport.set_operation_deadline(Some(deadline));
+        let mut groups = authority_fanout_groups(&local, std::slice::from_ref(&target));
+        groups[0].command.batch.journal_frames = (4..=7)
+            .map(|sequence| crate::DfsMetadataJournalFrameRecord {
+                sequence,
+                exact_bytes: bytes::Bytes::from(vec![sequence as u8; 64 * 1024]),
+            })
+            .collect();
+        let mut fanout = transport
+            .start_metadata_authority_fanout(&groups, deadline)
+            .expect("authority fan-out")
+            .expect("async peer retained");
+
+        // Sample progress twice, one hedge interval apart, while the upload of
+        // a 256 KiB prepare runs at about 400 KiB/s.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let earlier = fanout.direct_upload_bytes(&target).unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let later = fanout.direct_upload_bytes(&target).unwrap();
+        assert!(earlier > 0, "the upload has started: {earlier}");
+        assert!(
+            later > earlier,
+            "a slow but progressing upload advances between hedges: {earlier} -> {later}"
+        );
+        assert!(matches!(
+            fanout.next_event(deadline),
+            Some(DfsMetadataAuthorityFanoutEvent::Direct { result: Ok(_), .. })
+        ));
+        assert!(fanout.direct_upload_bytes(&target).unwrap() >= 256 * 1024);
+    }
+
+    #[test]
+    fn saturated_blocking_workers_leave_authority_targets_without_a_direct_call() {
+        let local = node_id("node_authority_fanout_saturated_n1");
+        let target = node_id("node_authority_fanout_saturated_n2");
+        let peer = AuthorityFanoutPeer::new(Vec::new(), Vec::new());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            [target.clone()],
+            sync_peer,
+            Duration::from_secs(2),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        transport.set_operation_deadline(Some(deadline));
+        transport.blocking_metadata_fanout_workers.store(
+            DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT,
+            AtomicOrdering::Release,
+        );
+        let groups = authority_fanout_groups(&local, std::slice::from_ref(&target));
+
+        let mut fanout = transport
+            .start_metadata_authority_fanout(&groups, deadline)
+            .expect("authority fan-out")
+            .expect("blocking peer retained");
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: target.clone(),
+            frame_id: 42,
+            message_id: 42,
+            message: DfsNetworkMessage::MetadataJournalBatch(groups[0].command.clone()),
+        };
+        let returned = transport
+            .send_routed_message_on_metadata_authority_fanout(&mut fanout, message)
+            .expect("routed fan-out call");
+        transport
+            .blocking_metadata_fanout_workers
+            .store(0, AtomicOrdering::Release);
+
+        assert!(!fanout.has_direct_call(&target));
+        assert_eq!(fanout.in_flight(), 0);
+        assert!(
+            returned.is_some(),
+            "without a worker the caller keeps its ordinary routed send"
+        );
+        assert!(peer.direct_timeouts.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -10133,5 +11152,15 @@ impl DfsNodeTransport {
         let attempts = Arc::new(StdAtomicUsize::new(0));
         self.test_routed_call_attempts = Some(Arc::clone(&attempts));
         attempts
+    }
+
+    /// Record `(target, journal frame count)` for each metadata journal batch
+    /// started on an authority fan-out's routed path.
+    pub(crate) fn observe_metadata_authority_routed_sends_for_test(
+        &mut self,
+    ) -> Arc<std::sync::Mutex<Vec<(NodeId, usize)>>> {
+        let sends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.test_metadata_authority_routed_sends = Some(Arc::clone(&sends));
+        sends
     }
 }

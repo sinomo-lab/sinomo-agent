@@ -12,20 +12,26 @@ use std::time::{Duration, Instant};
 
 use crate::*;
 
-const DFS_METADATA_AUTHORITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+/// A replica whose direct prepare has not answered by this point, and again
+/// after each further interval, also gets an empty confirmation over the
+/// routed path. This is only a hedge timer: the direct call keeps running
+/// under the operation deadline.
+const DFS_METADATA_AUTHORITY_HEDGE_AFTER: Duration = Duration::from_millis(250);
 /// Bound authority-side preparation when an inbound served request carries no
 /// caller deadline. Healthy operations finish far inside this cap; reaching it
 /// means full-participant publication is unavailable for this operation.
 const DFS_METADATA_AUTHORITY_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Every authority round gets at least this much network time unless the
+/// caller's own deadline is shorter. A prepare round trip over a poor mobile
+/// link commonly takes a few hundred milliseconds before any upload time.
+const DFS_METADATA_AUTHORITY_MIN_NETWORK_DEADLINE: Duration = Duration::from_secs(1);
 // Namespace ACKs share one durable exact-frame path regardless of record
-// count. Give that path enough time to get behind an already-running bounded
-// materialization pass; abandoning it after the ordinary 250ms probe budget
-// turns a sub-second wait into a multi-second cluster-quorum fallback.
-const DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-const DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT: Duration = Duration::from_millis(5);
+// count, which can sit behind an already-running bounded materialization pass.
+// An empty confirmation sent after the ordinary 250ms would queue behind the
+// same pass, so namespace prepares wait longer before hedging.
+const DFS_METADATA_AUTHORITY_NAMESPACE_HEDGE_AFTER: Duration = Duration::from_secs(1);
 
-fn metadata_authority_probe_timeout(
-    _shard: &DfsMetadataShardConfig,
+fn metadata_authority_hedge_after(
     operation: &DfsMetadataAuthorityOperation,
     prepared_batch: &DfsMetadataJournalBatch,
 ) -> Duration {
@@ -34,8 +40,121 @@ fn metadata_authority_probe_timeout(
     } = operation;
     if prepared_batch.entries.iter().any(|entry| entry.sequence == *prepare_sequence && matches!(
         &entry.mutation, DfsMetadataMutation::PrepareOperationV7 { record, .. } if record.payload.prepared_intent.is_none())) {
-        DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT
-    } else { DFS_METADATA_AUTHORITY_PROBE_TIMEOUT }
+        DFS_METADATA_AUTHORITY_NAMESPACE_HEDGE_AFTER
+    } else { DFS_METADATA_AUTHORITY_HEDGE_AFTER }
+}
+
+/// The deadline for one authority round started at `now`: the operation
+/// deadline, raised to the minimum network time when only the internal cap
+/// would leave less. The caller's own deadline always wins.
+fn metadata_authority_round_deadline(
+    operation_deadline: Instant,
+    caller_deadline: Option<Instant>,
+    now: Instant,
+) -> Instant {
+    let deadline = now
+        .checked_add(DFS_METADATA_AUTHORITY_MIN_NETWORK_DEADLINE)
+        .map_or(operation_deadline, |floor| operation_deadline.max(floor));
+    caller_deadline.map_or(deadline, |caller| deadline.min(caller))
+}
+
+/// How one direct prepare reply bears on its target's acknowledgement.
+enum MetadataAuthorityDirectReply {
+    Acknowledged,
+    Rejected,
+    Unconfirmed,
+}
+
+fn metadata_authority_direct_reply(
+    command: &DfsMetadataJournalBatchCommand,
+    response: &DfsMetadataJournalBatchResponse,
+) -> MetadataAuthorityDirectReply {
+    let correlated = response.request_id == command.request_id
+        && response.shard_id == command.batch.shard_id
+        && response.next_after_sequence == command.batch.next_after_sequence
+        && !response.verified_prefix_only;
+    let expected_confirmation_id = command
+        .authority_probe
+        .as_ref()
+        .and_then(metadata_authority_probe_confirmation_id);
+    if correlated
+        && response.result == DfsMetadataJournalBatchResult::Applied
+        && response.verified_authority_probe_id.as_deref() == expected_confirmation_id.as_deref()
+    {
+        MetadataAuthorityDirectReply::Acknowledged
+    } else if correlated
+        && response.verified_authority_probe_id.is_none()
+        && matches!(&response.result,
+            DfsMetadataJournalBatchResult::Rejected { code, .. }
+                if *code != DfsMetadataRejectionCode::PrimaryMismatch)
+    {
+        MetadataAuthorityDirectReply::Rejected
+    } else {
+        MetadataAuthorityDirectReply::Unconfirmed
+    }
+}
+
+/// The empty confirmation sent as a hedge: the same operation and exact
+/// prefix challenge, without journal frames.
+fn metadata_authority_hedge_command(
+    command: &DfsMetadataJournalBatchCommand,
+) -> DfsMetadataJournalBatchCommand {
+    DfsMetadataJournalBatchCommand {
+        request_id: command.request_id.clone(),
+        source_node_id: command.source_node_id.clone(),
+        file_system_id: command.file_system_id.clone(),
+        authority_epoch: command.authority_epoch,
+        verify_prefix_only: false,
+        prefix_probe: None,
+        authority_probe: command.authority_probe.clone(),
+        durable_replication: None,
+        batch: DfsMetadataJournalFrameBatch {
+            shard_id: command.batch.shard_id.clone(),
+            next_after_sequence: command.batch.next_after_sequence,
+            journal_frames: Vec::new(),
+        },
+    }
+}
+
+/// Where the reply to one routed authority request arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataAuthorityRoutedDelivery {
+    /// As one fan-out event.
+    Fanout,
+    /// Through the transport's ordinary inbound messages.
+    Inbound,
+}
+
+#[derive(Debug)]
+struct MetadataAuthorityRoutedRequest {
+    request_id: String,
+    target_node_id: NodeId,
+    hedge: Option<MetadataAuthorityHedge>,
+    delivery: MetadataAuthorityRoutedDelivery,
+}
+
+/// One empty confirmation sent while the target's direct prepare is in flight.
+#[derive(Debug)]
+struct MetadataAuthorityHedge {
+    /// Direct-call request bytes handed to the network when the previous
+    /// hedge to this target was sent; `None` for the first hedge.
+    previous_upload_bytes: Option<u64>,
+    /// Whether its unconfirmed reply has already been judged.
+    judged: bool,
+}
+
+/// A hedge reply that does not confirm the prepare means the replica does not
+/// hold it yet. The direct upload is then stalled when it handed no further
+/// request bytes to the network since the previous hedge; a still-advancing
+/// upload is left alone so a slow link does not carry the body twice.
+fn metadata_authority_upload_stalled(
+    previous_upload_bytes: Option<u64>,
+    current_upload_bytes: Option<u64>,
+) -> bool {
+    matches!(
+        (previous_upload_bytes, current_upload_bytes),
+        (Some(previous), Some(current)) if current <= previous
+    )
 }
 
 pub(crate) use crate::publication_guard::ShardFenceGuard;
@@ -216,13 +335,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // transport segments. Large prepares therefore use the same stream-
         // native replica path as small ones; semantic record count must never
         // change the required participant set.
-        let probe_timeout = metadata_authority_probe_timeout(shard, operation, prepared_batch);
+        let hedge_after = metadata_authority_hedge_after(operation, prepared_batch);
         let probe_started = Instant::now();
         let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
             shard,
             operation,
             prepared_batch,
-            probe_timeout,
+            hedge_after,
         )?;
         let trace_probe_ms = probe_started.elapsed().as_millis();
         #[cfg(any(test, feature = "test-support"))]
@@ -237,7 +356,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         serde_json::json!({
                             "source": self.node_id, "operation": operation, "expected_shard": shard,
                             "required": required_node_ids, "acknowledged": acknowledged_node_ids,
-                            "probe_timeout_ms": probe_timeout.as_millis(), "probe_elapsed_ms": trace_probe_ms,
+                            "probe_hedge_after_ms": hedge_after.as_millis(), "probe_elapsed_ms": trace_probe_ms,
                         })
                     },
                     false,
@@ -246,13 +365,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let trace_acknowledged = acknowledged_node_ids.len();
         dfs_perf_trace(format_args!(
-            "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={} timeout_ms={}",
+            "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={} hedge_after_ms={}",
             shard.shard_id,
             shard.epoch,
             prepared_batch.next_after_sequence,
             acknowledged_node_ids.len(),
             required_node_ids.len(),
-            probe_timeout.as_millis(),
+            hedge_after.as_millis(),
         ));
         if acknowledged_node_ids == required_node_ids {
             dfs_perf_trace(format_args!(
@@ -303,7 +422,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: &DfsMetadataShardConfig,
         operation: &DfsMetadataAuthorityOperation,
         prepared_batch: &DfsMetadataJournalBatch,
-        timeout: Duration,
+        hedge_after: Duration,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         let targets = shard
             .replica_node_ids
@@ -319,7 +438,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .checked_add(DFS_METADATA_AUTHORITY_OPERATION_TIMEOUT)
             .unwrap_or_else(Instant::now);
         let observed_previous_deadline = self.transport.operation_deadline();
-        let effective_operation_deadline = observed_previous_deadline
+        let mut effective_operation_deadline = observed_previous_deadline
             .map_or(fallback_deadline, |deadline| {
                 deadline.min(fallback_deadline)
             });
@@ -335,7 +454,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prepared_batch,
                 targets.clone(),
                 effective_operation_deadline,
-                timeout,
+                hedge_after,
                 &mut rejected_node_ids,
             )?;
             self.check_cancelled("metadata authority result")?;
@@ -407,6 +526,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // Discard every old ACK. The same immutable preparation is checked
             // again against the current exact prefix with new nonces on ALL
             // assigned replicas. No further catch-up round is started here.
+            // Catch-up can consume most of the internal cap; the refreshed
+            // round still receives a usable network deadline.
+            effective_operation_deadline = metadata_authority_round_deadline(
+                effective_operation_deadline,
+                observed_previous_deadline,
+                Instant::now(),
+            );
+            self.transport
+                .set_operation_deadline(Some(effective_operation_deadline));
             let mut rejected_again = BTreeSet::new();
             let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
                 shard,
@@ -414,7 +542,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prepared_batch,
                 targets,
                 effective_operation_deadline,
-                timeout,
+                hedge_after,
                 &mut rejected_again,
             )?;
             self.check_cancelled("metadata authority refreshed result")?;
@@ -449,7 +577,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         prepared_batch: &DfsMetadataJournalBatch,
         targets: BTreeSet<NodeId>,
         operation_deadline: Instant,
-        timeout: Duration,
+        hedge_after: Duration,
         rejected_node_ids: &mut BTreeSet<NodeId>,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         #[cfg(any(test, feature = "test-support"))]
@@ -464,11 +592,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_unavailable = Vec::new();
         #[cfg(any(test, feature = "test-support"))]
-        let mut diagnostic_direct = None;
+        let mut diagnostic_direct = Vec::new();
         #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_routed = Vec::new();
         let mut request_ids = Vec::with_capacity(targets.len());
-        let mut request_targets = Vec::with_capacity(targets.len());
+        let mut routed_requests =
+            Vec::<MetadataAuthorityRoutedRequest>::with_capacity(targets.len());
         let mut acknowledged_node_ids = BTreeSet::from([self.node_id.clone()]);
         let required_acknowledgements = targets.len() + 1;
         if Instant::now() >= operation_deadline {
@@ -604,10 +733,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     command,
                 ));
             }
-            // Replayable object-RPC construction can encode a multi-megabyte
-            // catch-up value. The duration-aware transport keeps that local
-            // work under `operation_deadline` and begins this shorter budget
-            // only after encoding, immediately before peer fan-out.
             #[cfg(any(test, feature = "test-support"))]
             if diagnostic_root.is_some() {
                 diagnostic_groups = authority_groups
@@ -623,251 +748,353 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                     .collect::<Vec<_>>();
             }
-            let direct_result = self
+            // Every target's prepare starts at once on the canonical metadata
+            // route, each group encoded once. A call's network deadline is the
+            // operation deadline: a prepare over a poor mobile link commonly
+            // needs a few hundred milliseconds, so `hedge_after` only decides
+            // when a still-silent target also gets an empty routed confirmation.
+            let mut fanout = self
                 .transport
-                .send_grouped_metadata_journal_batches_direct_with_response_timeout(
-                    &authority_groups,
-                    timeout,
-                );
-            #[cfg(any(test, feature = "test-support"))]
-            if diagnostic_root.is_some() {
-                diagnostic_direct = Some(direct_result.clone());
+                .start_metadata_authority_fanout(&authority_groups, operation_deadline)
+                // The direct route is an accelerator. Without it every target
+                // receives its prepare over the ordinary routed path below.
+                .unwrap_or(None);
+            let mut next_hedge_at = Instant::now()
+                .checked_add(hedge_after)
+                .unwrap_or(operation_deadline);
+            let mut hedge_upload_bytes = BTreeMap::<NodeId, u64>::new();
+            // Cancellation wakes whichever wait the loop below is in. Register
+            // before its first cancellation check so no cancellation is missed.
+            let fanout_waker = fanout.as_ref().map(DfsMetadataAuthorityFanout::waker);
+            let incoming_waker = self.transport.incoming_wait_waker();
+            let cancellation_waker: crate::service_state::DfsCancellationWaker =
+                std::sync::Arc::new(move || {
+                    if let Some(waker) = &fanout_waker {
+                        waker();
+                    }
+                    if let Some(waker) = &incoming_waker {
+                        waker();
+                    }
+                });
+            let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
+            let mut direct_in_flight = BTreeSet::new();
+            let mut needs_routed_prepare = Vec::new();
+            for target_node_id in authority_groups
+                .iter()
+                .flat_map(|group| &group.target_node_ids)
+            {
+                if fanout
+                    .as_ref()
+                    .is_some_and(|fanout| fanout.has_direct_call(target_node_id))
+                {
+                    direct_in_flight.insert(target_node_id.clone());
+                } else {
+                    needs_routed_prepare.push(target_node_id.clone());
+                }
             }
-            match direct_result {
-                Ok(Some(responses)) => {
-                    let mut cursors = Vec::new();
-                    for group in &authority_groups {
-                        let expected_confirmation_id = group
-                            .command
-                            .authority_probe
+            let mut routed_prepares = BTreeSet::new();
+            let mut fanout_routed_in_flight = BTreeMap::<NodeId, usize>::new();
+            let mut routed_acknowledged = Vec::new();
+            loop {
+                self.check_cancelled("metadata authority acknowledgement")?;
+                // A target without a usable direct reply receives its prepare
+                // over the routed path as soon as that is known.
+                for target_node_id in std::mem::take(&mut needs_routed_prepare) {
+                    if acknowledged_node_ids.contains(&target_node_id)
+                        || rejected_node_ids.contains(&target_node_id)
+                        || !routed_prepares.insert(target_node_id.clone())
+                    {
+                        continue;
+                    }
+                    if Instant::now() >= operation_deadline {
+                        return Ok(acknowledged_node_ids);
+                    }
+                    let group = authority_groups
+                        .iter()
+                        .find(|group| group.target_node_ids.contains(&target_node_id))
+                        .expect("every authority target belongs to one group");
+                    // Journal frames are shared `Bytes`: this per-target command
+                    // copies only identities, not the prepared body.
+                    let request = self.send_metadata_authority_request_routed(
+                        fanout.as_mut(),
+                        &target_node_id,
+                        group.command.clone(),
+                        shard,
+                        None,
+                        &mut request_ids,
+                    )?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if diagnostic_root.is_some() {
+                        diagnostic_routed.push(format!("prepare {target_node_id}: {request:?}"));
+                    }
+                    if let Some(request) = request {
+                        if request.delivery == MetadataAuthorityRoutedDelivery::Fanout {
+                            *fanout_routed_in_flight
+                                .entry(target_node_id.clone())
+                                .or_default() += 1;
+                        }
+                        routed_requests.push(request);
+                    }
+                }
+                // A slow direct call keeps running. Once per hedge interval its
+                // target also gets an empty confirmation, which succeeds once
+                // that replica holds the prepared prefix; whichever exact ACK
+                // arrives first counts.
+                let hedge_targets = direct_in_flight
+                    .iter()
+                    .filter(|target_node_id| {
+                        !acknowledged_node_ids.contains(*target_node_id)
+                            && !rejected_node_ids.contains(*target_node_id)
+                            && !routed_prepares.contains(*target_node_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !hedge_targets.is_empty() && Instant::now() >= next_hedge_at {
+                    next_hedge_at = Instant::now()
+                        .checked_add(hedge_after)
+                        .unwrap_or(operation_deadline);
+                    for target_node_id in hedge_targets {
+                        if Instant::now() >= operation_deadline {
+                            return Ok(acknowledged_node_ids);
+                        }
+                        let group = authority_groups
+                            .iter()
+                            .find(|group| group.target_node_ids.contains(&target_node_id))
+                            .expect("every authority target belongs to one group");
+                        let upload_bytes = fanout
                             .as_ref()
-                            .and_then(metadata_authority_probe_confirmation_id);
-                        for target_node_id in &group.target_node_ids {
-                            let Some((_, response)) = responses
-                                .iter()
-                                .find(|(response_node_id, _)| response_node_id == target_node_id)
-                            else {
-                                continue;
-                            };
-                            if response.request_id == group.command.request_id
-                                && response.shard_id == group.command.batch.shard_id
-                                && response.next_after_sequence
-                                    == group.command.batch.next_after_sequence
-                                && !response.verified_prefix_only
-                                && response.verified_authority_probe_id.is_none()
-                                && matches!(&response.result,
-                                    DfsMetadataJournalBatchResult::Rejected { code, .. }
-                                        if *code != DfsMetadataRejectionCode::PrimaryMismatch)
-                            {
-                                rejected_node_ids.insert(target_node_id.clone());
+                            .and_then(|fanout| fanout.direct_upload_bytes(&target_node_id))
+                            .unwrap_or_default();
+                        let hedge = MetadataAuthorityHedge {
+                            previous_upload_bytes: hedge_upload_bytes
+                                .insert(target_node_id.clone(), upload_bytes),
+                            judged: false,
+                        };
+                        let request = self.send_metadata_authority_request_routed(
+                            fanout.as_mut(),
+                            &target_node_id,
+                            metadata_authority_hedge_command(&group.command),
+                            shard,
+                            Some(hedge),
+                            &mut request_ids,
+                        )?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if diagnostic_root.is_some() {
+                            diagnostic_routed.push(format!("hedge {target_node_id}: {request:?}"));
+                        }
+                        if let Some(request) = request {
+                            if request.delivery == MetadataAuthorityRoutedDelivery::Fanout {
+                                *fanout_routed_in_flight
+                                    .entry(target_node_id.clone())
+                                    .or_default() += 1;
                             }
-                            if response.request_id != group.command.request_id
-                                || response.shard_id != group.command.batch.shard_id
-                                || response.next_after_sequence
-                                    != group.command.batch.next_after_sequence
-                                || response.verified_prefix_only
-                                || response.result != DfsMetadataJournalBatchResult::Applied
-                                || response.verified_authority_probe_id.as_deref()
-                                    != expected_confirmation_id.as_deref()
-                            {
-                                continue;
-                            }
-                            cursors.push((
-                                target_node_id.clone(),
-                                group.command.batch.next_after_sequence,
-                            ));
-                            #[cfg(any(test, feature = "test-support"))]
-                            if let Some(mut trace) =
-                                crate::native_shard_trace::current_boundary_interest()
-                            {
-                                trace.observe(
-                                    crate::native_shard_trace::NativeBoundaryFactsV1::SourceJournalResponseAccepted {
-                                        authenticated_source_node_id: target_node_id.clone(),
-                                        response: response.clone(),
-                                        expected_target_node_id: target_node_id.clone(),
-                                        expected_next_after_sequence: group.command.batch.next_after_sequence,
-                                        expected_prefix_only: false,
-                                        expected_confirmation_id: expected_confirmation_id.clone(),
-                                    }, None, None,
-                                );
-                            }
-                            acknowledged_node_ids.insert(target_node_id.clone());
+                            routed_requests.push(request);
                         }
                     }
+                }
+                // Routed replies arrive as ordinary inbound messages. Direct
+                // replies do not, so a round answered only on the direct route
+                // processes no unrelated inbound work.
+                let events = if routed_requests.is_empty() {
+                    Vec::new()
+                } else {
+                    self.process_incoming()?
+                };
+                for event in events {
+                    // A hedge rejection only shows that the replica has not yet
+                    // applied the prepare still in flight on its direct call.
+                    if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                        request_id,
+                        source_node_id,
+                        shard_id,
+                        ..
+                    } = event
+                        && shard_id == prepared_batch.shard_id
+                        && routed_requests.iter().any(|request| {
+                            request.hedge.is_none()
+                                && request.request_id == request_id
+                                && request.target_node_id == source_node_id
+                        })
+                    {
+                        rejected_node_ids.insert(source_node_id);
+                    }
+                }
+                let mut inbound_pending = BTreeSet::new();
+                for request in &mut routed_requests {
+                    match self
+                        .replication
+                        .metadata_authority_probe_results
+                        .get(&request.request_id)
+                    {
+                        Some(true) => {
+                            if acknowledged_node_ids.insert(request.target_node_id.clone()) {
+                                routed_acknowledged.push(request.target_node_id.clone());
+                            }
+                        }
+                        Some(false) => {
+                            let target_node_id = &request.target_node_id;
+                            if let Some(hedge) =
+                                request.hedge.as_mut().filter(|hedge| !hedge.judged)
+                            {
+                                hedge.judged = true;
+                                // Send the body routed once; the direct call may
+                                // keep running and whichever ACK arrives first counts.
+                                if direct_in_flight.contains(target_node_id)
+                                    && !acknowledged_node_ids.contains(target_node_id)
+                                    && !routed_prepares.contains(target_node_id)
+                                    && metadata_authority_upload_stalled(
+                                        hedge.previous_upload_bytes,
+                                        fanout.as_ref().and_then(|fanout| {
+                                            fanout.direct_upload_bytes(target_node_id)
+                                        }),
+                                    )
+                                {
+                                    needs_routed_prepare.push(target_node_id.clone());
+                                }
+                            }
+                        }
+                        None if request.delivery == MetadataAuthorityRoutedDelivery::Inbound => {
+                            inbound_pending.insert(request.target_node_id.clone());
+                        }
+                        None => {}
+                    }
+                }
+                if acknowledged_node_ids.len() == required_acknowledgements {
+                    let cursors = routed_acknowledged
+                        .iter()
+                        .map(|node| (node.clone(), prepared_prefix.journal_sequence))
+                        .collect::<Vec<_>>();
                     self.record_metadata_authority_replication_cursors(
                         &prepared_batch.shard_id,
                         &cursors,
                     );
-                    if acknowledged_node_ids.len() == required_acknowledgements {
-                        return Ok(acknowledged_node_ids);
-                    }
+                    return Ok(acknowledged_node_ids);
                 }
-                Ok(None) => {}
-                Err(_) => {}
-            }
-
-            // Routed responses are correlated through one process-wide pending
-            // map. Only transports without the grouped direct accelerator pay
-            // to materialize one command per target, each with a unique wire
-            // identity. Move the last command in each group to avoid retaining
-            // an otherwise unused extra copy even on this compatibility path.
-            self.check_cancelled("metadata authority fallback")?;
-            let mut authority_requests = Vec::with_capacity(required_acknowledgements - 1);
-            for group in authority_groups {
-                let unresolved_target_node_ids = group
-                    .target_node_ids
-                    .into_iter()
-                    .filter(|target_node_id| {
+                let unresolved = authority_groups
+                    .iter()
+                    .flat_map(|group| &group.target_node_ids)
+                    .any(|target_node_id| {
                         !acknowledged_node_ids.contains(target_node_id)
                             && !rejected_node_ids.contains(target_node_id)
-                    })
-                    .collect::<Vec<_>>();
-                let target_count = unresolved_target_node_ids.len();
-                let mut shared_command = Some(group.command);
-                for (target_index, target_node_id) in
-                    unresolved_target_node_ids.into_iter().enumerate()
-                {
-                    if Instant::now() >= operation_deadline {
-                        return Ok(acknowledged_node_ids);
-                    }
-                    let mut command = if target_index + 1 == target_count {
-                        shared_command
-                            .take()
-                            .expect("last routed target owns grouped authority command")
-                    } else {
-                        shared_command
-                            .as_ref()
-                            .expect("grouped authority command remains available")
-                            .clone()
-                    };
-                    command.request_id = self.next_request_id();
-                    command
-                        .authority_probe
-                        .as_mut()
-                        .expect("authority request carries probe")
-                        .probe_id = sinomo_core::Id::generate().to_string();
-                    authority_requests.push((target_node_id, command));
+                            && (direct_in_flight.contains(target_node_id)
+                                || fanout_routed_in_flight
+                                    .get(target_node_id)
+                                    .is_some_and(|count| *count > 0)
+                                || inbound_pending.contains(target_node_id))
+                    });
+                if !unresolved {
+                    return Ok(acknowledged_node_ids);
                 }
-            }
-            // The short direct probe is an accelerator, not a second semantic
-            // deadline. Its routed continuation still owns the same original
-            // operation budget; do not abandon a real missing ACK early or
-            // restart that budget after local preparation/direct dispatch.
-            let response_deadline = operation_deadline;
-            if Instant::now() >= response_deadline {
-                return Ok(acknowledged_node_ids);
-            }
-            let observed_previous_deadline = self.transport.operation_deadline();
-            let replaced_previous_deadline = self
-                .transport
-                .set_operation_deadline(Some(response_deadline));
-            let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
-            let routed_result = (|| {
-                for (target_node_id, command) in authority_requests {
-                    let request_id = command.request_id.clone();
-                    let confirmation_id = metadata_authority_probe_confirmation_id(
-                        command
-                            .authority_probe
-                            .as_ref()
-                            .expect("authority request carries probe"),
-                    )
-                    .expect("prepared authority probe has an exact prefix confirmation");
-                    self.replication.pending_metadata_authority_probes.insert(
-                        request_id.clone(),
-                        PendingMetadataAuthorityProbe {
-                            target_node_id: target_node_id.clone(),
-                            confirmation_id,
-                            expected_shard: shard.clone(),
-                            expected_next_after_sequence: command.batch.next_after_sequence,
-                        },
-                    );
-                    let sent_result = self.send_dfs_message_if_routable(
-                        &target_node_id,
-                        DfsNetworkMessage::MetadataJournalBatch(command),
-                    );
-                    #[cfg(any(test, feature = "test-support"))]
-                    if diagnostic_root.is_some() {
-                        diagnostic_routed.push((
-                            target_node_id.clone(),
-                            request_id.clone(),
-                            sent_result.clone(),
-                        ));
-                    }
-                    let sent = match sent_result {
-                        Ok(sent) => sent,
-                        Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => false,
-                        Err(error) => return Err(error),
-                    };
-                    if !sent {
-                        self.replication
-                            .pending_metadata_authority_probes
-                            .remove(&request_id);
-                        continue;
-                    }
-                    request_ids.push(request_id.clone());
-                    request_targets.push((request_id, target_node_id));
+                let now = Instant::now();
+                if now >= operation_deadline {
+                    return Ok(acknowledged_node_ids);
                 }
-                loop {
-                    self.check_cancelled("metadata authority acknowledgement")?;
-                    for event in self.process_incoming()? {
-                        if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
-                            request_id,
-                            source_node_id,
-                            shard_id,
-                            ..
-                        } = event
-                            && shard_id == prepared_batch.shard_id
-                            && request_targets.iter().any(|(pending_id, target)| {
-                                pending_id == &request_id && target == &source_node_id
-                            })
-                        {
-                            rejected_node_ids.insert(source_node_id);
-                        }
-                    }
-                    let mut unresolved = false;
-                    for (request_id, target_node_id) in &request_targets {
-                        match self
-                            .replication
-                            .metadata_authority_probe_results
-                            .get(request_id)
-                        {
-                            Some(true) => {
-                                acknowledged_node_ids.insert(target_node_id.clone());
-                            }
-                            Some(false) => {}
-                            None => unresolved = true,
-                        }
-                    }
-                    if acknowledged_node_ids.len() == required_acknowledgements {
-                        let acknowledged_replicas = acknowledged_node_ids
-                            .iter()
-                            .filter(|id| *id != &self.node_id)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let cursors = acknowledged_replicas
-                            .into_iter()
-                            .map(|node| (node, prepared_prefix.journal_sequence))
-                            .collect::<Vec<_>>();
-                        self.record_metadata_authority_replication_cursors(
-                            &prepared_batch.shard_id,
-                            &cursors,
-                        );
-                        return Ok(acknowledged_node_ids);
-                    }
-                    if !unresolved {
-                        return Ok(acknowledged_node_ids);
-                    }
-                    let Some(remaining) = response_deadline.checked_duration_since(Instant::now())
-                    else {
-                        return Ok(acknowledged_node_ids);
-                    };
+                // A stalled upload found from a hedge reply sends its body now.
+                if !needs_routed_prepare.is_empty() {
+                    continue;
+                }
+                // The hedge timer is the only timer; replies, completions and
+                // cancellation wake the wait below.
+                let mut wake_at = operation_deadline;
+                if direct_in_flight.iter().any(|target_node_id| {
+                    !acknowledged_node_ids.contains(target_node_id)
+                        && !rejected_node_ids.contains(target_node_id)
+                        && !routed_prepares.contains(target_node_id)
+                }) {
+                    wake_at = wake_at.min(next_hedge_at);
+                }
+                let Some(fanout) = fanout.as_mut().filter(|fanout| fanout.in_flight() > 0) else {
+                    // Only ordinary routed replies remain outstanding.
                     self.transport
-                        .wait_for_incoming(DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT.min(remaining))
+                        .wait_for_incoming(wake_at.saturating_duration_since(now))
                         .map_err(DfsError::from_network)?;
+                    continue;
+                };
+                match fanout.next_event(wake_at) {
+                    None => {}
+                    Some(DfsMetadataAuthorityFanoutEvent::Direct {
+                        target_node_id,
+                        result,
+                    }) => {
+                        direct_in_flight.remove(&target_node_id);
+                        #[cfg(any(test, feature = "test-support"))]
+                        if diagnostic_root.is_some() {
+                            diagnostic_direct.push(format!("{target_node_id}: {result:?}"));
+                        }
+                        // After the first exact ACK, later replies for the same
+                        // target change nothing.
+                        if acknowledged_node_ids.contains(&target_node_id) {
+                            continue;
+                        }
+                        let group = authority_groups
+                            .iter()
+                            .find(|group| group.target_node_ids.contains(&target_node_id))
+                            .expect("every authority target belongs to one group");
+                        let reply = result.map(|response| {
+                            let reply = metadata_authority_direct_reply(&group.command, &response);
+                            (reply, response)
+                        });
+                        match reply {
+                            Ok((MetadataAuthorityDirectReply::Acknowledged, _response)) => {
+                                #[cfg(any(test, feature = "test-support"))]
+                                if let Some(mut trace) =
+                                    crate::native_shard_trace::current_boundary_interest()
+                                {
+                                    trace.observe(
+                                        crate::native_shard_trace::NativeBoundaryFactsV1::SourceJournalResponseAccepted {
+                                            authenticated_source_node_id: target_node_id.clone(),
+                                            response: _response,
+                                            expected_target_node_id: target_node_id.clone(),
+                                            expected_next_after_sequence: group.command.batch.next_after_sequence,
+                                            expected_prefix_only: false,
+                                            expected_confirmation_id: group
+                                                .command
+                                                .authority_probe
+                                                .as_ref()
+                                                .and_then(metadata_authority_probe_confirmation_id),
+                                        }, None, None,
+                                    );
+                                }
+                                self.record_metadata_authority_replication_cursors(
+                                    &prepared_batch.shard_id,
+                                    &[(
+                                        target_node_id.clone(),
+                                        group.command.batch.next_after_sequence,
+                                    )],
+                                );
+                                acknowledged_node_ids.insert(target_node_id);
+                            }
+                            Ok((MetadataAuthorityDirectReply::Rejected, _)) => {
+                                rejected_node_ids.insert(target_node_id);
+                            }
+                            // An unconfirmed reply or a failed direct call
+                            // gets the prepare over the routed path.
+                            Ok((MetadataAuthorityDirectReply::Unconfirmed, _)) | Err(_) => {
+                                needs_routed_prepare.push(target_node_id);
+                            }
+                        }
+                    }
+                    Some(DfsMetadataAuthorityFanoutEvent::Routed {
+                        target_node_id,
+                        result,
+                    }) => {
+                        if let Some(count) = fanout_routed_in_flight.get_mut(&target_node_id) {
+                            *count = count.saturating_sub(1);
+                        }
+                        // A routed delivery failure leaves that request
+                        // unacknowledged, exactly like an unroutable send.
+                        match result.and_then(|messages| {
+                            self.transport
+                                .deliver_metadata_authority_fanout_replies(messages)
+                        }) {
+                            Ok(()) => {}
+                            Err(error) => dfs_perf_trace(format_args!(
+                                "metadata_authority action=routed-unacknowledged target={target_node_id} error={error}"
+                            )),
+                        }
+                    }
                 }
-            })();
-            self.transport.set_operation_deadline(previous_deadline);
-            routed_result
+            }
         })();
         #[cfg(any(test, feature = "test-support"))]
         if let Some(root) = &diagnostic_root {
@@ -882,8 +1109,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "unavailable_batches": diagnostic_unavailable,
                         "actual_direct_result": format!("{diagnostic_direct:?}"),
                         "actual_routed_sends": format!("{diagnostic_routed:?}"),
-                        "requests": request_targets.iter().map(|(id, target)| serde_json::json!({
-                            "request_id": id, "target": target, "accepted": self.replication.metadata_authority_probe_results.get(id),
+                        "requests": routed_requests.iter().map(|request| serde_json::json!({
+                            "request_id": request.request_id, "target": request.target_node_id, "hedge": request.hedge.is_some(),
+                            "accepted": self.replication.metadata_authority_probe_results.get(&request.request_id),
                         })).collect::<Vec<_>>(),
                         "remaining_operation_ms": operation_deadline.saturating_duration_since(Instant::now()).as_millis(),
                     })
@@ -893,6 +1121,76 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.clear_metadata_authority_probe_requests(&request_ids);
         result
+    }
+
+    /// Send one authority prepare, or its empty hedge, over the routed path
+    /// with a fresh request and probe identity. Returns `None` when the target
+    /// is not routable now; that target stays unacknowledged.
+    fn send_metadata_authority_request_routed(
+        &mut self,
+        fanout: Option<&mut DfsMetadataAuthorityFanout>,
+        target_node_id: &NodeId,
+        mut command: DfsMetadataJournalBatchCommand,
+        shard: &DfsMetadataShardConfig,
+        hedge: Option<MetadataAuthorityHedge>,
+        request_ids: &mut Vec<String>,
+    ) -> Result<Option<MetadataAuthorityRoutedRequest>, DfsError> {
+        command.request_id = self.next_request_id();
+        let probe = command
+            .authority_probe
+            .as_mut()
+            .expect("authority request carries probe");
+        probe.probe_id = sinomo_core::Id::generate().to_string();
+        let confirmation_id = metadata_authority_probe_confirmation_id(probe)
+            .expect("prepared authority probe has an exact prefix confirmation");
+        let request_id = command.request_id.clone();
+        request_ids.push(request_id.clone());
+        self.replication.pending_metadata_authority_probes.insert(
+            request_id.clone(),
+            PendingMetadataAuthorityProbe {
+                target_node_id: target_node_id.clone(),
+                confirmation_id,
+                expected_shard: shard.clone(),
+                expected_next_after_sequence: command.batch.next_after_sequence,
+            },
+        );
+        let request = |delivery| MetadataAuthorityRoutedRequest {
+            request_id: request_id.clone(),
+            target_node_id: target_node_id.clone(),
+            hedge,
+            delivery,
+        };
+        let mut message = self.next_dfs_routed_message(
+            target_node_id,
+            DfsNetworkMessage::MetadataJournalBatch(command),
+        );
+        if let Some(fanout) = fanout {
+            match self
+                .transport
+                .send_routed_message_on_metadata_authority_fanout(fanout, message)
+            {
+                Ok(None) => return Ok(Some(request(MetadataAuthorityRoutedDelivery::Fanout))),
+                Ok(Some(returned)) => message = returned,
+                Err(_) => {
+                    self.replication
+                        .pending_metadata_authority_probes
+                        .remove(&request_id);
+                    return Ok(None);
+                }
+            }
+        }
+        let sent = match self.send_routed_dfs_message_if_routable(message) {
+            Ok(sent) => sent,
+            Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        if !sent {
+            self.replication
+                .pending_metadata_authority_probes
+                .remove(&request_id);
+            return Ok(None);
+        }
+        Ok(Some(request(MetadataAuthorityRoutedDelivery::Inbound)))
     }
 
     fn metadata_authority_replicated_through_sequence_for_target(
@@ -1665,6 +1963,25 @@ pub(crate) fn verify_persisted_metadata_authority_operation(
 #[cfg(test)]
 mod authority_cursor_tests {
     use super::*;
+
+    #[test]
+    fn an_unconfirmed_hedge_resends_the_body_only_without_upload_progress() {
+        // The first hedge has no earlier sample and only records one.
+        assert!(!metadata_authority_upload_stalled(None, Some(0)));
+        // No bytes handed to the network since the previous hedge.
+        assert!(metadata_authority_upload_stalled(Some(0), Some(0)));
+        assert!(metadata_authority_upload_stalled(
+            Some(64 * 1024),
+            Some(64 * 1024)
+        ));
+        // A slow but advancing upload is left alone.
+        assert!(!metadata_authority_upload_stalled(
+            Some(64 * 1024),
+            Some(80 * 1024)
+        ));
+        // Without a direct call there is no upload to judge.
+        assert!(!metadata_authority_upload_stalled(Some(0), None));
+    }
 
     #[test]
     fn unknown_outgoing_cursor_still_challenges_the_exact_original_and_current_cut() {

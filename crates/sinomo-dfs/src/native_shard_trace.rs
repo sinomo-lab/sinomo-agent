@@ -2345,6 +2345,19 @@ pub(crate) fn rpc_attempt_context() -> Option<NativeRpcAttemptContext> {
         ))
     })
 }
+/// Carry a caller's copy-only call observation interest onto the worker thread
+/// that performs that same call. The lease restores the worker's own context.
+pub(crate) fn enter_rpc_attempt_context(
+    context: Option<NativeRpcAttemptContext>,
+) -> NativeBoundaryContextLease {
+    let value = context.map(|context| NativeBoundaryContext {
+        capture: context.0,
+        resident_custody: None,
+        normal_replica_freeze_read_id: None,
+        pending_read_observations: Vec::new(),
+    });
+    NativeBoundaryContextLease(BOUNDARY_CONTEXT.with(|slot| slot.replace(value)))
+}
 /// Resolve only a copy observer for this normal source's already-owned root.
 /// Registry lookup creates no owner, authority read, or transport. The returned
 /// weak context carries no owner/file/admission lease into the actual future.

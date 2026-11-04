@@ -501,11 +501,14 @@ pub use maintenance_schedule::{
     dfs_maintenance_probe_is_due, dfs_maintenance_revalidation_decision,
     dfs_maintenance_should_launch,
 };
-pub(crate) use message_transport::DfsMetadataJournalBatchDirectGroup;
 pub use message_transport::{
     AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture,
     DfsOutboundAttachment, DfsRoutedCall, DfsRoutedSend, DfsRoutedSendOutcome,
     DfsTransportIdentity, materialize_dfs_routed_call_sync,
+};
+pub(crate) use message_transport::{
+    DfsMetadataAuthorityFanout, DfsMetadataAuthorityFanoutEvent, DfsMetadataAuthorityFanoutSignal,
+    DfsMetadataAuthorityFanoutWorkers, DfsMetadataJournalBatchDirectGroup,
 };
 pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,

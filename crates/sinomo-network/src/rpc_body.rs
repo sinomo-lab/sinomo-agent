@@ -5,7 +5,8 @@
 
 use crate::owned_chunk::{
     BODY_CHUNK_MAX, CHUNK_HEADROOM_BYTES, ChunkAllocator, ChunkLease, OwnedChunk,
-    PayloadCopyReason, SECURE_WIRE_MAX, observe_chunk_identity, record_shared_payload_copy,
+    PayloadCopyReason, ReceiveCreditLease, SECURE_WIRE_MAX, observe_chunk_identity,
+    record_shared_payload_copy,
 };
 use crate::{NetworkDeliveryState, NetworkError, SinomoObjectCodec};
 use bytes::{Bytes, BytesMut};
@@ -341,6 +342,55 @@ pub(crate) enum ObjectRpcBodyRole {
 #[derive(Clone, Debug)]
 struct ReplayableBytes {
     bytes: Bytes,
+    progress: Option<ObjectRpcBodyProgress>,
+}
+
+/// Shared count of one call's request-body bytes handed to the network.
+///
+/// Attach it with [`ObjectRpcReplayableCall::call_with_progress`]. An owned
+/// body chunk counts when the carrier releases it after writing it, so the
+/// count stops while the connection stops draining. Tracked bodies use 16 KiB
+/// chunks to keep that count fine-grained on slow links. A body small enough
+/// to travel in the request head counts when it moves into that head;
+/// byte-copying writers count each chunk as they take it.
+#[derive(Clone, Debug, Default)]
+pub struct ObjectRpcBodyProgress(Arc<std::sync::atomic::AtomicU64>);
+
+/// Chunk size for a body whose upload progress is tracked.
+const TRACKED_BODY_CHUNK_BYTES: usize = 16 * 1024;
+
+impl ObjectRpcBodyProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Body bytes handed to the network so far.
+    pub fn bytes(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn record(progress: Option<&Self>, bytes: usize) {
+        if let Some(progress) = progress {
+            progress
+                .0
+                .fetch_add(bytes as u64, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Count `chunk` when the carrier releases it. Outgoing chunks carry no
+    /// receive credit of their own, so the release lease is free to use.
+    fn count_on_release(progress: Option<&Self>, mut chunk: OwnedChunk) -> OwnedChunk {
+        if let Some(progress) = progress {
+            let progress = progress.clone();
+            chunk.replace_receive_credit(ReceiveCreditLease::new(
+                chunk.len(),
+                None,
+                None,
+                Some(Arc::new(move |bytes| Self::record(Some(&progress), bytes))),
+            ));
+        }
+        chunk
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -926,7 +976,10 @@ impl ObjectRpcBodySource {
             return Self::empty();
         }
         Self {
-            kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes { bytes }),
+            kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
+                bytes,
+                progress: None,
+            }),
             role: ObjectRpcBodyRole::Attachment,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1232,7 +1285,10 @@ impl ObjectRpcBodySource {
         }
         match self.kind {
             ObjectRpcBodySourceKind::Empty => Ok(Bytes::new()),
-            ObjectRpcBodySourceKind::Bytes(source) => Ok(source.bytes),
+            ObjectRpcBodySourceKind::Bytes(source) => {
+                ObjectRpcBodyProgress::record(source.progress.as_ref(), source.bytes.len());
+                Ok(source.bytes)
+            }
             _ => unreachable!("checked inline object RPC body source kind"),
         }
     }
@@ -1264,9 +1320,10 @@ impl ObjectRpcBodySource {
     fn open(&self) -> Result<Box<dyn Read + Send>, NetworkError> {
         match &self.kind {
             ObjectRpcBodySourceKind::Empty => Ok(Box::new(std::io::empty())),
-            ObjectRpcBodySourceKind::Bytes(source) => {
-                Ok(Box::new(BytesReader::new(source.bytes.clone())))
-            }
+            ObjectRpcBodySourceKind::Bytes(source) => Ok(Box::new(BytesReader::new(
+                source.bytes.clone(),
+                source.progress.clone(),
+            ))),
             ObjectRpcBodySourceKind::AdoptableSobj(source) => {
                 let buffers = source
                     .buffers
@@ -1408,14 +1465,21 @@ impl ObjectRpcBodySource {
                 bytes: Bytes::new(),
                 offset: 0,
                 chunk_bytes: max_chunk_bytes.max(1),
+                progress: None,
                 _lifetime_guards: Arc::clone(&self.lifetime_guards),
             }));
         }
         if let ObjectRpcBodySourceKind::Bytes(source) = &self.kind {
+            let chunk_bytes = if source.progress.is_some() {
+                max_chunk_bytes.min(TRACKED_BODY_CHUNK_BYTES)
+            } else {
+                max_chunk_bytes
+            };
             return Ok(BodyProducer::Bytes(BytesBodyProducer {
                 bytes: source.bytes.clone(),
                 offset: 0,
-                chunk_bytes: max_chunk_bytes.max(1),
+                chunk_bytes: chunk_bytes.max(1),
+                progress: source.progress.clone(),
                 _lifetime_guards: Arc::clone(&self.lifetime_guards),
             }));
         }
@@ -1508,6 +1572,7 @@ fn body_consumed_error(detail: &str) -> NetworkError {
 struct BytesReader {
     bytes: Bytes,
     offset: usize,
+    progress: Option<ObjectRpcBodyProgress>,
 }
 
 struct AdoptableSobjReader {
@@ -1586,8 +1651,12 @@ impl Read for RepeatedBytesReader {
 }
 
 impl BytesReader {
-    fn new(bytes: Bytes) -> Self {
-        Self { bytes, offset: 0 }
+    fn new(bytes: Bytes, progress: Option<ObjectRpcBodyProgress>) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            progress,
+        }
     }
 }
 
@@ -1597,6 +1666,7 @@ impl Read for BytesReader {
         let read = remaining.len().min(output.len());
         output[..read].copy_from_slice(&remaining[..read]);
         self.offset += read;
+        ObjectRpcBodyProgress::record(self.progress.as_ref(), read);
         Ok(read)
     }
 }
@@ -2496,11 +2566,22 @@ impl ObjectRpcReplayableCall {
     /// Produces one independently consumable value call over the shared wire
     /// representation.
     pub fn call(&self) -> ObjectRpcCall {
+        self.call_with(None)
+    }
+
+    /// Like [`Self::call`], counting the body bytes the transport takes for
+    /// sending into `progress`.
+    pub fn call_with_progress(&self, progress: &ObjectRpcBodyProgress) -> ObjectRpcCall {
+        self.call_with(Some(progress.clone()))
+    }
+
+    fn call_with(&self, progress: Option<ObjectRpcBodyProgress>) -> ObjectRpcCall {
         ObjectRpcCall {
             request: self.request.clone(),
             body: ObjectRpcBodySource {
                 kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
                     bytes: self.value.clone(),
+                    progress,
                 }),
                 role: ObjectRpcBodyRole::Value,
                 lifetime_guards: Arc::new(Mutex::new(Vec::new())),
@@ -2975,7 +3056,7 @@ pub(crate) enum BodyProducer {
 impl BodyProducer {
     pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, NetworkError> {
         match self {
-            Self::Bytes(producer) => producer.next(),
+            Self::Bytes(producer) => producer.next_counted(),
             Self::Adoptable(producer) => producer.next(),
             Self::Deferred(_) => Err(NetworkError::Serialization {
                 detail: "credit-bounded SOBJ values require the canonical owned-chunk transport"
@@ -2997,7 +3078,12 @@ impl BodyProducer {
             Self::Deferred(producer) => producer.next_owned(allocator).await,
             Self::Async(producer) => producer.next_owned(allocator).await,
             Self::Incoming(producer) => producer.next_owned(allocator).await,
-            Self::Bytes(producer) => copy_source_chunk_to_owned(producer.next()?, allocator).await,
+            Self::Bytes(producer) => {
+                let chunk = copy_source_chunk_to_owned(producer.next()?, allocator).await?;
+                Ok(chunk.map(|chunk| {
+                    ObjectRpcBodyProgress::count_on_release(producer.progress.as_ref(), chunk)
+                }))
+            }
             Self::RepeatedBytes(producer) => producer.next_owned(allocator).await,
             Self::Sync(producer) => producer.next_owned(allocator).await,
         }
@@ -3262,6 +3348,7 @@ pub(crate) struct BytesBodyProducer {
     bytes: Bytes,
     offset: usize,
     chunk_bytes: usize,
+    progress: Option<ObjectRpcBodyProgress>,
     _lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
 }
 
@@ -3277,6 +3364,15 @@ impl BytesBodyProducer {
         let bytes = self.bytes.slice(self.offset..end);
         self.offset = end;
         Ok(Some(bytes))
+    }
+
+    /// A byte-copying writer hands each chunk on as it takes it.
+    fn next_counted(&mut self) -> Result<Option<Bytes>, NetworkError> {
+        let bytes = self.next()?;
+        if let Some(bytes) = &bytes {
+            ObjectRpcBodyProgress::record(self.progress.as_ref(), bytes.len());
+        }
+        Ok(bytes)
     }
 }
 
@@ -3937,6 +4033,82 @@ mod tests {
             producer.finish().await.expect("finish replayable producer");
             assert_eq!(actual, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn tracked_replayable_body_counts_chunks_when_the_carrier_releases_them() {
+        let value = UnknownLengthMap {
+            payload: (0..(TRACKED_BODY_CHUNK_BYTES * 3 + 17))
+                .map(|offset| (offset % 251) as u8)
+                .collect(),
+        };
+        let replayable = ObjectRpcCall::encode_replayable_value(
+            "/test/replayable-progress",
+            "test.replayable-progress",
+            &value,
+        )
+        .expect("prepare replayable call");
+        let progress = ObjectRpcBodyProgress::new();
+        let call = replayable.call_with_progress(&progress);
+        let allocator = ChunkAllocator::default();
+        let mut producer = call
+            .body
+            .producer(BODY_CHUNK_MAX)
+            .expect("open tracked producer");
+
+        let first = producer
+            .next_owned(&allocator)
+            .await
+            .expect("read tracked chunk")
+            .expect("first tracked chunk");
+        assert_eq!(first.len(), TRACKED_BODY_CHUNK_BYTES);
+        assert_eq!(
+            progress.bytes(),
+            0,
+            "a chunk still queued for the carrier is not yet handed to the network"
+        );
+        drop(first);
+        assert_eq!(progress.bytes(), TRACKED_BODY_CHUNK_BYTES as u64);
+        while let Some(chunk) = producer
+            .next_owned(&allocator)
+            .await
+            .expect("read tracked chunk")
+        {
+            drop(chunk);
+        }
+        producer.finish().await.expect("finish tracked producer");
+        assert_eq!(progress.bytes(), replayable.encoded_value_bytes() as u64);
+
+        // Untracked calls over the same encoding keep their ordinary chunking.
+        let mut untracked = replayable
+            .call()
+            .body
+            .producer(BODY_CHUNK_MAX)
+            .expect("open untracked producer");
+        let whole = untracked
+            .next_owned(&allocator)
+            .await
+            .expect("read untracked chunk")
+            .expect("untracked chunk");
+        assert_eq!(whole.len(), replayable.encoded_value_bytes());
+        assert_eq!(progress.bytes(), replayable.encoded_value_bytes() as u64);
+    }
+
+    #[test]
+    fn tracked_inline_body_counts_when_it_moves_into_the_request_head() {
+        let replayable = ObjectRpcCall::encode_replayable_value(
+            "/test/replayable-inline-progress",
+            "test.replayable-inline-progress",
+            &"small",
+        )
+        .expect("prepare replayable call");
+        let progress = ObjectRpcBodyProgress::new();
+        let inline = replayable
+            .call_with_progress(&progress)
+            .body
+            .try_into_inline_bytes(BODY_CHUNK_MAX)
+            .expect("small body travels inline");
+        assert_eq!(progress.bytes(), inline.len() as u64);
     }
 
     #[tokio::test(flavor = "current_thread")]

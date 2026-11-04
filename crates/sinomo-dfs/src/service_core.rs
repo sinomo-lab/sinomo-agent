@@ -214,6 +214,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         });
     }
 
+    /// Wake `waker` when this service's cancellation fires, while the
+    /// returned registration lives. Register before the wait's final
+    /// [`Self::check_cancelled`].
+    pub(crate) fn register_cancellation_waker(
+        &self,
+        waker: &crate::service_state::DfsCancellationWaker,
+    ) -> Option<crate::service_state::DfsCancellationWakerRegistration> {
+        self.cancellation
+            .as_ref()
+            .map(|cancellation| cancellation.register_waker(waker))
+    }
+
     pub(crate) fn check_cancelled(&self, operation: &'static str) -> Result<(), DfsError> {
         if self
             .cancellation

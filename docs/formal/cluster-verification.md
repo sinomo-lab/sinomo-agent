@@ -1723,9 +1723,14 @@ ordered completion. This finite three-node slice abstracts RPC bytes, timeouts,
 membership changes, and the full-shard grace timer.
 The Rust refinement is `send_metadata_journal_batches_direct`. Checkpoint
 catch-up uses the two-slot `DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT` cap and
-the short `DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET`; operation-bound
-authority fan-out uses its cluster-sized inflight cap and a larger outer cap,
-while the caller supplies the tighter small- or large-prepare deadline.
+the short `DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET`. Operation-bound
+authority rounds instead use `start_metadata_authority_fanout` with the
+cluster-sized inflight cap: every call carries the operation deadline as its
+network deadline. Once per small- or large-prepare interval, a target whose
+direct call has not yet answered receives an empty routed confirmation. The
+prepare body travels routed only when the direct call failed, or when a
+confirmation finds it absent and the direct upload has handed no further bytes
+to the network since the previous confirmation.
 
 The `dfs_metadata_shard_concurrent_dispatch_safety.safety` companion defines
 the daemon mutation-lane scheduler above the already-concurrent object-RPC

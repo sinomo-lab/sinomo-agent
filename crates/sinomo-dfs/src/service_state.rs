@@ -363,17 +363,113 @@ pub(crate) struct DfsNamespaceOperationContext {
     pub(crate) placement_config: Option<DfsFileSystemConfig>,
 }
 
+/// Wakes one blocked wait when a cancellation source it registered on fires.
+/// It may run more than once and on any thread, so it must be cheap.
+pub(crate) type DfsCancellationWaker = Arc<dyn Fn() + Send + Sync>;
+
+/// The waits currently registered on one cancellation source.
+#[derive(Default)]
+pub(crate) struct DfsCancellationWakers {
+    registered: Mutex<(u64, BTreeMap<u64, DfsCancellationWaker>)>,
+}
+
+impl std::fmt::Debug for DfsCancellationWakers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let registered = self
+            .registered
+            .lock()
+            .map(|registered| registered.1.len())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("DfsCancellationWakers")
+            .field("registered", &registered)
+            .finish()
+    }
+}
+
+impl DfsCancellationWakers {
+    fn register(self: &Arc<Self>, waker: &DfsCancellationWaker) -> (Arc<Self>, u64) {
+        let mut registered = self
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registered.0 = registered.0.wrapping_add(1);
+        let id = registered.0;
+        registered.1.insert(id, Arc::clone(waker));
+        (Arc::clone(self), id)
+    }
+
+    fn unregister(&self, id: u64) {
+        self.registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .remove(&id);
+    }
+
+    /// Wake every registered wait. Wakers run after the registry lock drops.
+    fn wake_all(&self) {
+        let wakers = self
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for waker in wakers {
+            waker();
+        }
+    }
+}
+
+/// An owner-advanced generation. A flag created from an older value is
+/// cancelled once the owner advances it.
+#[derive(Debug, Default)]
+pub(crate) struct DfsCancellationGeneration {
+    value: AtomicU64,
+    wakers: Arc<DfsCancellationWakers>,
+}
+
+impl DfsCancellationGeneration {
+    pub(crate) fn current(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    /// Advance the generation, then wake every wait registered on a flag that
+    /// observes it.
+    pub(crate) fn advance(&self) {
+        self.value.fetch_add(1, Ordering::AcqRel);
+        self.wakers.wake_all();
+    }
+}
+
+/// Keeps one waker registered on every source of a flag until dropped.
+#[must_use = "dropping the registration unregisters the waker"]
+pub(crate) struct DfsCancellationWakerRegistration(Vec<(Arc<DfsCancellationWakers>, u64)>);
+
+impl Drop for DfsCancellationWakerRegistration {
+    fn drop(&mut self) {
+        for (wakers, id) in self.0.drain(..) {
+            wakers.unregister(id);
+        }
+    }
+}
+
 /// Cooperative cancellation handle for a [`NetworkedDfsService`]. Cloneable and
 /// thread-safe: a caller keeps one clone, hands the service the other, and flips
 /// it when a budgeted operation gives up (e.g. a degraded cluster link on a
 /// mobile device — a normal operating state, not an exceptional one). The
 /// service's distributed wait/retry loops observe the flag and return
 /// [`DfsError::Cancelled`] instead of running out their full network timeouts.
+/// A blocking wait can also register a waker, so cancellation ends that wait
+/// at once instead of at its next flag check.
 #[derive(Clone, Debug, Default)]
 pub struct DfsCancellationFlag {
     local: Arc<AtomicBool>,
+    local_wakers: Arc<DfsCancellationWakers>,
     inherited: Arc<[DfsCancellationFlag]>,
-    generation: Option<(Arc<AtomicU64>, u64)>,
+    generation: Option<(Arc<DfsCancellationGeneration>, u64)>,
 }
 
 impl DfsCancellationFlag {
@@ -389,6 +485,7 @@ impl DfsCancellationFlag {
     pub fn linked(inherited: impl IntoIterator<Item = DfsCancellationFlag>) -> DfsCancellationFlag {
         Self {
             local: Arc::new(AtomicBool::new(false)),
+            local_wakers: Arc::default(),
             inherited: inherited.into_iter().collect::<Vec<_>>().into(),
             generation: None,
         }
@@ -396,7 +493,10 @@ impl DfsCancellationFlag {
 
     /// Observe the existing owner's generation directly, including while a
     /// synchronous protocol wait prevents its async caller from being polled.
-    pub(crate) fn after_generation_change(source: Arc<AtomicU64>, observed: u64) -> Self {
+    pub(crate) fn after_generation_change(
+        source: Arc<DfsCancellationGeneration>,
+        observed: u64,
+    ) -> Self {
         Self {
             generation: Some((source, observed)),
             ..Self::default()
@@ -404,17 +504,49 @@ impl DfsCancellationFlag {
     }
 
     /// Request cancellation. Idempotent; already-running local work finishes,
-    /// distributed waits and retries stop at their next flag check.
+    /// distributed waits and retries stop at their next flag check, and
+    /// registered waits wake now.
     pub fn cancel(&self) {
         self.local.store(true, Ordering::Release);
+        self.local_wakers.wake_all();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.local.load(Ordering::Acquire)
             || self.inherited.iter().any(DfsCancellationFlag::is_cancelled)
-            || self.generation.as_ref().is_some_and(|(source, observed)| {
-                source.load(Ordering::Acquire) != *observed
-            })
+            || self
+                .generation
+                .as_ref()
+                .is_some_and(|(source, observed)| source.current() != *observed)
+    }
+
+    /// Run `waker` whenever this flag or a source it observes is cancelled,
+    /// until the returned registration drops.
+    ///
+    /// Register before a wait's final [`Self::is_cancelled`] check: a
+    /// cancellation after registration always runs `waker`, and one before it
+    /// is visible to that check.
+    pub(crate) fn register_waker(
+        &self,
+        waker: &DfsCancellationWaker,
+    ) -> DfsCancellationWakerRegistration {
+        let mut registrations = Vec::new();
+        self.register_waker_into(waker, &mut registrations);
+        DfsCancellationWakerRegistration(registrations)
+    }
+
+    fn register_waker_into(
+        &self,
+        waker: &DfsCancellationWaker,
+        registrations: &mut Vec<(Arc<DfsCancellationWakers>, u64)>,
+    ) {
+        registrations.push(self.local_wakers.register(waker));
+        for inherited in self.inherited.iter() {
+            inherited.register_waker_into(waker, registrations);
+        }
+        if let Some((source, _)) = &self.generation {
+            registrations.push(source.wakers.register(waker));
+        }
     }
 }
 
@@ -1193,3 +1325,72 @@ pub(crate) struct ActiveReplicaStage {
 }
 
 pub(crate) type PendingRoutedNamespaceResult = DfsRoutedNamespaceOperationOutcome;
+
+#[cfg(test)]
+mod cancellation_wake_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn counting_waker() -> (DfsCancellationWaker, Arc<AtomicUsize>) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&wakes);
+        let waker: DfsCancellationWaker = Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        (waker, wakes)
+    }
+
+    #[test]
+    fn cancel_wakes_a_registered_wait_until_the_registration_drops() {
+        let flag = DfsCancellationFlag::new();
+        let (waker, wakes) = counting_waker();
+        let registration = flag.register_waker(&waker);
+        flag.clone().cancel();
+        assert!(flag.is_cancelled());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        drop(registration);
+        flag.cancel();
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "a dropped wait is not woken"
+        );
+    }
+
+    #[test]
+    fn an_inherited_source_wakes_a_wait_on_the_linked_flag() {
+        let caller = DfsCancellationFlag::new();
+        let mount = DfsCancellationFlag::new();
+        let linked = DfsCancellationFlag::linked([caller.clone(), mount.clone()]);
+        let (waker, wakes) = counting_waker();
+        let _registration = linked.register_waker(&waker);
+        mount.cancel();
+        assert!(linked.is_cancelled());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        caller.cancel();
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn advancing_the_owner_generation_wakes_a_wait_on_an_older_flag() {
+        let generation = Arc::new(DfsCancellationGeneration::default());
+        let flag = DfsCancellationFlag::after_generation_change(
+            Arc::clone(&generation),
+            generation.current(),
+        );
+        let (waker, wakes) = counting_waker();
+        let _registration = flag.register_waker(&waker);
+        assert!(!flag.is_cancelled());
+        generation.advance();
+        assert!(flag.is_cancelled());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        let next = DfsCancellationFlag::after_generation_change(
+            Arc::clone(&generation),
+            generation.current(),
+        );
+        assert!(
+            !next.is_cancelled(),
+            "a flag from the new generation stays live"
+        );
+    }
+}

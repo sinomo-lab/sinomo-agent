@@ -4,13 +4,14 @@
 //! typed DFS message plane. Higher-level DFS services depend on these traits,
 //! not on a concrete transport implementation.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use sinomo_core::network::{NetworkError, ObjectRpcBodySource};
+use sinomo_core::network::{NetworkError, ObjectRpcBodyProgress, ObjectRpcBodySource};
 use sinomo_core::node::NodeId;
 
 use crate::protocol::DfsRoutedMessage;
@@ -141,7 +142,7 @@ pub struct DfsRoutedSendOutcome {
 /// owned command lets production transports encode and replay that value once
 /// without first deep-cloning it into a command per replica. A transport that
 /// cannot retain shared replayable values returns `None`; the service then
-/// materializes the ordinary per-target routed fallback commands.
+/// sends each target its prepare over the ordinary routed path.
 #[derive(Debug)]
 pub struct DfsMetadataJournalBatchDirectGroup {
     pub target_node_ids: Vec<NodeId>,
@@ -154,6 +155,158 @@ impl DfsMetadataJournalBatchDirectGroup {
             target_node_ids,
             command,
         }
+    }
+}
+
+/// Completion of one call started on a [`DfsMetadataAuthorityFanout`].
+#[derive(Debug)]
+pub enum DfsMetadataAuthorityFanoutEvent {
+    /// The canonical metadata route returned, or failed, for one target.
+    Direct {
+        target_node_id: NodeId,
+        result: Result<DfsMetadataJournalBatchResponse, NetworkError>,
+    },
+    /// One routed DFS message call returned. Its reply messages are not yet
+    /// processed; the owner hands them to
+    /// [`DfsMessageTransport::deliver_metadata_authority_fanout_replies`].
+    Routed {
+        target_node_id: NodeId,
+        result: Result<Vec<DfsRoutedMessage>, NetworkError>,
+    },
+}
+
+/// One fan-out channel item: a call completion, or `None` to wake the owner.
+pub(crate) type DfsMetadataAuthorityFanoutSignal = Option<DfsMetadataAuthorityFanoutEvent>;
+
+/// Transport-owned workers behind one [`DfsMetadataAuthorityFanout`].
+pub(crate) trait DfsMetadataAuthorityFanoutWorkers: Send {
+    /// Start one routed call bounded by `deadline` that reports exactly one
+    /// event. Returns the message when no worker can run it.
+    fn start_routed(
+        &mut self,
+        message: DfsRoutedMessage,
+        deadline: Instant,
+        events: &Sender<DfsMetadataAuthorityFanoutSignal>,
+    ) -> Result<(), DfsRoutedMessage>;
+
+    /// Stop every call still in flight.
+    fn abort(&mut self);
+}
+
+/// The metadata authority calls in flight for one prepare round.
+///
+/// Every call carries the same network deadline and reports exactly one
+/// event. Calls run until they finish or that deadline expires; the owner's
+/// decision to hedge never cancels them. Dropping the fan-out abandons every
+/// call still in flight.
+pub struct DfsMetadataAuthorityFanout {
+    deadline: Instant,
+    direct_calls: BTreeMap<NodeId, ObjectRpcBodyProgress>,
+    in_flight: usize,
+    events_tx: Sender<DfsMetadataAuthorityFanoutSignal>,
+    events: Receiver<DfsMetadataAuthorityFanoutSignal>,
+    workers: Box<dyn DfsMetadataAuthorityFanoutWorkers>,
+}
+
+impl DfsMetadataAuthorityFanout {
+    /// `direct_calls` names the direct calls already started with senders
+    /// cloned from `events_tx`, each with the progress of its request upload.
+    pub(crate) fn new(
+        deadline: Instant,
+        direct_calls: BTreeMap<NodeId, ObjectRpcBodyProgress>,
+        events_tx: Sender<DfsMetadataAuthorityFanoutSignal>,
+        events: Receiver<DfsMetadataAuthorityFanoutSignal>,
+        workers: Box<dyn DfsMetadataAuthorityFanoutWorkers>,
+    ) -> Self {
+        Self {
+            deadline,
+            in_flight: direct_calls.len(),
+            direct_calls,
+            events_tx,
+            events,
+            workers,
+        }
+    }
+
+    /// The network deadline shared by every call on this fan-out.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether a direct call to `target_node_id` was started.
+    pub fn has_direct_call(&self, target_node_id: &NodeId) -> bool {
+        self.direct_calls.contains_key(target_node_id)
+    }
+
+    /// Request-body bytes of the direct call to `target_node_id` handed to the
+    /// network so far.
+    pub fn direct_upload_bytes(&self, target_node_id: &NodeId) -> Option<u64> {
+        self.direct_calls
+            .get(target_node_id)
+            .map(ObjectRpcBodyProgress::bytes)
+    }
+
+    /// Ends the current or next [`Self::next_event`] wait early.
+    pub(crate) fn waker(&self) -> crate::service_state::DfsCancellationWaker {
+        let events = self.events_tx.clone();
+        std::sync::Arc::new(move || {
+            let _ = events.send(None);
+        })
+    }
+
+    /// Calls whose completion event has not been returned yet.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    pub(crate) fn start_routed(
+        &mut self,
+        message: DfsRoutedMessage,
+    ) -> Result<(), DfsRoutedMessage> {
+        self.workers
+            .start_routed(message, self.deadline, &self.events_tx)?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// Wait for the next completion. Returns `None` at `until`, when no call
+    /// remains in flight, or when a [`Self::waker`] fires.
+    pub fn next_event(&mut self, until: Instant) -> Option<DfsMetadataAuthorityFanoutEvent> {
+        if self.in_flight == 0 {
+            return None;
+        }
+        let timeout = until.saturating_duration_since(Instant::now());
+        let received = match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if matches!(
+                    runtime.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                tokio::task::block_in_place(|| self.events.recv_timeout(timeout))
+            }
+            _ => self.events.recv_timeout(timeout),
+        };
+        let event = received.ok()??;
+        self.in_flight -= 1;
+        Some(event)
+    }
+}
+
+impl Drop for DfsMetadataAuthorityFanout {
+    fn drop(&mut self) {
+        self.workers.abort();
+    }
+}
+
+impl std::fmt::Debug for DfsMetadataAuthorityFanout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DfsMetadataAuthorityFanout")
+            .field("deadline", &self.deadline)
+            .field("direct_target_node_ids", &self.direct_calls.keys())
+            .field("in_flight", &self.in_flight)
+            .finish_non_exhaustive()
     }
 }
 
@@ -408,47 +561,44 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         Ok(Some(responses))
     }
 
-    /// Send one prepared metadata batch to several replicas while giving the
-    /// peer response phase a fresh relative budget.
+    /// Start one metadata authority prepare round on the canonical metadata
+    /// route and return without waiting for replies.
     ///
-    /// Production transports which encode large replayable calls should
-    /// override this method and begin `response_timeout` only after encoding.
-    /// The compatibility implementation scopes the shorter deadline around
-    /// the existing direct-send method and always restores the caller's
-    /// operation deadline before returning.
-    fn send_metadata_journal_batches_direct_with_response_timeout(
-        &mut self,
-        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
-        response_timeout: Duration,
-    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
-        let requested_deadline = Instant::now()
-            .checked_add(response_timeout)
-            .unwrap_or_else(Instant::now);
-        let observed_previous_deadline = self.operation_deadline();
-        let effective_deadline = observed_previous_deadline
-            .map_or(requested_deadline, |deadline| {
-                deadline.min(requested_deadline)
-            });
-        let replaced_previous_deadline = self.set_operation_deadline(Some(effective_deadline));
-        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
-        let result = self.send_metadata_journal_batches_direct(requests);
-        self.set_operation_deadline(previous_deadline);
-        result
-    }
-
-    /// Send cursor-grouped metadata batches without cloning one large command
-    /// per target before the transport can construct a replayable value.
-    ///
-    /// The default deliberately reports the accelerator as unavailable. This
-    /// preserves compatibility for message-only and rolling-upgrade transports:
-    /// the caller retains the same exact per-target routed fallback and its
-    /// target-unique request identities.
-    fn send_grouped_metadata_journal_batches_direct_with_response_timeout(
+    /// Each group is encoded once and replayed to its targets. `deadline` is
+    /// every call's whole network deadline. The default reports the direct
+    /// route as unavailable, so message-only and rolling-upgrade transports
+    /// keep the caller's per-target routed prepare and its target-unique
+    /// request identities.
+    fn start_metadata_authority_fanout(
         &mut self,
         _groups: &[DfsMetadataJournalBatchDirectGroup],
-        _response_timeout: Duration,
-    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        _deadline: Instant,
+    ) -> Result<Option<DfsMetadataAuthorityFanout>, NetworkError> {
         Ok(None)
+    }
+
+    /// Start one routed DFS message call on `fanout`, so its reply arrives as a
+    /// fan-out event bounded by the fan-out's deadline. Returns the message
+    /// when this transport cannot run it there; the caller then uses its
+    /// ordinary routed send.
+    fn send_routed_message_on_metadata_authority_fanout(
+        &mut self,
+        _fanout: &mut DfsMetadataAuthorityFanout,
+        message: DfsRoutedMessage,
+    ) -> Result<Option<DfsRoutedMessage>, NetworkError> {
+        Ok(Some(message))
+    }
+
+    /// Deliver the messages returned by one routed fan-out call through the
+    /// same inbound custody as the replies of an ordinary routed send.
+    fn deliver_metadata_authority_fanout_replies(
+        &mut self,
+        _messages: Vec<DfsRoutedMessage>,
+    ) -> Result<(), NetworkError> {
+        Err(NetworkError::Io {
+            operation: "deliver DFS metadata authority fan-out replies".to_string(),
+            detail: "transport starts no metadata authority fan-out".to_string(),
+        })
     }
 
     /// Take only the requested namespace response from this transport's real
@@ -501,6 +651,13 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
     /// caller budget cannot be extended by waiting for an already-dispatched
     /// write after the transport phase completes.
     fn operation_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// A waker that ends a current or next [`Self::wait_for_incoming`] early.
+    /// Transports whose wait cannot be interrupted return `None`; their waits
+    /// end only on an arrival or at their timeout.
+    fn incoming_wait_waker(&self) -> Option<crate::service_state::DfsCancellationWaker> {
         None
     }
 

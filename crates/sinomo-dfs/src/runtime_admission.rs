@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -150,7 +150,7 @@ pub(crate) struct DfsMutationScheduler {
     shard_gates: Mutex<BTreeMap<DfsMutationLaneKey, Arc<tokio::sync::Semaphore>>>,
     shard_gate_limit: usize,
     maintenance_interest_count: AtomicUsize,
-    foreground_generation: Arc<AtomicU64>,
+    foreground_generation: Arc<crate::service_state::DfsCancellationGeneration>,
     foreground_notify: tokio::sync::Notify,
 }
 
@@ -171,7 +171,7 @@ impl DfsMutationScheduler {
             shard_gates: Mutex::new(BTreeMap::new()),
             shard_gate_limit,
             maintenance_interest_count: AtomicUsize::new(0),
-            foreground_generation: Arc::new(AtomicU64::new(0)),
+            foreground_generation: Arc::default(),
             foreground_notify: tokio::sync::Notify::new(),
         }
     }
@@ -181,7 +181,7 @@ impl DfsMutationScheduler {
         // foreground waiter that can observe the interest therefore advances
         // a generation this guard will observe, including while another host
         // capability is still being acquired.
-        let foreground_generation = self.foreground_generation.load(Ordering::Acquire);
+        let foreground_generation = self.foreground_generation.current();
         self.maintenance_interest_count
             .fetch_add(1, Ordering::AcqRel);
         DfsMaintenanceForegroundPreemption {
@@ -194,7 +194,9 @@ impl DfsMutationScheduler {
         if self.maintenance_interest_count.load(Ordering::Acquire) == 0 {
             return;
         }
-        self.foreground_generation.fetch_add(1, Ordering::AcqRel);
+        // Also wakes a synchronous maintenance wait whose async caller cannot
+        // be polled until that wait returns.
+        self.foreground_generation.advance();
         self.foreground_notify.notify_waiters();
     }
 
@@ -365,7 +367,7 @@ impl DfsMaintenanceForegroundPreemption {
     }
 
     pub fn is_requested(&self) -> bool {
-        self.scheduler.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
+        self.scheduler.foreground_generation.current() != self.foreground_generation
     }
 
     pub async fn requested(&self) {

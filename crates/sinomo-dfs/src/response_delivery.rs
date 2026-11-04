@@ -241,6 +241,9 @@ impl Drop for DfsRoutedResponseRegistration {
 #[derive(Default)]
 struct InboxState {
     closed: bool,
+    /// One pending interruption, retained until a wait consumes it so a
+    /// wake raised just before the wait starts is not lost.
+    interrupted: bool,
     bytes: usize,
     messages: VecDeque<(DfsRoutedMessage, usize)>,
 }
@@ -307,19 +310,37 @@ impl DfsRoutedResponseInboxOwner {
         Ok(state.messages.len())
     }
 
+    /// Ends the current or next [`Self::wait`] on this inbox early.
+    pub(crate) fn interrupt_waker(&self) -> crate::service_state::DfsCancellationWaker {
+        let inbox = Arc::downgrade(&self.inbox);
+        Arc::new(move || {
+            let Some(inbox) = inbox.upgrade() else {
+                return;
+            };
+            inbox
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .interrupted = true;
+            inbox.ready.notify_all();
+            inbox.async_ready.notify_waiters();
+        })
+    }
+
     pub(crate) fn wait(&self, timeout: Duration) -> Result<bool, NetworkError> {
         let state = self
             .inbox
             .state
             .lock()
             .map_err(|_| custody_error("response inbox lock poisoned"))?;
-        let (state, _) = self
+        let (mut state, _) = self
             .inbox
             .ready
             .wait_timeout_while(state, timeout, |state| {
-                state.messages.is_empty() && !state.closed
+                state.messages.is_empty() && !state.closed && !state.interrupted
             })
             .map_err(|_| custody_error("response inbox wait poisoned"))?;
+        state.interrupted = false;
         if state.closed {
             return Err(custody_error("response inbox is closed"));
         }

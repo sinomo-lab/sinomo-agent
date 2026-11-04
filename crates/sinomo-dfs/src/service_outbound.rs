@@ -1091,8 +1091,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         message: DfsNetworkMessage,
     ) -> Result<bool, DfsError> {
         let routed_message = self.next_dfs_routed_message(target_node_id, message);
+        self.send_routed_dfs_message_if_routable(routed_message)
+    }
+
+    /// Send an already framed message to its target over the ordinary routed path.
+    pub(crate) fn send_routed_dfs_message_if_routable(
+        &mut self,
+        routed_message: DfsRoutedMessage,
+    ) -> Result<bool, DfsError> {
+        let target_node_id = routed_message.target_node_id.clone();
         match self.transport.send_routed_call(
-            target_node_id,
+            &target_node_id,
             crate::message_transport::native_snapshot_routed_call(routed_message)?,
         ) {
             Ok(()) => Ok(true),

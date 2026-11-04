@@ -273,26 +273,28 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
             ),
         )
     });
+    // Routine(B) holds its global admission while its direct authority call
+    // to held A is still in flight. A trace packet publishes only when its call
+    // ends, so the in-flight call is found here from RPC observations and is
+    // bound to the saved operation from the trace after the cycle.
     let mut reciprocal_queued = false;
     while Instant::now() < deadline {
-        reciprocal_queued = target_scheduler.global_is_exclusively_held()
-            && native.rpc_observations().iter().any(|call| {
+        reciprocal_queued = target_scheduler.global_is_exclusively_held() && {
+            let calls = native.rpc_observations();
+            calls.iter().any(|call| {
                 call.source == maintenance_node
                     && call.target == primary
                     && call.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
                     && call.phase == RpcPhase::BeforeDispatch
+                    && !calls.iter().any(|ended| {
+                        ended.call_id == call.call_id
+                            && matches!(
+                                ended.phase,
+                                RpcPhase::Completed | RpcPhase::EndedWithoutResponse
+                            )
+                    })
             })
-            && native_trace_json(&users_trace)["boundary_packets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|packet| {
-                    let fact = &packet["facts"];
-                    fact["phase"] == "direct-journal-rpc-attempt-started"
-                        && fact["target_node_id"] == primary.as_str()
-                        && fact["command"]["authority_probe"]["operation"]["operation_id"]
-                            == saved.operation_id
-                });
+        };
         if reciprocal_queued || foreground.is_finished() {
             break;
         }
@@ -319,6 +321,17 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
             && call.phase == RpcPhase::Completed
             && call.outcome_error.is_none()
     });
+    let routine_waited_for_held_authority = native_trace_json(&users_trace)["boundary_packets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|packet| {
+            let fact = &packet["facts"];
+            fact["phase"] == "direct-journal-rpc-attempt-started"
+                && fact["target_node_id"] == primary.as_str()
+                && fact["command"]["authority_probe"]["operation"]["operation_id"]
+                    == saved.operation_id
+        });
     let root_facts = native_trace_json(&root_trace);
     let diagnostics = std::env::temp_dir().join(format!(
         "native-reciprocal-maintenance-evidence-{}",
@@ -444,7 +457,7 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
         "actual encoded root request must hold Global(A)"
     );
     assert!(
-        reciprocal_queued,
+        reciprocal_queued && routine_waited_for_held_authority,
         "Routine(B) must wait for its users authority ACK from held A"
     );
     assert!(
