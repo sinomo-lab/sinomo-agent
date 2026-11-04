@@ -1130,6 +1130,7 @@ fn inherited_session_grant_cannot_select_a_module_worker_profile() {
                 instructions: "work".into(),
                 prompt: String::new(),
                 idle_timeout_secs: 86400,
+                start_paused: false,
                 worker: Some(SessionWorkerBinding {
                     agent_id: "evolution-implementer".into(),
                     provider: "fake".into(),
@@ -1148,4 +1149,66 @@ fn inherited_session_grant_cannot_select_a_module_worker_profile() {
             .list(&h.input.session.session_id)
             .is_empty()
     );
+}
+
+#[test]
+fn fast_detached_completion_is_consumed_before_wait_reports_finished() {
+    for _ in 0..4 {
+        let (release, ready) = mpsc::channel();
+        release.send(()).unwrap();
+        let h = harness(
+            Behavior::Async,
+            false,
+            AgentToolRegistry::new().with_tool(DelayedChildTool {
+                release: Mutex::new(ready),
+            }),
+            AgentToolSurface::default_for_role(AgentRole::Main),
+        );
+        let child = spawn(&h);
+        assert_eq!(wait(&h, &child.id).status, ManagedSessionStatus::Completed);
+        assert!(
+            h.requests.lock().unwrap().iter().any(|request| {
+                request.metadata["session_id"] == child.session_id.to_string()
+                    && request
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("detached child work finished"))
+            }),
+            "completion must be consumed before the worker is reported finished"
+        );
+        h.runtime
+            .sessions()
+            .dispose(&h.input.session.session_id, &child.id)
+            .unwrap();
+    }
+}
+
+#[test]
+fn cancelling_an_idle_parent_stops_its_running_descendants() {
+    let h = setup(Behavior::Block);
+    let parent = spawn(&h);
+    h.started.recv_timeout(Duration::from_secs(2)).unwrap();
+    h.release.store(true, Ordering::SeqCst);
+    wait(&h, &parent.id);
+    h.release.store(false, Ordering::SeqCst);
+    let leaf = h
+        .runtime
+        .sessions()
+        .spawn(
+            &parent.session_id,
+            "leaf",
+            "blocking descendant",
+            &AgentCancellationToken::new(),
+        )
+        .unwrap();
+    h.started.recv_timeout(Duration::from_secs(2)).unwrap();
+    h.runtime
+        .sessions()
+        .cancel(&h.input.session.session_id, &parent.id)
+        .unwrap();
+    assert_eq!(wait(&h, &leaf.id).status, ManagedSessionStatus::Cancelled);
+    h.runtime
+        .sessions()
+        .dispose(&h.input.session.session_id, &parent.id)
+        .unwrap();
 }

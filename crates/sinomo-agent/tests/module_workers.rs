@@ -101,6 +101,7 @@ fn module_worker_runs_without_interactive_subagents() {
             instructions: "finish the task".into(),
             prompt: String::new(),
             idle_timeout_secs: 86400,
+            start_paused: false,
             worker: Some(SessionWorkerBinding {
                 agent_id: "worker".into(),
                 provider: "scripted".into(),
@@ -111,6 +112,9 @@ fn module_worker_runs_without_interactive_subagents() {
             }),
         },
     });
+    let receipt: SessionCommandReceipt = serde_json::from_value(started.clone()).unwrap();
+    assert!(receipt.accepted);
+    assert!(receipt.operation_id.is_some());
     let id = started["session_id"].as_str().unwrap().to_string();
     let state = call(SessionRequest::Command {
         command: SessionCommand::Wait {
@@ -120,7 +124,10 @@ fn module_worker_runs_without_interactive_subagents() {
     });
     assert_eq!(state["status"], "completed", "{state}");
     let result = call(SessionRequest::Command {
-        command: SessionCommand::Result { id: id.clone() },
+        command: SessionCommand::Result {
+            id: id.clone(),
+            operation_id: started["operation_id"].as_str().unwrap().into(),
+        },
     });
     assert_eq!(
         result["run"]["final_decision"]["text"],
@@ -177,6 +184,7 @@ fn module_worker_runs_without_interactive_subagents() {
             instructions: "make the scoped edit".into(),
             prompt: String::new(),
             idle_timeout_secs: 86400,
+            start_paused: false,
             worker: Some(SessionWorkerBinding {
                 agent_id: "writer".into(),
                 provider: "scripted".into(),

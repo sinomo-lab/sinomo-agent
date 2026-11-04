@@ -46,6 +46,17 @@ pub struct ManagedSessionSnapshot {
     pub idle_timeout_secs: u64,
 }
 
+impl ManagedSessionSnapshot {
+    pub fn archived_at(&self, unix_seconds: i64) -> bool {
+        self.archived
+            || (self.status != ManagedSessionStatus::Running
+                && unix_seconds
+                    >= self
+                        .last_activity_unix
+                        .saturating_add(self.idle_timeout_secs as i64))
+    }
+}
+
 trait ChildRuntime: Send + Sync {
     fn submit(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError>;
     fn start(
@@ -55,6 +66,7 @@ trait ChildRuntime: Send + Sync {
     ) -> Result<AgentSessionControlResult, AgentError>;
     fn updates(&self) -> Vec<AsyncTaskUpdate>;
     fn detached_work(&self) -> bool;
+    fn pending_work(&self) -> bool;
     fn cancel_detached(&self);
     fn join(&self) -> Result<(), AgentError>;
     fn session(&self) -> Result<AgentSession, AgentError>;
@@ -77,6 +89,9 @@ impl<M: InteractionModel + Send + Sync + 'static> ChildRuntime for AgentSessionR
     }
     fn cancel_detached(&self) {
         self.cancel_detached_tools();
+    }
+    fn pending_work(&self) -> bool {
+        self.has_pending_turn_work().unwrap_or(false)
     }
     fn detached_work(&self) -> bool {
         self.session_snapshot()
@@ -126,6 +141,7 @@ struct ChildState {
     runtime: Option<Arc<dyn ChildRuntime>>,
     input: AgentLoopInput,
     pending: bool,
+    pending_operation_id: Option<TaskId>,
     updates: VecDeque<AsyncTaskUpdate>,
     admission: AgentCancellationToken,
     driver: bool,
@@ -146,6 +162,62 @@ pub struct AgentSessionHost {
     store: Arc<dyn AgentSessionStore>,
 }
 impl AgentSessionHost {
+    pub fn recover_interrupted(&self) -> Result<(), String> {
+        if !self.lock().children.is_empty() {
+            return Err("session recovery must precede admission".into());
+        }
+        let sessions = self.store.list_sessions().map_err(|e| e.to_string())?;
+        let roots: BTreeSet<_> = sessions
+            .iter()
+            .filter_map(|s| {
+                s.managed
+                    .as_ref()
+                    .filter(|m| m.owner.is_some())
+                    .map(|m| m.root_session_id.clone())
+            })
+            .collect();
+        for mut session in sessions {
+            let Some(managed) = &mut session.managed else {
+                continue;
+            };
+            if !roots.contains(&managed.root_session_id) {
+                continue;
+            }
+            if managed.archived
+                || (managed.status != ManagedSessionStatus::Running && !managed.archived_at(now()))
+            {
+                continue;
+            }
+            if managed.status == ManagedSessionStatus::Running {
+                managed.status = ManagedSessionStatus::Failed;
+                managed.error = Some("session host restarted; work was not replayed".into());
+                if let Some(active_op_id) = managed.operation_id.clone() {
+                    let event = AgentEvent::new(
+                        TaskId::generate(),
+                        session.session_id.clone(),
+                        AgentEventPayload::TurnInterrupted {
+                            sequence: 0,
+                            active_op_id,
+                            reason: "session host restarted; work was not replayed".into(),
+                        },
+                    );
+                    self.store
+                        .append_record(&AgentSessionStoreRecord::new(
+                            session.session_id.clone(),
+                            AgentSessionStoreRecordKind::ControlEventPublished { event },
+                        ))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            if now() >= managed.last_activity_unix + managed.idle_timeout_secs as i64 {
+                managed.archived = true;
+            }
+            self.store
+                .save_session(&session)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
     pub fn shutdown(&self, deadline: Instant) -> Result<(), String> {
         let children: Vec<_> = {
             let mut state = self.lock();
@@ -156,6 +228,11 @@ impl AgentSessionHost {
             let runtime = {
                 let mut state = child.state.lock().unwrap();
                 state.snapshot.archived = true;
+                if state.pending && state.pending_operation_id.is_some() {
+                    state.snapshot.status = ManagedSessionStatus::Cancelled;
+                    state.snapshot.cancel_requested = true;
+                    state.snapshot.last_activity_unix = now();
+                }
                 state.admission.cancel();
                 state.runtime.clone()
             };
@@ -192,6 +269,7 @@ impl AgentSessionHost {
         input: AgentLoopInput,
         cancellation: AgentCancellationToken,
         idle_timeout_secs: u64,
+        start_paused: bool,
     ) -> Result<ManagedSessionSnapshot, AgentError> {
         if self.lock().closing || cancellation.is_cancelled() {
             return Err(session_error("session admission stopped"));
@@ -201,7 +279,7 @@ impl AgentSessionHost {
             id: TaskId::generate(),
             parent_session_id: None,
             owner: Some(owner.into()),
-            operation_id: None,
+            operation_id: Some(TaskId::generate()),
             session_id: session_id.clone(),
             root_session_id: session_id.clone(),
             name: agent.config.definition.name.clone(),
@@ -219,7 +297,11 @@ impl AgentSessionHost {
         };
         let mut session = AgentSession::new(session_id, agent.config.definition.role.clone());
         session.managed = Some(snapshot.clone());
+        if start_paused {
+            session.pause = Some(AgentPauseRecord::new("awaiting owner admission"));
+        }
         session.workspace_binding = agent.config.run_context.workspace.clone();
+        session.agent_definition_key = Some(agent.config.definition.key().to_string());
         agent.session_store = self.store.clone();
         agent.session_store_configured = true;
         agent.session_host = OnceLock::from(self.clone());
@@ -231,6 +313,7 @@ impl AgentSessionHost {
                 runtime: Some(runtime),
                 input,
                 pending: true,
+                pending_operation_id: snapshot.operation_id.clone(),
                 updates: VecDeque::new(),
                 admission: cancellation,
                 driver: false,
@@ -265,6 +348,36 @@ impl AgentSessionHost {
             .collect())
     }
 
+    /// Validate a directly addressed session without scanning unrelated histories.
+    pub fn owned_session(&self, owner: &str, id: &str) -> Result<AgentSession, AgentError> {
+        let id = id
+            .parse()
+            .map_err(|_| session_error("invalid session id"))?;
+        let session = self
+            .store
+            .load_session(&id)
+            .map_err(|e| session_error(e.to_string()))?
+            .ok_or_else(|| session_error("session unavailable"))?;
+        let root_id = &session
+            .managed
+            .as_ref()
+            .ok_or_else(|| session_error("unmanaged session"))?
+            .root_session_id;
+        let root = self
+            .store
+            .load_session(root_id)
+            .map_err(|e| session_error(e.to_string()))?
+            .ok_or_else(|| session_error("session root unavailable"))?;
+        if !root
+            .managed
+            .as_ref()
+            .is_some_and(|m| m.owner.as_deref() == Some(owner) && m.parent_session_id.is_none())
+        {
+            return Err(session_error("session outside module grant"));
+        }
+        Ok(session)
+    }
+
     pub fn owned_command(
         self: &Arc<Self>,
         owner: &str,
@@ -276,25 +389,31 @@ impl AgentSessionHost {
             | SessionCommand::Wait { id, .. }
             | SessionCommand::Cancel { id }
             | SessionCommand::Archive { id }
-            | SessionCommand::Result { id } => id,
+            | SessionCommand::Result { id, .. }
+            | SessionCommand::Pause { id }
+            | SessionCommand::Resume { id } => id,
             _ => return Err(session_error("module commands require a session identity")),
         };
-        let session_id: SessionId = id
-            .parse()
-            .map_err(|_| session_error("invalid session id"))?;
-        let session = self
-            .store
-            .load_session(&session_id)
-            .map_err(|e| session_error(e.to_string()))?
-            .ok_or_else(|| session_error("session unavailable"))?;
+        let session = self.owned_session(owner, id)?;
         let root = session
             .managed
             .as_ref()
-            .ok_or_else(|| session_error("unmanaged session"))?
+            .expect("owned session")
             .root_session_id
             .clone();
-        if !self.owned_roots(owner)?.contains_key(root.as_str()) {
-            return Err(session_error("session outside module grant"));
+        if matches!(command, SessionCommand::Archive { .. })
+            && !self.lock().parents.contains_key(&root)
+        {
+            let mut session = session;
+            if let Some(managed) = &mut session.managed {
+                managed.archived = true;
+            }
+            self.store
+                .save_session(&session)
+                .map_err(|e| session_error(e.to_string()))?;
+            return Ok(
+                serde_json::json!({"accepted":true,"session_id":session.session_id,"archived":true}),
+            );
         }
         self.execute_command(&root, command, &AgentCancellationToken::new())
     }
@@ -304,7 +423,9 @@ impl AgentSessionHost {
     }
     pub(super) fn set_session(&self, session: &AgentSession) {
         if let Some(parent) = self.lock().parents.get_mut(&session.session_id) {
-            parent.session = session.clone();
+            if session.state_revision >= parent.session.state_revision {
+                parent.session = session.clone();
+            }
         }
     }
     pub(super) fn set_input(self: &Arc<Self>, input: &AgentLoopInput) {
@@ -375,6 +496,7 @@ impl AgentSessionHost {
                     runtime,
                     input: child_input,
                     pending: false,
+                    pending_operation_id: None,
                     updates: VecDeque::new(),
                     admission: AgentCancellationToken::new(),
                     driver: false,
@@ -422,8 +544,9 @@ impl AgentSessionHost {
         task: &str,
         cancellation: &AgentCancellationToken,
     ) -> Result<ManagedSessionSnapshot, AgentError> {
-        self.spawn_with_prompt(caller, name, task, "", IDLE_SECONDS, cancellation)
+        self.spawn_with_prompt(caller, name, task, "", IDLE_SECONDS, false, cancellation)
     }
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with_prompt(
         self: &Arc<Self>,
         caller: &SessionId,
@@ -431,6 +554,7 @@ impl AgentSessionHost {
         task: &str,
         prompt: &str,
         idle_timeout_secs: u64,
+        start_paused: bool,
         cancellation: &AgentCancellationToken,
     ) -> Result<ManagedSessionSnapshot, AgentError> {
         if task.trim().is_empty()
@@ -473,7 +597,7 @@ impl AgentSessionHost {
             id: TaskId::generate(),
             parent_session_id: Some(caller.clone()),
             owner: None,
-            operation_id: None,
+            operation_id: Some(TaskId::generate()),
             session_id: session.session_id.clone(),
             root_session_id: root,
             name: name.into(),
@@ -490,6 +614,9 @@ impl AgentSessionHost {
             idle_timeout_secs: idle_timeout_secs.clamp(1, IDLE_SECONDS),
         };
         session.managed = Some(snapshot.clone());
+        if start_paused {
+            session.pause = Some(AgentPauseRecord::new("awaiting owner admission"));
+        }
         session.relationship = snapshot.parent_session_id.as_ref().map(|parent| {
             sinomo_runtime::module_api::sessions::SessionRelationship {
                 parent_session_id: parent.to_string(),
@@ -522,6 +649,7 @@ impl AgentSessionHost {
                 runtime: Some(runtime),
                 input,
                 pending: true,
+                pending_operation_id: snapshot.operation_id.clone(),
                 updates: VecDeque::new(),
                 admission: cancellation.child_token(),
                 driver: false,
@@ -573,12 +701,30 @@ impl AgentSessionHost {
     }
     fn drive(manager: Weak<Self>, child: Arc<Child>) {
         loop {
-            let (runtime, input, admission) = {
+            let (runtime, input, admission, operation_id) = {
                 let mut state = child.state.lock().unwrap();
-                while !state.pending && !state.snapshot.archived {
+                while !state.snapshot.archived
+                    && (!state.pending
+                        || state
+                            .runtime
+                            .as_ref()
+                            .is_some_and(|runtime| runtime.session().is_ok_and(|s| s.is_paused())))
+                {
+                    if state.pending && state.admission.is_cancelled() {
+                        state.pending = false;
+                        state.pending_operation_id = None;
+                        state.snapshot.status = ManagedSessionStatus::Cancelled;
+                        state.snapshot.cancel_requested = true;
+                        if let Some(runtime) = &state.runtime {
+                            let _ = runtime.save_metadata(&state.snapshot);
+                        }
+                        child.changed.notify_all();
+                    }
                     if let Some(runtime) = state.runtime.clone() {
                         state.updates.extend(runtime.updates());
-                        if !state.updates.is_empty() {
+                        if !state.updates.is_empty()
+                            && !runtime.session().is_ok_and(|s| s.is_paused())
+                        {
                             state.pending = true;
                             break;
                         }
@@ -646,12 +792,21 @@ impl AgentSessionHost {
                     state.runtime.as_ref().unwrap().clone(),
                     input,
                     state.admission.clone(),
+                    state.pending_operation_id.take(),
                 )
             };
-            let op = AgentOp::continue_turn(input);
+            let mut op = AgentOp::continue_turn(input);
+            if let Some(id) = operation_id {
+                op.op_id = id;
+            }
             let id = op.op_id.clone();
-            child.state.lock().unwrap().snapshot.operation_id = Some(id.clone());
+            let metadata = {
+                let mut state = child.state.lock().unwrap();
+                state.snapshot.operation_id = Some(id.clone());
+                state.snapshot.clone()
+            };
             let result = (|| {
+                runtime.save_metadata(&metadata)?;
                 let accepted = runtime.start(op, admission.clone())?;
                 if !accepted.accepted {
                     return Err(session_error("child turn admission rejected"));
@@ -711,8 +866,15 @@ impl AgentSessionHost {
                         state.snapshot.error = Some(error.to_string());
                     }
                 }
+                // Reuse the core pending-work check: a completed detached call
+                // still belongs to this worker until its continuation is consumed.
+                let pending = runtime.pending_work();
+                state.updates.extend(runtime.updates());
+                if !state.updates.is_empty() {
+                    state.pending = true;
+                }
                 if state.snapshot.status == ManagedSessionStatus::Completed
-                    && runtime.detached_work()
+                    && (pending || state.pending || !state.updates.is_empty())
                 {
                     state.snapshot.status = ManagedSessionStatus::Running;
                 }
@@ -863,6 +1025,36 @@ impl AgentSessionHost {
         }
         Ok(state.snapshot.clone())
     }
+    fn control(
+        &self,
+        caller: &SessionId,
+        id: &TaskId,
+        op: AgentOp,
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
+        let child = self.child(caller, id)?;
+        let runtime = {
+            let state = child.state.lock().unwrap();
+            if state
+                .snapshot
+                .parent_session_id
+                .as_ref()
+                .unwrap_or(&state.snapshot.session_id)
+                != caller
+            {
+                return Err(session_error("only the owner can control a session"));
+            }
+            state
+                .runtime
+                .clone()
+                .ok_or_else(|| session_error("session is archived"))?
+        };
+        let result = runtime.submit(op)?;
+        if !result.accepted {
+            return Err(session_error("runtime rejected session control"));
+        }
+        child.changed.notify_all();
+        self.inspect(caller, id)
+    }
     pub fn cancel(
         &self,
         caller: &SessionId,
@@ -884,11 +1076,29 @@ impl AgentSessionHost {
             state.admission.cancel();
             state.runtime.clone()
         };
-        if let Some(runtime) = runtime {
+        let propagated = if let Some(runtime) = runtime {
             runtime.cancel_detached();
-            runtime.submit(AgentOp::cancel_active_turn("parent cancelled child"))?;
+            runtime
+                .submit(AgentOp::cancel_active_turn("parent cancelled child"))?
+                .accepted
+        } else {
+            false
+        };
+        if !propagated {
+            // A retained idle parent can still own running descendants.
+            let session_id = child.state.lock().unwrap().snapshot.session_id.clone();
+            self.cancel_children(&session_id);
         }
-        let state = child.state.lock().unwrap();
+        let mut state = child.state.lock().unwrap();
+        if state.pending && state.pending_operation_id.is_some() {
+            state.pending = false;
+            state.pending_operation_id = None;
+            state.snapshot.status = ManagedSessionStatus::Cancelled;
+            state.snapshot.last_activity_unix = now();
+            if let Some(runtime) = &state.runtime {
+                runtime.save_metadata(&state.snapshot)?;
+            }
+        }
         child.changed.notify_all();
         Ok(state.snapshot.clone())
     }
@@ -1298,6 +1508,7 @@ impl AgentSessionHost {
                 instructions,
                 prompt,
                 idle_timeout_secs,
+                start_paused,
                 worker: None,
             } => self.spawn_with_prompt(
                 caller,
@@ -1305,6 +1516,7 @@ impl AgentSessionHost {
                 &instructions,
                 &prompt,
                 idle_timeout_secs,
+                start_paused,
                 cancellation,
             )?,
             SessionCommand::Create {
@@ -1361,14 +1573,25 @@ impl AgentSessionHost {
             SessionCommand::Wait { id, timeout_ms } => {
                 self.wait(caller, &parse(id)?, timeout_ms, cancellation)?
             }
-            SessionCommand::Result { id } => {
+            SessionCommand::Result { id, operation_id } => {
                 let child = self.child(caller, &parse(id)?)?;
                 let state = child.state.lock().unwrap();
-                let result = match (&state.runtime, &state.snapshot.operation_id) {
-                    (Some(runtime), Some(id)) => runtime.result(id)?,
-                    _ => None,
-                };
+                let operation_id = operation_id
+                    .parse::<TaskId>()
+                    .map_err(|_| session_error("invalid operation id"))?;
+                let result = state
+                    .runtime
+                    .as_ref()
+                    .map(|r| r.result(&operation_id))
+                    .transpose()?
+                    .flatten();
                 return serde_json::to_value(result).map_err(|e| session_error(e.to_string()));
+            }
+            SessionCommand::Pause { id } => {
+                self.control(caller, &parse(id)?, AgentOp::pause("owner paused session"))?
+            }
+            SessionCommand::Resume { id } => {
+                self.control(caller, &parse(id)?, AgentOp::unpause())?
             }
             SessionCommand::Cancel { id } => self.cancel(caller, &parse(id)?)?,
             SessionCommand::Archive { id } => {
@@ -1381,7 +1604,7 @@ impl AgentSessionHost {
             }
         };
         Ok::<_, AgentError>(
-            serde_json::json!({"accepted":true,"session_id":snapshot.session_id,"status":snapshot.status,"archived":snapshot.archived,"subagent":snapshot}),
+            serde_json::json!({"accepted":true,"session_id":snapshot.session_id,"operation_id":snapshot.operation_id,"error":snapshot.error,"status":snapshot.status,"archived":snapshot.archived,"subagent":snapshot}),
         )
     }
 }

@@ -5,6 +5,7 @@ mod app_api;
 pub mod cli;
 mod cli_runtime;
 mod engine;
+mod execution;
 mod graph;
 mod module_abi;
 pub mod module_evidence;

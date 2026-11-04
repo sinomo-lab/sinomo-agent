@@ -183,6 +183,8 @@ pub struct CandidateBundleManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<sinomo_module_api::sessions::SessionExecutionRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_run_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_summary_path: Option<String>,

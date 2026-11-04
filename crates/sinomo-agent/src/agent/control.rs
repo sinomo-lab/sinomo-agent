@@ -1388,6 +1388,12 @@ where
         if explicit_snapshot || staged.session != state.control.session {
             self.agent.save_session(&staged.session)?;
         }
+        let pause_token = staged.active_turn_cancellation.clone();
+        state.control = staged;
+        let session = state.control.session.clone();
+        state.append_control_runtime_events(&result.events);
+        drop(state);
+        self.session_scope.manager.set_session(&session);
         if result.accepted && cancelling_children {
             self.session_scope.cancel_children();
         }
@@ -1401,20 +1407,19 @@ where
         if result.accepted
             && let Some(pause) = pause_signal
         {
-            if let Some(token) = &staged.active_turn_cancellation {
+            if let Some(token) = &pause_token {
                 if pause {
                     token.pause();
                 } else {
                     token.unpause();
                 }
             }
+        }
+        if result.accepted
+            && let Some(pause) = pause_signal
+        {
             self.session_scope.set_children_paused(pause);
         }
-        state.control = staged;
-        self.session_scope
-            .manager
-            .set_session(&state.control.session);
-        state.append_control_runtime_events(&result.events);
         Ok(result)
     }
 
@@ -1626,24 +1631,28 @@ where
         self.has_work(false)
     }
 
+    pub(super) fn has_pending_turn_work(&self) -> Result<bool, AgentError> {
+        self.own_work(true).map(|(busy, _)| busy)
+    }
+
+    fn own_work(&self, include_ready_updates: bool) -> Result<(bool, SessionId), AgentError> {
+        let mut state = self.lock_state()?;
+        state.collect_detached_completions();
+        let busy = state.control.active_turn.is_some()
+            || state.turn_worker_running
+            || detached_calls_running(&state.control.session.session_id) > 0
+            || (include_ready_updates
+                && (!state.async_updates.is_empty()
+                    || !state.control.session.steering_queue.is_empty()
+                    || !state.control.session.follow_up_queue.is_empty()));
+        Ok((busy, state.control.session.session_id.clone()))
+    }
+
     fn has_work(&self, include_ready_updates: bool) -> Result<bool, AgentError> {
-        let session_id = {
-            let mut state = self.lock_state()?;
-            state.collect_detached_completions();
-            // Ordinary idle checks include ready continuations. Shutdown joins
-            // executing work while leaving those completions for reattach.
-            if state.control.active_turn.is_some()
-                || state.turn_worker_running
-                || detached_calls_running(&state.control.session.session_id) > 0
-                || (include_ready_updates
-                    && (!state.async_updates.is_empty()
-                        || !state.control.session.steering_queue.is_empty()
-                        || !state.control.session.follow_up_queue.is_empty()))
-            {
-                return Ok(true);
-            }
-            state.control.session.session_id.clone()
-        };
+        let (busy, session_id) = self.own_work(include_ready_updates)?;
+        if busy {
+            return Ok(true);
+        }
         Ok(self
             .sessions()
             .list(&session_id)

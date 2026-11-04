@@ -80,6 +80,7 @@ impl sessions::SessionAccess for ModuleSessions {
                         instructions,
                         prompt,
                         idle_timeout_secs,
+                        start_paused,
                         worker: Some(worker),
                     },
             } => {
@@ -271,19 +272,43 @@ impl sessions::SessionAccess for ModuleSessions {
                         input,
                         AgentCancellationToken::from_parent_signal(self.cancellation.signal()),
                         idle_timeout_secs,
+                        start_paused,
                     )
                     .map_err(|e| e.to_string())?;
-                serde_json::to_value(snapshot).map_err(|e| e.to_string())
+                let mut receipt = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
+                receipt["accepted"] = serde_json::Value::Bool(true);
+                Ok(receipt)
             }
             SessionRequest::Command { command } => self
                 .sessions
                 .owned_command(&self.descriptor.module_id, command)
                 .map_err(|e| e.to_string()),
             read => {
-                let roots = self
-                    .sessions
-                    .owned_roots(&self.descriptor.module_id)
-                    .map_err(|e| e.to_string())?;
+                let target = match &read {
+                    SessionRequest::Execution { execution } => Some(execution.session_id.as_str()),
+                    SessionRequest::Inspect { session_id }
+                    | SessionRequest::Activity { session_id, .. } => Some(session_id.as_str()),
+                    _ => None,
+                };
+                let roots = if let Some(id) = target {
+                    let session = self
+                        .sessions
+                        .owned_session(&self.descriptor.module_id, id)
+                        .map_err(|e| e.to_string())?;
+                    [(
+                        id.to_string(),
+                        session
+                            .managed
+                            .as_ref()
+                            .map(|m| m.name.clone())
+                            .unwrap_or_default(),
+                    )]
+                    .into()
+                } else {
+                    self.sessions
+                        .owned_roots(&self.descriptor.module_id)
+                        .map_err(|e| e.to_string())?
+                };
                 crate::session_access::AgentSessionAccess::new(
                     Arc::new(FileAgentSessionStore::for_data_dir(&self.data_dir)),
                     roots,
@@ -339,6 +364,11 @@ pub fn with_session_host(
     let factory = StaticComponentFactory::new(
         ComponentDescriptor::new("sinomo-agent-sessions", env!("CARGO_PKG_VERSION")),
         move |_, scope| {
+            let recovery = sessions.clone();
+            scope.on_host_prepare(move || {
+                let recovery = recovery.clone();
+                async move { recovery.recover_interrupted() }
+            });
             let sessions = sessions.clone();
             scope.on_task_drain("managed sessions", move |deadline| {
                 let sessions = sessions.clone();
@@ -401,6 +431,7 @@ mod tests {
                     instructions: "do the task".into(),
                     prompt: String::new(),
                     idle_timeout_secs: 86400,
+                    start_paused: false,
                     worker: Some(SessionWorkerBinding {
                         agent_id: agent.into(),
                         provider: "scripted".into(),

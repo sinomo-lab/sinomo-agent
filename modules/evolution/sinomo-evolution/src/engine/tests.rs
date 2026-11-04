@@ -742,7 +742,7 @@ fn evolution_language_model_mutation_model_reports_unknown_provider() {
     };
 
     let error = model
-        .mutate(&packet, &candidate_workspace(&root), None)
+        .mutate(&packet, &candidate_workspace(&root), None, None)
         .expect_err("unknown provider should fail");
 
     assert!(matches!(
@@ -1493,6 +1493,7 @@ fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
             mutation_packet_path: "/tmp/sinomo-candidate-bundle/mutation-packet.json".to_string(),
             job_path: Some("/tmp/sinomo-candidate-bundle/job.json".to_string()),
             model_output_path: Some("/tmp/sinomo-candidate-bundle/model-output.json".to_string()),
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -2353,6 +2354,7 @@ fn sample_iteration_report(
             mutation_packet_path: "/tmp/sinomo-candidate-bundle/mutation-packet.json".to_string(),
             job_path: Some("/tmp/sinomo-candidate-bundle/job.json".to_string()),
             model_output_path: Some("/tmp/sinomo-candidate-bundle/model-output.json".to_string()),
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -3246,7 +3248,9 @@ fn language_model_bridge_requests_json_and_applies_returned_patch() {
         recovery: RecoveryPlan::default(),
     };
 
-    let result = bridge.mutate(&packet, &workspace, None).expect("mutate");
+    let result = bridge
+        .mutate(&packet, &workspace, None, None)
+        .expect("mutate");
 
     assert_eq!(
         requests.borrow()[0].response_format,
@@ -3313,7 +3317,9 @@ fn language_model_bridge_runs_tool_rounds_before_final_patch() {
         recovery: RecoveryPlan::default(),
     };
 
-    let result = bridge.mutate(&packet, &workspace, None).expect("mutate");
+    let result = bridge
+        .mutate(&packet, &workspace, None, None)
+        .expect("mutate");
 
     assert_eq!(requests.borrow().len(), 2);
     assert!(requests.borrow()[0].metadata["target_ring"].is_null());
@@ -3381,7 +3387,9 @@ fn language_model_bridge_treats_http_tool_providers_as_structured_patch_mode() {
         recovery: RecoveryPlan::default(),
     };
 
-    let result = bridge.mutate(&packet, &workspace, None).expect("mutation");
+    let result = bridge
+        .mutate(&packet, &workspace, None, None)
+        .expect("mutation");
 
     let request = &requests.borrow()[0];
     assert_eq!(request.metadata["direct_edit"], false);
@@ -3420,7 +3428,12 @@ fn unrestricted_language_model_bridge_fails_closed_without_permission_context() 
     let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
 
     let error = bridge
-        .mutate(&bridge_permission_test_packet(&workspace), &workspace, None)
+        .mutate(
+            &bridge_permission_test_packet(&workspace),
+            &workspace,
+            None,
+            None,
+        )
         .expect_err("unrestricted provider must require authoritative local consent");
 
     assert!(requests.borrow().is_empty());
@@ -3444,7 +3457,12 @@ fn unrestricted_language_model_bridge_rechecks_permission_between_provider_calls
         LanguageModelMutationBridge::new_for_data_dir(provider, PROVIDER_DEFAULT_MODEL, &data_dir);
 
     let error = bridge
-        .mutate(&bridge_permission_test_packet(&workspace), &workspace, None)
+        .mutate(
+            &bridge_permission_test_packet(&workspace),
+            &workspace,
+            None,
+            None,
+        )
         .expect_err("revocation must stop the next provider invocation");
 
     assert_eq!(requests.borrow().len(), 1);
@@ -3496,7 +3514,7 @@ fn language_model_bridge_errors_when_final_patch_fails_to_apply() {
     };
 
     let error = bridge
-        .mutate(&packet, &workspace, None)
+        .mutate(&packet, &workspace, None, None)
         .expect_err("bad patch");
 
     assert!(matches!(error, MutationModelError::ToolExecution { .. }));
@@ -4823,6 +4841,7 @@ fn regression_evidence_summary_preserves_trace_fixture_refs_for_future_gates() {
         mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -4928,6 +4947,7 @@ fn regression_evidence_summary_turns_rollout_telemetry_windows_into_trace_fixtur
         mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -5043,6 +5063,7 @@ fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtu
         mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -5165,6 +5186,7 @@ fn agent_mutation_worker_binds_local_permission_store_for_host_commands() {
             .to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -5219,7 +5241,12 @@ fn agent_mutation_worker_binds_local_permission_store_for_host_commands() {
         .with_max_steps(Some(4));
 
     let result = worker
-        .mutate(&mutation_packet_for_job(&job), &workspace, Some(&bundle))
+        .mutate(
+            &mutation_packet_for_job(&job),
+            &workspace,
+            Some(&bundle),
+            None,
+        )
         .expect("agent mutation");
 
     assert_eq!(
@@ -5409,6 +5436,7 @@ fn verify_stored_evolution_job_runs_plan_and_records_scorecard() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5489,6 +5517,7 @@ fn decide_stored_evolution_job_records_rejected_decision() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5862,6 +5891,7 @@ fn approved_candidate_commit_fast_forwards_source_checkout() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5942,6 +5972,7 @@ fn cleanup_stored_evolution_job_removes_worktree_job_and_bundle_dirs() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -6404,6 +6435,7 @@ impl MutationModel for FakeMutationModel {
         _packet: &MutationPacket,
         _workspace: &CandidateWorkspace,
         _bundle: Option<&CandidateBundleManifest>,
+        _on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let tool_result = EvolutionToolResult {
             tool: "read_file".to_string(),
@@ -6469,6 +6501,7 @@ impl MutationModel for FakeAgentArtifactMutationModel {
         _packet: &MutationPacket,
         _workspace: &CandidateWorkspace,
         _bundle: Option<&CandidateBundleManifest>,
+        _on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         Ok(ModelMutationResult {
             provider: "fake".to_string(),
@@ -6480,6 +6513,7 @@ impl MutationModel for FakeAgentArtifactMutationModel {
             tool_results: Vec::new(),
             model_turns: Vec::new(),
             agent_summary: Some(AgentMutationSummary {
+                execution: None,
                 stop_reason: "final-decision".to_string(),
                 model_turns: 2,
                 tool_results: 1,
@@ -6700,6 +6734,7 @@ fn approval_record_fixture(
     .expect("diff");
     let agent_summary_path = bundle_dir.join("agent-summary.json");
     let agent_summary = AgentMutationSummary {
+        execution: None,
         stop_reason: "final-decision".to_string(),
         model_turns: 2,
         tool_results: 1,
@@ -6732,6 +6767,7 @@ fn approval_record_fixture(
             mutation_packet_path: mutation_packet_path.display().to_string(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: Some(agent_summary_path.display().to_string()),
             benchmark_results_path: None,
@@ -6916,6 +6952,7 @@ fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
                     command:
                         SessionCommand::Create {
                             instructions,
+                            start_paused,
                             worker: Some(worker),
                             ..
                         },
@@ -6947,6 +6984,7 @@ fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
                                 input,
                                 sinomo_agent::AgentCancellationToken::new(),
                                 86400,
+                                *start_paused,
                             )
                             .map_err(|e| e.to_string())?,
                     )
@@ -6968,12 +7006,13 @@ fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
     let workspace = candidate_workspace(&root);
     let packet = bridge_permission_test_packet(&workspace);
     let mut model = EvolutionAgentMutationModel {
+        workflow_paths: None,
         provider: "fake".into(),
         model: "fake".into(),
         max_steps: Some(2),
         sessions: Some(&host),
     };
-    let result = model.mutate(&packet, &workspace, None).unwrap();
+    let result = model.mutate(&packet, &workspace, None, None).unwrap();
     assert_eq!(result.raw_output, "host completed candidate");
     assert!(result.agent_run.is_some());
     assert_eq!(
@@ -6986,7 +7025,7 @@ fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
     model.sessions = None;
     assert!(
         model
-            .mutate(&packet, &workspace, None)
+            .mutate(&packet, &workspace, None, None)
             .unwrap_err()
             .to_string()
             .contains("host session service is required")

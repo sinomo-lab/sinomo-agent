@@ -134,6 +134,12 @@ implementation, and evaluation to separately identified subagents. Those
 subagents receive only their task inputs and allowed capabilities, and cannot
 select or promote their own outputs.
 
+The shared agent runtime is authoritative for worker execution state. Evolution
+keeps goal intent and candidate evidence separately, binds assignments to actual
+session and operation identities, and obtains worker progress from the runtime.
+Pausing a goal pauses its workers; cancelling or completing a goal archives its
+workers while retaining their observed outcomes and history.
+
 The control plane is an iterative evidence loop.
 
 ```text

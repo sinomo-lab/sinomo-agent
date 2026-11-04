@@ -588,10 +588,16 @@ fn goal_card(
                             "{} · {} · {}{}",
                             run.role,
                             run.agent_id,
-                            run.summary,
-                            run.session_ref
-                                .as_deref()
-                                .map(|session| format!(" · {session}"))
+                            run.execution_detail
+                                .as_ref()
+                                .map(|detail| format!("{} · {detail}", run.summary))
+                                .unwrap_or_else(|| run.summary.clone()),
+                            run.execution
+                                .as_ref()
+                                .map(|execution| format!(
+                                    " · {} / {}",
+                                    execution.session_id, execution.operation_id
+                                ))
                                 .unwrap_or_default()
                         ))
                         .theme_when(clone_reader(reader)),

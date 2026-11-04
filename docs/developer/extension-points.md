@@ -168,6 +168,12 @@ The session API supports scoped discovery, inspection, paged journal activity,
 channel messages and explicitly granted lifecycle commands. Read-only panel
 invocations cannot mutate sessions. Lifecycle commands accept canonical session
 IDs and return a common acknowledgement; tool-specific handles remain aliases.
+Creation can reserve a paused worker with a stable operation ID. Persist that
+execution reference before resuming when a workflow needs durable admission.
+Execution queries project the core journal for a session/operation pair; callers
+cannot supply execution status. Result retrieval names the operation explicitly
+so a later turn cannot replace the requested result. Pause and cancellation are
+immediate control operations and do not wait for model or tool completion.
 Related sessions use ordinary relationship
 metadata, so consumers need no dependency on a subagent provider. Tool discovery
 and input parsing are separate from session access; the subagent tool uses this

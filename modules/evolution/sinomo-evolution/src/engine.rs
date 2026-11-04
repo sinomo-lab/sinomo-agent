@@ -3911,6 +3911,7 @@ impl CandidateBundleStore for LocalCandidateBundleStore {
                 .to_string(),
             job_path: Some(bundle_path.join("job.json").display().to_string()),
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -3972,12 +3973,16 @@ impl CandidateBundleStore for LocalCandidateBundleStore {
     }
 }
 
+pub type MutationSessionObserver<'a> =
+    Option<&'a dyn Fn(&sinomo_module_api::sessions::SessionExecutionRef) -> Result<(), String>>;
+
 pub trait MutationModel {
     fn mutate(
         &self,
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
         bundle: Option<&CandidateBundleManifest>,
+        on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError>;
 }
 
@@ -4035,6 +4040,8 @@ pub struct ModelMutationResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentMutationSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<sinomo_module_api::sessions::SessionExecutionRef>,
     pub stop_reason: String,
     pub model_turns: usize,
     pub tool_results: usize,
@@ -4215,6 +4222,7 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
         _bundle: Option<&CandidateBundleManifest>,
+        on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let info = self.provider.info();
         let direct_edit =
@@ -4391,6 +4399,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
         _bundle: Option<&CandidateBundleManifest>,
+        on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         match self.provider.as_str() {
             GitHubCopilotProvider::PROVIDER_ID => {
@@ -4414,7 +4423,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             GitHubCopilotCliProvider::PROVIDER_ID => {
                 let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
@@ -4426,7 +4435,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             CodexCliProvider::PROVIDER_ID => {
                 let provider = CodexCliProvider::new(CodexCliConfig {
@@ -4439,7 +4448,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             CODEX_PROVIDER_ID => {
                 let provider = codex_provider_for_model(&self.model);
@@ -4448,7 +4457,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
                 let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
@@ -4461,7 +4470,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             AnthropicProvider::PROVIDER_ID | "claude" => {
                 let credentials_path = self
@@ -4480,7 +4489,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             OpenAiProvider::PROVIDER_ID | "openai-api" => {
                 let credentials_path = self
@@ -4499,7 +4508,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             GeminiProvider::PROVIDER_ID | "google-gemini" => {
                 let credentials_path = self
@@ -4518,7 +4527,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             NvidiaProvider::PROVIDER_ID => {
                 let credentials_path = self
@@ -4539,7 +4548,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     self.model.clone(),
                     &self.data_dir,
                 )
-                .mutate(packet, workspace, None)
+                .mutate(packet, workspace, None, None)
             }
             _ => Err(MutationModelError::LanguageModel(
                 LanguageModelError::ProviderInvocationFailed {
@@ -4554,6 +4563,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
 
 #[derive(Clone)]
 pub struct EvolutionAgentMutationModel<'a> {
+    pub workflow_paths: Option<crate::EvolutionPaths>,
     pub provider: String,
     pub model: String,
     pub max_steps: Option<usize>,
@@ -4566,6 +4576,7 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
         bundle: Option<&CandidateBundleManifest>,
+        on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         use sinomo_module_api::sessions::*;
         let sessions = self.sessions.ok_or_else(|| MutationModelError::Agent {
@@ -4582,6 +4593,7 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
                 instructions: render_agent_mutation_prompt(packet, workspace),
                 prompt: String::new(),
                 idle_timeout_secs: 86400,
+                start_paused: true,
                 worker: Some(SessionWorkerBinding {
                     agent_id: crate::EVOLUTION_IMPLEMENTER_AGENT_ID.into(),
                     provider: self.provider.clone(),
@@ -4603,6 +4615,42 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
                 detail: "host omitted session identity".into(),
             })?
             .to_string();
+        let mut execution = SessionExecutionRef {
+            session_id: id.clone(),
+            operation_id: started["operation_id"]
+                .as_str()
+                .ok_or_else(|| MutationModelError::Agent {
+                    detail: "host omitted operation identity".into(),
+                })?
+                .into(),
+        };
+        let admit = |execution: &SessionExecutionRef| -> Result<(), MutationModelError> {
+            if let Some(observer) = on_session {
+                observer(execution).map_err(|detail| MutationModelError::Agent { detail })?;
+            }
+            Ok(())
+        };
+        if let Err(error) = admit(&execution) {
+            let _ = call(SessionRequest::Command {
+                command: SessionCommand::Cancel { id: id.clone() },
+            });
+            return Err(error);
+        }
+        let resumed = if let Some(paths) = &self.workflow_paths {
+            crate::execution::admit_candidate(paths, packet, &execution, self.sessions)
+                .map_err(|detail| MutationModelError::Agent { detail })
+        } else {
+            call(SessionRequest::Command {
+                command: SessionCommand::Resume { id: id.clone() },
+            })
+            .map(|_| ())
+        };
+        if let Err(error) = resumed {
+            let _ = call(SessionRequest::Command {
+                command: SessionCommand::Cancel { id: id.clone() },
+            });
+            return Err(error);
+        }
         loop {
             let state = call(SessionRequest::Command {
                 command: SessionCommand::Wait {
@@ -4610,12 +4658,34 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
                     timeout_ms: 100,
                 },
             })?;
-            if state["subagent"]["status"] != "running" {
+            if let Some(operation_id) = state["operation_id"].as_str()
+                && operation_id != execution.operation_id
+            {
+                execution.operation_id = operation_id.into();
+                if let Err(error) = admit(&execution) {
+                    let _ = call(SessionRequest::Command {
+                        command: SessionCommand::Cancel { id: id.clone() },
+                    });
+                    return Err(error);
+                }
+            }
+            if state["status"] != "running" {
+                if state["status"] != "completed" {
+                    return Err(MutationModelError::Agent {
+                        detail: state["error"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("worker execution {}", state["status"])),
+                    });
+                }
                 break;
             }
         }
         let result = call(SessionRequest::Command {
-            command: SessionCommand::Result { id },
+            command: SessionCommand::Result {
+                id,
+                operation_id: execution.operation_id.clone(),
+            },
         })?;
         let outcome: Option<sinomo_agent::AgentOpOutcome> = serde_json::from_value(result)
             .map_err(|e| MutationModelError::Serialization {
@@ -4626,7 +4696,13 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
             .ok_or_else(|| MutationModelError::Agent {
                 detail: "host session finished without a run".into(),
             })?;
-        agent_mutation_result(packet, &self.provider, &self.model, run)
+        let mut result = agent_mutation_result(packet, &self.provider, &self.model, run)?;
+        result
+            .agent_summary
+            .as_mut()
+            .expect("runtime summary")
+            .execution = Some(execution);
+        Ok(result)
     }
 }
 
@@ -4674,6 +4750,7 @@ where
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
         bundle: Option<&CandidateBundleManifest>,
+        on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let session = InteractionSession::new(
             SessionId::generate(),
@@ -4811,6 +4888,7 @@ fn agent_mutation_result(
     let final_text = run.final_decision.text.clone();
     let (input_tokens, output_tokens) = agent_model_usage_totals(&run.model_events);
     let agent_summary = AgentMutationSummary {
+        execution: None,
         stop_reason: agent_stop_reason_label(&run.stop_reason),
         model_turns: run.model_turns.len(),
         tool_results: run.tool_results.len(),
@@ -5400,7 +5478,30 @@ where
                     &[],
                     "mutation agent started",
                 )?;
-                let result = model.mutate(&packet, &candidate_workspace, Some(&bundle))?;
+                let admitted = std::cell::RefCell::new(None);
+                let on_session = |execution: &sinomo_module_api::sessions::SessionExecutionRef| {
+                    *admitted.borrow_mut() = Some(execution.clone());
+                    let mut active_bundle = bundle.clone();
+                    active_bundle.execution = Some(execution.clone());
+                    notify_lifecycle(
+                        observer,
+                        &job,
+                        &candidate_workspace,
+                        &active_bundle,
+                        None,
+                        &[],
+                        "worker session admitted",
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                let outcome = model.mutate(
+                    &packet,
+                    &candidate_workspace,
+                    Some(&bundle),
+                    Some(&on_session),
+                );
+                bundle.execution = admitted.into_inner();
+                let result = outcome?;
                 self.bundles
                     .write_text(&bundle, "model-output.txt", &result.raw_output)?;
                 self.bundles

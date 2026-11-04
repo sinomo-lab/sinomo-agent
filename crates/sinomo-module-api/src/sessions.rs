@@ -2,7 +2,7 @@
 //! mutation grants are supplied by the host, never by a module request.
 use serde::{Deserialize, Serialize};
 pub const SESSION_INTERFACE: &str = "sinomo.sessions";
-pub const SESSION_VERSION: &str = "2.0.0";
+pub const SESSION_VERSION: &str = "3.0.0";
 pub const SESSION_ACCESS: &str = "sessions.access";
 pub const MAX_SESSION_PAGE: usize = 256;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,6 +16,9 @@ pub enum SessionRequest {
     },
     Inspect {
         session_id: String,
+    },
+    Execution {
+        execution: SessionExecutionRef,
     },
     Messages {
         after_sequence: Option<u64>,
@@ -41,6 +44,8 @@ pub enum SessionCommand {
         prompt: String,
         idle_timeout_secs: u64,
         #[serde(default)]
+        start_paused: bool,
+        #[serde(default)]
         worker: Option<SessionWorkerBinding>,
     },
     List {
@@ -62,6 +67,13 @@ pub enum SessionCommand {
         id: String,
     },
     Result {
+        id: String,
+        operation_id: String,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
         id: String,
     },
     Archive {
@@ -136,8 +148,12 @@ pub struct ConversationMessage {
 /// fields; modules use the canonical session ID rather than a tool's handle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionCommandReceipt {
+    #[serde(default)]
+    pub error: Option<String>,
     pub accepted: bool,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -177,4 +193,36 @@ pub struct SessionWorkerProfile {
     /// Capability names from the agent tool contract. Empty grants are rejected.
     pub capabilities: Vec<String>,
     pub max_steps: Option<usize>,
+}
+
+/// Durable execution identity. Artifact paths are not session identities.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionExecutionRef {
+    pub session_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExecutionPhase {
+    Queued,
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionExecutionState {
+    pub current_operation_id: Option<String>,
+    pub execution: SessionExecutionRef,
+    pub agent_id: Option<String>,
+    pub phase: SessionExecutionPhase,
+    pub cancel_requested: bool,
+    pub archived: bool,
+    pub error: Option<String>,
+    pub last_event_id: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
 }

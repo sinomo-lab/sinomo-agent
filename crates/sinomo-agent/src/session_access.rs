@@ -163,7 +163,9 @@ impl AgentSessionAccess {
                         .unwrap_or_default(),
                     session_id: id,
                     relationship,
-                    archived: session.managed.as_ref().is_some_and(|s| s.archived),
+                    archived: session.managed.as_ref().is_some_and(|s| {
+                        s.archived_at(time::OffsetDateTime::now_utc().unix_timestamp())
+                    }),
                 },
             );
         }
@@ -204,7 +206,18 @@ impl SessionAccess for AgentSessionAccess {
                 .map_err(|_| "session scope cache poisoned")? = None;
             return Ok(result);
         }
-        let members = self.members()?;
+        let target = match &request {
+            SessionRequest::Execution { execution } => Some(execution.session_id.as_str()),
+            SessionRequest::Inspect { session_id }
+            | SessionRequest::Activity { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        };
+        let directly_granted = target.is_some_and(|id| self.roots.contains_key(id));
+        let members = if directly_granted {
+            BTreeMap::new()
+        } else {
+            self.members()?
+        };
         match request {
             SessionRequest::Messages {
                 after_sequence,
@@ -247,13 +260,24 @@ impl SessionAccess for AgentSessionAccess {
                 }
                 serde_json::to_value(entries).map_err(|e| e.to_string())
             }
+            SessionRequest::Execution { execution } => {
+                if !directly_granted && !members.contains_key(&execution.session_id) {
+                    return Err("session is outside the invocation grant".into());
+                }
+                serde_json::to_value(execution_state(self.store.as_ref(), execution)?)
+                    .map_err(|e| e.to_string())
+            }
             SessionRequest::Inspect { session_id } => {
-                if !members.contains_key(&session_id) {
+                if !directly_granted && !members.contains_key(&session_id) {
                     return Err("session is outside the invocation grant".into());
                 }
                 let id = session_id.parse().map_err(|_| "invalid session id")?;
-                serde_json::to_value(self.store.load_session(&id).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())
+                let mut session = self.store.load_session(&id).map_err(|e| e.to_string())?;
+                if let Some(managed) = session.as_mut().and_then(|s| s.managed.as_mut()) {
+                    managed.archived =
+                        managed.archived_at(time::OffsetDateTime::now_utc().unix_timestamp());
+                }
+                serde_json::to_value(session).map_err(|e| e.to_string())
             }
             SessionRequest::Activity {
                 session_id,
@@ -261,7 +285,7 @@ impl SessionAccess for AgentSessionAccess {
                 tail,
                 limit,
             } => {
-                if !members.contains_key(&session_id) {
+                if !directly_granted && !members.contains_key(&session_id) {
                     return Err("session is outside the invocation grant".into());
                 }
                 if limit == 0 || limit > MAX_SESSION_PAGE {
@@ -347,4 +371,146 @@ fn session_relationship(session: &crate::AgentSession) -> Option<SessionRelation
                 })
         })
     })
+}
+
+/// Execution projections come from the core journal, including control operations
+/// whose own ID differs from the turn they interrupt or cancel.
+fn execution_state(
+    store: &dyn AgentSessionStore,
+    execution: SessionExecutionRef,
+) -> Result<SessionExecutionState, String> {
+    use crate::{AgentEventPayload as E, AgentStopReason, ManagedSessionStatus};
+    let session_id = execution
+        .session_id
+        .parse()
+        .map_err(|_| "invalid session id")?;
+    let operation_id = execution
+        .operation_id
+        .parse::<crate::TaskId>()
+        .map_err(|_| "invalid operation id")?;
+    let session = store
+        .load_session(&session_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("session unavailable")?;
+    let managed = session
+        .managed
+        .as_ref()
+        .filter(|m| m.operation_id.as_ref() == Some(&operation_id));
+    let mut known = managed.is_some();
+    let mut state = SessionExecutionState {
+        current_operation_id: session
+            .managed
+            .as_ref()
+            .and_then(|m| m.operation_id.as_ref().map(ToString::to_string)),
+        execution,
+        agent_id: session.agent_definition_key.clone(),
+        phase: SessionExecutionPhase::Queued,
+        cancel_requested: false,
+        archived: session
+            .managed
+            .as_ref()
+            .is_some_and(|m| m.archived_at(time::OffsetDateTime::now_utc().unix_timestamp())),
+        error: None,
+        last_event_id: None,
+        started_at: None,
+        finished_at: None,
+    };
+    for event in store
+        .load_control_events(&session_id)
+        .map_err(|e| e.to_string())?
+    {
+        let own = event.op_id == operation_id;
+        let timestamp = event
+            .emitted_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok();
+        match &event.payload {
+            E::TurnStarted { .. } if own => {
+                known = true;
+                state.phase = SessionExecutionPhase::Running;
+                state.started_at = timestamp;
+            }
+            E::TurnCompleted { stop_reason, .. } if own => {
+                known = true;
+                state.finished_at = timestamp;
+                state.phase = match stop_reason {
+                    AgentStopReason::Cancelled => SessionExecutionPhase::Cancelled,
+                    AgentStopReason::MaxStepsReached => SessionExecutionPhase::Failed,
+                    _ => SessionExecutionPhase::Completed,
+                };
+            }
+            E::OperationQueued { .. } if own => {
+                known = true;
+            }
+            E::OperationRejected { reason, .. } if own => {
+                known = true;
+                state.phase = SessionExecutionPhase::Failed;
+                state.error = Some(reason.clone());
+                state.finished_at = timestamp;
+            }
+            E::CancellationRequested {
+                active_op_id: Some(id),
+                ..
+            } if id == &operation_id => {
+                known = true;
+                state.cancel_requested = true;
+            }
+            E::TurnInterrupted {
+                active_op_id,
+                reason,
+                ..
+            }
+            | E::TurnTimedOut {
+                active_op_id,
+                reason,
+                ..
+            } if active_op_id == &operation_id => {
+                known = true;
+                state.phase = SessionExecutionPhase::Failed;
+                state.error = Some(reason.clone());
+                state.finished_at = timestamp;
+            }
+            _ => continue,
+        }
+        state.last_event_id = Some(event.event_id.to_string());
+    }
+    if !known {
+        return Err("operation does not belong to this session".into());
+    }
+    if let Some(managed) = managed {
+        state.cancel_requested |= managed.cancel_requested;
+        match managed.status {
+            ManagedSessionStatus::Completed => state.phase = SessionExecutionPhase::Completed,
+            ManagedSessionStatus::Failed => {
+                state.phase = SessionExecutionPhase::Failed;
+                state.error = managed.error.clone();
+            }
+            ManagedSessionStatus::Cancelled => state.phase = SessionExecutionPhase::Cancelled,
+            ManagedSessionStatus::Running => {
+                if managed.archived {
+                    state.phase = SessionExecutionPhase::Cancelled;
+                } else if session.is_paused() {
+                    state.phase = SessionExecutionPhase::Paused;
+                } else if state.started_at.is_some() {
+                    state.phase = SessionExecutionPhase::Running;
+                }
+            }
+        }
+    }
+    if state.finished_at.is_none()
+        && matches!(
+            state.phase,
+            SessionExecutionPhase::Completed
+                | SessionExecutionPhase::Failed
+                | SessionExecutionPhase::Cancelled
+        )
+    {
+        state.finished_at = managed
+            .and_then(|m| time::OffsetDateTime::from_unix_timestamp(m.last_activity_unix).ok())
+            .and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            });
+    }
+    Ok(state)
 }

@@ -80,6 +80,7 @@ pub fn command_for_action(input: serde_json::Value) -> Result<SessionCommand, St
                 instructions: task,
                 prompt: format!("{PROMPT}\n\n{prompt}"),
                 idle_timeout_secs: 86400,
+                start_paused: false,
                 worker: None,
             }
         }
@@ -322,6 +323,7 @@ mod tests {
             command_for_action(serde_json::json!({"action":"spawn","task":"work"})).unwrap(),
             SessionCommand::Create {
                 idle_timeout_secs: 86400,
+                start_paused: false,
                 ..
             }
         ));

@@ -1522,7 +1522,7 @@ mod tests {
             "0.1.0",
             "sinomo-evolution",
             "sinomo-evolution",
-            "sinomo.evolution.v1",
+            sinomo_runtime::api::app::evolution::EVOLUTION_MODULE_INTERFACE_VERSION,
             sinomo_runtime::core::TrustRing::R2TrustedService,
             "sinomo-evolution",
         )
