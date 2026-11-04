@@ -35,6 +35,7 @@ impl MutationModel for FixtureModel {
         _: &MutationPacket,
         workspace: &CandidateWorkspace,
         _: Option<&CandidateBundleManifest>,
+        _: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         let mutate = || -> Result<(), String> {
             if let Some(upstream) = &self.upstream {

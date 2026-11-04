@@ -13,41 +13,26 @@ pub use opportunity::*;
 use crate::{
     CandidateApprovalPreflightCheck, CandidateApprovalPreflightReport, CandidateBundleAttestation,
     CandidateBundleContentManifest, CandidateBundleFileDigest, CandidateBundleManifest,
-    CandidateBundlePredicate, CandidateBundleSubject, CandidateDecisionOutcome, CommandLogRef,
-    EditScope, EvolutionJob, EvolutionJobId, EvolutionJobStatus, EvolutionPaths,
-    EvolutionPersistenceError, EvolutionScope, FileExcerpt, ModuleReplayReportRef,
-    MutationOutputContract, MutationPacket, RecordedCandidateDecision,
+    CandidateBundlePredicate, CandidateBundleSubject, CandidateDecisionOutcome,
+    CandidateEvidenceRequirements, CommandLogRef, EditScope, EvolutionJob, EvolutionJobId,
+    EvolutionJobStatus, EvolutionPaths, EvolutionPersistenceError, EvolutionScope, FileExcerpt,
+    ModuleReplayReportRef, MutationPacket, RecordedCandidateDecision,
     RecordedCandidateVerification, RecoveryPlan, StoredEvolutionJob, VerificationCommand,
     VerificationPlan, record_candidate_decision_with_preflight, record_candidate_verification,
     write_bundle_manifest, write_stored_job,
 };
-use serde::{Deserialize, Deserializer, Serialize};
-use sinomo_agent::{
-    Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentItem, AgentLoopInput,
-    AgentModelEvent, AgentOp, AgentRole, AgentSession, AgentSessionRuntime, AgentStoragePaths,
-    AgentToolKind, AgentToolPairIntegrity, AgentToolRegistry, AgentToolSpec, AgentToolSurface,
-    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
-    user_interaction_input_event,
-};
+use serde::{Deserialize, Serialize};
+use sinomo_agent::{AgentContextAttachment, AgentItem, AgentModelEvent, AgentToolPairIntegrity};
 use sinomo_lm::{
-    AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
-    CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
-    GeminiConfig, GeminiProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
-    GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError, LanguageModelInvocation,
-    LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo, LanguageModelRequest,
-    LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig, NvidiaProvider, OpenAiConfig,
-    OpenAiProvider, PROVIDER_DEFAULT_MODEL, codex_provider_for_model, model_or_default,
-    normalize_model_id_for_provider, normalize_model_provider,
+    GitHubCopilotProvider, PROVIDER_DEFAULT_MODEL, normalize_model_id_for_provider,
+    normalize_model_provider,
 };
 use sinomo_runtime::core::{
     EvaluationGate, EvaluationMetric, EvaluationOutcome, EvaluationScorecard, MetricValue,
     RollbackPolicy, TrustRing,
 };
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
-use sinomo_runtime::events::{EventId, SessionId};
-use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore, NodeId};
+use sinomo_runtime::events::EventId;
 use sinomo_runtime::registry::{
     ArtifactEvidenceManifest, ArtifactEvidenceRecord, ArtifactRegistry,
     RELEASE_MATERIAL_RELATIVE_PATH, VerifiedReleaseMaterialRecord, read_release_material_from_path,
@@ -3986,42 +3971,13 @@ pub trait MutationModel {
     ) -> Result<ModelMutationResult, MutationModelError>;
 }
 
-use crate::tools::{
-    EvolutionToolCall, EvolutionToolDescriptor, EvolutionToolRegistry, EvolutionToolResult,
-    ToolCallStatus,
-};
-#[cfg(test)]
-use crate::tools::{EvolutionToolEventContext, ToolEvidence};
-
-#[cfg(windows)]
-pub(crate) fn shell_command(command: &str) -> Command {
-    let mut shell = Command::new("powershell");
-    shell.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-    shell
-}
-
-#[cfg(not(windows))]
-pub(crate) fn shell_command(command: &str) -> Command {
-    let mut shell = Command::new("sh");
-    shell.args(["-c", command]);
-    shell
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelMutationResult {
     pub provider: String,
     pub model: String,
     pub raw_output: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parsed_patch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structured_output: Option<StructuredMutationOutput>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_results: Vec<EvolutionToolResult>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub model_turns: Vec<MutationModelTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_summary: Option<AgentMutationSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4054,511 +4010,6 @@ pub struct AgentMutationSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_pair_integrity: Option<AgentToolPairIntegrity>,
     pub final_text: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct MutationModelTurn {
-    pub turn: usize,
-    pub raw_output: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structured_output: Option<StructuredMutationOutput>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_results: Vec<EvolutionToolResult>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct StructuredMutationOutput {
-    #[serde(default, alias = "changedFiles")]
-    pub changed_files: Vec<String>,
-    #[serde(default, alias = "toolCalls")]
-    pub tool_calls: Vec<EvolutionToolCall>,
-    #[serde(default, alias = "unified_diff")]
-    pub patch: Option<String>,
-    #[serde(default, alias = "patchSummary")]
-    pub patch_summary: Option<String>,
-    #[serde(
-        default,
-        alias = "verificationNotes",
-        deserialize_with = "deserialize_optional_note"
-    )]
-    pub verification_notes: Option<String>,
-    #[serde(
-        default,
-        alias = "experimentNotes",
-        deserialize_with = "deserialize_optional_note"
-    )]
-    pub experiment_notes: Option<String>,
-    #[serde(
-        default,
-        alias = "recoveryNotes",
-        deserialize_with = "deserialize_optional_note"
-    )]
-    pub recovery_notes: Option<String>,
-}
-
-fn deserialize_optional_note<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::String(note) => Ok(Some(note)),
-        serde_json::Value::Array(items) => {
-            let notes: Vec<String> = items
-                .into_iter()
-                .filter_map(|item| match item {
-                    serde_json::Value::Null => None,
-                    serde_json::Value::String(note) => Some(note),
-                    other => Some(other.to_string()),
-                })
-                .collect();
-            if notes.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(notes.join("\n")))
-            }
-        }
-        other => Ok(Some(other.to_string())),
-    }
-}
-
-pub struct LanguageModelMutationBridge<P> {
-    provider: P,
-    model: String,
-    tool_registry: EvolutionToolRegistry,
-    local_permission_data_dir: Option<SinomoDataDir>,
-    max_tool_rounds: usize,
-}
-
-impl<P> LanguageModelMutationBridge<P> {
-    pub fn new(provider: P, model: impl Into<String>) -> Self {
-        Self {
-            provider,
-            model: model.into(),
-            tool_registry: EvolutionToolRegistry::bootstrap(),
-            local_permission_data_dir: None,
-            max_tool_rounds: 4,
-        }
-    }
-
-    pub fn with_tool_registry(mut self, tool_registry: EvolutionToolRegistry) -> Self {
-        self.tool_registry = tool_registry;
-        self
-    }
-
-    /// Constructs the bridge with node-local consent available to effectful
-    /// tools. The ordinary constructor remains fail-closed for callers that do
-    /// not have an authoritative local data directory.
-    pub fn new_for_data_dir(
-        provider: P,
-        model: impl Into<String>,
-        data_dir: &SinomoDataDir,
-    ) -> Self {
-        let mut bridge = Self::new(provider, model);
-        bridge.tool_registry = EvolutionToolRegistry::bootstrap_for_data_dir(data_dir.clone());
-        bridge.local_permission_data_dir = Some(data_dir.clone());
-        bridge
-    }
-
-    pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
-        self.max_tool_rounds = max_tool_rounds;
-        self
-    }
-
-    fn authorize_provider_host_access(
-        &self,
-        info: &LanguageModelProviderInfo,
-    ) -> Result<(), MutationModelError> {
-        if !info.host_access.requires_remote_management_permission() {
-            return Ok(());
-        }
-
-        let Some(data_dir) = self.local_permission_data_dir.as_ref() else {
-            return Err(self.provider_permission_denied(
-                info,
-                "no authoritative node-local permission context is configured",
-            ));
-        };
-        let store = LocalNodePermissionStore::new(data_dir.root());
-        let granted = store
-            .try_permission_granted(LocalNodePermission::RemoteManagement)
-            .map_err(|error| {
-                self.provider_permission_denied(
-                    info,
-                    format!("could not verify node-local permission: {error}"),
-                )
-            })?;
-        if !granted {
-            return Err(self.provider_permission_denied(
-                info,
-                "grant `remote-management` locally on this node",
-            ));
-        }
-        Ok(())
-    }
-
-    fn provider_permission_denied(
-        &self,
-        info: &LanguageModelProviderInfo,
-        detail: impl std::fmt::Display,
-    ) -> MutationModelError {
-        MutationModelError::LanguageModel(LanguageModelError::ProviderInvocationFailed {
-            provider: info.provider.clone(),
-            model: self.model.clone(),
-            detail: format!(
-                "provider requires node-local permission `remote-management` for unrestricted host access; {detail}"
-            ),
-        })
-    }
-}
-
-impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> {
-    fn mutate(
-        &self,
-        packet: &MutationPacket,
-        workspace: &CandidateWorkspace,
-        _bundle: Option<&CandidateBundleManifest>,
-        on_session: MutationSessionObserver<'_>,
-    ) -> Result<ModelMutationResult, MutationModelError> {
-        let info = self.provider.info();
-        let direct_edit =
-            info.supports_tool_permissions && info.invocation == LanguageModelInvocation::Process;
-        let structured_response = !direct_edit;
-        let response_format = if structured_response && info.supports_json_object {
-            LanguageModelResponseFormat::JsonObject
-        } else {
-            LanguageModelResponseFormat::Text
-        };
-        let descriptors = self.tool_registry.descriptors();
-        let mut messages = vec![
-            LanguageModelMessage {
-                role: LanguageModelRole::System,
-                content: render_mutation_system_prompt(structured_response, direct_edit),
-            },
-            LanguageModelMessage {
-                role: LanguageModelRole::User,
-                content: render_mutation_bridge_prompt(
-                    packet,
-                    workspace,
-                    &descriptors,
-                    structured_response,
-                    direct_edit,
-                ),
-            },
-        ];
-        let mut model_turns = Vec::new();
-        let mut all_tool_results = Vec::new();
-        let mut final_response = None;
-
-        for turn in 1..=self.max_tool_rounds.max(1) {
-            let request = LanguageModelRequest {
-                provider: info.provider.clone(),
-                model: self.model.clone(),
-                messages: messages.clone(),
-                items: Vec::new(),
-                tools: Vec::new(),
-                tool_choice: None,
-                parallel_tool_calls: None,
-                temperature: Some(0.2),
-                max_output_tokens: None,
-                response_format: response_format.clone(),
-                metadata: serde_json::json!({
-                    "usage_attribution": sinomo_runtime::api::app::usage::UsageAttribution{origin:"evolution".into(),purpose:"mutation".into(),task:Some(packet.job_id.to_string()),operation:Some(packet.job_id.to_string()),..Default::default()},
-                    "job_id": packet.job_id,
-                    "candidate_workspace": workspace.path,
-                    "direct_edit": direct_edit,
-                    "target_ring_policy": "ignored-during-bootstrap",
-                    "turn": turn,
-                    "max_tool_rounds": self.max_tool_rounds,
-                }),
-            };
-            // This check belongs immediately at the provider effect boundary,
-            // not bridge construction: a local operator can revoke consent
-            // between model/tool rounds and the next host process must stop.
-            self.authorize_provider_host_access(&info)?;
-            let response = sinomo_lm::usage::complete_provider(
-                self.local_permission_data_dir.as_ref(),
-                &self.provider,
-                &request,
-            )?;
-            let structured_output = parse_structured_mutation_output(&response.content);
-            let tool_calls = if direct_edit {
-                Vec::new()
-            } else {
-                structured_output
-                    .as_ref()
-                    .map(|output| output.tool_calls.clone())
-                    .unwrap_or_default()
-            };
-            let mut turn_tool_results = Vec::new();
-            for call in tool_calls {
-                let result = self.tool_registry.execute(workspace, call);
-                turn_tool_results.push(result.clone());
-                all_tool_results.push(result);
-            }
-            model_turns.push(MutationModelTurn {
-                turn,
-                raw_output: response.content.clone(),
-                structured_output: structured_output.clone(),
-                tool_results: turn_tool_results.clone(),
-            });
-
-            let has_final_patch = structured_output
-                .as_ref()
-                .and_then(|output| output.patch.as_ref())
-                .is_some_and(|patch| !patch.trim().is_empty());
-            let has_text_patch = extract_patch_from_text(&response.content).is_some();
-            if !direct_edit && !turn_tool_results.is_empty() && !has_final_patch && !has_text_patch
-            {
-                if turn >= self.max_tool_rounds.max(1) {
-                    return Err(MutationModelError::ToolRoundLimitExceeded {
-                        max_rounds: self.max_tool_rounds,
-                    });
-                }
-                messages.push(LanguageModelMessage {
-                    role: LanguageModelRole::Assistant,
-                    content: response.content,
-                });
-                messages.push(LanguageModelMessage {
-                    role: LanguageModelRole::User,
-                    content: render_tool_results_followup(&turn_tool_results),
-                });
-                continue;
-            } else {
-                final_response = Some(response);
-                break;
-            }
-        }
-
-        let response = final_response.ok_or(MutationModelError::ToolRoundLimitExceeded {
-            max_rounds: self.max_tool_rounds,
-        })?;
-        let structured_output = parse_structured_mutation_output(&response.content);
-        let parsed_patch = structured_output
-            .as_ref()
-            .and_then(|output| output.patch.clone())
-            .or_else(|| extract_patch_from_text(&response.content));
-        if !direct_edit
-            && let Some(patch) = parsed_patch
-                .as_ref()
-                .filter(|patch| !patch.trim().is_empty())
-        {
-            let result = self.tool_registry.execute(
-                workspace,
-                EvolutionToolCall {
-                    tool: "apply_patch".to_string(),
-                    input: serde_json::json!({ "patch": patch }),
-                },
-            );
-            if result.status != ToolCallStatus::Succeeded {
-                return Err(MutationModelError::ToolExecution {
-                    tool: result.tool,
-                    detail: result.evidence.summary,
-                });
-            }
-            all_tool_results.push(result);
-        }
-        let summary = structured_output
-            .as_ref()
-            .and_then(|output| output.patch_summary.clone())
-            .or_else(|| first_non_empty_line(&response.content));
-        Ok(ModelMutationResult {
-            provider: response.provider,
-            model: response.model,
-            raw_output: response.content,
-            parsed_patch,
-            summary,
-            structured_output,
-            tool_results: all_tool_results,
-            model_turns,
-            agent_summary: None,
-            agent_resource_usage: None,
-            agent_run: None,
-            agent_events: Vec::new(),
-            coding_run_state: None,
-            patch_snapshots: Vec::new(),
-            validation_records: Vec::new(),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct EvolutionLanguageModelMutationModel {
-    pub provider: String,
-    pub model: String,
-    pub data_dir: SinomoDataDir,
-}
-
-impl MutationModel for EvolutionLanguageModelMutationModel {
-    fn mutate(
-        &self,
-        packet: &MutationPacket,
-        workspace: &CandidateWorkspace,
-        _bundle: Option<&CandidateBundleManifest>,
-        on_session: MutationSessionObserver<'_>,
-    ) -> Result<ModelMutationResult, MutationModelError> {
-        match self.provider.as_str() {
-            GitHubCopilotProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
-                let default_config = GitHubCopilotConfig::default();
-                let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
-                    options: Default::default(),
-                    client_id: default_config.client_id,
-                    github_host: default_config.github_host,
-                    api_base_url: default_config.api_base_url,
-                    default_model: model_or_default(
-                        &self.model,
-                        GitHubCopilotConfig::default().default_model,
-                    ),
-                    token_store_path: Some(credentials_path),
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            GitHubCopilotCliProvider::PROVIDER_ID => {
-                let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
-                    model: model_or_default(&self.model, GitHubCopilotCliConfig::default().model),
-                    ..GitHubCopilotCliConfig::default()
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            CodexCliProvider::PROVIDER_ID => {
-                let provider = CodexCliProvider::new(CodexCliConfig {
-                    model: model_or_default(&self.model, CODEX_CLI_DEFAULT_MODEL.to_string()),
-                    working_dir: Some(workspace.path.clone()),
-                    ..CodexCliConfig::default()
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            CODEX_PROVIDER_ID => {
-                let provider = codex_provider_for_model(&self.model);
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
-                let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
-                    model: model_or_default(&self.model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
-                    working_dir: Some(workspace.path.clone()),
-                    ..ClaudeCodeConfig::default()
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            AnthropicProvider::PROVIDER_ID | "claude" => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(AnthropicProvider::PROVIDER_ID);
-                let provider = AnthropicProvider::new(AnthropicConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        AnthropicConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..AnthropicConfig::default()
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            OpenAiProvider::PROVIDER_ID | "openai-api" => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(OpenAiProvider::PROVIDER_ID);
-                let provider = OpenAiProvider::new(OpenAiConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        OpenAiConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..OpenAiConfig::default()
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            GeminiProvider::PROVIDER_ID | "google-gemini" => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(GeminiProvider::PROVIDER_ID);
-                let provider = GeminiProvider::new(GeminiConfig {
-                    default_model: model_or_default(
-                        &self.model,
-                        GeminiConfig::default().default_model,
-                    ),
-                    credentials_path: Some(credentials_path),
-                    ..GeminiConfig::default()
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            NvidiaProvider::PROVIDER_ID => {
-                let credentials_path = self
-                    .data_dir
-                    .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
-                let provider = NvidiaProvider::new(NvidiaConfig {
-                    options: Default::default(),
-                    api_base_url: NvidiaConfig::default().api_base_url,
-                    default_model: model_or_default(
-                        &self.model,
-                        NvidiaConfig::default().default_model,
-                    ),
-                    api_key: None,
-                    credentials_path: Some(credentials_path),
-                });
-                LanguageModelMutationBridge::new_for_data_dir(
-                    provider,
-                    self.model.clone(),
-                    &self.data_dir,
-                )
-                .mutate(packet, workspace, None, None)
-            }
-            _ => Err(MutationModelError::LanguageModel(
-                LanguageModelError::ProviderInvocationFailed {
-                    provider: self.provider.clone(),
-                    model: self.model.clone(),
-                    detail: "unknown evolution model provider".to_string(),
-                },
-            )),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -4706,179 +4157,6 @@ impl MutationModel for EvolutionAgentMutationModel<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct AgentMutationWorker<M> {
-    interaction_model: M,
-    provider: String,
-    model: String,
-    local_permission_data_dir: Option<SinomoDataDir>,
-    max_steps: Option<usize>,
-}
-
-impl<M> AgentMutationWorker<M> {
-    pub fn new(
-        interaction_model: M,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        Self {
-            interaction_model,
-            provider: provider.into(),
-            model: model.into(),
-            local_permission_data_dir: None,
-            max_steps: None,
-        }
-    }
-
-    pub fn with_local_permission_data_dir(mut self, data_dir: SinomoDataDir) -> Self {
-        self.local_permission_data_dir = Some(data_dir);
-        self
-    }
-
-    pub fn with_max_steps(mut self, max_steps: Option<usize>) -> Self {
-        self.max_steps = max_steps;
-        self
-    }
-}
-
-impl<M> MutationModel for AgentMutationWorker<M>
-where
-    M: InteractionModel + Clone + Send + Sync + 'static,
-{
-    fn mutate(
-        &self,
-        packet: &MutationPacket,
-        workspace: &CandidateWorkspace,
-        bundle: Option<&CandidateBundleManifest>,
-        on_session: MutationSessionObserver<'_>,
-    ) -> Result<ModelMutationResult, MutationModelError> {
-        let session = InteractionSession::new(
-            SessionId::generate(),
-            NodeId::from_legacy_named("node_evolution_agent").expect("valid evolution node id"),
-            InteractionSurface::new("evolution.mutation", InteractionSurfaceKind::CommandLine),
-        );
-        let storage_paths = AgentStoragePaths::new(agent_storage_root(workspace, bundle));
-        let mut workspace_config = LocalWorkspaceAgentConfig::new(&workspace.path)
-            .allowing_shell_commands(true)
-            .allowing_file_writes(true)
-            .with_agent_storage(&storage_paths, &session.session_id);
-        workspace_config.max_read_bytes = 256 * 1024;
-        workspace_config.max_command_output_bytes = 128 * 1024;
-        workspace_config.max_search_matches = 300;
-        // Candidate workspaces own an isolated command-sandbox store rather
-        // than instances in the daemon's node-local sandbox store.
-        let sandboxes = sinomo_runtime::sandbox::SandboxLifecycleClient::in_process_at_runtime_root(
-            &workspace_config.sandbox_runtime_root,
-        );
-        sinomo_agent::local_workspace::provision_default_agent_session_sandbox(
-            &sandboxes,
-            &workspace_config,
-            Vec::new(),
-        )
-        .map_err(|detail| MutationModelError::Agent {
-            detail: format!("provision evolution-agent command sandbox: {detail}"),
-        })?;
-
-        let mut config = AgentConfig::new(self.provider.clone(), self.model.clone())
-            .with_agent_definition(crate::evolution_implementer_agent_definition())
-            .with_workspace_root(&workspace.path)
-            .with_context_budget(AgentContextBudget::for_loaded_model(
-                &self.provider,
-                &self.model,
-                None,
-            ))
-            .with_max_model_repair_attempts(2);
-        if !config
-            .visible_toolsets
-            .iter()
-            .any(|toolset| toolset == "coding_advanced")
-        {
-            config.visible_toolsets.push("coding_advanced".to_string());
-        }
-        if let Some(max_steps) = self.max_steps {
-            config = config.with_max_steps(max_steps);
-        }
-
-        let tool_registry = AgentToolRegistry::local_workspace_with_config(workspace_config);
-        if let Some(data_dir) = &self.local_permission_data_dir {
-            tool_registry.set_local_permission_data_dir(data_dir.root());
-            tool_registry.set_usage_data_dir(data_dir.clone());
-            let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(
-                data_dir,
-                crate::EVOLUTION_IMPLEMENTER_AGENT_ID,
-            )
-            .map_err(|source| MutationModelError::Agent {
-                detail: format!("configure evolution-agent Markdown memory notes: {source}"),
-            })?;
-            sinomo_agent::memory_notes::register_tools(
-                &tool_registry,
-                sinomo_agent::MemoryNoteAgentToolConfig::from_backend(memory_backend),
-            );
-        }
-
-        let agent = Agent::new(
-            self.interaction_model.clone(),
-            self.provider.clone(),
-            self.model.clone(),
-        )
-        .with_config(config)
-        .with_tool_surface(AgentToolSurface::default_for_role(AgentRole::Deliberation))
-        .with_tool_registry(tool_registry)
-        .with_trace_store(FileAgentTraceStore::new(
-            storage_paths.trace_path_for_session(&session.session_id),
-        ));
-        let prompt = render_agent_mutation_prompt(packet, workspace);
-        let latest_event = user_interaction_input_event(&session, &prompt);
-        let input = AgentLoopInput {
-            session,
-            latest_event,
-            transient_system_context: None,
-            async_update: None,
-            context_attachments: vec![evolution_agent_context_attachment(packet, bundle)],
-            tool_specs: evolution_agent_mutation_tools(self.local_permission_data_dir.is_some()),
-        };
-        let runtime = AgentSessionRuntime::new(
-            agent,
-            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation),
-        );
-        let op = AgentOp::start_turn(input);
-        let op_id = op.op_id.clone();
-        let submit = runtime
-            .submit_op(op)
-            .map_err(|source| MutationModelError::Agent {
-                detail: source.to_string(),
-            })?;
-        if !submit.accepted {
-            let detail = submit
-                .events
-                .iter()
-                .find_map(|event| match &event.payload {
-                    sinomo_agent::AgentEventPayload::OperationRejected { reason, .. } => {
-                        Some(reason.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| "evolution agent turn was rejected".to_string());
-            return Err(MutationModelError::Agent { detail });
-        }
-        runtime
-            .join_active_turn()
-            .map_err(|source| MutationModelError::Agent {
-                detail: source.to_string(),
-            })?;
-        let run = runtime
-            .turn_result(&op_id)
-            .map_err(|source| MutationModelError::Agent {
-                detail: source.to_string(),
-            })?
-            .and_then(|outcome| outcome.run)
-            .ok_or_else(|| MutationModelError::Agent {
-                detail: format!("agent runtime turn `{op_id}` completed without a run"),
-            })?;
-        agent_mutation_result(packet, &self.provider, &self.model, run)
-    }
-}
-
 fn agent_mutation_result(
     packet: &MutationPacket,
     provider: &str,
@@ -4957,11 +4235,7 @@ fn agent_mutation_result(
         provider: provider.to_string(),
         model: model.to_string(),
         raw_output: final_text.clone(),
-        parsed_patch: None,
         summary: non_empty_string(final_text),
-        structured_output: None,
-        tool_results: Vec::new(),
-        model_turns: Vec::new(),
         agent_summary: Some(agent_summary),
         agent_resource_usage: Some(agent_resource_usage),
         agent_run: Some(agent_run),
@@ -4970,21 +4244,6 @@ fn agent_mutation_result(
         patch_snapshots,
         validation_records,
     })
-}
-
-fn agent_storage_root(
-    workspace: &CandidateWorkspace,
-    bundle: Option<&CandidateBundleManifest>,
-) -> PathBuf {
-    if let Some(bundle) = bundle {
-        return PathBuf::from(&bundle.bundle_path).join("agent");
-    }
-    workspace
-        .path
-        .parent()
-        .unwrap_or(&workspace.path)
-        .join("agent-artifacts")
-        .join(workspace.job_id.as_str())
 }
 
 fn agent_stop_reason_label(reason: &sinomo_agent::AgentStopReason) -> String {
@@ -5113,35 +4372,6 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
-fn evolution_agent_mutation_tools(markdown_memory_available: bool) -> Vec<AgentToolSpec> {
-    // The internal mutation harness has no host-injected stable activity
-    // backend. Do not advertise session_history_search through its per-turn
-    // tool projection: doing so would create a visible descriptor with no
-    // executor (or tempt this layer to read raw model-session storage). The
-    // three SIFS Markdown-note tools are registered above whenever the worker
-    // has an authoritative data directory.
-    let mut tools = default_coding_agent_tools()
-        .into_iter()
-        .filter(|tool| {
-            tool.kind != AgentToolKind::SessionHistorySearch
-                && (markdown_memory_available
-                    || !matches!(
-                        tool.kind,
-                        AgentToolKind::MemorySearch
-                            | AgentToolKind::MemoryRead
-                            | AgentToolKind::MemoryWrite
-                    ))
-        })
-        .collect::<Vec<_>>();
-    tools.push(AgentToolSpec::new(
-        AgentToolKind::ApplyPatch,
-        "apply_patch",
-        "Edit workspace files with a scoped provider-specific patch.",
-        true,
-    ));
-    tools
-}
-
 pub fn render_agent_mutation_prompt(
     packet: &MutationPacket,
     workspace: &CandidateWorkspace,
@@ -5156,9 +4386,9 @@ pub fn render_agent_mutation_prompt(
     prompt.push_str(
         "Treat this workspace as the only mutation target. The source checkout or owning runtime may be using the source workspace separately.\n",
     );
-    prompt.push_str("\n## Agent Harness Instructions\n");
+    prompt.push_str("\n## Candidate Work\n");
     prompt.push_str(
-        "Use the available workspace tools to inspect and edit files directly. Do not ask for approval; any visible tool or resource is already available under the active sandbox.\n",
+        "Use the host-provided workspace tools within their granted scope. Report unavailable capabilities and verification failures.\n",
     );
     prompt.push_str(
         "Keep changes scoped to the intended edit scope unless repository evidence shows a supporting file must also change. Run the requested verification commands when practical; the orchestrator will run them again after you finish.\n",
@@ -5216,163 +4446,17 @@ pub fn render_mutation_prompt(packet: &MutationPacket) -> String {
             ));
         }
     }
-    prompt.push_str("\n## Output Contract\n");
-    for section in &packet.output_contract.expected_sections {
+    prompt.push_str("\n## Candidate Evidence\n");
+    for section in &packet.evidence_requirements.expected_sections {
         prompt.push_str(&format!("- {section}\n"));
     }
-    prompt.push_str(&format!(
-        "prefer_patch: {}\nnotes: {}\n",
-        packet.output_contract.prefer_patch, packet.output_contract.notes
-    ));
+    prompt.push_str(&format!("notes: {}\n", packet.evidence_requirements.notes));
     prompt.push_str("\n## Recovery\n");
     prompt.push_str(&format!(
         "strategy: {:?}\nnote: {}\n",
         packet.recovery.strategy, packet.recovery.note
     ));
     prompt
-}
-
-pub fn render_mutation_bridge_prompt(
-    packet: &MutationPacket,
-    workspace: &CandidateWorkspace,
-    tool_descriptors: &[EvolutionToolDescriptor],
-    structured_json: bool,
-    direct_edit: bool,
-) -> String {
-    let mut prompt = render_mutation_prompt(packet);
-    prompt.push_str("\n## Candidate Workspace\n");
-    prompt.push_str(&format!("path: {}\n", workspace.path.display()));
-    prompt.push_str(&format!("branch: {}\n", workspace.branch_name));
-    if let Some(revision) = &workspace.source_revision {
-        prompt.push_str(&format!("source_revision: {revision}\n"));
-    }
-    prompt.push_str(
-        "Treat this workspace as the only mutation target. The source checkout or owning runtime may be using the source workspace separately.\n",
-    );
-
-    prompt.push_str("\n## Tool Substrate\n");
-    if tool_descriptors.is_empty() {
-        prompt.push_str("- no registered tools were provided\n");
-    } else {
-        for descriptor in tool_descriptors {
-            prompt.push_str(&format!(
-                "- {} effects={:?} input_schema={}\n",
-                descriptor.name, descriptor.effects, descriptor.input_schema_json
-            ));
-        }
-    }
-
-    prompt.push_str("\nLong-running command tools emit `run_id` values. If a command produces no further stdout/stderr, the runtime notifies the model after 1 minute, after 5 minutes, and then every 10 minutes of continued inactivity; use `interrupt_command` to send SIGINT or `kill_command` to terminate by run_id when appropriate.\n");
-
-    prompt.push_str("\n## Mutation Mode\n");
-    if direct_edit {
-        prompt.push_str(
-            "Edit files directly in the candidate workspace. Return concise evidence notes after the edits.\n",
-        );
-    } else {
-        prompt.push_str(
-            "Return a unified diff in the `patch` field. Sinomo will apply it to the candidate workspace through the tool registry.\n",
-        );
-    }
-
-    if structured_json {
-        prompt.push_str("\n## Required JSON Response\n");
-        prompt.push_str(
-            "Return only a json object with keys: tool_calls, changed_files, patch, patch_summary, verification_notes, experiment_notes, recovery_notes.\n",
-        );
-        prompt.push_str(
-            "`tool_calls` is an array of objects shaped like `{ \"tool\": \"read_file\", \"input\": { ... } }`. Use it when you need more context or want Sinomo to run a command before finalizing. When ready, leave `tool_calls` empty and provide `patch` or final notes.\n",
-        );
-        if direct_edit {
-            prompt.push_str("When files were edited directly, set patch to null unless you also have a useful evidence diff.\n");
-        }
-    }
-    prompt
-}
-
-fn render_mutation_system_prompt(structured_json: bool, direct_edit: bool) -> String {
-    let mut prompt = String::from(
-        "You are Sinomo's supervised evolution mutation worker. Work only on the requested candidate workspace and produce durable evidence.",
-    );
-    if direct_edit {
-        prompt.push_str(
-            " You may use the coding-agent harness to edit the candidate workspace directly.",
-        );
-    } else {
-        prompt.push_str(
-            " You cannot edit files directly; produce an inspectable patch that Sinomo can apply as a candidate.",
-        );
-    }
-    if structured_json {
-        prompt.push_str(" Return valid json only.");
-    }
-    prompt
-}
-
-pub fn parse_structured_mutation_output(raw_output: &str) -> Option<StructuredMutationOutput> {
-    let json = extract_json_object(raw_output)?;
-    serde_json::from_str::<StructuredMutationOutput>(json).ok()
-}
-
-fn extract_json_object(raw_output: &str) -> Option<&str> {
-    let trimmed = raw_output.trim();
-    for fence in ["```json", "```"] {
-        if let Some(start) = trimmed.find(fence) {
-            let body_start = start + fence.len();
-            let body = trimmed[body_start..].trim_start_matches(['\r', '\n']);
-            if let Some(end) = body.find("```") {
-                let candidate = body[..end].trim();
-                if candidate.starts_with('{') && candidate.ends_with('}') {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        return Some(trimmed);
-    }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if start < end {
-        Some(&trimmed[start..=end])
-    } else {
-        None
-    }
-}
-
-fn extract_patch_from_text(raw_output: &str) -> Option<String> {
-    let trimmed = raw_output.trim();
-    for fence in ["```diff", "```patch", "```"] {
-        if let Some(start) = trimmed.find(fence) {
-            let body_start = start + fence.len();
-            let body = trimmed[body_start..].trim_start_matches(['\r', '\n']);
-            if let Some(end) = body.find("```") {
-                let patch = body[..end].trim();
-                if patch.contains("diff --git") || patch.contains("--- ") {
-                    return Some(patch.to_string());
-                }
-            }
-        }
-    }
-    trimmed
-        .find("diff --git ")
-        .map(|start| trimmed[start..].trim().to_string())
-}
-
-fn first_non_empty_line(raw_output: &str) -> Option<String> {
-    raw_output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('{') && !line.starts_with('}'))
-        .map(ToOwned::to_owned)
-}
-
-fn render_tool_results_followup(results: &[EvolutionToolResult]) -> String {
-    let tool_results_json =
-        serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        "Tool results from the previous turn:\n```json\n{tool_results_json}\n```\nUse these results as evidence. Return the next JSON response. If more context is required, request more `tool_calls`; if ready, return an empty `tool_calls` array and provide the final patch or notes."
-    )
 }
 
 pub struct EvolutionOrchestrator<W, R, B> {
@@ -5577,20 +4661,6 @@ where
                             .display()
                             .to_string(),
                     );
-                }
-                if let Some(patch) = &result.parsed_patch {
-                    self.bundles.write_text(&bundle, "model.patch", patch)?;
-                }
-                if !result.tool_results.is_empty() {
-                    self.bundles.write_json(
-                        &bundle,
-                        "model-tool-results.json",
-                        &result.tool_results,
-                    )?;
-                }
-                if !result.model_turns.is_empty() {
-                    self.bundles
-                        .write_json(&bundle, "model-turns.json", &result.model_turns)?;
                 }
                 bundle.model_output_path = Some(
                     PathBuf::from(&bundle.bundle_path)
@@ -7901,7 +6971,7 @@ fn mutation_packet_for_job(job: &EvolutionJob) -> MutationPacket {
             &job.edit_scope.intended_paths,
         ),
         verification: job.verification.clone(),
-        output_contract: MutationOutputContract::default(),
+        evidence_requirements: CandidateEvidenceRequirements::default(),
         recovery: job.recovery.clone(),
     }
 }
@@ -8704,16 +7774,10 @@ pub enum BundleError {
 
 #[derive(Debug, Error)]
 pub enum MutationModelError {
-    #[error(transparent)]
-    LanguageModel(#[from] LanguageModelError),
     #[error("agent mutation failed: {detail}")]
     Agent { detail: String },
     #[error("failed to serialize mutation artifact: {detail}")]
     Serialization { detail: String },
-    #[error("mutation tool `{tool}` failed: {detail}")]
-    ToolExecution { tool: String, detail: String },
-    #[error("mutation bridge exceeded max tool rounds ({max_rounds})")]
-    ToolRoundLimitExceeded { max_rounds: usize },
 }
 
 #[cfg(test)]

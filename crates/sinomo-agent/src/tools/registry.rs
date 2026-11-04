@@ -1423,10 +1423,11 @@ mod tests {
 
     #[test]
     fn clearing_registry_keeps_resources_alive_for_running_tool() {
-        struct DropProbe(Arc<AtomicBool>);
+        struct DropProbe(Arc<AtomicBool>, std::sync::mpsc::Sender<()>);
         impl Drop for DropProbe {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::SeqCst);
+                let _ = self.1.send(());
             }
         }
 
@@ -1456,8 +1457,9 @@ mod tests {
         }
 
         let dropped = Arc::new(AtomicBool::new(false));
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
         let registry = AgentToolRegistry::new();
-        registry.retain_resource(Arc::new(DropProbe(Arc::clone(&dropped))));
+        registry.retain_resource(Arc::new(DropProbe(Arc::clone(&dropped), dropped_tx)));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         registry.register(BlockingTool {
@@ -1485,6 +1487,11 @@ mod tests {
         assert!(!dropped.load(Ordering::SeqCst));
         release_tx.send(()).expect("release tool");
         execution.join().expect("tool join");
+        // Result delivery can precede the executor thread dropping its resource
+        // snapshot. Observe actual release rather than racing that destructor.
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("executor released its resources");
         assert!(dropped.load(Ordering::SeqCst));
     }
 

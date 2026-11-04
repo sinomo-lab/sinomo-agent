@@ -47,6 +47,7 @@ impl AgentSessionToolProvider for Provider {
         }
         sessions
             .request(sinomo_runtime::module_api::sessions::SessionRequest::Command { command })
+            .map(sinomo_subagents::tool_output)
             .map_err(|detail| AgentError::Runtime { detail })
     }
 }

@@ -2677,10 +2677,13 @@ mod tests {
             read_json_file(&bundle_dir.join("manifest.json")).expect("stored manifest");
         assert_eq!(stored_manifest.artifact_refs, record.bundle.artifact_refs);
 
-        let service = open_evolution_sifs_service(&data_dir).expect("open sifs");
+        let mut service = open_evolution_sifs_service(&data_dir).expect("open sifs");
         assert_eq!(
             service
-                .posix_read_file(&format!("{}/mutation-packet.json", report.sifs_bundle_path))
+                .posix_read_file_distributed(&format!(
+                    "{}/mutation-packet.json",
+                    report.sifs_bundle_path
+                ))
                 .expect("read mirrored packet"),
             br#"{"task":"smoke"}"#
         );

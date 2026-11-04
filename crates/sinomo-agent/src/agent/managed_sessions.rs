@@ -1527,7 +1527,7 @@ impl AgentSessionHost {
                 ));
             }
             SessionCommand::List { archived } => {
-                return Ok(serde_json::json!({"subagents": self.search(caller, archived)}));
+                return Ok(serde_json::json!({"sessions": self.search(caller, archived)}));
             }
             SessionCommand::Inspect { id, session } => {
                 if id == "parent" {
@@ -1604,7 +1604,7 @@ impl AgentSessionHost {
             }
         };
         Ok::<_, AgentError>(
-            serde_json::json!({"accepted":true,"session_id":snapshot.session_id,"operation_id":snapshot.operation_id,"error":snapshot.error,"status":snapshot.status,"archived":snapshot.archived,"subagent":snapshot}),
+            serde_json::json!({"accepted":true,"session_id":snapshot.session_id,"operation_id":snapshot.operation_id,"error":snapshot.error,"status":snapshot.status,"archived":snapshot.archived,"state":snapshot}),
         )
     }
 }

@@ -434,7 +434,7 @@ fn native_timeline_reads_channel_sessions_and_optional_related_sessions() {
             };
             let _ = self.0.send(());
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
-            Ok(serde_json::json!({"subagent":{"status":"running"}}))
+            Ok(serde_json::json!({"status":"running","state":{"status":"running"}}))
         }
     }
     let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();

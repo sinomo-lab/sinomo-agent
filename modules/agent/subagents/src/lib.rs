@@ -101,6 +101,19 @@ pub fn command_for_action(input: serde_json::Value) -> Result<SessionCommand, St
     })
 }
 
+/// Tool-specific presentation belongs to the module, not the session host.
+pub fn tool_output(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        if let Some(state) = object.remove("state") {
+            object.insert("subagent".into(), state);
+        }
+        if let Some(sessions) = object.remove("sessions") {
+            object.insert("subagents".into(), sessions);
+        }
+    }
+    value
+}
+
 pub fn descriptor() -> NativeModuleDescriptor {
     let operations = [SESSION_TOOLS_DESCRIBE, SESSION_TOOLS_EXECUTE];
     NativeModuleDescriptor {
@@ -282,9 +295,7 @@ pub extern "C" fn sinomo_module_invoke_with_host_v1(
                             },
                         })
                         .map_err(|e| e.to_string())?;
-                    if value["subagent"]["status"] != "running"
-                        || std::time::Instant::now() >= deadline
-                    {
+                    if value["status"] != "running" || std::time::Instant::now() >= deadline {
                         break value;
                     }
                 }
@@ -296,7 +307,7 @@ pub extern "C" fn sinomo_module_invoke_with_host_v1(
             Ok(NativeModuleResponse::Invocation(
                 NativeModuleInvocationResponse {
                     operation: invocation.operation,
-                    payload_sobj: encode_sobj(&value).map_err(|e| e.to_string())?,
+                    payload_sobj: encode_sobj(&tool_output(value)).map_err(|e| e.to_string())?,
                     response_body: None,
                 },
             ))

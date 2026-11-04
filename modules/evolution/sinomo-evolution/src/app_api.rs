@@ -459,7 +459,7 @@ pub fn run_app_control_goal(
     };
     graph.control_action = match request.action {
         contract::EvolutionGoalControlAction::Resume => None,
-        _ => Some(request.action.clone()),
+        _ => Some(request.action),
     };
     // Control calls commit core state immediately; this lock never waits for a model or tool turn.
     let mut control_errors =

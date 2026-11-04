@@ -26,7 +26,14 @@ fn module_worker_runs_without_interactive_subagents() {
                 ]
             }).to_string()))
             .reply(reply)
-            .reply(sinomo_lm::ScriptedReply::new().tool_call("write_file", serde_json::json!({"path":"permitted.txt","content":"scoped edit"})))
+            .reply(sinomo_lm::ScriptedReply::new().text(serde_json::json!({
+                "response_mode":"defer", "text":"apply scoped changes and verify", "next_state":"waiting",
+                "tool_calls":[
+                    {"tool":"write_file","input":{"path":"permitted.txt","content":"scoped edit"},"async":false,"summary":"edit"},
+                    {"tool":"apply_patch","input":{"patch":"*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch"},"async":false,"summary":"patch"},
+                    {"tool":"run_command","input":{"command":"echo shared-runtime-command"},"async":false,"summary":"verify"}
+                ]
+            }).to_string()))
             .reply(sinomo_lm::ScriptedReply::new().text(r#"{"response_mode":"answer","text":"writer finished","tool_calls":[],"next_state":"listening"}"#))
             .save(&script)
             .unwrap();
@@ -54,6 +61,15 @@ fn module_worker_runs_without_interactive_subagents() {
     let other = data.root().join("workers/jobs/other");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(other.join("secret.txt"), "must stay isolated").unwrap();
+    std::fs::write(other.join("hello.txt"), "old\n").unwrap();
+    let mut permissions = sinomo_runtime::node::LocalNodePermissions::default();
+    permissions.set_permission(
+        sinomo_runtime::node::LocalNodePermission::RemoteManagement,
+        true,
+    );
+    sinomo_runtime::node::LocalNodePermissionStore::new(data.root())
+        .save(&permissions)
+        .unwrap();
     let host = ModuleSessionHost::new(&data);
     let mut descriptor = sinomo_subagents::descriptor();
     descriptor.module_id = "module.workers".into();
@@ -75,7 +91,7 @@ fn module_worker_runs_without_interactive_subagents() {
         .as_mut()
         .unwrap()
         .capabilities
-        .push("write_workspace".into());
+        .extend(["write_workspace", "execute_process"].map(str::to_string));
     descriptor.surfaces.agent_definitions = vec![worker, writer];
     let grants = host
         .host_services(
@@ -208,6 +224,24 @@ fn module_worker_runs_without_interactive_subagents() {
         "scoped edit"
     );
     assert!(!candidate.join("permitted.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(other.join("hello.txt")).unwrap(),
+        "new\n"
+    );
+    let result = call(SessionRequest::Command {
+        command: SessionCommand::Result {
+            id: id.clone(),
+            operation_id: started["operation_id"].as_str().unwrap().into(),
+        },
+    });
+    let command = result["run"]["tool_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outcome| outcome["call"]["tool"] == "run_command")
+        .unwrap();
+    assert_eq!(command["status"], "succeeded", "{command}");
+    assert!(command.to_string().contains("shared-runtime-command"));
     call(SessionRequest::Command {
         command: SessionCommand::Archive { id },
     });

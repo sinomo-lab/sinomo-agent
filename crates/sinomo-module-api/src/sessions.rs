@@ -2,7 +2,7 @@
 //! mutation grants are supplied by the host, never by a module request.
 use serde::{Deserialize, Serialize};
 pub const SESSION_INTERFACE: &str = "sinomo.sessions";
-pub const SESSION_VERSION: &str = "3.0.0";
+pub const SESSION_VERSION: &str = "4.0.0";
 pub const SESSION_ACCESS: &str = "sessions.access";
 pub const MAX_SESSION_PAGE: usize = 256;
 #[derive(Clone, Debug, Serialize, Deserialize)]
