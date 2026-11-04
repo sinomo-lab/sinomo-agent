@@ -266,18 +266,6 @@ impl crate::FileSystem for FileSystem {
             .map_err(Into::into)
     }
 
-    fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
-        let path = self.prepare_path(path);
-
-        set_host_path_mode(&path, mode)
-    }
-
-    fn set_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<()> {
-        let path = self.prepare_path(path);
-
-        set_host_path_owner(&path, uid, gid)
-    }
-
     fn set_times(&self, path: &Path, atime: Option<u64>, mtime: Option<u64>) -> Result<()> {
         let path = self.prepare_path(path);
         let metadata = fs::metadata(&path)?;
@@ -327,7 +315,7 @@ impl TryInto<Metadata> for std::fs::Metadata {
         let (char_device, block_device, socket, fifo, dev, ino, nlink, mode, uid, gid) = {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+                use std::os::unix::fs::{FileTypeExt, MetadataExt};
                 (
                     filetype.is_char_device(),
                     filetype.is_block_device(),
@@ -336,9 +324,9 @@ impl TryInto<Metadata> for std::fs::Metadata {
                     self.dev(),
                     self.ino(),
                     self.nlink(),
-                    self.permissions().mode() & 0o7777,
-                    self.uid(),
-                    self.gid(),
+                    if filetype.is_dir() { 0o755 } else { 0o644 },
+                    0,
+                    0,
                 )
             }
             #[cfg(not(unix))]
@@ -579,40 +567,6 @@ fn file_time_from_unix_nanos(value: u64) -> filetime::FileTime {
     filetime::FileTime::from_unix_time(seconds, nanos)
 }
 
-#[cfg(unix)]
-fn set_host_path_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let metadata = fs::metadata(path)?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode((permissions.mode() & !0o7777) | (mode & 0o7777));
-    fs::set_permissions(path, permissions).map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn set_host_path_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Err(FsError::Unsupported)
-}
-
-#[cfg(unix)]
-fn set_host_path_owner(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| FsError::InvalidInput)?;
-    let result = unsafe { libc::chown(path.as_ptr(), uid, gid) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-#[cfg(not(unix))]
-fn set_host_path_owner(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
-    Err(FsError::Unsupported)
-}
-
 //#[cfg_attr(feature = "enable-serde", typetag::serde)]
 #[async_trait::async_trait]
 impl VirtualFile for File {
@@ -651,12 +605,12 @@ impl VirtualFile for File {
             .map_err(|_| crate::FsError::IOError)
     }
 
-    fn set_mode(&mut self, mode: u32) -> crate::Result<()> {
-        set_host_path_mode(&self.host_path, mode)
+    fn set_mode(&mut self, _mode: u32) -> Result<()> {
+        Err(FsError::Unsupported)
     }
 
-    fn set_owner(&mut self, uid: u32, gid: u32) -> crate::Result<()> {
-        set_host_path_owner(&self.host_path, uid, gid)
+    fn set_owner(&mut self, _uid: u32, _gid: u32) -> Result<()> {
+        Err(FsError::Unsupported)
     }
 
     fn size(&self) -> u64 {

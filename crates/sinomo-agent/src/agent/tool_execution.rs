@@ -39,6 +39,7 @@ impl AgentToolSurface {
 
     pub fn for_definition(definition: &AgentDefinition) -> Self {
         Self::default_for_role(definition.role.clone())
+            .with_allowed_capabilities(definition.tool_surface.allowed_capabilities.iter().cloned())
             .with_allowed_tools(definition.tool_surface.allow_tools.iter().cloned())
             .with_denied_tools(definition.tool_surface.deny_tools.iter().cloned())
     }
@@ -345,6 +346,8 @@ impl<'a> AgentToolOrchestrator<'a> {
             Some(_) => progress_sink,
             None => progress_sink.for_call(step_index, call_index, call),
         };
+        let usage_started = std::time::Instant::now();
+        let usage_call_id = progress_sink.tool_call_id().cloned();
         let descriptor = tool_plan.descriptor(&call.tool);
         let descriptor_visible = tool_plan.is_model_visible(&call.tool);
         let executor_available = tool_plan.is_executable(&call.tool);
@@ -515,6 +518,9 @@ impl<'a> AgentToolOrchestrator<'a> {
             )
         };
 
+        if let Some(call_id) = usage_call_id.as_ref() {
+            outcome.call_id = call_id.clone();
+        }
         if availability_decision.allowed && outcome.evidence.availability.allowed {
             outcome.evidence.availability = availability_decision.clone();
         }
@@ -532,6 +538,25 @@ impl<'a> AgentToolOrchestrator<'a> {
             run_context: self.run_context.clone(),
         };
         outcome.evidence = with_tool_orchestration_record(outcome.evidence, &record);
+        if call.tool == "skill_activate" && outcome.status == AgentToolStatus::Succeeded {
+            if let Some(skill) =
+                json_input_string(call, "skill").and_then(|id| self.skill_plan.get(&id))
+            {
+                registry.record_skill_usage(
+                    session,
+                    usage_call_id.as_ref().unwrap_or(&outcome.call_id),
+                    skill,
+                    json_input_string(call, "resource"),
+                );
+            }
+        }
+        registry.record_usage(
+            session,
+            usage_call_id.as_ref().unwrap_or(&outcome.call_id),
+            &outcome,
+            usage_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            false,
+        );
         outcome
     }
 
@@ -582,9 +607,12 @@ impl<'a> AgentToolOrchestrator<'a> {
         let worker_tool_call_id = tool_call_id.clone();
         let worker_task_id = task_id.clone();
         set_detached_call_live(&task_id, true);
+        let usage_attribution = sinomo_lm::usage::current_attribution();
         let spawned = std::thread::Builder::new()
             .name("sinomo-agent-detached-tool".to_string())
             .spawn(move || {
+                let _usage_scope = sinomo_lm::usage::enter_attribution(usage_attribution);
+                let usage_started = std::time::Instant::now();
                 let outcome = registry.execute_planned_with_cancellation_and_progress(
                     &session,
                     step_index,
@@ -593,6 +621,13 @@ impl<'a> AgentToolOrchestrator<'a> {
                     generation,
                     cancellation,
                     progress_sink.clone(),
+                );
+                registry.record_usage(
+                    &session,
+                    &worker_tool_call_id,
+                    &outcome,
+                    usage_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    true,
                 );
                 let task_id = worker_task_id.clone();
                 progress_sink.emit(AgentToolProgressEvent::DetachedCompleted {

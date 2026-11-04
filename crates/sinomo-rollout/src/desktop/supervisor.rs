@@ -94,7 +94,7 @@ pub fn supervise_app<Lease>(
                 .spawn()
                 .map_err(err)?,
         );
-        return Ok(child.wait().map_err(err)?.code().unwrap_or(1));
+        return desktop_exit(child.wait().map_err(err)?);
     }
 
     if matches!(
@@ -109,6 +109,15 @@ pub fn supervise_app<Lease>(
     let bundled_cli = active.as_ref().and_then(|(_, cli)| cli.as_deref());
     let _daemon = ensure_runtime(bundled_cli)?;
     run_app_loop(data_dir, &releases, original_app, args, READY_TIMEOUT)
+}
+
+fn desktop_exit(status: std::process::ExitStatus) -> Result<i32> {
+    match status.code() {
+        Some(code) if code >= 0 => Ok(code),
+        // Windows exception codes have the high bit set. Unix reports a signal
+        // separately. Keep the OS diagnosis visible in both cases.
+        _ => Err(format!("The desktop application crashed ({status}).")),
+    }
 }
 
 fn is_managed_app_launch(data_dir: &SinomoDataDir, releases: &DesktopReleases, app: &Path) -> bool {
@@ -139,6 +148,29 @@ fn is_managed_app_launch(data_dir: &SinomoDataDir, releases: &DesktopReleases, a
 #[cfg(test)]
 mod installation_tests {
     use super::*;
+
+    #[test]
+    fn desktop_exit_distinguishes_a_crash_from_an_ordinary_exit() {
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0xC0000005)
+        };
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(11)
+        };
+        assert!(
+            desktop_exit(status)
+                .unwrap_err()
+                .contains(&status.to_string())
+        );
+        assert_eq!(
+            desktop_exit(std::process::ExitStatus::default()).unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn custom_install_binding_only_manages_its_selected_data_root() {
@@ -203,7 +235,7 @@ fn run_app_loop(
         let deadline = Instant::now() + ready_timeout;
         let exit = loop {
             if let Some(exit) = child.try_wait().map_err(err)? {
-                break exit.code().unwrap_or(1);
+                break desktop_exit(exit);
             }
             if activating && Instant::now() >= deadline {
                 if releases.read()?.launch_ready {
@@ -211,15 +243,18 @@ fn run_app_loop(
                 } else {
                     child.kill().map_err(err)?;
                     let _ = child.wait();
-                    break 1;
+                    break Ok(1);
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
         };
         let state = releases.read()?;
         if activating && !state.launch_ready {
+            let reason = exit
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|error| error.to_string());
             releases.rollback(format!(
-                "App update did not restore the workspace (exit {exit}); restored previous version."
+                "App update did not restore the workspace ({reason}); restored previous version."
             ))?;
             app = active_app(releases)?.unwrap_or(original_app.clone());
             activating = false;
@@ -261,7 +296,7 @@ fn run_app_loop(
             state.launch_ready = false;
             Ok(())
         })?;
-        return Ok(exit);
+        return exit;
     }
 }
 

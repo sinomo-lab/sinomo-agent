@@ -24,6 +24,18 @@ use crate::{
 pub trait NativeModuleRequestPreparer: Send + Sync {
     fn id(&self) -> &'static str;
 
+    /// Invocation services contributed by the domain owner after the native
+    /// descriptor and route identity have been verified.
+    fn host_services(
+        &self,
+        _data_dir_root: &Path,
+        _descriptor: &sinomo_module_api::NativeModuleDescriptor,
+        _cancellation: &NativeModuleOperationCancellationToken,
+    ) -> Result<std::collections::BTreeMap<String, Arc<dyn NativeModuleHostCallbacks>>, NetworkError>
+    {
+        Ok(Default::default())
+    }
+
     fn prepare(
         &self,
         data_dir_root: &Path,
@@ -364,6 +376,7 @@ async fn dispatch_native_module_service_request(
             data_dir_root,
             target,
             cancellation_token,
+            request_preparer,
             request,
             staged_request_body,
             response_body_path,
@@ -392,6 +405,7 @@ fn invoke_native_module_service_request(
     data_dir_root: PathBuf,
     target: NativeDylibModuleRouteTarget,
     cancellation_token: NativeModuleOperationCancellationToken,
+    request_preparer: Arc<dyn NativeModuleRequestPreparer>,
     request: ObjectRpcRequest,
     staged_request_body: Option<sinomo_module_api::NativeModuleStagedBody>,
     response_body_path: Option<String>,
@@ -456,7 +470,12 @@ fn invoke_native_module_service_request(
     }
     let host_data_dir_root = data_dir_root.to_string_lossy().into_owned();
     let callbacks: Arc<dyn NativeModuleHostCallbacks> = Arc::new(
-        DefaultNativeModuleHostCallbacks::new(cancellation_token, data_dir_root),
+        DefaultNativeModuleHostCallbacks::new(cancellation_token.clone(), data_dir_root.clone())
+            .with_services(request_preparer.host_services(
+                &data_dir_root,
+                descriptor,
+                &cancellation_token,
+            )?),
     );
     let native_response = module
         .invoke_with_callbacks(
@@ -514,6 +533,7 @@ fn invoke_native_module_service_request(
 }
 
 pub struct DefaultNativeModuleHostCallbacks {
+    services: std::collections::BTreeMap<String, Arc<dyn NativeModuleHostCallbacks>>,
     cancellation_token: NativeModuleOperationCancellationToken,
     data_dir_root: PathBuf,
 }
@@ -526,11 +546,31 @@ impl DefaultNativeModuleHostCallbacks {
         Self {
             cancellation_token,
             data_dir_root,
+            services: Default::default(),
         }
     }
 }
 
+impl DefaultNativeModuleHostCallbacks {
+    fn with_services(
+        mut self,
+        services: std::collections::BTreeMap<String, Arc<dyn NativeModuleHostCallbacks>>,
+    ) -> Self {
+        self.services = services;
+        self
+    }
+}
 impl NativeModuleHostCallbacks for DefaultNativeModuleHostCallbacks {
+    fn host_service(
+        &self,
+        request: &sinomo_module_api::host::HostServiceRequest,
+    ) -> Result<Vec<u8>, String> {
+        self.services
+            .get(&request.interface_id)
+            .ok_or("host service unavailable")?
+            .host_service(request)
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
     }

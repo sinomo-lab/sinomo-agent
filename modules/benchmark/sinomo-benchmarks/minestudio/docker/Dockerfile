@@ -42,9 +42,8 @@ COPY modules/benchmark/sinomo-benchmarks/minestudio/docker/entrypoint.sh /opt/si
 COPY modules/benchmark/sinomo-benchmarks/minestudio/docker/minestudio_http_server.py /opt/sinomo/minestudio/minestudio_http_server.py
 COPY modules/benchmark/sinomo-benchmarks/minestudio/docker/minestudio_client.py /opt/sinomo/minestudio/minestudio_client.py
 
-RUN chmod +x /opt/sinomo/minestudio/entrypoint.sh /opt/sinomo/minestudio/minestudio_client.py
 
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/opt/sinomo/minestudio/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/bin/bash", "/opt/sinomo/minestudio/entrypoint.sh"]
 CMD ["server"]

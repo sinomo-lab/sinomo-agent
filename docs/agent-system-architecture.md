@@ -786,47 +786,50 @@ session is saved. A paused session holds its completions until it resumes.
 
 ## Subagents
 
-`AgentSessionRuntime` registers the `subagents` tool for temporary parallel or
-focused child tasks. `spawn` returns a handle immediately; `list`, `inspect`,
-and bounded `wait` calls expose each child's status, result, and failure.
-`cancel` requests cancellation and `dispose` cancels and removes the handle.
-For example:
-
-```json
-{"action":"spawn","name":"review","task":"Review the parser changes and report defects."}
-```
+Subagents are reusable temporary agents exposed by the native `module.subagents`
+module through tools and skills. The module owns the tool contract and subagent
+prompt. The host session service owns execution, session state, inherited authority,
+cancellation and persistence for both delegated children and module-owned workers.
+Native modules receive scoped access to that service; they do not retain runtime
+implementations or borrowed invocation handles. Evolution uses the service
+independently of the interactive subagents module. Modules launch workers from
+explicitly exported capability profiles and workspace grants. The host validates
+those grants before constructing a worker, and tool execution enforces them;
+role prompts cannot expand authority. A missing or disabled provider leaves
+ordinary agent chat available without the delegation tool.
 
 Subagents inherit the parent's model, package identity, tool surface, runtime
 limits, skills, memory access, workspace, sandbox attachment, placement, and
-resource bindings. Launch captures the tool executors and resource leases before
-returning, so parent registry reconfiguration cannot release a running child's
-resources. Node-local authorization is checked at each effect, including after
-permission revocation. The tool accepts no permission or resource overrides.
+resource bindings. They add a subagent prompt and the parent's task instructions.
+Launch captures tool executors and resource leases; node-local authorization is
+still checked at each effect, including after permission revocation. Delegation
+cannot grant permissions or substitute resources.
 
-Each child has a fresh session and transcript. Its task remains user input;
-surface-specific participation instructions are not carried into the child.
-Session and task identities, the parent task when present, and event causality
-attribute child work. Children can launch their own children through the same
-tool. They share inherited workspaces and sandboxes, so callers must coordinate
-concurrent writes to shared resources.
+Each child starts with a separate session and transcript and can spawn children
+of its own. Agents in the same delegation tree can exchange messages and inspect
+one another's sessions. Only a child's parent can cancel or discard it. Agents
+share inherited workspaces and sandboxes, so callers must coordinate concurrent
+writes to shared resources. Session and task identities and event causality
+attribute child work.
 
-Child handles belong to exactly one parent session. Cancellation and deadlines
-flow to descendants, while child cancellation leaves parents and siblings
-running. Aborting a parent or cancelling its turn cancels its children;
-interrupting it pauses them (see
-[Interrupt (pause) versus cancel](#interrupt-pause-versus-cancel)). Releasing
-the last parent runtime handle cancels and removes its children; child
-completion also releases that child's descendants. Cancellation is cooperative: a running
-handle stays `running` until its worker exits, and `cancel_requested`
-distinguishes the request from confirmed termination.
+Completion notifies the parent. A subsequent message reuses the child's session;
+messages received during execution remain queued. Cancellation and deadlines
+flow to descendants while leaving parents and siblings running. Aborting a
+parent or cancelling its turn cancels its children; interrupting it pauses them
+(see [Interrupt (pause) versus cancel](#interrupt-pause-versus-cancel)). Detaching
+presentation or releasing a parent handle does not discard retained children.
 
-Children do not create agent packages, background activities, durable session
-checkpoints, or new sandboxes. Inherited evidence and trace stores may retain
-their attributable records. Terminal handles remain inspectable until disposal
-or parent release; result previews are bounded to 64 KiB and report truncation.
-They cannot resume after process restart. The synchronous `Agent::run` helper
-has no parent lifecycle and does not install the subagents tool; callers that
-need child execution use `AgentSessionRuntime`.
+Discarding a child cancels execution and archives its session. Children inactive
+for 24 hours are archived automatically. Default discovery returns active
+children, including idle children awaiting another task; archives require an
+explicit search or identifier. Archives retain transcripts while releasing
+execution resources, and cannot be resumed. Session persistence uses the same
+storage boundary as ordinary agents. Interrupted work is not automatically
+replayed after restart.
+
+See the [subagent skill](../modules/agent/subagents/skills/subagents/SKILL.md) for
+tool usage. Callers use `AgentSessionRuntime` for session tools; synchronous
+`Agent::run` alone does not install them.
 
 ## Cancellation
 

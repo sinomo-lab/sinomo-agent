@@ -25,7 +25,7 @@ impl RepairPlan {
         let scratch = ScratchDirectory::create(&env::temp_dir().join("sinomo-setup"), "repair")?;
         let stage = scratch.path();
         let cli = stage.join(binary("sinomo"));
-        fs::copy(executable, &cli)?;
+        copy_executable(executable, &cli)?;
         let mut files = vec![
             (cli.clone(), data.join("bin").join(binary("sinomo"))),
             (cli, data.join("bin").join(binary("sinomo-shadow"))),
@@ -66,7 +66,7 @@ impl RepairPlan {
             let setup = source.join(binary("sinomo-setup"));
             if setup.is_file() {
                 let staged = stage.join(binary("sinomo-setup"));
-                fs::copy(setup, &staged)?;
+                copy_executable(&setup, &staged)?;
                 #[cfg(target_os = "linux")]
                 let destination = data.join("bin").join(binary("sinomo-setup"));
                 #[cfg(not(target_os = "linux"))]

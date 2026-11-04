@@ -6,7 +6,7 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "tests/fixtures/*.sh", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "r2"
@@ -29,6 +29,7 @@ sinomo-product-profile = { path = "../sinomo-product-profile" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
+sinomo-subagents = { path = "../../modules/agent/subagents" }
 sinomo-runtime = { workspace = true, features = ["dfs-test-support"] }
 sinomo-lm = { path = "../sinomo-lm", features = ["scripted-provider"] }
 sinomo-testdir = { path = "../sinomo-testdir" }

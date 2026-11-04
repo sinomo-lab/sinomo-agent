@@ -80,12 +80,9 @@ COPY pjdfstest/linux-portability.json /opt/pjdfstest/SINOMO_PORTABILITY.json
 
 COPY entrypoint.sh /usr/local/bin/sinomo-node-entrypoint
 COPY run-pjdfstest-node.sh /usr/local/bin/sinomo-pjdfstest-runner
+COPY pjdfstest/fake-pjdfstest.sh /usr/local/share/sinomo/pjdfstest/fake-pjdfstest.sh
 COPY pjdfstest/smoke.tests /usr/local/share/sinomo/pjdfstest/smoke.tests
-RUN chmod +x \
-        /opt/pjdfstest/pjdfstest \
-        /usr/local/bin/sinomo-node-entrypoint \
-        /usr/local/bin/sinomo-pjdfstest-runner \
-    && test -f /opt/pjdfstest/tests/conf \
+RUN test -f /opt/pjdfstest/tests/conf \
     && test -r /usr/local/share/sinomo/pjdfstest/smoke.tests \
     && test "$(cat /opt/pjdfstest/REVISION)" = "${PJDFSTEST_COMMIT}" \
     && test "$(cat /opt/pjdfstest/SINOMO_PATCHSET)" = "${PJDFSTEST_PATCHSET}" \

@@ -727,6 +727,9 @@ pub(super) fn repair_request_for_model_response(
         role: LanguageModelRole::User,
         content,
     });
+    if let Some(attribution) = request.metadata.get_mut("usage_attribution") {
+        attribution["purpose"] = serde_json::json!("decision_repair");
+    }
     if let Some(metadata) = request.metadata.as_object_mut() {
         metadata.insert(
             "model_response_repair_attempt".to_string(),

@@ -87,6 +87,28 @@ observe runtime and the default warnings/errors-only formatted sinks. The
 explicit one-shot stderr trace mode opts into writing for that diagnostic
 process; it does not enable routine text writing in the daemons.
 
+## Usage Accounting
+
+Provider requests, orchestrated tools, skill activations and publications, and
+provider quota samples are attributable Observe events. Producers retain no
+independent metric store. Observe owns durable usage history and rebuildable
+projections; its normal metric recorder supplies bounded live counters and
+histograms. Conversation, session, operation and tool-call identities belong in
+retained evidence, not metric labels.
+
+Recording is best-effort and outside request admission: storage, transport or
+collection failures are logged and counted without changing model or tool
+outcomes. Native modules drain their observation producers before unloading.
+Raw usage does not contain prompts, model output, tool arguments or results;
+references resolve through the existing conversation and session evidence APIs.
+
+Retention, billing modes, catalog overrides and display-only budgets are compact
+cluster configuration. Raw and aggregate retention are independent and default
+to forever; aggregate history cannot expire before its raw source. Estimates
+use a single price snapshot for a collection and can re-price retained history.
+Unreported units, missing prices and incomplete node coverage remain explicit.
+Budgets never block, defer or redirect work. See the [usage guide](user/usage.md).
+
 ## Cluster Interface
 
 Observation is exposed as ordinary object RPC:
@@ -95,6 +117,8 @@ Observation is exposed as ordinary object RPC:
 - `/observe/logs` collects recent runtime logs and retained operational logs.
 - `/observe/metrics` reads live runtime metrics plus registered snapshot
   exporters.
+- `/observe/usage/query` reads retained usage with node coverage, dimensional
+  grouping, estimates and paged evidence.
 - `/observe/traces` reads the bounded trace ring.
 - `/observe/control` reads or updates the active tracing filter and the
   process-local opt-in live log writing mode.
@@ -125,7 +149,8 @@ The graphical app's Cluster surface is the built-in live console:
   queues, replication lag, exporter errors, and per-node observation freshness.
   Topology refreshes every 30 seconds during live sampling. Controls and scroll
   position survive updates. Pause freezes the displayed time; resuming starts
-  fresh rate baselines. Every chart opens its underlying metric in Explore.
+  fresh rate baselines. Usage charts open their retained Usage view; other charts open the underlying
+  metric in Explore.
 - **Explore** is a generic live metric browser over the descriptors returned by
   `/observe/metrics`. Operators can search and filter the registered catalog,
   select nodes and bounded label values, apply kind-safe counter or histogram
@@ -158,6 +183,13 @@ The graphical app's Cluster surface is the built-in live console:
   selectable text; messages wrap and keep their line breaks. Node failures and
   source/retention limits stay visible.
   Polling runs every five seconds only while this view is visible and live.
+
+- **Usage** presents retained agent work across nodes and time ranges. Summary
+  charts, provider and quota views, tool outcomes, skill publication history,
+  and individual records share filters and explicit coverage. Record links use
+  the existing activity and skill catalog APIs. Collection runs only while the
+  view is visible; refreshes preserve controls and scroll position. Usage charts
+  on Overview and conversation/provider indicators link to this retained view.
 
 ### Log collection
 

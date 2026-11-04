@@ -1672,6 +1672,8 @@ fn collect_agent_skill_package_files(
 pub struct SkillCatalogSifsStore {
     root: String,
     vfs: VfsHandle,
+    usage_data_dir: Option<sinomo_runtime::local::SinomoDataDir>,
+    usage_attribution: sinomo_runtime::api::app::usage::UsageAttribution,
 }
 
 impl SkillCatalogSifsStore {
@@ -1679,21 +1681,72 @@ impl SkillCatalogSifsStore {
         Self {
             root: SKILL_CATALOG_SIFS_ROOT.to_string(),
             vfs,
+            usage_data_dir: None,
+            usage_attribution: Default::default(),
         }
     }
 
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, SkillCatalogError> {
+        let usage_data_dir = data_dir
+            .clone()
+            .map(sinomo_runtime::local::SinomoDataDir::new)
+            .or_else(|| sinomo_runtime::local::SinomoDataDir::from_env_or_home().ok());
         let vfs = sinomo_runtime::vfs::mounted_sifs(data_dir).map_err(|source| {
             SkillCatalogError::Store {
                 path: SKILL_CATALOG_SIFS_ROOT.to_string(),
                 detail: source.to_string(),
             }
         })?;
-        Ok(Self::from_vfs(vfs))
+        let mut store = Self::from_vfs(vfs);
+        store.usage_data_dir = usage_data_dir;
+        Ok(store)
+    }
+    pub fn with_usage_attribution(
+        mut self,
+        attribution: sinomo_runtime::api::app::usage::UsageAttribution,
+    ) -> Self {
+        self.usage_attribution = attribution;
+        self
     }
 }
 
 impl SkillCatalogStore for SkillCatalogSifsStore {
+    fn record_publication(&self, previous: Option<&SkillCatalogEntry>, entry: &SkillCatalogEntry) {
+        let Some(data) = &self.usage_data_dir else {
+            return;
+        };
+        let mut attribution = self.usage_attribution.clone();
+        attribution.inherit_from(&sinomo_lm::usage::current_attribution());
+        if attribution.origin.is_empty() {
+            attribution.origin = "skill_catalog".into();
+            attribution.purpose = "skill_publication".into();
+        }
+        let source = if attribution.origin == "evolution" {
+            "evolution"
+        } else if attribution.tool_call.is_some() {
+            "agent"
+        } else if entry.source.kind.is_provider_managed() {
+            "provider"
+        } else {
+            entry.source.kind.as_str()
+        }
+        .to_string();
+        tracing::info!(target:"sinomo.agent.usage",skill=%entry.skill_id,version=%entry.version,source=%source,session=attribution.session.as_deref(),"skill version published");
+        sinomo_lm::usage::submit_usage(
+            data,
+            sinomo_lm::usage::record(
+                attribution,
+                sinomo_runtime::api::app::usage::UsageEvent::SkillVersionPublished {
+                    skill: entry.skill_id.clone(),
+                    previous_version: previous.map(|p| p.version.clone()),
+                    version: entry.version.clone(),
+                    previous_content_hash: previous.map(|p| p.content_hash.clone()),
+                    content_hash: entry.content_hash.clone(),
+                    source,
+                },
+            ),
+        );
+    }
     fn root(&self) -> &str {
         &self.root
     }
@@ -1728,6 +1781,12 @@ impl SkillCatalogStore for SkillCatalogSifsStore {
 }
 
 pub trait SkillCatalogStore {
+    fn record_publication(
+        &self,
+        _previous: Option<&SkillCatalogEntry>,
+        _entry: &SkillCatalogEntry,
+    ) {
+    }
     fn root(&self) -> &str;
     fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, SkillCatalogError>;
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), SkillCatalogError>;
@@ -1855,6 +1914,18 @@ pub trait SkillCatalogStore {
             }
         }
         let mut catalog = self.load_catalog()?;
+        let previous = write
+            .activate_scope
+            .as_deref()
+            .and_then(|scope| catalog.active_entry_for_scope(scope, &write.entry.skill_id))
+            .cloned();
+        let activation_changed = write.activate_scope.is_some()
+            && previous.as_ref().is_none_or(|old| {
+                old.version != write.entry.version || old.content_hash != write.entry.content_hash
+            });
+        let changed = catalog
+            .entry(&write.entry.skill_id, &write.entry.version)
+            .is_none_or(|entry| entry.content_hash != write.entry.content_hash);
         if write.create_only
             && catalog
                 .entry(&write.entry.skill_id, &write.entry.version)
@@ -1898,6 +1969,9 @@ pub trait SkillCatalogStore {
             self.write_file(&path, &encode_catalog_sobj(&path, &activation)?)?;
         }
         self.save_catalog(&catalog)?;
+        if changed || activation_changed {
+            self.record_publication(previous.as_ref(), &write.entry);
+        }
         Ok(catalog)
     }
 
@@ -1912,10 +1986,19 @@ pub trait SkillCatalogStore {
         let activation =
             SkillActivationRecord::new(scope.into(), entry, activated_by.into(), reason.into());
         let mut catalog = self.load_catalog()?;
+        let previous = catalog
+            .active_entry_for_scope(&activation.scope, &entry.skill_id)
+            .cloned();
+        let changed = previous.as_ref().is_none_or(|old| {
+            old.version != entry.version || old.content_hash != entry.content_hash
+        });
         catalog.set_activation(activation.clone())?;
         let path = skill_active_sifs_path(&activation.scope, &activation.skill_id);
         self.write_file(&path, &encode_catalog_sobj(&path, &activation)?)?;
         self.save_catalog(&catalog)?;
+        if changed {
+            self.record_publication(previous.as_ref(), entry);
+        }
         Ok(catalog)
     }
 

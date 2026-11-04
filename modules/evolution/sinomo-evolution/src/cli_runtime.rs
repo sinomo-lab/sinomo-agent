@@ -281,7 +281,7 @@ impl CliCommand for EvolveCliCommandRunner {
         if self.is_help() {
             return self.help().write(context);
         }
-        run_evolve_cli_command(self.command).map_err(Into::into)
+        run_evolve_cli_command(self.command, None).map_err(Into::into)
     }
 }
 
@@ -697,39 +697,48 @@ fn attach_persisted_memory_to_background_plan(
     Ok(())
 }
 
-pub fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
-    run_evolve_cli_command(parse_evolve_command(args)?)
+pub fn run_evolve_command(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
+    run_evolve_cli_command(parse_evolve_command(args)?, sessions)
 }
 
-pub fn run_evolve_command_captured(args: &[String]) -> Result<String, CliError> {
+pub fn run_evolve_command_captured(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<String, CliError> {
     let capture = EvolutionCliOutputCapture::begin()?;
-    run_evolve_command(args)?;
+    run_evolve_command(args, sessions)?;
     Ok(capture.finish())
 }
 
-pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
+pub(crate) fn run_evolve_cli_command(
+    command: EvolveCliCommand,
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     match command {
         EvolveCliCommand::Help => {
             print_evolve_cli_help();
             Ok(())
         }
-        EvolveCliCommand::Propose(args) => evolve_propose(&args),
+        EvolveCliCommand::Propose(args) => evolve_propose(&args, sessions),
         EvolveCliCommand::Schedule(args) => evolve_schedule(&args),
-        EvolveCliCommand::Iterate(args) => evolve_iterate(&args),
+        EvolveCliCommand::Iterate(args) => evolve_iterate(&args, sessions),
         EvolveCliCommand::Evaluate(args) => evolve_evaluate(&args),
         EvolveCliCommand::Campaign(command) => evolve_campaign(command),
-        EvolveCliCommand::Tick(args) => evolve_tick(&args),
+        EvolveCliCommand::Tick(args) => evolve_tick(&args, sessions),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
-        EvolveCliCommand::Graph(args) => evolve_graph(&args),
-        EvolveCliCommand::Goal(args) => evolve_goal(&args),
+        EvolveCliCommand::Graph(args) => evolve_graph(&args, sessions),
+        EvolveCliCommand::Goal(args) => evolve_goal(&args, sessions),
         EvolveCliCommand::Revision(args) => evolve_revision(&args),
-        EvolveCliCommand::Workflow(args) => evolve_workflow(&args),
+        EvolveCliCommand::Workflow(args) => evolve_workflow(&args, sessions),
         EvolveCliCommand::Show(args) => evolve_show(&args),
         EvolveCliCommand::Verify(args) => evolve_verify(&args),
         EvolveCliCommand::Packet(args) => evolve_show_packet(&args),
         EvolveCliCommand::Cleanup(args) => evolve_cleanup(&args),
-        EvolveCliCommand::Job(args) => evolve_job(&args),
+        EvolveCliCommand::Job(args) => evolve_job(&args, sessions),
         EvolveCliCommand::TrustedSigners(command) => evolve_trusted_signers(command),
         EvolveCliCommand::Models(_) => Err(CliError::Parse {
             detail: "model configuration is handled by `sinomo models`; use `sinomo models ...`"
@@ -1307,7 +1316,10 @@ impl EvolutionLifecycleObserver for PersistentEvolutionLifecycleObserver {
     }
 }
 
-pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_propose(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let options = parse_propose_options(args)?;
     let data_dir = evolution_data_dir()?;
     data_dir.ensure_root_layout()?;
@@ -1372,9 +1384,10 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         LocalCandidateBundleStore::new(&paths.jobs),
     );
     let model_runner = EvolutionAgentMutationModel {
+        workflow_paths: Some(paths.clone()),
+        sessions,
         provider: prepared.provider,
         model: prepared.model,
-        data_dir: data_dir.clone(),
         max_steps: None,
     };
     let lifecycle = PersistentEvolutionLifecycleObserver {
@@ -1416,7 +1429,10 @@ pub(crate) fn evolve_schedule(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_iterate(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let options = parse_iteration_options(args)?;
     let data_dir = evolution_data_dir()?;
     data_dir.ensure_root_layout()?;
@@ -1442,6 +1458,7 @@ pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     }
 
     let (report, update, bundle) = execute_campaign_iteration_plan(
+        sessions,
         &data_dir,
         &paths,
         config.as_ref(),
@@ -1476,6 +1493,7 @@ struct IterationExecutionOverrides {
 }
 
 fn execute_campaign_iteration_plan(
+    sessions: crate::SessionServices<'_>,
     data_dir: &SinomoDataDir,
     paths: &EvolutionPaths,
     config: Option<&EvolutionConfig>,
@@ -1483,6 +1501,9 @@ fn execute_campaign_iteration_plan(
     mut plan: ScheduledIterationPlan,
     overrides: IterationExecutionOverrides,
 ) -> Result<(EvolutionReport, StageEvaluationUpdate, CampaignBundlePaths), CliError> {
+    let _admission =
+        crate::execution::CampaignExecutionLease::acquire(paths, &campaign.campaign_id)
+            .map_err(|detail| CliError::Parse { detail })?;
     let (model_config, _) = load_model_config_for_node(data_dir)?;
     let evolution_model_config = config.map(|config| sinomo_lm::ModelConfig {
         default_provider: config.default_provider.clone(),
@@ -1524,12 +1545,20 @@ fn execute_campaign_iteration_plan(
         LocalCandidateBundleStore::new(&paths.jobs),
     );
     let model_runner = EvolutionAgentMutationModel {
+        workflow_paths: Some(paths.clone()),
+        sessions,
         provider,
         model,
-        data_dir: data_dir.clone(),
         max_steps: None,
     };
-    let mut report = orchestrator.propose(plan.evolution_request.clone(), Some(&model_runner))?;
+    let lifecycle = PersistentEvolutionLifecycleObserver {
+        paths: paths.clone(),
+    };
+    let mut report = orchestrator.propose_with_lifecycle(
+        plan.evolution_request.clone(),
+        Some(&model_runner),
+        Some(&lifecycle),
+    )?;
     if let Some(sifs_root) = configured_sifs_artifact_root(config) {
         mirror_evolution_report_bundle_to_sifs(data_dir, &mut report, &sifs_root)?;
     }
@@ -1537,8 +1566,13 @@ fn execute_campaign_iteration_plan(
     let resource_usage =
         candidate_resource_usage_estimates_for_report(&campaign, &plan.task.task_id, &report)?;
 
-    let update = evaluate_campaign_stage(StageEvaluationRequest {
-        campaign,
+    let _guard = crate::persistence::workflow_lock()?;
+    let latest = read_campaign(paths, &campaign.campaign_id)?;
+    let intent = read_evolution_goal_graph(paths, &campaign.campaign_id)
+        .ok()
+        .and_then(|graph| graph.control_action);
+    let mut update = evaluate_campaign_stage(StageEvaluationRequest {
+        campaign: latest.clone(),
         task_id: plan.task.task_id.clone(),
         report: report.clone(),
         resource_usage,
@@ -1546,7 +1580,11 @@ fn execute_campaign_iteration_plan(
         root_cause_summary: None,
         what_was_learned: Vec::new(),
     });
-    let bundle = write_campaign_iteration_evaluation(paths, &plan, &update)?;
+    if intent.is_some() {
+        update.campaign.status = latest.status;
+    }
+    let bundle =
+        crate::persistence::write_campaign_iteration_evaluation_locked(paths, &plan, &update)?;
     Ok((report, update, bundle))
 }
 
@@ -1786,7 +1824,10 @@ fn dedup_events_by_id(events: &mut Vec<EventEnvelope>) {
     events.retain(|event| seen.insert(event.event_id.clone()));
 }
 
-pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_tick(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let options = parse_background_tick_options(args)?;
     if !options.dry_run && !options.dispatch_approved {
         return Err(CliError::Usage);
@@ -1848,6 +1889,7 @@ pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
             };
             let campaign = read_campaign(&paths, &update.campaign.campaign_id)?;
             let (report, execution_update, bundle) = execute_campaign_iteration_plan(
+                sessions,
                 &data_dir,
                 &paths,
                 config.as_ref(),
@@ -1927,16 +1969,22 @@ pub(crate) fn evolve_status(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-pub(crate) fn evolve_graph(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_graph(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let selected_goal = flag_value(args, "--goal");
-    let graphs = if let Some(goal_id) = selected_goal {
+    let mut graphs = if let Some(goal_id) = selected_goal {
         vec![read_evolution_goal_graph(&paths, &goal_id)?]
     } else {
         list_evolution_goal_graphs(&paths)?
     };
+    for graph in &mut graphs {
+        crate::execution::refresh_execution_states(graph, sessions);
+    }
     if has_flag(args, "--json") {
         return print_json("evolution goal graphs", &graphs);
     }
@@ -1975,7 +2023,10 @@ pub(crate) fn evolve_graph(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-pub(crate) fn evolve_goal(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_goal(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let Some((command, rest)) = args.split_first() else {
         return Err(CliError::Usage);
     };
@@ -2017,6 +2068,7 @@ pub(crate) fn evolve_goal(args: &[String]) -> Result<(), CliError> {
             };
             let response = run_app_control_goal(
                 &data_dir,
+                sessions,
                 evolution_contract::EvolutionGoalControlRequest {
                     goal_id: goal_id.clone(),
                     action,
@@ -2048,7 +2100,10 @@ pub(crate) fn evolve_revision(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-pub(crate) fn evolve_workflow(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_workflow(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let [command, request_path] = args else {
         return Err(CliError::Usage);
     };
@@ -2059,7 +2114,7 @@ pub(crate) fn evolve_workflow(args: &[String]) -> Result<(), CliError> {
     let request: evolution_contract::EvolutionWorkflowUpdateRequest =
         read_json_file(&request_path)?;
     let data_dir = evolution_data_dir()?;
-    let response = run_app_update_workflow(&data_dir, request)?;
+    let response = run_app_update_workflow(&data_dir, sessions, request)?;
     println!("accepted: {}", response.accepted);
     Ok(())
 }
@@ -2160,12 +2215,15 @@ pub(crate) fn evolve_cleanup(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-pub(crate) fn evolve_job(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn evolve_job(
+    args: &[String],
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     match args.split_first() {
         Some((command, rest)) if command == "create" => {
             let mut propose_args = rest.to_vec();
             propose_args.push("--dry-run".to_string());
-            evolve_propose(&propose_args)
+            evolve_propose(&propose_args, sessions)
         }
         _ => Err(CliError::Usage),
     }
@@ -2186,6 +2244,7 @@ pub fn evolution_cli_descriptor() -> sinomo_runtime::module_api::cli::CliCommand
 }
 
 pub fn invoke_evolution_module_cli(
+    sessions: crate::SessionServices<'_>,
     request: &sinomo_runtime::module_api::cli::CliModuleRequest,
 ) -> sinomo_runtime::module_api::cli::CliModuleResponse {
     use sinomo_runtime::module_api::cli::{CliAction, CliModuleResponse};
@@ -2221,7 +2280,7 @@ pub fn invoke_evolution_module_cli(
                 Ok(capture) => capture,
                 Err(error) => return CliModuleResponse::failure(1, error.to_string()),
             };
-            let result = run_evolve_cli_command(command);
+            let result = run_evolve_cli_command(command, sessions);
             let stdout = capture.finish().into_bytes();
             let mut response = match result {
                 Ok(()) => CliModuleResponse::default(),

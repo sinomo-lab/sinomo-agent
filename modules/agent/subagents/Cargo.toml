@@ -1,0 +1,25 @@
+[package]
+name = "sinomo-subagents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native session tools and skills for disposable subagents"
+include = ["src/**/*.rs", "skills/**/*.md", "Cargo.toml"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[package.metadata.sinomo]
+ring = "r2"
+
+[package.metadata.sinomo.native-dylib]
+module-id = "module.subagents"
+interface-version = "sinomo.agent.session-tools.v2"
+cache-key = "module/agent/subagents"
+source = "rollout:modules/agent/subagents"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sinomo-module-api.workspace = true

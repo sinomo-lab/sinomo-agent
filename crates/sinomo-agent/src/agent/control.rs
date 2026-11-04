@@ -1,6 +1,6 @@
 //! Session control, worker ownership, cancellation, and live-input reconciliation.
 
-use super::subagents::{AgentSubagentScope, AgentSubagents};
+use super::managed_sessions::{AgentSessionHost, AgentSessionScope};
 use super::{
     Agent, AgentAbortRecord, AgentCancellationToken, AgentCompactionSummary, AgentError,
     AgentFollowUpMessage, AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentRole, AgentRun,
@@ -1171,7 +1171,7 @@ where
 {
     pub(super) agent: Arc<Agent<M>>,
     pub(super) state: Arc<Mutex<AgentSessionRuntimeState>>,
-    subagent_scope: Arc<AgentSubagentScope>,
+    pub(super) session_scope: Arc<AgentSessionScope>,
 }
 
 impl<M> Clone for AgentSessionRuntime<M>
@@ -1182,7 +1182,7 @@ where
         Self {
             agent: Arc::clone(&self.agent),
             state: Arc::clone(&self.state),
-            subagent_scope: Arc::clone(&self.subagent_scope),
+            session_scope: Arc::clone(&self.session_scope),
         }
     }
 }
@@ -1239,10 +1239,18 @@ impl AgentRuntimeStorage {
         store.load_session(session_id)
     }
 
-    pub(super) fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
+    pub(crate) fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
     where
         M: InteractionModel,
     {
+        if agent.session_tools.is_none()
+            && let Some(data_dir) = &self.durable_data_dir
+        {
+            match super::NativeAgentSessionTools::resolve_shared(data_dir) {
+                Ok(provider) => agent = agent.with_session_tool_provider(provider),
+                Err(error) => tracing::debug!(%error, "native session tools unavailable"),
+            }
+        }
         if agent.memory_retriever.is_none()
             && let Some(retriever) = &self.memory_retriever
         {
@@ -1312,10 +1320,10 @@ where
     }
 
     pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
-        let subagent_scope = agent.subagent_scope(session.clone());
-        Self {
+        let session_scope = agent.session_scope(session.clone());
+        let runtime = Self {
             agent,
-            subagent_scope,
+            session_scope,
             state: Arc::new(Mutex::new(AgentSessionRuntimeState {
                 control: AgentSessionControlPlane::new(session),
                 in_flight_input_ids: BTreeSet::new(),
@@ -1326,7 +1334,9 @@ where
                 async_updates: Vec::new(),
                 detached_cancellation: AgentCancellationToken::new(),
             })),
-        }
+        };
+        runtime.bind_session_messages();
+        runtime
     }
 
     pub fn submit_op(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError> {
@@ -1378,8 +1388,14 @@ where
         if explicit_snapshot || staged.session != state.control.session {
             self.agent.save_session(&staged.session)?;
         }
+        let pause_token = staged.active_turn_cancellation.clone();
+        state.control = staged;
+        let session = state.control.session.clone();
+        state.append_control_runtime_events(&result.events);
+        drop(state);
+        self.session_scope.manager.set_session(&session);
         if result.accepted && cancelling_children {
-            self.subagent_scope.cancel_children();
+            self.session_scope.cancel_children();
         }
         if result.accepted
             && let Some(token) = cancellation
@@ -1391,24 +1407,23 @@ where
         if result.accepted
             && let Some(pause) = pause_signal
         {
-            if let Some(token) = &staged.active_turn_cancellation {
+            if let Some(token) = &pause_token {
                 if pause {
                     token.pause();
                 } else {
                     token.unpause();
                 }
             }
-            self.subagent_scope.set_children_paused(pause);
         }
-        state.control = staged;
-        self.subagent_scope
-            .manager
-            .set_session(&state.control.session);
-        state.append_control_runtime_events(&result.events);
+        if result.accepted
+            && let Some(pause) = pause_signal
+        {
+            self.session_scope.set_children_paused(pause);
+        }
         // An unpause releases held completions and a removed input can end
         // the work keeping a host resident, whichever path submitted it.
         if result.accepted {
-            wake_session(&state.control.session.session_id);
+            wake_session(&session.session_id);
         }
         Ok(result)
     }
@@ -1448,8 +1463,8 @@ where
         Ok(self.lock_state()?.control.session.clone())
     }
 
-    pub fn subagents(&self) -> Arc<AgentSubagents> {
-        Arc::clone(&self.subagent_scope.manager)
+    pub fn sessions(&self) -> Arc<AgentSessionHost> {
+        Arc::clone(&self.session_scope.manager)
     }
 
     pub fn load_explicit_skill_context(
@@ -1467,7 +1482,7 @@ where
                 detail: "cannot replace agent session while a turn is active".to_string(),
             });
         }
-        self.subagent_scope.replace_session(&session);
+        self.session_scope.replace_session(&session);
         if state.control.session.session_id != session.session_id {
             // Another session's detached calls keep reporting to that
             // session; this one's are restored from its records on attach.
@@ -1477,6 +1492,8 @@ where
         state.in_flight_input_ids.clear();
         state.runtime_events.clear();
         state.completed_turns.clear();
+        drop(state);
+        self.bind_session_messages();
         Ok(())
     }
 
@@ -1619,29 +1636,33 @@ where
         self.has_work(false)
     }
 
+    pub(super) fn has_pending_turn_work(&self) -> Result<bool, AgentError> {
+        self.own_work(true).map(|(busy, _)| busy)
+    }
+
+    fn own_work(&self, include_ready_updates: bool) -> Result<(bool, SessionId), AgentError> {
+        let mut state = self.lock_state()?;
+        state.collect_detached_completions();
+        let busy = state.control.active_turn.is_some()
+            || state.turn_worker_running
+            || detached_calls_running(&state.control.session.session_id) > 0
+            || (include_ready_updates
+                && (!state.async_updates.is_empty()
+                    || !state.control.session.steering_queue.is_empty()
+                    || !state.control.session.follow_up_queue.is_empty()));
+        Ok((busy, state.control.session.session_id.clone()))
+    }
+
     fn has_work(&self, include_ready_updates: bool) -> Result<bool, AgentError> {
-        let session_id = {
-            let mut state = self.lock_state()?;
-            state.collect_detached_completions();
-            // Ordinary idle checks include ready continuations. Shutdown joins
-            // executing work while leaving those completions for reattach.
-            if state.control.active_turn.is_some()
-                || state.turn_worker_running
-                || detached_calls_running(&state.control.session.session_id) > 0
-                || (include_ready_updates
-                    && (!state.async_updates.is_empty()
-                        || !state.control.session.steering_queue.is_empty()
-                        || !state.control.session.follow_up_queue.is_empty()))
-            {
-                return Ok(true);
-            }
-            state.control.session.session_id.clone()
-        };
+        let (busy, session_id) = self.own_work(include_ready_updates)?;
+        if busy {
+            return Ok(true);
+        }
         Ok(self
-            .subagents()
+            .sessions()
             .list(&session_id)
             .iter()
-            .any(|child| matches!(child.status, super::AgentSubagentStatus::Running)))
+            .any(|child| matches!(child.status, super::ManagedSessionStatus::Running)))
     }
 
     pub fn event_cursor(&self) -> Result<AgentSessionControlEventCursor, AgentError> {
@@ -1729,8 +1750,10 @@ where
 
     /// Stop the session's detached tool calls.
     pub fn cancel_detached_tools(&self) {
-        if let Ok(state) = self.state.lock() {
-            state.detached_cancellation.cancel();
+        if let Ok(mut state) = self.state.lock() {
+            // Existing calls retain the cancelled token; later turns get a
+            // fresh scope when this reusable session starts more work.
+            std::mem::take(&mut state.detached_cancellation).cancel();
         }
     }
 
@@ -1918,7 +1941,7 @@ where
             return Err(error);
         }
         state.turn_worker_running = true;
-        self.subagent_scope.manager.set_session(&session_for_turn);
+        self.session_scope.manager.set_session(&session_for_turn);
 
         let worker_state = Arc::clone(&self.state);
         let progress_state = Arc::clone(&self.state);
@@ -2326,6 +2349,9 @@ impl AgentSessionRuntimeState {
             completed_session.abort = live_abort;
         }
         completed_session.pause = live_pause;
+        // Lifecycle metadata is host-owned and can be archived during a turn.
+        // A late turn snapshot must not resurrect a discarded child.
+        completed_session.managed = live_session.managed.clone();
         if live_state_revision > base_state_revision {
             completed_session.state_revision = completed_session
                 .state_revision
@@ -2624,7 +2650,19 @@ fn detached_call_completed(session_id: &SessionId, update: crate::AsyncTaskUpdat
     drop(woken);
 }
 
-fn detached_calls_running(session_id: &SessionId) -> usize {
+/// Deliver host-originated session updates without changing the count of
+/// independently executing detached tool calls.
+pub(super) fn queue_session_update(session_id: &SessionId, update: crate::AsyncTaskUpdate) {
+    let woken = with_detached_work(|work| {
+        let session = work.entry(session_id.clone()).or_default();
+        session.completions.push(update);
+        // A finished subagent's parent host may be waiting for it.
+        session.wake()
+    });
+    drop(woken);
+}
+
+pub(super) fn detached_calls_running(session_id: &SessionId) -> usize {
     with_detached_work(|work| work.get(session_id).map_or(0, |session| session.running))
 }
 
@@ -2669,6 +2707,29 @@ mod shutdown_tests {
         ) -> Result<sinomo_lm::LanguageModelResponse, sinomo_lm::LanguageModelError> {
             panic!("shutdown must not start a model turn");
         }
+    }
+
+    #[test]
+    fn session_notifications_do_not_complete_unrelated_detached_tools() {
+        let id = SessionId::generate();
+        let update = AsyncTaskUpdate {
+            kind: "agent.managed.completed".into(),
+            task_id: TaskId::generate(),
+            tool_call_id: None,
+            status: AsyncTaskStatus::Completed,
+            summary: "child finished".into(),
+            needs_user_attention: false,
+            result_ref: None,
+            next_action_hint: AsyncTaskNextAction::InspectResult,
+        };
+        detached_call_started(&id);
+        queue_session_update(&id, update.clone());
+        assert_eq!(detached_calls_running(&id), 1);
+        assert_eq!(take_detached_completions(&id), vec![update.clone()]);
+        assert_eq!(detached_calls_running(&id), 1);
+        detached_call_completed(&id, update.clone());
+        assert_eq!(detached_calls_running(&id), 0);
+        assert_eq!(take_detached_completions(&id), vec![update]);
     }
 
     #[test]

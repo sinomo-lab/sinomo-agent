@@ -110,9 +110,9 @@ impl GeminiProvider {
             temperature: None,
             max_output_tokens: Some(8),
             response_format: LanguageModelResponseFormat::Text,
-            metadata: serde_json::Value::Null,
+            metadata: serde_json::json!({"purpose":"provider_verification","loop":"provider_service"}),
         };
-        self.complete(&request).map(|_| ())
+        crate::usage::complete_provider(None, self, &request).map(|_| ())
     }
 }
 
@@ -172,6 +172,7 @@ impl LanguageModelProvider for GeminiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("gemini", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -223,6 +224,7 @@ impl LanguageModelProvider for GeminiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("gemini", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -346,7 +348,7 @@ pub(crate) fn extract_gemini_response_text(value: &serde_json::Value) -> String 
 }
 
 pub(crate) fn extract_gemini_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
-    value.get("usageMetadata").map(|usage| LanguageModelUsage {
+    let result = value.get("usageMetadata").map(|usage| LanguageModelUsage {
         input_tokens: usage
             .get("promptTokenCount")
             .and_then(serde_json::Value::as_u64),
@@ -354,7 +356,14 @@ pub(crate) fn extract_gemini_usage(value: &serde_json::Value) -> Option<Language
             .get("candidatesTokenCount")
             .and_then(serde_json::Value::as_u64)
             .map(|count| count.saturating_add(usage["thoughtsTokenCount"].as_u64().unwrap_or(0))),
-    })
+        cache_read_input_tokens: usage["cachedContentTokenCount"].as_u64(),
+        reasoning_tokens: usage["thoughtsTokenCount"].as_u64(),
+        ..Default::default()
+    });
+    if let Some(usage) = &result {
+        crate::usage::record_usage_report(usage);
+    }
+    result
 }
 
 fn stream_gemini_generate_content_response(

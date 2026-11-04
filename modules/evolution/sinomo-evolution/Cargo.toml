@@ -16,7 +16,7 @@ ring = "r2"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.evolution"
-interface-version = "sinomo.evolution.v1"
+interface-version = "sinomo.evolution.v2"
 cache-key = "module/evolution/sinomo-evolution"
 source = "rollout:modules/evolution/sinomo-evolution"
 

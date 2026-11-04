@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext};
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -88,15 +88,6 @@ pub fn load_or_create_node_identity(path: &Path) -> Result<NodeIdentity, NodeIde
             .unwrap_or_else(|_| "unknown".to_string()),
     };
     write_object(path, &identity)?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            NodeIdentityError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-    }
     Ok(identity)
 }
 
@@ -123,10 +114,17 @@ fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), NodeIdentity
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-    fs::write(path, content).map_err(|source| NodeIdentityError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &content))
+        .map_err(|source| NodeIdentityError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]

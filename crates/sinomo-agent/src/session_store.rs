@@ -273,6 +273,15 @@ pub struct AgentTaskActivityProjectionPage {
 }
 
 pub trait AgentSessionStore: Send + Sync {
+    /// Stable storage identity for reattaching live child sessions in this process.
+    fn session_namespace(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn list_sessions(&self) -> Result<Vec<AgentSession>, AgentSessionStoreError> {
+        Ok(Vec::new())
+    }
+
     fn load_session(
         &self,
         session_id: &SessionId,
@@ -1583,6 +1592,30 @@ impl FileAgentSessionStore {
 }
 
 impl AgentSessionStore for FileAgentSessionStore {
+    fn session_namespace(&self) -> Option<PathBuf> {
+        Some(self.paths.sessions_dir.clone())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<AgentSession>, AgentSessionStoreError> {
+        let directory = self.vfs_path_for(&self.paths.sessions_dir)?;
+        let entries = self
+            .vfs
+            .list_if_exists(&directory)
+            .map_err(|error| session_vfs_error(&self.paths.sessions_dir, error))?;
+        let mut sessions = Vec::new();
+        for entry in entries {
+            if entry.kind != VfsObjectKind::Directory {
+                continue;
+            }
+            if let Ok(id) = entry.name.parse::<SessionId>()
+                && let Some(session) = self.load_session(&id)?
+            {
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
+    }
+
     fn load_session(
         &self,
         session_id: &SessionId,

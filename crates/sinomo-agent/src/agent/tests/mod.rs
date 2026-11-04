@@ -620,3 +620,5 @@ fn run_git_for_test<const N: usize>(root: &Path, args: [&str; N]) {
         .expect("git command");
     assert!(status.success(), "git command failed");
 }
+
+mod usage;

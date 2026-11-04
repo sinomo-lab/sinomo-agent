@@ -301,9 +301,9 @@ impl ClaudeProvider {
             temperature: None,
             max_output_tokens: Some(4),
             response_format: LanguageModelResponseFormat::Text,
-            metadata: serde_json::Value::Null,
+            metadata: serde_json::json!({"purpose":"provider_verification","loop":"provider_service"}),
         };
-        self.complete(&request).map(|_| ())
+        crate::usage::complete_provider(None, self, &request).map(|_| ())
     }
 
     fn stored_oauth_tokens(&self) -> Result<Option<ClaudeOAuthTokens>, LanguageModelError> {
@@ -373,6 +373,7 @@ impl ClaudeProvider {
             };
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("claude", &body);
             if !status.is_success() {
                 last_error = Some(format!("HTTP {status}: {body}"));
                 continue;
@@ -416,6 +417,7 @@ impl ClaudeProvider {
             };
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("claude", &body);
             if !status.is_success() {
                 last_error = Some(format!("HTTP {status}: {body}"));
                 continue;
@@ -555,11 +557,13 @@ impl LanguageModelProvider for ClaudeProvider {
             && !tokens.refresh_token.is_empty()
         {
             tokens = self.refresh_oauth_tokens(tokens)?;
+            crate::usage::record_retry("credentials_refreshed");
             response = self.post_messages(&model, &tokens, &payload)?;
         }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("claude", &body);
             return Err(claude_invocation_error(
                 &model,
                 format!("Claude Messages API failed: HTTP {status}: {body}"),
@@ -604,6 +608,7 @@ impl LanguageModelUsageProvider for ClaudeProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("claude", &body);
             return Err(claude_invocation_error(
                 PROVIDER_DEFAULT_MODEL,
                 format!("Claude OAuth usage API failed: HTTP {status}: {body}"),

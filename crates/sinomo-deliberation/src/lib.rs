@@ -183,7 +183,7 @@ impl DeliberationWorker {
         model: impl Into<String>,
     ) -> Result<DeliberationJobRecord, DeliberationError> {
         let request = self.model_request(&job, provider_id, model);
-        let response = model_provider.complete(&request)?;
+        let response = sinomo_lm::usage::complete_provider(None, model_provider, &request)?;
         let mut summary = parse_deliberation_summary(&response.content)?;
         summary.model = Some(LanguageModelAttribution {
             provider: response.provider,
@@ -231,6 +231,7 @@ impl DeliberationWorker {
             max_output_tokens: Some(800),
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::json!({
+                "usage_attribution": sinomo_runtime::api::app::usage::UsageAttribution {node:self.node_id.to_string(),session:job.session_id.as_ref().map(ToString::to_string),task:Some(job.job.job_id.to_string()),turn:Some(job.job.trigger_event_id.to_string()),operation:Some(job.job.job_id.to_string()),origin:"background_agent".into(),purpose:"deliberation".into(),..Default::default()},
                 "loop": "deliberative",
                 "node_id": self.node_id,
                 "job_id": job.job.job_id,

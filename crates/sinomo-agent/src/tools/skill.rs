@@ -76,7 +76,23 @@ impl AgentTool for SkillUpdateTool {
         let source_id = request.session.session_id.to_string();
 
         let store = match SkillCatalogSifsStore::open(Some(self.config.data_dir.root())) {
-            Ok(store) => store,
+            Ok(store) => {
+                store.with_usage_attribution(sinomo_runtime::api::app::usage::UsageAttribution {
+                    node: request.session.node_id.to_string(),
+                    session: sinomo_lm::usage::current_attribution()
+                        .session
+                        .or_else(|| Some(request.session.session_id.to_string())),
+                    chat: request
+                        .session
+                        .conversation_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                    tool_call: Some(request.call_id.to_string()),
+                    origin: sinomo_lm::usage::current_attribution().origin,
+                    purpose: "skill_update".into(),
+                    ..Default::default()
+                })
+            }
             Err(error) => return skill_error_result("open skill catalog", error),
         };
         let catalog = match store.load_catalog() {

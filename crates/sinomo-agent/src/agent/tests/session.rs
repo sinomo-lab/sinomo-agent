@@ -661,9 +661,7 @@ fn version_control_tools_cancel_active_git_subprocesses() {
     fs::create_dir_all(&root).expect("workspace");
     let fake_git = root.join("slow-git");
     fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").expect("fake git");
-    let mut permissions = fs::metadata(&fake_git).expect("metadata").permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    fs::set_permissions(&fake_git, permissions).expect("chmod fake git");
+    sinomo_testdir::install_shell_fixture(&fake_git).expect("install shell fixture");
     let fake_git_program = fake_git.display().to_string();
     let registry = with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(
         LocalWorkspaceAgentConfig::new(&root)

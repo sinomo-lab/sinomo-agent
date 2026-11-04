@@ -10,6 +10,7 @@ rust-version.workspace = true
 ring = "r1-boundary"
 
 [features]
+file-sync = ["client", "dep:sinomo-file-sync"]
 default = ["host"]
 # Contract/client profile used by frontends and other non-authority-owning consumers.
 client = [
@@ -71,6 +72,7 @@ network-test-support = ["client", "sinomo-core/network-test-support"]
 dfs-test-support = ["host", "sinomo-dfs/test-support", "sinomo-vfs-sifs/test-support"]
 
 [dependencies]
+sinomo-file-sync = { path = "../sinomo-file-sync", optional = true }
 sinomo-api = { path = "../sinomo-api", default-features = false, optional = true }
 sinomo-build = { path = "../sinomo-build", optional = true }
 sinomo-build-client = { path = "../sinomo-build-client", optional = true }

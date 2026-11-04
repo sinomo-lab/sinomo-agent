@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """No-Docker regressions for network acceptance helpers."""
+import shutil
 import importlib.util
 import json
 from pathlib import Path
@@ -91,7 +92,7 @@ class Tests(unittest.TestCase):
 
     def test_preflight_rejects_wrong_running_binary_before_traffic(self):
         with tempfile.TemporaryDirectory() as d:
-            binary=Path(d)/'sinomo'; binary.write_bytes(b'candidate'); binary.chmod(0o700)
+            binary=Path(d)/'sinomo'; binary.write_bytes(b'candidate')
             c=checks.Checks(SimpleNamespace(artifacts=d, project='test', compose_file=[], binary=str(binary)))
             with patch.object(c,'run',return_value=(0,b'wrong /proc/1/exe\nwrong /proc/2/exe')) as run:
                 with self.assertRaisesRegex(RuntimeError,'running binary'): c.preflight()
@@ -104,8 +105,7 @@ class Tests(unittest.TestCase):
             directory=Path(d)
             for name in ['docker','cargo']:
                 path=directory/name
-                path.write_text('#!/bin/sh\necho invoked >> "'+str(directory/'invoked')+'"\nexit 99\n')
-                path.chmod(0o700)
+                shutil.copy2(Path(__file__).with_name("fixtures") / "record-invocation.sh", path)
             env=dict(os.environ, PATH=d+':'+os.environ['PATH'], SINOMO_TEST_NETWORK_CASES='ready',
                      SINOMO_TEST_NETWORK_PLAN='1', SINOMO_TEST_ARTIFACTS=d+'/artifacts')
             script=Path(__file__).parent/'test-cluster.sh'

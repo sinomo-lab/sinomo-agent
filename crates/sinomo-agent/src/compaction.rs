@@ -40,6 +40,7 @@ Create a handoff summary with these sections:
 Preserve opaque identifiers exactly. Prefer recent context when older context conflicts."#;
 
 pub struct AgentCompactionRequest<'a> {
+    pub session_id: &'a crate::SessionId,
     pub config: &'a AgentConfig,
     pub projection_builder: &'a AgentCompactor,
     pub source_transcript: &'a AgentTranscript,
@@ -200,6 +201,7 @@ impl CodexStyleAgentCompactionEngine {
             max_output_tokens: self.max_summary_tokens.or(request.config.max_output_tokens),
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::json!({
+                "usage_attribution": sinomo_runtime::api::app::usage::UsageAttribution { agent: Some(request.config.definition.key().to_string()), session: Some(request.session_id.to_string()), origin: String::new(), purpose: "compaction".into(), ..Default::default() },
                 "loop": "agent_compaction",
                 "strategy_id": &self.strategy_id,
                 "trigger": &request.trigger,

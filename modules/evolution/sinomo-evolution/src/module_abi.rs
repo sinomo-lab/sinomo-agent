@@ -11,7 +11,6 @@ use sinomo_module_api::{
 };
 use sinomo_runtime::api::app::evolution as contract;
 use std::path::Path;
-use std::sync::Mutex;
 
 use crate::agent_package::{evolution_agent_exports, evolution_agent_resources};
 use crate::{
@@ -33,7 +32,6 @@ const CAPABILITY_IMPORTS: &[&str] = &[
 ];
 
 static MODULE_LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
-static EVOLUTION_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_api_version() -> u32 {
@@ -74,7 +72,7 @@ pub extern "C" fn sinomo_module_invoke(
         );
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        invoke_unchecked(request_sobj, response_sobj)
+        invoke_unchecked(request_sobj, response_sobj, None)
     }));
     match result {
         Ok(status) => status,
@@ -91,6 +89,9 @@ pub extern "C" fn sinomo_module_invoke(
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
     if MODULE_LIFECYCLE.begin_shutdown() {
+        sinomo_runtime::api::observe::recording::shutdown_producers(
+            std::time::Duration::from_secs(5),
+        );
         SINOMO_MODULE_STATUS_OK
     } else {
         SINOMO_MODULE_STATUS_RUNTIME_ERROR
@@ -194,6 +195,13 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
             env!("CARGO_PKG_VERSION"),
         )
         .with_display_name("Evolution")
+        .require(
+            sinomo_module_api::ServiceRequirement::new(
+                sinomo_module_api::sessions::SESSION_INTERFACE,
+                sinomo_module_api::sessions::SESSION_VERSION,
+            )
+            .with_operation(sinomo_module_api::sessions::SESSION_ACCESS),
+        )
         .with_offer(
             ServiceOffer::new(
                 contract::EVOLUTION_SERVICE_ID,
@@ -272,6 +280,7 @@ fn operation_offer(operation: &str, route: &str) -> ServiceOperationOffer {
 fn invoke_unchecked(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
+    sessions: crate::SessionServices<'_>,
 ) -> SinomoModuleStatusCode {
     let request = unsafe { request_sobj.as_slice() };
     let response = match decode_sobj::<NativeModuleRequest>(request) {
@@ -280,7 +289,7 @@ fn invoke_unchecked(
                 descriptor: evolution_native_module_descriptor(),
             })
         }
-        Ok(NativeModuleRequest::Invoke(request)) => invoke_operation(request),
+        Ok(NativeModuleRequest::Invoke(request)) => invoke_operation(request, sessions),
         Err(error) => NativeModuleResponse::Error(native_error(
             "invalid-request",
             &format!("decode evolution module request: {error}"),
@@ -289,42 +298,50 @@ fn invoke_unchecked(
     write_native_response(response_sobj, response)
 }
 
-fn invoke_operation(mut request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+fn invoke_operation(
+    mut request: NativeModuleInvocationRequest,
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     let host_data_dir_root = request.host_data_dir_root.take();
     match host_data_dir_root {
-        Some(root) => with_evolution_data_dir(Path::new(&root), || invoke_operation_inner(request)),
-        None => invoke_operation_inner(request),
+        Some(root) => with_evolution_data_dir(Path::new(&root), || {
+            invoke_operation_inner(request, sessions)
+        }),
+        None => invoke_operation_inner(request, sessions),
     }
 }
 
-fn invoke_operation_inner(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+fn invoke_operation_inner(
+    request: NativeModuleInvocationRequest,
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     match request.operation.as_str() {
         contract::EVOLUTION_DASHBOARD_OPERATION => {
-            invoke_dashboard(&request.operation, &request.payload_sobj)
+            invoke_dashboard(&request.operation, &request.payload_sobj, sessions)
         }
         contract::EVOLUTION_START_OPERATION => {
-            invoke_serialized(|| invoke_start(&request.operation, &request.payload_sobj))
+            invoke_start(&request.operation, &request.payload_sobj, sessions)
         }
         contract::EVOLUTION_DECISION_OPERATION => {
-            invoke_serialized(|| invoke_decision(&request.operation, &request.payload_sobj))
+            invoke_decision(&request.operation, &request.payload_sobj)
         }
         contract::EVOLUTION_GOAL_CREATE_OPERATION => {
-            invoke_serialized(|| invoke_goal_create(&request.operation, &request.payload_sobj))
+            invoke_goal_create(&request.operation, &request.payload_sobj)
         }
         contract::EVOLUTION_REVISION_RECORD_OPERATION => {
-            invoke_serialized(|| invoke_revision_record(&request.operation, &request.payload_sobj))
+            invoke_revision_record(&request.operation, &request.payload_sobj)
         }
         contract::EVOLUTION_GOAL_CONTROL_OPERATION => {
-            invoke_serialized(|| invoke_goal_control(&request.operation, &request.payload_sobj))
+            invoke_goal_control(&request.operation, &request.payload_sobj, sessions)
         }
         contract::EVOLUTION_WORKFLOW_UPDATE_OPERATION => {
-            invoke_serialized(|| invoke_workflow_update(&request.operation, &request.payload_sobj))
+            invoke_workflow_update(&request.operation, &request.payload_sobj, sessions)
         }
         cli_contract::CLI_INVOKE_OPERATION => {
             match decode_sobj::<cli_contract::CliModuleRequest>(&request.payload_sobj) {
                 Ok(payload) => {
                     let run = || match encode_sobj(
-                        &crate::cli_runtime::invoke_evolution_module_cli(&payload),
+                        &crate::cli_runtime::invoke_evolution_module_cli(sessions, &payload),
                     ) {
                         Ok(body) => invocation_response(cli_contract::CLI_INVOKE_OPERATION, body),
                         Err(error) => NativeModuleResponse::Error(native_error(
@@ -332,11 +349,7 @@ fn invoke_operation_inner(request: NativeModuleInvocationRequest) -> NativeModul
                             &error.to_string(),
                         )),
                     };
-                    if payload.action == cli_contract::CliAction::Invoke {
-                        invoke_serialized(run)
-                    } else {
-                        run()
-                    }
+                    run()
                 }
                 Err(error) => NativeModuleResponse::Error(native_error(
                     "invalid-cli-request",
@@ -345,7 +358,7 @@ fn invoke_operation_inner(request: NativeModuleInvocationRequest) -> NativeModul
             }
         }
         contract::EVOLUTION_CLI_OPERATION => {
-            invoke_serialized(|| invoke_cli(&request.operation, &request.payload_sobj))
+            invoke_cli(&request.operation, &request.payload_sobj, sessions)
         }
         other => NativeModuleResponse::Error(native_error(
             "unsupported-operation",
@@ -354,23 +367,17 @@ fn invoke_operation_inner(request: NativeModuleInvocationRequest) -> NativeModul
     }
 }
 
-fn invoke_serialized(run: impl FnOnce() -> NativeModuleResponse) -> NativeModuleResponse {
-    let Ok(_guard) = EVOLUTION_MUTATION_LOCK.lock() else {
-        return NativeModuleResponse::Error(native_error(
-            "evolution-state-lock-poisoned",
-            "evolution module state mutation lock is unavailable",
-        ));
-    };
-    run()
-}
-
-fn invoke_dashboard(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+fn invoke_dashboard(
+    operation: &str,
+    payload: &[u8],
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     let request = decode_sobj::<contract::EvolutionDashboardRequest>(payload);
     match request.and_then(|_| {
         let data_dir = evolution_data_dir()
             .map_err(|error| sinomo_module_api::NativeModuleApiError::Runtime(error.to_string()))?;
         encode_sobj(&contract::EvolutionDashboardResponse {
-            dashboard: app_evolution_dashboard(&data_dir),
+            dashboard: app_evolution_dashboard(&data_dir, sessions),
         })
     }) {
         Ok(payload_sobj) => invocation_response(operation, payload_sobj),
@@ -381,9 +388,13 @@ fn invoke_dashboard(operation: &str, payload: &[u8]) -> NativeModuleResponse {
     }
 }
 
-fn invoke_start(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+fn invoke_start(
+    operation: &str,
+    payload: &[u8],
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     invoke_mutation::<contract::EvolutionStartRequest, _>(operation, payload, |request| {
-        run_app_evolution_job(request)
+        run_app_evolution_job(request, sessions)
             .map(|()| contract::EvolutionMutationResponse { accepted: true })
     })
 }
@@ -409,17 +420,25 @@ fn invoke_revision_record(operation: &str, payload: &[u8]) -> NativeModuleRespon
     })
 }
 
-fn invoke_goal_control(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+fn invoke_goal_control(
+    operation: &str,
+    payload: &[u8],
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     invoke_mutation::<contract::EvolutionGoalControlRequest, _>(operation, payload, |request| {
         let data_dir = evolution_data_dir()?;
-        run_app_control_goal(&data_dir, request)
+        run_app_control_goal(&data_dir, sessions, request)
     })
 }
 
-fn invoke_workflow_update(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+fn invoke_workflow_update(
+    operation: &str,
+    payload: &[u8],
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     invoke_mutation::<contract::EvolutionWorkflowUpdateRequest, _>(operation, payload, |request| {
         let data_dir = evolution_data_dir()?;
-        run_app_update_workflow(&data_dir, request)
+        run_app_update_workflow(&data_dir, sessions, request)
     })
 }
 
@@ -453,9 +472,13 @@ where
     }
 }
 
-fn invoke_cli(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+fn invoke_cli(
+    operation: &str,
+    payload: &[u8],
+    sessions: crate::SessionServices<'_>,
+) -> NativeModuleResponse {
     match decode_sobj::<contract::EvolutionCliRequest>(payload) {
-        Ok(request) => match run_evolve_command_captured(&request.args) {
+        Ok(request) => match run_evolve_command_captured(&request.args, sessions) {
             Ok(stdout) => match encode_sobj(&contract::EvolutionCliResponse { stdout }) {
                 Ok(payload_sobj) => invocation_response(operation, payload_sobj),
                 Err(error) => NativeModuleResponse::Error(native_error(
@@ -613,22 +636,25 @@ mod tests {
                 2,
             ),
         ] {
-            let response = invoke_operation(NativeModuleInvocationRequest {
-                operation: cli_contract::CLI_INVOKE_OPERATION.into(),
-                payload_sobj: encode_sobj(&cli_contract::CliModuleRequest {
-                    command_id: command.command_id.clone(),
-                    invocation_id: "test-cli".into(),
-                    action,
-                    args,
-                    stdin: Vec::new(),
-                    current_dir: None,
-                })
-                .unwrap(),
-                host_data_dir_root: Some(root.path().display().to_string()),
-                cancellation_wait_handle: None,
-                request_body: None,
-                response_body_path: None,
-            });
+            let response = invoke_operation(
+                NativeModuleInvocationRequest {
+                    operation: cli_contract::CLI_INVOKE_OPERATION.into(),
+                    payload_sobj: encode_sobj(&cli_contract::CliModuleRequest {
+                        command_id: command.command_id.clone(),
+                        invocation_id: "test-cli".into(),
+                        action,
+                        args,
+                        stdin: Vec::new(),
+                        current_dir: None,
+                    })
+                    .unwrap(),
+                    host_data_dir_root: Some(root.path().display().to_string()),
+                    cancellation_wait_handle: None,
+                    request_body: None,
+                    response_body_path: None,
+                },
+                None,
+            );
             let NativeModuleResponse::Invocation(response) = response else {
                 panic!("{response:?}");
             };
@@ -655,15 +681,18 @@ mod tests {
     #[test]
     fn invocation_uses_the_host_data_directory_and_captures_cli_output() {
         let root = sinomo_testdir::TestDir::new("evolution-native-host-context");
-        let dashboard = invoke_operation(NativeModuleInvocationRequest {
-            operation: contract::EVOLUTION_DASHBOARD_OPERATION.to_string(),
-            payload_sobj: encode_sobj(&contract::EvolutionDashboardRequest)
-                .expect("dashboard request"),
-            host_data_dir_root: Some(root.path().display().to_string()),
-            cancellation_wait_handle: None,
-            request_body: None,
-            response_body_path: None,
-        });
+        let dashboard = invoke_operation(
+            NativeModuleInvocationRequest {
+                operation: contract::EVOLUTION_DASHBOARD_OPERATION.to_string(),
+                payload_sobj: encode_sobj(&contract::EvolutionDashboardRequest)
+                    .expect("dashboard request"),
+                host_data_dir_root: Some(root.path().display().to_string()),
+                cancellation_wait_handle: None,
+                request_body: None,
+                response_body_path: None,
+            },
+            None,
+        );
         let NativeModuleResponse::Invocation(dashboard) = dashboard else {
             panic!("dashboard invocation failed: {dashboard:?}");
         };
@@ -674,26 +703,29 @@ mod tests {
             root.path().join("evolution").display().to_string()
         );
 
-        let create = invoke_operation(NativeModuleInvocationRequest {
-            operation: contract::EVOLUTION_GOAL_CREATE_OPERATION.to_string(),
-            payload_sobj: encode_sobj(&contract::EvolutionGoalCreateRequest {
-                objective: "improve a generic artifact".to_string(),
-                evolution_agent_id: None,
-                metrics: vec![contract::EvolutionMetricDefinitionInput {
-                    id: "quality".to_string(),
-                    label: "Quality".to_string(),
-                    direction: "maximize".to_string(),
-                    unit: "points".to_string(),
-                    target: None,
-                    required: true,
-                }],
-            })
-            .expect("goal create request"),
-            host_data_dir_root: Some(root.path().display().to_string()),
-            cancellation_wait_handle: None,
-            request_body: None,
-            response_body_path: None,
-        });
+        let create = invoke_operation(
+            NativeModuleInvocationRequest {
+                operation: contract::EVOLUTION_GOAL_CREATE_OPERATION.to_string(),
+                payload_sobj: encode_sobj(&contract::EvolutionGoalCreateRequest {
+                    objective: "improve a generic artifact".to_string(),
+                    evolution_agent_id: None,
+                    metrics: vec![contract::EvolutionMetricDefinitionInput {
+                        id: "quality".to_string(),
+                        label: "Quality".to_string(),
+                        direction: "maximize".to_string(),
+                        unit: "points".to_string(),
+                        target: None,
+                        required: true,
+                    }],
+                })
+                .expect("goal create request"),
+                host_data_dir_root: Some(root.path().display().to_string()),
+                cancellation_wait_handle: None,
+                request_body: None,
+                response_body_path: None,
+            },
+            None,
+        );
         let NativeModuleResponse::Invocation(create) = create else {
             panic!("goal creation failed: {create:?}");
         };
@@ -701,22 +733,351 @@ mod tests {
             decode_sobj(&create.payload_sobj).expect("goal create response");
         assert!(create.accepted);
 
-        let cli = invoke_operation(NativeModuleInvocationRequest {
-            operation: contract::EVOLUTION_CLI_OPERATION.to_string(),
-            payload_sobj: encode_sobj(&contract::EvolutionCliRequest {
-                args: vec!["help".to_string()],
-            })
-            .expect("CLI request"),
-            host_data_dir_root: Some(root.path().display().to_string()),
-            cancellation_wait_handle: None,
-            request_body: None,
-            response_body_path: None,
-        });
+        let cli = invoke_operation(
+            NativeModuleInvocationRequest {
+                operation: contract::EVOLUTION_CLI_OPERATION.to_string(),
+                payload_sobj: encode_sobj(&contract::EvolutionCliRequest {
+                    args: vec!["help".to_string()],
+                })
+                .expect("CLI request"),
+                host_data_dir_root: Some(root.path().display().to_string()),
+                cancellation_wait_handle: None,
+                request_body: None,
+                response_body_path: None,
+            },
+            None,
+        );
         let NativeModuleResponse::Invocation(cli) = cli else {
             panic!("CLI invocation failed: {cli:?}");
         };
         let cli: contract::EvolutionCliResponse =
             decode_sobj(&cli.payload_sobj).expect("CLI response");
         assert!(cli.stdout.contains("sinomo evolve propose"));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_invoke_with_host_v1(
+    request: SinomoModuleByteSlice,
+    host: sinomo_module_api::host::InvocationHost,
+    response: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
+    let Some(_invocation) = MODULE_LIFECYCLE.begin_invocation() else {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    };
+    let client = unsafe { sinomo_module_api::sessions::SessionClient::new(&host) };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        invoke_unchecked(request, response, Some(&client))
+    }))
+    .unwrap_or_else(|_| {
+        write_native_response(
+            response,
+            NativeModuleResponse::Error(native_error("panic", "evolution invocation panicked")),
+        )
+    })
+}
+
+#[cfg(test)]
+mod live_execution_tests {
+    use super::*;
+    use sinomo_agent::*;
+    use sinomo_lm::{
+        LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent,
+    };
+    use sinomo_module_api::sessions::*;
+    use sinomo_runtime::{events::SessionId, local::SinomoDataDir, node::NodeId};
+    use std::{
+        sync::{Arc, mpsc},
+        time::{Duration, Instant},
+    };
+
+    struct BlockingModel(mpsc::Sender<()>);
+    impl InteractionModel for BlockingModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.complete_streaming_events_with_cancellation(
+                request,
+                &AgentCancellationToken::new(),
+                &mut |_| {},
+            )
+        }
+        fn complete_streaming_events_with_cancellation(
+            &self,
+            request: &LanguageModelRequest,
+            token: &AgentCancellationToken,
+            _: &mut dyn FnMut(LanguageModelStreamEvent),
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.0.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !token.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(LanguageModelError::ProviderInvocationFailed {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                detail: "blocked fixture stopped".into(),
+            })
+        }
+    }
+    struct Host {
+        sessions: Arc<AgentSessionHost>,
+        store: Arc<FileAgentSessionStore>,
+        started: mpsc::Sender<()>,
+    }
+    impl SessionService for Host {
+        fn request(&self, request: &SessionRequest) -> Result<serde_json::Value, String> {
+            use sinomo_runtime::module::sessions::SessionAccess;
+            match request {
+                SessionRequest::Command {
+                    command:
+                        SessionCommand::Create {
+                            instructions,
+                            idle_timeout_secs,
+                            start_paused,
+                            worker: Some(worker),
+                            ..
+                        },
+                } => {
+                    assert!(
+                        *start_paused,
+                        "workflow must persist its reference before opening admission"
+                    );
+                    let agent = Agent::new(
+                        BlockingModel(self.started.clone()),
+                        &worker.provider,
+                        &worker.model,
+                    )
+                    .with_config(
+                        AgentConfig::new(&worker.provider, &worker.model)
+                            .with_agent_definition(crate::evolution_implementer_agent_definition())
+                            .with_workspace_root(&worker.workspace),
+                    );
+                    let session = InteractionSession::new(
+                        SessionId::generate(),
+                        NodeId::generate(),
+                        InteractionSurface::new("fixture", InteractionSurfaceKind::CommandLine),
+                    );
+                    let input = AgentLoopInput {
+                        latest_event: user_interaction_input_event(&session, instructions),
+                        session,
+                        transient_system_context: None,
+                        async_update: None,
+                        context_attachments: vec![],
+                        tool_specs: vec![],
+                    };
+                    serde_json::to_value(
+                        self.sessions
+                            .start(
+                                contract::EVOLUTION_MODULE_ID,
+                                agent,
+                                input,
+                                AgentCancellationToken::new(),
+                                *idle_timeout_secs,
+                                *start_paused,
+                            )
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                SessionRequest::Command { command } => self
+                    .sessions
+                    .owned_command(contract::EVOLUTION_MODULE_ID, command.clone())
+                    .map_err(|e| e.to_string()),
+                read => sinomo_agent::session_access::AgentSessionAccess::new(
+                    self.store.clone(),
+                    self.sessions
+                        .owned_roots(contract::EVOLUTION_MODULE_ID)
+                        .map_err(|e| e.to_string())?,
+                )
+                .request(read.clone()),
+            }
+        }
+    }
+    fn request(
+        operation: &str,
+        payload: impl serde::Serialize,
+        data: &SinomoDataDir,
+    ) -> NativeModuleInvocationRequest {
+        NativeModuleInvocationRequest {
+            operation: operation.into(),
+            payload_sobj: encode_sobj(&payload).unwrap(),
+            host_data_dir_root: Some(data.root().display().to_string()),
+            cancellation_wait_handle: None,
+            request_body: None,
+            response_body_path: None,
+        }
+    }
+
+    #[test]
+    fn native_goal_controls_reach_a_live_worker_before_candidate_artifacts_exist() {
+        let temp = sinomo_testdir::TestDir::new("evolution-live-control");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "fixture@example.test"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "."])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-m", "fixture"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let data = SinomoDataDir::new(temp.path().join("node"));
+        let paths = crate::EvolutionPaths::new(&data);
+        paths.ensure().unwrap();
+        crate::write_config(
+            &paths,
+            &crate::EvolutionConfig {
+                repo: repo.display().to_string(),
+                default_provider: Some("openai".into()),
+                default_model: Some("gpt-4o-mini".into()),
+                sifs_artifact_root: String::new(),
+            },
+        )
+        .unwrap();
+        let (started, ready) = mpsc::channel();
+        let store = Arc::new(FileAgentSessionStore::for_data_dir(&data));
+        let host = Host {
+            sessions: AgentSessionHost::new(store.clone()),
+            store,
+            started,
+        };
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                invoke_operation(
+                    request(
+                        contract::EVOLUTION_START_OPERATION,
+                        contract::EvolutionStartRequest {
+                            objective: "exercise live worker control".into(),
+                            target_ring: "r3".into(),
+                            intended_paths: vec!["README.md".into()],
+                        },
+                        &data,
+                    ),
+                    Some(&host),
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if ready.recv_timeout(Duration::from_millis(50)).is_ok() {
+                    break;
+                }
+                if run.is_finished() {
+                    panic!("candidate did not start: {:?}", run.join().unwrap());
+                }
+                assert!(Instant::now() < deadline, "worker did not reach the model");
+            }
+            let graph = crate::list_evolution_goal_graphs(&paths)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(
+                graph.agent_runs.len(),
+                1,
+                "only actual executions are recorded"
+            );
+            let reference = graph.agent_runs[0]
+                .execution
+                .clone()
+                .expect("durable execution reference");
+            assert!(!reference.operation_id.is_empty());
+            assert!(
+                graph
+                    .tasks
+                    .iter()
+                    .any(|task| task.assigned_agent_run_id.as_deref()
+                        == Some(&graph.agent_runs[0].agent_run_id))
+            );
+            assert!(
+                graph
+                    .revisions
+                    .iter()
+                    .all(|revision| revision.status == crate::EvolutionRevisionStatus::Baseline)
+            );
+            let began = Instant::now();
+            let response = invoke_operation(
+                request(
+                    contract::EVOLUTION_GOAL_CONTROL_OPERATION,
+                    contract::EvolutionGoalControlRequest {
+                        goal_id: graph.goal_id.clone(),
+                        action: contract::EvolutionGoalControlAction::Pause,
+                        note: String::new(),
+                    },
+                    &data,
+                ),
+                Some(&host),
+            );
+            assert!(
+                matches!(response, NativeModuleResponse::Invocation(_)),
+                "{response:?}"
+            );
+            assert!(
+                began.elapsed() < Duration::from_secs(3),
+                "control waited for the model"
+            );
+            let paused = crate::execution::execution_state(Some(&host), &reference).unwrap();
+            assert_eq!(paused.phase, SessionExecutionPhase::Paused);
+            let response = invoke_operation(
+                request(
+                    contract::EVOLUTION_GOAL_CONTROL_OPERATION,
+                    contract::EvolutionGoalControlRequest {
+                        goal_id: graph.goal_id.clone(),
+                        action: contract::EvolutionGoalControlAction::Cancel,
+                        note: String::new(),
+                    },
+                    &data,
+                ),
+                Some(&host),
+            );
+            assert!(
+                matches!(response, NativeModuleResponse::Invocation(_)),
+                "{response:?}"
+            );
+            run.join().unwrap();
+            let dashboard = crate::app_evolution_dashboard(&data, Some(&host));
+            assert!(dashboard.error.is_none(), "{:?}", dashboard.error);
+            let goal = dashboard
+                .goals
+                .iter()
+                .find(|goal| goal.id == graph.goal_id)
+                .unwrap();
+            assert!(goal.status.eq_ignore_ascii_case("cancelled"));
+            assert!(goal.agent_runs[0].status.eq_ignore_ascii_case("cancelled"));
+            assert_eq!(
+                goal.agent_runs[0].execution.as_ref().unwrap().session_id,
+                reference.session_id
+            );
+        });
+        host.sessions
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .unwrap();
     }
 }

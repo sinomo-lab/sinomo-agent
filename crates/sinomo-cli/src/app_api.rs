@@ -3819,6 +3819,7 @@ fn app_agent_item_id(item: &AgentItem) -> TaskId {
 /// delivery differ from the regular turn-based agent loop.
 #[derive(Clone)]
 pub struct AgentChatToolContext {
+    attribution: sinomo_runtime::api::app::usage::UsageAttribution,
     registry: AgentToolRegistry,
     session: InteractionSession,
     plan: AgentToolPlan,
@@ -3858,6 +3859,15 @@ impl AgentChatToolContext {
             .collect();
         let (descriptors, _) = surface.filter_tool_descriptors(executable_descriptors);
         Self {
+            attribution: sinomo_runtime::api::app::usage::UsageAttribution {
+                agent: Some(definition.key().to_string()),
+                session: Some(session.session_id.to_string()),
+                chat: session.conversation_id.as_ref().map(ToString::to_string),
+                participant: session.participant_id.as_ref().map(ToString::to_string),
+                origin: "realtime".into(),
+                purpose: "tool_call".into(),
+                ..Default::default()
+            },
             registry,
             session,
             plan,
@@ -3877,6 +3887,7 @@ impl AgentChatToolContext {
         call: &AgentToolCall,
         cancellation_token: sinomo_agent::AgentCancellationToken,
     ) -> AgentToolOutcome {
+        let _attribution = sinomo_lm::usage::enter_attribution(self.attribution.clone());
         if !self
             .descriptors
             .iter()
@@ -3891,7 +3902,7 @@ impl AgentChatToolContext {
                 "invocation_mode": "realtime",
                 "tool": call.tool,
             });
-            return AgentToolOutcome {
+            let outcome = AgentToolOutcome {
                 call_id: TaskId::generate(),
                 step_index: 0,
                 call_index,
@@ -3903,6 +3914,9 @@ impl AgentChatToolContext {
                 evidence: AgentToolEvidence::availability_only(false, summary)
                     .with_output_value(&output, false),
             };
+            self.registry
+                .record_usage(&self.session, &outcome.call_id, &outcome, 0, false);
+            return outcome;
         }
         AgentToolOrchestrator::new(&self.surface, None, &self.run_context)
             .execute_with_cancellation(
@@ -4445,9 +4459,17 @@ impl AgentChat {
     pub fn tool_context(&self) -> AgentChatToolContext {
         let handler = self.runtime.handler();
         let info = tui::app_runtime_info(handler);
+        let mut session = self.runtime.session().clone();
+        session.conversation_id = Some(self.channel.channel_id.clone());
+        session.participant_id = self
+            .channel
+            .participants
+            .iter()
+            .find(|p| p.agent_session_id == session.session_id)
+            .map(|p| p.participant_id.clone());
         AgentChatToolContext::new(
             handler.tool_registry(),
-            self.runtime.session().clone(),
+            session,
             handler.agent_definition().clone(),
             handler.module_tool_projection(),
             &info.provider,
@@ -5915,6 +5937,10 @@ impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
             (sink.borrow_mut())(ChatStreamEvent::SpeakerStarted(speaker.clone()));
         }
 
+        runtime.set_conversation_id(
+            channel.channel_id.clone(),
+            participant.participant_id.clone(),
+        );
         let channel_id = channel.channel_id.clone();
         let mut streamed_answer = String::new();
         let mut streamed_step = None;
@@ -7462,11 +7488,14 @@ fn app_session(data_dir: &SinomoDataDir, session_id: Option<&str>) -> Interactio
     let session_id = session_id
         .and_then(|id| SessionId::from_str(id).ok())
         .unwrap_or_else(SessionId::generate);
-    InteractionSession::new(
+    let conversation_id = session_id.clone();
+    let mut session = InteractionSession::new(
         session_id,
         node_id,
         InteractionSurface::new("surface.app", InteractionSurfaceKind::App),
-    )
+    );
+    session.conversation_id = Some(conversation_id);
+    session
 }
 
 fn app_channel_source(
@@ -8915,6 +8944,16 @@ impl SifsBrowser {
     }
 
     /// Read the exact immutable object version described by a prior stat.
+    pub fn read_object_range(
+        &self,
+        request: &sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.read_object_range(request),
+            SifsBrowserBackend::Remote(remote) => remote.read_object_range(request),
+        }
+    }
+
     pub fn read_object_version(
         &self,
         object_id: &str,
@@ -9525,6 +9564,26 @@ impl RemoteSifsBrowser {
             },
         )?;
         response.into_result().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn read_object_range(
+        &self,
+        request: &sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        let reply: sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeResponse = self.read_rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE,
+            request,
+        )?;
+        if reply.request != *request
+            || reply.bytes.len() as u64
+                != request
+                    .size_bytes
+                    .saturating_sub(request.offset)
+                    .min(u64::from(request.length))
+        {
+            return Err("SIFS returned a different version or range".into());
+        }
+        Ok(reply.bytes)
     }
 
     pub(crate) fn read_object_version(

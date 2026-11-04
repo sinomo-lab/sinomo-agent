@@ -3,6 +3,10 @@
 //! Native modules share the host process address space. This loader verifies
 //! content hashes and ABI descriptors, but it is not a security sandbox.
 
+use sinomo_module_api::host::{
+    HostServiceRequest, HostServiceResponse, INVOCATION_HOST_VERSION, InvocationHost,
+    InvokeWithHostFn, MAX_HOST_CALL_BYTES,
+};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
@@ -46,6 +50,11 @@ pub enum NativeModuleHostError {
 }
 
 pub trait NativeModuleHostCallbacks: Send + Sync {
+    /// Only services explicitly attached to this invocation are available.
+    fn host_service(&self, _request: &HostServiceRequest) -> Result<Vec<u8>, String> {
+        Err("host service is not available in this invocation".into())
+    }
+
     fn output_payload(&self, _payload_sobj: &[u8]) {}
     /// Synchronous output hook for module effects which require durable host
     /// acknowledgement before they may proceed. Existing hosts retain their
@@ -141,6 +150,7 @@ pub struct NativeModule {
     library: Option<Library>,
     descriptor: NativeModuleDescriptor,
     invoke: SinomoModuleInvokeFn,
+    invoke_with_host: Option<InvokeWithHostFn>,
     shutdown: Option<SinomoModuleShutdownFn>,
     free_buffer: SinomoModuleFreeBufferFn,
     callbacks: Option<Box<NativeModuleHostCallbackState>>,
@@ -325,6 +335,12 @@ impl NativeModule {
         let invoke = unsafe {
             load_symbol::<SinomoModuleInvokeFn>(&library, b"sinomo_module_invoke\0", library_path)?
         };
+        let invoke_with_host = unsafe {
+            library
+                .get::<InvokeWithHostFn>(b"sinomo_module_invoke_with_host_v1\0")
+                .ok()
+                .map(|symbol| *symbol)
+        };
         let shutdown = unsafe {
             load_symbol::<SinomoModuleShutdownFn>(
                 &library,
@@ -365,6 +381,7 @@ impl NativeModule {
             library: Some(library),
             descriptor,
             invoke,
+            invoke_with_host,
             shutdown: Some(shutdown),
             free_buffer,
             callbacks: Some(callbacks),
@@ -511,6 +528,10 @@ unsafe fn native_module_descriptor(
 }
 
 impl NativeModule {
+    pub fn supports_invocation_host(&self) -> bool {
+        self.invoke_with_host.is_some()
+    }
+
     pub fn descriptor(&self) -> &NativeModuleDescriptor {
         &self.descriptor
     }
@@ -533,13 +554,35 @@ impl NativeModule {
             .callbacks
             .as_ref()
             .expect("loaded native module callback state")
-            .set_callbacks(callbacks)?;
+            .set_callbacks(if self.invoke_with_host.is_some() {
+                None
+            } else {
+                callbacks.clone()
+            })?;
         let mut response_buffer = SinomoModuleByteBuffer::null();
         let status = unsafe {
-            (self.invoke)(
-                SinomoModuleByteSlice::from_slice(&request_bytes),
-                &mut response_buffer,
-            )
+            if let Some(invoke) = self.invoke_with_host {
+                let context = InvocationServices {
+                    callbacks,
+                    requirements: &self.descriptor.component.requirements,
+                };
+                invoke(
+                    SinomoModuleByteSlice::from_slice(&request_bytes),
+                    InvocationHost {
+                        version: INVOCATION_HOST_VERSION,
+                        user_data: &context as *const InvocationServices<'_> as *mut c_void,
+                        call: invocation_host_call,
+                        free: free_host_service_buffer,
+                        is_cancelled: invocation_host_cancelled,
+                    },
+                    &mut response_buffer,
+                )
+            } else {
+                (self.invoke)(
+                    SinomoModuleByteSlice::from_slice(&request_bytes),
+                    &mut response_buffer,
+                )
+            }
         };
         let response_bytes = unsafe { copy_and_free_buffer(response_buffer, self.free_buffer) };
         if status != SINOMO_MODULE_STATUS_OK {
@@ -849,6 +892,78 @@ pub fn native_module_cache_path(
         .join(library_name)
 }
 
+struct InvocationServices<'a> {
+    callbacks: Option<Arc<dyn NativeModuleHostCallbacks>>,
+    requirements: &'a [sinomo_module_api::ServiceRequirement],
+}
+unsafe extern "C" fn free_host_service_buffer(buffer: SinomoModuleByteBuffer) {
+    unsafe {
+        drop(SinomoModuleByteBuffer::into_vec(buffer));
+    }
+}
+unsafe extern "C" fn invocation_host_call(
+    data: *mut c_void,
+    request: SinomoModuleByteSlice,
+    out: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
+    if data.is_null() || out.is_null() || request.len > MAX_HOST_CALL_BYTES {
+        return sinomo_module_api::SINOMO_MODULE_STATUS_INVALID_ARGUMENT;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let context = unsafe { &*(data as *const InvocationServices<'_>) };
+        let request: HostServiceRequest =
+            sinomo_module_api::decode_sobj(unsafe { request.as_slice() })
+                .map_err(|e| e.to_string())?;
+        if !context.requirements.iter().any(|requirement| {
+            requirement.interface_id == request.interface_id
+                && (requirement.interface_version == request.interface_version
+                    || requirement.interface_version == "*")
+                && requirement.operations.contains(&request.operation)
+        }) {
+            return Err("module did not declare this host service operation".to_string());
+        }
+        let callbacks = context
+            .callbacks
+            .as_ref()
+            .ok_or("no host services attached")?;
+        if callbacks.is_cancelled() {
+            return Err("invocation cancelled".into());
+        }
+        let bytes = callbacks.host_service(&request)?;
+        if bytes.len() > MAX_HOST_CALL_BYTES / 2 {
+            return Err("host service response exceeds limit".into());
+        }
+        Ok(bytes)
+    }))
+    .unwrap_or_else(|_| Err("host service panicked".into()));
+    let response = match result {
+        Ok(bytes) => HostServiceResponse::Value(bytes),
+        Err(error) => HostServiceResponse::Error(error),
+    };
+    match sinomo_module_api::encode_sobj(&response) {
+        Ok(bytes) => {
+            unsafe {
+                *out = SinomoModuleByteBuffer::from_vec(bytes);
+            }
+            SINOMO_MODULE_STATUS_OK
+        }
+        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    }
+}
+
+unsafe extern "C" fn invocation_host_cancelled(data: *mut c_void) -> u8 {
+    if data.is_null() {
+        return 1;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { &*(data as *const InvocationServices<'_>) }
+            .callbacks
+            .as_ref()
+            .is_some_and(|callbacks| callbacks.is_cancelled()) as u8
+    }))
+    .unwrap_or(1)
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -962,5 +1077,47 @@ mod lifecycle_tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("second lifecycle acquired after release");
         waiter.join().expect("join lifecycle waiter");
+    }
+}
+
+#[cfg(test)]
+mod invocation_service_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Calls(AtomicUsize);
+    impl NativeModuleHostCallbacks for Calls {
+        fn host_service(&self, _: &HostServiceRequest) -> Result<Vec<u8>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            encode_sobj(&7u64).map_err(|e| e.to_string())
+        }
+    }
+    #[test]
+    fn scoped_host_calls_check_declared_operation_and_version_before_dispatch() {
+        let calls = Arc::new(Calls(AtomicUsize::new(0)));
+        let requirements = vec![
+            sinomo_module_api::ServiceRequirement::new("test.service", "1.0.0")
+                .with_operation("read"),
+        ];
+        let context = InvocationServices {
+            callbacks: Some(calls.clone()),
+            requirements: &requirements,
+        };
+        let host = InvocationHost {
+            version: INVOCATION_HOST_VERSION,
+            user_data: &context as *const _ as *mut c_void,
+            call: invocation_host_call,
+            free: free_host_service_buffer,
+            is_cancelled: invocation_host_cancelled,
+        };
+        assert!(unsafe { host.call_sobj::<_, u64>("test.service", "2.0.0", "read", &()) }.is_err());
+        assert!(
+            unsafe { host.call_sobj::<_, u64>("test.service", "1.0.0", "write", &()) }.is_err()
+        );
+        assert_eq!(calls.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            unsafe { host.call_sobj::<_, u64>("test.service", "1.0.0", "read", &()) }.unwrap(),
+            7
+        );
+        assert_eq!(calls.0.load(Ordering::SeqCst), 1);
     }
 }

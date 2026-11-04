@@ -63,15 +63,17 @@ pub enum ClusterSubview {
     Topology,
     Activity,
     Logs,
+    Usage,
 }
 
 impl ClusterSubview {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Overview,
         Self::Explore,
         Self::Topology,
         Self::Activity,
         Self::Logs,
+        Self::Usage,
     ];
 
     fn index(self) -> usize {
@@ -81,6 +83,7 @@ impl ClusterSubview {
             Self::Topology => 2,
             Self::Activity => 3,
             Self::Logs => 4,
+            Self::Usage => 5,
         }
     }
 
@@ -91,6 +94,7 @@ impl ClusterSubview {
             Self::Topology => "Topology",
             Self::Activity => "Activity",
             Self::Logs => "Logs",
+            Self::Usage => "Usage",
         }
     }
 }
@@ -327,6 +331,7 @@ pub struct ClusterState {
     explorer: MetricExplorerState,
     explorer_navigation: MasterDetailState,
     logs: logs::LogState,
+    usage: usage::UsageState,
 }
 
 /// Cloneable UI projection shared by the Cluster tab's structural selectors.
@@ -351,11 +356,29 @@ pub struct ClusterStructureKey {
     metrics_revision: u64,
     observation_time: Option<OffsetDateTime>,
     logs: logs::LogKey,
+    usage: usage::UsageKey,
     /// No node has reported a metric target yet, so the overview has nothing to chart.
     observation_empty: bool,
 }
 
 impl ClusterStructureKey {
+    pub(crate) fn usage_storage_summary(&self) -> String {
+        let mut text = self
+            .usage
+            .ledger_sizes
+            .iter()
+            .map(|(node, size)| format!("{node}: {:.2} MiB", *size as f64 / (1024.0 * 1024.0)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            text = "Refresh to read retained usage storage on each node.".into();
+        }
+        if let Some(error) = &self.usage.ledger_error {
+            text.push_str(&format!("\n{error}"));
+        }
+        text
+    }
+
     /// What starts or stops live observation besides the active tab: an observing subview,
     /// the overview's live state, and live logs.
     pub(crate) fn observation_schedule(&self) -> (bool, bool, bool) {
@@ -365,7 +388,8 @@ impl ClusterStructureKey {
                 ClusterSubview::Overview | ClusterSubview::Explore
             ),
             self.observation_live,
-            self.subview == ClusterSubview::Logs && self.logs.is_live(),
+            (self.subview == ClusterSubview::Logs && self.logs.is_live())
+                || self.subview == ClusterSubview::Usage,
         )
     }
 
@@ -388,12 +412,14 @@ impl ClusterStructureKey {
                 metrics_revision: 0,
                 observation_time: None,
                 logs: logs::LogKey::default(),
+                usage: usage::UsageKey::default(),
                 observation_empty: true,
             };
         };
         Self {
             snapshot: cluster.snapshot.clone(),
             logs: cluster.logs.key.clone(),
+            usage: cluster.usage.key.clone(),
             subview: cluster.subview,
             selected: cluster.selected.clone(),
             diagnostics_open: cluster.diagnostics_open,
@@ -474,6 +500,7 @@ impl ClusterState {
             explorer: MetricExplorerState::default(),
             explorer_navigation: MasterDetailState::default(),
             logs: logs::LogState::default(),
+            usage: usage::UsageState::default(),
         };
         state.sync_explorer_history_scope();
         state
@@ -746,6 +773,9 @@ pub fn pump_refresh(shared: &Shared) -> bool {
 }
 
 pub fn request_observation(shared: &Shared) -> bool {
+    if usage::visible(shared) {
+        return usage::request(shared, false);
+    }
     if shared.is_ready() && shared.cluster().subview == ClusterSubview::Logs {
         return logs::request(shared, false);
     }
@@ -773,10 +803,14 @@ pub fn pump_observation(shared: &Shared) -> bool {
     }
     let metrics = shared.cluster_mut().pump_observation();
     let logs = logs::pump(shared);
-    metrics || logs
+    let usage = usage::pump(shared);
+    metrics || logs || usage
 }
 
 pub fn observation_visible(shared: &Shared) -> bool {
+    if usage::visible(shared) {
+        return true;
+    }
     if logs::live(shared) {
         return true;
     }
@@ -1150,7 +1184,8 @@ pub fn view(shared: Shared) -> impl Widget {
         .with_child(cluster_explorer_view(&shared, &reader))
         .with_child(ClusterView::new(shared.clone()))
         .with_child(cluster_activity_host(&shared, &reader))
-        .with_child(logs::view(&shared, &reader));
+        .with_child(logs::view(&shared, &reader))
+        .with_child(usage::view(&shared, &reader));
     let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
     let cluster = Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
         .top(HEADER_H, cluster_header(&shared, &reader));
@@ -1175,31 +1210,44 @@ fn build_cluster_section_bar(
         .gap(0.0)
         .selected_from(selected)
         .theme_when(clone_reader(reader))
-        .on_change(move |index, _label| {
-            let Some(subview) = ClusterSubview::ALL.get(index).copied() else {
-                return;
-            };
-            if change_shared.cluster().subview == subview {
-                return;
-            }
-            change_shared.cluster_mut().subview = subview;
-            if subview == ClusterSubview::Logs {
-                logs::request(&change_shared, true);
-                request_refresh(&change_shared);
-            } else if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
-                request_observation(&change_shared);
-            }
-        });
-    Surface::window(tabs)
-        .border(SurfaceBorder::Bottom)
-        .padding(Insets {
-            left: PAD,
-            right: PAD,
-            top: 5.0,
-            bottom: 5.0,
-        })
-        .fill()
+        .on_change(move |index, _label| select_cluster_subview(&change_shared, index));
+    let change_shared = shared.clone();
+    let selection_shared = shared.clone();
+    let compact = Select::new("Cluster view")
+        .options(ClusterSubview::ALL.into_iter().map(ClusterSubview::title))
+        .selected_when(move || Some(selection_shared.cluster().subview.index()))
         .theme_when(clone_reader(reader))
+        .on_change(move |index, _label| select_cluster_subview(&change_shared, index));
+    Surface::window(
+        ConstraintView::new(compact).when(ConstraintQuery::new().min_width(640.0), tabs),
+    )
+    .border(SurfaceBorder::Bottom)
+    .padding(Insets {
+        left: PAD,
+        right: PAD,
+        top: 5.0,
+        bottom: 5.0,
+    })
+    .fill()
+    .theme_when(clone_reader(reader))
+}
+
+fn select_cluster_subview(change_shared: &Shared, index: usize) {
+    let Some(subview) = ClusterSubview::ALL.get(index).copied() else {
+        return;
+    };
+    if change_shared.cluster().subview == subview {
+        return;
+    }
+    change_shared.cluster_mut().subview = subview;
+    if subview == ClusterSubview::Usage {
+        usage::request(&change_shared, true);
+    } else if subview == ClusterSubview::Logs {
+        logs::request(&change_shared, true);
+        request_refresh(&change_shared);
+    } else if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
+        request_observation(&change_shared);
+    }
 }
 
 fn cluster_explorer_view(shared: &Shared, reader: &ThemeReader) -> MasterDetail {
@@ -5584,6 +5632,10 @@ mod tests {
             DashboardMetric::AgentActiveTurns,
             DashboardMetric::AgentPendingTasks,
             DashboardMetric::AgentFailedTasks,
+            DashboardMetric::ModelRequests,
+            DashboardMetric::ModelInputTokens,
+            DashboardMetric::ModelOutputTokens,
+            DashboardMetric::ToolCalls,
             DashboardMetric::DfsBacklog,
         ]
         .into_iter()
@@ -5602,12 +5654,16 @@ mod tests {
         })
         .collect::<Vec<_>>();
 
-        assert_eq!(card_tops.len(), 4);
-        let first = card_tops.iter().copied().reduce(f32::min).unwrap();
-        let last = card_tops.iter().copied().reduce(f32::max).unwrap();
+        assert_eq!(card_tops.len(), 8);
+        let first = card_tops[..card_tops.len() - 1]
+            .iter()
+            .copied()
+            .reduce(f32::max)
+            .unwrap();
+        let last = *card_tops.last().unwrap();
         assert!(
             (280.0..420.0).contains(&(last - first)),
-            "the storage section should follow the compact agent chart row: {card_tops:?}"
+            "the storage section should follow the last agent chart row: {card_tops:?}"
         );
         Ok(())
     }
@@ -7092,6 +7148,7 @@ mod tests {
             explorer: MetricExplorerState::default(),
             explorer_navigation: MasterDetailState::default(),
             logs: logs::LogState::default(),
+            usage: usage::UsageState::default(),
         };
         tx.send(ClusterSnapshot {
             nodes: vec![node("node-a")],
@@ -7534,4 +7591,22 @@ mod tests {
                 .any(|line| line == "next: public route is reachable")
         );
     }
+}
+
+mod usage;
+
+pub(crate) fn open_usage(shared: &Shared, filter: sinomo_client::usage_contract::UsageFilter) {
+    {
+        let mut cluster = shared.cluster_mut();
+        cluster.subview = ClusterSubview::Usage;
+        cluster.usage.key.query.filter = filter;
+        cluster.usage.key.query.cursor = None;
+        cluster.usage.key.response = None;
+    }
+    shared.set_active_tab(Tab::Cluster);
+    usage::request(shared, true);
+}
+
+pub(crate) fn refresh_usage_sizes(shared: &Shared) {
+    usage::request_sizes(shared);
 }

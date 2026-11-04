@@ -1,19 +1,20 @@
 use super::*;
 use crate::{WorkspaceId, read_stored_job, write_stored_job};
-use sinomo_lm::{
-    LanguageModelHostAccess, LanguageModelProviderInfo, LanguageModelResponse, LanguageModelUsage,
-    PROVIDER_DEFAULT_MODEL,
+use sinomo_agent::{
+    Agent, AgentLoopInput, InteractionModel, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, user_interaction_input_event,
 };
+use sinomo_lm::{GeminiProvider, LanguageModelError, LanguageModelRequest, LanguageModelResponse};
 use sinomo_runtime::core::{
     Confidence, EvaluationOutcome, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass,
     RollbackPolicy, RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_runtime::eval::LocalCommandRunner;
-use sinomo_runtime::events::EventId;
+use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::module::{
     MODULE_INVOCATION_DECISION_EVENT_KIND, MODULE_TIMEOUT_EVENT_KIND, ModuleId,
 };
-use sinomo_runtime::node::{LocalNodePermission, LocalNodePermissionStore, LocalNodePermissions};
+use sinomo_runtime::{local::SinomoDataDir, node::NodeId};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -712,46 +713,6 @@ fn background_tick_estimates_require_campaign_context() {
     assert!(matches!(
         error,
         EvolutionInputParseError::Invalid { detail } if detail.contains("at least one campaign")
-    ));
-}
-
-#[test]
-fn evolution_language_model_mutation_model_reports_unknown_provider() {
-    let root = temp_dir("unknown-provider-model");
-    let packet = MutationPacket {
-        job_id: EvolutionJobId::from_legacy_named("evojob_unknown_provider").expect("job"),
-        objective: "test unknown provider".to_string(),
-        target_ring: TrustRing::R1TrustedRuntime,
-        edit_scope: EditScope {
-            workspace_root: root.display().to_string(),
-            intended_paths: vec!["README.md".to_string()],
-            notes: "test".to_string(),
-        },
-        relevant_files: Vec::new(),
-        verification: VerificationPlan {
-            commands: Vec::new(),
-            module_replay_reports: Vec::new(),
-        },
-        output_contract: MutationOutputContract::default(),
-        recovery: RecoveryPlan::default(),
-    };
-    let model = EvolutionLanguageModelMutationModel {
-        provider: "unknown-provider".to_string(),
-        model: "test-model".to_string(),
-        data_dir: SinomoDataDir::new(root.join("data")),
-    };
-
-    let error = model
-        .mutate(&packet, &candidate_workspace(&root), None)
-        .expect_err("unknown provider should fail");
-
-    assert!(matches!(
-        error,
-        MutationModelError::LanguageModel(LanguageModelError::ProviderInvocationFailed {
-            provider,
-            model,
-            ..
-        }) if provider == "unknown-provider" && model == "test-model"
     ));
 }
 
@@ -1493,6 +1454,7 @@ fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
             mutation_packet_path: "/tmp/sinomo-candidate-bundle/mutation-packet.json".to_string(),
             job_path: Some("/tmp/sinomo-candidate-bundle/job.json".to_string()),
             model_output_path: Some("/tmp/sinomo-candidate-bundle/model-output.json".to_string()),
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -2353,6 +2315,7 @@ fn sample_iteration_report(
             mutation_packet_path: "/tmp/sinomo-candidate-bundle/mutation-packet.json".to_string(),
             job_path: Some("/tmp/sinomo-candidate-bundle/job.json".to_string()),
             model_output_path: Some("/tmp/sinomo-candidate-bundle/model-output.json".to_string()),
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -3067,7 +3030,7 @@ fn mutation_prompt_contains_objective_verification_and_recovery() {
             }],
             module_replay_reports: Vec::new(),
         },
-        output_contract: MutationOutputContract::default(),
+        evidence_requirements: CandidateEvidenceRequirements::default(),
         recovery: RecoveryPlan::default(),
     };
 
@@ -3077,81 +3040,6 @@ fn mutation_prompt_contains_objective_verification_and_recovery() {
     assert!(prompt.contains("cargo check"));
     assert!(prompt.contains("recovery notes"));
     assert!(prompt.contains("restore the disposable VM snapshot"));
-}
-
-#[test]
-fn bridge_prompt_exposes_candidate_workspace_tools_and_json_contract() {
-    let root = temp_dir("bridge-prompt");
-    let workspace = candidate_workspace(&root);
-    let packet = MutationPacket {
-        job_id: workspace.job_id.clone(),
-        objective: "add mutation evidence".to_string(),
-        target_ring: TrustRing::R1TrustedRuntime,
-        edit_scope: EditScope {
-            workspace_root: root.display().to_string(),
-            intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
-            notes: "keep it focused".to_string(),
-        },
-        relevant_files: Vec::new(),
-        verification: VerificationPlan {
-            commands: Vec::new(),
-            module_replay_reports: Vec::new(),
-        },
-        output_contract: MutationOutputContract::default(),
-        recovery: RecoveryPlan::default(),
-    };
-
-    let prompt = render_mutation_bridge_prompt(
-        &packet,
-        &workspace,
-        &EvolutionToolRegistry::bootstrap().descriptors(),
-        true,
-        false,
-    );
-
-    assert!(prompt.contains("Candidate Workspace"));
-    assert!(prompt.contains(&root.display().to_string()));
-    assert!(prompt.contains("apply_patch"));
-    assert!(prompt.contains("interrupt_command"));
-    assert!(prompt.contains("kill_command"));
-    assert!(prompt.contains("no further stdout/stderr"));
-    assert!(prompt.contains("Required JSON Response"));
-    assert!(prompt.contains("json object"));
-}
-
-#[test]
-fn structured_mutation_output_parses_json_and_patch_fences() {
-    let structured = parse_structured_mutation_output(
-        r#"{"changed_files":["src/lib.rs"],"patch":"diff --git a/src/lib.rs b/src/lib.rs","patch_summary":"updated bridge"}"#,
-    )
-    .expect("structured output");
-
-    assert_eq!(structured.changed_files, vec!["src/lib.rs".to_string()]);
-    assert_eq!(structured.patch_summary.as_deref(), Some("updated bridge"));
-
-    let patch = extract_patch_from_text(
-        "notes\n```diff\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n```\n",
-    )
-    .expect("patch");
-    assert!(patch.starts_with("diff --git"));
-
-    let fenced = parse_structured_mutation_output(
-        "```json\n{\"tool_calls\":[{\"tool\":\"read_file\",\"input\":{\"path\":\"Cargo.toml\"}}],\"changed_files\":[]}\n```",
-    )
-    .expect("fenced json");
-    assert_eq!(fenced.tool_calls.len(), 1);
-    assert_eq!(fenced.tool_calls[0].tool, "read_file");
-
-    let array_notes = parse_structured_mutation_output(
-        r#"{"changed_files":["agent-target.md"],"patch":"diff --git a/agent-target.md b/agent-target.md","verification_notes":["ran grep","passed"],"experiment_notes":["none"],"recovery_notes":["checkout file"]}"#,
-    )
-    .expect("array notes json");
-    assert_eq!(
-        array_notes.verification_notes.as_deref(),
-        Some("ran grep\npassed")
-    );
-    assert_eq!(array_notes.experiment_notes.as_deref(), Some("none"));
-    assert_eq!(array_notes.recovery_notes.as_deref(), Some("checkout file"));
 }
 
 #[test]
@@ -3197,309 +3085,6 @@ fn mutation_packet_collects_relevant_source_excerpts_from_intended_paths() {
             .iter()
             .any(|file| file.path == "crates/example/src/lib.rs")
     );
-}
-
-#[test]
-fn language_model_bridge_requests_json_and_applies_returned_patch() {
-    let root = git_repo("bridge-applies-patch");
-    fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
-    run_in(&root, "git add patched.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    let workspace = candidate_workspace(&root);
-    let provider = FakeLanguageModelProvider::new(
-        LanguageModelProviderInfo {
-            provider: "fake-json".to_string(),
-            default_model: "fake-model".to_string(),
-            invocation: sinomo_lm::LanguageModelInvocation::Http,
-            host_access: LanguageModelHostAccess::NetworkOnly,
-            capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
-            supports_json_object: true,
-            supports_tool_permissions: false,
-        },
-        serde_json::json!({
-            "changed_files": ["patched.txt"],
-            "patch": "diff --git a/patched.txt b/patched.txt\n--- a/patched.txt\n+++ b/patched.txt\n@@ -1 +1 @@\n-old\n+new\n",
-            "patch_summary": "updated patched.txt",
-            "verification_notes": "not run",
-            "experiment_notes": "unit test fixture",
-            "recovery_notes": "restore temp repo"
-        })
-        .to_string(),
-    );
-    let requests = provider.requests.clone();
-    let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
-    let packet = MutationPacket {
-        job_id: workspace.job_id.clone(),
-        objective: "apply patch from json provider".to_string(),
-        target_ring: TrustRing::R1TrustedRuntime,
-        edit_scope: EditScope {
-            workspace_root: root.display().to_string(),
-            intended_paths: vec!["patched.txt".to_string()],
-            notes: String::new(),
-        },
-        relevant_files: Vec::new(),
-        verification: VerificationPlan {
-            commands: Vec::new(),
-            module_replay_reports: Vec::new(),
-        },
-        output_contract: MutationOutputContract::default(),
-        recovery: RecoveryPlan::default(),
-    };
-
-    let result = bridge.mutate(&packet, &workspace, None).expect("mutate");
-
-    assert_eq!(
-        requests.borrow()[0].response_format,
-        LanguageModelResponseFormat::JsonObject
-    );
-    assert_eq!(result.summary.as_deref(), Some("updated patched.txt"));
-    assert!(result.parsed_patch.as_deref().is_some());
-    assert_eq!(result.tool_results[0].status, ToolCallStatus::Succeeded);
-    let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
-    assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-}
-
-#[test]
-fn language_model_bridge_runs_tool_rounds_before_final_patch() {
-    let root = git_repo("bridge-tool-rounds");
-    fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
-    run_in(&root, "git add patched.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    let workspace = candidate_workspace(&root);
-    let provider = FakeLanguageModelProvider::with_responses(
-        LanguageModelProviderInfo {
-            provider: "fake-tool-loop".to_string(),
-            default_model: "fake-model".to_string(),
-            invocation: sinomo_lm::LanguageModelInvocation::Http,
-            host_access: LanguageModelHostAccess::NetworkOnly,
-            capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
-            supports_json_object: true,
-            supports_tool_permissions: false,
-        },
-        vec![
-            serde_json::json!({
-                "tool_calls": [
-                    { "tool": "read_file", "input": { "path": "patched.txt" } }
-                ],
-                "changed_files": []
-            })
-            .to_string(),
-            serde_json::json!({
-                "tool_calls": [],
-                "changed_files": ["patched.txt"],
-                "patch": "diff --git a/patched.txt b/patched.txt\n--- a/patched.txt\n+++ b/patched.txt\n@@ -1 +1 @@\n-old\n+new\n",
-                "patch_summary": "updated after reading file"
-            })
-            .to_string(),
-        ],
-    );
-    let requests = provider.requests.clone();
-    let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
-    let packet = MutationPacket {
-        job_id: workspace.job_id.clone(),
-        objective: "use tools before patch".to_string(),
-        target_ring: TrustRing::R3SandboxedModule,
-        edit_scope: EditScope {
-            workspace_root: root.display().to_string(),
-            intended_paths: vec!["patched.txt".to_string()],
-            notes: String::new(),
-        },
-        relevant_files: Vec::new(),
-        verification: VerificationPlan {
-            commands: Vec::new(),
-            module_replay_reports: Vec::new(),
-        },
-        output_contract: MutationOutputContract::default(),
-        recovery: RecoveryPlan::default(),
-    };
-
-    let result = bridge.mutate(&packet, &workspace, None).expect("mutate");
-
-    assert_eq!(requests.borrow().len(), 2);
-    assert!(requests.borrow()[0].metadata["target_ring"].is_null());
-    assert_eq!(
-        requests.borrow()[0].metadata["target_ring_policy"],
-        "ignored-during-bootstrap"
-    );
-    assert!(
-        requests.borrow()[1]
-            .messages
-            .last()
-            .unwrap()
-            .content
-            .contains("Tool results")
-    );
-    assert_eq!(result.model_turns.len(), 2);
-    assert_eq!(result.tool_results[0].tool, "read_file");
-    assert_eq!(result.tool_results[1].tool, "apply_patch");
-    let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
-    assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-}
-
-#[test]
-fn language_model_bridge_treats_http_tool_providers_as_structured_patch_mode() {
-    let root = git_repo("bridge-http-tool-provider");
-    fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
-    run_in(&root, "git add patched.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    let workspace = candidate_workspace(&root);
-    let provider = FakeLanguageModelProvider::new(
-        LanguageModelProviderInfo {
-            provider: "fake-http-tools".to_string(),
-            default_model: "fake-model".to_string(),
-            invocation: sinomo_lm::LanguageModelInvocation::Http,
-            host_access: LanguageModelHostAccess::NetworkOnly,
-            capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
-            supports_json_object: true,
-            supports_tool_permissions: true,
-        },
-        serde_json::json!({
-            "tool_calls": [],
-            "changed_files": ["patched.txt"],
-            "patch": "diff --git a/patched.txt b/patched.txt\n--- a/patched.txt\n+++ b/patched.txt\n@@ -1 +1 @@\n-old\n+new\n",
-            "patch_summary": "patched tracked file"
-        })
-        .to_string(),
-    );
-    let requests = provider.requests.clone();
-    let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
-    let packet = MutationPacket {
-        job_id: workspace.job_id.clone(),
-        objective: "patch file".to_string(),
-        target_ring: TrustRing::R1TrustedRuntime,
-        edit_scope: EditScope {
-            workspace_root: root.display().to_string(),
-            intended_paths: vec!["patched.txt".to_string()],
-            notes: String::new(),
-        },
-        relevant_files: Vec::new(),
-        verification: VerificationPlan {
-            commands: Vec::new(),
-            module_replay_reports: Vec::new(),
-        },
-        output_contract: MutationOutputContract::default(),
-        recovery: RecoveryPlan::default(),
-    };
-
-    let result = bridge.mutate(&packet, &workspace, None).expect("mutation");
-
-    let request = &requests.borrow()[0];
-    assert_eq!(request.metadata["direct_edit"], false);
-    assert_eq!(
-        request.response_format,
-        LanguageModelResponseFormat::JsonObject
-    );
-    assert_eq!(
-        result
-            .structured_output
-            .as_ref()
-            .map(|output| output.changed_files.clone()),
-        Some(vec!["patched.txt".to_string()])
-    );
-    let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
-    assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-}
-
-#[test]
-fn unrestricted_language_model_bridge_fails_closed_without_permission_context() {
-    let root = temp_dir("bridge-unrestricted-no-permission-context");
-    let workspace = candidate_workspace(&root);
-    let provider = FakeLanguageModelProvider::new(
-        LanguageModelProviderInfo {
-            provider: "fake-unrestricted".to_string(),
-            default_model: "fake-model".to_string(),
-            invocation: sinomo_lm::LanguageModelInvocation::Process,
-            host_access: LanguageModelHostAccess::Unrestricted,
-            capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
-            supports_json_object: false,
-            supports_tool_permissions: true,
-        },
-        "unreachable".to_string(),
-    );
-    let requests = provider.requests.clone();
-    let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
-
-    let error = bridge
-        .mutate(&bridge_permission_test_packet(&workspace), &workspace, None)
-        .expect_err("unrestricted provider must require authoritative local consent");
-
-    assert!(requests.borrow().is_empty());
-    assert!(error.to_string().contains("remote-management"));
-    assert!(error.to_string().contains("no authoritative"));
-}
-
-#[test]
-fn unrestricted_language_model_bridge_rechecks_permission_between_provider_calls() {
-    let root = temp_dir("bridge-unrestricted-revocation");
-    fs::write(root.join("context.txt"), "permission boundary\n").expect("write context");
-    let workspace = candidate_workspace(&root);
-    let data_dir = SinomoDataDir::new(root.join("node-data"));
-    set_remote_management(&data_dir, true);
-    let requests = Rc::new(RefCell::new(Vec::new()));
-    let provider = RevokingLanguageModelProvider {
-        store: LocalNodePermissionStore::new(data_dir.root()),
-        requests: requests.clone(),
-    };
-    let bridge =
-        LanguageModelMutationBridge::new_for_data_dir(provider, PROVIDER_DEFAULT_MODEL, &data_dir);
-
-    let error = bridge
-        .mutate(&bridge_permission_test_packet(&workspace), &workspace, None)
-        .expect_err("revocation must stop the next provider invocation");
-
-    assert_eq!(requests.borrow().len(), 1);
-    assert!(error.to_string().contains("remote-management"));
-    assert!(!LocalNodePermissionStore::new(data_dir.root()).remote_management_enabled());
-}
-
-#[test]
-fn language_model_bridge_errors_when_final_patch_fails_to_apply() {
-    let root = git_repo("bridge-bad-patch");
-    fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
-    run_in(&root, "git add patched.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    let workspace = candidate_workspace(&root);
-    let provider = FakeLanguageModelProvider::new(
-        LanguageModelProviderInfo {
-            provider: "fake-json".to_string(),
-            default_model: "fake-model".to_string(),
-            invocation: sinomo_lm::LanguageModelInvocation::Http,
-            host_access: LanguageModelHostAccess::NetworkOnly,
-            capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
-            supports_json_object: true,
-            supports_tool_permissions: false,
-        },
-        serde_json::json!({
-            "tool_calls": [],
-            "changed_files": ["missing.txt"],
-            "patch": "diff --git a/missing.txt b/missing.txt\n--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-old\n+new\n"
-        })
-        .to_string(),
-    );
-    let bridge = LanguageModelMutationBridge::new(provider, PROVIDER_DEFAULT_MODEL);
-    let packet = MutationPacket {
-        job_id: workspace.job_id.clone(),
-        objective: "bad patch".to_string(),
-        target_ring: TrustRing::R1TrustedRuntime,
-        edit_scope: EditScope {
-            workspace_root: root.display().to_string(),
-            intended_paths: vec!["missing.txt".to_string()],
-            notes: String::new(),
-        },
-        relevant_files: Vec::new(),
-        verification: VerificationPlan {
-            commands: Vec::new(),
-            module_replay_reports: Vec::new(),
-        },
-        output_contract: MutationOutputContract::default(),
-        recovery: RecoveryPlan::default(),
-    };
-
-    let error = bridge
-        .mutate(&packet, &workspace, None)
-        .expect_err("bad patch");
-
-    assert!(matches!(error, MutationModelError::ToolExecution { .. }));
 }
 
 #[test]
@@ -3676,8 +3261,6 @@ fn orchestrator_writes_model_turn_and_tool_evidence_artifacts() {
 
     assert!(bundle.join("model-output.txt").exists());
     assert!(bundle.join("model-result.json").exists());
-    assert!(bundle.join("model-turns.json").exists());
-    assert!(bundle.join("model-tool-results.json").exists());
 }
 
 #[test]
@@ -4823,6 +4406,7 @@ fn regression_evidence_summary_preserves_trace_fixture_refs_for_future_gates() {
         mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -4928,6 +4512,7 @@ fn regression_evidence_summary_turns_rollout_telemetry_windows_into_trace_fixtur
         mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -5043,6 +4628,7 @@ fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtu
         mutation_packet_path: "/tmp/bundle/mutation-packet.json".to_string(),
         job_path: None,
         model_output_path: None,
+        execution: None,
         agent_run_path: None,
         agent_summary_path: None,
         benchmark_results_path: None,
@@ -5125,156 +4711,6 @@ fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtu
     let summary = render_candidate_evidence_summary(&evidence);
     assert!(summary.contains("module-telemetry-window-1"));
     assert!(summary.contains("event-log-signal-1"));
-}
-
-#[test]
-fn agent_mutation_worker_binds_local_permission_store_for_host_commands() {
-    let root = temp_dir("agent-mutation-worker");
-    let data_dir = SinomoDataDir::new(root.join("node-data"));
-    set_remote_management(&data_dir, true);
-    fs::write(root.join("hello.txt"), "old\n").expect("fixture");
-    let job = create_bootstrap_job(
-        &EvolutionRequest {
-            objective: "replace hello fixture".to_string(),
-            target_ring: TrustRing::R2TrustedService,
-            intended_paths: vec!["hello.txt".to_string()],
-            verification_commands: Vec::new(),
-            benchmark_gates: Vec::new(),
-            module_replay_reports: Vec::new(),
-            model_provider: None,
-            model: None,
-            dry_run: false,
-        },
-        &root,
-    );
-    let workspace = CandidateWorkspace {
-        job_id: job.job_id.clone(),
-        path: root.to_path_buf(),
-        branch_name: "codex/evolve/agent-worker".to_string(),
-        source_revision: Some("test".to_string()),
-    };
-    let bundle_dir = root.join("bundle");
-    fs::create_dir_all(&bundle_dir).expect("bundle");
-    let bundle = CandidateBundleManifest {
-        job_id: job.job_id.clone(),
-        bundle_path: bundle_dir.display().to_string(),
-        created_at: OffsetDateTime::now_utc(),
-        mutation_packet_path: bundle_dir
-            .join("mutation-packet.json")
-            .display()
-            .to_string(),
-        job_path: None,
-        model_output_path: None,
-        agent_run_path: None,
-        agent_summary_path: None,
-        benchmark_results_path: None,
-        resource_usage_path: None,
-        content_manifest_path: None,
-        attestation_path: None,
-        registry_record_path: None,
-        bundle_content_hash: None,
-        changed_files_path: None,
-        diff_path: None,
-        scorecard_path: None,
-        candidate_summary_path: None,
-        decision_path: None,
-        artifact_refs: Vec::new(),
-        command_logs: Vec::new(),
-    };
-    let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
-    let command = agent_output_command();
-    let model = FakeInteractionModel::new([
-        serde_json::json!({
-            "response_mode": "defer",
-            "text": "Applying the requested source edit.",
-            "tool_calls": [
-                {
-                    "tool": "apply_patch",
-                    "input": { "patch": patch },
-                    "async": false,
-                    "summary": "Update hello fixture."
-                },
-                {
-                    "tool": "run_command",
-                    "input": { "command": command },
-                    "async": false,
-                    "summary": "Verify command execution with local consent."
-                }
-            ],
-            "background_handoff": null,
-            "next_state": "waiting"
-        })
-        .to_string(),
-        serde_json::json!({
-            "response_mode": "answer",
-            "text": "Changed hello.txt from old to new. Verification not requested.",
-            "tool_calls": [],
-            "background_handoff": null,
-            "next_state": "listening"
-        })
-        .to_string(),
-    ]);
-    let worker = AgentMutationWorker::new(model, "fake", "fake")
-        .with_local_permission_data_dir(data_dir)
-        .with_max_steps(Some(4));
-
-    let result = worker
-        .mutate(&mutation_packet_for_job(&job), &workspace, Some(&bundle))
-        .expect("agent mutation");
-
-    assert_eq!(
-        fs::read_to_string(root.join("hello.txt")).expect("fixture"),
-        "new\n"
-    );
-    assert!(result.agent_run.is_some());
-    assert_eq!(
-        result
-            .agent_summary
-            .as_ref()
-            .map(|summary| summary.tool_results),
-        Some(2)
-    );
-    let run = result.agent_run.as_ref().expect("serialized agent run");
-    let command_outcome = run["tool_results"]
-        .as_array()
-        .expect("tool results")
-        .iter()
-        .find(|outcome| outcome["call"]["tool"] == "run_command")
-        .expect("run command outcome");
-    assert_eq!(
-        command_outcome["status"],
-        serde_json::Value::String("succeeded".to_string()),
-        "unexpected run-command outcome: {command_outcome}"
-    );
-}
-
-#[test]
-fn internal_evolution_tool_projection_only_advertises_backed_recall_tools() {
-    let tools = evolution_agent_mutation_tools(true);
-    let names = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-
-    assert!(names.contains(&"memory_search"));
-    assert!(names.contains(&"memory_read"));
-    assert!(names.contains(&"memory_write"));
-    assert!(
-        !names.contains(&"session_history_search"),
-        "the internal mutation harness must not advertise history until a stable host backend is injected"
-    );
-
-    let unbacked_tools = evolution_agent_mutation_tools(false);
-    let unbacked_names = unbacked_tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    for memory_tool in ["memory_search", "memory_read", "memory_write"] {
-        assert!(
-            !unbacked_names.contains(&memory_tool),
-            "the internal mutation harness must not advertise {memory_tool} without an authoritative data directory"
-        );
-    }
 }
 
 #[test]
@@ -5409,6 +4845,7 @@ fn verify_stored_evolution_job_runs_plan_and_records_scorecard() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5489,6 +4926,7 @@ fn decide_stored_evolution_job_records_rejected_decision() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5862,6 +5300,7 @@ fn approved_candidate_commit_fast_forwards_source_checkout() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5942,6 +5381,7 @@ fn cleanup_stored_evolution_job_removes_worktree_job_and_bundle_dirs() {
             mutation_packet_path: String::new(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: None,
             benchmark_results_path: None,
@@ -5974,407 +5414,7 @@ fn cleanup_stored_evolution_job_removes_worktree_job_and_bundle_dirs() {
     assert!(!bundle_dir.exists());
 }
 
-#[test]
-fn bootstrap_tool_registry_exposes_minimal_phase_three_tools() {
-    let registry = EvolutionToolRegistry::bootstrap();
-    let names = registry
-        .descriptors()
-        .into_iter()
-        .map(|descriptor| descriptor.name)
-        .collect::<Vec<_>>();
-
-    for expected in [
-        "read_file",
-        "search",
-        "apply_patch",
-        "run_command",
-        "interrupt_command",
-        "kill_command",
-    ] {
-        assert!(names.iter().any(|name| name == expected), "{expected}");
-    }
-}
-
-fn evolution_registry_with_remote_management(root: &Path) -> EvolutionToolRegistry {
-    let data_dir = SinomoDataDir::new(root.join("node-data"));
-    set_remote_management(&data_dir, true);
-    EvolutionToolRegistry::bootstrap_for_data_dir(data_dir)
-}
-
-fn set_remote_management(data_dir: &SinomoDataDir, enabled: bool) {
-    let store = LocalNodePermissionStore::new(data_dir.root());
-    let mut permissions = LocalNodePermissions::default();
-    permissions.set_permission(LocalNodePermission::RemoteManagement, enabled);
-    store
-        .save(&permissions)
-        .expect("write remote-management grant");
-}
-
-#[test]
-fn run_command_tool_fails_closed_without_local_remote_management_permission() {
-    let root = temp_dir("run-command-local-permission");
-    let workspace = candidate_workspace(&root);
-    let registry = EvolutionToolRegistry::bootstrap();
-    let descriptor = registry
-        .descriptors()
-        .into_iter()
-        .find(|descriptor| descriptor.name == "run_command")
-        .expect("run command descriptor");
-
-    assert_eq!(
-        descriptor.required_local_permissions,
-        vec![LocalNodePermission::RemoteManagement.as_str().to_string()]
-    );
-    let result = registry.execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "run_command".to_string(),
-            input: serde_json::json!({ "command": output_command() }),
-        },
-    );
-    assert_eq!(result.status, ToolCallStatus::Failed);
-    assert!(result.evidence.summary.contains("node-local permission"));
-}
-
-#[test]
-fn read_file_tool_returns_content_and_path_evidence() {
-    let root = temp_dir("read-file-tool");
-    fs::write(root.join("notes.txt"), "hello tools").expect("write note");
-    let workspace = candidate_workspace(&root);
-    let result = EvolutionToolRegistry::bootstrap().execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "read_file".to_string(),
-            input: serde_json::json!({ "path": "notes.txt" }),
-        },
-    );
-
-    assert_eq!(result.status, ToolCallStatus::Succeeded);
-    assert_eq!(result.output["content"], "hello tools");
-    assert_eq!(result.evidence.paths, vec!["notes.txt".to_string()]);
-}
-
-#[test]
-fn tool_registry_can_emit_execution_event_with_result_and_changed_files() {
-    let root = git_repo("tool-event");
-    fs::write(root.join("tracked.txt"), "before\n").expect("write tracked");
-    run_in(&root, "git add tracked.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    fs::write(root.join("tracked.txt"), "after\n").expect("modify tracked");
-    let workspace = candidate_workspace(&root);
-    let context = EvolutionToolEventContext::new(
-        NodeId::from_legacy_named("node_tool_test").expect("node"),
-        workspace.job_id.clone(),
-    );
-
-    let (result, event) = EvolutionToolRegistry::bootstrap().execute_with_event(
-        &workspace,
-        &context,
-        EvolutionToolCall {
-            tool: "read_file".to_string(),
-            input: serde_json::json!({ "path": "tracked.txt" }),
-        },
-    );
-
-    assert_eq!(result.status, ToolCallStatus::Succeeded);
-    assert_eq!(event.kind.as_str(), "evolution.tool.executed");
-    assert_eq!(event.payload["tool"], "read_file");
-    assert_eq!(event.payload["result"]["status"], "succeeded");
-    assert_eq!(
-        event.payload["changed_files"],
-        serde_json::json!(["tracked.txt"])
-    );
-    assert_eq!(event.evidence.refs.len(), 1);
-}
-
-#[test]
-fn run_command_tool_captures_exit_code_stdout_and_stderr() {
-    let root = temp_dir("run-command-tool");
-    let workspace = candidate_workspace(&root);
-    let result = evolution_registry_with_remote_management(&root).execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "run_command".to_string(),
-            input: serde_json::json!({ "command": output_command() }),
-        },
-    );
-
-    assert_eq!(result.status, ToolCallStatus::Succeeded);
-    assert_eq!(result.output["exit_code"], 0);
-    assert!(result.output["run_id"].as_str().is_some());
-    assert!(
-        result.output["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("sinomo-stdout")
-    );
-    assert!(
-        result.output["stderr"]
-            .as_str()
-            .unwrap()
-            .contains("sinomo-stderr")
-    );
-    assert!(result.evidence.command.is_some());
-}
-
-#[test]
-fn command_control_tool_reports_unknown_run_id() {
-    let root = temp_dir("command-control-tool");
-    let workspace = candidate_workspace(&root);
-    let result = EvolutionToolRegistry::bootstrap().execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "interrupt_command".to_string(),
-            input: serde_json::json!({ "run_id": "cmd_missing" }),
-        },
-    );
-
-    assert_eq!(result.status, ToolCallStatus::Failed);
-    assert!(
-        result.evidence.summary.contains("cmd_missing"),
-        "{}",
-        result.evidence.summary
-    );
-}
-
-#[test]
-#[cfg(unix)]
-fn kill_command_tool_can_terminate_active_run_command() {
-    use std::thread;
-
-    let root = temp_dir("kill-command-tool");
-    let workspace = candidate_workspace(&root);
-    let registry = std::sync::Arc::new(evolution_registry_with_remote_management(&root));
-    let running_registry = registry.clone();
-    let running_workspace = workspace.clone();
-    let handle = thread::spawn(move || {
-        running_registry.execute(
-            &running_workspace,
-            EvolutionToolCall {
-                tool: "run_command".to_string(),
-                input: serde_json::json!({ "command": "sleep 5" }),
-            },
-        )
-    });
-    let run_id = wait_for_active_command(&registry);
-
-    let control = registry.execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "kill_command".to_string(),
-            input: serde_json::json!({ "run_id": run_id }),
-        },
-    );
-    let result = handle.join().expect("run command thread");
-
-    assert_eq!(control.status, ToolCallStatus::Succeeded);
-    assert_ne!(result.output["exit_code"], 0);
-}
-
-#[cfg(unix)]
-fn wait_for_active_command(registry: &EvolutionToolRegistry) -> String {
-    for _ in 0..100 {
-        if let Some(run_id) = registry.active_command_run_ids().into_iter().next() {
-            return run_id;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("expected an active command run");
-}
-
-#[test]
-fn run_command_can_report_git_status_and_diff_from_candidate_workspace() {
-    let root = git_repo("git-tools");
-    fs::write(root.join("tracked.txt"), "before\n").expect("write tracked");
-    run_in(&root, "git add tracked.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    fs::write(root.join("tracked.txt"), "after\n").expect("modify tracked");
-    let workspace = candidate_workspace(&root);
-    let registry = evolution_registry_with_remote_management(&root);
-
-    let status = registry.execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "run_command".to_string(),
-            input: serde_json::json!({ "command": "git status --short" }),
-        },
-    );
-    let diff = registry.execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "run_command".to_string(),
-            input: serde_json::json!({ "command": "git diff --binary HEAD --" }),
-        },
-    );
-
-    assert_eq!(status.status, ToolCallStatus::Succeeded);
-    assert!(
-        status.output["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("tracked.txt")
-    );
-    assert_eq!(diff.status, ToolCallStatus::Succeeded);
-    assert!(diff.output["stdout"].as_str().unwrap().contains("+after"));
-}
-
-#[test]
-fn apply_patch_tool_applies_unified_diff_in_candidate_workspace() {
-    let root = git_repo("apply-patch-tool");
-    fs::write(root.join("patched.txt"), "old\n").expect("write tracked");
-    run_in(&root, "git add patched.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    let workspace = candidate_workspace(&root);
-    let patch = "\
-diff --git a/patched.txt b/patched.txt
-index 3b18e51..6320cd2 100644
---- a/patched.txt
-+++ b/patched.txt
-@@ -1 +1 @@
--old
-+new
-";
-    let result = EvolutionToolRegistry::bootstrap().execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "apply_patch".to_string(),
-            input: serde_json::json!({ "patch": patch }),
-        },
-    );
-
-    assert_eq!(result.status, ToolCallStatus::Succeeded);
-    let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
-    assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-}
-
-#[test]
-fn apply_patch_tool_applies_v4a_update_patch_in_candidate_workspace() {
-    let root = git_repo("apply-v4a-patch-tool");
-    fs::write(root.join("patched.txt"), "# Title\n\nold\n").expect("write tracked");
-    run_in(&root, "git add patched.txt").expect("git add");
-    run_in(&root, "git commit -m init").expect("git commit");
-    let workspace = candidate_workspace(&root);
-    let patch = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: patched.txt\n",
-        "@@\n",
-        " # Title\n",
-        " \n",
-        "-old\n",
-        "+new\n",
-        "*** End Patch\n"
-    );
-    let result = EvolutionToolRegistry::bootstrap().execute(
-        &workspace,
-        EvolutionToolCall {
-            tool: "apply_patch".to_string(),
-            input: serde_json::json!({ "patch": patch }),
-        },
-    );
-
-    assert_eq!(result.status, ToolCallStatus::Succeeded);
-    let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
-    assert_eq!(patched.replace("\r\n", "\n"), "# Title\n\nnew\n");
-}
-
-#[derive(Clone, Debug)]
-struct FakeLanguageModelProvider {
-    info: LanguageModelProviderInfo,
-    responses: Vec<String>,
-    requests: Rc<RefCell<Vec<LanguageModelRequest>>>,
-}
-
-impl FakeLanguageModelProvider {
-    fn new(info: LanguageModelProviderInfo, response: String) -> Self {
-        Self::with_responses(info, vec![response])
-    }
-
-    fn with_responses(info: LanguageModelProviderInfo, responses: Vec<String>) -> Self {
-        Self {
-            info,
-            responses,
-            requests: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-}
-
-impl LanguageModelProvider for FakeLanguageModelProvider {
-    fn info(&self) -> LanguageModelProviderInfo {
-        self.info.clone()
-    }
-
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        let response_index = self.requests.borrow().len();
-        self.requests.borrow_mut().push(request.clone());
-        Ok(LanguageModelResponse {
-            provider: self.info.provider.clone(),
-            model: self.info.default_model.clone(),
-            content: self
-                .responses
-                .get(response_index)
-                .or_else(|| self.responses.last())
-                .cloned()
-                .unwrap_or_default(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: Some(LanguageModelUsage {
-                input_tokens: Some(10),
-                output_tokens: Some(20),
-            }),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RevokingLanguageModelProvider {
-    store: LocalNodePermissionStore,
-    requests: Rc<RefCell<Vec<LanguageModelRequest>>>,
-}
-
-impl LanguageModelProvider for RevokingLanguageModelProvider {
-    fn info(&self) -> LanguageModelProviderInfo {
-        LanguageModelProviderInfo {
-            provider: "fake-revoking-unrestricted".to_string(),
-            default_model: "fake-model".to_string(),
-            invocation: sinomo_lm::LanguageModelInvocation::Process,
-            host_access: LanguageModelHostAccess::Unrestricted,
-            capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
-            supports_json_object: true,
-            supports_tool_permissions: false,
-        }
-    }
-
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        self.requests.borrow_mut().push(request.clone());
-        self.store
-            .mutate(|permissions| {
-                Ok(permissions.set_permission(LocalNodePermission::RemoteManagement, false))
-            })
-            .expect("revoke remote-management after first provider call");
-        Ok(LanguageModelResponse {
-            provider: "fake-revoking-unrestricted".to_string(),
-            model: "fake-model".to_string(),
-            content: serde_json::json!({
-                "tool_calls": [
-                    { "tool": "read_file", "input": { "path": "context.txt" } }
-                ],
-                "changed_files": []
-            })
-            .to_string(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: None,
-        })
-    }
-}
-
-fn bridge_permission_test_packet(workspace: &CandidateWorkspace) -> MutationPacket {
+fn candidate_test_packet(workspace: &CandidateWorkspace) -> MutationPacket {
     MutationPacket {
         job_id: workspace.job_id.clone(),
         objective: "exercise provider permission boundary".to_string(),
@@ -6389,7 +5429,7 @@ fn bridge_permission_test_packet(workspace: &CandidateWorkspace) -> MutationPack
             commands: Vec::new(),
             module_replay_reports: Vec::new(),
         },
-        output_contract: MutationOutputContract::default(),
+        evidence_requirements: CandidateEvidenceRequirements::default(),
         recovery: RecoveryPlan::default(),
     }
 }
@@ -6403,39 +5443,13 @@ impl MutationModel for FakeMutationModel {
         _packet: &MutationPacket,
         _workspace: &CandidateWorkspace,
         _bundle: Option<&CandidateBundleManifest>,
+        _on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
-        let tool_result = EvolutionToolResult {
-            tool: "read_file".to_string(),
-            status: ToolCallStatus::Succeeded,
-            output: serde_json::json!({ "content": "evidence" }),
-            evidence: ToolEvidence {
-                summary: "read evidence".to_string(),
-                command: None,
-                exit_code: None,
-                duration_ms: None,
-                paths: vec!["evidence.txt".to_string()],
-            },
-        };
         Ok(ModelMutationResult {
             provider: "fake".to_string(),
             model: "fake-model".to_string(),
             raw_output: "{\"patch_summary\":\"fake mutation\"}".to_string(),
-            parsed_patch: None,
-            summary: Some("fake mutation".to_string()),
-            structured_output: Some(StructuredMutationOutput {
-                patch_summary: Some("fake mutation".to_string()),
-                ..StructuredMutationOutput::default()
-            }),
-            tool_results: vec![tool_result.clone()],
-            model_turns: vec![MutationModelTurn {
-                turn: 1,
-                raw_output: "{\"patch_summary\":\"fake mutation\"}".to_string(),
-                structured_output: Some(StructuredMutationOutput {
-                    patch_summary: Some("fake mutation".to_string()),
-                    ..StructuredMutationOutput::default()
-                }),
-                tool_results: vec![tool_result],
-            }],
+            summary: Some("fake mutation".into()),
             agent_summary: None,
             agent_resource_usage: None,
             agent_run: None,
@@ -6468,17 +5482,15 @@ impl MutationModel for FakeAgentArtifactMutationModel {
         _packet: &MutationPacket,
         _workspace: &CandidateWorkspace,
         _bundle: Option<&CandidateBundleManifest>,
+        _on_session: MutationSessionObserver<'_>,
     ) -> Result<ModelMutationResult, MutationModelError> {
         Ok(ModelMutationResult {
             provider: "fake".to_string(),
             model: "fake-model".to_string(),
             raw_output: "agent completed".to_string(),
-            parsed_patch: None,
             summary: Some("agent completed".to_string()),
-            structured_output: None,
-            tool_results: Vec::new(),
-            model_turns: Vec::new(),
             agent_summary: Some(AgentMutationSummary {
+                execution: None,
                 stop_reason: "final-decision".to_string(),
                 model_turns: 2,
                 tool_results: 1,
@@ -6699,6 +5711,7 @@ fn approval_record_fixture(
     .expect("diff");
     let agent_summary_path = bundle_dir.join("agent-summary.json");
     let agent_summary = AgentMutationSummary {
+        execution: None,
         stop_reason: "final-decision".to_string(),
         model_turns: 2,
         tool_results: 1,
@@ -6731,6 +5744,7 @@ fn approval_record_fixture(
             mutation_packet_path: mutation_packet_path.display().to_string(),
             job_path: None,
             model_output_path: None,
+            execution: None,
             agent_run_path: None,
             agent_summary_path: Some(agent_summary_path.display().to_string()),
             benchmark_results_path: None,
@@ -6856,7 +5870,7 @@ fn git_repo(name: &str) -> sinomo_testdir::TestDir {
 }
 
 fn run_in(cwd: &Path, command: &str) -> Result<(), String> {
-    let output = super::shell_command(command)
+    let output = test_shell_command(command)
         .current_dir(cwd)
         .output()
         .map_err(|error| error.to_string())?;
@@ -6867,28 +5881,8 @@ fn run_in(cwd: &Path, command: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
-fn output_command() -> &'static str {
-    "Write-Output sinomo-stdout; [Console]::Error.WriteLine('sinomo-stderr')"
-}
-
 fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
-}
-
-#[cfg(not(windows))]
-fn output_command() -> &'static str {
-    "printf sinomo-stdout; printf sinomo-stderr >&2"
-}
-
-#[cfg(windows)]
-fn agent_output_command() -> &'static str {
-    "echo sinomo-stdout & echo sinomo-stderr 1>&2"
-}
-
-#[cfg(not(windows))]
-fn agent_output_command() -> &'static str {
-    output_command()
 }
 
 #[cfg(windows)]
@@ -6899,4 +5893,111 @@ fn failing_verification_command() -> &'static str {
 #[cfg(not(windows))]
 fn failing_verification_command() -> &'static str {
     "printf failure-details >&2; exit 7"
+}
+
+#[test]
+fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
+    use sinomo_agent::{AgentSessionHost, FileAgentSessionStore};
+    use sinomo_module_api::sessions::{SessionCommand, SessionRequest, SessionService};
+    struct Host {
+        sessions: Arc<AgentSessionHost>,
+    }
+    impl SessionService for Host {
+        fn request(&self, request: &SessionRequest) -> Result<serde_json::Value, String> {
+            match request {
+                SessionRequest::Command {
+                    command:
+                        SessionCommand::Create {
+                            instructions,
+                            start_paused,
+                            worker: Some(worker),
+                            ..
+                        },
+                } => {
+                    assert_eq!(worker.agent_id, crate::EVOLUTION_IMPLEMENTER_AGENT_ID);
+                    assert!(instructions.contains("Candidate Workspace"));
+                    let model = FakeInteractionModel::new([
+                        r#"{"response_mode":"answer","text":"host completed candidate","tool_calls":[],"next_state":"listening"}"#,
+                    ]);
+                    let agent = Agent::new(model, &worker.provider, &worker.model);
+                    let session = InteractionSession::new(
+                        SessionId::generate(),
+                        NodeId::generate(),
+                        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+                    );
+                    let input = AgentLoopInput {
+                        latest_event: user_interaction_input_event(&session, instructions),
+                        session,
+                        transient_system_context: None,
+                        async_update: None,
+                        context_attachments: vec![],
+                        tool_specs: vec![],
+                    };
+                    serde_json::to_value(
+                        self.sessions
+                            .start(
+                                "module.evolution",
+                                agent,
+                                input,
+                                sinomo_agent::AgentCancellationToken::new(),
+                                86400,
+                                *start_paused,
+                            )
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                SessionRequest::Command { command } => self
+                    .sessions
+                    .owned_command("module.evolution", command.clone())
+                    .map_err(|e| e.to_string()),
+                _ => Err("unexpected request".into()),
+            }
+        }
+    }
+    let root = temp_dir("hosted-candidate");
+    let data = SinomoDataDir::new(root.join("data"));
+    let host = Host {
+        sessions: AgentSessionHost::new(Arc::new(FileAgentSessionStore::for_data_dir(&data))),
+    };
+    let workspace = candidate_workspace(&root);
+    let packet = candidate_test_packet(&workspace);
+    let mut model = EvolutionAgentMutationModel {
+        workflow_paths: None,
+        provider: "fake".into(),
+        model: "fake".into(),
+        max_steps: Some(2),
+        sessions: Some(&host),
+    };
+    let result = model.mutate(&packet, &workspace, None, None).unwrap();
+    assert_eq!(result.raw_output, "host completed candidate");
+    assert!(result.agent_run.is_some());
+    assert_eq!(
+        host.sessions.owned_roots("module.evolution").unwrap().len(),
+        1
+    );
+    host.sessions
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    model.sessions = None;
+    assert!(
+        model
+            .mutate(&packet, &workspace, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("host session service is required")
+    );
+}
+
+#[cfg(windows)]
+fn test_shell_command(command: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("powershell");
+    shell.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+    shell
+}
+#[cfg(not(windows))]
+fn test_shell_command(command: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("sh");
+    shell.args(["-c", command]);
+    shell
 }

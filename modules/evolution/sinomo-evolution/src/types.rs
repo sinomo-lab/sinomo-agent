@@ -135,7 +135,8 @@ pub struct MutationPacket {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relevant_files: Vec<FileExcerpt>,
     pub verification: VerificationPlan,
-    pub output_contract: MutationOutputContract,
+    #[serde(default)]
+    pub evidence_requirements: CandidateEvidenceRequirements,
     pub recovery: RecoveryPlan,
 }
 
@@ -146,15 +147,14 @@ pub struct FileExcerpt {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct MutationOutputContract {
+pub struct CandidateEvidenceRequirements {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_sections: Vec<String>,
-    pub prefer_patch: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
 }
 
-impl Default for MutationOutputContract {
+impl Default for CandidateEvidenceRequirements {
     fn default() -> Self {
         Self {
             expected_sections: vec![
@@ -164,9 +164,9 @@ impl Default for MutationOutputContract {
                 "experiment notes".to_string(),
                 "recovery notes".to_string(),
             ],
-            prefer_patch: false,
-            notes: "write directly in the candidate workspace when using a coding-agent provider"
-                .to_string(),
+            notes:
+                "Use host-provided workspace tools and return evidence for the candidate changes"
+                    .to_string(),
         }
     }
 }
@@ -182,6 +182,8 @@ pub struct CandidateBundleManifest {
     pub job_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<sinomo_module_api::sessions::SessionExecutionRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_run_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

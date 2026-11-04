@@ -9,9 +9,8 @@ pub struct LocalSandboxFileSystem {
     layout: LocalSandboxInstanceLayout,
     owners: Arc<Mutex<BTreeMap<SandboxPath, (u32, u32)>>>,
     times: Arc<Mutex<BTreeMap<SandboxPath, (u64, u64)>>>,
-    /// Guest permission bits on hosts whose filesystem cannot store POSIX
-    /// modes (Windows). Unix hosts store them on the file itself.
-    modes: Arc<Mutex<BTreeMap<SandboxPath, u32>>>,
+    /// Guest mode overrides for the local sandbox namespace.
+    modes: Arc<Mutex<BTreeMap<u64, u32>>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -306,6 +305,7 @@ impl LocalSandboxFileSystem {
     ) -> Result<SandboxMetadata, SandboxFsError> {
         let metadata = fs::symlink_metadata(host_path)
             .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+        let inode = metadata_inode(&metadata, host_path, path);
         Ok(SandboxMetadata {
             path: path.clone(),
             is_dir: metadata.is_dir(),
@@ -316,23 +316,23 @@ impl LocalSandboxFileSystem {
                 .modes
                 .lock()
                 .ok()
-                .and_then(|modes| modes.get(path).copied())
-                .unwrap_or_else(|| metadata_mode(&metadata)),
+                .and_then(|modes| modes.get(&inode).copied())
+                .unwrap_or(if metadata.is_dir() { 0o755 } else { 0o644 }),
             uid: self
                 .owners
                 .lock()
                 .ok()
                 .and_then(|owners| owners.get(path).copied())
                 .map(|(uid, _)| uid)
-                .unwrap_or_else(|| metadata_uid(&metadata)),
+                .unwrap_or(0),
             gid: self
                 .owners
                 .lock()
                 .ok()
                 .and_then(|owners| owners.get(path).copied())
                 .map(|(_, gid)| gid)
-                .unwrap_or_else(|| metadata_gid(&metadata)),
-            inode: metadata_inode(&metadata, host_path, path),
+                .unwrap_or(0),
+            inode,
             object_identity: None,
             content_hash: None,
             accessed_at_unix_nanos: self
@@ -795,20 +795,12 @@ impl SandboxFileSystem for LocalSandboxFileSystem {
             return Err(SandboxFsError::ReadOnly { path: path.clone() });
         }
         let host_path = self.host_path_follow_final(path)?;
-        if !cfg!(unix) {
-            fs::symlink_metadata(&host_path)
-                .map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
-            self.modes
-                .lock()
-                .map_err(|_| SandboxFsError::Unavailable {
-                    reason: "local sandbox mode metadata lock poisoned".to_string(),
-                })?
-                .insert(path.clone(), mode & 0o7777);
-            return Ok(());
-        }
-        set_host_mode(&host_path, mode).map_err(|source| SandboxFsError::Unavailable {
-            reason: format!("set mode {}: {source}", path),
-        })
+        let metadata = fs::symlink_metadata(&host_path).map_err(|_| SandboxFsError::NotFound { path: path.clone() })?;
+        let inode = metadata_inode(&metadata, &host_path, path);
+        self.modes.lock().map_err(|_| SandboxFsError::Unavailable {
+            reason: "local sandbox mode metadata lock poisoned".to_string(),
+        })?.insert(inode, mode & 0o7777);
+        Ok(())
     }
 
     fn set_times(
@@ -995,60 +987,6 @@ struct HostFileIdentity {
 #[cfg(all(not(unix), not(windows)))]
 fn host_file_identity(_: &Path) -> Option<HostFileIdentity> {
     None
-}
-
-fn metadata_mode(metadata: &fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o7777
-    }
-    #[cfg(not(unix))]
-    {
-        if metadata.is_dir() { 0o755 } else { 0o644 }
-    }
-}
-
-fn metadata_uid(metadata: &fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.uid()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        0
-    }
-}
-
-fn metadata_gid(metadata: &fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.gid()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        0
-    }
-}
-
-fn set_host_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::symlink_metadata(path)?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode((permissions.mode() & !0o7777) | (mode & 0o7777));
-        fs::set_permissions(path, permissions)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
-    }
 }
 
 fn metadata_inode(metadata: &fs::Metadata, host_path: &Path, path: &SandboxPath) -> u64 {

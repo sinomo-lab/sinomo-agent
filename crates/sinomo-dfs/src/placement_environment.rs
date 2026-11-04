@@ -638,8 +638,8 @@ fn sample_content_location(
             .push("location-detached".to_string());
         return observation;
     }
-    let metadata = match std::fs::metadata(&config.root) {
-        Ok(metadata) if metadata.is_dir() => metadata,
+    match std::fs::metadata(&config.root) {
+        Ok(metadata) if metadata.is_dir() => {},
         Ok(_) => {
             observation.health = DfsHealthState::Critical;
             observation
@@ -671,13 +671,6 @@ fn sample_content_location(
     observation.available_bytes = Some(available);
     observation.usable_bytes = Some(available.saturating_sub(config.reserved_free_bytes));
     observation.last_success_at = Some(now);
-    if metadata.permissions().readonly() {
-        observation.health = DfsHealthState::Critical;
-        observation
-            .reason_codes
-            .push("location-read-only".to_string());
-        return observation;
-    }
     if config.lifecycle == DfsContentLocationLifecycle::Draining {
         observation.health = DfsHealthState::Degraded;
         observation

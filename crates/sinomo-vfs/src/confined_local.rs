@@ -319,8 +319,8 @@ impl VfsBackend for ConfinedLocalVfsBackend {
                 .map_err(|source| map_io(path, source))?;
             return file.sync_all().map_err(|source| map_io(path, source));
         }
-        // Write atomically: a sibling temp file is synced, takes over any
-        // replaced file's permissions, then is renamed onto the target, so a
+        // Write atomically: a sibling temp file is synced, then is
+        // renamed onto the target, so a
         // crash leaves either the previous content or the complete new one.
         let temp = format!(
             ".sinomo-vfs-{}-{}",
@@ -336,10 +336,6 @@ impl VfsBackend for ConfinedLocalVfsBackend {
             file.write_all(bytes)
                 .map_err(|source| map_io(path, source))?;
             file.sync_all().map_err(|source| map_io(path, source))?;
-            if let Some(metadata) = existing.as_ref() {
-                file.set_permissions(metadata.permissions())
-                    .map_err(|source| map_io(path, source))?;
-            }
             drop(file);
             parent
                 .rename(&temp, &parent, name)
@@ -636,7 +632,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn confined_replace_preserves_permissions() {
+    fn confined_replace_uses_creation_defaults() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = sinomo_testdir::TestDir::new("sinomo-vfs-confined-mode");
@@ -656,7 +652,8 @@ mod tests {
             .expect("metadata")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o755);
+        std::fs::write(root.join("control"), []).unwrap();
+        assert_eq!(mode, std::fs::metadata(root.join("control")).unwrap().permissions().mode());
     }
 
     #[cfg(windows)]

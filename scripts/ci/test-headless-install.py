@@ -34,9 +34,7 @@ def main():
         member = archive.getmember("sinomo")
         if not member.isfile():
             raise RuntimeError("CLI artifact must be a regular executable")
-        with archive.extractfile(member) as input_file, cli.open("wb") as output:
-            shutil.copyfileobj(input_file, output)
-    cli.chmod(0o755)
+        archive.extract(member, source, filter="data")
     env = dict(os.environ)
     for key in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "LD_LIBRARY_PATH",
                 "SINOMO_DATA_DIR", "SINOMO_INSTALL_DIR"):
@@ -48,8 +46,7 @@ def main():
     # Catch both PATH-based and sibling-executable graphical dispatch.
     for name in ("sinomo-setup", "zenity", "kdialog", "xdg-open"):
         guard = source / name
-        guard.write_text('#!/bin/sh\nprintf GUI > "$SINOMO_TEST_GUI_MARKER"\nexit 97\n')
-        guard.chmod(0o755)
+        shutil.copy2(Path(__file__).with_name("fixtures") / "gui-guard.sh", guard)
     env["PATH"] = str(source) + os.pathsep + env.get("PATH", "")
     if shutil.which("systemctl", path=env["PATH"]):
         raise RuntimeError("Use a minimal image without systemctl for this acceptance gate")

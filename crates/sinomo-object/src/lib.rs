@@ -870,6 +870,13 @@ impl Value {
         self.encode_value(out, mode)
     }
 
+    /// Encode the payload following this value's dynamic type tag.
+    pub fn to_value_bytes(&self, mode: LengthMode) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.encode_value(&mut bytes, mode)?;
+        Ok(bytes)
+    }
+
     fn encode_value(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<()> {
         match self {
             Self::Boolean(value) => try_push_vec(out, u8::from(*value), "bool")?,
@@ -1327,11 +1334,113 @@ pub struct ElementCursor<'a> {
     bytes: &'a [u8],
     mode: LengthMode,
     limits: DecodeLimits,
+    implicit_optional: Option<ElementType>,
 }
 
 impl<'a> ElementCursor<'a> {
     pub const fn type_id(&self) -> TypeId {
         self.type_id
+    }
+
+    /// The exact encoded value, excluding any dynamic type tag.
+    pub fn encoded_value(&self) -> &'a [u8] {
+        &self.bytes[self.value_offset..self.next_offset]
+    }
+
+    pub fn optional_child(&self) -> Result<Option<Self>> {
+        if self.type_id != TypeId::Optional {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let element_type = match &self.implicit_optional {
+            Some(inner) => inner.clone(),
+            None => read_element_type(&mut reader)?,
+        };
+        let child = match reader.read_u8()? {
+            0 => None,
+            1 => Some(read_typed_value_cursor(&mut reader, &element_type)?),
+            other => return Err(Error::InvalidBoolean(other)),
+        };
+        self.finish_reader(&reader)?;
+        Ok(child)
+    }
+
+    /// Replace one leaf, preserving the original document's metadata, padding,
+    /// container descriptors and all other encoded values.
+    pub fn replace_leaf(&self, value: &Value) -> Result<Vec<u8>> {
+        if self.type_id != value.type_id()
+            || matches!(
+                value,
+                Value::Object(_) | Value::List(_) | Value::Optional(_) | Value::Array(_)
+            )
+        {
+            return Err(Error::TypeMismatch);
+        }
+        match value {
+            Value::String(s) => {
+                ensure_decode_limit("string bytes", s.len() as u64, self.limits.max_string_bytes)?
+            }
+            Value::Bytes(b) => ensure_decode_limit(
+                "bytes value bytes",
+                b.len() as u64,
+                self.limits.max_bytes_value_bytes,
+            )?,
+            _ => {}
+        }
+        let replacement = value.to_value_bytes(self.mode)?;
+        self.replace_range(self.value_offset..self.next_offset, &replacement)
+    }
+
+    /// Rename a field of this dynamic object, preserving the encoded value and its siblings.
+    pub fn rename_field(&self, index: usize, expected: &str, name: &str) -> Result<Vec<u8>> {
+        let object = self.as_object()?;
+        let mut range = None;
+        for (i, field) in object.iter().enumerate() {
+            let field = field?;
+            if i == index {
+                if field.key != expected {
+                    return Err(Error::TypeMismatch);
+                }
+                let start = field.key.as_ptr() as usize - self.bytes.as_ptr() as usize;
+                range = Some(start - self.mode.width()..start + field.key.len());
+            } else if field.key == name {
+                return Err(Error::DuplicateKey(name.to_owned()));
+            }
+        }
+        let range = range.ok_or(Error::TypeMismatch)?;
+        ensure_decode_limit(
+            "string bytes",
+            name.len() as u64,
+            self.limits.max_string_bytes,
+        )?;
+        let replacement = Value::String(name.into()).to_value_bytes(self.mode)?;
+        self.replace_range(range, &replacement)
+    }
+
+    fn replace_range(&self, range: std::ops::Range<usize>, replacement: &[u8]) -> Result<Vec<u8>> {
+        let (_, metadata) = read_document_header(self.bytes, DecodeOptions::new(self.limits))?;
+        let old_len = range.len();
+        if metadata.alignment_hint == AlignmentHint::Aligned
+            && range.end < self.bytes.len()
+            && replacement.len() % 8 != old_len % 8
+        {
+            return Err(Error::Text("resizing this field would shift aligned data; use a length change divisible by eight".into()));
+        }
+        let size = (self.bytes.len() - old_len)
+            .checked_add(replacement.len())
+            .ok_or(Error::SizeOverflow)?;
+        self.mode.validate(size as u64)?;
+        ensure_decode_limit(
+            "document bytes",
+            size as u64,
+            self.limits.max_document_bytes,
+        )?;
+        let mut out = try_vec_with_capacity(size, "edited document")?;
+        out.extend_from_slice(&self.bytes[..range.start]);
+        out.extend_from_slice(replacement);
+        out.extend_from_slice(&self.bytes[range.end..]);
+        patch_length(&mut out[8..8 + self.mode.width()], self.mode, size as u64)?;
+        Ok(out)
     }
 
     pub fn as_u32(&self) -> Result<u32> {
@@ -2016,6 +2125,7 @@ fn read_element_cursor<'a>(reader: &mut Reader<'a>) -> Result<ElementCursor<'a>>
         bytes: reader.bytes,
         mode: reader.mode,
         limits: reader.limits,
+        implicit_optional: None,
     })
 }
 
@@ -2033,6 +2143,10 @@ fn read_typed_value_cursor<'a>(
         bytes: reader.bytes,
         mode: reader.mode,
         limits: reader.limits,
+        implicit_optional: match element_type {
+            ElementType::Optional(inner) => Some((**inner).clone()),
+            _ => None,
+        },
     })
 }
 

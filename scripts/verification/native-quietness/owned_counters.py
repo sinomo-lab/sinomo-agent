@@ -291,7 +291,7 @@ def capture(manifest, manifest_sha256, output, samples=121):
     started = time.monotonic_ns()
     deadline = started + policy.POLICY["absolute_deadline_seconds"] * SECOND
     policy.require(type(samples) is int and 1 <= samples <= 121, "samples must be 1..121; reduced runs are diagnostic")
-    output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    output.mkdir(parents=True, exist_ok=False)
     receipt = dict(schema=SCHEMA, acceptance=False, verdict="BLOCKED", scope=policy.SCOPE,
                    whole_host_gate=False, started_ns=started, absolute_deadline_ns=deadline,
                    manifest_sha256=manifest_sha256, samples=0, requested_samples=samples,
@@ -305,7 +305,7 @@ def capture(manifest, manifest_sha256, output, samples=121):
         receipt["purpose"] = collector.manifest["purpose"]
         receipt["source_revision"] = collector.manifest["source_revision"]
         tick = time.monotonic_ns()
-        with os.fdopen(os.open(output/"samples.ndjson",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w") as raw:
+        with (output / "samples.ndjson").open("x") as raw:
             for sequence in range(samples):
                 now = time.monotonic_ns()
                 if now >= deadline:
@@ -332,7 +332,7 @@ def capture(manifest, manifest_sha256, output, samples=121):
         if collector:
             collector.close()
         receipt["finished_ns"] = time.monotonic_ns()
-        with os.fdopen(os.open(output/"receipt.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w") as stream:
+        with (output / "receipt.json").open("x") as stream:
             json.dump(receipt,stream,indent=2);stream.write("\n")
     return receipt
 

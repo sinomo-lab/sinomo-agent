@@ -226,7 +226,6 @@ def main():
         parser.error("this KWin headless lane requires existing /dev/udmabuf; use a VM with virtual graphics if unavailable")
     output = args.output.resolve() / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6])
     output.mkdir(parents=True)
-    output.chmod(0o700)
     if args.build_image:
         with (output / "image-build.log").open("w") as log:
             run(["docker", "build", "--target", "runtime", "-t", args.image, SOURCE / "compositor"], stdout=log, stderr=subprocess.STDOUT)

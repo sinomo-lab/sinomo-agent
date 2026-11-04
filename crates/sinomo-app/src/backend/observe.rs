@@ -20,7 +20,9 @@ use time::OffsetDateTime;
 use crate::backend::{Backend, Connection};
 
 const OBSERVE_DASHBOARD_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const OBSERVE_DASHBOARD_MAX_WORKERS: usize = 8;
+#[cfg(test)]
+const OBSERVE_DASHBOARD_MAX_WORKERS: usize =
+    sinomo_client::api::observe::OBSERVE_MAX_CONCURRENT_NODES;
 const OBSERVE_DASHBOARD_MAX_TARGETS: usize = 32;
 const OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET: usize = 4_096;
 
@@ -286,31 +288,14 @@ where
     ObserveFuture: Future<Output = Result<Response, String>> + Send + 'static,
     Response: Send + 'static,
 {
-    let mut samples = Vec::with_capacity(targets.len());
-    // Each chunk preserves input order and bounds both routed traffic and live
-    // task state. The next chunk starts only after every task in this one ends.
-    for chunk in targets.chunks(OBSERVE_DASHBOARD_MAX_WORKERS) {
-        let jobs = chunk
-            .iter()
-            .cloned()
-            .map(|target| {
-                let node_id = observation_target_label(target.as_ref());
-                let observe = observe.clone();
-                (
-                    node_id,
-                    tokio::spawn(async move { Box::pin(observe(target)).await }),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (node_id, job) in jobs {
-            let response = match job.await {
-                Ok(response) => response,
-                Err(error) => Err(format!("cluster observation task failed: {error}")),
-            };
-            samples.push(ObserveTargetSample { node_id, response });
-        }
-    }
-    samples
+    sinomo_client::api::observe::collect_bounded(targets, observe)
+        .await
+        .into_iter()
+        .map(|(target, response)| ObserveTargetSample {
+            node_id: observation_target_label(target.as_ref()),
+            response,
+        })
+        .collect()
 }
 
 fn observation_target_label(target: Option<&NodeId>) -> String {

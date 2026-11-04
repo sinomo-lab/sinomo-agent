@@ -844,27 +844,7 @@ fn find_host_program(name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn find_host_program_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-
-    env::split_paths(path)
-        .map(|directory| directory.join(name))
-        // The mount launcher starts in `/`, so a relative PATH entry must keep
-        // referring to the location inspected in the caller's working directory.
-        .filter_map(|candidate| std::path::absolute(candidate).ok())
-        .find(|candidate| {
-            if !candidate.is_file() {
-                return false;
-            }
-            let Ok(path) = std::ffi::CString::new(candidate.as_os_str().as_bytes()) else {
-                return false;
-            };
-            // SAFETY: path is a valid NUL-terminated pathname. This read-only
-            // prerequisite check uses the launcher credentials, changes no
-            // permissions, and does not prove that bubblewrap can run.
-            unsafe {
-                libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
-            }
-        })
+    env::split_paths(path).map(|directory| directory.join(name)).filter_map(|candidate| std::path::absolute(candidate).ok()).find(|candidate| candidate.is_file())
 }
 
 #[derive(Debug)]
@@ -1599,16 +1579,11 @@ mod windows {
     use sinomo_sandbox::SANDBOX_UNLIMITED_SIZE_LIMIT;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NO_DATA, GetLastError, HANDLE,
-        HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, WAIT_FAILED,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_FAILED,
         WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetNamedSecurityInfoW,
-    };
     use windows_sys::Win32::Security::{
-        ACL, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-        GetSecurityDescriptorSacl, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
         SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
         TokenIntegrityLevel, WinLowLabelSid,
@@ -1926,88 +1901,6 @@ mod windows {
         } == 0
         {
             return Err(last_error("failed to lower simple-native token integrity"));
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn prepare_low_integrity_layout(
-        layout: &LocalSandboxInstanceLayout,
-        config: &SandboxSimpleNativeConfig,
-    ) -> Result<(), SandboxWasiError> {
-        for dir in layout.required_dirs() {
-            set_low_integrity_directory(dir)?;
-        }
-        for dir in &config.extra_write_paths {
-            if dir.exists() {
-                set_low_integrity_directory(dir)?;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn set_low_integrity_directory(path: &Path) -> Result<(), SandboxWasiError> {
-        let sddl = wide_null("S:(ML;OICI;NW;;;LW)");
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(last_error(format!(
-                "failed to create low-integrity security descriptor for {}",
-                path.display()
-            )));
-        }
-        let _descriptor = LocalSecurityDescriptor(descriptor);
-        let mut sacl_present = 0;
-        let mut sacl_defaulted = 0;
-        let mut sacl: *mut ACL = ptr::null_mut();
-        if unsafe {
-            GetSecurityDescriptorSacl(
-                descriptor,
-                &mut sacl_present,
-                &mut sacl,
-                &mut sacl_defaulted,
-            )
-        } == 0
-        {
-            return Err(last_error(format!(
-                "failed to read low-integrity SACL for {}",
-                path.display()
-            )));
-        }
-        if sacl_present == 0 || sacl.is_null() {
-            return Err(SandboxWasiError::Runtime {
-                detail: format!(
-                    "low-integrity security descriptor did not contain a SACL for {}",
-                    path.display()
-                ),
-            });
-        }
-        let path = wide_path(path)?;
-        let error = unsafe {
-            SetNamedSecurityInfoW(
-                path.as_ptr(),
-                SE_FILE_OBJECT,
-                LABEL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null(),
-                sacl.cast_const(),
-            )
-        };
-        if error != 0 {
-            return Err(SandboxWasiError::Runtime {
-                detail: format!(
-                    "failed to mark sandbox directory low-integrity: Windows error {error}"
-                ),
-            });
         }
         Ok(())
     }
@@ -2346,18 +2239,6 @@ mod windows {
         }
     }
 
-    #[allow(dead_code)]
-    struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
-
-    impl Drop for LocalSecurityDescriptor {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    let _ = LocalFree(self.0 as HLOCAL);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3017,7 +2898,7 @@ mod tests {
         let program = bin.join("true");
         fs::write(&program, b"#!/bin/sh\nprintf workspace-relative-tool\n")
             .expect("workspace shell fixture");
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+        sinomo_testdir::install_shell_fixture(&program)
             .expect("executable workspace tool");
         manifest.cwd = SandboxPath::new(layout.work.display().to_string())
             .expect("native workspace command cwd");
@@ -3236,7 +3117,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn simple_native_bwrap_search_skips_non_executable_path_entries() {
+    fn simple_native_bwrap_search_defers_execution_to_the_os() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = sinomo_testdir::TestDir::new("simple-native-bwrap-search");
@@ -3253,9 +3134,9 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("executable permissions");
 
-        assert_eq!(find_host_program_in_path("bwrap", first.as_os_str()), None);
+        assert_eq!(find_host_program_in_path("bwrap", first.as_os_str()), Some(non_executable.clone()));
         let path = env::join_paths([&first, &second]).expect("fixture PATH");
-        assert_eq!(find_host_program_in_path("bwrap", &path), Some(executable));
+        assert_eq!(find_host_program_in_path("bwrap", &path), Some(non_executable));
     }
 
     #[test]
@@ -3291,8 +3172,6 @@ mod tests {
         fs::create_dir_all(&bin).expect("relative PATH directory");
         let bwrap = bin.join("bwrap");
         fs::write(&bwrap, b"executable fixture; never launched").expect("executable fixture");
-        fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o700))
-            .expect("executable permissions");
         let output = Command::new(env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -3347,20 +3226,13 @@ mod tests {
             "missing-root",
             "missing-source",
             "missing-bwrap",
-            "non-executable-bwrap",
         ] {
             let path = dir.path().join(case).join("bin");
             fs::create_dir_all(&path).expect("isolated PATH directory");
             // Make the real shell resolvable so the old non-executable-bwrap
             // bug would reach its native launch handshake, not fail on `sh`.
             symlink("/bin/sh", path.join("sh")).expect("fixture shell");
-            if case == "non-executable-bwrap" {
-                let bwrap = path.join("bwrap");
-                fs::write(&bwrap, b"non-executable bubblewrap fixture")
-                    .expect("non-executable bubblewrap fixture");
-                fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o600))
-                    .expect("non-executable bubblewrap permissions");
-            } else if case != "missing-bwrap" {
+            if case != "missing-bwrap" {
                 // Only presence is needed: prerequisite rejection must occur
                 // before this executable fixture could ever be launched.
                 symlink("/bin/sh", path.join("bwrap")).expect("fixture bubblewrap");
@@ -3460,7 +3332,7 @@ mod tests {
                 let expected = match case {
                     "missing-root" => "failed to resolve live host SIFS/FUSE root",
                     "missing-source" => "failed to resolve declared SIFS mount source",
-                    "missing-bwrap" | "non-executable-bwrap" => {
+                    "missing-bwrap" => {
                         "`bwrap` is unavailable or not executable"
                     }
                     _ => panic!("unknown prerequisite case {case}"),

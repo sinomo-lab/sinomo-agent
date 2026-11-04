@@ -162,7 +162,7 @@ pub struct ComponentContext {
     node_resources: Option<sinomo_device::NodeResourceMonitor>,
     activity_observer: Option<Arc<dyn ComponentActivityObserver>>,
     service_registry: Option<ServiceRegistrySnapshotStore>,
-    module_runtime: Option<crate::ModuleRuntimeHost>,
+    module_runtime: Option<Arc<crate::ModuleRuntimeHost>>,
     event_bus: Option<crate::ComponentEventBus>,
 }
 
@@ -227,7 +227,10 @@ impl ComponentContext {
     }
 
     pub fn with_module_runtime(mut self, module_runtime: crate::ModuleRuntimeHost) -> Self {
-        self.module_runtime = Some(module_runtime);
+        self.module_runtime = Some(crate::runtime_generation::bind_process_module_host(
+            &self.data_dir.root(),
+            module_runtime,
+        ));
         self
     }
 

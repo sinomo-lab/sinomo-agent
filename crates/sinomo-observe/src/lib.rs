@@ -1,4 +1,7 @@
 //! Operational events, logs, and object-RPC observation service.
+mod recording;
+pub mod usage;
+pub use recording::{ObserveEventWriter, start_event_writer};
 
 mod builtin_metrics;
 mod cli;
@@ -99,6 +102,9 @@ pub const OBSERVE_CONTROL_ROUTE: &str = "/observe/control";
 pub const OBSERVE_CPU_PROFILE_ROUTE: &str = "/observe/profile/cpu";
 pub const OBSERVE_NETWORK_TIMELINE_ROUTE: &str = "/observe/timeline/network";
 pub const OBSERVE_OBJECT_RPC_ROUTES: &[&str] = &[
+    sinomo_api::observe::recording::APPEND_ROUTE,
+    sinomo_api::app::usage::USAGE_QUERY_ROUTE,
+    usage::service::LOCAL_ROUTE,
     OBSERVE_EVENTS_ROUTE,
     OBSERVE_LOGS_ROUTE,
     OBSERVE_METRICS_ROUTE,
@@ -465,6 +471,14 @@ fn append_jsonl_record_with_config<T: Serialize>(
     record: &T,
     rotation: JsonlRotationConfig,
 ) -> Result<(), ObserveError> {
+    append_jsonl_record_mode(path, record, rotation, false)
+}
+fn append_jsonl_record_mode<T: Serialize>(
+    path: &Path,
+    record: &T,
+    rotation: JsonlRotationConfig,
+    durable: bool,
+) -> Result<(), ObserveError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ObserveError::Io {
             path: parent.display().to_string(),
@@ -475,14 +489,28 @@ fn append_jsonl_record_with_config<T: Serialize>(
     FileExt::lock_exclusive(&lock).map_err(|source| lock_error(path, source))?;
     let result = (|| {
         rotate_jsonl_if_needed(path, rotation)?;
+        let created = !path.exists();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(durable)
             .open(path)
             .map_err(|source| ObserveError::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             })?;
+        if durable {
+            truncate_torn_jsonl_tail(&mut file).map_err(|source| ObserveError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0)).map_err(|source| {
+                ObserveError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+        }
         serde_json::to_writer(&mut file, record).map_err(|source| ObserveError::Json {
             path: path.display().to_string(),
             detail: source.to_string(),
@@ -491,10 +519,29 @@ fn append_jsonl_record_with_config<T: Serialize>(
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-        file.flush().map_err(|source| ObserveError::Io {
+        (if durable {
+            file.sync_all()
+        } else {
+            file.flush()
+        })
+        .map_err(|source| ObserveError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
-        })
+        })?;
+        #[cfg(unix)]
+        if durable && created {
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|source| ObserveError::Io {
+                        path: parent.display().to_string(),
+                        detail: source.to_string(),
+                    })?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = created;
+        Ok(())
     })();
     let unlock = FileExt::unlock(&lock).map_err(|source| lock_error(path, source));
     match (result, unlock) {
@@ -724,6 +771,24 @@ pub fn observe_module_surfaces() -> sinomo_module::ModuleSurfaces {
 
     let mut surfaces = ModuleSurfaces::default()
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            sinomo_api::observe::recording::APPEND_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.events.append",
+            ModuleRouteAuth::LocalCommand,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            sinomo_api::app::usage::USAGE_QUERY_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.usage.read",
+            ModuleRouteAuth::LocalCommand,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            usage::service::LOCAL_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.usage.read",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             OBSERVE_EVENTS_ROUTE,
             OBSERVE_RPC_CATEGORY,
             "observe.events.read",
@@ -786,6 +851,8 @@ pub fn observe_module_capabilities() -> sinomo_core::ModuleCapabilities {
             observe_capability(OBSERVE_METRIC_EXPORTER_OPERATION),
         ],
         exports: vec![
+            observe_capability("observe.events.append"),
+            observe_capability("observe.usage.read"),
             observe_capability("observe.events.read"),
             observe_capability("observe.logs.read"),
             observe_capability("observe.metrics.read"),
@@ -864,6 +931,12 @@ pub fn register_storage_paths(
         "observe/formation",
         "operator diagnostic formation captures: JSON responses, stderr text, capture indexes and process-generation markers",
     )?;
+    layout.register_escape_path(
+        SINOMO_OBSERVE_MODULE_OWNER,
+        StorageRing::R1,
+        "observe/usage",
+        "retained usage events and rebuildable dimensional projections",
+    )?;
     Ok(())
 }
 
@@ -934,6 +1007,10 @@ pub fn component_factory()
                     tracing::warn!(%error, "observe component runtime initialization failed");
                 }
                 register_builtin_observe_metric_exporters();
+                usage::metrics::register();
+                let writer=start_event_writer(context.data_dir()).map_err(|e|sinomo_module::ComponentError::component("module.observe",e))?;
+                scope.defer(move||drop(writer));
+                usage::start_maintenance(context,scope);
                 let timeline_data_dir = context.data_dir_root();
                 scope.defer(move || {
                     if let Err(error) = persist_active_observe_network_timeline(&timeline_data_dir)
@@ -990,7 +1067,8 @@ pub fn component_factory()
             }
             Ok(())
         })?
-        .with_storage_paths(register_storage_paths),
+        .with_storage_paths(register_storage_paths)
+        .with_config_definitions(|builder|builder.register(sinomo_api::app::usage::pricing::config_definition().map_err(|e|e.to_string())?).map_err(|e|e.to_string())),
     )
 }
 
@@ -998,6 +1076,17 @@ fn append_component_event_record(
     data_dir: &Path,
     event: &sinomo_module::ComponentEvent,
 ) -> Result<(), ObserveError> {
+    if event.schema_id == "sinomo.usage"
+        || serde_json::from_value::<sinomo_api::app::usage::UsageRecord>(
+            event.envelope.payload.clone(),
+        )
+        .is_ok()
+    {
+        return recording::append_observation_event(
+            &sinomo_core::local::SinomoDataDir::new(data_dir),
+            event.envelope.clone(),
+        );
+    }
     let payload = event.envelope.payload.as_object();
     let severity = match payload
         .and_then(|payload| payload.get("severity"))
@@ -1073,6 +1162,15 @@ impl Service for ObserveService {
     ) -> ServiceFuture<'_> {
         let component_services = self.component_services.clone();
         Box::pin(async move {
+            if request.route == sinomo_api::observe::recording::APPEND_ROUTE {
+                return recording::ObserveAppendService.handle(ctx, request).await;
+            }
+            if matches!(
+                request.route.as_str(),
+                sinomo_api::app::usage::USAGE_QUERY_ROUTE | usage::service::LOCAL_ROUTE
+            ) {
+                return usage::service::UsageService.handle(ctx, request).await;
+            }
             match request.route.as_str() {
                 OBSERVE_EVENTS_ROUTE => {
                     let request: ObserveEventsRequest = ctx.decode_request_body(&request).await?;
@@ -2086,4 +2184,22 @@ mod tests {
     fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(prefix)
     }
+}
+
+fn truncate_torn_jsonl_tail(file: &mut fs::File) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut cursor = file.metadata()?.len();
+    let mut buffer = [0u8; 4096];
+    while cursor > 0 {
+        let start = cursor.saturating_sub(buffer.len() as u64);
+        let n = (cursor - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..n])?;
+        if let Some(index) = buffer[..n].iter().rposition(|byte| *byte == b'\n') {
+            file.set_len(start + index as u64 + 1)?;
+            return Ok(());
+        }
+        cursor = start;
+    }
+    file.set_len(0)
 }

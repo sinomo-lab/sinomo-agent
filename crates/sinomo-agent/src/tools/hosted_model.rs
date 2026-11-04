@@ -44,6 +44,9 @@ intended change.
 
 pub trait HostedModelToolBackend: Send + Sync {
     fn capabilities(&self) -> LanguageModelProviderCapabilities;
+    fn provider_id(&self) -> &'static str {
+        "hosted"
+    }
 
     fn web_search(
         &self,
@@ -57,6 +60,9 @@ pub trait HostedModelToolBackend: Send + Sync {
 }
 
 impl HostedModelToolBackend for OpenAiProvider {
+    fn provider_id(&self) -> &'static str {
+        "openai"
+    }
     fn capabilities(&self) -> LanguageModelProviderCapabilities {
         LanguageModelProviderCapabilities::openai()
     }
@@ -79,6 +85,9 @@ impl HostedModelToolBackend for OpenAiProvider {
 /// A ChatGPT sign-in reaches the same image model and a standalone web search endpoint through the
 /// Codex backend, so both hosted tools resolve against it.
 impl HostedModelToolBackend for OpenAiResponsesCodexClient {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
     fn capabilities(&self) -> LanguageModelProviderCapabilities {
         LanguageModelProviderCapabilities::codex()
     }
@@ -104,6 +113,7 @@ pub struct HostedModelAgentToolConfig {
     backend: Arc<dyn HostedModelToolBackend>,
     artifact_root: PathBuf,
     allowed_image_roots: Vec<PathBuf>,
+    usage_data_dir: Option<sinomo_runtime::local::SinomoDataDir>,
 }
 
 impl HostedModelAgentToolConfig {
@@ -115,7 +125,69 @@ impl HostedModelAgentToolConfig {
             backend,
             artifact_root: artifact_root.into(),
             allowed_image_roots: Vec::new(),
+            usage_data_dir: None,
         }
+    }
+
+    pub fn with_usage_data_dir(mut self, data_dir: sinomo_runtime::local::SinomoDataDir) -> Self {
+        self.usage_data_dir = Some(data_dir);
+        self
+    }
+    fn record(
+        &self,
+        request: &AgentToolRequest<'_>,
+        operation: &str,
+        model: Option<&str>,
+        units: Option<sinomo_lm::LanguageModelUsage>,
+        success: bool,
+        started: std::time::Instant,
+        retries: &sinomo_lm::usage::RetryScope,
+    ) {
+        use sinomo_runtime::api::app::usage::*;
+        let Some(data_dir) = &self.usage_data_dir else {
+            return;
+        };
+        let units = units.unwrap_or_else(|| retries.reported_usage());
+        let attribution = UsageAttribution {
+            node: request.session.node_id.to_string(),
+            session: sinomo_lm::usage::current_attribution()
+                .session
+                .or_else(|| Some(request.session.session_id.to_string())),
+            chat: request
+                .session
+                .conversation_id
+                .as_ref()
+                .map(ToString::to_string),
+            tool_call: Some(request.call_id.to_string()),
+            origin: sinomo_lm::usage::current_attribution().origin,
+            purpose: "hosted_tool".into(),
+            ..sinomo_lm::usage::current_attribution()
+        };
+        sinomo_lm::usage::submit_usage(
+            data_dir,
+            sinomo_lm::usage::record(
+                attribution,
+                UsageEvent::ModelRequest {
+                    provider: self.backend.provider_id().into(),
+                    account: "default".into(),
+                    model: model.unwrap_or("provider-default").into(),
+                    operation: operation.into(),
+                    status: if request.cancellation_token.is_cancelled() {
+                        UsageStatus::Cancelled
+                    } else if success {
+                        UsageStatus::Succeeded
+                    } else {
+                        UsageStatus::Failed
+                    },
+                    error_class: (!success).then(|| "provider".into()),
+                    retry_count: Some(retries.count()),
+                    duration_ms: Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+                    first_output_ms: None,
+                    reported: units.reported(),
+                    units,
+                },
+            ),
+        );
     }
 
     pub fn with_allowed_image_roots(
@@ -134,7 +206,7 @@ pub fn register_hosted_model_tools(
     let capabilities = config.backend.capabilities();
     if capabilities.web_search {
         registry.register(WebSearchTool {
-            backend: config.backend.clone(),
+            config: config.clone(),
         });
     }
     if capabilities.image_generation {
@@ -144,7 +216,7 @@ pub fn register_hosted_model_tools(
 
 #[derive(Clone)]
 struct WebSearchTool {
-    backend: Arc<dyn HostedModelToolBackend>,
+    config: HostedModelAgentToolConfig,
 }
 
 impl AgentTool for WebSearchTool {
@@ -172,12 +244,24 @@ impl AgentTool for WebSearchTool {
             Some("high") => OpenAiWebSearchContextSize::High,
             _ => OpenAiWebSearchContextSize::Medium,
         };
-        let result = match self.backend.web_search(&OpenAiWebSearchRequest {
+        let retries = sinomo_lm::usage::RetryScope::enter();
+        let started = std::time::Instant::now();
+        let response = self.config.backend.web_search(&OpenAiWebSearchRequest {
             query: query.clone(),
             model: None,
             allowed_domains,
             context_size,
-        }) {
+        });
+        self.config.record(
+            &request,
+            "web_search",
+            response.as_ref().ok().map(|r| r.model.as_str()),
+            response.as_ref().ok().and_then(|r| r.usage.clone()),
+            response.is_ok(),
+            started,
+            &retries,
+        );
+        let result = match response {
             Ok(result) => result,
             Err(detail) => {
                 return AgentToolResult::failed(
@@ -254,7 +338,9 @@ impl AgentTool for ImageGenerationTool {
                     );
                 }
             };
-        let result = match self
+        let retries = sinomo_lm::usage::RetryScope::enter();
+        let started = std::time::Instant::now();
+        let response = self
             .config
             .backend
             .generate_or_edit_image(&OpenAiImageRequest {
@@ -263,7 +349,17 @@ impl AgentTool for ImageGenerationTool {
                 size: input_string(&request.call.input, "size"),
                 quality: input_string(&request.call.input, "quality"),
                 background: input_string(&request.call.input, "background"),
-            }) {
+            });
+        self.config.record(
+            &request,
+            "image_generation",
+            response.as_ref().ok().map(|r| r.model.as_str()),
+            response.as_ref().ok().and_then(|r| r.usage.clone()),
+            response.is_ok(),
+            started,
+            &retries,
+        );
+        let result = match response {
             Ok(result) => result,
             Err(detail) => {
                 return AgentToolResult::failed(

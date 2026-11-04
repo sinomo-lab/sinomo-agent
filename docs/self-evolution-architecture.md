@@ -134,6 +134,14 @@ implementation, and evaluation to separately identified subagents. Those
 subagents receive only their task inputs and allowed capabilities, and cannot
 select or promote their own outputs.
 
+The shared agent runtime owns model and tool turns, session persistence,
+messaging, cancellation, and completion delivery. It is authoritative for worker
+execution state. Evolution owns goals, revision DAGs, candidate workspaces,
+evaluation, budgets, and the promotion workflow. It binds assignments to actual
+session and operation identities and obtains worker progress from the runtime.
+Pausing a goal pauses its workers; cancelling or completing a goal archives its
+workers while retaining their observed outcomes and history.
+
 The control plane is an iterative evidence loop.
 
 ```text
@@ -470,7 +478,8 @@ rollback happened. The module emits these families:
 - opportunity planning: `evolution.job.scoped`, scoped from
   `evolution.metric.regression`, `evolution.replay.failure`,
   `evolution.scorecard.stale`, and module signals;
-- tool use: `evolution.tool.executed`.
+- worker execution and tool use: shared agent session events, linked by session
+  and operation identity.
 
 Module and rollout infrastructure supply the lifecycle facts that evolution
 treats as evidence: `module.shadow.decision`, `module.invocation.decision`,

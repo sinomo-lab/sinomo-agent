@@ -693,7 +693,9 @@ impl AgentRuntimeService {
 }
 
 pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
-    builder.register(AgentRuntimeService::new())
+    builder
+        .register(AgentRuntimeService::new())
+        .register(crate::session_panels::SessionModuleService)
 }
 
 pub fn register_runtime_control_services(

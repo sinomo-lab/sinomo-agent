@@ -518,7 +518,7 @@ pub(crate) fn start_android_lifecycle_monitor(android_app: sui::AndroidApp) {
 fn install_android_lifecycle_monitor(
     android_app: &sui::AndroidApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use jni::objects::{JClass, JObject, JString};
+    use jni::objects::{JClass, JObject};
     use jni::refs::Global;
     use jni::{NativeMethod, jni_sig, jni_str};
 
@@ -526,30 +526,6 @@ fn install_android_lifecycle_monitor(
     let raw_activity = android_app.activity_as_ptr() as jni::sys::jobject;
     vm.attach_current_thread(|env| {
         let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-        let cache_dir = env
-            .call_method(
-                &activity,
-                jni_str!("getCodeCacheDir"),
-                jni_sig!("()Ljava/io/File;"),
-                &[],
-            )?
-            .l()?;
-        let cache_dir_path = env
-            .call_method(
-                &cache_dir,
-                jni_str!("getAbsolutePath"),
-                jni_sig!("()Ljava/lang/String;"),
-                &[],
-            )?
-            .l()?;
-        let cache_dir_path = JString::cast_local(env, cache_dir_path)?.try_to_string(env)?;
-        let dex_path = std::path::PathBuf::from(&cache_dir_path).join("sinomo-lifecycle.dex");
-        let _ = std::fs::remove_file(&dex_path);
-        std::fs::write(&dex_path, ANDROID_LIFECYCLE_DEX)?;
-        let mut permissions = std::fs::metadata(&dex_path)?.permissions();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&dex_path, permissions)?;
-
         let parent_loader = env
             .call_method(
                 &activity,
@@ -558,20 +534,15 @@ fn install_android_lifecycle_monitor(
                 &[],
             )?
             .l()?;
-        let dex_path_string = env.new_string(dex_path.to_string_lossy())?;
-        let cache_path_string = env.new_string(&cache_dir_path)?;
-        let null_library_path = JObject::null();
+        let dex = env.byte_array_from_slice(ANDROID_LIFECYCLE_DEX)?;
+        let buffer = env.call_static_method(
+            jni_str!("java/nio/ByteBuffer"), jni_str!("wrap"),
+            jni_sig!("([B)Ljava/nio/ByteBuffer;"), &[(&dex).into()],
+        )?.l()?;
         let dex_loader = env.new_object(
-            jni_str!("dalvik/system/DexClassLoader"),
-            jni_sig!(
-                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V"
-            ),
-            &[
-                (&dex_path_string).into(),
-                (&cache_path_string).into(),
-                (&null_library_path).into(),
-                (&parent_loader).into(),
-            ],
+            jni_str!("dalvik/system/InMemoryDexClassLoader"),
+            jni_sig!("(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"),
+            &[(&buffer).into(), (&parent_loader).into()],
         )?;
         let class_name = env.new_string("net.sinomo.app.runtime.SinomoLifecycleCallbacks")?;
         let lifecycle_class = env
@@ -583,7 +554,6 @@ fn install_android_lifecycle_monitor(
             )?
             .l()?;
         let lifecycle_class = JClass::cast_local(env, lifecycle_class)?;
-        let _ = std::fs::remove_file(&dex_path);
 
         let native_methods = [
             unsafe {

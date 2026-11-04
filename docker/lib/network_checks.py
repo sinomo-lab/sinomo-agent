@@ -111,7 +111,7 @@ class Checks:
 
     def preflight(self):
         binary = Path(self.args.binary)
-        if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        if not binary.is_absolute() or not binary.is_file():
             raise ValueError('an executable absolute --binary path is required; no implicit build')
         with binary.open('rb') as source:
             digest = hashlib.file_digest(source, 'sha256').hexdigest()

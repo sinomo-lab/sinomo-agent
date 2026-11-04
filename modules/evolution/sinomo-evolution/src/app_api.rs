@@ -5,7 +5,7 @@ use sinomo_runtime::local::SinomoDataDir;
 
 use crate::persistence::{
     EvolutionPaths, StoredEvolutionJob, list_evolution_goal_graphs, list_job_records,
-    read_campaign, read_evolution_goal_graph, write_campaign_bundle, write_evolution_goal_graph,
+    read_campaign, read_evolution_goal_graph, write_evolution_goal_graph,
 };
 use crate::{
     CliError, EvolutionAgentRole, EvolutionAgentRunRecord, EvolutionAgentRunStatus,
@@ -17,7 +17,10 @@ use crate::{
     run_evolve_command_captured,
 };
 
-pub fn app_evolution_dashboard(data_dir: &SinomoDataDir) -> contract::EvolutionDashboard {
+pub fn app_evolution_dashboard(
+    data_dir: &SinomoDataDir,
+    sessions: crate::SessionServices<'_>,
+) -> contract::EvolutionDashboard {
     let paths = EvolutionPaths::new(data_dir);
     let source = paths.root.display().to_string();
     let mut records = match list_job_records(&paths) {
@@ -33,7 +36,19 @@ pub fn app_evolution_dashboard(data_dir: &SinomoDataDir) -> contract::EvolutionD
     };
     records.sort_by_key(|record| std::cmp::Reverse(record.bundle.created_at));
     let (goals, graph_error) = match list_evolution_goal_graphs(&paths) {
-        Ok(graphs) => (graphs.into_iter().map(summarize_graph).collect(), None),
+        Ok(graphs) => {
+            let mut errors = vec![];
+            let goals = graphs
+                .into_iter()
+                .map(|mut graph| {
+                    errors.extend(crate::execution::refresh_execution_states(
+                        &mut graph, sessions,
+                    ));
+                    summarize_graph(graph)
+                })
+                .collect();
+            (goals, (!errors.is_empty()).then(|| errors.join("; ")))
+        }
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
     contract::EvolutionDashboard {
@@ -44,7 +59,10 @@ pub fn app_evolution_dashboard(data_dir: &SinomoDataDir) -> contract::EvolutionD
     }
 }
 
-pub fn run_app_evolution_job(request: contract::EvolutionStartRequest) -> Result<(), CliError> {
+pub fn run_app_evolution_job(
+    request: contract::EvolutionStartRequest,
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let mut args = vec![
         "propose".to_string(),
         request.objective,
@@ -55,7 +73,7 @@ pub fn run_app_evolution_job(request: contract::EvolutionStartRequest) -> Result
         args.push("--allow".to_string());
         args.push(path);
     }
-    run_evolve_command_captured(&args).map(|_| ())
+    run_evolve_command_captured(&args, sessions).map(|_| ())
 }
 
 fn summarize_graph(graph: EvolutionGoalGraph) -> contract::EvolutionGoalSummary {
@@ -172,13 +190,14 @@ fn summarize_graph(graph: EvolutionGoalGraph) -> contract::EvolutionGoalSummary 
             .agent_runs
             .into_iter()
             .map(|run| contract::EvolutionAgentRunSummary {
+                execution_detail: run.execution_detail,
                 id: run.agent_run_id,
                 agent_id: run.agent_id,
                 role: enum_label(&run.role),
                 status: enum_label(&run.status),
                 parent_agent_run_id: run.parent_agent_run_id,
                 task_id: run.task_id,
-                session_ref: run.session_ref,
+                execution: run.execution,
                 summary: run.summary,
             })
             .collect(),
@@ -219,11 +238,14 @@ fn metric_value_label(value: &EvolutionMetricValue) -> String {
 pub fn run_app_evolution_decision(
     request: contract::EvolutionDecisionRequest,
 ) -> Result<(), CliError> {
-    run_evolve_command_captured(&[
-        request.action.command().to_string(),
-        "--job".to_string(),
-        request.job_id,
-    ])
+    run_evolve_command_captured(
+        &[
+            request.action.command().to_string(),
+            "--job".to_string(),
+            request.job_id,
+        ],
+        None,
+    )
     .map(|_| ())
 }
 
@@ -239,6 +261,7 @@ pub fn run_app_create_goal(
             "evolution goal must declare at least one metric or guardrail",
         ));
     }
+    let _guard = crate::persistence::workflow_lock()?;
     let paths = EvolutionPaths::new(data_dir);
     paths.ensure()?;
     let goal_id = format!("goal_{}", EvolutionJobId::generate());
@@ -273,19 +296,6 @@ pub fn run_app_create_goal(
             required: metric.required,
         });
     }
-    let governor_run_id = format!("governor_{goal_id}");
-    graph.upsert_agent_run(EvolutionAgentRunRecord {
-        agent_run_id: governor_run_id.clone(),
-        agent_id: graph.evolution_agent_id.clone(),
-        role: EvolutionAgentRole::Governor,
-        status: EvolutionAgentRunStatus::Running,
-        parent_agent_run_id: None,
-        task_id: None,
-        session_ref: None,
-        summary: "govern the goal, tasks, revision DAG, evidence, and resources".to_string(),
-        started_at: now.clone(),
-        finished_at: None,
-    });
     graph.append_event(EvolutionGraphEvent {
         event_id: format!("event_{}", EvolutionJobId::generate()),
         kind: crate::EVOLUTION_GOAL_CREATED_EVENT_KIND.to_string(),
@@ -294,19 +304,6 @@ pub fn run_app_create_goal(
         revision_id: None,
         task_id: None,
         agent_run_id: None,
-        provenance: app_event_provenance(&graph.evolution_agent_id),
-        evidence_refs: Vec::new(),
-        caused_by_event_ids: Vec::new(),
-        routing: app_event_routing(),
-    });
-    graph.append_event(EvolutionGraphEvent {
-        event_id: format!("event_{}", EvolutionJobId::generate()),
-        kind: crate::EVOLUTION_AGENT_UPDATED_EVENT_KIND.to_string(),
-        occurred_at: now.clone(),
-        goal_id: goal_id.clone(),
-        revision_id: None,
-        task_id: None,
-        agent_run_id: Some(governor_run_id),
         provenance: app_event_provenance(&graph.evolution_agent_id),
         evidence_refs: Vec::new(),
         caused_by_event_ids: Vec::new(),
@@ -323,6 +320,7 @@ pub fn run_app_record_revision(
     data_dir: &SinomoDataDir,
     request: contract::EvolutionRevisionRecordRequest,
 ) -> Result<contract::EvolutionRevisionRecordResponse, CliError> {
+    let _guard = crate::persistence::workflow_lock()?;
     let paths = EvolutionPaths::new(data_dir);
     paths.ensure()?;
     let mut graph = read_evolution_goal_graph(&paths, &request.goal_id)?;
@@ -436,8 +434,10 @@ pub fn run_app_record_revision(
 
 pub fn run_app_control_goal(
     data_dir: &SinomoDataDir,
+    sessions: crate::SessionServices<'_>,
     request: contract::EvolutionGoalControlRequest,
 ) -> Result<contract::EvolutionMutationResponse, CliError> {
+    let _guard = crate::persistence::workflow_lock()?;
     let paths = EvolutionPaths::new(data_dir);
     paths.ensure()?;
     if let Ok(mut campaign) = read_campaign(&paths, &request.goal_id) {
@@ -448,7 +448,7 @@ pub fn run_app_control_goal(
             contract::EvolutionGoalControlAction::Cancel => EvolutionCampaignStatus::Cancelled,
         };
         campaign.updated_at = current_time();
-        write_campaign_bundle(&paths, &campaign)?;
+        crate::persistence::write_campaign_bundle_locked(&paths, &campaign)?;
     }
     let mut graph = read_evolution_goal_graph(&paths, &request.goal_id)?;
     graph.status = match request.action {
@@ -457,6 +457,13 @@ pub fn run_app_control_goal(
         contract::EvolutionGoalControlAction::Complete => EvolutionGoalStatus::Complete,
         contract::EvolutionGoalControlAction::Cancel => EvolutionGoalStatus::Cancelled,
     };
+    graph.control_action = match request.action {
+        contract::EvolutionGoalControlAction::Resume => None,
+        _ => Some(request.action),
+    };
+    // Control calls commit core state immediately; this lock never waits for a model or tool turn.
+    let mut control_errors =
+        crate::execution::control_executions(&graph, sessions, &request.action);
     let now = current_time();
     for task in &mut graph.tasks {
         task.status = match request.action {
@@ -494,44 +501,19 @@ pub fn run_app_control_goal(
         task.updated_at = now.clone();
     }
     for run in &mut graph.agent_runs {
-        run.status = match request.action {
-            contract::EvolutionGoalControlAction::Pause
-                if run.status == EvolutionAgentRunStatus::Running =>
-            {
-                EvolutionAgentRunStatus::Waiting
-            }
-            contract::EvolutionGoalControlAction::Resume
-                if run.status == EvolutionAgentRunStatus::Waiting =>
-            {
-                EvolutionAgentRunStatus::Running
-            }
-            contract::EvolutionGoalControlAction::Complete
-                if !matches!(
-                    run.status,
-                    EvolutionAgentRunStatus::Failed | EvolutionAgentRunStatus::Cancelled
-                ) =>
-            {
-                EvolutionAgentRunStatus::Complete
-            }
-            contract::EvolutionGoalControlAction::Cancel
-                if !matches!(
-                    run.status,
-                    EvolutionAgentRunStatus::Complete | EvolutionAgentRunStatus::Failed
-                ) =>
-            {
-                EvolutionAgentRunStatus::Cancelled
-            }
-            _ => run.status.clone(),
-        };
-        if matches!(
-            run.status,
-            EvolutionAgentRunStatus::Complete
-                | EvolutionAgentRunStatus::Failed
-                | EvolutionAgentRunStatus::Cancelled
-        ) {
-            run.finished_at.get_or_insert_with(|| now.clone());
+        if run.execution.is_none()
+            && matches!(
+                request.action,
+                contract::EvolutionGoalControlAction::Cancel
+                    | contract::EvolutionGoalControlAction::Complete
+            )
+        {
+            run.status = EvolutionAgentRunStatus::Cancelled;
         }
     }
+    control_errors.extend(crate::execution::refresh_execution_states(
+        &mut graph, sessions,
+    ));
     graph.updated_at = now.clone();
     graph.append_event(EvolutionGraphEvent {
         event_id: format!("event_{}", EvolutionJobId::generate()),
@@ -558,13 +540,27 @@ pub fn run_app_control_goal(
         routing: app_event_routing(),
     });
     write_evolution_goal_graph(&paths, &graph)?;
+    if !control_errors.is_empty() {
+        return Err(parse_error(control_errors.join("; ")));
+    }
     Ok(contract::EvolutionMutationResponse { accepted: true })
 }
 
 pub fn run_app_update_workflow(
     data_dir: &SinomoDataDir,
+    sessions: crate::SessionServices<'_>,
     request: contract::EvolutionWorkflowUpdateRequest,
 ) -> Result<contract::EvolutionMutationResponse, CliError> {
+    let observed = request
+        .agent_runs
+        .iter()
+        .filter_map(|run| run.execution.as_ref().map(|execution| (&run.id, execution)))
+        .map(|(id, execution)| {
+            crate::execution::execution_state(sessions, execution).map(|state| (id.clone(), state))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+        .map_err(parse_error)?;
+    let _guard = crate::persistence::workflow_lock()?;
     let paths = EvolutionPaths::new(data_dir);
     paths.ensure()?;
     let mut graph = read_evolution_goal_graph(&paths, &request.goal_id)?;
@@ -572,22 +568,35 @@ pub fn run_app_update_workflow(
     let mut events = Vec::new();
     for run in request.agent_runs {
         let run_id = required_text(run.id, "agent run id")?;
-        graph.upsert_agent_run(EvolutionAgentRunRecord {
+        let mut record = EvolutionAgentRunRecord {
+            execution_detail: None,
             agent_run_id: run_id.clone(),
             agent_id: required_text(run.agent_id, "agent id")?,
             role: parse_agent_role(&run.role)?,
-            status: parse_agent_status(&run.status)?,
+            status: EvolutionAgentRunStatus::Queued,
             parent_agent_run_id: run.parent_agent_run_id,
             task_id: run.task_id,
-            session_ref: run.session_ref,
+            execution: run.execution,
             summary: required_text(run.summary, "agent run summary")?,
-            started_at: if run.started_at.trim().is_empty() {
-                now.clone()
-            } else {
-                run.started_at
-            },
-            finished_at: run.finished_at,
-        });
+            started_at: now.clone(),
+            finished_at: None,
+        };
+        if let Some(state) = observed.get(&run_id) {
+            let expected_role = match record.agent_id.as_str() {
+                crate::EVOLUTION_IMPLEMENTER_AGENT_ID => EvolutionAgentRole::Implementer,
+                crate::EVOLUTION_PROPOSER_AGENT_ID => EvolutionAgentRole::Proposer,
+                crate::EVOLUTION_EVALUATOR_AGENT_ID => EvolutionAgentRole::Evaluator,
+                _ => record.role.clone(),
+            };
+            if record.role != expected_role {
+                return Err(parse_error(
+                    "worker role does not match its runtime profile",
+                ));
+            }
+            crate::execution::apply_execution_state(&mut record, state.clone())
+                .map_err(parse_error)?;
+        }
+        graph.upsert_agent_run(record);
         events.push((
             crate::EVOLUTION_AGENT_UPDATED_EVENT_KIND,
             None,
@@ -661,6 +670,7 @@ pub fn run_app_update_workflow(
             routing: app_event_routing(),
         });
     }
+    crate::execution::refresh_execution_states(&mut graph, sessions);
     write_evolution_goal_graph(&paths, &graph)?;
     Ok(contract::EvolutionMutationResponse { accepted: true })
 }
@@ -793,20 +803,6 @@ fn parse_agent_role(value: &str) -> Result<EvolutionAgentRole, CliError> {
         "specialist" => Ok(EvolutionAgentRole::Specialist),
         _ => Err(parse_error(format!(
             "unknown evolution agent role `{value}`"
-        ))),
-    }
-}
-
-fn parse_agent_status(value: &str) -> Result<EvolutionAgentRunStatus, CliError> {
-    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "queued" => Ok(EvolutionAgentRunStatus::Queued),
-        "running" => Ok(EvolutionAgentRunStatus::Running),
-        "waiting" => Ok(EvolutionAgentRunStatus::Waiting),
-        "complete" => Ok(EvolutionAgentRunStatus::Complete),
-        "failed" => Ok(EvolutionAgentRunStatus::Failed),
-        "cancelled" => Ok(EvolutionAgentRunStatus::Cancelled),
-        _ => Err(parse_error(format!(
-            "unknown evolution agent status `{value}`"
         ))),
     }
 }
@@ -1057,6 +1053,7 @@ mod tests {
 
         run_app_update_workflow(
             &data_dir,
+            None,
             contract::EvolutionWorkflowUpdateRequest {
                 goal_id: goal.goal_id.clone(),
                 tasks: vec![contract::EvolutionTaskInput {
@@ -1073,13 +1070,10 @@ mod tests {
                     id: "run-implementer".to_string(),
                     agent_id: crate::EVOLUTION_IMPLEMENTER_AGENT_ID.to_string(),
                     role: "implementer".to_string(),
-                    status: "running".to_string(),
-                    parent_agent_run_id: Some(format!("governor_{}", goal.goal_id)),
+                    parent_agent_run_id: None,
                     task_id: Some("task-improve".to_string()),
-                    session_ref: Some("agent://implementer".to_string()),
+                    execution: None,
                     summary: "implement the next revision".to_string(),
-                    started_at: String::new(),
-                    finished_at: None,
                 }],
                 resources: vec![contract::EvolutionResourceInput {
                     id: "cost-1".to_string(),
@@ -1100,6 +1094,7 @@ mod tests {
 
         run_app_control_goal(
             &data_dir,
+            None,
             contract::EvolutionGoalControlRequest {
                 goal_id: goal.goal_id.clone(),
                 action: contract::EvolutionGoalControlAction::Pause,
@@ -1107,7 +1102,7 @@ mod tests {
             },
         )
         .expect("pause goal");
-        let dashboard = app_evolution_dashboard(&data_dir);
+        let dashboard = app_evolution_dashboard(&data_dir, None);
         assert!(dashboard.error.is_none());
         assert_eq!(dashboard.goals.len(), 1);
         assert_eq!(dashboard.goals[0].status, "paused");
@@ -1117,7 +1112,9 @@ mod tests {
             "inline-content"
         );
         assert_eq!(dashboard.goals[0].tasks.len(), 1);
-        assert_eq!(dashboard.goals[0].agent_runs.len(), 2);
+        assert_eq!(dashboard.goals[0].agent_runs.len(), 1);
+        assert!(dashboard.goals[0].agent_runs[0].execution.is_none());
+        assert_eq!(dashboard.goals[0].agent_runs[0].status, "queued");
         assert_eq!(
             dashboard.goals[0].resources[0].monetary_microunits,
             Some(35_000)

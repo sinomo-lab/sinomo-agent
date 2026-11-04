@@ -1124,6 +1124,33 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
     }
 
+    pub(crate) fn read_object_range(
+        &self,
+        request: &sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        if let Some(client) = self.resident_client(None, false)? {
+            return client.read_object_range(request);
+        }
+        let identity = sinomo_runtime::dfs::DfsFileVersionIdentity {
+            file_system_id: sifs_file_system_id(),
+            object_id: sinomo_runtime::dfs::DfsObjectId::new(&request.object_id)
+                .map_err(|e| e.to_string())?,
+            version: sinomo_runtime::dfs::DfsVersion::new(&request.version)
+                .map_err(|e| e.to_string())?,
+        };
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        service
+            .read_sifs_version_range(
+                &identity,
+                &request.content_hash,
+                request.size_bytes,
+                request.offset,
+                request.length,
+            )
+            .map_err(|e| e.to_string())
+    }
+
     pub(crate) fn read_object_version(
         &self,
         object_id: &str,

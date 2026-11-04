@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 pub const EVOLUTION_MODULE_ID: &str = "module.evolution";
 pub const EVOLUTION_MODULE_OWNER: &str = "sinomo-evolution";
 pub const EVOLUTION_INTERFACE_ID: &str = "sinomo.evolution";
-pub const EVOLUTION_INTERFACE_VERSION: &str = "1.0.0";
-pub const EVOLUTION_MODULE_INTERFACE_VERSION: &str = "sinomo.evolution.v1";
+pub const EVOLUTION_INTERFACE_VERSION: &str = "2.0.0";
+pub const EVOLUTION_MODULE_INTERFACE_VERSION: &str = "sinomo.evolution.v2";
 pub const EVOLUTION_SERVICE_ID: &str = "evolution";
 pub const EVOLUTION_RPC_CATEGORY: &str = "evolution.app";
 pub const EVOLUTION_ROUTE_AUTH_SCOPE: &str = "local-command";
@@ -53,7 +53,7 @@ pub const EVOLUTION_OPERATIONS: &[&str] = &[
 pub struct EvolutionDashboard {
     pub source: String,
     /// Goal-centric projection. Each goal owns its complete revision DAG and
-    /// orchestration/resource state. `jobs` remains for v1 clients.
+    /// orchestration/resource state. `jobs` exposes candidate and evidence status.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub goals: Vec<EvolutionGoalSummary>,
     pub jobs: Vec<EvolutionJobSummary>,
@@ -207,13 +207,15 @@ pub struct EvolutionTaskSummary {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionAgentRunSummary {
+    #[serde(default)]
+    pub execution_detail: Option<String>,
     pub id: String,
     pub agent_id: String,
     pub role: String,
     pub status: String,
     pub parent_agent_run_id: Option<String>,
     pub task_id: Option<String>,
-    pub session_ref: Option<String>,
+    pub execution: Option<sinomo_module_api::sessions::SessionExecutionRef>,
     pub summary: String,
 }
 
@@ -444,17 +446,15 @@ pub struct EvolutionTaskInput {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EvolutionAgentRunInput {
     pub id: String,
     pub agent_id: String,
     pub role: String,
-    pub status: String,
     pub parent_agent_run_id: Option<String>,
     pub task_id: Option<String>,
-    pub session_ref: Option<String>,
+    pub execution: Option<sinomo_module_api::sessions::SessionExecutionRef>,
     pub summary: String,
-    pub started_at: String,
-    pub finished_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]

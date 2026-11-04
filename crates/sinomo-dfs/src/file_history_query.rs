@@ -1225,6 +1225,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
         expected_size_bytes: Option<u64>,
     ) -> Result<Vec<u8>, DfsError> {
+        let (object, size) =
+            self.authorize_version_content(identity, content_hash, expected_size_bytes)?;
+        let capacity =
+            usize::try_from(size).map_err(|_| error("version is too large to collect"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| error("cannot allocate version content"))?;
+        loop {
+            let offset = bytes.len() as u64;
+            let page = self.read_authorized_range(
+                &object,
+                size,
+                offset,
+                DFS_FILE_HISTORY_RANGE_LIMIT as usize,
+            )?;
+            bytes.extend_from_slice(&page);
+            if bytes.len() == capacity {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    pub fn read_sifs_version_range(
+        &mut self,
+        identity: &DfsRevisionReference,
+        hash: &str,
+        size: u64,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, DfsError> {
+        if length == 0 || length > crate::DFS_BROWSER_RANGE_LIMIT || offset > size {
+            return Err(error("invalid immutable content range"));
+        }
+        let (object, size) = self.authorize_version_content(identity, hash, Some(size))?;
+        self.read_authorized_range(&object, size, offset, length as usize)
+    }
+
+    fn authorize_version_content(
+        &mut self,
+        identity: &DfsRevisionReference,
+        content_hash: &str,
+        expected_size_bytes: Option<u64>,
+    ) -> Result<(DfsObjectMetadata, u64), DfsError> {
         let current = self.resolve_file_version_current_object(identity)?;
         let object = match current {
             Some(object)
@@ -1243,6 +1287,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 retained_revision_content_object(&descriptor)?
             }
         };
+        if object.object_id != identity.object_id
+            || object.version != identity.version
+            || object.file_system_id != identity.file_system_id
+        {
+            return Err(error(
+                "resolved descriptor does not match the requested version",
+            ));
+        }
         if object.content_hash.as_deref() != Some(content_hash) {
             return Err(error(
                 "requested content hash does not match the authorized version",
@@ -1256,45 +1308,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "requested length does not match the authorized version",
             ));
         }
-        let capacity =
-            usize::try_from(size).map_err(|_| error("version is too large to collect"))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(capacity)
-            .map_err(|_| error("cannot allocate version content"))?;
-        loop {
-            let offset = bytes.len() as u64;
-            let outcome = self
-                .read_immutable_object_metadata_range_or_fetch_remote_without_cache(
-                    &object,
-                    offset,
-                    DFS_FILE_HISTORY_RANGE_LIMIT as usize,
-                )
-                .map_err(|source| error(source.to_string()))?;
-            let NetworkedDfsRangeReadOutcome::Found { data, .. } = outcome else {
-                return Err(error(
-                    "authorized version has no currently readable replica",
-                ));
-            };
-            if data.object_id != identity.object_id
-                || data.version != identity.version
-                || data.content_hash != object.content_hash
-                || data.total_size_bytes != size
-                || data.offset != offset
-                || data.bytes.len() as u64
-                    != size
-                        .saturating_sub(offset)
-                        .min(DFS_FILE_HISTORY_RANGE_LIMIT as u64)
-            {
-                return Err(error(
-                    "version range does not match its authoritative descriptor",
-                ));
-            }
-            bytes.extend_from_slice(&data.bytes);
-            if bytes.len() == capacity {
-                return Ok(bytes);
-            }
+        Ok((object, size))
+    }
+
+    fn read_authorized_range(
+        &mut self,
+        object: &DfsObjectMetadata,
+        size: u64,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, DfsError> {
+        let outcome = self
+            .read_immutable_object_metadata_range_or_fetch_remote_without_cache(
+                object, offset, length,
+            )
+            .map_err(|source| error(source.to_string()))?;
+        let NetworkedDfsRangeReadOutcome::Found { data, .. } = outcome else {
+            return Err(error(
+                "authorized version has no currently readable replica",
+            ));
+        };
+        if data.object_id != object.object_id
+            || data.version != object.version
+            || data.content_hash != object.content_hash
+            || data.total_size_bytes != size
+            || data.offset != offset
+            || data.bytes.len() as u64 != size.saturating_sub(offset).min(length as u64)
+        {
+            return Err(error(
+                "version range does not match its authoritative descriptor",
+            ));
         }
+        Ok(data.bytes)
     }
 }
 

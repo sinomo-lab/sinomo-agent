@@ -100,6 +100,11 @@ pub fn extension_catalog_route() -> ServiceRoute {
 pub fn default_host_extension_point_definitions() -> Vec<HostExtensionPointDefinition> {
     vec![
         HostExtensionPointDefinition::new(
+            "sinomo-app",
+            env!("CARGO_PKG_VERSION"),
+            sinomo_module_api::panels::extension_point(),
+        ),
+        HostExtensionPointDefinition::new(
             "sinomo-cli",
             env!("CARGO_PKG_VERSION"),
             sinomo_module_api::cli::cli_commands_extension_point(),

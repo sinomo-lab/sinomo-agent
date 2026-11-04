@@ -128,6 +128,7 @@ const SETTINGS_GROUPS: &[SettingsGroup] = &[
         list_name: "settings-ai",
         sections: &[
             SettingsSection::Providers,
+            SettingsSection::Usage,
             SettingsSection::Agents,
             SettingsSection::Skills,
         ],
@@ -171,6 +172,7 @@ pub enum SettingsSection {
     /// Connection status, app version, and diagnostics.
     System,
     Providers,
+    Usage,
     Agents,
     Skills,
     /// The SIFS mount and the NFS mount on the selected node.
@@ -184,10 +186,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Appearance,
         SettingsSection::System,
         SettingsSection::Providers,
+        SettingsSection::Usage,
         SettingsSection::Agents,
         SettingsSection::Skills,
         SettingsSection::Storage,
@@ -213,6 +216,7 @@ impl SettingsSection {
             SettingsSection::RemoteManagement => "Host access",
             SettingsSection::Cluster => "Membership",
             SettingsSection::Modules => "Modules",
+            SettingsSection::Usage => "Usage",
             SettingsSection::Configuration => "Configuration",
         }
     }
@@ -244,6 +248,9 @@ impl SettingsSection {
             SettingsSection::Modules => {
                 "Manage module lifecycle and effective configuration across nodes."
             }
+            SettingsSection::Usage => {
+                "Retain usage history, maintain price estimates, and set display-only budgets."
+            }
             SettingsSection::Configuration => {
                 "Browse and edit every setting key, for the selected node or the whole cluster."
             }
@@ -261,6 +268,7 @@ impl SettingsSection {
             SettingsSection::RemoteManagement => IconGlyph::Lock,
             SettingsSection::Cluster => IconGlyph::Link,
             SettingsSection::Modules => IconGlyph::Blocks,
+            SettingsSection::Usage => IconGlyph::FileText,
             SettingsSection::Configuration => IconGlyph::MoreHorizontal,
         }
     }
@@ -6034,6 +6042,7 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             let settings = shared.settings();
             skills_sidebar_preview(&settings.skills)
         }
+        SettingsSection::Usage => "History, prices and budgets".into(),
         SettingsSection::Configuration => {
             let settings = shared.settings();
             if settings.config_error.is_some() {
@@ -6875,11 +6884,38 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         )
         .build(shared, reader);
 
-    Stack::vertical()
+    let content = Stack::vertical()
         .gap(16.0)
         .alignment(Alignment::Stretch)
         .with_child(theme_and_text)
-        .with_child(display)
+        .with_child(display);
+    if cfg!(target_os = "android") {
+        return content;
+    }
+    use crate::backend::app_config::{FileOpenAction, save_file_open_action};
+    let files = shared.files();
+    let preference = std::sync::Arc::clone(&files.open_files_externally);
+    let selected = std::sync::Arc::clone(&preference);
+    let data_dir = files.data_dir.clone();
+    let picker = Select::new("Default file action")
+        .options(["Open in Sinomo", "Open externally"])
+        .selected_when(move || Some(usize::from(selected.load(Ordering::Relaxed))))
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _| {
+            let action = if index == 1 {
+                FileOpenAction::External
+            } else {
+                FileOpenAction::Internal
+            };
+            match save_file_open_action(&data_dir, action) {
+                Ok(()) => preference.store(action == FileOpenAction::External, Ordering::Relaxed),
+                Err(error) => tracing::warn!(%error, "could not save the default file action"),
+            }
+        });
+    drop(files);
+    content.with_child(SettingsCard::new("Files").row(SettingRow::new("Default file action")
+        .help("Double-click a file or press Enter to open it. Right-click for the other option.")
+        .control(picker).build(shared)).build(shared, reader))
 }
 
 /// Connection status first, since that is why people usually open this page, then the app build
@@ -10654,6 +10690,21 @@ fn provider_usage_row(
     {
         stack = stack.with_child(muted_label(shared, format!("Credits: {balance}")));
     }
+    let action = shared.clone();
+    let provider = usage.provider.clone();
+    stack = stack.with_child(
+        sui::Button::new("Usage history")
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                crate::ui::cluster::open_usage(
+                    &action,
+                    sinomo_client::usage_contract::UsageFilter {
+                        provider: Some(provider.clone()),
+                        ..Default::default()
+                    },
+                );
+            }),
+    );
     FormRow::new("Usage and limits", stack)
         .stacked()
         .theme_when(clone_reader(reader))
@@ -16325,6 +16376,7 @@ fn section_body(
                 reader,
                 section_modules(shared, reader),
             )),
+            SettingsSection::Usage => widgets::Boxed::new(usage_settings::section(shared, reader)),
             SettingsSection::Configuration => {
                 widgets::Boxed::new(section_configuration_page(shared, reader))
             }
@@ -22983,4 +23035,24 @@ mod tests {
             "a completed flow is cleared back to the resting state"
         );
     }
+}
+
+mod usage_settings;
+pub(crate) fn open_usage_skill(shared: &Shared, id: &str, version: &str) {
+    let selected = (id.to_string(), version.to_string());
+    {
+        let mut settings = shared.settings_mut();
+        settings.open(SettingsSection::Skills);
+        settings.skill_selected = Some(selected.clone());
+        settings.skills_include_all = true;
+    }
+    shared.set_active_tab(Tab::Settings);
+    queue_settings_operation(
+        shared,
+        SettingsOperationScope::Skills,
+        SettingsOperation::RefreshSkills {
+            include_all: true,
+            selected: Some(selected),
+        },
+    );
 }

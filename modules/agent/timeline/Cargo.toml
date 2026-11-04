@@ -1,0 +1,20 @@
+[package]
+name = "sinomo-agent-timeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native module for conversation agent interaction timelines"
+[lib]
+crate-type = ["rlib", "cdylib"]
+[package.metadata.sinomo]
+ring = "r2"
+[package.metadata.sinomo.native-dylib]
+module-id = "module.agent-timeline"
+interface-version = "sinomo.ui.session-panel.v1"
+cache-key = "module/agent/timeline"
+source = "rollout:modules/agent/timeline"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sinomo-module-api.workspace = true

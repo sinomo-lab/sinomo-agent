@@ -6,6 +6,7 @@
 //! process on desktop so the UI stays daemon-backed without linking the daemon host into the GUI.
 
 pub mod backend;
+pub mod external_edit;
 pub mod metrics;
 mod mobile_runtime;
 mod native_picker;
@@ -195,7 +196,8 @@ pub fn run() -> sui::Result<()> {
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
     let final_shared = shared.clone();
-    let result = app.run_with_handle(move |ui| {
+    let platform = sui::DesktopPlatform::new().with_extension(shared.borrow().reports.clone());
+    let result = app.run_with_platform_and_handle(platform, move |ui| {
         // Stash a waker so background work (e.g. provider device-login) can refresh the UI.
         shared.borrow_mut().waker = Some(ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -229,6 +231,7 @@ pub fn run() -> sui::Result<()> {
     {
         tracing::warn!(%error, "workspace save failed");
     }
+    sinomo_client::api::observe::recording::shutdown_producers(std::time::Duration::from_secs(5));
     result
 }
 

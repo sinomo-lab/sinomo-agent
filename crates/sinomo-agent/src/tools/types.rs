@@ -157,6 +157,7 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::RunShellCommand => vec!["core", "coding", "local"],
         AgentToolKind::ChangedFiles | AgentToolKind::GitDiff => vec!["version_control"],
         AgentToolKind::ModuleObjectRpc => vec!["module", "object_rpc"],
+        AgentToolKind::ModuleService => vec!["module"],
         AgentToolKind::McpCall => vec!["core", "mcp", "network"],
         AgentToolKind::WebSearch => vec!["core", "research", "network"],
         AgentToolKind::ImageGeneration => vec!["core", "media", "creative"],
@@ -182,7 +183,6 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         AgentToolKind::StartAsyncTask
         | AgentToolKind::InspectAsyncTask
         | AgentToolKind::CancelAsyncTask => vec!["async_task"],
-        AgentToolKind::Subagents => vec!["core", "delegation"],
         AgentToolKind::HandoffToBackground => vec!["delegation"],
         AgentToolKind::ObserveVision => vec!["perception"],
     }

@@ -6,6 +6,9 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod cli;
+pub mod module_sessions;
+pub mod session_access;
+pub mod session_panels;
 
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
@@ -65,6 +68,11 @@ pub struct AgentCancellationToken {
 }
 
 impl AgentCancellationToken {
+    pub(crate) fn from_parent_signal(signal: Arc<AtomicBool>) -> Self {
+        let mut parent = Self::new();
+        parent.cancelled = signal;
+        parent.child_token()
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -482,7 +490,6 @@ impl AgentToolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolKind {
-    Subagents,
     StartAsyncTask,
     InspectAsyncTask,
     CancelAsyncTask,
@@ -511,6 +518,10 @@ pub enum AgentToolKind {
     SkillActivate,
     SkillUpdate,
     ModuleObjectRpc,
+    /// Native module service tool. The alias only reads older saved tool specs;
+    /// execution still requires a registered module provider.
+    #[serde(alias = "subagents")]
+    ModuleService,
     McpCall,
     WebSearch,
     ImageGeneration,
@@ -707,6 +718,8 @@ pub enum AgentPackageSource {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolSurfaceDefinition {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_capabilities: Vec<AgentToolCapability>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_toolsets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2131,6 +2144,29 @@ impl AgentDefinition {
         definition.description = export.description.clone();
         definition.skills = export.skills.clone();
         definition.tool_surface.visible_toolsets = export.visible_toolsets.clone();
+        if let Some(profile) = &export.worker {
+            definition.tool_surface.allowed_capabilities = profile
+                .capabilities
+                .iter()
+                .map(|name| {
+                    serde_json::from_value(serde_json::Value::String(name.clone())).map_err(|_| {
+                        AgentDefinitionValidationError::InvalidToolSurfaceEntry {
+                            id: export.id.clone(),
+                            field: "allowed_capabilities".into(),
+                            value: name.clone(),
+                        }
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            if definition.tool_surface.allowed_capabilities.is_empty() {
+                return Err(AgentDefinitionValidationError::InvalidToolSurfaceEntry {
+                    id: export.id.clone(),
+                    field: "allowed_capabilities".into(),
+                    value: "empty worker profile".into(),
+                });
+            }
+            definition.runtime_limits.max_steps = profile.max_steps;
+        }
         definition.context.pipeline_id = export
             .context_pipeline_id
             .clone()
@@ -2708,6 +2744,11 @@ fn parse_agent_interaction_state(value: &str) -> Option<AgentInteractionState> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct InteractionSession {
+    /// Conversation evidence supplied by the surface owner; never inferred from a surface label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant_id: Option<TaskId>,
     pub session_id: SessionId,
     pub node_id: NodeId,
     pub surface: InteractionSurface,
@@ -2716,6 +2757,8 @@ pub struct InteractionSession {
 impl InteractionSession {
     pub fn new(session_id: SessionId, node_id: NodeId, surface: InteractionSurface) -> Self {
         Self {
+            conversation_id: None,
+            participant_id: None,
             session_id,
             node_id,
             surface,
@@ -3034,6 +3077,7 @@ pub fn interaction_model_request<S: EventStore>(
         max_output_tokens: Some(800),
         response_format: LanguageModelResponseFormat::Text,
         metadata: serde_json::json!({
+            "usage_attribution": sinomo_runtime::api::app::usage::UsageAttribution { node: session.node_id.to_string(), session: Some(session.session_id.to_string()), chat: session.conversation_id.as_ref().map(ToString::to_string), turn: Some(message_event_id.to_string()), origin: "interactive_chat".into(), purpose: "agent_turn".into(), ..Default::default() },
             "loop": "interactive",
             "node_id": session.node_id,
             "session_id": session.session_id,

@@ -29,6 +29,8 @@ pub struct EvolutionGoalGraph {
     pub goal_id: String,
     pub objective: String,
     pub status: EvolutionGoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_action: Option<sinomo_runtime::api::app::evolution::EvolutionGoalControlAction>,
     pub evolution_agent_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metric_definitions: Vec<EvolutionMetricDefinition>,
@@ -59,6 +61,7 @@ impl EvolutionGoalGraph {
             goal_id: goal_id.into(),
             objective: objective.into(),
             status: EvolutionGoalStatus::Planning,
+            control_action: None,
             evolution_agent_id: evolution_agent_id.into(),
             metric_definitions: Vec::new(),
             revisions: Vec::new(),
@@ -761,6 +764,8 @@ pub enum EvolutionTaskStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionAgentRunRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_detail: Option<String>,
     pub agent_run_id: String,
     pub agent_id: String,
     pub role: EvolutionAgentRole,
@@ -770,7 +775,7 @@ pub struct EvolutionAgentRunRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_ref: Option<String>,
+    pub execution: Option<sinomo_module_api::sessions::SessionExecutionRef>,
     pub summary: String,
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -790,6 +795,7 @@ pub enum EvolutionAgentRole {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum EvolutionAgentRunStatus {
+    Unavailable,
     Queued,
     Running,
     Waiting,

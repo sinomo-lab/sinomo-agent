@@ -1,0 +1,17 @@
+[package]
+name = "sinomo-file-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable staging and execution for filesystem writeback adapters"
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+blake3.workspace = true
+fs2.workspace = true
+serde.workspace = true
+sinomo-core = { path = "../sinomo-core", default-features = false, features = ["client"] }
+sinomo-module-api = { path = "../sinomo-module-api" }

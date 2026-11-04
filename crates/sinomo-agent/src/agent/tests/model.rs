@@ -41,6 +41,7 @@ fn agent_repairs_malformed_model_response_once() {
             Some(sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(10),
                 output_tokens: Some(1),
+                ..Default::default()
             }),
         ),
         (
@@ -54,6 +55,7 @@ fn agent_repairs_malformed_model_response_once() {
             Some(sinomo_lm::LanguageModelUsage {
                 input_tokens: Some(20),
                 output_tokens: Some(2),
+                ..Default::default()
             }),
         ),
     ]);

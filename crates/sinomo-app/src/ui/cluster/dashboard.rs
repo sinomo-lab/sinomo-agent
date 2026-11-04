@@ -9,6 +9,10 @@ pub(super) enum DashboardMetric {
     AgentActiveTurns,
     AgentPendingTasks,
     AgentFailedTasks,
+    ModelRequests,
+    ModelInputTokens,
+    ModelOutputTokens,
+    ToolCalls,
     DfsBacklog,
 
     DfsPendingWrites,
@@ -176,6 +180,56 @@ pub(super) const DEFAULT_DASHBOARD: DashboardSpec = DashboardSpec {
             ExplorerWindow::FiveMinutes,
             "",
             "Retained failed + timed-out states · highest node",
+        ),
+        panel(
+            DashboardMetric::ModelRequests,
+            "Model requests",
+            "sinomo.usage.model.requests",
+            Group::Agents,
+            Read::Rate,
+            ObserveMetricUnit::Count,
+            ExplorerWindow::FiveMinutes,
+            "/s",
+            "Completed provider requests across reporting nodes",
+        ),
+        labels(
+            panel(
+                DashboardMetric::ModelInputTokens,
+                "Input tokens",
+                "sinomo.usage.model.tokens",
+                Group::Agents,
+                Read::Rate,
+                ObserveMetricUnit::Count,
+                ExplorerWindow::FiveMinutes,
+                "tokens/s",
+                "Provider-reported input tokens including cache subsets",
+            ),
+            &[("unit", "input")],
+        ),
+        labels(
+            panel(
+                DashboardMetric::ModelOutputTokens,
+                "Output tokens",
+                "sinomo.usage.model.tokens",
+                Group::Agents,
+                Read::Rate,
+                ObserveMetricUnit::Count,
+                ExplorerWindow::FiveMinutes,
+                "tokens/s",
+                "Provider-reported output tokens including reasoning",
+            ),
+            &[("unit", "output")],
+        ),
+        panel(
+            DashboardMetric::ToolCalls,
+            "Tool calls",
+            "sinomo.usage.tool.calls",
+            Group::Agents,
+            Read::Rate,
+            ObserveMetricUnit::Count,
+            ExplorerWindow::FiveMinutes,
+            "/s",
+            "Completed orchestrated tool calls across reporting nodes",
         ),
         panel(
             DashboardMetric::DfsBacklog,
@@ -374,10 +428,14 @@ pub(super) const DEFAULT_DASHBOARD: DashboardSpec = DashboardSpec {
 };
 
 impl DashboardMetric {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 24] = [
         Self::AgentActiveTurns,
         Self::AgentPendingTasks,
         Self::AgentFailedTasks,
+        Self::ModelRequests,
+        Self::ModelInputTokens,
+        Self::ModelOutputTokens,
+        Self::ToolCalls,
         Self::DfsBacklog,
         Self::DfsPendingWrites,
         Self::RpcRate,
@@ -777,6 +835,30 @@ fn inspect_button(shared: &Shared, metric: DashboardMetric) -> IconButton {
     .tone(SemanticTone::Neutral)
     .theme_when(move || theme.theme_sized(sui::ControlSize::Small))
     .on_press_with_ctx(move |ctx| {
+        if matches!(
+            metric,
+            DashboardMetric::ModelRequests
+                | DashboardMetric::ModelInputTokens
+                | DashboardMetric::ModelOutputTokens
+                | DashboardMetric::ToolCalls
+        ) {
+            super::open_usage(
+                &action,
+                sinomo_client::usage_contract::UsageFilter {
+                    event_kind: Some(
+                        if metric == DashboardMetric::ToolCalls {
+                            "agent.tool.call.completed"
+                        } else {
+                            "lm.request.completed"
+                        }
+                        .into(),
+                    ),
+                    ..Default::default()
+                },
+            );
+            request_metric_explorer_relayout(ctx);
+            return;
+        }
         let spec = metric.spec();
         action.cluster_mut().inspect_explorer_metric(
             spec.explorer_metric,
@@ -1271,11 +1353,16 @@ fn page(shared: &Shared, reader: &ThemeReader) -> Flex {
                 .min_width(120.0),
         );
     }
+    let usage_action = shared.clone();
+    let usage_button = Button::new("Agent usage history")
+        .theme_when(clone_reader(reader))
+        .on_press(move || super::open_usage(&usage_action, Default::default()));
     let mut body = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(20.0)
         .with_child(dashboard_header(shared, reader, &samples))
-        .with_child(summary);
+        .with_child(summary)
+        .with_child(usage_button);
     for group in Group::ALL
         .into_iter()
         .filter(|group| *group != Group::Diagnostics)

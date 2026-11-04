@@ -16,6 +16,7 @@ default = []
 cpu-profiler = ["dep:backtrace", "dep:pprof"]
 
 [dependencies]
+sinomo-config.workspace = true
 fs2.workspace = true
 metrics.workspace = true
 serde.workspace = true

@@ -807,7 +807,20 @@ pub fn hosted_agent_chat_component_factory(
 ) -> Result<sinomo_runtime::daemon::DaemonComponentFactory, String> {
     let daemon_address = daemon_address.into();
     let factory = sinomo_runtime::module::StaticComponentFactory::new(
-        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION")),
+        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION"))
+            .with_offer(
+                sinomo_runtime::module_api::ServiceOffer::new(
+                    "sessions",
+                    sinomo_runtime::module_api::sessions::SESSION_INTERFACE,
+                    "1.0.0",
+                )
+                .with_operation(
+                    sinomo_runtime::module_api::ServiceOperationOffer::new(
+                        sinomo_runtime::module_api::sessions::SESSION_ACCESS,
+                    )
+                    .at_route(sinomo_runtime::module_api::panels::SESSION_ROUTE),
+                ),
+            ),
         move |context, scope| {
             let runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
             let control_host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
@@ -2171,32 +2184,43 @@ impl InteractionModel for ConfiguredInteractionModel {
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         if self.provider == MINICPM_PROVIDER_ID {
-            let model = if self.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
-                MINICPM_DEFAULT_MODEL.to_string()
-            } else {
-                self.model.clone()
-            };
-            if let Some(endpoint) = self.runtime_config.pytorch_bridge.endpoint.clone() {
-                ensure_local_pytorch_endpoint(&endpoint, &model)?;
-                let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
-                    endpoint,
-                    timeout_seconds: self
-                        .runtime_config
-                        .pytorch_bridge
-                        .timeout_seconds
-                        .unwrap_or(300),
-                    auth_token: None,
-                });
-                return sinomo_lm::LanguageModelProvider::complete(
-                    &provider,
-                    &LanguageModelRequest {
-                        provider: self.provider.clone(),
-                        model,
-                        ..request.clone()
-                    },
-                );
-            }
-            return self.complete_with_managed_pytorch(request, &model);
+            let observation = sinomo_lm::usage::RequestObservation::new(
+                &self.data_dir,
+                &self.provider,
+                &self.model,
+                self.account.as_ref(),
+                request,
+            );
+            let result = (|| {
+                let model = if self.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
+                    MINICPM_DEFAULT_MODEL.to_string()
+                } else {
+                    self.model.clone()
+                };
+                if let Some(endpoint) = self.runtime_config.pytorch_bridge.endpoint.clone() {
+                    ensure_local_pytorch_endpoint(&endpoint, &model)?;
+                    let provider = RemotePytorchRuntime::new(RemotePytorchRuntimeConfig {
+                        endpoint,
+                        timeout_seconds: self
+                            .runtime_config
+                            .pytorch_bridge
+                            .timeout_seconds
+                            .unwrap_or(300),
+                        auth_token: None,
+                    });
+                    return sinomo_lm::LanguageModelProvider::complete(
+                        &provider,
+                        &LanguageModelRequest {
+                            provider: self.provider.clone(),
+                            model,
+                            ..request.clone()
+                        },
+                    );
+                }
+                return self.complete_with_managed_pytorch(request, &model);
+            })();
+            observation.finish(&result, false, None, None);
+            return result;
         }
         complete_configured_model_request_with_account(
             &self.data_dir,
@@ -2221,6 +2245,91 @@ impl InteractionModel for ConfiguredInteractionModel {
     }
 
     fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.complete_streaming_events_with_cancellation(
+            request,
+            &AgentCancellationToken::new(),
+            on_event,
+        )
+    }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if self.provider != MINICPM_PROVIDER_ID {
+            let token = cancellation_token.clone();
+            let cancellation = LanguageModelCancellation::new(move || token.is_cancelled());
+            return complete_configured_model_request_streaming_events_with_account_and_cancellation(
+                &self.data_dir,
+                &self.provider,
+                &self.model,
+                self.account.as_ref(),
+                None,
+                request,
+                &cancellation,
+                on_event,
+            );
+        }
+
+        let observation = sinomo_lm::usage::RequestObservation::new(
+            &self.data_dir,
+            &self.provider,
+            &self.model,
+            self.account.as_ref(),
+            request,
+        );
+        let started = std::time::Instant::now();
+        let mut first = None;
+        let mut units = None;
+        let result = (|| {
+            if cancellation_token.is_cancelled() {
+                return Err(configured_model_cancelled_error(request, "before request"));
+            }
+            let response = self.complete_streaming_events_unobserved(request, &mut |event| {
+                if matches!(
+                    &event,
+                    LanguageModelStreamEvent::TextDelta { .. }
+                        | LanguageModelStreamEvent::ReasoningDelta { .. }
+                ) && first.is_none()
+                {
+                    first = Some(started.elapsed().as_millis() as u64);
+                }
+                if let LanguageModelStreamEvent::Usage { usage } = &event {
+                    units = Some(usage.clone());
+                }
+                if !cancellation_token.is_cancelled() {
+                    on_event(event);
+                }
+            })?;
+            if cancellation_token.is_cancelled() {
+                return Err(configured_model_cancelled_error(request, "during response"));
+            }
+            Ok(response)
+        })();
+        observation.finish(&result, cancellation_token.is_cancelled(), first, units);
+        result
+    }
+}
+
+fn configured_model_cancelled_error(
+    request: &LanguageModelRequest,
+    phase: &'static str,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
+        detail: format!("model invocation cancelled {phase}"),
+    }
+}
+
+impl ConfiguredInteractionModel {
+    fn complete_streaming_events_unobserved(
         &self,
         request: &LanguageModelRequest,
         on_event: &mut dyn FnMut(LanguageModelStreamEvent),
@@ -2321,54 +2430,6 @@ impl InteractionModel for ConfiguredInteractionModel {
         )
     }
 
-    fn complete_streaming_events_with_cancellation(
-        &self,
-        request: &LanguageModelRequest,
-        cancellation_token: &AgentCancellationToken,
-        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        if self.provider != MINICPM_PROVIDER_ID {
-            let token = cancellation_token.clone();
-            let cancellation = LanguageModelCancellation::new(move || token.is_cancelled());
-            return complete_configured_model_request_streaming_events_with_account_and_cancellation(
-                &self.data_dir,
-                &self.provider,
-                &self.model,
-                self.account.as_ref(),
-                None,
-                request,
-                &cancellation,
-                on_event,
-            );
-        }
-
-        if cancellation_token.is_cancelled() {
-            return Err(configured_model_cancelled_error(request, "before request"));
-        }
-        let response = self.complete_streaming_events(request, &mut |event| {
-            if !cancellation_token.is_cancelled() {
-                on_event(event);
-            }
-        })?;
-        if cancellation_token.is_cancelled() {
-            return Err(configured_model_cancelled_error(request, "during response"));
-        }
-        Ok(response)
-    }
-}
-
-fn configured_model_cancelled_error(
-    request: &LanguageModelRequest,
-    phase: &'static str,
-) -> LanguageModelError {
-    LanguageModelError::ProviderInvocationFailed {
-        provider: request.provider.clone(),
-        model: request.model.clone(),
-        detail: format!("model invocation cancelled {phase}"),
-    }
-}
-
-impl ConfiguredInteractionModel {
     fn complete_with_managed_pytorch(
         &self,
         request: &LanguageModelRequest,
@@ -5102,6 +5163,7 @@ fn configure_agent_tool_registry_for_workspace_projection_with_modules(
     // authoritative store after rebuilding the registry so tools that require
     // a node-local grant fail closed until the operator allows it.
     registry.set_local_permission_data_dir(data_dir.root());
+    registry.set_usage_data_dir(data_dir.clone());
     if let Some(mount) = live_sifs_mount.as_ref() {
         mount.retain_for_registry(registry);
     }
@@ -5314,6 +5376,7 @@ fn register_hosted_model_tools_for_workspace(
     register_hosted_model_tools(
         registry,
         HostedModelAgentToolConfig::new(backend, artifact_root)
+            .with_usage_data_dir(data_dir.clone())
             .with_allowed_image_roots(workspace_roots.iter().cloned()),
     );
 }
@@ -5619,6 +5682,13 @@ pub(crate) fn ensure_cluster_directory_installed() {
 }
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
+    // Observe owns the lifetime of standalone-command observations. The daemon
+    // component replaces this producer registration when a daemon is launched.
+    let _observe_events = SinomoDataDir::from_env_or_home().ok().and_then(|data| {
+        sinomo_runtime::observe::start_event_writer(&data)
+            .map_err(|error| tracing::warn!(%error,"Observe event writer unavailable"))
+            .ok()
+    });
     init_explicit_cli_dfs_perf_tracing(&args);
     run_parsed_cli_invocation(parse_cli_invocation(&args)?)
 }

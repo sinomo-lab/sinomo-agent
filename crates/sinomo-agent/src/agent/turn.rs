@@ -68,7 +68,8 @@ impl<M: InteractionModel> Agent<M> {
         model_progress_sink: AgentModelProgressSink,
         progress: &mut AgentTurnProgress,
     ) -> Result<AgentRun, AgentError> {
-        if let Some(subagents) = self.subagents.get() {
+        let _usage_scope = sinomo_lm::usage::enter_attribution(self.usage_attribution(input));
+        if let Some(subagents) = self.session_host.get() {
             subagents.set_input(input);
         }
         if let Some(update) = &input.async_update
@@ -308,6 +309,7 @@ impl<M: InteractionModel> Agent<M> {
                         })
                         .min(typed_transcript.items.len());
                     let compaction = self.compact_source_transcript(
+                        &input.session.session_id,
                         &typed_transcript,
                         "context budget threshold reached".to_string(),
                         turn_context.budget_estimate.total_bytes,
@@ -666,6 +668,7 @@ impl<M: InteractionModel> Agent<M> {
                 items.push(tool_call_item);
                 let call_progress =
                     progress_sink.for_tool_call(tool_call_id.clone(), step_index, call_index, call);
+                let tool_started = std::time::Instant::now();
                 let detached = (!cancellation_token.is_cancelled())
                     .then(|| {
                         tool_orchestrator.detach(
@@ -679,7 +682,9 @@ impl<M: InteractionModel> Agent<M> {
                         )
                     })
                     .flatten();
-                let mut outcome = if cancellation_token.is_cancelled() {
+                let was_detached = detached.is_some();
+                let cancelled_before_execution = cancellation_token.is_cancelled();
+                let mut outcome = if cancelled_before_execution {
                     cancelled_tool_outcome(
                         step_index,
                         call_index,
@@ -703,13 +708,25 @@ impl<M: InteractionModel> Agent<M> {
                 // Every outcome, including ones decided before execution,
                 // pairs with the recorded call.
                 outcome.call_id = tool_call_id;
+                if cancelled_before_execution {
+                    self.tools
+                        .record_usage(&input.session, &outcome.call_id, &outcome, 0, false);
+                }
                 let event = caused_by_latest_event(
                     agent_event(
                         &input.session,
-                        "agent.loop.tool.completed",
+                        if was_detached {
+                            "agent.tool.call.detached"
+                        } else {
+                            "agent.tool.call.completed"
+                        },
                         0.62,
                         serde_json::json!({
                             "call_id": outcome.call_id,
+                            "duration_ms": tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            "detached": was_detached,
+                            "runtime": "agent",
+                            "node": input.session.node_id,
                             "step_index": outcome.step_index,
                             "call_index": outcome.call_index,
                             "tool": outcome.call.tool,

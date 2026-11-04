@@ -131,7 +131,6 @@ require_wheel 'numpy-*-cp313-cp313-wasix_wasm32.whl'
 require_wheel 'matplotlib-*-cp313-cp313-wasix_wasm32.whl'
 
 if [ -d "${DATA_DIR}" ]; then
-    chmod -R u+rwX "${DATA_DIR}" 2>/dev/null || true
 fi
 rm -rf "${DATA_DIR}"
 mkdir -p "${DATA_DIR}"

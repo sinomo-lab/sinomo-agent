@@ -1248,7 +1248,11 @@ pub fn test_provider_connection(
                 };
             let (usage, usage_error) =
                 if sinomo_lm::subscription_usage_provider_ids().contains(&provider.as_str()) {
-                    match sinomo_lm::provider_usage_in_data_dir(data_dir, &provider) {
+                    match sinomo_lm::provider_usage_for_account_in_data_dir(
+                        data_dir,
+                        &provider,
+                        Some(account_config),
+                    ) {
                         Ok(usage) => (Some(usage), None),
                         Err(error) => (None, Some(error.to_string())),
                     }
