@@ -17,6 +17,18 @@ pub(super) fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalRep
     }
 }
 
+/// A lane publish runs because its shard committed new journal entries; it
+/// sends those entries and nothing to a replica already at the head. Probing
+/// caught-up replicas stays with explicit repair, so a publish leaves no
+/// round in flight after every target has acknowledged the head.
+pub(super) fn daemon_dfs_metadata_lane_replication_options() -> DfsMetadataJournalReplicationOptions
+{
+    DfsMetadataJournalReplicationOptions {
+        probe_caught_up_replicas: false,
+        ..daemon_dfs_metadata_replication_options()
+    }
+}
+
 pub(super) fn daemon_dfs_smoke_options() -> sinomo_dfs::DfsSmokeOptions {
     sinomo_dfs::dfs_resident_smoke_options()
 }
@@ -1194,7 +1206,7 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                         "DFS metadata publish execution has no registered runtime task owner"
                             .to_string()
                     })?;
-                let replication_options = daemon_dfs_metadata_replication_options();
+                let replication_options = daemon_dfs_metadata_lane_replication_options();
                 let plan = prepare_daemon_dfs_metadata_publish_with_replanning(
                     mutation_scheduler,
                     data_dir,

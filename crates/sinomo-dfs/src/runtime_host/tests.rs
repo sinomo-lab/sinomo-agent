@@ -4896,6 +4896,14 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
     assert!(daemon_dfs_metadata_replication_options().probe_caught_up_replicas);
     assert!(daemon_dfs_metadata_replication_options().background_publication);
     assert_eq!(
+        super::publish_host::daemon_dfs_metadata_lane_replication_options(),
+        DfsMetadataJournalReplicationOptions {
+            probe_caught_up_replicas: false,
+            ..daemon_dfs_metadata_replication_options()
+        },
+        "a lane publish sends new entries only"
+    );
+    assert_eq!(
         daemon_dfs_metadata_publish_schedule_options().max_retry_rounds,
         DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS
     );
