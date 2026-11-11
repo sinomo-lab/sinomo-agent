@@ -1436,6 +1436,7 @@ mod tests {
             result: crate::DfsBlobTransferResult::Committed {
                 content_hash: command.content_hash.clone(),
             },
+            receipt_generation: command.receipt_generation,
         };
         let candidate = OriginalRepairTerminal { key: prepared.prepared.key.clone(), prepared_id: prepared.prepared.logical_id, prepared_seal: prepared.prepared.seal.clone(), bound_id: prepared.prepared.logical_id+1, logical_id: prepared.prepared.logical_id+1, store_incarnation: prepared.prepared.store_incarnation.clone(), response, provenance: crate::publication_guard::NativeContentOnlyRepairProvenance { receiver: material.original.target_node_id.clone(), admitted_shard: command.authority_shard.clone().unwrap(), effect: crate::publication_guard::NativeRepairEffectManifest::ReceiverContentAndLocalCacheOnly } };
         let reject = |candidate| {

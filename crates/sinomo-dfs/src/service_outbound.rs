@@ -222,6 +222,8 @@ where
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
         let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let receipt_generation =
+            self.backend_receipt_slot_generation(object_id, version, target_node_id)?;
         let reader = self.open_patch_blob_stream(patch_hash, patch_size_bytes)?;
         let send_outcome = self
             .send_best_effort_message_attachment_if_routable_async(
@@ -239,6 +241,7 @@ where
                     bytes: Vec::new(),
                     object_metadata,
                     authority_shard,
+                    receipt_generation,
                 }),
                 DfsOutboundAttachment::from_reader(reader, patch_size_bytes, patch_hash),
             )
@@ -868,6 +871,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .retained_content_transfer_required(intent_id, object_id, version)?;
         let mut requests = Vec::with_capacity(targets.len());
         for (target_node_id, request_id) in targets {
+            // Every new transfer plans against the target slot's current
+            // generation before it is sent; its reply may publish only there.
+            let receipt_generation =
+                self.backend_receipt_slot_generation(object_id, version, target_node_id)?;
             let original_store = if matches!(
                 kind,
                 ReplicaTransferKind::Repair | ReplicaTransferKind::BackgroundRepair
@@ -957,6 +964,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         bytes: Vec::new(),
                         object_metadata: object_metadata.clone(),
                         authority_shard: authority_shard.clone(),
+                        receipt_generation,
                     });
                     let routed = self.next_dfs_routed_message(target_node_id, message);
                     let descriptor = DfsRpcAttachmentDescriptor {
@@ -1021,6 +1029,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         bytes: Vec::new(),
                         object_metadata: object_metadata.clone(),
                         authority_shard: authority_shard.clone(),
+                        receipt_generation,
                     };
                     if self
                         .coordinator
@@ -1045,6 +1054,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             bytes: Vec::new(),
                             object_metadata: object_metadata.clone(),
                             authority_shard: authority_shard.clone(),
+                            receipt_generation,
                         })
                     } else {
                         DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
@@ -1062,6 +1072,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             bytes: Vec::new(),
                             object_metadata: object_metadata.clone(),
                             authority_shard: authority_shard.clone(),
+                            receipt_generation,
                         })
                     }
                 }
@@ -1154,6 +1165,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
         let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let receipt_generation =
+            self.backend_receipt_slot_generation(object_id, version, target_node_id)?;
         let reader = self.open_patch_blob_stream(patch_hash, patch_size_bytes)?;
         let send_outcome = self.send_best_effort_message_attachment_if_routable(
             target_node_id,
@@ -1170,6 +1183,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 bytes: Vec::new(),
                 object_metadata,
                 authority_shard,
+                receipt_generation,
             }),
             DfsOutboundAttachment::from_reader(reader, patch_size_bytes, patch_hash),
         )?;

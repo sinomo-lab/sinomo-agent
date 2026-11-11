@@ -264,6 +264,29 @@ pub struct DfsCrossShardSourceFamily {
 
 pub use sinomo_api::dfs::metadata_records::DfsReplicaReceiptRecord;
 
+/// Withdrawn receipt slot of one live version. The row keeps the slot's
+/// advanced generation, so a reply planned before the withdrawal cannot
+/// publish a receipt for the same (object, version, replica) slot.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsReplicaReceiptWithdrawalRecord {
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub replica_node_id: NodeId,
+    pub generation: u64,
+}
+
+impl DfsReplicaReceiptWithdrawalRecord {
+    pub(crate) fn slot_key(&self) -> (DfsObjectId, DfsVersion, NodeId) {
+        (
+            self.object_id.clone(),
+            self.version.clone(),
+            self.replica_node_id.clone(),
+        )
+    }
+}
+
 pub use sinomo_api::dfs::metadata_records::DfsWriteIntentRecord;
 
 /// Compact terminal write identity retained after recovery no longer needs the
@@ -2008,6 +2031,8 @@ pub struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receipts: Vec<DfsReplicaReceiptRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_withdrawals: Vec<DfsReplicaReceiptWithdrawalRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intents: Vec<DfsWriteIntentRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_receipts: Vec<DfsWriteIntentReceipt>,
@@ -2142,13 +2167,22 @@ pub enum DfsMetadataTableOp {
         removed_pins: Vec<DfsMetadataVersionPinRecord>,
         removed_pin_transfers: Vec<DfsCrossShardPinTransferRecord>,
     },
+    /// Publish a receipt at `receipt.generation`, which must equal the slot's
+    /// current generation.
     PutReceipt {
         receipt: DfsReplicaReceiptRecord,
     },
+    /// Collect a receipt slot. While its version is live the slot keeps its
+    /// generation; only whole-version collection forgets it.
     RemoveReceipt {
         object_id: DfsObjectId,
         version: DfsVersion,
         replica_node_id: NodeId,
+    },
+    /// Withdraw a receipt slot of a live version: the slot's generation must
+    /// be `withdrawal.generation - 1`, and the tombstone keeps the new one.
+    WithdrawReceipt {
+        withdrawal: DfsReplicaReceiptWithdrawalRecord,
     },
     PutIntent {
         intent: DfsWriteIntentRecord,

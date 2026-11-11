@@ -971,6 +971,7 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
             !tables.version_pins.is_empty(),
             !tables.cross_shard_pin_transfers.is_empty(),
             !tables.receipts.is_empty(),
+            !tables.receipt_withdrawals.is_empty(),
             !tables.intents.is_empty(),
             !tables.intent_receipts.is_empty(),
             !tables.intent_receipt_retention.is_empty(),
@@ -1038,6 +1039,12 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
         }
         if !tables.receipts.is_empty() {
             state.serialize_field("receipts", &BorrowedMapValues(&tables.receipts))?;
+        }
+        if !tables.receipt_withdrawals.is_empty() {
+            state.serialize_field(
+                "receipt_withdrawals",
+                &BorrowedMapValues(&tables.receipt_withdrawals),
+            )?;
         }
         if !tables.intents.is_empty() {
             state.serialize_field("intents", &BorrowedMapValues(&tables.intents))?;
@@ -1217,6 +1224,7 @@ pub(crate) fn metadata_tables_snapshot(
         version_pins: tables.version_pins.values().cloned().collect(),
         cross_shard_pin_transfers: tables.cross_shard_pin_transfers.values().cloned().collect(),
         receipts: tables.receipts.values().cloned().collect(),
+        receipt_withdrawals: tables.receipt_withdrawals.values().cloned().collect(),
         intents: tables.intents.values().cloned().collect(),
         intent_receipts: tables.intent_receipts.values().cloned().collect(),
         intent_receipt_retention: tables.intent_receipt_retention.clone(),
@@ -1300,8 +1308,13 @@ pub(crate) fn metadata_tables_from_snapshot(
             transfer,
         );
     }
+    // Snapshot rows are installed table state, not publications: a present
+    // receipt keeps its generation without a compare against the empty table.
     for receipt in snapshot.receipts {
-        tables.apply_checked(DfsMetadataTableOp::PutReceipt { receipt })?;
+        tables.apply(DfsMetadataTableOp::PutReceipt { receipt });
+    }
+    for withdrawal in snapshot.receipt_withdrawals {
+        tables.load_receipt_withdrawal(withdrawal)?;
     }
     for intent in snapshot.intents {
         tables.apply_checked(DfsMetadataTableOp::PutIntent { intent })?;

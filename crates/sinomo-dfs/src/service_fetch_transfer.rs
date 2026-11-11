@@ -619,12 +619,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if !service.ensure_local_repair_manifest(object_id, version, content_hash)? {
                     return Ok(());
                 }
+                // The local manifest was verified just now, so this node's
+                // own receipt plans against the slot's current generation.
+                let generation =
+                    service.backend_receipt_slot_generation(object_id, version, &local_node_id)?;
                 service.put_metadata_receipt(
                     &file_system_id,
                     object_id,
                     version,
                     &local_node_id,
                     content_hash,
+                    generation,
                 )?;
                 service
                     .coordinator

@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod receipt_generation;
 mod recovery_custody;
 mod source_fetch_admission;
 mod rename_pending;
@@ -3978,6 +3979,12 @@ fn receipt_updates_visible_current_locations_for_current_version() {
             &stat.version,
             &receipt.replica_node_id,
             receipt.content_hash.as_deref().unwrap(),
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &receipt.replica_node_id,
+            )
+            .unwrap(),
         )
         .unwrap()
     );
@@ -6686,6 +6693,7 @@ fn repair_command_conflicting_receipt_does_not_commit_visible_metadata() {
         &version_2,
         &replica,
         "blake3:stale-conflicting-repair-command-receipt",
+        dfs.backend_receipt_slot_generation(&object_id, &version_2, &replica).unwrap(),
     )
     .expect("seed conflicting receipt");
 
@@ -6704,6 +6712,7 @@ fn repair_command_conflicting_receipt_does_not_commit_visible_metadata() {
                 bytes: bytes.to_vec(),
                 object_metadata: None,
                 authority_shard: None,
+                receipt_generation: 0,
             },
         )
         .expect("repair command response event");
@@ -7024,6 +7033,7 @@ fn assert_repair_hint_cannot_authorize_unknown_foreign_object(background_repair:
             bytes: bytes.to_vec(),
             object_metadata: Some(untrusted_hint),
             authority_shard: Some(config.clone()),
+            receipt_generation: 0,
         }),
     );
     let result = runtime.rpc_request(
@@ -7106,6 +7116,7 @@ fn stage_command_conflicting_receipt_does_not_store_orphan_content() {
         &version_2,
         &replica,
         "blake3:stale-conflicting-stage-command-receipt",
+        dfs.backend_receipt_slot_generation(&object_id, &version_2, &replica).unwrap(),
     )
     .expect("seed conflicting receipt");
 
@@ -7123,6 +7134,7 @@ fn stage_command_conflicting_receipt_does_not_store_orphan_content() {
                 bytes: bytes.to_vec(),
                 object_metadata: None,
                 authority_shard: None,
+                receipt_generation: 0,
             },
         )
         .expect("stage command response event");
@@ -7238,6 +7250,7 @@ fn assert_native_repair_receiver(name: &str, bytes: &[u8], advance_metadata: boo
             bytes: bytes.to_vec(),
             object_metadata: Some(metadata),
             authority_shard: Some(shard),
+            receipt_generation: 0,
         }),
     );
     let before = runtime.rpc_observations().len();
@@ -7390,7 +7403,13 @@ fn unmanaged_manifest_reconnect_requires_native_receipt_publication() {
             &stat.object_id,
             &stat.version,
             &removed.replica_node_id,
-            stat.content_hash.as_deref().unwrap()
+            stat.content_hash.as_deref().unwrap(),
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &removed.replica_node_id,
+            )
+            .unwrap(),
         )
         .unwrap()
     );
@@ -7439,7 +7458,13 @@ fn unmanaged_manifest_reconnect_requires_native_receipt_publication() {
             &stat.object_id,
             &stat.version,
             &receipt.replica_node_id,
-            stat.content_hash.as_deref().unwrap()
+            stat.content_hash.as_deref().unwrap(),
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &receipt.replica_node_id,
+            )
+            .unwrap(),
         )
         .unwrap(),
         "the same actual receipt is published once"
@@ -7489,6 +7514,7 @@ fn commit_version_conflicting_receipt_does_not_advance_visible_metadata() {
         &version_2,
         &replica,
         "blake3:stale-conflicting-commit-receipt",
+        dfs.backend_receipt_slot_generation(&object_id, &version_2, &replica).unwrap(),
     )
     .expect("seed conflicting receipt");
 
@@ -7897,7 +7923,13 @@ fn duplicate_metadata_receipt_publication_is_idempotent() {
             &stat.object_id,
             &stat.version,
             &receipt.replica_node_id,
-            hash
+            hash,
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &receipt.replica_node_id,
+            )
+            .unwrap(),
         )
         .unwrap()
     );
@@ -7913,7 +7945,13 @@ fn duplicate_metadata_receipt_publication_is_idempotent() {
             &stat.object_id,
             &stat.version,
             &receipt.replica_node_id,
-            hash
+            hash,
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &receipt.replica_node_id,
+            )
+            .unwrap(),
         )
         .unwrap()
     );
@@ -7943,7 +7981,13 @@ fn conflicting_metadata_receipt_from_same_replica_is_rejected() {
             &stat.object_id,
             &stat.version,
             &receipt.replica_node_id,
-            hash
+            hash,
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &receipt.replica_node_id,
+            )
+            .unwrap(),
         )
         .unwrap()
     );
@@ -7960,6 +8004,12 @@ fn conflicting_metadata_receipt_from_same_replica_is_rejected() {
             &stat.version,
             &receipt.replica_node_id,
             "blake3:receipt-conflicting",
+            dfs.backend_receipt_slot_generation(
+                &stat.object_id,
+                &stat.version,
+                &receipt.replica_node_id,
+            )
+            .unwrap(),
         )
         .expect_err("conflicting receipt must be rejected");
     assert!(

@@ -1068,6 +1068,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(confirmed_locations.into_iter().collect())
     }
 
+    /// Publish one receipt at the slot generation its evidence was planned
+    /// against. A later withdrawal makes this a typed
+    /// [`DfsError::ReceiptGenerationSuperseded`]; the metadata writer enforces
+    /// the same compare when the publication is prepared and committed. An
+    /// already present receipt at that generation publishes nothing new.
     pub(crate) fn put_metadata_receipt(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -1075,12 +1080,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
         replica_node_id: &NodeId,
         content_hash: &str,
+        generation: u64,
     ) -> Result<bool, DfsError> {
         self.ensure_metadata_receipt_accepts(object_id, version, replica_node_id, content_hash)?;
         let object = self.current_object_for_write(object_id)?;
         if object.file_system_id != *file_system_id {
             return Err(DfsError::Metadata {
                 message: "receipt filesystem differs from its actual object".into(),
+            });
+        }
+        let current = self.backend_receipt_slot_generation(object_id, version, replica_node_id)?;
+        if current != generation {
+            return Err(DfsError::ReceiptGenerationSuperseded {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                replica_node_id: replica_node_id.clone(),
+                expected: generation,
+                current,
             });
         }
         let existing = self.backend_receipt_for_replica(object_id, version, replica_node_id)?;
@@ -1099,6 +1115,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replica_node_id: replica_node_id.clone(),
                     content_hash: Some(content_hash.into()),
                     received_at: OffsetDateTime::now_utc(),
+                    generation,
                 },
             });
         }
@@ -1354,6 +1371,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .backend_receipt_for_replica(&intent.object_id, &intent.target_version, replica)?
                 .is_none()
             {
+                // These holders were planned against this same table state.
+                let generation = self.backend_receipt_slot_generation(
+                    &intent.object_id,
+                    &intent.target_version,
+                    replica,
+                )?;
                 effects.push(DfsPreparedMetadataEffect::PutReceipt {
                     receipt: DfsReplicaReceiptRecord {
                         receipt: DfsWriteReceipt {
@@ -1366,6 +1389,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         replica_node_id: replica.clone(),
                         content_hash: Some(content_hash.into()),
                         received_at: OffsetDateTime::now_utc(),
+                        generation,
                     },
                 });
             }
@@ -1718,21 +1742,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(committed_object.clone()),
         );
         intent_record.created_at = pending_intent_record.created_at;
+        // The sealed W receipts plan against this same table state; the
+        // prepared publication compares each slot generation again.
         let receipts = durable_nodes
             .iter()
-            .map(|replica_node_id| DfsReplicaReceiptRecord {
-                receipt: DfsWriteReceipt {
-                    file_system_id: intent.file_system_id.clone(),
-                    object_id: intent.object_id.clone(),
-                    committed_version: intent.target_version.clone(),
-                    owner_node_id: self.node_id.clone(),
-                    event_id: EventId::generate(),
-                },
-                replica_node_id: replica_node_id.clone(),
-                content_hash: Some(content_hash.to_string()),
-                received_at: OffsetDateTime::now_utc(),
+            .map(|replica_node_id| {
+                Ok(DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: intent.file_system_id.clone(),
+                        object_id: intent.object_id.clone(),
+                        committed_version: intent.target_version.clone(),
+                        owner_node_id: self.node_id.clone(),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id: replica_node_id.clone(),
+                    content_hash: Some(content_hash.to_string()),
+                    received_at: OffsetDateTime::now_utc(),
+                    generation: self.backend_receipt_slot_generation(
+                        &intent.object_id,
+                        &intent.target_version,
+                        replica_node_id,
+                    )?,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, DfsError>>()?;
         let mut touched_parent = None;
         let create_transaction = if first_visible_create {
             if durable_object_exists {

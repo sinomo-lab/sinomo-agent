@@ -7020,6 +7020,7 @@ mod selected_custody_pause_tests {
                     result: DfsBlobTransferResult::Rejected {
                         reason: "wrong-family".into(),
                     },
+                    receipt_generation: 0,
                 });
             assert!(captured_write_reply(&expected, &observation, wrong).is_err());
             let mut foreign_call = observation.clone();

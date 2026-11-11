@@ -5355,6 +5355,7 @@ pub(crate) mod tests {
                 assignment: crate::DfsMetadataShardAssignment::Root,
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             }),
+            receipt_generation: 0,
         };
         let message = crate::DfsRoutedMessage {
             source_node_id: producer,
@@ -5438,6 +5439,7 @@ pub(crate) mod tests {
                     content_hash: command.content_hash.clone(),
                 }
             },
+            receipt_generation: 0,
         }
     }
 

@@ -122,6 +122,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.object_id.clone(),
             command.version.clone(),
             result.clone(),
+            command.receipt_generation,
         )?;
         Ok(self.repair_replica_result_event(
             command.intent_id,
@@ -423,6 +424,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     version: command.version.clone(),
                     replica_node_id: self.node_id.clone(),
                     result: result.clone(),
+                    receipt_generation: command.receipt_generation,
                 },
             },
         );
@@ -434,6 +436,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.object_id.clone(),
             command.version.clone(),
             result.clone(),
+            command.receipt_generation,
         );
         if let Some(started) = response_started {
             dfs_perf_trace(format_args!(
@@ -554,6 +557,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.object_id.clone(),
             command.version.clone(),
             result.clone(),
+            command.receipt_generation,
         )?;
         Ok(self.stage_blob_result_event(
             command.intent_id,
@@ -572,6 +576,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: DfsObjectId,
         version: DfsVersion,
         result: DfsBlobTransferResult,
+        receipt_generation: u64,
     ) -> Result<(), DfsError> {
         self.send_dfs_message_if_routable(
             requester_node_id,
@@ -583,6 +588,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 version,
                 replica_node_id: self.node_id.clone(),
                 result,
+                receipt_generation,
             }),
         )?;
         Ok(())
@@ -916,13 +922,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &response.intent_id,
                             content_hash,
                         )?;
-                        service.put_metadata_receipt(
+                        if let Err(error) = service.put_metadata_receipt(
                             &response.file_system_id,
                             &response.object_id,
                             &response.version,
                             &response.replica_node_id,
                             content_hash,
-                        )?;
+                            response.receipt_generation,
+                        ) {
+                            if !matches!(error, DfsError::ReceiptGenerationSuperseded { .. }) {
+                                return Err(error);
+                            }
+                            // A withdrawal after this stage was planned
+                            // supersedes it; a later attempt plans afresh.
+                            service.record_stage_retry_scheduled(
+                                &response.intent_id,
+                                &response.replica_node_id,
+                            );
+                            return Ok(NetworkedDfsServiceEvent::BlobStageRejected {
+                                intent_id: response.intent_id.clone(),
+                                object_id: response.object_id.clone(),
+                                replica_node_id: response.replica_node_id.clone(),
+                                reason: error.to_string(),
+                            });
+                        }
                         let intent_was_committed = service
                             .coordinator
                             .intent(&response.intent_id)

@@ -2960,9 +2960,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?
                 .is_some();
             if !exists {
-                family_effects.push(crate::DfsPreparedMetadataEffect::PutReceipt {
-                    receipt: receipt.clone(),
-                });
+                // Receipt-slot generations belong to the authority that
+                // publishes the slot. Adopted evidence enters at this shard's
+                // current slot generation; the authority change already
+                // fences replies planned against the source shard.
+                let mut adopted = receipt.clone();
+                adopted.generation = self.backend_receipt_slot_generation(
+                    &receipt.receipt.object_id,
+                    &receipt.receipt.committed_version,
+                    &receipt.replica_node_id,
+                )?;
+                family_effects
+                    .push(crate::DfsPreparedMetadataEffect::PutReceipt { receipt: adopted });
             }
         }
         if let Some(backend) = self.metadata_backend.as_ref() {

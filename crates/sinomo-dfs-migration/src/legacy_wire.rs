@@ -3315,6 +3315,7 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
         | "metadata-effect/put-namespace-job-receipt"
         | "metadata-effect/put-namespace-request-receipt" => &["receipt"],
         "metadata-effect/remove-receipt" => &["object_id", "version", "replica_node_id"],
+        "metadata-effect/withdraw-receipt" => &["withdrawal"],
         "metadata-effect/put-intent" => &["intent"],
         "metadata-effect/remove-retained-repair-owner" => &["object_id", "intent_id"],
         "metadata-effect/remove-intent-receipt" => &["object_id", "intent_id", "retention"],
@@ -3497,7 +3498,20 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
             "expected_parent_version",
             "receipt",
         ],
-        "replica-receipt" => &["receipt", "replica_node_id", "content_hash", "received_at"],
+        "replica-receipt" => &[
+            "receipt",
+            "replica_node_id",
+            "content_hash",
+            "received_at",
+            "generation",
+        ],
+        "receipt-withdrawal" => &[
+            "file_system_id",
+            "object_id",
+            "version",
+            "replica_node_id",
+            "generation",
+        ],
         "write-receipt" => &[
             "file_system_id",
             "object_id",
@@ -4186,6 +4200,7 @@ fn original_omit(schema: &str, key: &str, value: &Value) -> bool {
                 | "created_at_unix_nanos"
                 | "changed_at_unix_nanos"
         ) | ("legacy-version", "history_order")
+            | ("replica-receipt", "generation")
     ) && value.as_u64() == Some(0)
     {
         return true;
@@ -4274,7 +4289,7 @@ fn original_omit(schema: &str, key: &str, value: &Value) -> bool {
                     "local-write-proof",
                     "expected_parent_object_id" | "expected_parent_version"
                 )
-                | ("replica-receipt", "content_hash")
+                | ("replica-receipt", "content_hash" | "generation")
                 | (
                     "adopt-object-at-path",
                     "pin_transfer_id"
@@ -4356,6 +4371,7 @@ fn original_child(schema: &str, key: &str) -> &'static str {
             "list/pin-transfer"
         }
         ("metadata-effect/put-receipt", "receipt") => "replica-receipt",
+        ("metadata-effect/withdraw-receipt", "withdrawal") => "receipt-withdrawal",
         ("metadata-effect/put-intent", "intent") => "intent",
         ("metadata-effect/put-intent-receipt", "receipt") => "intent-receipt",
         (

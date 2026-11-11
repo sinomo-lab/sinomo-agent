@@ -1516,6 +1516,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(intents.into_iter().map(|intent| intent.intent_id).collect())
     }
 
+    /// Current receipt-slot generation in the local metadata backend. A node
+    /// publishing its own receipt right after verifying its local content
+    /// plans against this generation; remote evidence carries the generation
+    /// its transfer was planned against instead.
+    pub(crate) fn backend_receipt_slot_generation(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<u64, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(0);
+        };
+        Ok(backend.receipt_slot_generation(object_id, version, replica_node_id)?)
+    }
+
     pub(crate) fn backend_receipt_for_replica(
         &self,
         object_id: &DfsObjectId,

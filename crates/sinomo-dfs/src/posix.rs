@@ -2944,6 +2944,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replica_node_id: self.node_id.clone(),
                     content_hash: object.content_hash.clone(),
                     received_at: time::OffsetDateTime::now_utc(),
+                    // Each bulk write names a new version, whose slots have
+                    // never been withdrawn.
+                    generation: 0,
                 },
             };
             let group =

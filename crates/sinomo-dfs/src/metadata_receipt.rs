@@ -58,7 +58,8 @@ pub(crate) fn replay_receipt_matches_existing(
             && existing.receipt.object_id == replayed.receipt.object_id
             && existing.receipt.committed_version == replayed.receipt.committed_version
             && existing.replica_node_id == replayed.replica_node_id
-            && existing.content_hash == replayed.content_hash)
+            && existing.content_hash == replayed.content_hash
+            && existing.generation == replayed.generation)
 }
 
 #[cfg(test)]
@@ -93,6 +94,7 @@ mod tests {
             replica_node_id: node("node_replica"),
             content_hash: content_hash.map(str::to_string),
             received_at: OffsetDateTime::UNIX_EPOCH,
+            generation: 0,
         }
     }
 

@@ -47,6 +47,9 @@ pub enum DfsPreparedMetadataEffect {
         version: DfsVersion,
         replica_node_id: NodeId,
     },
+    WithdrawReceipt {
+        withdrawal: DfsReplicaReceiptWithdrawalRecord,
+    },
     PutIntent {
         intent: DfsWriteIntentRecord,
     },
@@ -158,6 +161,9 @@ impl DfsPreparedMetadataEffect {
                 version,
                 replica_node_id,
             },
+            Self::WithdrawReceipt { withdrawal } => {
+                DfsMetadataTableOp::WithdrawReceipt { withdrawal }
+            }
             Self::PutIntent { intent } => DfsMetadataTableOp::PutIntent { intent },
             Self::RemoveRetainedRepairOwner {
                 object_id,
@@ -246,6 +252,9 @@ impl DfsPreparedMetadataEffect {
             }
             Self::PutReceipt { receipt } => {
                 ids.insert(receipt.receipt.object_id.clone());
+            }
+            Self::WithdrawReceipt { withdrawal } => {
+                ids.insert(withdrawal.object_id.clone());
             }
             Self::PutIntent { intent } => {
                 ids.insert(intent.object_id.clone());

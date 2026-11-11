@@ -122,6 +122,19 @@ pub enum DfsError {
         version: DfsVersion,
         content_hash: String,
     },
+    /// A receipt publisher planned against an older receipt-slot generation:
+    /// a later withdrawal superseded its attempt. Callers re-plan from the
+    /// current tables instead of retrying the superseded evidence.
+    #[error(
+        "DFS receipt slot of object {object_id} version {version} replica {replica_node_id} is at generation {current}, superseding planned generation {expected}"
+    )]
+    ReceiptGenerationSuperseded {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        replica_node_id: NodeId,
+        expected: u64,
+        current: u64,
+    },
     #[error("unauthorized DFS replica command from {source_node_id}: {reason}")]
     UnauthorizedReplicaCommand {
         source_node_id: NodeId,
@@ -297,6 +310,19 @@ impl From<MetadataBackendError> for DfsError {
                 message: error.to_string(),
             },
             MetadataBackendError::WritePreconditionFailed { failure } => Self::WritePreconditionFailed { failure },
+            MetadataBackendError::ReceiptGenerationSuperseded {
+                object_id,
+                version,
+                replica_node_id,
+                expected,
+                current,
+            } => Self::ReceiptGenerationSuperseded {
+                object_id,
+                version,
+                replica_node_id,
+                expected,
+                current,
+            },
             MetadataBackendError::AlreadyExists { path } => Self::AlreadyExists { path },
             MetadataBackendError::DirectoryNotEmpty { path } => Self::DirectoryNotEmpty { path },
             error => Self::Metadata {

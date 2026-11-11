@@ -2142,6 +2142,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
                 bytes: b"repair".to_vec(),
                 object_metadata: None,
                 authority_shard: None,
+                receipt_generation: 0,
             }),
         },
     })

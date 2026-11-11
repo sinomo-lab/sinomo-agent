@@ -1471,12 +1471,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_metadata: Option<&DfsObjectMetadata>,
     ) -> Result<(), DfsError> {
         if self.replica_command_metadata_is_authoritative(object_id, object_metadata)? {
+            // This receiver holds the content it just stored, so its own
+            // receipt plans against the slot's current generation.
+            let generation =
+                self.backend_receipt_slot_generation(object_id, version, replica_node_id)?;
             self.put_metadata_receipt(
                 file_system_id,
                 object_id,
                 version,
                 replica_node_id,
                 content_hash,
+                generation,
             )?;
         } else {
             self.ensure_metadata_receipt_accepts(
@@ -1501,12 +1506,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let persist_authoritative_metadata =
             self.replica_command_metadata_is_authoritative(object_id, object_metadata)?;
         if persist_authoritative_metadata {
+            // This receiver verified its own committed content just now.
+            let generation =
+                self.backend_receipt_slot_generation(object_id, version, replica_node_id)?;
             self.put_metadata_receipt(
                 file_system_id,
                 object_id,
                 version,
                 replica_node_id,
                 content_hash,
+                generation,
             )?;
         } else {
             self.ensure_metadata_receipt_accepts(

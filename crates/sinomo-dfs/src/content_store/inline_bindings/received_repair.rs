@@ -1038,6 +1038,7 @@ mod tests {
             bytes: bytes.to_vec(),
             object_metadata: None,
             authority_shard: None,
+            receipt_generation: 0,
         }
     }
 

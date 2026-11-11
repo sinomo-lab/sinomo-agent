@@ -1119,6 +1119,7 @@ mod tests {
             bytes: bytes.to_vec(),
             object_metadata: None,
             authority_shard: None,
+            receipt_generation: 0,
         };
         let pending = make_command("pending", b"pending material root");
         let bound = make_command("bound", b"bound material root");

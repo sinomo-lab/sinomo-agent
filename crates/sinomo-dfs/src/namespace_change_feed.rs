@@ -651,6 +651,7 @@ impl NamespaceChangeProjector<'_> {
                 | Effect::RemoveCrossShardPinTransfer { .. }
                 | Effect::PutReceipt { .. }
                 | Effect::RemoveReceipt { .. }
+                | Effect::WithdrawReceipt { .. }
                 | Effect::PutIntent { .. }
                 | Effect::RemoveRetainedRepairOwner { .. }
                 | Effect::PutIntentReceipt { .. }

@@ -262,6 +262,7 @@ mod tests {
                     result: crate::DfsBlobTransferResult::Committed {
                         content_hash: command.content_hash.clone(),
                     },
+                    receipt_generation: command.receipt_generation,
                 },
             ),
         };

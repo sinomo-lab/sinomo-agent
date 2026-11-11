@@ -7089,6 +7089,7 @@ mod tests {
                         bytes: Vec::new(),
                         object_metadata: None,
                         authority_shard: None,
+                        receipt_generation: 0,
                     }),
                 },
                 DfsOutboundAttachment::from_bytes(bytes, content_hash),
@@ -7147,6 +7148,7 @@ mod tests {
                                 result: DfsBlobTransferResult::Rejected {
                                     reason: "wire capture fixture has no receiver effect".into(),
                                 },
+                                receipt_generation: command.receipt_generation,
                             },
                         ),
                     }]
@@ -7304,6 +7306,7 @@ mod tests {
                 result: DfsBlobTransferResult::Rejected {
                     reason: "correlation DATA only".into(),
                 },
+                receipt_generation: command.receipt_generation,
             }),
         };
         let response = DfsMessageResponse {
@@ -7623,6 +7626,7 @@ mod tests {
                 bytes: Vec::new(),
                 object_metadata: None,
                 authority_shard: None,
+                receipt_generation: 0,
             }),
         };
         let (empty_repair_command, empty_repair_call) =

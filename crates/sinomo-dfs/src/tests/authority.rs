@@ -4915,6 +4915,11 @@ fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
             b"native content awaiting receipt publication",
         )
         .unwrap();
+    // The publisher plans once against this never-withdrawn slot; each retry
+    // below carries the same planned generation as its original attempt.
+    let planned_generation = owner
+        .backend_receipt_slot_generation(&original.object_id, &version, &shard.primary_node_id)
+        .unwrap();
     let stopped = shard.replica_node_ids[0].clone();
     runtime.stop_node(&stopped).unwrap();
     assert!(
@@ -4924,7 +4929,8 @@ fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
                 &original.object_id,
                 &version,
                 &shard.primary_node_id,
-                &manifest.content_hash
+                &manifest.content_hash,
+                planned_generation,
             )
             .is_err()
     );
@@ -4951,7 +4957,8 @@ fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
                 &original.object_id,
                 &version,
                 &shard.primary_node_id,
-                &crate::content_hash(b"changed receipt input")
+                &crate::content_hash(b"changed receipt input"),
+                planned_generation,
             )
             .is_err()
     );
@@ -4972,7 +4979,8 @@ fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
                 &original.object_id,
                 &version,
                 &shard.primary_node_id,
-                &manifest.content_hash
+                &manifest.content_hash,
+                planned_generation,
             )
             .unwrap()
     );
@@ -5028,7 +5036,8 @@ fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
                 &original.object_id,
                 &version,
                 &shard.primary_node_id,
-                &manifest.content_hash
+                &manifest.content_hash,
+                planned_generation,
             )
             .unwrap()
     );
@@ -5178,6 +5187,10 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
         .clone();
     assert_ne!(missing, owner);
     assert_ne!(missing, replica);
+    // Every retry below carries the generation its first attempt planned.
+    let planned_generation = source
+        .backend_receipt_slot_generation(&stat.object_id, &stat.version, &replica)
+        .unwrap();
     runtime.stop_node(&missing).unwrap();
     assert!(
         source
@@ -5186,7 +5199,8 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
                 &stat.object_id,
                 &stat.version,
                 &replica,
-                &hash
+                &hash,
+                planned_generation,
             )
             .is_err()
     );
@@ -5236,7 +5250,8 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
                 &stat.object_id,
                 &stat.version,
                 &replica,
-                &crate::content_hash(b"wrong receipt bytes")
+                &crate::content_hash(b"wrong receipt bytes"),
+                planned_generation,
             )
             .is_err()
     );
@@ -5280,6 +5295,7 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
         &stat.version,
         &replica,
         &hash,
+        planned_generation,
     );
     if let Err(error) = &replay {
         eprintln!("compound-receipt retry error: {error:?}");
@@ -5365,7 +5381,8 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
                 &stat.object_id,
                 &stat.version,
                 &replica,
-                &hash
+                &hash,
+                planned_generation,
             )
             .unwrap()
     );

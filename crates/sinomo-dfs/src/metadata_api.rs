@@ -1982,6 +1982,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsReplicaReceiptPage>;
 
+    /// Current generation of one receipt slot: the present receipt's, the
+    /// withdrawal tombstone's, or zero for a slot that was never withdrawn.
+    fn receipt_slot_generation(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<u64>;
+
     /// Inspect the active object/version intent index for a placement-owned
     /// repair contract. Compacted retry history is not a live obligation.
     fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool>;

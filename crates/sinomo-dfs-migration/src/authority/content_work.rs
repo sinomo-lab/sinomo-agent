@@ -948,6 +948,8 @@ impl NativeImportAuthority {
                         bytes: Vec::new(),
                         object_metadata: Some(object.clone()),
                         authority_shard: Some((*cfg).clone()),
+                        // Imported content stages into slots never withdrawn.
+                        receipt_generation: 0,
                     },
                 ),
             },
@@ -1123,6 +1125,8 @@ impl NativeImportAuthority {
                         replica_node_id: target.clone(),
                         content_hash: Some(hash.to_owned()),
                         received_at: time::OffsetDateTime::now_utc(),
+                        // Imported content enters slots that were never withdrawn.
+                        generation: 0,
                     });
                     continue;
                 }
@@ -1142,6 +1146,7 @@ impl NativeImportAuthority {
                 replica_node_id: target.clone(),
                 content_hash: Some(hash.to_owned()),
                 received_at: time::OffsetDateTime::now_utc(),
+                generation: 0,
             });
         }
         if receipts.len() < policy.min_commit_replicas {
@@ -2002,6 +2007,7 @@ mod tests {
                                 bytes: Vec::new(),
                                 object_metadata: Some(object.clone()),
                                 authority_shard: Some(request.authority.clone()),
+                                receipt_generation: 0,
                             },
                         ),
                     },

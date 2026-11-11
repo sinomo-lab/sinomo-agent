@@ -179,12 +179,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         has_current_manifest = true;
                         if may_refresh_local_replica_receipt {
                             let local_node_id = self.node_id.clone();
+                            // The local blob was checked just now.
+                            let generation = self.backend_receipt_slot_generation(
+                                &object.object_id,
+                                &object.version,
+                                &local_node_id,
+                            )?;
                             let receipt_inserted = self.put_metadata_receipt(
                                 &object.file_system_id,
                                 &object.object_id,
                                 &object.version,
                                 &local_node_id,
                                 &manifest.content_hash,
+                                generation,
                             )?;
                             if receipt_inserted {
                                 refreshed_receipts += 1;

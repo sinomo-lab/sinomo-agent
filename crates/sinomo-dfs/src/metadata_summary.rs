@@ -685,6 +685,7 @@ mod tests {
             replica_node_id,
             content_hash: object.content_hash.clone(),
             received_at: OffsetDateTime::UNIX_EPOCH,
+            generation: 0,
         }
     }
 

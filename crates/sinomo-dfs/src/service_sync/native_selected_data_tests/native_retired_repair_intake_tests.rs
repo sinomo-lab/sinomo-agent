@@ -261,6 +261,7 @@ fn held_normal_return(
             result: DfsBlobTransferResult::Committed {
                 content_hash: command.content_hash.clone()
             },
+            receipt_generation: command.receipt_generation,
         }
     );
     let now = repair_wire_calls(fixture);

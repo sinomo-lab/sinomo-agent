@@ -47,6 +47,9 @@ enum SnapshotRecord {
     Eviction {
         record: DfsPreparedOperationEviction,
     },
+    ReceiptWithdrawal {
+        record: DfsReplicaReceiptWithdrawalRecord,
+    },
 }
 #[derive(Default)]
 struct CopyCursor {
@@ -245,7 +248,12 @@ fn next_record(
                     record: record.clone(),
                 }
             })?,
-            25 => return Ok(None),
+            25 => next_map(&t.receipt_withdrawals, &cursor.key, |_, record| {
+                SnapshotRecord::ReceiptWithdrawal {
+                    record: record.clone(),
+                }
+            })?,
+            26 => return Ok(None),
             _ => return Err("unknown metadata snapshot cursor family".into()),
         };
         if let Some((record, key)) = next {
@@ -286,9 +294,15 @@ fn apply_record(tables: &mut DfsMetadataTables, record: SnapshotRecord) -> Resul
                 return Err(error("snapshot repeats an evicted operation identity"));
             }
         }
+        // A present receipt is installed table state with its generation, not
+        // a publication compared against the partially loaded image.
+        SnapshotRecord::Table {
+            op: op @ DfsMetadataTableOp::PutReceipt { .. },
+        } => tables.apply(op),
         SnapshotRecord::Table { op } => {
             tables.apply_checked(op)?;
         }
+        SnapshotRecord::ReceiptWithdrawal { record } => tables.load_receipt_withdrawal(record)?,
         SnapshotRecord::Transfer { transfer } => {
             let key = (transfer.object_id.clone(), transfer.transfer_id.clone());
             if tables

@@ -308,6 +308,7 @@ mod tests {
                     bytes,
                     object_metadata: None,
                     authority_shard: None,
+                    receipt_generation: 0,
                 }),
             },
         }

@@ -1138,6 +1138,17 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::receipt_for_replica(self, object_id, version, replica_node_id)
     }
 
+    fn receipt_slot_generation(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<u64> {
+        Ok(self
+            .current_tables_snapshot()?
+            .receipt_slot_generation(object_id, version, replica_node_id))
+    }
+
     fn write_intent_counter_floor(&self) -> Result<u64> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.intent_receipt_retention.max_evicted_counter())

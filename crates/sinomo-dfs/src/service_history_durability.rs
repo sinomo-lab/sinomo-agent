@@ -3,7 +3,7 @@
 
 use crate::*;
 use sinomo_core::DfsObjectPolicy;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -121,9 +121,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             blob,
         )?;
 
-        let mut durable = BTreeSet::new();
+        // Each copy plans against its slot generation before the transfer;
+        // the local copy was verified above, so it plans against the current one.
+        let mut durable = BTreeMap::new();
         if desired.contains(&self.node_id) {
-            durable.insert(self.node_id.clone());
+            let generation = self.backend_receipt_slot_generation(
+                &object.object_id,
+                &version.version,
+                &self.node_id,
+            )?;
+            durable.insert(self.node_id.clone(), generation);
         }
         let deadline = self
             .transport
@@ -138,8 +145,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if durable.len() >= policy.min_commit_replicas {
                 break;
             }
-            if self.stage_history_grant_copy(&node, object, version, deadline)? {
-                durable.insert(node);
+            let generation =
+                self.backend_receipt_slot_generation(&object.object_id, &version.version, &node)?;
+            if self.stage_history_grant_copy(&node, object, version, generation, deadline)? {
+                durable.insert(node, generation);
             }
         }
         if durable.len() < policy.min_commit_replicas {
@@ -152,7 +161,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Seal the actual content receipts in one current prepared payload.
         // Its captured owner epoch is revalidated by the publication guard.
         let mut effects = Vec::new();
-        for node in durable {
+        for (node, generation) in durable {
             self.ensure_metadata_receipt_accepts(&object.object_id, &version.version, &node, hash)?;
             let receipt = DfsReplicaReceiptRecord {
                 receipt: sinomo_core::DfsWriteReceipt {
@@ -165,6 +174,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_id: node,
                 content_hash: Some(hash.to_string()),
                 received_at: OffsetDateTime::now_utc(),
+                generation,
             };
             effects.push(crate::DfsPreparedMetadataEffect::PutReceipt { receipt });
         }
@@ -213,6 +223,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         node: &NodeId,
         object: &DfsObjectMetadata,
         version: &DfsObjectVersionRecord,
+        receipt_generation: u64,
         deadline: Instant,
     ) -> Result<bool, DfsError> {
         if Instant::now() >= deadline {
@@ -241,6 +252,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 bytes: Vec::new(),
                 object_metadata: Some(object.clone()),
                 authority_shard,
+                receipt_generation,
             }),
             DfsOutboundAttachment::from_reader(reader, size, hash),
         )?;
@@ -264,7 +276,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         && response.intent_id == intent_id
                         && response.file_system_id == object.file_system_id
                         && response.object_id == object.object_id
-                        && response.version == version.version;
+                        && response.version == version.version
+                        && response.receipt_generation == receipt_generation;
                     if exact {
                         acknowledged = Some(matches!(&response.result,
                             DfsBlobTransferResult::Durable { content_hash }

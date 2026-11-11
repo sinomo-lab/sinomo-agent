@@ -206,6 +206,7 @@ fn native_owned_original_repair_return_keeps_exact_call_and_source_state() {
                 result: DfsBlobTransferResult::Committed {
                     content_hash: command.content_hash.clone()
                 },
+                receipt_generation: command.receipt_generation,
             }
         );
         // C's routed frame/message counters are preserved, never equated with

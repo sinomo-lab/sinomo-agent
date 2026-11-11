@@ -2145,6 +2145,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.object_id.clone(),
             command.version.clone(),
             result.clone(),
+            command.receipt_generation,
         )?;
         Ok(self.repair_replica_result_event(
             command.intent_id,
@@ -2201,7 +2202,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.metadata.add_object(object)?;
         self.commit_local_metadata(&command.object_id, &command.version, &command.content_hash, dfs_now_unix_nanos())?;
-        let response = DfsRepairReplicaResponse { request_id: command.request_id.clone(), intent_id: command.intent_id.clone(), file_system_id: command.file_system_id.clone(), object_id: command.object_id.clone(), version: command.version.clone(), replica_node_id: self.node_id.clone(), result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() } };
+        let response = DfsRepairReplicaResponse { request_id: command.request_id.clone(), intent_id: command.intent_id.clone(), file_system_id: command.file_system_id.clone(), object_id: command.object_id.clone(), version: command.version.clone(), replica_node_id: self.node_id.clone(), result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() }, receipt_generation: command.receipt_generation };
         let outcome = NativeOriginalRepairOutcome { admission, response, prepared_seal: bound.prepared_seal().into(), bound_id: bound.bound_id() };
         let response = self.content.finish_original_repair(&bound, &outcome)?;
         self.send_dfs_message_if_routable(&requester, DfsNetworkMessage::RepairReplicaResponse(response.clone()))?;
@@ -2581,6 +2582,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// A reply planned before a later withdrawal of its receipt slot finished
+    /// its transfer but cannot publish. An ordinary attempt is complete and
+    /// its target is due again, so the next pass plans at the current slot
+    /// generation instead of resending this attempt. An enrolled original
+    /// keeps its immutable command, so it backs off as a rejected attempt.
+    fn record_superseded_repair_response(
+        &mut self,
+        response: &DfsRepairReplicaResponse,
+        original: bool,
+        superseded: &DfsError,
+    ) -> Result<(), DfsError> {
+        if original {
+            let rejected = DfsRepairReplicaResponse {
+                result: DfsBlobTransferResult::Rejected {
+                    reason: superseded.to_string(),
+                },
+                ..response.clone()
+            };
+            self.record_owned_repair_terminal_response(&rejected)?;
+            self.record_repair_retry_scheduled(&response.intent_id, &response.replica_node_id);
+            return Ok(());
+        }
+        self.record_owned_repair_terminal_response(response)?;
+        if let Some(state) = self
+            .writes
+            .pending_writes
+            .get_mut(&response.intent_id)
+            .and_then(|pending| pending.repair_retries.get_mut(&response.replica_node_id))
+        {
+            wake_repair_retry_state(state);
+        }
+        Ok(())
+    }
+
     fn ensure_repair_response_matches_pending(
         &self,
         response: &DfsRepairReplicaResponse,
@@ -2827,13 +2862,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 let event =
                     self.with_placement_intent_authority(&response.intent_id, |service| {
-                        service.put_metadata_receipt(
+                        if let Err(error) = service.put_metadata_receipt(
                             &response.file_system_id,
                             &response.object_id,
                             &response.version,
                             &response.replica_node_id,
                             content_hash,
-                        )?;
+                            response.receipt_generation,
+                        ) {
+                            if !matches!(error, DfsError::ReceiptGenerationSuperseded { .. }) {
+                                return Err(error);
+                            }
+                            let original = original_store
+                                .as_ref()
+                                .map(|store| {
+                                    store.original_repair_for_result(&service.node_id, &response)
+                                })
+                                .transpose()?
+                                .flatten()
+                                .is_some();
+                            service.record_superseded_repair_response(
+                                &response,
+                                original,
+                                &error,
+                            )?;
+                            return Ok(NetworkedDfsServiceEvent::RepairRejected {
+                                intent_id: response.intent_id.clone(),
+                                object_id: response.object_id.clone(),
+                                replica_node_id: response.replica_node_id.clone(),
+                                reason: error.to_string(),
+                            });
+                        }
                         #[cfg(test)]
                         if let Some(store) = &original_store
                             && let Some(birth) =
@@ -3013,6 +3072,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: DfsObjectId,
         version: DfsVersion,
         result: DfsBlobTransferResult,
+        receipt_generation: u64,
     ) -> Result<(), DfsError> {
         self.send_dfs_message_if_routable(
             requester_node_id,
@@ -3024,6 +3084,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 version,
                 replica_node_id: self.node_id.clone(),
                 result,
+                receipt_generation,
             }),
         )?;
         Ok(())
@@ -7282,6 +7343,7 @@ mod received_repair_content_tests {
                 version: version.clone(), content_hash: manifest.content_hash.clone(), bytes: Vec::new(), object_metadata: Some(object.clone()),
                 authority_shard: Some(DfsMetadataShardConfig { file_system_id: object.file_system_id.clone(), shard_id: "root".into(), primary_node_id: producer,
                     replica_node_ids: vec![target], epoch: 7, assignment: DfsMetadataShardAssignment::Root, default_policy: DfsObjectPolicy::ReplicatedEventual }),
+                receipt_generation: 0,
             }) };
         let descriptor = DfsRpcAttachmentDescriptor { total_size_bytes: manifest.size_bytes, content_hash: Some(manifest.content_hash.clone()) };
         let retained = content.capture_repair_payload(
@@ -7623,6 +7685,7 @@ mod received_repair_content_tests {
             bytes,
             object_metadata: None,
             authority_shard: None,
+            receipt_generation: 0,
         };
         (service, requester, command)
     }
@@ -8459,6 +8522,11 @@ mod receipt_projection_tests {
                 .is_some()
         );
         let mut publisher = runtime.metadata_primary_service(path).unwrap();
+        // The peer's verified bytes are republished after the withdrawal
+        // above, so the publication plans against the advanced slot.
+        let generation = publisher
+            .backend_receipt_slot_generation(&stat.object_id, &stat.version, &peer)
+            .unwrap();
         assert!(
             publisher
                 .put_metadata_receipt(
@@ -8466,7 +8534,8 @@ mod receipt_projection_tests {
                     &stat.object_id,
                     &stat.version,
                     &peer,
-                    stat.content_hash.as_deref().unwrap()
+                    stat.content_hash.as_deref().unwrap(),
+                    generation,
                 )
                 .unwrap()
         );

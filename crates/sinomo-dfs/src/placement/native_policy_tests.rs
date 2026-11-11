@@ -1625,6 +1625,13 @@ fn native_same_service_local_receipt_control(check_negatives: bool) {
                 &written.version,
                 &other_node,
                 written.content_hash.as_deref().unwrap(),
+                service
+                    .backend_receipt_slot_generation(
+                        &written.object_id,
+                        &written.version,
+                        &other_node,
+                    )
+                    .unwrap(),
             )
             .unwrap();
         assert!(
@@ -1635,6 +1642,13 @@ fn native_same_service_local_receipt_control(check_negatives: bool) {
                     &written.version,
                     &other_node,
                     written.content_hash.as_deref().unwrap(),
+                    service
+                        .backend_receipt_slot_generation(
+                            &written.object_id,
+                            &written.version,
+                            &other_node
+                        )
+                        .unwrap(),
                 )
                 .unwrap()
         );
@@ -1683,6 +1697,9 @@ fn native_same_service_local_receipt_control(check_negatives: bool) {
                 &written.version,
                 &primary,
                 written.content_hash.as_deref().unwrap(),
+                service
+                    .backend_receipt_slot_generation(&written.object_id, &written.version, &primary)
+                    .unwrap(),
             )
             .unwrap();
         assert!(
@@ -1693,6 +1710,13 @@ fn native_same_service_local_receipt_control(check_negatives: bool) {
                     &written.version,
                     &primary,
                     written.content_hash.as_deref().unwrap(),
+                    service
+                        .backend_receipt_slot_generation(
+                            &written.object_id,
+                            &written.version,
+                            &primary
+                        )
+                        .unwrap(),
                 )
                 .unwrap()
         );

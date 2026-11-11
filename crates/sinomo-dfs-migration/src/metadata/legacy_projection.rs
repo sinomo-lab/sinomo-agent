@@ -356,6 +356,7 @@ impl LegacyProjection {
                 .cross_shard_pin_transfers
                 .push(wire::normalize_pin_transfer(row)?),
             "receipts" => self.seed.receipts.push(decode(row)?),
+            "receipt_withdrawals" => self.seed.receipt_withdrawals.push(decode(row)?),
             "intents" => self.seed.intents.push(wire::normalize_intent(row)?),
             "intent_receipts" => self
                 .seed

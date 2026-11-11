@@ -1803,6 +1803,12 @@ fn protect_prepared_operation(
                 ));
                 hashes.extend(receipt.content_hash.iter().cloned());
             }
+            Effect::WithdrawReceipt { withdrawal } => {
+                versions.insert(DfsMetadataVersionIdentity::new(
+                    withdrawal.object_id.clone(),
+                    withdrawal.version.clone(),
+                ));
+            }
             Effect::PutIntent { intent } => {
                 versions.insert(DfsMetadataVersionIdentity::new(
                     intent.object_id.clone(),
@@ -3131,6 +3137,7 @@ mod tests {
                 replica_node_id: replica,
                 content_hash: Some("blake3:receipt-before-version".to_string()),
                 received_at: timestamp(3),
+                generation: 0,
             },
         );
 

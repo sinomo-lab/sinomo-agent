@@ -16,6 +16,7 @@ fn repair_background_hint_is_required_and_explicit_priorities_round_trip() {
         bytes: vec![1, 2, 3],
         object_metadata: None,
         authority_shard: None,
+        receipt_generation: 0,
     };
     let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
     let foreground = serde_json::to_value(&command).unwrap();
@@ -300,6 +301,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
             bytes: bytes.clone(),
             object_metadata: None,
             authority_shard: None,
+            receipt_generation: 0,
         },
         "bytes",
     );
@@ -317,6 +319,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
             bytes: bytes.clone(),
             object_metadata: None,
             authority_shard: None,
+            receipt_generation: 0,
         },
         "bytes",
     );
@@ -333,6 +336,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
             bytes: bytes.clone(),
             object_metadata: None,
             authority_shard: None,
+            receipt_generation: 0,
         },
         "bytes",
     );

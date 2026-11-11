@@ -885,6 +885,12 @@ pub(crate) fn validate_preparation_against_tables(
         );
     }
     for receipt in &record.payload.content_receipts {
+        // Sealed content evidence names the slot generation it was planned
+        // against; a later withdrawal supersedes it before it becomes durable.
+        if let Err(error) = tables.validate_receipt_publication(receipt) {
+            rollback.rollback(tables);
+            return Err(error);
+        }
         tables.apply_with_rollback(
             DfsMetadataTableOp::PutReceipt {
                 receipt: receipt.clone(),
@@ -1940,6 +1946,21 @@ fn validate_metadata_effects(
 ) -> Result<()> {
     use crate::DfsPreparedMetadataEffect as E;
     let mut intent_identities = std::collections::BTreeMap::new();
+    // Receipt-slot generations as the sealed effects advance them in order.
+    type SlotKey = (crate::DfsObjectId, crate::DfsVersion, sinomo_core::node::NodeId);
+    fn slot_generation(
+        tables: &DfsMetadataTables,
+        slots: &std::collections::BTreeMap<SlotKey, u64>,
+        object_id: &crate::DfsObjectId,
+        version: &crate::DfsVersion,
+        node: &sinomo_core::node::NodeId,
+    ) -> u64 {
+        slots
+            .get(&(object_id.clone(), version.clone(), node.clone()))
+            .copied()
+            .unwrap_or_else(|| tables.receipt_slot_generation(object_id, version, node))
+    }
+    let mut slot_generations = std::collections::BTreeMap::<SlotKey, u64>::new();
     for effect in &record.metadata_effects {
         let scope = match effect {
             E::PutFileSystem { file_system } => Some(&file_system.file_system_id),
@@ -1947,6 +1968,7 @@ fn validate_metadata_effects(
             E::PutVersion { version } => Some(&version.file_system_id),
             E::PutVersionPin { pin } => Some(&pin.file_system_id),
             E::PutReceipt { receipt } => Some(&receipt.receipt.file_system_id),
+            E::WithdrawReceipt { withdrawal } => Some(&withdrawal.file_system_id),
             E::PutIntent { intent } => Some(&intent.file_system_id),
             E::PutIntentReceipt { receipt } => Some(&receipt.file_system_id),
             E::PutAdvisoryLockState { state } => Some(&state.file_system_id),
@@ -2163,6 +2185,82 @@ fn validate_metadata_effects(
                         "receipt effect scope mismatch".into(),
                     ));
                 }
+                let current = slot_generation(
+                    tables,
+                    &slot_generations,
+                    &receipt.receipt.object_id,
+                    &receipt.receipt.committed_version,
+                    &receipt.replica_node_id,
+                );
+                if current != receipt.generation {
+                    return Err(MetadataBackendError::ReceiptGenerationSuperseded {
+                        object_id: receipt.receipt.object_id.clone(),
+                        version: receipt.receipt.committed_version.clone(),
+                        replica_node_id: receipt.replica_node_id.clone(),
+                        expected: receipt.generation,
+                        current,
+                    });
+                }
+                slot_generations.insert(
+                    (
+                        receipt.receipt.object_id.clone(),
+                        receipt.receipt.committed_version.clone(),
+                        receipt.replica_node_id.clone(),
+                    ),
+                    receipt.generation,
+                );
+            }
+            E::WithdrawReceipt { withdrawal } => {
+                let expected = withdrawal.generation.checked_sub(1).ok_or_else(|| {
+                    MetadataBackendError::Serde("receipt withdrawal must advance its slot".into())
+                })?;
+                let current = slot_generation(
+                    tables,
+                    &slot_generations,
+                    &withdrawal.object_id,
+                    &withdrawal.version,
+                    &withdrawal.replica_node_id,
+                );
+                if current != expected {
+                    return Err(MetadataBackendError::ReceiptGenerationSuperseded {
+                        object_id: withdrawal.object_id.clone(),
+                        version: withdrawal.version.clone(),
+                        replica_node_id: withdrawal.replica_node_id.clone(),
+                        expected,
+                        current,
+                    });
+                }
+                if !tables.receipt_version_is_live(&withdrawal.object_id, &withdrawal.version) {
+                    return Err(MetadataBackendError::Serde(
+                        "receipt withdrawal targets a collected version".into(),
+                    ));
+                }
+                // A withdrawn slot cannot remain a listed head or version location.
+                let node = &withdrawal.replica_node_id;
+                let head_listed = tables.objects.get(&withdrawal.object_id).is_some_and(|object| {
+                    object.version == withdrawal.version && object.current_locations.contains(node)
+                });
+                let version_listed = tables
+                    .versions
+                    .get(&(withdrawal.object_id.clone(), withdrawal.version.clone()))
+                    .is_some_and(|version| version.locations.contains(node));
+                let head_cleared = record.metadata_effects.iter().any(|effect| {
+                    matches!(effect, E::PutObject { object }
+                        if object.object_id == withdrawal.object_id
+                            && !object.current_locations.contains(node))
+                });
+                let version_cleared = record.metadata_effects.iter().any(|effect| {
+                    matches!(effect, E::PutVersion { version }
+                        if version.object_id == withdrawal.object_id
+                            && version.version == withdrawal.version
+                            && !version.locations.contains(node))
+                });
+                if (head_listed && !head_cleared) || (version_listed && !version_cleared) {
+                    return Err(MetadataBackendError::Serde(
+                        "receipt withdrawal leaves its replica listed as a location".into(),
+                    ));
+                }
+                slot_generations.insert(withdrawal.slot_key(), withdrawal.generation);
             }
             E::RemovePreparedOperation { digest } => {
                 let target = tables

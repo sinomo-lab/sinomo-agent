@@ -6,6 +6,7 @@
 use std::io;
 use std::path::PathBuf;
 
+use sinomo_core::node::NodeId;
 use thiserror::Error;
 
 use crate::{
@@ -58,6 +59,18 @@ pub enum MetadataBackendError {
     MembershipHandoffFrozen {
         shard_id: DfsMetadataShardId,
         handoff_id: String,
+    },
+    /// The receipt slot advanced past the generation its publisher planned
+    /// against: a later withdrawal superseded that attempt.
+    #[error(
+        "receipt slot of object {object_id} version {version} replica {replica_node_id} is at generation {current}, superseding planned generation {expected}"
+    )]
+    ReceiptGenerationSuperseded {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        replica_node_id: NodeId,
+        expected: u64,
+        current: u64,
     },
     #[error(
         "metadata transaction conflict for object {object_id}: expected {expected}, current {current}"

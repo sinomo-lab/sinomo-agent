@@ -189,6 +189,13 @@ pub(crate) fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
+    for withdrawal in tables.receipt_withdrawals.values() {
+        require_replica_snapshot_record_file_system(
+            "receipt withdrawal record",
+            &withdrawal.file_system_id,
+            expected,
+        )?;
+    }
     for intent in tables.intents.values() {
         crate::file_history::validate_intent_publication(intent)?;
         require_replica_snapshot_record_file_system(

@@ -32,11 +32,14 @@ use crate::metadata_records::{
     DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord,
     DfsNamespaceRequestStatus, DfsNamespaceTransactionReceipt, DfsObjectVersionRecord,
     DfsPathRecord, DfsPreparedOperationEviction, DfsPreparedOperationRecord,
-    DfsPreparedOperationStatus, DfsReplicaReceiptRecord, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, normalized_object_metadata,
+    DfsPreparedOperationStatus, DfsReplicaReceiptRecord, DfsReplicaReceiptWithdrawalRecord,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    normalized_object_metadata,
 };
 
 mod prepared_operation;
+#[cfg(test)]
+mod receipt_generation_tests;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
@@ -64,6 +67,11 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) cross_shard_pin_transfers:
         BTreeMap<(DfsObjectId, String), DfsCrossShardPinTransferRecord>,
     pub(crate) receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptRecord>,
+    /// Withdrawn receipt slots of live versions. A slot is present in at most
+    /// one of `receipts` and `receipt_withdrawals`; its generation is the row's
+    /// generation, or zero when neither row exists.
+    pub(crate) receipt_withdrawals:
+        BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptWithdrawalRecord>,
     pub(crate) intents: BTreeMap<(DfsObjectId, String), DfsWriteIntentRecord>,
     pub(crate) intent_receipts: BTreeMap<(DfsObjectId, String), DfsWriteIntentReceipt>,
     pub(crate) intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
@@ -736,6 +744,9 @@ impl DfsMetadataTables {
             DfsMetadataTableOp::PutReceipt { receipt } => {
                 DfsMetadataStatusMutationEffect::Object(receipt.receipt.object_id.clone())
             }
+            DfsMetadataTableOp::WithdrawReceipt { withdrawal } => {
+                DfsMetadataStatusMutationEffect::Object(withdrawal.object_id.clone())
+            }
             DfsMetadataTableOp::PutIntent { intent } => {
                 DfsMetadataStatusMutationEffect::Object(intent.object_id.clone())
             }
@@ -1045,6 +1056,12 @@ impl DfsMetadataTables {
     }
     pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
         match op {
+            DfsMetadataTableOp::PutReceipt { receipt } => {
+                self.validate_receipt_publication(receipt)
+            }
+            DfsMetadataTableOp::WithdrawReceipt { withdrawal } => {
+                self.validate_receipt_withdrawal(withdrawal)
+            }
             DfsMetadataTableOp::PutPreparedOperationV7 { record } => record.validate(),
             DfsMetadataTableOp::CommitPreparedOperationV7 {
                 digest,
@@ -1089,6 +1106,133 @@ impl DfsMetadataTables {
             _ => Ok(()),
         }
     }
+    /// Current generation of one receipt slot: the present receipt's, the
+    /// withdrawal tombstone's, or zero for a slot that was never withdrawn.
+    pub(crate) fn receipt_slot_generation(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> u64 {
+        let key = (object_id.clone(), version.clone(), replica_node_id.clone());
+        self.receipts
+            .get(&key)
+            .map(|receipt| receipt.generation)
+            .or_else(|| {
+                self.receipt_withdrawals
+                    .get(&key)
+                    .map(|withdrawal| withdrawal.generation)
+            })
+            .unwrap_or(0)
+    }
+
+    /// A version keeps its receipt-slot generations while it has a version row
+    /// or is its object's head; whole-version collection forgets them.
+    pub(crate) fn receipt_version_is_live(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> bool {
+        self.versions
+            .contains_key(&(object_id.clone(), version.clone()))
+            || self
+                .objects
+                .get(object_id)
+                .is_some_and(|object| object.version == *version)
+    }
+
+    fn receipt_withdrawal_keys_for_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Vec<(DfsObjectId, DfsVersion, NodeId)> {
+        self.receipt_withdrawals
+            .range((
+                Included((object_id.clone(), version.clone(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((object, slot_version, _), _)| {
+                object == object_id && slot_version == version
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Publication compare-and-swap: the receipt names the slot generation its
+    /// publisher planned against. A same-generation publication over a present
+    /// receipt leaves the generation unchanged.
+    pub(crate) fn validate_receipt_publication(
+        &self,
+        receipt: &DfsReplicaReceiptRecord,
+    ) -> Result<()> {
+        let current = self.receipt_slot_generation(
+            &receipt.receipt.object_id,
+            &receipt.receipt.committed_version,
+            &receipt.replica_node_id,
+        );
+        if current != receipt.generation {
+            return Err(MetadataBackendError::ReceiptGenerationSuperseded {
+                object_id: receipt.receipt.object_id.clone(),
+                version: receipt.receipt.committed_version.clone(),
+                replica_node_id: receipt.replica_node_id.clone(),
+                expected: receipt.generation,
+                current,
+            });
+        }
+        Ok(())
+    }
+
+    /// Withdrawal compare-and-swap: it advances exactly the observed slot
+    /// generation of a live version, whether or not a receipt is present.
+    fn validate_receipt_withdrawal(
+        &self,
+        withdrawal: &DfsReplicaReceiptWithdrawalRecord,
+    ) -> Result<()> {
+        let expected = withdrawal.generation.checked_sub(1).ok_or_else(|| {
+            MetadataBackendError::Serde("receipt withdrawal must advance its slot".into())
+        })?;
+        if !self.receipt_version_is_live(&withdrawal.object_id, &withdrawal.version) {
+            return Err(MetadataBackendError::Serde(
+                "receipt withdrawal targets a collected version".into(),
+            ));
+        }
+        let current = self.receipt_slot_generation(
+            &withdrawal.object_id,
+            &withdrawal.version,
+            &withdrawal.replica_node_id,
+        );
+        if current != expected {
+            return Err(MetadataBackendError::ReceiptGenerationSuperseded {
+                object_id: withdrawal.object_id.clone(),
+                version: withdrawal.version.clone(),
+                replica_node_id: withdrawal.replica_node_id.clone(),
+                expected,
+                current,
+            });
+        }
+        Ok(())
+    }
+
+    /// Install one withdrawn slot from a snapshot image. Snapshots carry table
+    /// state, not publications, so no generation compare applies.
+    pub(crate) fn load_receipt_withdrawal(
+        &mut self,
+        withdrawal: DfsReplicaReceiptWithdrawalRecord,
+    ) -> Result<()> {
+        let key = withdrawal.slot_key();
+        if withdrawal.generation == 0 || self.receipts.contains_key(&key) {
+            return Err(MetadataBackendError::Serde(
+                "snapshot receipt withdrawal must be the slot's only advanced row".into(),
+            ));
+        }
+        if self.receipt_withdrawals.insert(key, withdrawal).is_some() {
+            return Err(MetadataBackendError::Serde(
+                "snapshot repeats a receipt withdrawal".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_checked_with_rollback(
         &mut self,
         op: DfsMetadataTableOp,
@@ -1140,6 +1284,12 @@ impl DfsMetadataTables {
                     .clone();
                 record.status = status;
                 self.put_prepared_operation_indexed(record);
+                Ok(())
+            }
+            op @ (DfsMetadataTableOp::PutReceipt { .. }
+            | DfsMetadataTableOp::WithdrawReceipt { .. }) => {
+                self.validate_checked(&op)?;
+                self.apply_with_rollback(op, rollback);
                 Ok(())
             }
             op => {
@@ -1229,6 +1379,7 @@ impl DfsMetadataTables {
             || !self.version_pins.is_empty()
             || !self.cross_shard_pin_transfers.is_empty()
             || !self.receipts.is_empty()
+            || !self.receipt_withdrawals.is_empty()
             || !self.intents.is_empty()
             || !self.intent_receipts.is_empty()
             || !self.intent_receipt_retention.is_empty()
@@ -1979,6 +2130,9 @@ impl DfsMetadataTables {
                 );
             }
             DfsMetadataTableOp::RemoveVersion { object_id, version } => {
+                for key in self.receipt_withdrawal_keys_for_version(&object_id, &version) {
+                    self.receipt_withdrawals.remove(&key);
+                }
                 if let Some(previous) = self.versions.remove(&(object_id.clone(), version)) {
                     self.retained_revision_index.update_version(
                         &previous,
@@ -2091,25 +2245,44 @@ impl DfsMetadataTables {
                 }
             }
             DfsMetadataTableOp::PutReceipt { receipt } => {
-                self.receipts.insert(
-                    (
-                        receipt.receipt.object_id.clone(),
-                        receipt.receipt.committed_version.clone(),
-                        receipt.replica_node_id.clone(),
-                    ),
-                    receipt,
+                let key = (
+                    receipt.receipt.object_id.clone(),
+                    receipt.receipt.committed_version.clone(),
+                    receipt.replica_node_id.clone(),
                 );
+                self.receipt_withdrawals.remove(&key);
+                self.receipts.insert(key, receipt);
             }
             DfsMetadataTableOp::RemoveReceipt {
                 object_id,
                 version,
                 replica_node_id,
             } => {
-                self.receipts.remove(&(
-                    object_id.clone(),
-                    version.clone(),
-                    replica_node_id.clone(),
-                ));
+                let key = (object_id, version, replica_node_id);
+                let removed = self.receipts.remove(&key);
+                if !self.receipt_version_is_live(&key.0, &key.1) {
+                    self.receipt_withdrawals.remove(&key);
+                } else if let Some(receipt) = removed
+                    && receipt.generation > 0
+                {
+                    // Collecting one row of a live version must not let the
+                    // slot's generation go backwards under an older reply.
+                    self.receipt_withdrawals.insert(
+                        key.clone(),
+                        DfsReplicaReceiptWithdrawalRecord {
+                            file_system_id: receipt.receipt.file_system_id,
+                            object_id: key.0,
+                            version: key.1,
+                            replica_node_id: key.2,
+                            generation: receipt.generation,
+                        },
+                    );
+                }
+            }
+            DfsMetadataTableOp::WithdrawReceipt { withdrawal } => {
+                let key = withdrawal.slot_key();
+                self.receipts.remove(&key);
+                self.receipt_withdrawals.insert(key, withdrawal);
             }
             DfsMetadataTableOp::PutIntent { intent } => {
                 self.intent_receipts
@@ -2377,6 +2550,8 @@ pub(crate) struct DfsMetadataTableRollback {
     cross_shard_pin_transfers:
         HashMap<(DfsObjectId, String), Option<DfsCrossShardPinTransferRecord>>,
     receipts: HashMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptRecord>>,
+    receipt_withdrawals:
+        HashMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptWithdrawalRecord>>,
     intents: HashMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
     intent_receipts: HashMap<(DfsObjectId, String), Option<DfsWriteIntentReceipt>>,
     intent_receipt_retention: Option<DfsWriteIntentReceiptRetentionState>,
@@ -2524,11 +2699,20 @@ impl DfsMetadataTableRollback {
                 &tables.versions,
                 (version.object_id.clone(), version.version.clone()),
             ),
-            DfsMetadataTableOp::RemoveVersion { object_id, version } => record_rollback_value(
-                &mut self.versions,
-                &tables.versions,
-                (object_id.clone(), version.clone()),
-            ),
+            DfsMetadataTableOp::RemoveVersion { object_id, version } => {
+                record_rollback_value(
+                    &mut self.versions,
+                    &tables.versions,
+                    (object_id.clone(), version.clone()),
+                );
+                for key in tables.receipt_withdrawal_keys_for_version(object_id, version) {
+                    record_rollback_value(
+                        &mut self.receipt_withdrawals,
+                        &tables.receipt_withdrawals,
+                        key,
+                    );
+                }
+            }
             DfsMetadataTableOp::PutVersionPin { pin } => record_rollback_value(
                 &mut self.version_pins,
                 &tables.version_pins,
@@ -2624,9 +2808,8 @@ impl DfsMetadataTableRollback {
                     self.record(tables, &nested);
                 }
             }
-            DfsMetadataTableOp::PutReceipt { receipt } => record_rollback_value(
-                &mut self.receipts,
-                &tables.receipts,
+            DfsMetadataTableOp::PutReceipt { receipt } => self.record_receipt_slot(
+                tables,
                 (
                     receipt.receipt.object_id.clone(),
                     receipt.receipt.committed_version.clone(),
@@ -2637,11 +2820,13 @@ impl DfsMetadataTableRollback {
                 object_id,
                 version,
                 replica_node_id,
-            } => record_rollback_value(
-                &mut self.receipts,
-                &tables.receipts,
+            } => self.record_receipt_slot(
+                tables,
                 (object_id.clone(), version.clone(), replica_node_id.clone()),
             ),
+            DfsMetadataTableOp::WithdrawReceipt { withdrawal } => {
+                self.record_receipt_slot(tables, withdrawal.slot_key())
+            }
             DfsMetadataTableOp::PutIntent { intent } => {
                 let key = (intent.object_id.clone(), intent.intent_id.clone());
                 record_rollback_value(&mut self.intents, &tables.intents, key.clone());
@@ -2798,6 +2983,19 @@ impl DfsMetadataTableRollback {
         }
     }
 
+    fn record_receipt_slot(
+        &mut self,
+        tables: &DfsMetadataTables,
+        key: (DfsObjectId, DfsVersion, NodeId),
+    ) {
+        record_rollback_value(&mut self.receipts, &tables.receipts, key.clone());
+        record_rollback_value(
+            &mut self.receipt_withdrawals,
+            &tables.receipt_withdrawals,
+            key,
+        );
+    }
+
     pub(crate) fn new_repair_owners(
         &self,
         tables: &DfsMetadataTables,
@@ -2895,6 +3093,7 @@ impl DfsMetadataTableRollback {
             self.cross_shard_pin_transfers,
         );
         rollback_map(&mut tables.receipts, self.receipts);
+        rollback_map(&mut tables.receipt_withdrawals, self.receipt_withdrawals);
         // Validation temporarily changes only these recorded keys. Restore
         // their exact old rows and index keys without rescanning unrelated
         // owners for every prepared record replayed from the durable log.
@@ -3265,6 +3464,7 @@ mod intent_index_rollback_tests {
             replica_node_id: original.coordinator_node_id,
             content_hash: original.content_hash,
             received_at: OffsetDateTime::UNIX_EPOCH,
+            generation: 0,
         };
         for _ in 0..3 {
             let mut undo = DfsMetadataTableRollback::default();

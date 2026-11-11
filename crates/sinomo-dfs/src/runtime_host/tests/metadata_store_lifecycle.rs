@@ -267,6 +267,7 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
                 bytes: bytes.to_vec(),
                 object_metadata: Some(object.clone()),
                 authority_shard: Some(shard),
+                receipt_generation: 0,
             }),
         },
     );

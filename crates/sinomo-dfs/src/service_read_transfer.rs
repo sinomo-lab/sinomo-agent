@@ -908,34 +908,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     record.locations.retain(|node| node != source_node_id);
                     effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
                 }
-                if backend
-                    .receipts_for_version(object_id, version)?
-                    .iter()
-                    .any(|receipt| receipt.replica_node_id == *source_node_id)
-                {
-                    if !effects
-                        .iter()
-                        .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutObject { .. }))
-                    {
-                        effects.push(DfsPreparedMetadataEffect::PutObject {
-                            object: current.clone(),
-                        });
-                    }
-                    if !effects.iter().any(|effect| {
-                        matches!(effect, DfsPreparedMetadataEffect::PutVersion { .. })
-                    }) && let Some(record) = backend.get_version(object_id, version)?
-                    {
-                        effects.push(DfsPreparedMetadataEffect::PutVersion { version: record });
-                    }
-                    effects.push(DfsPreparedMetadataEffect::RemoveReceipt {
+                // Withdraw the slot whether or not a receipt is present: a
+                // positive reply planned before this failed read cannot be
+                // ordered against it, so the slot's generation advances.
+                let generation =
+                    backend.receipt_slot_generation(object_id, version, source_node_id)?;
+                effects.push(DfsPreparedMetadataEffect::WithdrawReceipt {
+                    withdrawal: crate::DfsReplicaReceiptWithdrawalRecord {
+                        file_system_id: current.file_system_id.clone(),
                         object_id: object_id.clone(),
                         version: version.clone(),
                         replica_node_id: source_node_id.clone(),
-                    });
-                }
-                if effects.is_empty() {
-                    return Ok(None);
-                }
+                        generation: generation.saturating_add(1),
+                    },
+                });
                 let mut payload = DfsPreparedOperationPayload::for_metadata_effects(
                     scope.clone(),
                     vec![DfsNamespaceObjectVersionExpectation {

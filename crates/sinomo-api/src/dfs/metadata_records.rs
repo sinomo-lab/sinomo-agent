@@ -437,6 +437,15 @@ pub struct DfsReplicaReceiptRecord {
     pub content_hash: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub received_at: OffsetDateTime,
+    /// Generation of this receipt slot (object, version, replica) that the
+    /// publisher planned against. Only a withdrawal advances a slot's
+    /// generation, so a slot that was never withdrawn stays at zero.
+    #[serde(default, skip_serializing_if = "is_zero_receipt_generation")]
+    pub generation: u64,
+}
+
+fn is_zero_receipt_generation(generation: &u64) -> bool {
+    *generation == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

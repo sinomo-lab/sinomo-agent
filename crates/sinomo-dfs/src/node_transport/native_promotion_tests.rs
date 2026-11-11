@@ -609,6 +609,7 @@ fn native_background_repair_reply_survives_local_completion_failure() {
         bytes: Vec::new(),
         object_metadata: actual.object_metadata.clone(),
         authority_shard: actual.authority_shard.clone(),
+        receipt_generation: 0,
     };
     let original = crate::routes::build_dfs_routed_message(
         &case.source,

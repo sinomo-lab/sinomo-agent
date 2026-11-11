@@ -5961,6 +5961,7 @@ mod native_selected_data_tests {
                 result: DfsBlobTransferResult::Committed {
                     content_hash: command.content_hash.clone()
                 },
+                receipt_generation: command.receipt_generation,
             })
         );
         assert_eq!(
@@ -6027,6 +6028,7 @@ mod native_selected_data_tests {
                 file_system_id: command.file_system_id.clone(), object_id: command.object_id.clone(),
                 version: command.version.clone(), replica_node_id: fixture.holder.clone(),
                 result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() },
+                receipt_generation: command.receipt_generation,
             }));
             // This is the real A queue after the actual C response was lost.
             // A's original identity/body/root and uncertain attempt remain.
@@ -7850,6 +7852,7 @@ mod native_selected_data_tests {
                 request_id: command.request_id.clone(), intent_id: command.intent_id.clone(), file_system_id: command.file_system_id.clone(),
                 object_id: command.object_id.clone(), version: command.version.clone(), replica_node_id: fixture.holder.clone(),
                 result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() },
+                receipt_generation: command.receipt_generation,
             });
         }
 

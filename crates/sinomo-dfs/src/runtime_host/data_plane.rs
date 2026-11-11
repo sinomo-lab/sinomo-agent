@@ -3037,6 +3037,7 @@ mod peer_delivery_tests {
                     bytes: Vec::new(),
                     object_metadata: None,
                     authority_shard: None,
+                    receipt_generation: 0,
                 }),
             },
             DfsOutboundAttachment::from_bytes(bytes, hash),

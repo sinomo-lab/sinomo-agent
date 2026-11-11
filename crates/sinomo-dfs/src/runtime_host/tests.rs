@@ -2193,6 +2193,7 @@ fn background_repair_admission_waits_while_explicit_foreground_repairs_preempt()
         bytes: Vec::new(),
         object_metadata: None,
         authority_shard: None,
+        receipt_generation: 0,
     };
     let mut background = foreground.clone();
     background.background_repair = true;
@@ -7282,6 +7283,7 @@ fn pending_write_receipt_for_test(
         replica_node_id,
         content_hash: intent.content_hash.clone(),
         received_at: OffsetDateTime::UNIX_EPOCH,
+        generation: 0,
     }
 }
 

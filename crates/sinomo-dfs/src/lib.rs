@@ -568,9 +568,10 @@ pub use metadata_records::{
     DfsPreparedOperationPayload, DfsPreparedOperationRecord, DfsPreparedOperationScope,
     DfsPreparedOperationStatus, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
     DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
-    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
-    DfsWriteIntentPageCursor, DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState,
-    DfsWriteIntentRecord, DfsWriteIntentScanCursor, DfsWriteIntentScanPage, DfsWriteIntentStatus,
+    DfsReplicaReceiptWithdrawalRecord, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsWriteIntentPage, DfsWriteIntentPageCursor,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    DfsWriteIntentScanCursor, DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
     dfs_now_unix_nanos, metadata_journal_batch_file_system_id, object_version_record,

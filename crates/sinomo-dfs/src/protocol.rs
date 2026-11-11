@@ -1218,6 +1218,10 @@ pub struct DfsStageBlobCommand {
     pub object_metadata: Option<DfsObjectMetadata>,
     #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
+    /// Receipt-slot generation the sender planned this transfer against.
+    /// The receiver echoes it; only a matching slot may publish the receipt.
+    #[serde(default, skip_serializing_if = "is_zero_receipt_generation")]
+    pub receipt_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1229,6 +1233,16 @@ pub struct DfsStageBlobResponse {
     pub version: DfsVersion,
     pub replica_node_id: NodeId,
     pub result: DfsBlobTransferResult,
+    /// The command's receipt-slot generation, echoed unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_receipt_generation")]
+    pub receipt_generation: u64,
+}
+
+/// A zero generation stays implicit, so a transfer to a never-withdrawn slot
+/// keeps its existing encoding. Any other generation is explicit and a peer
+/// without receipt generations rejects the command instead of acting on it.
+fn is_zero_receipt_generation(generation: &u64) -> bool {
+    *generation == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1249,6 +1263,9 @@ pub struct DfsStagePatchCommand {
     pub object_metadata: Option<DfsObjectMetadata>,
     #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
+    /// Receipt-slot generation the sender planned this transfer against.
+    #[serde(default, skip_serializing_if = "is_zero_receipt_generation")]
+    pub receipt_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1301,6 +1318,10 @@ pub struct DfsRepairReplicaCommand {
     pub object_metadata: Option<DfsObjectMetadata>,
     #[serde(deserialize_with = "required_optional")]
     pub authority_shard: Option<DfsMetadataShardConfig>,
+    /// Receipt-slot generation the sender planned this repair against. The
+    /// receiver echoes it; only a matching slot may publish the receipt.
+    #[serde(default, skip_serializing_if = "is_zero_receipt_generation")]
+    pub receipt_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1312,6 +1333,9 @@ pub struct DfsRepairReplicaResponse {
     pub version: DfsVersion,
     pub replica_node_id: NodeId,
     pub result: DfsBlobTransferResult,
+    /// The command's receipt-slot generation, echoed unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_receipt_generation")]
+    pub receipt_generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

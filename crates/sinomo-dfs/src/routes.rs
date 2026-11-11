@@ -1181,6 +1181,7 @@ mod tests {
             bytes: Vec::new(),
             object_metadata: None,
             authority_shard: Some(authority_shard(&file_system_id, "scope-transfer-shard")),
+            receipt_generation: 0,
         };
 
         assert_eq!(

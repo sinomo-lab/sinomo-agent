@@ -5857,6 +5857,7 @@ fn dfs_protocol_codec_samples(payload: &[u8]) -> Vec<DfsProtocolCodecSample> {
                 bytes: Vec::new(),
                 object_metadata: None,
                 authority_shard: None,
+                receipt_generation: 0,
             }),
             attachment.clone(),
         ),

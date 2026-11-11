@@ -503,6 +503,8 @@ impl MetadataImportAuthority for StandaloneImportAuthority {
                 replica_node_id: self.factory.node_id.clone(),
                 content_hash: version.content_hash.clone(),
                 received_at: time::OffsetDateTime::now_utc(),
+                // Imported content enters a slot that was never withdrawn.
+                generation: 0,
             }],
         })
     }

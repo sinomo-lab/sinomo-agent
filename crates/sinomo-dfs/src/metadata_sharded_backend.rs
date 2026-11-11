@@ -4910,6 +4910,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(replica_receipt_page_with_shard_cursor(page, &shard_id))
     }
 
+    fn receipt_slot_generation(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<u64> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(0);
+        };
+        self.shard_backend(&shard_id)?
+            .receipt_slot_generation(object_id, version, replica_node_id)
+    }
+
     fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool> {
         let shard_id = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
         self.shard_backend(&shard_id)?
