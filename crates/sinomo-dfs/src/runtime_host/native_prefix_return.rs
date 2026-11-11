@@ -313,9 +313,13 @@ fn capture_source(
             "source DATA owner pathname differs from its held native lock",
         ));
     }
-    let _fence = crate::metadata_lock::try_metadata_inspection_lock(
+    // The node's own readers and writers, such as a journal publication
+    // reading the frames it sends, hold the shard for one bounded operation:
+    // the capture waits for that release within the attempt's deadline.
+    let _fence = crate::metadata_lock::metadata_inspection_lock_until(
         root.clone(),
         crate::metadata_cursor::journal_write_lock_path(&root),
+        attempt.deadline(),
     )
     .map_err(invalid)?
     .ok_or_else(|| invalid("actual prefix source is busy or unavailable"))?;

@@ -45,7 +45,7 @@ pub(crate) fn try_metadata_inspection_lock(
     root: PathBuf,
     lock_path: PathBuf,
 ) -> Result<Option<MetadataWriteLock>> {
-    inspection_lock(root, lock_path, false)
+    inspection_lock(root, lock_path, InspectionWait::None)
 }
 
 /// Required work on an owned blocking worker may wait for the existing fence.
@@ -54,14 +54,36 @@ pub(crate) fn metadata_inspection_lock(
     root: PathBuf,
     lock_path: PathBuf,
 ) -> Result<Option<MetadataWriteLock>> {
-    inspection_lock(root, lock_path, true)
+    inspection_lock(root, lock_path, InspectionWait::Required)
+}
+
+/// An observational read with its own deadline. A holder of the root in this
+/// process, a reader or writer doing one bounded operation, is waited for on
+/// its release edge until `deadline`; the read is unavailable only if the
+/// root is still held then. A writer in another process has no such edge
+/// here and makes the read unavailable at once, as for
+/// [`try_metadata_inspection_lock`].
+pub(crate) fn metadata_inspection_lock_until(
+    root: PathBuf,
+    lock_path: PathBuf,
+    deadline: std::time::Instant,
+) -> Result<Option<MetadataWriteLock>> {
+    inspection_lock(root, lock_path, InspectionWait::Until(deadline))
+}
+
+#[derive(Clone, Copy)]
+enum InspectionWait {
+    None,
+    Until(std::time::Instant),
+    Required,
 }
 
 fn inspection_lock(
     root: PathBuf,
     lock_path: PathBuf,
-    required: bool,
+    wait: InspectionWait,
 ) -> Result<Option<MetadataWriteLock>> {
+    let required = matches!(wait, InspectionWait::Required);
     let file = match fs::OpenOptions::new().read(true).open(&lock_path) {
         Ok(file) => file,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -72,11 +94,20 @@ fn inspection_lock(
             });
         }
     };
-    let path_guard = if required {
-        MetadataPathWriteGuard::lock(root)
-    } else {
-        let Some(guard) = MetadataPathWriteGuard::try_lock(root) else { return Ok(None); };
-        guard
+    let path_guard = match wait {
+        InspectionWait::Required => MetadataPathWriteGuard::lock(root),
+        InspectionWait::Until(deadline) => {
+            let Some(guard) = MetadataPathWriteGuard::lock_until(root, deadline) else {
+                return Ok(None);
+            };
+            guard
+        }
+        InspectionWait::None => {
+            let Some(guard) = MetadataPathWriteGuard::try_lock(root) else {
+                return Ok(None);
+            };
+            guard
+        }
     };
     let locked = if required { FileExt::lock_shared(&file) } else { FileExt::try_lock_shared(&file) };
     match locked {
@@ -286,6 +317,24 @@ impl MetadataPathWriteGuard {
         }
         Self { path }
     }
+
+    /// Wait for the root's release edge, which every guard's drop signals,
+    /// until `deadline`.
+    fn lock_until(path: PathBuf, deadline: std::time::Instant) -> Option<Self> {
+        let (mutex, condvar) =
+            METADATA_WRITE_PATH_LOCKS.get_or_init(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
+        let mut locked = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !locked.insert(path.clone()) {
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            locked = condvar
+                .wait_timeout(locked, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        Some(Self { path })
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +441,51 @@ mod tests {
         assert!(backend.try_begin_resident_read_snapshot().unwrap());
         assert_eq!(backend.metadata_prefix_proof().unwrap(), prefix);
         backend.end_consistent_read_snapshot();
+    }
+
+    #[test]
+    fn a_deadline_bounded_inspection_waits_for_an_in_process_holder_to_release() {
+        let root = sinomo_testdir::TestDir::new("inspection-waits-for-release");
+        let lock_path = root.path().join("journal/write.lock");
+        let holder = metadata_write_lock(root.path().to_owned(), lock_path.clone()).unwrap();
+        // A refusing inspection sees the holder as busy.
+        assert!(
+            try_metadata_inspection_lock(root.path().to_owned(), lock_path.clone())
+                .unwrap()
+                .is_none()
+        );
+        // While the holder stays past the deadline, the bounded one is
+        // unavailable too.
+        let started = std::time::Instant::now();
+        assert!(
+            metadata_inspection_lock_until(
+                root.path().to_owned(),
+                lock_path.clone(),
+                started + Duration::from_millis(50),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        // A holder that releases within the deadline is waited for.
+        let (released_tx, released_rx) = mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(holder);
+            released_tx.send(()).unwrap();
+        });
+        let inspection = metadata_inspection_lock_until(
+            root.path().to_owned(),
+            lock_path,
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(
+            inspection.is_some(),
+            "the release edge admits the inspection"
+        );
+        released_rx.recv().unwrap();
+        releaser.join().unwrap();
     }
 
     #[test]
