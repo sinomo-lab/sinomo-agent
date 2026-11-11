@@ -327,11 +327,12 @@ pub(super) fn daemon_dfs_reconciliation_checkpoint_matches(
         })
 }
 
-/// A startup/activation edge reconciles metadata-owned repair obligations with
-/// the node-local queue. A previous run's marker cannot prove that a later
-/// process stopped after persisting every committed queue handoff. This is not
-/// scheduled by reads, status queries, or ordinary idle maintenance wakes.
-pub(crate) fn schedule_daemon_dfs_startup_repair_reconciliation(
+/// A startup/activation edge runs one authoritative reconciliation: commit
+/// promotion and commit-ready write recovery, prepare recovery and namespace
+/// job compaction. Repair needs no reconciliation: the executor reads its
+/// primary shards' index when it first observes their assignments. This is
+/// not scheduled by reads, status queries, or ordinary idle maintenance wakes.
+pub(crate) fn schedule_daemon_dfs_startup_reconciliation(
     paths: &DaemonPaths,
 ) -> Result<u64, DaemonError> {
     request_daemon_dfs_maintenance_reconciliation(paths)
@@ -355,87 +356,6 @@ pub(super) fn complete_daemon_dfs_maintenance_reconciliation(
             .set(requests.len() as f64);
     }
     Ok(())
-}
-
-pub(super) fn record_daemon_dfs_repair_queue_nonempty(data_dir: &SinomoDataDir, nonempty: bool) {
-    DAEMON_DFS_REPAIR_QUEUE_NONEMPTY
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(data_dir.root(), nonempty);
-}
-
-pub(super) fn refresh_daemon_dfs_repair_queue_nonempty(
-    data_dir: &SinomoDataDir,
-) -> Result<bool, sinomo_dfs::DfsError> {
-    let nonempty =
-        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(data_dir)?
-            .is_some_and(|snapshot| !snapshot.records.is_empty());
-    record_daemon_dfs_repair_queue_nonempty(data_dir, nonempty);
-    Ok(nonempty)
-}
-
-/// Record that committed work asks for the routine repair pass. A
-/// reconciliation tick consuming the same wake leaves the request pending.
-pub(crate) fn request_daemon_dfs_repair_maintenance(data_dir: &SinomoDataDir) {
-    DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(data_dir.root());
-}
-
-/// Keep a request taken by a routine pass that did not complete.
-pub(super) fn restore_daemon_dfs_repair_maintenance_request(paths: &DaemonPaths) {
-    let Some(data_root) = paths.root.parent() else {
-        return;
-    };
-    DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(data_root.to_path_buf());
-}
-
-/// Whether committed work still waits for a routine repair pass. `take`
-/// clears the request as that pass begins.
-pub(super) fn daemon_dfs_repair_maintenance_requested(paths: &DaemonPaths, take: bool) -> bool {
-    let Some(data_root) = paths.root.parent() else {
-        return false;
-    };
-    let Some(requests) = DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS.get() else {
-        return false;
-    };
-    let mut requests = requests
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if take {
-        requests.remove(data_root)
-    } else {
-        requests.contains(data_root)
-    }
-}
-
-/// Return the process-local queue state sampled at startup, a committed repair
-/// edge, or the end of the previous bounded maintenance pass.
-///
-/// Connectivity generation changes use this to wake only a repair executor
-/// whose external route blocker may have cleared. An empty cluster must not
-/// turn routine route refreshes into broad DFS maintenance passes.
-pub(crate) fn daemon_dfs_repair_queue_work_is_known(paths: &DaemonPaths) -> bool {
-    let Some(data_root) = paths.root.parent() else {
-        return false;
-    };
-    DAEMON_DFS_REPAIR_QUEUE_NONEMPTY
-        .get()
-        .and_then(|states| {
-            states
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(data_root)
-                .copied()
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -539,94 +459,27 @@ pub(super) fn daemon_dfs_maintenance_execution_exclusions(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
 ) -> DfsMaintenanceExecutionExclusions {
-    DfsMaintenanceExecutionExclusions::new(daemon_dfs_offline_node_ids(cluster_paths, state))
-}
-
-/// Add newly committed repair identities to the bounded durable queue.
-///
-/// This runs at the mutation's committed edge, before its live service lane is
-/// released. Existing retry/backoff state wins for an already queued target;
-/// maintenance remains the sole owner of advancing or clearing that state.
-/// The framed append is proportional only to this message's newly committed
-/// targets and never reads or rewrites the accumulated queue.
-pub(super) fn persist_daemon_dfs_repair_queue_records(
-    data_dir: &SinomoDataDir,
-    committed_records: Vec<DfsRepairAttemptRecord>,
-) -> Result<usize, sinomo_dfs::DfsError> {
-    if committed_records.is_empty() {
-        return Ok(0);
-    }
-    let appended = if let Some(layout) =
-        sinomo_dfs::maintenance::selected_native_layout_for_maintenance(data_dir)?
-    {
-        layout.queue()?.append_enqueues(committed_records)?
-    } else {
-        sinomo_dfs::persist_default_dfs_repair_queue_records(data_dir, committed_records)?
-    };
-    if appended > 0 {
-        record_daemon_dfs_repair_queue_nonempty(data_dir, true);
-    }
-    Ok(appended)
-}
-
-#[cfg(test)]
-mod selected_queue_checkpoint_tests {
-    use super::*;
-
-    #[test]
-    fn selected_native_checkpoint_uses_owned_reader_and_preserves_retry() {
-        let root = sinomo_testdir::TestDir::new("selected-native-queue-checkpoint");
-        let data = SinomoDataDir::new(root.path());
-        assert_eq!(persist_daemon_dfs_repair_queue_records(&data, Vec::new()).unwrap(), 0);
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-
-        let paths = DfsRuntimePaths::new(&data);
-        let mut owner = DfsDataOwnerLock::acquire(&paths).unwrap();
-        let layout = owner.admit_selected_original_fixture(None).unwrap();
-        let owner = Arc::new(owner);
-        register_daemon_dfs_data_owner_lock(&paths, &owner).unwrap();
-        let queue = layout.queue().unwrap();
-        let ordinary = crate::LocalDfsRepairQueueStore::new(
-            crate::default_dfs_repair_attempt_snapshot_path(&data),
-        );
-        assert!(ordinary.view().is_err(), "default reader must remain rejected");
-        let record = DfsRepairAttemptRecord {
-            intent_id: "selected-checkpoint-advisory-intent".into(),
-            object_id: crate::DfsObjectId::from_legacy_named("selected-checkpoint-object").unwrap(),
-            version: crate::DfsVersion::from_legacy_named("selected-checkpoint-version").unwrap(),
-            content_hash: "blake3:selected-checkpoint-test".into(),
-            missing_replica_node_id: NodeId::from_legacy_named("selected-checkpoint-target").unwrap(),
-            attempts: 3,
-            in_flight: false,
-            last_attempt_unix_nanos: 10,
-            next_retry_unix_nanos: 100,
-            transfer_request_id: None,
-            completed_transfer_request_id: None,
-            transfer_kind: Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair),
-            transfer_delivery_state: Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent),
-            last_error: Some("retained advisory retry".into()),
-        };
-        assert_eq!(persist_daemon_dfs_repair_queue_records(&data, vec![record.clone()]).unwrap(), 1);
-        assert_eq!(queue.view().unwrap().records, vec![record.clone()]);
-        let before = queue.view().unwrap();
-        let mut stale = record;
-        stale.attempts = 0;
-        stale.next_retry_unix_nanos = 0;
-        stale.last_error = None;
-        assert_eq!(persist_daemon_dfs_repair_queue_records(&data, vec![stale]).unwrap(), 0);
-        assert_eq!(queue.view().unwrap(), before, "checkpoint cannot reset retained retry state");
-        assert!(ordinary.view().is_err());
-        assert!(daemon_dfs_repair_queue_work_is_known(&paths));
-        drop(ordinary);
-        drop(queue);
-        drop(layout);
-        drop(owner);
+    // Read the executor's reachability-event count first: an event raised
+    // after it is newer than this set, and the pass that consumes it reads
+    // reachability again.
+    let epoch = cluster_paths
+        .root
+        .parent()
+        .map(crate::repair_executor::repair_executor_reachability_epoch);
+    let excluded = daemon_dfs_offline_node_ids(cluster_paths, state);
+    let expiries =
+        crate::maintenance::dfs_reachability_evidence_expiry(cluster_paths, state, &excluded);
+    let exclusions =
+        DfsMaintenanceExecutionExclusions::new(excluded).with_reevaluate_at_by_target(expiries);
+    match epoch {
+        Some(epoch) => exclusions.with_repair_reachability_epoch(epoch),
+        None => exclusions,
     }
 }
 
-/// Transfer a completed local recovery scan to durable queue ownership before
-/// any cancellable network phase. Retrying placement or repair must not replay
-/// the whole inventory and requeue its commit promotions on every preemption.
+/// Record a completed local recovery scan under its authority generation
+/// before any cancellable network phase, so a retried turn does not replay the
+/// whole inventory and requeue its commit promotions on every preemption.
 #[tracing::instrument(target = "sinomo.perf", level = "trace", name = "dfs.recovery.handoff",
     skip_all, fields(stage = "dfs.recovery.handoff", outcome = tracing::field::Empty))]
 pub(super) fn checkpoint_daemon_dfs_reconciliation(
@@ -634,19 +487,7 @@ pub(super) fn checkpoint_daemon_dfs_reconciliation(
     authority: &DaemonDfsMetadataAuthorityGeneration,
     authority_generation: u64,
     request_generation: Option<u64>,
-    records: Vec<DfsRepairAttemptRecord>,
 ) -> Result<bool, DaemonError> {
-    if authority
-        .retained_complete_prefix_revision_for_generation(authority_generation)
-        .is_none()
-    {
-        return Ok(false);
-    }
-    // The existing enqueue protocol preserves retry/backoff for known targets
-    // and fsyncs new identities before the volatile request can be completed.
-    for chunk in records.chunks(256) {
-        persist_daemon_dfs_repair_queue_records(data_dir, chunk.to_vec())?;
-    }
     if authority
         .retained_complete_prefix_revision_for_generation(authority_generation)
         .is_none()
@@ -674,33 +515,6 @@ pub(super) fn checkpoint_daemon_dfs_reconciliation(
     Ok(true)
 }
 
-#[cfg(test)]
-pub(super) fn fail_next_daemon_dfs_mounted_mutation_after_repair_persist(data_dir: &SinomoDataDir) {
-    DAEMON_DFS_TEST_MOUNTED_MUTATION_FAIL_AFTER_REPAIR_PERSIST
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-        .expect("mounted-mutation crash-cut hooks")
-        .insert(data_dir.root());
-}
-
-#[cfg(test)]
-pub(super) fn inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(
-    data_dir: &SinomoDataDir,
-) -> Result<(), DaemonError> {
-    let should_fail = DAEMON_DFS_TEST_MOUNTED_MUTATION_FAIL_AFTER_REPAIR_PERSIST
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-        .expect("mounted-mutation crash-cut hooks")
-        .remove(&data_dir.root());
-    if should_fail {
-        return Err(DaemonError::Io {
-            path: data_dir.root().display().to_string(),
-            detail: "injected mounted-mutation crash after repair queue persistence".to_string(),
-        });
-    }
-    Ok(())
-}
-
 pub(super) struct DaemonMountedSifsMutationHandoffHost<'a> {
     pub(super) data_dir: &'a SinomoDataDir,
     pub(super) cluster_paths: &'a ClusterPaths,
@@ -709,21 +523,6 @@ pub(super) struct DaemonMountedSifsMutationHandoffHost<'a> {
 }
 
 impl sinomo_dfs::MountedSifsMutationHandoffHost for DaemonMountedSifsMutationHandoffHost<'_> {
-    fn repair_queue_persisted(&self, appended_record_count: usize) {
-        if appended_record_count > 0 {
-            record_daemon_dfs_repair_queue_nonempty(self.data_dir, true);
-        }
-    }
-
-    fn after_repair_queue_persisted(&self) -> Result<(), sinomo_dfs::DfsError> {
-        #[cfg(test)]
-        inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(self.data_dir).map_err(
-            |error| sinomo_dfs::DfsError::Metadata {
-                message: error.to_string(),
-            },
-        )?;
-        Ok(())
-    }
 
     fn committed_work(&self, committed_work: DfsMessageCommittedWork) {
         emit_daemon_dfs_committed_edges(
@@ -817,18 +616,14 @@ pub(super) fn daemon_dfs_pending_reactive_maintenance_work_from_authority_entrie
     if !cluster_paths.state.exists() {
         return daemon_dfs_mounted_mutation_pending_work(&data_dir, now_unix_nanos);
     }
-    let repair_attempt_records =
-        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(&data_dir)?
-            .map(|snapshot| snapshot.records)
-            .unwrap_or_default();
-    record_daemon_dfs_repair_queue_nonempty(&data_dir, !repair_attempt_records.is_empty());
+    // Repair work is the node executor's, derived from the repair index; the
+    // node-local queue is inert and never read for scheduling.
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
     sinomo_dfs::dfs_pending_reactive_maintenance_work_from_authority_entries(
         &data_dir,
         &state.local_node_id,
         authority_entries,
-        &repair_attempt_records,
         now_unix_nanos,
     )
     .map_err(Into::into)
@@ -983,10 +778,6 @@ fn daemon_dfs_pending_maintenance_work_with_topology(
             &active_shards,
             &authority_entries,
         )?;
-    let repair_attempt_records =
-        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(&data_dir)?
-            .map(|snapshot| snapshot.records)
-            .unwrap_or_default();
     let placement_prefix =
         sinomo_dfs::placement_reconciliations_prefix(&sinomo_dfs::sifs_file_system_id());
     let placement_reconciliation_jobs = authority_entries
@@ -1025,7 +816,6 @@ fn daemon_dfs_pending_maintenance_work_with_topology(
         &receipt_records,
         &metadata_shard_statuses,
         &repair_views,
-        &repair_attempt_records,
         &intents_without_recovery_source,
         &repairs_without_recovery_source,
         &offline_node_ids,

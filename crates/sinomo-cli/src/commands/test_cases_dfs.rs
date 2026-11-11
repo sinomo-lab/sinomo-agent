@@ -8074,7 +8074,7 @@ mod tests {
             repair_attempts: Vec::new(),
         };
         status.push_bounded_omission(
-            dfs::DfsOperatorStatusOmission::resident_repair_queue_not_hydrated(),
+            dfs::DfsOperatorStatusOmission::historical_routing_topology(1),
         );
         let unavailable_repair_targets = BTreeSet::new();
 

@@ -947,7 +947,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.apply_metadata_object_to_service_state(current)?;
                 self.record_message_committed_work(DfsMessageCommittedWork {
                     publish_metadata: true,
-                    repair_maintenance: true,
                     ..Default::default()
                 });
             }
@@ -1053,7 +1052,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object_pruned && version_pruned && receipt_pruned {
             self.record_message_committed_work(DfsMessageCommittedWork {
                 publish_metadata: true,
-                repair_maintenance: true,
                 ..DfsMessageCommittedWork::default()
             });
             for intent_id in self.backend_intent_ids_for_version(object_id, version)? {
@@ -1073,10 +1071,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if self.coordinator.intent(&intent_id).is_none() {
                     self.coordinator
                         .restore_intent(distributed_intent_from_record(&record))?;
-                    self.restore_backend_receipt_pages_for_intent(&record, false)?;
+                    self.restore_backend_receipt_pages_for_intent(&record)?;
                 }
                 self.coordinator
-                    .withdraw_durable_receipt_for_repair(&intent_id, &local_node_id)?;
+                    .withdraw_durable_receipt(&intent_id, &local_node_id)?;
                 self.restore_pending_write_for_intent_if_missing(&intent_id, object_id)?;
             }
         }

@@ -6699,28 +6699,13 @@ pub fn process_dfs_metadata_journal_batch(
     context: Option<&DfsMetadataReplicaShardContext>,
     command: DfsMetadataJournalBatchCommand,
 ) -> DfsMetadataJournalBatchResponse {
-    process_dfs_metadata_journal_batch_inner(backend, context, command, None)
-}
-
-pub(crate) fn process_dfs_metadata_journal_batch_with_selected_receiver_budget(
-    backend: &mut dyn DfsMetadataBackend,
-    context: Option<&DfsMetadataReplicaShardContext>,
-    command: DfsMetadataJournalBatchCommand,
-    captured: std::time::Instant,
-    deadline: std::time::Instant,
-) -> DfsMetadataJournalBatchResponse {
-    if deadline.checked_duration_since(captured) != Some(Duration::from_secs(5)) {
-        return dfs_metadata_journal_rejection_response(&command,
-            "selected receiver has an invalid local processing budget");
-    }
-    process_dfs_metadata_journal_batch_inner(backend, context, command, Some((captured, deadline)))
+    process_dfs_metadata_journal_batch_inner(backend, context, command)
 }
 
 fn process_dfs_metadata_journal_batch_inner(
     backend: &mut dyn DfsMetadataBackend,
     context: Option<&DfsMetadataReplicaShardContext>,
     command: DfsMetadataJournalBatchCommand,
-    selected_clock: Option<(std::time::Instant, std::time::Instant)>,
 ) -> DfsMetadataJournalBatchResponse {
     if let Err(reason) = validate_durable_metadata_journal_frames(&command) {
         return dfs_metadata_journal_rejection_response(&command, reason);
@@ -6746,7 +6731,7 @@ fn process_dfs_metadata_journal_batch_inner(
         });
         let response =
             match verify_dfs_metadata_journal_prefix_with_receiver_budget(
-                backend, context, source_node_id, &command, selected_clock,
+                backend, context, source_node_id, &command,
             ) {
                 Ok(verified_primary_handoff_id) => DfsMetadataJournalBatchResponse {
                     request_id: command.request_id,
@@ -6992,15 +6977,7 @@ pub(crate) fn verify_dfs_metadata_journal_prefix(
     source_node_id: &NodeId,
     command: &DfsMetadataJournalBatchCommand,
 ) -> Result<Option<String>, DfsMetadataRejection> {
-    verify_dfs_metadata_journal_prefix_with_receiver_budget(backend, context, source_node_id, command, None)
-}
-
-fn selected_receiver_before(deadline: Option<std::time::Instant>) -> Result<(), DfsMetadataRejection> {
-    if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
-        return Err(DfsMetadataRejection::new(DfsMetadataRejectionCode::Other,
-            "selected receiver processing budget unavailable/expired; actual DATA and uncertainty retained"));
-    }
-    Ok(())
+    verify_dfs_metadata_journal_prefix_with_receiver_budget(backend, context, source_node_id, command)
 }
 
 fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
@@ -7008,7 +6985,6 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
     context: &DfsMetadataReplicaShardContext,
     source_node_id: &NodeId,
     command: &DfsMetadataJournalBatchCommand,
-    selected_clock: Option<(std::time::Instant, std::time::Instant)>,
 ) -> Result<Option<String>, DfsMetadataRejection> {
     let batch = &command.batch;
     let Some(probe) = command.prefix_probe.as_ref() else {
@@ -7034,41 +7010,6 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
     }
     let verified_primary_handoff_id =
         validated_pending_primary_handoff_prefix_probe_id(context, source_node_id, probe)?;
-    let needs_repair_custody = verified_primary_handoff_id.is_some()
-        && context
-            .pending_membership_handoff
-            .as_ref()
-            .is_some_and(|handoff| {
-                matches!(
-                    handoff.cause,
-                    crate::DfsMetadataShardHandoffCause::Membership
-                )
-            });
-    if needs_repair_custody != probe.repair_custody.is_some() {
-        return Err("primary rotation requires versioned exact repair custody; ordinary probes cannot import it".to_string().into());
-    }
-    let layout = if probe.repair_custody.is_some() {
-        backend.selected_original_data_layout(&context.shard.file_system_id, &probe.shard_id)
-            .map_err(|error| error.to_string())?
-    } else { None };
-    let selected = probe.repair_custody.as_ref().is_some_and(|page| page.cut.version == 2);
-    let selected_deadline = selected_clock.map(|(_, deadline)| deadline);
-    if let Some(page) = probe.repair_custody.as_ref() {
-        if selected {
-            if layout.is_none() {
-                return Err("default native reader rejects selected original DATA".to_string().into());
-            }
-            selected_receiver_before(selected_deadline)?;
-            page.validate_selected_original_data().map_err(|error| error.to_string())?;
-        } else { page.validate().map_err(|error| error.to_string())?; }
-        if context.pending_membership_handoff.as_ref() != Some(&page.cut.handoff) {
-            return Err(
-                "repair custody differs from the authenticated pending handoff"
-                    .to_string()
-                    .into(),
-            );
-        }
-    }
     backend
         .refresh_metadata_shard_durable_view(&probe.shard_id)
         .map_err(|error| {
@@ -7117,37 +7058,6 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
                 batch.shard_id.0, probe.journal_sequence
             )
         })?;
-    if selected {
-        selected_receiver_before(selected_deadline)?;
-        let page = probe.repair_custody.as_ref().expect("selected page checked");
-        let layout = layout.as_ref().expect("selected reader checked");
-        let scope = backend.publication_owner_scope(&context.shard.file_system_id, &probe.shard_id)
-            .map_err(|error| error.to_string())?;
-        let owner = crate::runtime_host::publication_runtime_owner(scope.root())
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "selected receive has no actual native DATA owner".to_string())?;
-        layout.check_owner(&owner).map_err(|error| error.to_string())?;
-        let origin = crate::repair_handoff::native_selected_page_origin(scope.root(), page,
-            selected_deadline.expect("selected receiver deadline checked"))
-            .map_err(|error| error.to_string())?;
-        let crate::DfsNetworkMessage::RepairReplica(original) = &origin.original.message else {
-            return Err("selected origin is not actual Repair material".to_string().into());
-        };
-        if original.file_system_id != context.shard.file_system_id
-            || backend.get_object_on_shard(&probe.shard_id, &original.object_id)
-                .map_err(|error| error.to_string())?
-                .is_none_or(|object| object.file_system_id != context.shard.file_system_id)
-            || original.object_metadata.as_ref().is_some_and(|object|
-                object.object_id != original.object_id || object.file_system_id != original.file_system_id)
-        { return Err("selected original is outside the authenticated frozen shard".to_string().into()); }
-        for row in &page.records {
-            if backend.get_object_on_shard(&probe.shard_id, &row.object_id)
-                .map_err(|error| error.to_string())?
-                .is_none_or(|object| object.file_system_id != context.shard.file_system_id)
-            { return Err("selected page row is outside the authenticated frozen shard".to_string().into()); }
-        }
-        selected_receiver_before(selected_deadline)?;
-    }
     if let Some(primary_handoff_id) = verified_primary_handoff_id.as_deref() {
         let handoff = context
             .pending_membership_handoff
@@ -7183,7 +7093,6 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
             )));
         }
     }
-    if selected { selected_receiver_before(selected_deadline)?; }
     backend
         .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
             shard_id: probe.shard_id.clone(),
@@ -7197,39 +7106,6 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
                 batch.shard_id.0, probe.journal_sequence
             )
         })?;
-    if let Some(page) = probe.repair_custody.as_ref() {
-        let scope = backend
-            .publication_owner_scope(&context.shard.file_system_id, &probe.shard_id)
-            .map_err(|error| error.to_string())?;
-        let owner = crate::runtime_host::publication_runtime_owner(scope.root())
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "repair custody receive has no actual native DATA owner".to_string())?;
-        for row in &page.records {
-            if backend
-                .get_object_on_shard(&probe.shard_id, &row.object_id)
-                .map_err(|error| error.to_string())?
-                .is_none_or(|object| object.file_system_id != context.shard.file_system_id)
-            {
-                return Err("repair custody row is outside the exact frozen shard"
-                    .to_string()
-                    .into());
-            }
-        }
-        if let Some(layout) = &layout {
-            layout.check_owner(&owner).map_err(|error| error.to_string())?;
-        }
-        if selected { selected_receiver_before(selected_deadline)?; }
-        backend
-            .bind_metadata_shard_repair_handoff_cut(&probe.shard_id, &page.cut)
-            .map_err(|error| error.to_string())?;
-        if selected { selected_receiver_before(selected_deadline)?; }
-        let confirmation = if let Some(layout) = &layout {
-            crate::repair_handoff::receive_native_layout(scope.root(), layout, page, selected_deadline)
-        } else { crate::repair_handoff::receive(scope.root(), page) }
-            .map_err(|error| error.to_string())?;
-        if selected { selected_receiver_before(selected_deadline)?; }
-        return Ok(Some(confirmation));
-    }
     Ok(verified_primary_handoff_id)
 }
 
@@ -8103,7 +7979,6 @@ fn dfs_metadata_caught_up_probe_command(
             journal_sequence,
             state_fingerprint,
             primary_handoff_id: None,
-            repair_custody: None,
         }),
         authority_probe: None,
         durable_replication: None,

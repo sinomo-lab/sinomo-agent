@@ -28,11 +28,10 @@ use std::os::windows::fs::MetadataExt as _;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::{DfsCommittedWork, DfsError, DfsRepairAttemptRecord};
+use crate::{DfsCommittedWork, DfsError};
 
 pub const MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION: u16 = 1;
 pub const MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS: usize = 64;
-pub const MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS: usize = 64;
 pub const MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES: usize = 512;
 pub const MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES: usize = 512 * 1024;
 
@@ -92,23 +91,31 @@ pub struct MountedSifsMutationOrigin {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "MountedSifsMutationCapturedWorkWire")]
 pub struct MountedSifsMutationCapturedWork {
     pub committed_work: DfsCommittedWork,
-    pub committed_repair_records: Vec<DfsRepairAttemptRecord>,
 }
 
 impl MountedSifsMutationCapturedWork {
-    pub fn new(
-        committed_work: DfsCommittedWork,
-        committed_repair_records: Vec<DfsRepairAttemptRecord>,
-    ) -> Result<Self, DfsError> {
-        let captured = Self {
-            committed_work,
-            committed_repair_records,
-        };
-        validate_captured_work(&captured)?;
-        Ok(captured)
+    pub fn new(committed_work: DfsCommittedWork) -> Self {
+        Self { committed_work }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MountedSifsMutationCapturedWorkWire {
+    committed_work: DfsCommittedWork,
+    /// Rows of the removed node-local repair queue in captures written
+    /// before its removal: accepted and dropped. The shard tables' repair
+    /// index carries that work.
+    #[serde(default, rename = "committed_repair_records")]
+    _removed_repair_records: Option<serde::de::IgnoredAny>,
+}
+
+impl From<MountedSifsMutationCapturedWorkWire> for MountedSifsMutationCapturedWork {
+    fn from(wire: MountedSifsMutationCapturedWorkWire) -> Self {
+        Self::new(wire.committed_work)
     }
 }
 
@@ -135,7 +142,6 @@ impl MountedSifsMutationErrorObservation {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct MountedSifsMutationRecoveryReceipt {
-    pub repair_queue_durable: bool,
     pub metadata_publish_durably_owned: bool,
     pub maintenance_durably_owned: bool,
     pub metadata_replica_progress_durably_owned: bool,
@@ -690,7 +696,6 @@ impl MountedSifsMutationLease<'_> {
         arm_request_id: &MountedSifsMutationArmRequestId,
         captured_work: MountedSifsMutationCapturedWork,
     ) -> Result<(), DfsError> {
-        validate_captured_work(&captured_work)?;
         self.transition_from_armed(arm_request_id, |marker| {
             marker.phase = MountedSifsMutationOutboxPhase::Captured {
                 arm_request_id: arm_request_id.clone(),
@@ -1110,7 +1115,6 @@ impl MountedSifsMutationOutboxStore {
         arm_request_id: &MountedSifsMutationArmRequestId,
         captured_work: &MountedSifsMutationCapturedWork,
     ) -> Result<MountedSifsMutationOutboxMarker, DfsError> {
-        validate_captured_work(captured_work)?;
         self.accept_live_with_durable_work(
             marker_id,
             marker_nonce,
@@ -2806,28 +2810,22 @@ fn validate_marker(marker: &MountedSifsMutationOutboxMarker) -> Result<(), DfsEr
     }
     validate_origin(&marker.origin)?;
     match &marker.phase {
-        MountedSifsMutationOutboxPhase::Captured { captured_work, .. } => {
-            validate_captured_work(captured_work)?
-        }
         MountedSifsMutationOutboxPhase::DaemonAccepted {
             captured_work,
             requires_full_recovery,
             error_observation,
             ..
-        } => {
-            validate_captured_work(captured_work)?;
-            match (*requires_full_recovery, error_observation) {
-                (false, None) => {}
-                (true, Some(observation)) if &observation.captured_work == captured_work => {
-                    validate_error_observation(observation)?;
-                }
-                _ => {
-                    return Err(outbox_error(
-                        "mounted-mutation accepted phase has inconsistent error evidence",
-                    ));
-                }
+        } => match (*requires_full_recovery, error_observation) {
+            (false, None) => {}
+            (true, Some(observation)) if &observation.captured_work == captured_work => {
+                validate_error_observation(observation)?;
             }
-        }
+            _ => {
+                return Err(outbox_error(
+                    "mounted-mutation accepted phase has inconsistent error evidence",
+                ));
+            }
+        },
         MountedSifsMutationOutboxPhase::UnknownAfterError { observation, .. } => {
             validate_error_observation(observation)?
         }
@@ -2864,21 +2862,9 @@ fn validate_origin(origin: &MountedSifsMutationOrigin) -> Result<(), DfsError> {
     validate_label("operation", &origin.operation, false)
 }
 
-fn validate_captured_work(work: &MountedSifsMutationCapturedWork) -> Result<(), DfsError> {
-    if work.committed_repair_records.len() > MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS {
-        return Err(outbox_error(format!(
-            "mounted-mutation captured {} repair records; max is {}",
-            work.committed_repair_records.len(),
-            MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
-        )));
-    }
-    Ok(())
-}
-
 fn validate_error_observation(
     observation: &MountedSifsMutationErrorObservation,
 ) -> Result<(), DfsError> {
-    validate_captured_work(&observation.captured_work)?;
     validate_label("error_code", &observation.error_code, false)
 }
 
@@ -3010,11 +2996,6 @@ fn validate_recovery_receipt(
     }
     let captured_work = captured_work_for_phase(&marker.phase);
     if let Some(work) = captured_work {
-        if !work.committed_repair_records.is_empty() && !receipt.repair_queue_durable {
-            return Err(outbox_error(
-                "mounted-mutation recovery has not durably owned its repair queue delta",
-            ));
-        }
         if work.committed_work.publish_metadata && !receipt.metadata_publish_durably_owned {
             return Err(outbox_error(
                 "mounted-mutation recovery has no durable metadata-publication owner",
@@ -3046,7 +3027,6 @@ fn validate_full_recovery_receipt(
     receipt: &MountedSifsMutationRecoveryReceipt,
 ) -> Result<(), DfsError> {
     if receipt.completed_at_unix_nanos == 0
-        || !receipt.repair_queue_durable
         || !receipt.full_recovery_completed
         || !receipt.metadata_publish_durably_owned
         || !receipt.maintenance_durably_owned
@@ -3188,7 +3168,6 @@ mod tests {
 
     fn full_recovery_receipt() -> MountedSifsMutationRecoveryReceipt {
         MountedSifsMutationRecoveryReceipt {
-            repair_queue_durable: true,
             metadata_publish_durably_owned: true,
             maintenance_durably_owned: true,
             metadata_replica_progress_durably_owned: true,
@@ -3656,14 +3635,10 @@ mod tests {
             mutation
                 .record_captured_success(
                     &arm_request_id,
-                    MountedSifsMutationCapturedWork::new(
-                        DfsCommittedWork {
-                            publish_metadata: true,
-                            ..DfsCommittedWork::default()
-                        },
-                        Vec::new(),
-                    )
-                    .expect("captured work"),
+                    MountedSifsMutationCapturedWork::new(DfsCommittedWork {
+                        publish_metadata: true,
+                        ..DfsCommittedWork::default()
+                    }),
                 )
                 .expect("capture");
             mutation.marker.marker_id.clone()
@@ -3716,15 +3691,11 @@ mod tests {
         let marker_id = mutation.marker.marker_id.clone();
         let marker_nonce = mutation.marker.marker_nonce.clone();
         let arm_request_id = arm(&store, &mutation);
-        let captured = MountedSifsMutationCapturedWork::new(
-            DfsCommittedWork {
-                publish_metadata: true,
-                namespace_maintenance: true,
-                ..DfsCommittedWork::default()
-            },
-            Vec::new(),
-        )
-        .expect("captured");
+        let captured = MountedSifsMutationCapturedWork::new(DfsCommittedWork {
+            publish_metadata: true,
+            namespace_maintenance: true,
+            ..DfsCommittedWork::default()
+        });
         mutation
             .record_captured_success(&arm_request_id, captured.clone())
             .expect("capture");
@@ -4370,14 +4341,10 @@ mod tests {
             let marker_id = mutation.marker.marker_id.clone();
             let marker_nonce = mutation.marker.marker_nonce.clone();
             let arm_request_id = arm(&store, &mutation);
-            let captured = MountedSifsMutationCapturedWork::new(
-                DfsCommittedWork {
-                    publish_metadata: true,
-                    ..DfsCommittedWork::default()
-                },
-                Vec::new(),
-            )
-            .expect("captured committed work");
+            let captured = MountedSifsMutationCapturedWork::new(DfsCommittedWork {
+                publish_metadata: true,
+                ..DfsCommittedWork::default()
+            });
             mutation
                 .record_captured_success(&arm_request_id, captured.clone())
                 .expect("capture successful mutation");

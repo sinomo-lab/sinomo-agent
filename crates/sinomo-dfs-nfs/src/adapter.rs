@@ -178,9 +178,7 @@ impl SifsNfsFileSystem {
             Ok((opened, root_stat))
         };
         let opened = if let Some(handoff) = &handoff {
-            handoff.run_mount_open(open_service, |opened| {
-                opened.0.service.durable_repair_queue_records()
-            })?
+            handoff.run_mount_open(open_service)?
         } else {
             open_service()?
         };

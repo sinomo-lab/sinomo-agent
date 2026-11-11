@@ -130,10 +130,10 @@ caller sessions, historical replay APIs, or substitute KV operation ledgers.
 An ambiguous configuration transaction is reconciled from its existing native
 outcome and exact guarded configuration state; DFS then resumes its own durable
 shard protocol. Paths, intents, receipts, namespace transactions, journals,
-snapshots, object metadata, bytes, repair queues, and metadata acknowledgement
-floors remain exclusively in DFS. Historical global metadata floors and
-watermarks may be interpreted only by migration to preserve old obligations;
-they do not authorize a current ordinary write.
+snapshots, object metadata, bytes, the derived repair index, and metadata
+acknowledgement floors remain exclusively in DFS. Historical global metadata
+floors and watermarks may be interpreted only by migration to preserve old
+obligations; they do not authorize a current ordinary write.
 
 The commit path must preserve these properties:
 
@@ -208,13 +208,14 @@ Object identity remains stable across path moves. Versions are immutable once
 committed. Tombstones preserve enough history for replicas and caches to reject
 stale paths without retaining deleted content indefinitely.
 
-Authority transfer also preserves the retiring owner's durable repair work,
-including original operation identities, delivery uncertainty and retry state.
-The successor must durably receive that work before it can publish under the
-new assignment. Partial transfer, incompatible evidence or conflicting custody
-leaves the affected work fenced; retained source records cannot authorize the
-retired owner to resume effects. Metadata handoff does not manufacture missing
-content or weaken the configured durability requirement.
+Authority transfer requires no repair state from the retiring owner, which is
+usually offline when a transfer happens. Every replica derives the shard's
+remaining repair work from its replicated tables, so the successor schedules
+that work as soon as it is assigned. Each replica receipt slot carries a
+generation that a repair reply must match to publish, which fences late replies
+to attempts made before the transfer. Retry timing restarts at the successor.
+Metadata handoff does not manufacture missing content or weaken the configured
+durability requirement.
 
 ## Content Stores
 
@@ -421,6 +422,19 @@ Repair is manifest-based rather than an arbitrary directory scan:
 4. Quarantine divergent blobs instead of treating them as versions.
 5. Continue until the desired placement is satisfied or authority/policy
    suppresses the work explicitly.
+
+Each shard's tables derive its repair needs from desired placement and replica
+receipts, so every replica holds the same repair index and a new primary can
+schedule the remaining work as soon as it is assigned. Only the shard primary's
+repair executor dispatches repairs. It keeps attempt and retry state in memory;
+there is no node-local repair queue and no custody of earlier attempts. The
+executor is reactive: it runs on changes to the index, attempt outcomes,
+reachability and authority changes, a gained primary assignment, a durability
+wait on a missing replica, and its own re-send timer, and each pass does work
+proportional to those events. It reads a shard's whole index only when it gains
+that shard, including at process start. A durability wait can move its object
+ahead of other ready repairs but never shortens a backoff that an earlier failure
+earned.
 
 Scrub, old-version collection, orphan cleanup, and tombstone compaction are
 background lifecycle operations.

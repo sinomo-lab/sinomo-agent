@@ -101,7 +101,6 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
             journal_sequence: cut.prefix_proof.journal_sequence,
             state_fingerprint: cut.prefix_proof.digest.clone(),
             primary_handoff_id: None,
-            repair_custody: None,
         }),
         authority_probe: None,
         durable_replication: None,
@@ -150,240 +149,6 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
         after.semantic_state_fingerprint,
         cut.semantic_state_fingerprint
     );
-    runtime.close().unwrap();
-}
-
-#[test]
-fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
-    let name = "native-captured-repair-attempt-service-reopen";
-    let (runtime, mut dfs, config) =
-        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
-    let owner = config.primary_node_id;
-    drop(dfs);
-    let background = runtime
-        .deny_background_replica_before_claim(&owner)
-        .unwrap();
-    let mut dfs = runtime
-        .metadata_primary_service("/services/native-recorded-backoff")
-        .unwrap();
-    let replica = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 2)
-        .into_iter()
-        .find(|node| *node != owner)
-        .unwrap();
-    let stat = dfs
-        .posix_write_file(
-            "/services/native-recorded-backoff",
-            b"actual repair attempt bytes",
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                replica_candidates: vec![owner.clone(), replica.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(dfs.coordinator().repair_jobs().len(), 1);
-    let scheduled = dfs.retry_pending_repairs_bounded(1).unwrap();
-    assert_eq!(scheduled.len(), 1);
-    let records = dfs.active_repair_attempt_records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].object_id, stat.object_id);
-    assert_eq!(records[0].version, stat.version);
-    assert_eq!(records[0].content_hash, stat.content_hash.clone().unwrap());
-    assert_eq!(records[0].missing_replica_node_id, replica);
-    assert!(records[0].in_flight);
-    assert!(records[0].transfer_request_id.is_some());
-    assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
-    assert!(
-        runtime
-            .rpc_observations()
-            .iter()
-            .any(|event| event.source == owner
-                && event.target == replica
-                && event.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::Completed),
-        "the captured retry must follow a real hosted receiver"
-    );
-    // Drop this caller before its queued response is consumed. The actual
-    // returned in-flight record is restart bookkeeping, never a receipt or
-    // permission to run repair without current native authority.
-    drop(dfs);
-    let mut reopened = runtime
-        .metadata_primary_service("/services/native-recorded-backoff")
-        .unwrap();
-    reopened.hydrate_from_metadata_backend().unwrap();
-    let before = runtime.rpc_observations().len();
-    assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
-    assert!(
-        reopened
-            .retry_pending_repairs_bounded_with_attempts(1, &records)
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        reopened.operational_metrics().unwrap().repair_attempt_count,
-        1
-    );
-    assert!(
-        !runtime.rpc_observations()[before..]
-            .iter()
-            .any(|event| event.source == owner
-                && event.target == replica
-                && event.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch)
-    );
-    let peer = runtime.client(&replica).unwrap();
-    assert_eq!(
-        peer.content()
-            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
-            .unwrap()
-            .1,
-        b"actual repair attempt bytes"
-    );
-    drop(peer);
-    drop(reopened);
-    drop(background);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
-    let name = "native-captured-fetch-attempt-service-reopen";
-    let (runtime, mut dfs, config) =
-        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
-    let primary = config.primary_node_id;
-    drop(dfs);
-    let background = runtime
-        .deny_background_replica_before_claim(&primary)
-        .unwrap();
-    let mut dfs = runtime
-        .metadata_primary_service("/services/native-fetch-backoff.bin")
-        .unwrap();
-    let other = crate::test_support::DfsTestRuntime::ordered_node_ids(name, 3)
-        .into_iter()
-        .filter(|node| *node != primary)
-        .collect::<Vec<_>>();
-    let source = other[0].clone();
-    let target = other[1].clone();
-    for route in [
-        crate::DFS_DATA_STAGE_BLOB_ROUTE,
-        crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
-    ] {
-        runtime.install_fault(crate::test_support::DfsTestFaultRule {
-            source: Some(primary.clone()),
-            target: Some(target.clone()),
-            route: Some(route.into()),
-            call_id: None,
-            origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
-            remaining_hits: 32,
-            action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-        });
-    }
-    let path = "/services/native-fetch-backoff.bin";
-    let bytes = (0..2 * 1024 * 1024 + 17)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
-    let stat = dfs
-        .posix_write_file(
-            path,
-            &bytes,
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 3).unwrap(),
-                replica_candidates: vec![primary.clone(), source.clone(), target.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    let receipts = dfs
-        .metadata_backend()
-        .unwrap()
-        .receipts_for_version(&stat.object_id, &stat.version)
-        .unwrap();
-    assert_eq!(
-        receipts
-            .iter()
-            .map(|receipt| receipt.replica_node_id.clone())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([primary.clone(), source.clone()])
-    );
-    assert_eq!(dfs.coordinator().repair_jobs().len(), 1);
-    let hash = stat.content_hash.clone().unwrap();
-    dfs.content().debug_remove_loose_blob(&hash).unwrap();
-    assert!(
-        dfs.content().open_blob_stream(&hash).is_err(),
-        "fault removes the actual local bytes"
-    );
-    let before_fetch = runtime.rpc_observations().len();
-    assert!(dfs.retry_pending_repairs_bounded(1).unwrap().is_empty());
-    assert!(
-        runtime.rpc_observations()[before_fetch..]
-            .iter()
-            .any(|event| event.source == primary
-                && event.target == source
-                && event.route == crate::DFS_DATA_FETCH_BLOB_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
-    );
-    let records = dfs.active_repair_attempt_records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].object_id, stat.object_id);
-    assert_eq!(records[0].version, stat.version);
-    assert_eq!(records[0].content_hash, hash);
-    assert_eq!(records[0].missing_replica_node_id, target);
-    assert!(records[0].in_flight);
-    let pending = dfs
-        .writes
-        .pending_writes
-        .get(&records[0].intent_id)
-        .expect("actual producer owns the pending Fetch");
-    assert!(pending.fetch_inflight_from.contains(&source));
-    assert!(
-        pending
-            .fetch_inflight_request_ids
-            .get(&source)
-            .is_some_and(|id| !id.is_empty()),
-        "the actual source Fetch has its own correlated request identity"
-    );
-    assert!(
-        records[0].transfer_request_id.is_none(),
-        "a source Fetch cannot invent custody of a separate target Repair"
-    );
-    assert!(!pending.repair_inflight_request_ids.contains_key(&target));
-    assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
-    drop(dfs);
-    let mut reopened = runtime
-        .metadata_primary_service("/services/native-fetch-backoff.bin")
-        .unwrap();
-    reopened.hydrate_from_metadata_backend().unwrap();
-    let before_retry = runtime.rpc_observations().len();
-    assert!(records[0].next_retry_unix_nanos > dfs_now_unix_nanos());
-    assert!(
-        reopened
-            .retry_pending_repairs_bounded_with_attempts(1, &records)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !runtime.rpc_observations()[before_retry..]
-            .iter()
-            .any(|event| event.source == primary
-                && event.target == source
-                && event.route == crate::DFS_DATA_FETCH_BLOB_ROUTE
-                && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch)
-    );
-    let actual_source = runtime.client(&source).unwrap();
-    assert_eq!(
-        actual_source
-            .content()
-            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
-            .unwrap()
-            .1,
-        bytes
-    );
-    drop(actual_source);
-    drop(reopened);
-    runtime.clear_faults();
-    drop(background);
     runtime.close().unwrap();
 }
 
@@ -1130,10 +895,7 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
     });
 
     sifs_posix_cluster_pump_until(&mut cluster, "primary async repair", |cluster| {
-        cluster
-            .primary
-            .retry_pending_repairs()
-            .expect("primary repair tick");
+        drive_repair_executor(&cluster._runtime, &mut cluster.primary);
         cluster
             .primary
             .posix_read_file(path)
@@ -1263,8 +1025,7 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
                 Instant::now() < setup_deadline,
                 "native predecessor desired copies must settle"
             );
-            original.retry_pending_repairs().unwrap();
-            original.process_incoming().unwrap();
+            drive_repair_executor(&runtime, &mut original);
         }
         original.flush_detached_transport_sends().unwrap();
         if let Some(missing) = peers.get(1) {
@@ -1359,7 +1120,7 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
                 .unwrap(),
             unchanged
         );
-        recovered.retry_pending_repairs().unwrap();
+        recovered.retry_pending_stages(8).unwrap();
         let fresh_request_id = recovered
             .writes
             .pending_writes
@@ -1395,14 +1156,24 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
                 if event_intent_id == &intent_id
         )));
         assert!(report.committed_work.publish_metadata);
-        assert_eq!(
-            report.committed_work.repair_maintenance, expect_repair_maintenance,
-            "a recovered receipt must retain repair work exactly while desired replicas remain for {case}"
+        let committed = recovered
+            .metadata_backend()
+            .unwrap()
+            .get_object(&request.object_id)
+            .unwrap()
+            .expect("the recovered commit is visible");
+        let remaining = super::repair::indexed_object_repair_needs(
+            &runtime,
+            &recovered,
+            &committed.file_system_id,
+            &committed.path,
+            &committed.object_id,
+            &committed.version,
         );
         assert_eq!(
-            report.committed_repair_records.len(),
+            remaining.len(),
             usize::from(expect_repair_maintenance),
-            "the recovered commit must hand off only its newly created missing target for {case}"
+            "the recovered commit leaves exactly its missing desired replica as repair work for {case}: {remaining:?}"
         );
         assert!(matches!(
             recovered.write_outcome(&intent_id).expect("committed outcome"),

@@ -1534,6 +1534,26 @@ impl ClusterConnectivityGraph {
     pub(crate) fn earliest_expires_at(&self) -> Option<OffsetDateTime> {
         self.records.iter().map(|record| record.expires_at).min()
     }
+
+    /// When the earliest `Unreachable` record from `source` to `target`
+    /// expires. Without a new record, only such an expiry can make `target`
+    /// look more available to `source`; an expiring healthy or degraded
+    /// record only takes reachability away.
+    pub fn earliest_unreachable_expiry(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+    ) -> Option<OffsetDateTime> {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.state == ClusterConnectivityState::Unreachable
+                    && &record.source_node_id == source
+                    && &record.target_node_id == target
+            })
+            .map(|record| record.expires_at)
+            .min()
+    }
 }
 
 fn cluster_endpoint_record_for_connectivity_record(

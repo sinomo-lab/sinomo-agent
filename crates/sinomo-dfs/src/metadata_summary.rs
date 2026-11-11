@@ -343,6 +343,13 @@ pub(crate) struct RepairDemand {
     owner_root: Option<RepairRoot>,
 }
 
+impl RepairDemand {
+    /// Root of the selected owner intent, which covers this demand's root.
+    pub(crate) fn owner_root(&self) -> Option<RepairRoot> {
+        self.owner_root
+    }
+}
+
 fn repair_root_covers(owner: RepairRoot, demand: RepairRoot) -> bool {
     match (owner, demand) {
         (RepairRoot::Permanent, _) => true,
@@ -368,12 +375,32 @@ pub(crate) fn repair_demands_for_object<'a>(
     versions: impl IntoIterator<Item = &'a DfsObjectVersionRecord>,
     pinned_versions: &BTreeSet<DfsVersion>,
 ) -> BTreeMap<RepairDemandKey, RepairDemand> {
+    repair_demands_for_object_observed_at(
+        object,
+        intents,
+        receipts,
+        versions,
+        pinned_versions,
+        Some(crate::dfs_now_unix_nanos()),
+    )
+}
+
+/// `observed_at: None` selects owners as if every root were live, so the
+/// result depends only on metadata rows. The derived repair index uses this
+/// form and leaves the liveness of a root to the executor at dispatch time.
+pub(crate) fn repair_demands_for_object_observed_at<'a>(
+    object: &DfsObjectMetadata,
+    intents: impl IntoIterator<Item = &'a DfsWriteIntentRecord>,
+    receipts: impl IntoIterator<Item = &'a DfsReplicaReceiptRecord>,
+    versions: impl IntoIterator<Item = &'a DfsObjectVersionRecord>,
+    pinned_versions: &BTreeSet<DfsVersion>,
+    observed_at: Option<u64>,
+) -> BTreeMap<RepairDemandKey, RepairDemand> {
     let versions = versions
         .into_iter()
         .map(|version| (version.version.clone(), version))
         .collect::<BTreeMap<_, _>>();
     let high = retention_orders_for_versions(versions.values().copied());
-    let observed_at = crate::dfs_now_unix_nanos();
     let receipts = receipts
         .into_iter()
         .filter(|receipt| {
@@ -413,7 +440,9 @@ pub(crate) fn repair_demands_for_object<'a>(
             // A historical expired owner cannot win lexically over a live
             // Current root. Prefer the real owner with the strongest own root;
             // ties are deterministic. The merged lifetime is checked below.
-            if let Some(owner) = owner.filter(|_| root.is_live(observed_at)) {
+            if let Some(owner) =
+                owner.filter(|_| observed_at.is_none_or(|observed_at| root.is_live(observed_at)))
+            {
                 let replace = entry.owner_root.is_none_or(|old_root| {
                     !repair_root_covers(old_root, root)
                         || (repair_root_covers(root, old_root)
@@ -698,6 +727,7 @@ mod tests {
             scanned,
             "incremental status projection diverged after {context}"
         );
+        crate::metadata_tables::assert_repair_index_matches_rows(tables, context);
     }
 
     #[test]

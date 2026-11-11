@@ -9,6 +9,8 @@ pub(crate) type DaemonDfsMaintenanceTickOutcome = sinomo_dfs::DfsMaintenanceTick
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DaemonDfsMaintenanceKind {
     Routine,
+    /// Only the repair executor's pass, for a wake that concerns only it.
+    RepairExecutor,
     MountedMutationRecovery,
     AuthoritativeReconciliation {
         content_gc_requested: bool,
@@ -22,13 +24,14 @@ impl DaemonDfsMaintenanceKind {
         // These callers already own an unfinished reconciliation/recovery
         // request. Foreground preemption cannot convert it into idle routine
         // work merely because its first phase has not reached a checkpoint.
-        !matches!(self, Self::Routine)
+        !matches!(self, Self::Routine | Self::RepairExecutor)
     }
 
     pub(super) fn replica_dispatch_is_deferred(self) -> bool {
         matches!(
             self,
             Self::Routine
+                | Self::RepairExecutor
                 | Self::MountedMutationRecovery
                 | Self::AuthoritativeReconciliation {
                     content_gc_requested: false,
@@ -90,9 +93,6 @@ pub(super) fn prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(
         return Ok(DaemonDfsMountedMutationRecoveryBatch::default());
     }
     let batch = DaemonDfsMountedMutationRecoveryBatch::prepare(&data_dir)?;
-    if batch.appended_repair_record_count() > 0 {
-        record_daemon_dfs_repair_queue_nonempty(&data_dir, true);
-    }
     for committed_work in batch.committed_work().iter().copied() {
         emit_daemon_dfs_committed_edges(
             &data_dir,
@@ -227,16 +227,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let kind = match maintenance_kind {
         DaemonDfsMaintenanceKind::Routine => "routine",
+        DaemonDfsMaintenanceKind::RepairExecutor => "repair-executor",
         DaemonDfsMaintenanceKind::MountedMutationRecovery => "mounted-mutation-recovery",
         DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. } => "reconciliation",
     };
     let mut observation =
         crate::background_observation::DfsBackgroundObservation::new("maintenance", kind);
-    // A routine pass runs the repairs committed effects requested; restore the
-    // request unless this pass finished its whole turn, since a bounded pass
-    // can stop before its repair phase.
-    let repair_requested = maintenance_kind == DaemonDfsMaintenanceKind::Routine
-        && daemon_dfs_repair_maintenance_requested(paths, true);
     let result = run_daemon_dfs_maintenance_tick_kind_inner(
         paths,
         runtime,
@@ -244,16 +240,6 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         node_resources,
     )
     .await;
-    if repair_requested
-        && !matches!(
-            result,
-            Ok(DaemonDfsMaintenanceTickOutcome::Completed {
-                reached_limit: false
-            })
-        )
-    {
-        restore_daemon_dfs_repair_maintenance_request(paths);
-    }
     observation.finish(match &result {
         Ok(DaemonDfsMaintenanceTickOutcome::Completed {
             reached_limit: false,
@@ -289,14 +275,37 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     // weak reference, so dropping this guard before the resident cache opens
     // can otherwise replace a successfully warmed projection with a fresh,
     // empty generation under parallel cold roots.
-    let initial_metadata_authority_preflight =
+    let executor_only = maintenance_kind == DaemonDfsMaintenanceKind::RepairExecutor;
+    // Read before the turn captures its authority view: an authority event
+    // counted after this is newer than the view the executor dispatches with.
+    let repair_authority_epoch =
+        crate::repair_executor::repair_executor_authority_epoch(&data_dir.root());
+    // An executor-only turn serves the published assignment it finds. It does
+    // not wait for a configuration that is not ready yet: it yields, and the
+    // turn after the configuration's publication serves the same pending work.
+    let initial_metadata_authority_preflight = if executor_only {
+        match warm_daemon_dfs_repair_executor_authority(
+            &cluster_paths,
+            &preflight_cluster_state,
+            runtime,
+        )
+        .await?
+        {
+            Some(preflight) => preflight,
+            None => {
+                crate::repair_executor::repair_executor_await_publication(&data_dir.root());
+                return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+            }
+        }
+    } else {
         warm_daemon_dfs_metadata_authority_for_identity_async(
             &cluster_paths,
             &preflight_cluster_state.cluster_id,
             &preflight_cluster_state.local_node_id,
             runtime,
         )
-        .await?;
+        .await?
+    };
     // Publication can advance the shared configuration's authority fence even
     // when every filesystem and physical store is unchanged. Complete it before
     // capturing the admitted generation. Retain the initial owner through this
@@ -308,13 +317,18 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     );
     let mut advertisement_control_plane =
         DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, runtime);
-    match sinomo_dfs::publish_dfs_content_advertisement_if_needed_async(
-        &mut advertisement_control_plane,
-        &preflight_cluster_state.local_node_id,
-        local_advertisement,
-    )
-    .await
-    {
+    // An executor-only turn publishes nothing; the advertisement keeps the
+    // triggers of the ordinary turns.
+    match if executor_only {
+        Ok(false)
+    } else {
+        sinomo_dfs::publish_dfs_content_advertisement_if_needed_async(
+            &mut advertisement_control_plane,
+            &preflight_cluster_state.local_node_id,
+            local_advertisement,
+        )
+        .await
+    } {
         Ok(true) => {
             let committed_revision = advertisement_control_plane.observed_revision();
             initial_metadata_authority_preflight
@@ -332,19 +346,42 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     // Archived goal dispatch consumes the ordinary current advertisement cut.
     // Publish it before running callbacks that need real current candidates;
     // callbacks remain outside service ownership and mutation admission.
-    let namespace_work = super::maintenance_host::run_namespace_reconciliation_work(paths)?;
+    let namespace_work = if executor_only {
+        super::maintenance_host::NamespaceReconciliationRun {
+            complete: true,
+            blocks_ordinary_maintenance: false,
+        }
+    } else {
+        super::maintenance_host::run_namespace_reconciliation_work(paths)?
+    };
     if namespace_work.blocks_ordinary_maintenance {
         return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
     }
     // The normal preflight validates the resulting retained proof, including
     // concurrent filesystem/shard transitions and possibly applied publication.
-    let mut metadata_authority_preflight = warm_daemon_dfs_metadata_authority_for_identity_async(
-        &cluster_paths,
-        &preflight_cluster_state.cluster_id,
-        &preflight_cluster_state.local_node_id,
-        runtime,
-    )
-    .await?;
+    let mut metadata_authority_preflight = if executor_only {
+        match warm_daemon_dfs_repair_executor_authority(
+            &cluster_paths,
+            &preflight_cluster_state,
+            runtime,
+        )
+        .await?
+        {
+            Some(preflight) => preflight,
+            None => {
+                crate::repair_executor::repair_executor_await_publication(&data_dir.root());
+                return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+            }
+        }
+    } else {
+        warm_daemon_dfs_metadata_authority_for_identity_async(
+            &cluster_paths,
+            &preflight_cluster_state.cluster_id,
+            &preflight_cluster_state.local_node_id,
+            runtime,
+        )
+        .await?
+    };
     drop(advertisement_control_plane);
     drop(initial_metadata_authority_preflight);
     // Publish maintenance interest before cluster/local admission. A
@@ -436,6 +473,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                     preflight_cluster_state.clone(),
                     runtime,
                     &metadata_authority_preflight,
+                    repair_authority_epoch,
                     maintenance_kind,
                     node_resources,
                     committed_work_tracker.clone(),
@@ -521,6 +559,14 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         let retained_progress = retained_progress?;
         let outcome = match maintenance_result {
             DaemonDfsMaintenancePreemptionOutcome::Finished(result) => match result? {
+                DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(_)
+                    if executor_only =>
+                {
+                    // The assignment moved during the turn: the next turn
+                    // serves it from the newer publication.
+                    crate::repair_executor::repair_executor_await_publication(&data_dir.root());
+                    DaemonDfsMaintenanceTickOutcome::Deferred
+                }
                 DaemonDfsMaintenancePreExecution::AuthorityPreflightStale(stale) => {
                     if authority_replans >= 2 {
                         return Err(stale.into_dfs_error().into());
@@ -590,18 +636,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                 }
             }
         };
-        if let Err(error) = refresh_daemon_dfs_repair_queue_nonempty(&data_dir) {
-            // Retain fail-open wake eligibility. A queue whose snapshot cannot be
-            // observed must never be mistaken for proof that repair work is empty.
-            record_daemon_dfs_repair_queue_nonempty(&data_dir, true);
-            tracing::warn!(
-                target: "sinomo.dfs.fault_healing",
-                data_root = %data_dir.root().display(),
-                error = %error,
-                "could not refresh bounded DFS repair queue state after maintenance"
-            );
-        }
-        if matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
+        if !executor_only && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
             // Lifecycle work can delete or compact content without producing a
             // served-message event. One coalesced dirty edge after a completed pass
             // keeps capacity evidence current without a periodic filesystem scan.
@@ -697,6 +732,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     cluster_state: sinomo_core::ClusterBootstrapState,
     runtime: &tokio::runtime::Handle,
     metadata_authority_preflight: &DaemonDfsMetadataAuthorityPreflight,
+    repair_authority_epoch: u64,
     maintenance_kind: DaemonDfsMaintenanceKind,
     node_resources: sinomo_device::NodeResourceSnapshot,
     committed_work_tracker: DfsCommittedWorkTracker,
@@ -724,7 +760,8 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // retained authority checks below revalidate that identity before taking
     // the lane; no file-state wait may retain admission needed by its producer.
     let execution_exclusions =
-        daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
+        daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state)
+            .with_repair_authority_epoch(repair_authority_epoch);
     // Transfer the mutation lane only after validating the admitted native
     // identity. Topology comes from the retained proof-bearing generation
     // below; maintenance must never refresh or materialize the complete KV
@@ -794,15 +831,17 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // Release this strong owner before returning the reusable lane to cache.
     let publication_provider_scope = publication_provider
         .map(|provider| maintenance_service.publication_provider.install(provider));
-    let placement_advertisements = maintenance_service
-        .placement_content_candidates()
-        .unwrap_or_default();
-    refresh_daemon_dfs_placement_snapshot(
-        &data_dir,
-        &cluster_paths,
-        &cluster_state.local_node_id,
-        placement_advertisements,
-    );
+    if maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor {
+        let placement_advertisements = maintenance_service
+            .placement_content_candidates()
+            .unwrap_or_default();
+        refresh_daemon_dfs_placement_snapshot(
+            &data_dir,
+            &cluster_paths,
+            &cluster_state.local_node_id,
+            placement_advertisements,
+        );
+    }
     let authority_generation_before_maintenance = signature.metadata_authority_generation;
     let authoritative_topology = match metadata_authority_generation
         .retained_complete_prefix_for_generation(authority_generation_before_maintenance)
@@ -843,6 +882,23 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             DaemonDfsMaintenanceKind::Routine => {
                 daemon_dfs_routine_maintenance_tick_options(node_resources)
             }
+            DaemonDfsMaintenanceKind::RepairExecutor => {
+                let options = daemon_dfs_routine_maintenance_tick_options(node_resources);
+                let shards = crate::metadata_shards_from_authority_projection(
+                    &authoritative_topology,
+                    &crate::sifs_file_system_id(),
+                )
+                .map_err(DaemonError::from)?;
+                return crate::maintenance::run_dfs_repair_executor_turn(
+                    &mut *maintenance_service,
+                    &data_dir.root(),
+                    &shards,
+                    &execution_exclusions,
+                    options.repair_max_jobs,
+                )
+                .map(Some)
+                .map_err(DaemonError::from);
+            }
             DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
             | DaemonDfsMaintenanceKind::MountedMutationRecovery => {
                 let (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested) = match maintenance_kind {
@@ -850,7 +906,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                         content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested,
                     } => (content_gc_requested, content_reservation_reconciliation_requested, commit_promotion_recovery_requested),
                     DaemonDfsMaintenanceKind::MountedMutationRecovery => (false, false, false),
-                    DaemonDfsMaintenanceKind::Routine => unreachable!("routine handled above"),
+                    DaemonDfsMaintenanceKind::Routine | DaemonDfsMaintenanceKind::RepairExecutor => {
+                        unreachable!("routine and executor-only turns handled above")
+                    }
                 };
                 let recovery_options = if maintenance_kind == DaemonDfsMaintenanceKind::MountedMutationRecovery {
                     crate::dfs_mounted_mutation_recovery_tick_options()
@@ -875,6 +933,11 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     let recovery_shards = crate::metadata_shards_from_authority_projection(
                         &authoritative_topology, &crate::sifs_file_system_id(),
                     ).map_err(DaemonError::from)?;
+                    #[cfg(test)]
+                    crate::maintenance::phase_runs::record(
+                        &data_dir.root(),
+                        crate::maintenance::phase_runs::HANDOFF,
+                    );
                     let handoff_result = maintenance_service.reconcile_pending_metadata_shard_membership_handoffs_until_cancelled(
                         &recovery_shards, recovery_options.metadata_replication.target_timeout,
                         &|| {
@@ -941,7 +1004,6 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                             &metadata_authority_generation,
                             authority_generation_before_maintenance,
                             request_generation,
-                            maintenance_service.durable_repair_queue_records(),
                         )?;
                     if !recovery_handed_off {
                         return Ok(None);
@@ -958,7 +1020,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             // Resume only the original durable request. Ending this continuation
             // leaves every other bounded phase for the next ordinary tick, rather
             // than resetting its work budgets after each remote response.
-            maintenance_service.recover_pending_namespace_requests_bounded(1)?;
+            let resumed = maintenance_service.recover_pending_namespace_requests_bounded(1);
+            // A completed repair wait's deadline belongs to that re-run only.
+            maintenance_service.file_sync_wait_deadline = None;
+            resumed?;
             return Ok(None);
         }
         // Both kinds now execute the same bounded phases. Recovery has already
@@ -988,6 +1053,13 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         }
     }
     .await;
+    // An executor-only turn wakes the detached worker only for sends of its
+    // own; sends other producers queued keep their own wakes.
+    if maintenance_kind == DaemonDfsMaintenanceKind::RepairExecutor
+        && matches!(&maintenance_result, Ok(Some(report)) if report.scheduled_repairs.is_empty())
+    {
+        *_deferred_work = None;
+    }
     let remote_namespace_phase =
         if let Some(phase) = maintenance_service.remote_namespace_phase.take() {
             let request = maintenance_service
@@ -1004,6 +1076,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             None
         };
     if matches!(&maintenance_result, Ok(Some(_)))
+        && maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor
         && let Some((generation, jobs)) =
             super::maintenance_host::daemon_dfs_requested_namespace_job_compaction(
                 &DaemonPaths::new(&data_dir),
@@ -1165,9 +1238,6 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         target: "sinomo.dfs.maintenance",
         metadata_replications_sent = observations.metadata_replications_sent,
         repair_attempt_count = observations.repair_attempt_count,
-        repair_attempt_in_flight_count = observations.repair_attempt_in_flight_count,
-        repair_attempt_backoff_count = observations.repair_attempt_backoff_count,
-        repair_attempt_suppressed_count = observations.repair_attempt_suppressed_count,
         scheduled_repair_count = report.scheduled_repairs.len(),
         followup_event_count = report.followup_events.len(),
         namespace_jobs_scanned = report.namespace_jobs.scanned_job_count,
@@ -1233,7 +1303,30 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
     node_resources: sinomo_device::NodeResourceSnapshot,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
+    run_daemon_dfs_maintenance_in_blocking_task(paths, runtime, node_resources, shutdown, false)
+        .await
+}
+
+/// Run one executor-only turn from Tokio's blocking pool, owned and cancelled
+/// exactly like a maintenance tick.
+pub(crate) async fn run_daemon_dfs_repair_executor_turn_in_blocking_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
+    run_daemon_dfs_maintenance_in_blocking_task(paths, runtime, node_resources, shutdown, true)
+        .await
+}
+
+async fn run_daemon_dfs_maintenance_in_blocking_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    executor_only: bool,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
@@ -1253,15 +1346,24 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
                 biased;
                 _ = cancellation_owner.wait_for_shutdown() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
                 _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
-                result = until_shutdown_observed(
-                    run_daemon_dfs_maintenance_tick_on_runtime(
-                        &paths,
-                        &tick_runtime,
-                        node_resources,
-                    ),
-                    &cancellation_owner,
-                    &shutdown_state,
-                ) => result,
+                result = until_shutdown_observed(async {
+                    if executor_only {
+                        run_daemon_dfs_maintenance_tick_kind_on_runtime(
+                            &paths,
+                            &tick_runtime,
+                            DaemonDfsMaintenanceKind::RepairExecutor,
+                            node_resources,
+                        )
+                        .await
+                    } else {
+                        run_daemon_dfs_maintenance_tick_on_runtime(
+                            &paths,
+                            &tick_runtime,
+                            node_resources,
+                        )
+                        .await
+                    }
+                }, &cancellation_owner, &shutdown_state) => result,
             }
         });
         // Match the prior JoinHandle result boundary only after the actual
@@ -1300,6 +1402,26 @@ where
         std::task::Poll::Pending => std::task::Poll::Pending,
     })
     .await
+}
+
+/// The current authority preflight if its configuration is ready now, without
+/// waiting for a pending publication.
+async fn warm_daemon_dfs_repair_executor_authority(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<DaemonDfsMetadataAuthorityPreflight>, DaemonError> {
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &state.cluster_id,
+        &state.local_node_id,
+        Some(runtime),
+    )?;
+    Ok(
+        warm_daemon_dfs_metadata_authority_before_deadline(authority, tokio::time::Instant::now())
+            .await
+            .ok(),
+    )
 }
 
 pub(super) fn daemon_dfs_routine_maintenance_tick_options(

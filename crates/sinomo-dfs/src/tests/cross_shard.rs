@@ -3551,10 +3551,7 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
     cluster._runtime.clear_faults();
     let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
     while cluster.users_primary.posix_stat(from).unwrap().version != target {
-        cluster
-            .users_primary
-            .retry_pending_repairs_bounded(8)
-            .unwrap();
+        cluster.users_primary.retry_pending_stages(8).unwrap();
         cluster.users_primary.process_incoming().unwrap();
         assert!(
             Instant::now() < deadline,

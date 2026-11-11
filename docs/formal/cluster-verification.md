@@ -96,7 +96,7 @@ The model inventory is split by subsystem:
     `content_catalog_causal_cut`, `pending_request_lifecycle`,
     `repair_authorization`, `repair_content_validation`,
     `replica_quorum_fanout`, `replica_promotion_outbox`,
-    `repair_lost_authority`, `repair_queue_refresh`, `bounded_intent_scan`,
+    `repair_lost_authority`, `bounded_intent_scan`,
     and `anti_entropy`;
   - daemon scheduling: `metadata_shard_concurrent_dispatch` and
     `daemon_read_blocking_admission`.
@@ -805,27 +805,6 @@ oversized requests leave content and accounting unchanged, and namespace
 metadata cannot become visible before its blob is durable. Crash may discard
 only derived counters; a durable-blob scan restores exact stats without
 changing namespace visibility or quota authority.
-
-The `dfs_repair_queue_refresh_safety.safety` invariant is a target refinement
-for retaining the materialized node-local repair queue across maintenance
-passes. A cached view is reusable only when its snapshot/log content
-fingerprint matches the exact durable byte generation and no failed sync
-remains unresolved. Fingerprints are not wall-clock timestamps or sequence
-numbers. Replacement at the same sequence invalidates the resident observation
-token, so a stale maintenance reconciliation cannot overwrite newer pending
-records or retry state. The slice covers external append/replacement,
-truncation/corruption, failed complete/torn append, resync before no-op retry,
-restart, unsupported fingerprint evidence, and duplicate enqueue backoff.
-Hash collision resistance and the existing serialized owner discipline are
-assumptions; this model does not make independent simultaneous process writers
-safe, bound real disk latency, or model scheduling fairness. The registered
-case is `dfs-repair-queue-refresh` (depth 6; 5,000 simulation traces of 24 steps,
-all 18 witnesses reached with seed `0x51a0f04d20260711`). The replay candidate
-must hash its actual decoded snapshot and framed-log buffers, including covered
-frames and recoverable tails; separate before/after scans cannot reject an
-A-to-B-to-A substitution during replay. Eleven focused Rust regressions cover
-these cache, observation, and retry boundaries; the full DFS library suite
-passes with 2,038 tests and one ignored test.
 
 The `dfs_bounded_intent_scan_safety.safety` invariant is a bounded target/refinement
 for `dfs-bounded-intent-maintenance-scan`: one physical shard is enumerated per

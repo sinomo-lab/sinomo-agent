@@ -414,25 +414,6 @@ pub(crate) fn from_intent(intent: &DistributedWriteIntent) -> Box<DfsContentDura
     })
 }
 
-/// Match an actual receipt to the complete target byte identity. The receipt's
-/// owner is its metadata publisher; the recorded plan's coordinator is the
-/// original requester. Neither node identity substitutes for this DATA join.
-/// Callers retain their existing committed-plan and publication provenance checks.
-pub(crate) fn receipt_matches_target_version(
-    receipt: &DfsReplicaReceiptRecord,
-    target: &DfsObjectVersionRecord,
-    replica_node_id: &sinomo_core::node::NodeId,
-) -> bool {
-    target.size_bytes.is_some()
-        && target.content_hash.as_ref().is_some_and(|hash| {
-            receipt.replica_node_id == *replica_node_id
-                && receipt.receipt.file_system_id == target.file_system_id
-                && receipt.receipt.object_id == target.object_id
-                && receipt.receipt.committed_version == target.version
-                && receipt.content_hash.as_ref() == Some(hash)
-        })
-}
-
 /// The local-eventual batch contract is exactly one durable caller copy.
 /// Its receipt does not carry a distributed write-intent authority epoch.
 pub(crate) fn from_local_receipt(receipt: &DfsReplicaReceiptRecord) -> Box<DfsContentDurability> {

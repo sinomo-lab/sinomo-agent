@@ -17,9 +17,8 @@ use crate::{
     DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
     DfsFileSystemId, DfsLocalEventualBatchWriteProof, DfsMessageTransport, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
-    DfsNamespaceTransaction, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
     DfsPreparedMetadataEffect, DfsPreparedOperationPayload, DfsPreparedOperationScope,
-    DfsPreparedOperationStatus,
     DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, MetadataBackendError,
     NetworkedDfsService, dfs_perf_trace, metadata_path, normalize_current_locations,
     path_index_key,
@@ -886,83 +885,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(true)
     }
 
-    /// Resume an actual hidden receipt publication after its content reply was
-    /// retained but metadata application failed. The response selects existing
-    /// preparation DATA only; it never constructs a replacement publication.
-    pub(crate) fn recover_original_repair_receipt_prepare(
-        &mut self,
-        birth: &crate::repair_queue_store::RepairOriginalBirth,
-    ) -> Result<bool, DfsError> {
-        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
-            return Ok(false);
-        };
-        let Some(shard) = command.authority_shard.as_ref() else {
-            return Ok(false);
-        };
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(false);
-        };
-        // Reuse the exact-shard reservation index with an empty-effect read
-        // footprint. It is never prepared or published, and reuses the actual
-        // Repair request ID rather than allocating another operation identity.
-        let footprint = DfsPreparedOperationPayload::for_metadata_effects(
-            DfsPreparedOperationScope {
-                file_system_id: command.file_system_id.clone(),
-                shard_id: DfsMetadataShardId::new(&shard.shard_id),
-                owner_epoch: shard.epoch,
-                operation_id: command.request_id.clone(),
-            },
-            vec![DfsNamespaceObjectVersionExpectation {
-                object_id: command.object_id.clone(),
-                expected_version: Some(command.version.clone()),
-            }],
-            Vec::new(),
-            Vec::new(),
-            OffsetDateTime::UNIX_EPOCH,
-        )?;
-        let mut matching = None;
-        for record in backend.prepared_operation_reservations(&footprint)? {
-            if record.status != DfsPreparedOperationStatus::Prepared
-                || record.digest.file_system_id != command.file_system_id
-                || record.digest.shard_id.0 != shard.shard_id
-                || record.digest.owner_epoch < shard.epoch
-            {
-                continue;
-            }
-            record.validate()?;
-            let original = record.payload.as_ref();
-            let input = match original.metadata_effects.split_last() {
-                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
-                    if file_system.file_system_id == original.file_system_id => input,
-                _ => original.metadata_effects.as_slice(),
-            };
-            let Some(receipt) = metadata_receipt_projection_input(input) else {
-                continue;
-            };
-            if receipt.receipt.file_system_id != command.file_system_id
-                || receipt.receipt.object_id != command.object_id
-                || receipt.receipt.committed_version != command.version
-                || receipt.receipt.owner_node_id != birth.original.source_node_id
-                || receipt.replica_node_id != birth.original.target_node_id
-                || receipt.content_hash.as_deref() != Some(command.content_hash.as_str())
-            {
-                continue;
-            }
-            if matching.replace(record).is_some() {
-                return Err(DfsError::Metadata {
-                    message: "multiple hidden publications claim the same original repair receipt"
-                        .into(),
-                });
-            }
-        }
-        let Some(record) = matching else {
-            // An absent receipt after a committed publication can be a later
-            // withdrawal. Only a still-hidden original may be continued here.
-            return Ok(false);
-        };
-        self.recover_one_prepared_operation(record)
-    }
-
     /// A same-version placement producer retains a deterministic intent ID,
     /// although its metadata envelope and observation timestamps are minted on
     /// each attempt. Resume only its exact original intent-only preparation.
@@ -1550,52 +1472,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?)
     }
 
-    /// `rebuild_repair_jobs` selects between the eager per-receipt repair
-    /// rebuild and the deferred one for bulk restore loops: hydration restores
-    /// every receipt of an unsettled-write backlog, and rebuilding per receipt
-    /// made SIFS opens burn seconds of CPU once a degraded cluster link had
-    /// let that backlog accumulate.
-    pub(crate) fn restore_backend_durable_receipt_with_repair_rebuild(
+    /// The coordinator only learns durability; an unsettled location is a
+    /// need in the shard's repair index, which the executor schedules.
+    pub(crate) fn restore_backend_durable_receipt(
         &mut self,
         intent_id: &str,
         replica_node_id: NodeId,
         allow_unknown_intent: bool,
-        rebuild_repair_jobs: bool,
     ) -> Result<(), DfsError> {
-        // Raw object rows describe publication; ordinary reads merge receipt
-        // locations and would conceal a durable receipt's unfinished journal
-        // effect. Preserve all receipt durability while retaining that target
-        // in the existing repair mechanism until the normal handler settles it.
-        let unsettled_location = self.coordinator.intent(intent_id).and_then(|intent| {
-            if !matches!(
-                intent.state,
-                crate::distributed::DfsWriteIntentState::Committed
-            ) || !intent.publication.is_current()
-            {
-                return Some(false);
-            }
-            self.metadata.object(&intent.object_id).map(|object| {
-                object.file_system_id == intent.file_system_id
-                    && object.version == intent.target_version
-                    && object.content_hash.is_some()
-                    && !object.current_locations.contains(&replica_node_id)
-            })
-        });
-        if let Some(unsettled) = unsettled_location {
-            self.coordinator.restore_receipt_location_settlement(
-                intent_id,
-                &replica_node_id,
-                unsettled,
-            );
-        }
-        let restored = if rebuild_repair_jobs {
-            self.coordinator
-                .restore_durable_receipt(intent_id, replica_node_id)
-        } else {
-            self.coordinator
-                .restore_durable_receipt_deferring_repair_rebuild(intent_id, replica_node_id)
-                .map(drop)
-        };
+        let restored = self
+            .coordinator
+            .restore_durable_receipt(intent_id, replica_node_id);
         match restored {
             Ok(()) => Ok(()),
             Err(DfsDistributedError::UnknownIntent { .. }) if allow_unknown_intent => Ok(()),
@@ -1610,7 +1497,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn restore_backend_receipt_pages_for_intent(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
-        rebuild_repair_jobs: bool,
     ) -> Result<(), DfsError> {
         for receipt in self
             .backend_receipts_for_version(&intent_record.object_id, &intent_record.target_version)?
@@ -1620,11 +1506,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            self.restore_backend_durable_receipt_with_repair_rebuild(
+            self.restore_backend_durable_receipt(
                 &intent_record.intent_id,
                 receipt.replica_node_id,
                 false,
-                rebuild_repair_jobs,
             )?;
         }
         Ok(())

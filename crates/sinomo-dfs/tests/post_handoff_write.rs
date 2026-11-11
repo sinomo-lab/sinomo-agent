@@ -259,10 +259,6 @@ fn promoted_services_primary_fetches_new_create_from_outside_replica_plan() {
     drop(owner);
     let bytes = writer.posix_read_file_distributed(path);
     drop(writer);
-    let queue = sinomo_dfs::LocalDfsRepairQueueStore::new(
-        sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&promoted)),
-    );
-    let initial_queue = queue.view().unwrap();
     let mut ticks = Vec::new();
     let repair_result = (|| -> Result<(), String> {
         loop {
@@ -296,7 +292,6 @@ fn promoted_services_primary_fetches_new_create_from_outside_replica_plan() {
             tick?;
         }
     })();
-    let final_queue = queue.view().unwrap();
     let replica_bytes = selected
         .iter()
         .map(|target| {
@@ -312,8 +307,7 @@ fn promoted_services_primary_fetches_new_create_from_outside_replica_plan() {
         runtime.data_dir(&promoted).root().join("post-handoff-n-repair.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "intent_id":repair_intent,"object_id":repair_object,"version":repair_version,
-            "expected_targets":selected,"initial_queue":initial_queue.records,
-            "final_queue":final_queue.records,"result":repair_result,"last_ticks":ticks,
+            "expected_targets":selected,"result":repair_result,"last_ticks":ticks,
             "replica_bytes":replica_bytes,
             "qualification":"actual normal Main maintenance, same original absolute deadline; no second create or supplied transfer evidence"
         })).unwrap(),

@@ -32,9 +32,6 @@ pub struct DfsOutboundAttachment {
 pub struct DfsRoutedCall {
     pub message: DfsRoutedMessage,
     pub attachment: Option<DfsOutboundAttachment>,
-    /// Prospective wire representation only. `message` remains the actual
-    /// ordinary carrier used by original-attempt and delivery correlation.
-    pub original_repair: Option<crate::DfsOriginalRepairMaterial>,
 }
 
 impl DfsRoutedCall {
@@ -42,7 +39,6 @@ impl DfsRoutedCall {
         Self {
             message,
             attachment: None,
-            original_repair: None,
         }
     }
 
@@ -50,38 +46,8 @@ impl DfsRoutedCall {
         Self {
             message,
             attachment: Some(attachment),
-            original_repair: None,
         }
     }
-
-    pub(crate) fn with_original_repair(mut self, material: crate::DfsOriginalRepairMaterial) -> Result<Self, crate::DfsError> {
-        material.validate()?;
-        if !material.matches_carrier(&self.message)
-            || self.attachment.as_ref().map(|body| &body.descriptor) != Some(&material.attachment)
-        {
-            return Err(crate::DfsError::Metadata { message: "selected Repair carrier/body differs from actual original".into() });
-        }
-        self.original_repair = Some(material);
-        Ok(self)
-    }
-}
-
-pub(crate) fn selected_original_repair_wire_message(
-    mut message: DfsRoutedMessage,
-    material: Option<crate::DfsOriginalRepairMaterial>,
-) -> Result<DfsRoutedMessage, NetworkError> {
-    if let Some(material) = material {
-        material.validate().map_err(|error| NetworkError::Serialization { detail: error.to_string() })?;
-        if !material.matches_carrier(&message) {
-            return Err(NetworkError::Serialization { detail: "selected Repair representation changed original carrier".into() });
-        }
-        message.message = crate::DfsNetworkMessage::SelectedOriginalRepair(crate::DfsSelectedOriginalRepairCommand {
-            version: 1,
-            material,
-            bytes: Vec::new(),
-        });
-    }
-    Ok(message)
 }
 
 /// Preserve the same normal message route while moving a native snapshot's
@@ -116,7 +82,6 @@ pub(crate) fn native_snapshot_routed_call(
 pub struct DfsRoutedSend {
     pub target_node_id: NodeId,
     pub call: DfsRoutedCall,
-    pub(crate) native_repair_custody: Option<crate::runtime_host::PreparedNativeRepairCustody>,
 }
 
 impl DfsRoutedSend {
@@ -124,7 +89,6 @@ impl DfsRoutedSend {
         Self {
             target_node_id,
             call,
-            native_repair_custody: None,
         }
     }
 }
@@ -415,17 +379,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         })
     }
 
-    /// Scalar options only, never a native-return or publication capability.
-    /// A concrete native owner preserves the SAME absolute operation deadline;
-    /// consumers must not restart a remaining Duration after preparation/await.
-    /// Custom transports default to unsupported without changing their legacy
-    /// no-Original path or supplying a stronger native proof.
-    fn native_replica_send_options(
-        &self,
-    ) -> Result<Option<(crate::DfsObjectRpcSendOptions, Option<Instant>)>, NetworkError> {
-        Ok(None)
-    }
-
     /// Runtime-local response custody only. The service retains authority checks.
     fn register_routed_write_response_owner(
         &mut self,
@@ -466,9 +419,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         requests: Vec<DfsRoutedSend>,
         _max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
-        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
-            return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
-        }
         Ok(requests
             .into_iter()
             .map(|request| {
@@ -498,7 +448,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
     fn prepare_background_replica_dispatch(
         &mut self,
         _requests: Vec<DfsRoutedSend>,
-        _producer_delivery: &[Option<(bool, Option<sinomo_core::network::NetworkDeliveryState>)>],
     ) -> Result<(), NetworkError> {
         Err(NetworkError::Io {
             operation: "prepare background DFS replica dispatch".to_string(),
@@ -628,6 +577,19 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         false
     }
 
+    /// True while this transport serves a routed request under the host's
+    /// admission: a wait here holds that admission.
+    fn serves_routed_request(&self) -> bool {
+        false
+    }
+
+    /// True when the repair executor's sends leave through the detached
+    /// worker the host schedules after it releases admission. A transport
+    /// with no admitting host sends them directly.
+    fn detaches_executor_sends(&self) -> bool {
+        false
+    }
+
     /// Returns `true` when a completed routed-write response belongs to a
     /// different caller than the request currently attached to this
     /// transport. Served transports use this to move unrelated response RPCs
@@ -696,9 +658,6 @@ pub trait AsyncDfsMessageTransport: Send {
         _max_inflight: usize,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         Box::pin(async move {
-            if requests.iter().any(|request| request.native_repair_custody.is_some()) {
-                return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
-            }
             let mut outcomes = Vec::with_capacity(requests.len());
             for request in requests {
                 let result = self
@@ -802,9 +761,7 @@ pub fn materialize_dfs_routed_call_sync(
     let DfsRoutedCall {
         message,
         attachment,
-        original_repair,
     } = call;
-    let message = selected_original_repair_wire_message(message, original_repair)?;
     let Some(attachment) = attachment else {
         return Ok(message);
     };
@@ -819,9 +776,7 @@ pub(crate) async fn materialize_dfs_routed_call(
     let DfsRoutedCall {
         message,
         attachment,
-        original_repair,
     } = call;
-    let message = selected_original_repair_wire_message(message, original_repair)?;
     let Some(attachment) = attachment else {
         return Ok(message);
     };
@@ -846,9 +801,6 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
-        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
-            return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
-        }
         if requests.is_empty() {
             return Ok(Vec::new());
         }

@@ -16,8 +16,8 @@ yield. Dropping the future saves that position before admission is released;
 resumption does not repeat all the completed earlier phases.
 
 An interrupted asynchronous placement page remains unfinished. On reentry the
-existing durable repair queue receives one bounded turn before placement is
-retried. This prevents repeated observation requests from placing queued repair
+node's repair executor receives one bounded turn before placement is
+retried. This prevents repeated observation requests from placing pending repair
 behind the same interrupted placement page. That repair-only invocation returns an
 explicit incomplete result to Main before placement resumes, so it cannot count
 as a completed reconciliation or consume two repair-page budgets in one call.
@@ -45,7 +45,7 @@ still acquires current authority and starts fresh phase bookkeeping when the
 old generation was retired; it cannot reuse old publication permission.
 
 That incomplete outcome requests resumption through the existing scheduler even
-if a transient queue probe is empty. It cannot acknowledge mounted recovery or
+if a transient work probe is empty. It cannot acknowledge mounted recovery or
 completed reconciliation. A routine call with no saved turn, and a source-fence
 Pending that makes no progress, remain `Deferred` with the existing retry pacing. Protocol
 reads continue to preempt both admission and execution.
@@ -53,17 +53,18 @@ reads continue to preempt both admission and execution.
 A returned phase error restarts advisory phase bookkeeping on the next call.
 Earlier phases may need to advance the failed phase's dependencies, such as a
 placement scan preceding repair-permit admission. This reset occurs only after
-the turn drains; it preserves durable cursors, queue records and unacknowledged
-producer captures. Foreground cancellation retains completed phase progress.
+the turn drains; it preserves durable cursors. Foreground cancellation retains
+completed phase progress.
 
 ## Durable work and cancellation
 
 The source of repair work remains the native committed intent and its exact
-version, content identity, policy and target. The repair queue is its derived
-scheduling record. Producer captures are retained until the queue owner
-acknowledges their checkpoint. If that write fails, another producer phase cannot
-run before the retained captures are retried. Placement and lifecycle work
-checkpoint new captures before yielding.
+version, content identity, policy and target. The repair index in the shard
+tables is its derived scheduling record, from which the shard primary's repair
+executor schedules. No producer writes repair work anywhere else: a commit that
+leaves a replica missing changes the index, and that change is the executor's
+wake. Attempt state lives only in the executor's memory, so a restarted node or a
+successor primary starts from its own index.
 
 A resident background receipt read, publication planner or replica materializer
 tries the existing physical metadata writer fence once. Contention retains the
@@ -78,17 +79,14 @@ exact table refresh and prefix validation as before. An already-pinned nested
 read keeps its existing cut. A multi-shard attempt releases any earlier pins if
 a later shard is busy. Stable corruption and authority errors remain errors.
 Background publication/materialization retains its existing retry owner and
-pacing; an incomplete repair page keeps its cursor. Producer captures are
-checkpointed through the existing queue writer before a source attempt can
-return Pending, including captures produced by earlier rows of a partial restore.
-Failed queue persistence retains those captures for the next bounded turn.
+pacing.
 
-Repair attempt reservations and queue updates precede payload handoff. The
-existing detached-send owner retains the actual request identity, immutable
-payload and delivery state; it starts after admission is released. Cancelling a
-waiter cannot discard an admitted send or turn a possibly-applied result into a
-definitely-not-sent result. Normal receipt correlation and authority checks still
-govern completion or retry.
+The executor registers each attempt before its payload is handed to the
+detached-send owner, which starts after admission is released and holds the
+request and immutable payload. A send failure, a rejected reply and a reply that
+publishes all end the attempt and wake the executor. A reply publishes only
+through the receipt-slot generation compare, so a late or duplicate reply cannot
+publish over a newer withdrawal.
 
 The blocking maintenance child observes both component shutdown and shutdown of
 its actual registered runtime owner. Runtime shutdown wakes a waiting child even
@@ -97,21 +95,19 @@ same child and retains its data-owner lease until the maintenance future ends;
 notification is cancellation, not evidence that the child has drained.
 
 No backend borrow, admission guard or publication capability is stored in a phase
-checkpoint. A completed report requires every phase to finish, the bound
-generation to remain current, and all captured queue births to be acknowledged.
+checkpoint. A completed report requires every phase to finish and the bound
+generation to remain current.
 Main rechecks the live retained authority before acknowledging reconciliation
 readiness. A report from a retired generation is not readiness for its successor.
 
 ## Restart and replay
 
 Phase position and partial reports are process-local. Restart begins a new
-bounded pass over the existing durable journals, intents, queue records and
-request outcomes. Already completed effects are reconciled through their normal
-native identities and guards; the phase marker cannot manufacture a receipt.
-If a crash occurs after intent publication but before its queue index is durable,
-normal startup recovery reconstructs work from that actual committed intent.
-An acknowledged queue checkpoint reopens with its exact captured identities and
-delivery evidence.
+bounded pass over the existing durable journals, intents and request outcomes.
+Already completed effects are reconciled through their normal native identities
+and guards; the phase marker cannot manufacture a receipt. Repair resumes when
+the executor first observes the node's primary assignments and reads those
+shards' repair index.
 
 Metadata storage preparation has a separate source-custody controller. Its
 contended calls return no-progress Pending and preserve the same physical source
@@ -121,10 +117,9 @@ lock and validated cursor; see [storage migrations](storage-migrations.md).
 
 The progress-state tests cover cancellation, exclusive turn ownership, scope and
 budget changes, native generation rollover and rejection of incomplete reports.
-The native queue test obtains repair captures from an actual W1/N3 write, forces
-a queue I/O failure, and checks exact retry and reopen behavior. The networked
-overwrite case retains repeated routed reads, its original completion deadline,
-both replica receipts, the original sealed body and single mutation dispatch.
+The networked overwrite case retains repeated routed reads, its original
+completion deadline, both replica receipts, the original sealed body and single
+mutation dispatch.
 File-sync, restart, authority and process-cluster tests remain separate required
 checks. A focused pass does not establish cluster acceptance.
 

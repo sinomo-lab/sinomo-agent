@@ -148,9 +148,11 @@ mod posix_path;
 mod protocol;
 mod renewable_lease;
 mod repair;
-mod repair_handoff;
-mod repair_queue_store;
-pub use repair_handoff::{DfsRepairHandoffCut, DfsRepairHandoffPage};
+mod legacy_repair_state;
+mod repair_executor;
+#[cfg(any(test, feature = "test-support"))]
+pub use repair_executor::DfsRepairExecutorTestHold;
+mod selected_fixture;
 mod response_delivery;
 pub use response_delivery::DfsRoutedResponseDelivery;
 #[cfg(any(test, feature = "test-support"))]
@@ -287,8 +289,7 @@ pub use runtime_mounted_mutation::{
     MountedSifsMutationHandoffRequest, MountedSifsMutationHandoffResponse,
     MountedSifsMutationRecoveryBatch, all_mounted_sifs_mutation_committed_work,
     handle_mounted_sifs_mutation_handoff, mounted_sifs_mutation_pending_maintenance_work,
-    mounted_sifs_mutation_startup_committed_work, persist_default_dfs_repair_queue_records,
-};
+    mounted_sifs_mutation_startup_committed_work, };
 pub use runtime_mounted_mutation::{
     MountedSifsMutationHandoffPhase as DaemonDfsMountedMutationHandoffPhase,
     MountedSifsMutationHandoffRequest as DaemonDfsMountedMutationHandoffRequest,
@@ -473,13 +474,11 @@ pub use maintenance::{
     DfsMaintenanceExecutionExclusions, DfsMaintenanceHost, DfsMaintenanceRunOptions,
     DfsMaintenanceTickObservations, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataReplicationSuppressionSnapshot,
-    DfsPendingMaintenanceWork, DfsRepairAttemptRecord, DfsRepairAttemptSnapshot,
-    DfsRepairMaintenancePageCheckpoint, DfsWriteIntentMaintenanceReport, LocalDfsMaintenanceHost,
+    DfsPendingMaintenanceWork, DfsRepairAttemptRecord, DfsWriteIntentMaintenanceReport, LocalDfsMaintenanceHost,
     clear_dfs_anti_entropy_cursor, default_dfs_anti_entropy_cursor_path,
     default_dfs_metadata_replication_suppression_snapshot_path,
-    default_dfs_repair_attempt_snapshot_path, dfs_actionable_placement_reconciliation_count,
-    dfs_completed_local_primary_handoff_rebind_count, dfs_events_should_wake_repair_maintenance,
-    dfs_explicit_disaster_recovery_tick_options, dfs_lifecycle_maintenance_notice_lines,
+    dfs_actionable_placement_reconciliation_count,
+    dfs_completed_local_primary_handoff_rebind_count, dfs_explicit_disaster_recovery_tick_options, dfs_lifecycle_maintenance_notice_lines,
     dfs_maintenance_report_reached_limit, dfs_maintenance_tick_observations,
     dfs_mounted_mutation_recovery_tick_options, dfs_namespace_job_maintenance_notice_lines,
     dfs_node_is_offline_for_maintenance, dfs_offline_node_ids,
@@ -488,8 +487,7 @@ pub use maintenance::{
     dfs_resident_metadata_replication_options, dfs_resident_routine_maintenance_tick_options,
     dfs_resident_smoke_options, dfs_write_intent_maintenance_notice_lines,
     put_local_dfs_metadata_replication_suppression, read_dfs_anti_entropy_cursor,
-    read_dfs_metadata_replication_suppression_snapshot, read_dfs_repair_attempt_snapshot,
-    run_cluster_dfs_maintenance_tick_with_async_peer_transport,
+    read_dfs_metadata_replication_suppression_snapshot, run_cluster_dfs_maintenance_tick_with_async_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker,
@@ -500,8 +498,7 @@ pub use maintenance::{
     run_dfs_lifecycle_maintenance_with_host, run_dfs_maintenance_tick_with_async_host,
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions,
     run_dfs_maintenance_tick_with_host, write_dfs_anti_entropy_cursor,
-    write_dfs_metadata_replication_suppression_snapshot, write_dfs_repair_attempt_snapshot,
-};
+    write_dfs_metadata_replication_suppression_snapshot, };
 pub use maintenance_schedule::{
     DFS_DEFERRED_WORK_REPROBE_INTERVAL, DFS_MAINTENANCE_LEASE_RETRY_DELAY,
     DFS_MAINTENANCE_MEMBER_PHASE_SLOT, DFS_MAINTENANCE_MEMBER_PHASE_WINDOW,
@@ -525,7 +522,7 @@ pub(crate) use message_transport::{
 pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,
     DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
-    DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
+    DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot, DfsRepairIndexPage,
     DfsSelectedOriginalDataLayout, DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{
@@ -661,7 +658,7 @@ pub use mount_config::{
 };
 pub use mounted_mutation_outbox::{
     MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS,
-    MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES,
+    MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES,
     MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION, MountedSifsHostMountSessionId,
     MountedSifsHostMountSessionLease, MountedSifsHostMountSessionMarker,
     MountedSifsHostMountSessionPhase, MountedSifsMutationAdapter, MountedSifsMutationArmRequestId,
@@ -761,8 +758,7 @@ pub use protocol::{
     DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,
     DfsCommitVersionResponse, DfsDirectReadRequest, DfsDistributedWriteCommand,
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
-    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsImportedRepairHistoryRef,
-    DfsLocalEventualBatchWriteProof, DfsMessageCommand, DfsMessageResponse,
+    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof, DfsMessageCommand, DfsMessageResponse,
     DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataDurableReplication,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
@@ -770,14 +766,9 @@ pub use protocol::{
     DfsMkdirAtNoLinksWithAttrs, DfsNamespaceChangePollRequest, DfsNamespaceChangePollResponse,
     DfsNamespaceCommand, DfsNamespaceDestinationPrecondition, DfsNamespaceObjectPrecondition,
     DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
-    DfsNamespaceShardCursor, DfsNetworkMessage, DfsOriginalRepairHead,
-    DfsOriginalRepairHistoryCarrier, DfsOriginalRepairHistoryCertificate,
-    DfsOriginalRepairHistoryPending, DfsOriginalRepairHistoryQueryRef,
-    DfsOriginalRepairHistoryRejection, DfsOriginalRepairHistoryRequest,
-    DfsOriginalRepairHistoryResponse, DfsOriginalRepairHistoryResult, DfsOriginalRepairMaterial,
-    DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
+    DfsNamespaceShardCursor, DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
     DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsRoutedMessage,
-    DfsSelectedOriginalRepairCommand, DfsStableNamespaceOperationReceipt,
+    DfsStableNamespaceOperationReceipt,
     DfsStableNamespaceOperationReconciliation, DfsStableNamespaceReconciliationRequest,
     DfsStableNamespaceReconciliationResponse, DfsStableWriteOperationReceipt,
     DfsStableWriteOperationReconciliation, DfsStableWriteReconciliationRequest,
@@ -797,15 +788,7 @@ pub use renewable_lease::{
 #[cfg(test)]
 pub(crate) use repair::repair_rejection_indicates_stale_replica_base;
 pub(crate) use repair::{
-    repair_attempt_record_indicates_lost_authority,
-    repair_attempt_record_indicates_transient_route_failure,
-    repair_error_indicates_transient_route_failure, repair_rejection_indicates_lost_authority,
-};
-pub use repair_queue_store::{
-    DfsRepairQueueBoundedStatus, DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport,
-    DfsRepairQueueKey, DfsRepairQueueMaintenancePage, DfsRepairQueueOperation,
-    DfsRepairQueueReconcileOutcome, DfsRepairQueueStatusView, DfsRepairQueueView,
-    LocalDfsRepairQueueStore,
+    repair_rejection_indicates_lost_authority,
 };
 pub use routes::{
     DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE, DFS_CONTROL_PLANE_ROUTES,
@@ -828,7 +811,7 @@ pub use routes::{
     decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response, decode_dfs_smoke_rpc_response,
     decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
-    dfs_message_allows_write_repair_progress, dfs_message_execution_scope,
+    dfs_message_execution_scope,
     dfs_message_is_read_only_request, dfs_message_rpc_call, dfs_message_rpc_request,
     dfs_metadata_journal_batch_execution_scope, dfs_metadata_journal_batch_replayable_rpc_call,
     dfs_metadata_journal_batch_rpc_call, dfs_metadata_journal_batch_rpc_request,
@@ -836,9 +819,7 @@ pub use routes::{
     dfs_metadata_snapshot_install_rpc_request, dfs_route_is_message_data_plane,
     dfs_routed_message_rpc_request, dfs_smoke_rpc_request, dfs_status_rpc_request,
 };
-pub(crate) use routes::{
-    build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,
-};
+pub(crate) use routes::build_dfs_routed_message;
 pub(crate) use service_content::object_content_identity;
 pub(crate) use service_repair::DFS_PENDING_TRANSFER_STALE_AFTER;
 pub use service_sync::{
@@ -919,8 +900,6 @@ pub use smoke::{
 pub(crate) use smoke::{
     dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets, dfs_smoke_routable_node_ids,
 };
-#[cfg(test)]
-use transfer::{DFS_REPAIR_RETRY_SUPPRESSED_TICK, fetch_inflight_timeout_ticks};
 #[cfg(any(test, feature = "test-support"))]
 mod test_runtime;
 

@@ -1454,7 +1454,7 @@ fn complete_native_routed_write(
         .authority_shard
         .clone();
     runtime.clear_faults();
-    // Repair retry and publication are Main-side store work: use the
+    // Stage retry, repair and publication are Main-side store work: use the
     // authority's store-backed opener, not a caller delegating to its Main.
     let path = runtime
         .node_metadata(&primary)
@@ -1466,8 +1466,7 @@ fn complete_native_routed_write(
     let mut owner = runtime.metadata_primary_service(&path).unwrap();
     assert_eq!(owner.node_id(), &primary);
     owner.hydrate_from_metadata_backend().unwrap();
-    owner.retry_pending_repairs().unwrap();
-    owner.process_incoming().unwrap();
+    drive_repair_executor(runtime, &mut owner);
     owner.flush_detached_transport_sends().unwrap();
     let publication = runtime
         .maintenance_tick(&primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
@@ -1665,6 +1664,9 @@ fn routed_write_stale_pending_response_does_not_downgrade_completion() {
     drop(client);
     runtime.close().unwrap();
 }
+
+
+
 
 /// A caller delegating to its Main never ingests routed journal batches, even
 /// when its node replicates the shard and the primary holds a backlog larger

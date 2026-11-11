@@ -480,7 +480,6 @@ fn native_selected_local_recovery_fence_refuses_actual_replica_ingest_and_all_ac
                 journal_sequence: prefix.journal_sequence,
                 state_fingerprint: prefix.digest.clone(),
                 primary_handoff_id: None,
-                repair_custody: None,
             }),
             authority_probe: None,
             durable_replication: None,

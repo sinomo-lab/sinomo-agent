@@ -40,9 +40,15 @@ use crate::metadata_records::{
 mod prepared_operation;
 #[cfg(test)]
 mod receipt_generation_tests;
+mod repair_index;
+#[cfg(test)]
+mod repair_index_tests;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
+#[cfg(test)]
+pub(crate) use repair_index::assert_repair_index_matches_rows;
+pub(crate) use repair_index::{DfsRepairIndex, DfsRepairNeed, DfsRepairNeedKey};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsMetadataTables {
@@ -103,6 +109,9 @@ pub(crate) struct DfsMetadataTables {
     /// boundary as the materialized indexes above. Status must never rediscover
     /// these counts by walking a production-sized metadata generation.
     status_index: DfsMetadataStatusIndex,
+    /// Current repair needs, derived at the same per-object boundary as the
+    /// status projection; never serialized.
+    repair_index: DfsRepairIndex,
 }
 
 type RetainedPathKey = (DfsFileSystemId, Option<String>, String);
@@ -765,6 +774,18 @@ impl DfsMetadataTables {
         &self,
         object_id: &DfsObjectId,
     ) -> DfsMetadataObjectStatusContribution {
+        self.object_status_and_repair_needs(object_id).0
+    }
+
+    /// One per-object derivation feeds both the status projection and the
+    /// repair index, so the two cannot disagree about an object's demand.
+    fn object_status_and_repair_needs(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> (
+        DfsMetadataObjectStatusContribution,
+        BTreeMap<DfsRepairNeedKey, DfsRepairNeed>,
+    ) {
         let intents = self
             .intents
             .range((Included((object_id.clone(), String::new())), Unbounded))
@@ -781,10 +802,13 @@ impl DfsMetadataTables {
             .get(object_id)
             .or_else(|| self.compacted_tombstones.get(object_id))
         else {
-            return DfsMetadataObjectStatusContribution {
-                pending_write_count,
-                ..DfsMetadataObjectStatusContribution::default()
-            };
+            return (
+                DfsMetadataObjectStatusContribution {
+                    pending_write_count,
+                    ..DfsMetadataObjectStatusContribution::default()
+                },
+                BTreeMap::new(),
+            );
         };
         let path_record = self
             .file_system_objects
@@ -803,10 +827,13 @@ impl DfsMetadataTables {
                 Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
             )
         {
-            return DfsMetadataObjectStatusContribution {
-                pending_write_count,
-                ..DfsMetadataObjectStatusContribution::default()
-            };
+            return (
+                DfsMetadataObjectStatusContribution {
+                    pending_write_count,
+                    ..DfsMetadataObjectStatusContribution::default()
+                },
+                BTreeMap::new(),
+            );
         }
 
         let versions = self
@@ -825,11 +852,15 @@ impl DfsMetadataTables {
             .map(|(_, record)| record);
         let mut pending_repair_count = 0usize;
         let mut expiring_repairs = BTreeMap::<u64, usize>::new();
-        for demand in crate::metadata_summary::repair_demands_for_object(
-            object, intents, receipts, versions, &pins,
-        )
-        .values()
-        {
+        let mut needs = BTreeMap::new();
+        for (key, demand) in crate::metadata_summary::repair_demands_for_object_observed_at(
+            object,
+            intents.iter().copied(),
+            receipts,
+            versions,
+            &pins,
+            None,
+        ) {
             match demand.root {
                 crate::metadata_summary::RepairRoot::Permanent => {
                     pending_repair_count = pending_repair_count.saturating_add(1);
@@ -839,15 +870,58 @@ impl DfsMetadataTables {
                     *count = count.saturating_add(1);
                 }
             }
+            // A version names one content hash; a conflicting second hash for
+            // the same missing replica keeps the first in key order.
+            let need_key = (
+                object_id.clone(),
+                key.version.clone(),
+                key.replica_node_id.clone(),
+            );
+            if needs.contains_key(&need_key) {
+                continue;
+            }
+            let receipt_generation =
+                self.receipt_slot_generation(object_id, &key.version, &key.replica_node_id);
+            // The same unfinished owner that file-history enrollment defers to.
+            let enrollment_blocked_by = demand
+                .owner_intent_id
+                .is_none()
+                .then(|| {
+                    intents
+                        .iter()
+                        .filter(|intent| {
+                            intent.file_system_id == object.file_system_id
+                                && intent.target_version == key.version
+                                && write_intent_status_is_active(&intent.status)
+                        })
+                        .map(|intent| intent.intent_id.clone())
+                        .min()
+                })
+                .flatten();
+            needs.insert(
+                need_key,
+                DfsRepairNeed {
+                    file_system_id: object.file_system_id.clone(),
+                    content_hash: key.content_hash,
+                    owner_root: demand.owner_root(),
+                    owner_intent_id: demand.owner_intent_id,
+                    root: demand.root,
+                    receipt_generation,
+                    enrollment_blocked_by,
+                },
+            );
         }
 
-        DfsMetadataObjectStatusContribution {
-            file_system_id: Some(object.file_system_id.clone()),
-            object_count: usize::from(object_countable),
-            pending_repair_count,
-            expiring_repairs,
-            pending_write_count,
-        }
+        (
+            DfsMetadataObjectStatusContribution {
+                file_system_id: Some(object.file_system_id.clone()),
+                object_count: usize::from(object_countable),
+                pending_repair_count,
+                expiring_repairs,
+                pending_write_count,
+            },
+            needs,
+        )
     }
 
     fn adjust_status_map_count(
@@ -1225,11 +1299,14 @@ impl DfsMetadataTables {
                 "snapshot receipt withdrawal must be the slot's only advanced row".into(),
             ));
         }
+        let object_id = key.0.clone();
         if self.receipt_withdrawals.insert(key, withdrawal).is_some() {
             return Err(MetadataBackendError::Serde(
                 "snapshot repeats a receipt withdrawal".into(),
             ));
         }
+        // The tombstone carries the slot generation the derived index records.
+        self.refresh_repair_index_for_object(&object_id);
         Ok(())
     }
 
@@ -1981,11 +2058,12 @@ impl DfsMetadataTables {
         match effect {
             DfsMetadataStatusMutationEffect::None => {}
             DfsMetadataStatusMutationEffect::Object(object_id) => {
-                let after = self.object_status_contribution(&object_id);
+                let (after, needs) = self.object_status_and_repair_needs(&object_id);
                 self.replace_object_status_contribution(
                     object_before.expect("object status mutation captured prior contribution"),
                     after,
                 );
+                self.repair_index.replace_object(&object_id, needs);
             }
 
             DfsMetadataStatusMutationEffect::NamespaceJob(job_id) => {
@@ -2566,12 +2644,22 @@ pub(crate) struct DfsMetadataTableRollback {
     namespace_request_receipts: HashMap<(NodeId, String), Option<DfsNamespaceRequestReceipt>>,
     namespace_receipt_retention: Option<DfsNamespaceReceiptRetentionState>,
     status_index: Option<DfsMetadataStatusIndex>,
+    /// Each touched object's repair needs before its first recorded change.
+    repair_index: HashMap<DfsObjectId, Vec<(DfsRepairNeedKey, DfsRepairNeed)>>,
 }
 
 impl DfsMetadataTableRollback {
     fn record(&mut self, tables: &DfsMetadataTables, op: &DfsMetadataTableOp) {
         if self.status_index.is_none() {
             self.status_index = Some(tables.status_index.clone());
+        }
+        if let DfsMetadataStatusMutationEffect::Object(object_id) =
+            DfsMetadataTables::status_mutation_effect(op)
+            && let std::collections::hash_map::Entry::Vacant(entry) =
+                self.repair_index.entry(object_id)
+        {
+            let entries = tables.repair_index.object_entries(entry.key());
+            entry.insert(entries);
         }
         match op {
             DfsMetadataTableOp::RemovePreparedOperation { digest } => {
@@ -3133,6 +3221,11 @@ impl DfsMetadataTableRollback {
         tables.rebuild_pending_namespace_request_index();
         if let Some(status_index) = self.status_index {
             tables.status_index = status_index;
+        }
+        for (object_id, entries) in self.repair_index {
+            tables
+                .repair_index
+                .replace_object(&object_id, entries.into_iter().collect());
         }
     }
 }

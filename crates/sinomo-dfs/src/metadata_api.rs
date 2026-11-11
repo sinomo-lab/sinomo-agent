@@ -51,13 +51,8 @@ pub struct DfsSelectedOriginalDataLayout {
     data_root: std::path::PathBuf,
     data_identity: (u64, u64),
     owner_identity: (u64, u64),
-    queue: crate::repair_queue_store::LocalDfsRepairQueueStore,
-    queue_layout: crate::repair_queue_store::SelectedOriginalFixtureIdentity,
-    routing_layout: crate::repair_queue_store::SelectedOriginalFixtureIdentity,
-    stages: std::sync::Mutex<BTreeMap<(DfsFileSystemId, crate::DfsMetadataShardId), crate::repair_queue_store::SelectedOriginalFixtureIdentity>>,
-    selection: std::sync::Mutex<Option<(NodeId, DfsFileSystemId, crate::DfsMetadataShardId, String, crate::DfsMetadataShardMembershipHandoff)>>,
-    #[cfg(any(test, feature = "test-support"))]
-    receiver_clocks: std::sync::Mutex<(Vec<(String, std::time::Instant, std::time::Instant)>, usize)>,
+    routing_layout: crate::selected_fixture::SelectedOriginalFixtureIdentity,
+    stages: std::sync::Mutex<BTreeMap<(DfsFileSystemId, crate::DfsMetadataShardId), crate::selected_fixture::SelectedOriginalFixtureIdentity>>,
 }
 
 fn selected_layout_rejection(message: impl Into<String>) -> MetadataBackendError {
@@ -127,8 +122,8 @@ impl DfsSelectedOriginalDataLayout {
         let after = std::fs::symlink_metadata(&path)
             .map_err(|error| selected_layout_rejection(error.to_string()))?;
         if after.file_type().is_symlink()
-            || !crate::repair_queue_store::same_file_observation(&before, &opened)
-            || !crate::repair_queue_store::same_file_observation(&opened, &after)
+            || !crate::selected_fixture::same_file_observation(&before, &opened)
+            || !crate::selected_fixture::same_file_observation(&opened, &after)
         { return Err(selected_layout_rejection("selected named owner changed while opening")); }
         crate::runtime_host::storage_file_identity(&file)
             .map_err(|error| selected_layout_rejection(error.to_string()))
@@ -144,8 +139,6 @@ impl DfsSelectedOriginalDataLayout {
         {
             return Err(selected_layout_rejection("selected native owner file was replaced"));
         }
-        self.queue.validate_selected_original_fixture(&self.queue_layout)
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
         self.routing_layout.check().map_err(|error| selected_layout_rejection(error.to_string()))
     }
 
@@ -158,15 +151,6 @@ impl DfsSelectedOriginalDataLayout {
             return Err(selected_layout_rejection("selected layout belongs to another retained DATA owner"));
         }
         Ok(())
-    }
-
-    pub(crate) fn queue(&self) -> Result<crate::repair_queue_store::LocalDfsRepairQueueStore> {
-        self.check()?;
-        Ok(self.queue.clone())
-    }
-
-    pub(crate) fn queue_layout(&self) -> &crate::repair_queue_store::SelectedOriginalFixtureIdentity {
-        &self.queue_layout
     }
 
     pub(crate) fn check_routing_root(&self, root: &std::path::Path) -> Result<()> {
@@ -182,7 +166,7 @@ impl DfsSelectedOriginalDataLayout {
         filesystem: &DfsFileSystemId,
         shard: &crate::DfsMetadataShardId,
         root: &std::path::Path,
-    ) -> Result<crate::repair_queue_store::SelectedOriginalFixtureIdentity> {
+    ) -> Result<crate::selected_fixture::SelectedOriginalFixtureIdentity> {
         self.check()?;
         let stages = self.stages.lock()
             .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?;
@@ -226,7 +210,7 @@ impl DfsSelectedOriginalDataLayout {
         }
         let parent = root.parent().ok_or_else(|| selected_layout_rejection("selected stage has no parent"))?;
         std::fs::create_dir_all(parent).map_err(|error| selected_layout_rejection(error.to_string()))?;
-        let stage = self.queue_layout.admit_staging_root(root.to_path_buf())
+        let stage = self.routing_layout.admit_staging_root(root.to_path_buf())
             .map_err(|error| selected_layout_rejection(error.to_string()))?;
         stages.insert(key, stage);
         Ok(())
@@ -249,14 +233,13 @@ impl DfsSelectedOriginalDataLayout {
         {
             return Err(selected_layout_rejection("fresh selected native fixture cannot adopt existing metadata"));
         }
-        let snapshot = crate::default_dfs_repair_attempt_snapshot_path(&data_dir);
-        let queue_root = snapshot.parent().ok_or_else(|| selected_layout_rejection("selected queue has no parent"))?.to_path_buf();
-        let parent = queue_root.parent().ok_or_else(|| selected_layout_rejection("selected queue has no namespace"))?;
+        let parent = metadata.parent().ok_or_else(|| selected_layout_rejection("selected metadata root has no namespace"))?;
         std::fs::create_dir_all(parent).map_err(|error| selected_layout_rejection(error.to_string()))?;
         Self::directory_identity(parent)?;
-        let (queue, queue_layout) = crate::repair_queue_store::LocalDfsRepairQueueStore::new_selected_original_fixture_at(queue_root, snapshot)
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
-        let routing_layout = queue_layout.admit_staging_root(metadata)
+        if metadata.exists() {
+            std::fs::remove_dir(&metadata).map_err(|error| selected_layout_rejection(error.to_string()))?;
+        }
+        let routing_layout = crate::selected_fixture::SelectedOriginalFixtureIdentity::create(metadata)
             .map_err(|error| selected_layout_rejection(error.to_string()))?;
         sinomo_core::storage::durable_file::sync_directory(&data_root)
             .map_err(|error| selected_layout_rejection(error.to_string()))?;
@@ -267,11 +250,8 @@ impl DfsSelectedOriginalDataLayout {
         let context = std::sync::Arc::new(Self {
             data_identity,
             owner_identity,
-            data_root, queue, queue_layout, routing_layout,
+            data_root, routing_layout,
             stages: std::sync::Mutex::new(BTreeMap::new()),
-            selection: std::sync::Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            receiver_clocks: std::sync::Mutex::new((Vec::new(), 0)),
         });
         context.check_owner(owner)?;
         Ok(context)
@@ -280,8 +260,6 @@ impl DfsSelectedOriginalDataLayout {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reopen(&self, owner: &crate::runtime_host::DfsDataOwnerLock) -> Result<()> {
         self.check_owner(owner)?;
-        crate::repair_queue_store::LocalDfsRepairQueueStore::reopen_selected_original_fixture(&self.queue_layout)
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
         for stage in self.stages.lock()
             .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?.values()
         {
@@ -290,84 +268,6 @@ impl DfsSelectedOriginalDataLayout {
         Ok(())
     }
 
-    /// Bind the genuine control-owner-generated handoff while the fixture
-    /// holds the existing publication fence, before its first native freeze.
-    /// The fixture chose this real original/desired role before proposing it.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn select_original(&self, producer: &NodeId, request: &str, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<()> {
-        let (_, birth) = self.queue()?.selected_original_handoff_data(producer, request)
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
-        let crate::DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
-            return Err(selected_layout_rejection("selected native birth is not Repair"));
-        };
-        let shard = command.authority_shard.as_ref()
-            .ok_or_else(|| selected_layout_rejection("selected native birth has no original shard"))?;
-        if handoff.retiring_primary_fence.is_some() || handoff.handoff_id.is_empty()
-            || handoff.retiring_shard.primary_node_id != *producer
-            || handoff.retiring_shard.file_system_id != command.file_system_id
-            || handoff.retiring_shard.shard_id != shard.shard_id
-            || handoff.desired_shard.file_system_id != command.file_system_id
-            || handoff.desired_shard.shard_id != shard.shard_id
-            || handoff.desired_shard.primary_node_id == *producer
-            || handoff.retiring_shard.epoch.checked_add(1) != Some(handoff.desired_shard.epoch)
-            || shard.epoch > handoff.retiring_shard.epoch
-        {
-            return Err(selected_layout_rejection("selected origin needs its exact unfenced generated role handoff"));
-        }
-        let key = (producer.clone(), command.file_system_id.clone(), crate::DfsMetadataShardId::new(&shard.shard_id), request.to_owned(), handoff.clone());
-        let stages = self.stages.lock()
-            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?;
-        let freeze_path = stages.get(&(command.file_system_id.clone(), crate::DfsMetadataShardId::new(&shard.shard_id)))
-            .map(|stage| stage.root().join("journal/membership-handoff-write-freeze.sobj"));
-        drop(stages);
-        if let Some(path) = freeze_path {
-            if read_handoff_freeze_with_layout(&path, Some(self))?
-                .is_some_and(|freeze| freeze.activated_epoch.is_none())
-            {
-                return Err(selected_layout_rejection("selected original must be fixed before its pending native freeze"));
-            }
-        }
-        let mut selection = self.selection.lock()
-            .map_err(|_| selected_layout_rejection("selected native origin selection poisoned"))?;
-        if selection.as_ref().is_some_and(|prior| prior != &key) {
-            return Err(selected_layout_rejection("selected native original cannot change"));
-        }
-        *selection = Some(key);
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn observe_receiver_clock(&self, request: &str, captured: std::time::Instant, deadline: std::time::Instant) -> Result<()> {
-        let mut observations = self.receiver_clocks.lock()
-            .map_err(|_| selected_layout_rejection("native receiver-clock observation poisoned"))?;
-        if observations.0.len() < crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT {
-            observations.0.push((request.to_owned(), captured, deadline));
-        } else { observations.1 = observations.1.saturating_add(1); }
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn receiver_clocks(&self) -> Result<(Vec<(String, std::time::Instant, std::time::Instant)>, usize)> {
-        self.receiver_clocks.lock().map(|observations| observations.clone())
-            .map_err(|_| selected_layout_rejection("native receiver-clock observation poisoned"))
-    }
-
-    pub(crate) fn selected_request(&self, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<Option<String>> {
-        self.check()?;
-        let selection = self.selection.lock()
-            .map_err(|_| selected_layout_rejection("selected native origin selection poisoned"))?;
-        let Some((_, fs, shard, request, expected)) = selection.as_ref() else { return Ok(None); };
-        if *fs != handoff.retiring_shard.file_system_id || shard.0 != handoff.retiring_shard.shard_id {
-            return Ok(None);
-        }
-        let mut actual = handoff.clone();
-        // Only the independently authenticated native fence may be added.
-        actual.retiring_primary_fence = None;
-        if &actual != expected {
-            return Err(selected_layout_rejection("selected native handoff differs from its exact fixture expectation"));
-        }
-        Ok(Some(request.clone()))
-    }
 }
 
 /// Durable shard-local freeze installed while a same-primary membership
@@ -403,16 +303,11 @@ pub struct DfsMetadataShardWriteFreeze {
     /// advances this proof before pruning the journal history needed to
     /// reconstruct it. Current markers always carry the exact proof.
     pub rebind_prefix_proof: crate::DfsMetadataPrefixProof,
-    /// New primary rotations retain their complete original repair cut.
-    /// Legacy completed markers cannot invent missing historical custody.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_custody: Option<crate::DfsRepairHandoffCut>,
 }
 
-// A new custody-bearing marker cannot be interpreted by an older binary as
-// an ordinary metadata-only freeze. Keep legacy completed markers readable,
-// but put the new contract in an explicit envelope: old readers lack their
-// required top-level handoff_id and fail closed rather than ignore custody.
+// Markers written before repair custody was removed may carry a custody cut
+// in one of two envelopes; they still load, and the cut is dropped: an
+// authority transfer carries no repair state.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum DfsMetadataShardWriteFreezeWire {
@@ -476,30 +371,31 @@ struct DfsMetadataShardWriteFreezePayload {
     journal_sequence: u64,
     state_fingerprint: String,
     rebind_prefix_proof: crate::DfsMetadataPrefixProof,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    repair_custody: Option<crate::DfsRepairHandoffCut>,
+    #[serde(default, skip_serializing, rename = "repair_custody")]
+    _repair_custody: Option<LegacyRepairCustody>,
+}
+
+/// A removed repair custody cut in a marker written before its removal:
+/// accepted and dropped, never written.
+struct LegacyRepairCustody;
+impl<'de> serde::Deserialize<'de> for LegacyRepairCustody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let _ = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self)
+    }
 }
 
 impl From<DfsMetadataShardWriteFreeze> for DfsMetadataShardWriteFreezeWire {
     fn from(value: DfsMetadataShardWriteFreeze) -> Self {
-        let payload = DfsMetadataShardWriteFreezePayload {
+        Self::Legacy(DfsMetadataShardWriteFreezePayload {
             handoff_id: value.handoff_id,
             retiring_epoch: value.retiring_epoch,
             activated_epoch: value.activated_epoch,
             journal_sequence: value.journal_sequence,
             state_fingerprint: value.state_fingerprint,
             rebind_prefix_proof: value.rebind_prefix_proof,
-            repair_custody: value.repair_custody,
-        };
-        if payload.repair_custody.as_ref().is_some_and(|cut| cut.version == 2) {
-            Self::SelectedOriginalDataV2 { selected_original_data_v2: payload }
-        } else if payload.repair_custody.is_some() {
-            Self::CustodyV1 {
-                repair_custody_v1: payload,
-            }
-        } else {
-            Self::Legacy(payload)
-        }
+            _repair_custody: None,
+        })
     }
 }
 
@@ -514,31 +410,8 @@ pub(crate) fn read_handoff_freeze_with_layout(
         return crate::metadata_io::read_sobj_optional(path);
     };
     check_handoff_layout_path(layout, path)?;
-    let wire: Option<DfsMetadataShardWriteFreezeWire> = crate::metadata_io::read_sobj_optional(path)
+    let result: Option<DfsMetadataShardWriteFreeze> = crate::metadata_io::read_sobj_optional(path)
         .map_err(|error| selected_layout_rejection(error.to_string()))?;
-    let result = match wire {
-        None => None,
-        Some(DfsMetadataShardWriteFreezeWire::LocalRecoveryV1 { .. }) => {
-            return Err(selected_layout_rejection("selected local recovery fence is not a cooperative handoff"));
-        }
-        Some(DfsMetadataShardWriteFreezeWire::SelectedOriginalDataV2 { selected_original_data_v2: payload }) => {
-            let cut = payload.repair_custody.as_ref()
-                .ok_or_else(|| selected_layout_rejection("selected freeze has no exact custody cut"))?;
-            cut.validate_selected_original_data()
-                .map_err(|error| selected_layout_rejection(error.to_string()))?;
-            Some(DfsMetadataShardWriteFreeze {
-                handoff_id: payload.handoff_id,
-                retiring_epoch: payload.retiring_epoch,
-                activated_epoch: payload.activated_epoch,
-                journal_sequence: payload.journal_sequence,
-                state_fingerprint: payload.state_fingerprint,
-                rebind_prefix_proof: payload.rebind_prefix_proof,
-                repair_custody: payload.repair_custody,
-            })
-        }
-        Some(wire) => Some(DfsMetadataShardWriteFreeze::try_from(wire)
-            .map_err(selected_layout_rejection)?),
-    };
     check_handoff_layout_path(layout, path)?;
     Ok(result)
 }
@@ -551,38 +424,8 @@ pub(crate) fn write_handoff_freeze_with_layout(
     require_no_selected_local_recovery_fence(path, layout)?;
     if let Some(layout) = layout {
         check_handoff_layout_path(layout, path)?;
-        if let Some(cut) = &freeze.repair_custody {
-            if cut.version == 2 {
-                cut.validate_selected_original_data()
-                    .map_err(|error| selected_layout_rejection(error.to_string()))?;
-            } else {
-                cut.validate().map_err(|error| selected_layout_rejection(error.to_string()))?;
-            }
-        }
     } else {
         reject_default_handoff_layout(path)?;
-        if freeze.repair_custody.as_ref().is_some_and(|cut| cut.version != 1) {
-            return Err(selected_layout_rejection("default writer rejects selected freeze representation"));
-        }
-    }
-    if let Some(layout) = layout.filter(|_| freeze.repair_custody.as_ref().is_some_and(|cut| cut.version == 2)) {
-        let root = path.parent().and_then(std::path::Path::parent)
-            .ok_or_else(|| selected_layout_rejection("selected freeze has no shard root"))?;
-        let stage = layout.stages.lock()
-            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?
-            .values().find(|stage| stage.root() == root).cloned()
-            .ok_or_else(|| selected_layout_rejection("selected freeze has no admitted stage"))?;
-        let generation = crate::repair_handoff::publish_and_certify_selected(path, freeze)
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
-        crate::repair_handoff::sync_selected_namespace(&stage, path.parent().expect("freeze journal parent"))
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
-        let current = std::fs::symlink_metadata(path)
-            .map_err(|error| selected_layout_rejection(error.to_string()))?;
-        if !crate::repair_queue_store::same_file_observation(&generation, &current) {
-            return Err(selected_layout_rejection("selected freeze generation changed across its namespace barriers"));
-        }
-        check_handoff_layout_path(layout, path)?;
-        return Ok(());
     }
     crate::metadata_io::write_sobj_atomic(path, freeze)?;
     if let Some(layout) = layout { check_handoff_layout_path(layout, path)?; }
@@ -596,7 +439,7 @@ pub(crate) fn validate_handoff_layout_root(layout: &DfsSelectedOriginalDataLayou
 fn reject_default_handoff_layout(path: &std::path::Path) -> Result<()> {
     let root = path.parent().and_then(std::path::Path::parent)
         .ok_or_else(|| selected_layout_rejection("handoff freeze has no shard root"))?;
-    crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(root)
+    crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(root)
         .map_err(|error| selected_layout_rejection(error.to_string()))
 }
 
@@ -621,21 +464,13 @@ impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
             DfsMetadataShardWriteFreezeWire::LocalRecoveryV1 { .. } => {
                 return Err("selected local recovery fence is not a cooperative handoff");
             }
-            DfsMetadataShardWriteFreezeWire::CustodyV1 {
+            DfsMetadataShardWriteFreezeWire::SelectedOriginalDataV2 {
+                selected_original_data_v2: payload,
+            }
+            | DfsMetadataShardWriteFreezeWire::CustodyV1 {
                 repair_custody_v1: payload,
-            } if payload
-                .repair_custody
-                .as_ref()
-                .is_some_and(|cut| cut.version == 1) =>
-            {
-                payload
             }
-            DfsMetadataShardWriteFreezeWire::Legacy(payload)
-                if payload.repair_custody.is_none() =>
-            {
-                payload
-            }
-            _ => return Err("unsupported repair custody freeze marker"),
+            | DfsMetadataShardWriteFreezeWire::Legacy(payload) => payload,
         };
         Ok(Self {
             handoff_id: payload.handoff_id,
@@ -644,7 +479,6 @@ impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
             journal_sequence: payload.journal_sequence,
             state_fingerprint: payload.state_fingerprint,
             rebind_prefix_proof: payload.rebind_prefix_proof,
-            repair_custody: payload.repair_custody,
         })
     }
 }
@@ -959,6 +793,17 @@ pub struct DfsForeignShardSourceEvictionPlan {
     pub effects: Vec<crate::DfsPreparedMetadataEffect>,
 }
 
+/// One page of a shard's derived repair index: each current repair need with
+/// what the node's repair executor dispatches.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsRepairIndexPage {
+    pub(crate) needs: Vec<(
+        crate::metadata_tables::DfsRepairNeedKey,
+        crate::metadata_tables::DfsRepairNeed,
+    )>,
+}
+
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     #[cfg(test)]
     fn retain_native_prefix_history(
@@ -1158,7 +1003,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         _digest: &crate::metadata_records::DfsPreparedOperationDigest,
         _guard: crate::publication_guard::DfsPublicationGuard,
-        enrollment: Option<&mut dyn FnMut(&[crate::DfsRepairAttemptRecord]) -> Result<()>>,
     ) -> Result<crate::metadata_records::DfsPreparedOperationCommitResult>;
 
     /// Pin one coherent in-memory metadata generation for a bounded bulk read.
@@ -1995,6 +1839,38 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// repair contract. Compacted retry history is not a live obligation.
     fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool>;
 
+    /// At most `max_entries` needs of one local shard's derived repair index,
+    /// in `(object, version, missing replica)` order after `after`. A shard
+    /// this backend does not hold has no needs.
+    #[doc(hidden)]
+    fn repair_index_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&(DfsObjectId, DfsVersion, NodeId)>,
+        max_entries: usize,
+    ) -> Result<DfsRepairIndexPage>;
+
+    /// The current needs among `keys` in one local shard's repair index.
+    #[doc(hidden)]
+    fn repair_index_needs(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        keys: &[(DfsObjectId, DfsVersion, NodeId)],
+    ) -> Result<DfsRepairIndexPage>;
+
+    /// Every current need of `objects` in one local shard's repair index.
+    #[doc(hidden)]
+    fn repair_index_objects(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        objects: &std::collections::BTreeSet<DfsObjectId>,
+    ) -> Result<DfsRepairIndexPage>;
+
+    /// The number of owned needs in one local shard's repair index, as the
+    /// index maintains it.
+    #[doc(hidden)]
+    fn repair_index_owned_count(&self, shard_id: &DfsMetadataShardId) -> Result<usize>;
+
     /// Actual unit-test scan counters from already initialized physical children.
     /// These memory-only observations never open a backend or grant authority.
     #[cfg(test)]
@@ -2782,16 +2658,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
-    fn bind_metadata_shard_repair_handoff_cut(
-        &mut self,
-        _shard_id: &DfsMetadataShardId,
-        _cut: &crate::DfsRepairHandoffCut,
-    ) -> Result<()> {
-        Err(MetadataBackendError::Serde(
-            "backend does not support exact repair custody handoff".into(),
-        ))
-    }
-
     /// Durably mark the exact matching freeze as activated without binding
     /// this backend instance to the successor authority generation. This lets
     /// a retiring instance record control-plane completion while remaining
@@ -3047,7 +2913,7 @@ mod selected_native_layout_tests {
         let file = std::fs::File::open(root.path()).unwrap();
         let opened = file.metadata().unwrap();
         let after = std::fs::symlink_metadata(root.path()).unwrap();
-        assert!(!crate::repair_queue_store::same_file_observation(&before, &opened),
+        assert!(!crate::selected_fixture::same_file_observation(&before, &opened),
             "the unchanged regular-file predicate rejects directories");
         assert!(DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &after));
         assert_eq!(DfsSelectedOriginalDataLayout::directory_identity(root.path()).unwrap(),
@@ -3155,7 +3021,6 @@ mod selected_native_layout_tests {
         let mut backend = crate::LocalSobjMetadataBackend::new_with_selected_layout(
             fs.clone(), shard.clone(), root.clone(), Arc::clone(&layout)).unwrap();
         let freeze = backend.freeze_metadata_shard_for_membership_handoff(&shard, "selected-native-v1", 7).unwrap().unwrap();
-        assert!(freeze.repair_custody.is_none());
         drop(backend);
         let path = root.join("journal/membership-handoff-write-freeze.sobj");
         let before = files(&data.root());
@@ -3217,5 +3082,100 @@ mod selected_native_layout_tests {
         assert!(layout.stage(&fs, &shard, &stage).is_err());
         assert!(layout.admit_stage(&fs, &shard, &stage).is_err(), "reopen cannot adopt a replacement");
         assert!(files(&stage).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod removed_repair_custody_marker_tests {
+    use super::*;
+
+    /// The marker body written before repair custody was removed: the same
+    /// fields plus a custody cut.
+    #[derive(serde::Serialize)]
+    struct OldPayload {
+        handoff_id: String,
+        retiring_epoch: u64,
+        journal_sequence: u64,
+        state_fingerprint: String,
+        rebind_prefix_proof: crate::DfsMetadataPrefixProof,
+        repair_custody: OldCut,
+    }
+
+    #[derive(serde::Serialize)]
+    struct OldCut {
+        version: u32,
+        handoff_id: String,
+        page_count: u64,
+        records: Vec<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct CustodyV1 {
+        repair_custody_v1: OldPayload,
+    }
+
+    #[derive(serde::Serialize)]
+    struct SelectedOriginalDataV2 {
+        selected_original_data_v2: OldPayload,
+    }
+
+    fn old_payload() -> OldPayload {
+        OldPayload {
+            handoff_id: "handoff-before-removal".into(),
+            retiring_epoch: 3,
+            journal_sequence: 17,
+            state_fingerprint: "fingerprint".into(),
+            rebind_prefix_proof: crate::DfsMetadataPrefixProof {
+                version: 2,
+                journal_sequence: 17,
+                digest: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
+            },
+            repair_custody: OldCut {
+                version: 1,
+                handoff_id: "handoff-before-removal".into(),
+                page_count: 2,
+                records: vec!["row".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn a_marker_written_with_a_custody_cut_still_loads_and_drops_the_cut() {
+        let root = sinomo_testdir::TestDir::new("removed-custody-freeze-marker");
+        for (name, bytes) in [
+            (
+                "custody-v1",
+                crate::metadata_io::encode_sobj(&CustodyV1 {
+                    repair_custody_v1: old_payload(),
+                })
+                .unwrap(),
+            ),
+            (
+                "selected-v2",
+                crate::metadata_io::encode_sobj(&SelectedOriginalDataV2 {
+                    selected_original_data_v2: old_payload(),
+                })
+                .unwrap(),
+            ),
+        ] {
+            let path = root
+                .path()
+                .join(name)
+                .join("journal/membership-handoff-write-freeze.sobj");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let freeze = read_handoff_freeze_with_layout(&path, None)
+                .unwrap()
+                .expect("the old marker loads");
+            assert_eq!(freeze.handoff_id, "handoff-before-removal", "{name}");
+            assert_eq!(freeze.journal_sequence, 17);
+            // Rewriting it carries no custody: an authority transfer holds no
+            // repair state.
+            write_handoff_freeze_with_layout(&path, &freeze, None).unwrap();
+            assert_eq!(
+                read_handoff_freeze_with_layout(&path, None).unwrap(),
+                Some(freeze)
+            );
+        }
     }
 }

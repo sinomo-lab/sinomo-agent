@@ -454,6 +454,7 @@ impl DfsMetadataAuthorityRuntime {
         Ok(snapshot.write.is_some().then_some(snapshot))
     }
 
+    #[cfg(test)]
     /// The floor-checked publication with its complete write configuration.
     /// Owned read input for one operation, not an execution capability.
     pub(crate) fn current_write_configuration_snapshot(

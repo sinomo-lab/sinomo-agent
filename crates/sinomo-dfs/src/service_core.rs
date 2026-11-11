@@ -63,7 +63,6 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             metadata_lookup_cache_depth: std::sync::Mutex::new(0),
             read_shard_snapshot: None,
             passive_fetch_started_at: BTreeMap::new(),
-            repair_attempt_records: BTreeMap::new(),
             pending_routed_namespace_ops: BTreeMap::new(),
             stable_namespace_reconciliation_results: BTreeMap::new(),
             stable_namespace_reconciliation_targets: BTreeMap::new(),
@@ -71,6 +70,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             remote_namespace_phase: None,
             pending_namespace_request_recovery: None,
             completed_remote_namespace_phases: BTreeMap::new(),
+            file_sync_wait_deadline: None,
             prepared_remote_sources: BTreeMap::new(),
             publication_execution: Default::default(),
             publication_provider: Default::default(),
@@ -573,15 +573,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let committed_work_has_durable_owner = self.message_committed_work
             == DfsMessageCommittedWork::default()
             || self.committed_work_tracker.is_some();
-        let repair_attempts_are_not_in_flight = self
-            .repair_attempt_records
-            .values()
-            .all(|record| !record.in_flight);
 
         metadata_lookup_scope_quiescent
             && self.writes.is_quiescent()
             && self.reads.is_quiescent()
-            && repair_attempts_are_not_in_flight
             && self.replication.is_quiescent()
             && self.pending_routed_namespace_ops.is_empty()
             && self.namespace_execution.is_quiescent()
@@ -609,7 +604,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // they are durable/reconstructable retry inventory or advisory caches,
         // not owners of an in-flight request. `pending_writes` above is the
         // exact live owner for an executable repair and prevents this reset.
-        self.repair_attempt_records.clear();
         self.reads.transient_remote_read_pruned_locations.clear();
         self.replication.local_metadata_journal_cursors.clear();
         self.last_events.clear();
@@ -639,7 +633,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn begin_message_committed_work(&mut self) {
         self.message_committed_work = DfsMessageCommittedWork::default();
-        self.coordinator.begin_message_repair_job_capture();
     }
 
     pub(crate) fn record_message_committed_work(&mut self, work: DfsMessageCommittedWork) {
@@ -706,23 +699,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .values()
             .map(|pending| pending.stage_retries.len())
             .sum();
-        let repair_retry_count = self
-            .writes
-            .pending_writes
-            .values()
-            .map(|pending| pending.repair_retries.len())
-            .sum();
         let stage_inflight_count = self
             .writes
             .pending_writes
             .values()
             .map(|pending| pending.stage_inflight_request_ids.len())
-            .sum();
-        let repair_inflight_count = self
-            .writes
-            .pending_writes
-            .values()
-            .map(|pending| pending.repair_inflight_request_ids.len())
             .sum();
         let fetch_inflight_count = self
             .writes
@@ -738,6 +719,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .sum();
         let authoritative_write_frozen_shard_count =
             self.authoritative_write_frozen_shard_count()?;
+        let repair = crate::repair_executor::repair_executor_work_for_node(&self.node_id)
+            .unwrap_or_default();
         Ok(DfsOperationalMetrics {
             node_id: self.node_id.clone(),
             file_system_count: self.metadata.filesystems.len(),
@@ -745,14 +728,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             coordinator_intent_count: self.coordinator.intent_count(),
             coordinator_receipt_count: self.coordinator.receipt_count(),
             coordinator_committed_version_count: self.coordinator.committed_version_count(),
+            // Repair attempts live in the node's repair executor, not in a
+            // service lane; this lane reports its coordinator's derived view.
             repair_job_count: self.coordinator.repair_jobs().len(),
-            repair_attempt_count: self.active_repair_attempt_records().len(),
+            repair_attempt_count: repair.tracked_need_count,
             pending_write_count: self.writes.pending_writes.len(),
             pending_read_count: self.reads.pending_reads.len(),
             stage_retry_count,
-            repair_retry_count,
+            repair_retry_count: repair.backoff_count,
             stage_inflight_count,
-            repair_inflight_count,
+            repair_inflight_count: repair.in_flight_count,
             fetch_inflight_count,
             fetch_failed_source_count,
             active_replica_stage_count: self.writes.active_replica_stages.len(),
@@ -774,13 +759,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
 #[cfg(test)]
 mod projection_release_tests {
-    use std::collections::BTreeSet;
-    use std::time::{Duration, Instant};
     use time::OffsetDateTime;
 
-    use super::*;
     use crate::transfer::PendingNetworkedWrite;
-    use crate::{DfsMetadataShardId, DfsObjectId, DfsVersion};
+    use crate::{DfsObjectId, DfsVersion};
 
     #[test]
     fn projection_release_quiescence_fails_closed_for_live_operation_state() {
@@ -872,159 +854,6 @@ mod projection_release_tests {
             "the normal safety gate must leave current content counters unchanged",
         );
         drop(service);
-        runtime.close().expect("native owner drain");
-    }
-
-    #[test]
-    fn quiescent_exact_lane_releases_only_the_rebuildable_projection() {
-        let (runtime, mut service, config) = crate::test_support::current_native_metadata_service(
-            "native-projection-release-exact-lane",
-            1,
-            "/services",
-        )
-        .expect("actual current runtime");
-        let node = config.primary_node_id.clone();
-        let file_system_id = config.file_system_id.clone();
-        let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
-        let stat = service
-            .posix_mkdir("/services/projection-release")
-            .expect("normal guarded directory");
-        let object = runtime
-            .node_metadata(&node)
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
-            .unwrap();
-        runtime
-            .maintenance_tick(&node, Duration::from_secs(5))
-            .expect("normal served owner")
-            .outcome
-            .expect("normal maintenance result");
-        let data_dir = runtime.data_dir(&node);
-        let paths = sinomo_core::network::ClusterPaths::new(data_dir);
-        let peer = crate::runtime_host::read_daemon_dfs_message_peer_snapshot(&paths)
-            .expect("actual registered host projection")
-            .expect("mounted host");
-        let resident = crate::runtime_host::daemon_dfs_cached_resident_metadata_shard_handle(
-            data_dir,
-            &peer,
-            &file_system_id,
-            &shard_id,
-            &paths,
-            &runtime.runtime_handle(),
-        )
-        .expect("already-published current physical shard");
-        let native_head = resident
-            .with_backend(|backend| Ok(backend.journal_last_sequence()))
-            .expect("actual retained journal head");
-        service = service
-            .with_resident_metadata_shard_backend_lazy(
-                resident.checkout().expect("actual existing shard lease"),
-            )
-            .expect("same native service with exact backend");
-        service
-            .metadata
-            .add_object(object.clone())
-            .expect("current cached object");
-        let replica =
-            NodeId::from_legacy_named("node_projection_release_replica").expect("replica");
-        service.repair_attempt_records.insert(
-            ("durable-repair".to_string(), replica.clone()),
-            crate::DfsRepairAttemptRecord {
-                transfer_delivery_state: None,
-                completed_transfer_request_id: None,
-                transfer_kind: None,
-                intent_id: "durable-repair".to_string(),
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                content_hash: "repair-content".to_string(),
-                missing_replica_node_id: replica.clone(),
-                attempts: 2,
-                in_flight: false,
-                last_attempt_unix_nanos: 3,
-                next_retry_unix_nanos: 4,
-                transfer_request_id: None,
-                last_error: Some("retry later".to_string()),
-            },
-        );
-        service.reads.transient_remote_read_pruned_locations.insert(
-            (object.object_id.clone(), object.version.clone(), None),
-            BTreeSet::from([replica.clone()]),
-        );
-        service
-            .replication
-            .local_metadata_journal_cursors
-            .insert(shard_id.clone(), 91);
-        service.pending_namespace_request_recovery_cursor =
-            Some(crate::DfsPendingNamespaceRequestPageCursor {
-                updated_at: OffsetDateTime::UNIX_EPOCH,
-                requester_node_id: replica.clone(),
-                request_id: "recovery-cursor".to_string(),
-            });
-        service
-            .last_events
-            .push(NetworkedDfsServiceEvent::RepairRetryFailed {
-                reason: "retained observation".to_string(),
-            });
-        service
-            .replication
-            .metadata_replication_cursors
-            .insert((replica.clone(), shard_id.clone()), 92);
-        let committed_work_tracker = DfsCommittedWorkTracker::new();
-        service.set_committed_work_tracker(committed_work_tracker.clone());
-        service.record_message_committed_work(DfsMessageCommittedWork {
-            publish_metadata: true,
-            ..DfsMessageCommittedWork::default()
-        });
-        service.next_request_id = 73;
-
-        assert!(service.can_release_hydrated_metadata_projection());
-        assert!(
-            service
-                .release_hydrated_metadata_projection_if_quiescent()
-                .expect("projection release")
-        );
-        assert!(service.metadata().object(&object.object_id).is_none());
-        assert!(service.metadata.filesystems.contains_key(&file_system_id));
-        assert!(service.repair_attempt_records.is_empty());
-        assert!(
-            service
-                .reads
-                .transient_remote_read_pruned_locations
-                .is_empty()
-        );
-        assert_eq!(
-            service
-                .replication
-                .local_metadata_journal_cursors
-                .get(&shard_id),
-            Some(&native_head)
-        );
-        assert_eq!(
-            service
-                .pending_namespace_request_recovery_cursor
-                .as_ref()
-                .map(|cursor| cursor.request_id.as_str()),
-            Some("recovery-cursor")
-        );
-        assert!(service.last_events.is_empty());
-        assert_eq!(
-            service
-                .replication
-                .metadata_replication_cursors
-                .get(&(replica, shard_id)),
-            Some(&92)
-        );
-        assert_eq!(
-            service.message_committed_work,
-            DfsMessageCommittedWork::default()
-        );
-        assert!(committed_work_tracker.take().publish_metadata);
-        assert_eq!(service.next_request_id, 73);
-        assert!(service.metadata_backend().is_some());
-
-        drop(service);
-        drop(resident);
         runtime.close().expect("native owner drain");
     }
 }

@@ -139,7 +139,7 @@ Useful starting classifications:
 | Cluster configuration and committed transaction outcome | Existing KV API and retained coherent configuration projection | DFS-specific KV session, second operation ledger, per-operation mirror of namespace history |
 | Prepared body and semantic terminal result | Native DFS prepared-operation journal and exact outcome | Another pending/committed database requiring reconciliation with that journal |
 | Native store's lifetime | Component/data-root owner, physical writer and bound storage generation | Independently reopening the same store because a provider advertisement changed |
-| Repair obligation | Committed intent/version; existing durable repair queue for scheduling | A second queue/cursor that can advance independently or reconstruct an uncertain send as new |
+| Repair obligation | Committed intent/version; the shard tables' derived repair index for scheduling, served by the shard primary's executor | A node-local queue, cursor or retained attempt that can advance independently of the tables or survive an authority transfer |
 | Completion delivery | Existing detached-send owner/inbox and original request | Wrapper success state inferred from enqueue/event emission |
 | Snapshot freshness | Owning materialized generation and exact-prefix refresh | Private cursor/cache that misses installation and triggers another repair loop |
 

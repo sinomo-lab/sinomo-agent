@@ -25,13 +25,11 @@ use crate::{
     DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
     DfsMetadataShardWriteFreeze, DfsMetadataSummary, DfsObjectId, DfsOperatorFileSystemView,
     DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView, DfsOperatorStatus,
-    DfsOperatorStatusOmission, DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError,
-    DfsRepairQueueBoundedStatus, LocalDfsPinStore, LocalDfsRepairQueueStore,
+    DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
     LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
-    default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix, sifs_file_system_id,
+    metadata_shards_prefix, sifs_file_system_id,
 };
 
-const DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT: usize = 32;
 const DFS_METADATA_INSPECTION_CACHE_CAPACITY: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1362,33 +1360,21 @@ fn attach_primary_owned_operational_status(
     status.failed_namespace_job_count = primary_summary.failed_namespace_job_count;
 }
 
+/// Repair attempts the operator status lists at most.
+const DFS_OPERATOR_STATUS_REPAIR_ATTEMPT_SAMPLE: usize = 64;
+
 fn attach_cluster_aware_dfs_maintenance_observations(
     status: &mut DfsOperatorStatus,
     data_dir: &SinomoDataDir,
 ) -> Result<(), DfsError> {
-    // Historical conversion inspection belongs to the migration component.
-    match LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(data_dir))
-        .bounded_status_view(DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT)
-    {
-        Ok(DfsRepairQueueBoundedStatus::Hydrated(view)) => {
-            status.repair_attempt_count = view.record_count;
-            status.repair_attempts = view.records;
-        }
-        Ok(DfsRepairQueueBoundedStatus::NotHydrated) => {
-            status.push_bounded_omission(
-                DfsOperatorStatusOmission::resident_repair_queue_not_hydrated(),
-            );
-            status.repair_attempt_count = 0;
-            status.repair_attempts.clear();
-        }
-        Err(error) => {
-            status
-                .incomplete_reasons
-                .push(format!("repair queue observation unavailable: {error}"));
-            status.repair_attempt_count = 0;
-            status.repair_attempts.clear();
-        }
-    }
+    // Pending repair needs come from the shard tables' repair index; the
+    // attempts are the node's repair executor's, held in its memory.
+    status.repair_attempt_count =
+        crate::repair_executor::repair_executor_work(&data_dir.root()).tracked_need_count;
+    status.repair_attempts = crate::repair_executor::repair_executor_status_sample(
+        &data_dir.root(),
+        DFS_OPERATOR_STATUS_REPAIR_ATTEMPT_SAMPLE,
+    );
     Ok(())
 }
 
@@ -1699,8 +1685,8 @@ mod tests {
         let file_system_id = sifs_file_system_id();
         let shard_id = DfsMetadataShardId::new("root");
         let omissions = [
-            DfsOperatorStatusOmission::historical_routing_topology(1),
-            DfsOperatorStatusOmission::non_primary_resident_metadata_not_hydrated(
+            crate::DfsOperatorStatusOmission::historical_routing_topology(1),
+            crate::DfsOperatorStatusOmission::non_primary_resident_metadata_not_hydrated(
                 file_system_id,
                 shard_id,
             ),
@@ -1731,7 +1717,7 @@ mod tests {
         }
 
         let zero_proof =
-            DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(
+            crate::DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(
                 1,
             );
         let status = inspect_dfs_status_from_resident_snapshot(
@@ -2014,20 +2000,20 @@ mod tests {
     }
 
     #[test]
-    fn cold_repair_queue_is_a_typed_bounded_omission() {
-        let root = sinomo_testdir::TestDir::new("dfs-status-cold-repair-queue-omission");
+    fn cold_repair_status_reads_the_idle_executor_without_omission() {
+        let root = sinomo_testdir::TestDir::new("dfs-status-cold-repair-executor");
         let data_dir = SinomoDataDir::new(root.path());
         let mut status = empty_status();
 
         attach_cluster_aware_dfs_maintenance_observations(&mut status, &data_dir)
-            .expect("attach cold repair queue observation");
+            .expect("attach cold repair observation");
 
         assert_eq!(status.repair_attempt_count, 0);
         assert!(status.repair_attempts.is_empty());
-        assert!(status.bounded_omissions.iter().any(|omission| matches!(
-            omission,
-            DfsOperatorStatusOmission::ResidentRepairQueueNotHydrated
-        )));
+        assert!(
+            status.bounded_omissions.is_empty(),
+            "the executor's in-memory state is always observable"
+        );
         assert!(status.blocking_incomplete_reasons().is_empty());
         assert!(status.incomplete_reasons.is_empty());
     }

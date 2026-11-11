@@ -16,7 +16,7 @@ use sinomo_core::network::{
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -173,9 +173,7 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
         || placement_page_remaining
         || lifecycle_limit_reached
         || (report.repair_budget_exhausted
-            && (!report.scheduled_repairs.is_empty()
-                || report.repair_page_checkpoint.completed_record_count > 0
-                || report.repair_page_checkpoint.operation_count > 0))
+            && (!report.scheduled_repairs.is_empty() || report.repair_examined_count > 0))
 }
 
 /// Bounded resident-daemon maintenance policy. Inventory-wide lifecycle work
@@ -361,7 +359,50 @@ pub fn dfs_resident_maintenance_execution_exclusions(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
 ) -> DfsMaintenanceExecutionExclusions {
-    DfsMaintenanceExecutionExclusions::new(dfs_offline_node_ids(cluster_paths, state))
+    let excluded = dfs_offline_node_ids(cluster_paths, state);
+    let expiries = dfs_reachability_evidence_expiry(cluster_paths, state, &excluded);
+    DfsMaintenanceExecutionExclusions::new(excluded).with_reevaluate_at_by_target(expiries)
+}
+
+/// When the evidence that excludes each of `excluded` can expire by time
+/// alone, so whoever parks work on an excluded target re-reads reachability
+/// then; see [`dfs_exclusion_evidence_expiry`].
+pub(crate) fn dfs_reachability_evidence_expiry(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+    excluded: &BTreeSet<NodeId>,
+) -> BTreeMap<NodeId, u64> {
+    if excluded.is_empty() {
+        return BTreeMap::new();
+    }
+    dfs_exclusion_evidence_expiry(
+        &ClusterConnectivityGraph::read_for_local(cluster_paths, state),
+        &state.local_node_id,
+        excluded,
+    )
+}
+
+/// A target is excluded while it is not Online and shares no healthy
+/// component with this node ([`dfs_node_is_offline_for_maintenance`]).
+/// Without a new record or status, an expiring healthy record only shrinks a
+/// component and stored statuses do not expire, so the only evidence whose
+/// expiry can lift an exclusion is this node's own `Unreachable` records about
+/// the target: they make it Offline, and once they expire it is Unknown, which
+/// a routed candidate transport relaxes. Records about other nodes, or about
+/// the target from other sources, never lift its exclusion by expiring.
+pub(crate) fn dfs_exclusion_evidence_expiry(
+    graph: &ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    excluded: &BTreeSet<NodeId>,
+) -> BTreeMap<NodeId, u64> {
+    excluded
+        .iter()
+        .filter_map(|target| {
+            let expires_at = graph.earliest_unreachable_expiry(local_node_id, target)?;
+            let expires_at = u64::try_from(expires_at.unix_timestamp_nanos()).ok()?;
+            Some((target.clone(), expires_at))
+        })
+        .collect()
 }
 
 /// Count placement jobs that can advance without waiting on an already-owned
@@ -491,34 +532,25 @@ pub(crate) fn dfs_completed_local_primary_handoff_rebind_count_with_layout(
 }
 
 /// Build the bounded production maintenance projection from the retained DFS
-/// authority prefix and the durable repair queue. This never hydrates metadata
-/// or enumerates content.
+/// authority prefix and the node's repair executor. This never hydrates
+/// metadata or enumerates content.
 pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
     data_dir: &SinomoDataDir,
     local_node_id: &NodeId,
     authority_entries: &[KvEntry],
-    repair_attempt_records: &[DfsRepairAttemptRecord],
     now_unix_nanos: u64,
 ) -> Result<DfsPendingMaintenanceWork, DfsError> {
     let mounted_mutation_work =
         crate::mounted_sifs_mutation_pending_maintenance_work(data_dir, now_unix_nanos)?;
-    let due_repair_attempt_count = repair_attempt_records
-        .iter()
-        .filter(|record| {
-            !crate::service_repair::repair_record_has_unidentified_producer(record)
-                && record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos <= now_unix_nanos
-        })
-        .count();
-    let next_repair_retry_unix_nanos = repair_attempt_records
-        .iter()
-        .filter(|record| {
-            !crate::service_repair::repair_record_has_unidentified_producer(record)
-                && record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos > now_unix_nanos
-        })
-        .map(|record| record.next_retry_unix_nanos)
-        .min();
+    // Repair work is the node executor's. Its own timer wakes it, so only
+    // work already due counts here.
+    let executor = crate::repair_executor::repair_executor_work(&data_dir.root());
+    let executor_due = executor.due
+        || executor
+            .next_due_unix_nanos
+            .is_some_and(|due| due <= now_unix_nanos);
+    let due_repair_attempt_count = usize::from(executor_due);
+    let next_repair_retry_unix_nanos = None;
     let placement_prefix = crate::placement_reconciliations_prefix(&crate::sifs_file_system_id());
     let placement_queue_key =
         crate::control_plane::placement_reconciliation_queue_key(&crate::sifs_file_system_id());
@@ -554,7 +586,7 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         crate::control_plane::placement_reconciliation_pending_work_from_authority_entries(
             &crate::sifs_file_system_id(),
             authority_entries,
-            repair_attempt_records.len(),
+            executor.need_count,
         )?
     } else {
         0
@@ -570,8 +602,8 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         )?;
 
     Ok(DfsPendingMaintenanceWork {
-        pending_repair_count: repair_attempt_records.len(),
-        repair_attempt_count: repair_attempt_records.len(),
+        pending_repair_count: executor.need_count,
+        repair_attempt_count: executor.tracked_need_count,
         due_repair_attempt_count,
         next_repair_retry_unix_nanos,
         actionable_placement_reconciliation_count,
@@ -599,7 +631,7 @@ use crate::{
     ContentStoreVersionGcReport, DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
     DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker,
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
-    DfsControlPlaneKvClient, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
+    DfsControlPlaneKvClient, DfsError, DfsFileSystemConfig,
     DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataHistoryGcOptions,
     DfsMetadataHistoryGcReport, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
@@ -609,7 +641,7 @@ use crate::{
     DfsObjectId, DfsObjectPageCursor, DfsPeerTransport, DfsPlacementReconciliationJob,
     DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion,
     DistributedRepairJob, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
-    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    NetworkedDfsServiceEvent,
     async_dfs_metadata_journal_batch_sender_from_peer_transport,
     async_dfs_metadata_snapshot_install_sender_from_peer_transport,
     default_dfs_content_root_catalog_store, dfs_message_sender_from_peer_transport,
@@ -622,30 +654,6 @@ use crate::{
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
     publish_dfs_metadata_journal_with_host,
 };
-
-/// Returns true when an authority-side message commit created durable DFS work
-/// which must wake the reactive maintenance classifier.
-///
-/// A routed write requester observes `RemoteWriteCompleted`, but only the
-/// metadata authority serving `RemoteWriteServed` owns the pending intent or
-/// repair jobs. Keeping that distinction here prevents requester-side traffic
-/// from waking broad maintenance while guaranteeing that asynchronous W=1
-/// commits cannot park until an unrelated notification or safety reprobe.
-pub fn dfs_events_should_wake_repair_maintenance(events: &[NetworkedDfsServiceEvent]) -> bool {
-    events.iter().any(|event| {
-        let NetworkedDfsServiceEvent::RemoteWriteServed {
-            result: DfsDistributedWriteResult::Outcome { outcome },
-            ..
-        } = event
-        else {
-            return false;
-        };
-        match outcome {
-            NetworkedDfsWriteOutcome::Pending { .. } => true,
-            NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => !repair_jobs.is_empty(),
-        }
-    })
-}
 
 pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
     data_dir: &SinomoDataDir,
@@ -701,6 +709,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
     let mut report = run_dfs_maintenance_tick_with_host(
         &mut service,
         &mut maintenance_host,
+        data_dir,
         file_system.file_system_id,
         &local_node_id,
         metadata_shards,
@@ -970,8 +979,8 @@ where
 /// daemon service lane without reconstructing the complete DFS projection.
 ///
 /// This is the normal production healing path. It consumes durable namespace,
-/// placement, handoff, and repair queues plus the service lane's exact
-/// foreground state. Full metadata/content hydration is intentionally reserved
+/// placement and handoff work, the node's repair executor, and the service
+/// lane's exact foreground state. Full metadata/content hydration is intentionally reserved
 /// for an explicitly requested disaster-recovery pass.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cluster_dfs_reactive_maintenance_tick_with_reusable_service<T>(
@@ -1034,19 +1043,6 @@ where
         true,
     )
     .await;
-    if result.is_err()
-        && let Some(
-            crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::GenerationChanged {
-                current_head_sequence,
-            },
-        ) = maintenance_host.repair_page_generation_change
-    {
-        // The failed exact checkpoint did not publish this pass's private calls.
-        // Defer to a fresh actual page; no scan/completion count is fabricated.
-        tracing::debug!(target: "sinomo.dfs.maintenance", current_head_sequence,
-            "DFS maintenance deferred after its observed repair queue generation changed");
-        return Ok(None);
-    }
     result
 }
 
@@ -1372,9 +1368,6 @@ pub struct DfsAntiEntropyCursorRecord {
 
 pub use sinomo_api::dfs::maintenance::DfsRepairAttemptRecord;
 
-pub(crate) const DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY: &str =
-    "repair execution blocked: target has no currently usable cluster route";
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsWriteIntentMaintenanceReport {
     /// Physical scan work, including terminal and ownership-rejected records.
@@ -1387,12 +1380,6 @@ pub struct DfsWriteIntentMaintenanceReport {
     pub aborted_missing_object_count: usize,
     pub aborted_superseded_intent_count: usize,
     pub skipped_fresh_stale_candidate_count: usize,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsRepairAttemptSnapshot {
-    #[serde(default)]
-    pub records: Vec<DfsRepairAttemptRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1415,35 +1402,11 @@ pub struct DfsMetadataReplicationSuppressionSnapshot {
 #[derive(Clone, Debug)]
 pub struct LocalDfsMaintenanceHost {
     data_dir: SinomoDataDir,
-    repair_queue_store: crate::repair_queue_store::LocalDfsRepairQueueStore,
-    repair_queue_observation: Option<crate::repair_queue_store::DfsRepairQueueObservation>,
-    repair_page_observation: Option<crate::repair_queue_store::DfsRepairQueuePageObservation>,
-    // Actual owner result only; it cannot acknowledge records or grant dispatch.
-    repair_page_generation_change:
-        Option<crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome>,
 }
 
 impl LocalDfsMaintenanceHost {
-    fn with_queue(data_dir: SinomoDataDir, repair_queue_store: crate::LocalDfsRepairQueueStore) -> Self {
-        Self {
-            data_dir, repair_queue_store,
-            repair_queue_observation: None,
-            repair_page_observation: None,
-            repair_page_generation_change: None,
-        }
-    }
-
     pub fn new(data_dir: SinomoDataDir) -> Self {
-        let repair_queue_store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
-            default_dfs_repair_attempt_snapshot_path(&data_dir),
-        );
-        Self {
-            data_dir,
-            repair_queue_store,
-            repair_queue_observation: None,
-            repair_page_observation: None,
-            repair_page_generation_change: None,
-        }
+        Self { data_dir }
     }
 
     fn cursor_path(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
@@ -1473,143 +1436,6 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
         clear_dfs_anti_entropy_cursor(&self.cursor_path(file_system_id))
     }
 
-    fn load_repair_maintenance_page(
-        &mut self,
-        max_records: usize,
-    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
-        let (page, observed) = self
-            .repair_queue_store
-            .maintenance_page(max_records, &[], None)?;
-        self.repair_page_observation = Some(observed);
-        Ok(page)
-    }
-
-    fn enroll_repair_maintenance_page(
-        &mut self,
-        _page: &crate::DfsRepairQueueMaintenancePage,
-        max_records: usize,
-        captured: &[DfsRepairAttemptRecord],
-    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError> {
-        let expected = self
-            .repair_page_observation
-            .as_ref()
-            .ok_or_else(|| DfsError::Metadata {
-                message: "repair page enrollment has no observation".into(),
-            })?;
-        let (page, observed) =
-            self.repair_queue_store
-                .maintenance_page(max_records, captured, Some(expected))?;
-        self.repair_page_observation = Some(observed);
-        Ok(page)
-    }
-
-    fn checkpoint_repair_maintenance_page(
-        &mut self,
-        page: &crate::DfsRepairQueueMaintenancePage,
-        examined: &BTreeSet<(String, NodeId)>,
-        desired: &[DfsRepairAttemptRecord],
-        retired: &[DfsRepairAttemptRecord],
-    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError> {
-        self.repair_page_generation_change = None;
-        let expected = self
-            .repair_page_observation
-            .as_ref()
-            .ok_or_else(|| DfsError::Metadata {
-                message: "repair page checkpoint has no observation".into(),
-            })?;
-        let examined_prefix = page
-            .records
-            .iter()
-            .take_while(|record| {
-                examined.contains(&(
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                ))
-            })
-            .count();
-        let reconciled = page
-            .records
-            .iter()
-            .chain(&page.enrollment_records)
-            .filter(|record| {
-                examined.contains(&(
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                ))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let result = self.repair_queue_store.reconcile_maintenance_page(
-            expected,
-            examined_prefix.min(expected.record_count()),
-            &reconciled,
-            desired,
-            retired,
-            &page.enrollment_records,
-        )?;
-        match result {
-            crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::Applied {
-                removed_target_count,
-                operation_count,
-                has_more,
-                ..
-            } => {
-                self.repair_queue_store.compact_if_needed(
-                    crate::repair_queue_store::DfsRepairQueueCompactionOptions::default(),
-                )?;
-                self.repair_page_observation = None;
-                Ok(DfsRepairMaintenancePageCheckpoint {
-                    examined_record_count: examined.len(),
-                    completed_record_count: examined.len(),
-                    removed_target_count,
-                    operation_count,
-                    has_more,
-                })
-            }
-            outcome @ crate::repair_queue_store::DfsRepairQueuePageReconcileOutcome::GenerationChanged {
-                current_head_sequence,
-            } => {
-                self.repair_page_generation_change = Some(outcome);
-                Err(DfsError::Metadata {
-                    message: format!(
-                        "repair queue generation changed at page checkpoint (head {current_head_sequence})"
-                    ),
-                })
-            }
-        }
-    }
-
-    fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
-        let (view, observation) = self.repair_queue_store.view_for_maintenance()?;
-        self.repair_queue_observation = Some(observation);
-        Ok(view.records)
-    }
-
-    fn store_repair_attempt_records(
-        &mut self,
-        records: &[DfsRepairAttemptRecord],
-    ) -> Result<(), DfsError> {
-        let observation = match self.repair_queue_observation.clone() {
-            Some(observation) => observation,
-            None => self.repair_queue_store.view_for_maintenance()?.1,
-        };
-        match self.repair_queue_store.reconcile_observed(&observation, records)? {
-            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(updated) => {
-                self.repair_queue_observation = Some(updated);
-                self.repair_queue_store.compact_if_needed(
-                    crate::repair_queue_store::DfsRepairQueueCompactionOptions::default(),
-                )?;
-                Ok(())
-            }
-            crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::GenerationChanged { current_head_sequence } => {
-                // Keep the stale token until load is repeated. Merely learning
-                // the new head must not authorize a stale desired record set.
-                Err(DfsError::Metadata {
-                    message: format!("DFS repair queue changed during maintenance: expected sequence {}, found {current_head_sequence}", observation.head_sequence),
-                })
-            }
-        }
-    }
 }
 
 pub fn default_dfs_anti_entropy_cursor_path(
@@ -1637,23 +1463,7 @@ pub(crate) fn selected_native_layout_for_maintenance(
 }
 
 fn native_maintenance_host(data_dir: SinomoDataDir) -> Result<LocalDfsMaintenanceHost, DfsError> {
-    if let Some(layout) = selected_native_layout_for_maintenance(&data_dir)? {
-        Ok(LocalDfsMaintenanceHost::with_queue(data_dir, layout.queue()?))
-    } else { Ok(LocalDfsMaintenanceHost::new(data_dir)) }
-}
-
-pub(crate) fn read_native_repair_attempt_snapshot(data_dir: &SinomoDataDir) -> Result<Option<DfsRepairAttemptSnapshot>, DfsError> {
-    if let Some(layout) = selected_native_layout_for_maintenance(data_dir)? {
-        let view = layout.queue()?.view()?;
-        Ok((!view.records.is_empty()).then_some(DfsRepairAttemptSnapshot { records: view.records }))
-    } else { read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir)) }
-}
-
-pub fn default_dfs_repair_attempt_snapshot_path(data_dir: &SinomoDataDir) -> PathBuf {
-    data_dir
-        .dfs_dir()
-        .join("maintenance")
-        .join("repair-attempts.sobj")
+    Ok(LocalDfsMaintenanceHost::new(data_dir))
 }
 
 pub fn default_dfs_metadata_replication_suppression_snapshot_path(
@@ -1663,29 +1473,6 @@ pub fn default_dfs_metadata_replication_suppression_snapshot_path(
         .dfs_dir()
         .join("maintenance")
         .join("metadata-replication-suppressions.sobj")
-}
-
-pub fn read_dfs_repair_attempt_snapshot(
-    path: &Path,
-) -> Result<Option<DfsRepairAttemptSnapshot>, DfsError> {
-    let view = crate::repair_queue_store::LocalDfsRepairQueueStore::new(path).view()?;
-    Ok(
-        (view.head_sequence > 0 || !view.records.is_empty() || path.exists()).then_some(
-            DfsRepairAttemptSnapshot {
-                records: view.records,
-            },
-        ),
-    )
-}
-
-pub fn write_dfs_repair_attempt_snapshot(
-    path: &Path,
-    snapshot: &DfsRepairAttemptSnapshot,
-) -> Result<(), DfsError> {
-    let store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(path);
-    store.replace_records(&snapshot.records)?;
-    store.compact_if_needed(crate::repair_queue_store::DfsRepairQueueCompactionOptions::force())?;
-    Ok(())
 }
 
 pub fn read_dfs_metadata_replication_suppression_snapshot(
@@ -1904,36 +1691,6 @@ pub trait DfsMaintenanceHost: Send {
         file_system_id: &DfsFileSystemId,
     ) -> Result<(), DfsError>;
 
-    fn load_repair_maintenance_page(
-        &mut self,
-        _max_records: usize,
-    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError>;
-
-    fn enroll_repair_maintenance_page(
-        &mut self,
-        page: &crate::DfsRepairQueueMaintenancePage,
-        _max_records: usize,
-        captured: &[DfsRepairAttemptRecord],
-    ) -> Result<crate::DfsRepairQueueMaintenancePage, DfsError>;
-
-    fn checkpoint_repair_maintenance_page(
-        &mut self,
-        _page: &crate::DfsRepairQueueMaintenancePage,
-        _examined: &BTreeSet<(String, NodeId)>,
-        _desired: &[DfsRepairAttemptRecord],
-        _retired: &[DfsRepairAttemptRecord],
-    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError>;
-
-    fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
-        Ok(Vec::new())
-    }
-
-    fn store_repair_attempt_records(
-        &mut self,
-        _records: &[DfsRepairAttemptRecord],
-    ) -> Result<(), DfsError> {
-        Ok(())
-    }
 }
 
 pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
@@ -2276,13 +2033,52 @@ pub struct DfsMaintenanceTickOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsMaintenanceExecutionExclusions {
     target_node_ids: BTreeSet<NodeId>,
+    /// When the evidence that excludes each target can expire by time alone;
+    /// a consumer that parks work on that target re-reads reachability then.
+    reevaluate_at_by_target: BTreeMap<NodeId, u64>,
+    /// The repair executor's reachability-event count read before this set,
+    /// so a pass knows whether an event it consumes is newer than the set.
+    repair_reachability_epoch: Option<u64>,
+    /// The repair executor's authority-event count read before the turn
+    /// captured the authority view it dispatches with.
+    repair_authority_epoch: Option<u64>,
 }
 
 impl DfsMaintenanceExecutionExclusions {
     pub fn new(target_node_ids: impl IntoIterator<Item = NodeId>) -> Self {
         Self {
             target_node_ids: target_node_ids.into_iter().collect(),
+            reevaluate_at_by_target: BTreeMap::new(),
+            repair_reachability_epoch: None,
+            repair_authority_epoch: None,
         }
+    }
+
+    pub(crate) fn with_reevaluate_at_by_target(mut self, at: BTreeMap<NodeId, u64>) -> Self {
+        self.reevaluate_at_by_target = at;
+        self
+    }
+
+    pub(crate) fn with_repair_reachability_epoch(mut self, epoch: u64) -> Self {
+        self.repair_reachability_epoch = Some(epoch);
+        self
+    }
+
+    pub(crate) fn with_repair_authority_epoch(mut self, epoch: u64) -> Self {
+        self.repair_authority_epoch = Some(epoch);
+        self
+    }
+
+    pub(crate) fn reevaluate_at_by_target(&self) -> &BTreeMap<NodeId, u64> {
+        &self.reevaluate_at_by_target
+    }
+
+    pub(crate) fn repair_reachability_epoch(&self) -> Option<u64> {
+        self.repair_reachability_epoch
+    }
+
+    pub(crate) fn repair_authority_epoch(&self) -> Option<u64> {
+        self.repair_authority_epoch
     }
 
     pub fn contains(&self, target_node_id: &NodeId) -> bool {
@@ -2293,96 +2089,6 @@ impl DfsMaintenanceExecutionExclusions {
         self.target_node_ids.is_empty()
     }
 
-    /// Never defer a newly committed repair solely from a cached reachability
-    /// projection. Its first bounded send is the evidence which establishes
-    /// whether the target is actually blocked; older work with a concrete
-    /// failure remains parked until the routing generation changes.
-    fn allowing_unattempted_repairs(&self, records: &[DfsRepairAttemptRecord]) -> Self {
-        let first_attempt_targets = records
-            .iter()
-            .filter(|record| record.attempts == 0)
-            .map(|record| record.missing_replica_node_id.clone())
-            .collect::<BTreeSet<_>>();
-        Self::new(
-            self.target_node_ids
-                .iter()
-                .filter(|target| !first_attempt_targets.contains(*target))
-                .cloned(),
-        )
-    }
-}
-
-fn mark_connectivity_blocked_dfs_repair_attempt_records(
-    records: &mut [DfsRepairAttemptRecord],
-    execution_exclusions: &DfsMaintenanceExecutionExclusions,
-) {
-    for record in records {
-        if !execution_exclusions.contains(&record.missing_replica_node_id)
-            || record.next_retry_unix_nanos == u64::MAX
-            || record.in_flight
-            || record.transfer_request_id.is_some()
-        {
-            continue;
-        }
-        record.in_flight = false;
-        record.next_retry_unix_nanos = u64::MAX;
-        record.transfer_request_id = None;
-        record.last_error = Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.to_string());
-    }
-}
-
-fn dfs_repair_attempt_is_eligible_without_execution_projection(
-    record: &DfsRepairAttemptRecord,
-) -> bool {
-    // The synchronous maintenance API has no current connectivity projection
-    // with which to prove that a durable blocker cleared. A MAX deadline is
-    // the explicit parked/suppressed marker, so it cannot contribute to the
-    // bounded executable queue until a projection-aware path admits it.
-    record.next_retry_unix_nanos != u64::MAX
-}
-
-fn dfs_repair_maintenance_budget_exhausted(
-    repair_max_jobs: usize,
-    eligible_repair_count_before: usize,
-    scheduled_repair_count: usize,
-    durable_repair_queue_after: &[DfsRepairAttemptRecord],
-    now_unix_nanos: u64,
-) -> bool {
-    repair_max_jobs > 0
-        && repair_max_jobs != usize::MAX
-        && eligible_repair_count_before >= repair_max_jobs
-        && scheduled_repair_count > 0
-        && durable_repair_queue_after.iter().any(|record| {
-            !crate::service_repair::repair_record_has_unidentified_producer(record)
-                && record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos <= now_unix_nanos
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn merge_parked_dfs_repair_attempt_records(
-    active_records: Vec<DfsRepairAttemptRecord>,
-    parked_records: Vec<DfsRepairAttemptRecord>,
-    active_repair_keys: &BTreeSet<(String, NodeId)>,
-    execution_exclusions: &DfsMaintenanceExecutionExclusions,
-) -> Vec<DfsRepairAttemptRecord> {
-    let mut records = active_records
-        .into_iter()
-        .filter(|record| !execution_exclusions.contains(&record.missing_replica_node_id))
-        .collect::<Vec<_>>();
-    records.extend(parked_records.into_iter().filter(|record| {
-        active_repair_keys.contains(&(
-            record.intent_id.clone(),
-            record.missing_replica_node_id.clone(),
-        ))
-    }));
-    records.sort_by(|left, right| {
-        left.intent_id.cmp(&right.intent_id).then_with(|| {
-            left.missing_replica_node_id
-                .cmp(&right.missing_replica_node_id)
-        })
-    });
-    records
 }
 
 impl Default for DfsMaintenanceTickOptions {
@@ -2403,42 +2109,32 @@ impl Default for DfsMaintenanceTickOptions {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DfsRepairMaintenancePageCheckpoint {
-    pub examined_record_count: usize,
-    /// Keys whose scan/execution outcome was acknowledged by the queue owner.
-    pub completed_record_count: usize,
-    pub removed_target_count: usize,
-    pub operation_count: usize,
-    pub has_more: bool,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMaintenanceTickReport {
     pub namespace_jobs: DfsNamespaceJobMaintenanceReport,
     pub write_intents: DfsWriteIntentMaintenanceReport,
     pub placement_reconciliation: Option<DfsPlacementReconciliationJob>,
     pub lifecycle_reports: Vec<DfsLifecycleMaintenanceReport>,
+    /// Repairs the node's executor dispatched in this pass.
     pub scheduled_repairs: Vec<DistributedRepairJob>,
     pub followup_events: Vec<NetworkedDfsServiceEvent>,
-    pub repair_attempts_before: Vec<DfsRepairAttemptRecord>,
-    pub repair_attempts_after: Vec<DfsRepairAttemptRecord>,
-    /// This bounded pass scheduled at least one repair and stopped while
-    /// another repair record was immediately runnable. The daemon may continue
-    /// without its ordinary retry gate.
+    /// The executor stopped at its bound with ready needs or a gained
+    /// assignment's traversal left.
     pub repair_budget_exhausted: bool,
-    /// Set only after the existing queue owner acknowledges this page.
-    pub repair_page_checkpoint: DfsRepairMaintenancePageCheckpoint,
+    /// Index entries and tracked needs the executor's pass touched. With a
+    /// dispatched repair, the explicit progress that lets a remainder
+    /// continue in the same wake.
+    pub repair_examined_count: usize,
+    /// Needs the executor tracks after this pass.
+    pub repair_tracked_need_count: usize,
     pub metadata_replication: DfsMetadataJournalReplicationReport,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsMaintenanceTickObservations {
     pub metadata_replications_sent: usize,
+    /// Needs the node's repair executor tracks.
     pub repair_attempt_count: usize,
-    pub repair_attempt_in_flight_count: usize,
-    pub repair_attempt_backoff_count: usize,
-    pub repair_attempt_suppressed_count: usize,
     /// Informational repair summaries retained by the ordinary in-memory log sink.
     pub routine_notice_lines: Vec<String>,
     pub notice_lines: Vec<String>,
@@ -2470,23 +2166,17 @@ pub fn dfs_maintenance_tick_observations(
     let (routine_notice_lines, repair_notices) = dfs_repair_maintenance_observation_lines(
         &report.scheduled_repairs,
         &report.followup_events,
-        &report.repair_attempts_after,
     );
     notice_lines.extend(repair_notices);
     notice_lines.extend(dfs_metadata_replication_notice_lines(
         &report.metadata_replication,
     ));
-    let repair_attempt_summary =
-        dfs_repair_attempt_observation_counts(&report.repair_attempts_after);
 
     DfsMaintenanceTickObservations {
         metadata_replications_sent: dfs_metadata_replication_sent_count(
             &report.metadata_replication,
         ),
-        repair_attempt_count: report.repair_attempts_after.len(),
-        repair_attempt_in_flight_count: repair_attempt_summary.in_flight,
-        repair_attempt_backoff_count: repair_attempt_summary.backoff,
-        repair_attempt_suppressed_count: repair_attempt_summary.suppressed,
+        repair_attempt_count: report.repair_tracked_need_count,
         routine_notice_lines,
         notice_lines,
     }
@@ -2677,11 +2367,9 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
 pub fn dfs_repair_maintenance_notice_lines(
     scheduled_repairs: &[DistributedRepairJob],
     followup_events: &[NetworkedDfsServiceEvent],
-    repair_attempts: &[DfsRepairAttemptRecord],
 ) -> Vec<String> {
-    let (mut lines, events) = dfs_repair_maintenance_observation_lines(
-        scheduled_repairs, followup_events, repair_attempts,
-    );
+    let (mut lines, events) =
+        dfs_repair_maintenance_observation_lines(scheduled_repairs, followup_events);
     lines.extend(events);
     lines
 }
@@ -2689,7 +2377,6 @@ pub fn dfs_repair_maintenance_notice_lines(
 fn dfs_repair_maintenance_observation_lines(
     scheduled_repairs: &[DistributedRepairJob],
     followup_events: &[NetworkedDfsServiceEvent],
-    repair_attempts: &[DfsRepairAttemptRecord],
 ) -> (Vec<String>, Vec<String>) {
     let repair_followups = followup_events
         .iter()
@@ -2704,32 +2391,15 @@ fn dfs_repair_maintenance_observation_lines(
             )
         })
         .count();
-    if scheduled_repairs.is_empty() && repair_followups == 0 && repair_attempts.is_empty() {
+    if scheduled_repairs.is_empty() && repair_followups == 0 {
         return (Vec::new(), Vec::new());
     }
 
-    let mut lines = vec![format!(
+    let routine_lines = vec![format!(
         "DFS repairs: scheduled={}, followups={}",
         scheduled_repairs.len(),
         repair_followups
     )];
-    if !repair_attempts.is_empty() {
-        let summary = dfs_repair_attempt_observation_counts(repair_attempts);
-        let next_retry = summary
-            .next_retry_unix_nanos
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
-        lines.push(format!(
-            "DFS repair attempts: active={}, in_flight={}, due={}, backoff={}, suppressed={}, next_retry_unix_nanos={}",
-            repair_attempts.len(),
-            summary.in_flight,
-            summary.due,
-            summary.backoff,
-            summary.suppressed,
-            next_retry
-        ));
-    }
-    let routine_lines = lines;
     let mut lines = Vec::new();
     lines.extend(scheduled_repairs.iter().map(|job| {
         format!(
@@ -2780,47 +2450,11 @@ fn dfs_repair_maintenance_observation_lines(
     (routine_lines, lines)
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DfsRepairAttemptObservationCounts {
-    in_flight: usize,
-    due: usize,
-    backoff: usize,
-    suppressed: usize,
-    next_retry_unix_nanos: Option<u64>,
-}
-
-fn dfs_repair_attempt_observation_counts(
-    records: &[DfsRepairAttemptRecord],
-) -> DfsRepairAttemptObservationCounts {
-    let now = dfs_now_unix_nanos();
-    let mut counts = DfsRepairAttemptObservationCounts::default();
-    for record in records {
-        if record.in_flight {
-            counts.in_flight += 1;
-            continue;
-        }
-        if record.next_retry_unix_nanos == u64::MAX {
-            counts.suppressed += 1;
-            continue;
-        }
-        if record.next_retry_unix_nanos <= now {
-            counts.due += 1;
-        } else {
-            counts.backoff += 1;
-            counts.next_retry_unix_nanos = Some(
-                counts
-                    .next_retry_unix_nanos
-                    .map(|current| current.min(record.next_retry_unix_nanos))
-                    .unwrap_or(record.next_retry_unix_nanos),
-            );
-        }
-    }
-    counts
-}
-
+#[allow(clippy::too_many_arguments)]
 pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     maintenance_host: &mut dyn DfsMaintenanceHost,
+    data_dir: &SinomoDataDir,
     file_system_id: DfsFileSystemId,
     local_node_id: &NodeId,
     metadata_shards: Vec<DfsMetadataShardConfig>,
@@ -2866,16 +2500,16 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         options.write_intent_max_records,
         options.stale_write_intent_min_age,
     )?;
-    // One snapshot from the durable repair owner supplies both placement
-    // eligibility and the existing later repair phase under this same service
-    // admission. Placement/lifecycle do not persist attempt records.
-    let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
+    // Placement eligibility counts the executor's current repair needs; the
+    // node-local queue schedules nothing.
+    let pending_repair_count =
+        crate::repair_executor::repair_executor_work(&data_dir.root()).need_count;
     let placement_reconciliation = if options.placement_reconciliation_max_objects == 0 {
         None
     } else {
         service.run_placement_reconciliation_bounded_with_pending_repairs(
             options.placement_reconciliation_max_objects,
-            durable_repair_queue_before.len(),
+            pending_repair_count,
         )?
     };
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
@@ -2886,30 +2520,21 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     if let Some(content_gc) = run_dfs_content_gc_without_catalog(service, options.lifecycle)? {
         lifecycle_reports.push(content_gc);
     }
-    let eligible_repair_count_before = durable_repair_queue_before
-        .iter()
-        .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
-        .count();
-    let scheduled_repairs = service.retry_pending_repairs_bounded_with_attempts(
-        options.repair_max_jobs,
-        &durable_repair_queue_before,
-    )?;
-    let repair_attempts_before = durable_repair_queue_before
-        .into_iter()
-        .filter(|record| record.attempts > 0)
-        .collect();
+    service.retry_pending_stages(options.repair_max_jobs)?;
+    let repair_limit = options
+        .repair_max_jobs
+        .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
+    let pass = if repair_limit == 0 {
+        crate::repair_executor::DfsRepairExecutorPassReport::default()
+    } else {
+        service.run_repair_executor_pass(
+            &data_dir.root(),
+            &metadata_shards,
+            &DfsMaintenanceExecutionExclusions::default(),
+            repair_limit,
+        )?
+    };
     let followup_events = service.process_incoming_until_quiescent()?;
-    service.observe_repair_maintenance_events(&followup_events);
-    let repair_attempts_after = service.active_repair_attempt_records();
-    let durable_repair_queue_after = service.durable_repair_queue_records();
-    let repair_budget_exhausted = dfs_repair_maintenance_budget_exhausted(
-        options.repair_max_jobs,
-        eligible_repair_count_before,
-        scheduled_repairs.len(),
-        &durable_repair_queue_after,
-        dfs_now_unix_nanos(),
-    );
-    maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
     let metadata_replication = if options.publish_metadata {
         publish_dfs_metadata_journal_with_host(
             file_system_id,
@@ -2929,12 +2554,11 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         write_intents,
         placement_reconciliation,
         lifecycle_reports,
-        scheduled_repairs,
+        scheduled_repairs: pass.scheduled,
         followup_events,
-        repair_attempts_before,
-        repair_attempts_after,
-        repair_budget_exhausted,
-        repair_page_checkpoint: DfsRepairMaintenancePageCheckpoint::default(),
+        repair_budget_exhausted: pass.has_more,
+        repair_examined_count: pass.examined,
+        repair_tracked_need_count: pass.tracked,
         metadata_replication,
     })
 }
@@ -3036,11 +2660,6 @@ where
                 .as_ref()
                 .map(|prefix| prefix.revision()),
         })?;
-        service.coordinator.ensure_message_repair_job_capture();
-        let progress_owner = Arc::clone(&service.maintenance_progress);
-        // Retry unacknowledged producer data before authoring another phase. The
-        // same queue writer validates/merges these rows; they carry no authority.
-        progress_owner.retry_births(maintenance_host)?;
         let authoritative_topology = authoritative_prefix
             .map(crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix)
             .transpose()?;
@@ -3048,6 +2667,8 @@ where
             let Some(repair) = run_maintenance_repair_phase(
                 service,
                 maintenance_host,
+                data_dir,
+                &metadata_shards,
                 execution_exclusions,
                 options,
                 false,
@@ -3064,6 +2685,8 @@ where
         // Persist phase position before each cooperative yield. Native handoff and
         // publication checks still run under the current admitted generation.
         if turn.phase() == Phase::Handoff {
+            #[cfg(test)]
+            phase_runs::record(&data_dir.root(), phase_runs::HANDOFF);
             service.reconcile_pending_metadata_shard_membership_handoffs(
                 &metadata_shards,
                 options.metadata_replication.target_timeout,
@@ -3123,14 +2746,12 @@ where
                     // No actual page progress may acknowledge or advance this
                     // enabled phase. Keep its existing checkpoint for reentry,
                     // after retaining any real births from preceding phases.
-                    progress_owner.checkpoint_births(service, maintenance_host)?;
                     return Ok(None);
                 }
                 // This actual bounded page is complete. Keep its phase/cursor
                 // instead of wrapping it while a different page owner is busy.
                 // Preserve native birth persistence and publication before the
                 // normal Some(report) carrier handoff releases admission.
-                progress_owner.checkpoint_births(service, maintenance_host)?;
                 turn.report().metadata_replication = run_maintenance_publish_phase(
                     &file_system_id,
                     local_node_id,
@@ -3148,7 +2769,12 @@ where
             tokio::task::yield_now().await;
         }
         if turn.phase() == Phase::Placement {
-            let initial_repair_page = maintenance_host.load_repair_maintenance_page(0)?;
+            #[cfg(test)]
+            phase_runs::record(&data_dir.root(), phase_runs::PLACEMENT);
+            // A placement job waiting on repair waits on the executor's
+            // current needs; the node-local queue schedules nothing.
+            let pending_repair_count =
+                crate::repair_executor::repair_executor_work(&data_dir.root()).need_count;
             tokio::task::yield_now().await;
             turn.report().placement_reconciliation =
                 if options.placement_reconciliation_max_objects == 0 {
@@ -3157,12 +2783,11 @@ where
                     service
                         .run_placement_reconciliation_bounded_async_with_pending_repairs(
                             options.placement_reconciliation_max_objects,
-                            initial_repair_page.total_record_count,
+                            pending_repair_count,
                             &metadata_shards,
                         )
                         .await?
                 };
-            progress_owner.checkpoint_births(service, maintenance_host)?;
             turn.advance(Phase::MetadataLifecycle);
             tokio::task::yield_now().await;
         }
@@ -3172,7 +2797,6 @@ where
                 maintenance_host,
                 dfs_metadata_lifecycle_options(options.lifecycle),
             )?;
-            progress_owner.checkpoint_births(service, maintenance_host)?;
             turn.advance(Phase::ContentLifecycle);
             tokio::task::yield_now().await;
         }
@@ -3202,7 +2826,6 @@ where
                     turn.report().lifecycle_reports.push(content_gc);
                 }
             }
-            progress_owner.checkpoint_births(service, maintenance_host)?;
             turn.advance(Phase::Repair);
             tokio::task::yield_now().await;
         }
@@ -3210,6 +2833,8 @@ where
             let Some(repair) = run_maintenance_repair_phase(
                 service,
                 maintenance_host,
+                data_dir,
+                &metadata_shards,
                 execution_exclusions,
                 options,
                 true,
@@ -3224,6 +2849,8 @@ where
             tokio::task::yield_now().await;
         }
         if turn.phase() == Phase::Publish {
+            #[cfg(test)]
+            phase_runs::record(&data_dir.root(), phase_runs::JOURNAL_PUBLISH);
             turn.report().metadata_replication = run_maintenance_publish_phase(
                 &file_system_id,
                 local_node_id,
@@ -3285,306 +2912,165 @@ async fn run_maintenance_publish_phase(
 struct RepairPhaseReport {
     scheduled_repairs: Vec<DistributedRepairJob>,
     followup_events: Vec<NetworkedDfsServiceEvent>,
-    repair_attempts_before: Vec<DfsRepairAttemptRecord>,
-    repair_attempts_after: Vec<DfsRepairAttemptRecord>,
     repair_budget_exhausted: bool,
-    repair_page_checkpoint: DfsRepairMaintenancePageCheckpoint,
+    repair_examined_count: usize,
+    repair_tracked_need_count: usize,
 }
 impl RepairPhaseReport {
     fn apply(self, report: &mut DfsMaintenanceTickReport) {
         report.scheduled_repairs = self.scheduled_repairs;
         report.followup_events = self.followup_events;
-        report.repair_attempts_before = self.repair_attempts_before;
-        report.repair_attempts_after = self.repair_attempts_after;
         report.repair_budget_exhausted = self.repair_budget_exhausted;
-        report.repair_page_checkpoint = self.repair_page_checkpoint;
+        report.repair_examined_count = self.repair_examined_count;
+        report.repair_tracked_need_count = self.repair_tracked_need_count;
     }
 }
+
+/// The repair phase: an unfinished write's own stage retries, then one pass
+/// of the node's repair executor over the events since its last pass.
+#[allow(clippy::too_many_arguments)]
 async fn run_maintenance_repair_phase<T>(
     service: &mut NetworkedDfsService<T>,
-    maintenance_host: &mut dyn DfsMaintenanceHost,
+    _maintenance_host: &mut dyn DfsMaintenanceHost,
+    data_dir: &SinomoDataDir,
+    metadata_shards: &[DfsMetadataShardConfig],
     execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMaintenanceTickOptions,
     yield_before_followup: bool,
-    yield_on_source_fence: bool,
+    _yield_on_source_fence: bool,
 ) -> Result<Option<RepairPhaseReport>, DfsError>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
-    let repair_page_limit = options
+    let repair_limit = options
         .repair_max_jobs
         .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
-    // Enrollment alone proposes rows; it does not persist them. Keep producer
-    // captures in the existing progress owner until the ordinary queue writer
-    // acknowledges them, before any source read can yield or return an error.
-    let progress_owner = Arc::clone(&service.maintenance_progress);
-    progress_owner.checkpoint_births(service, maintenance_host)?;
-    // Observe the same bounded execution page after that durable checkpoint.
-    // Pending source admission cannot acknowledge or advance its scan cursor.
-    let mut page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
-    // Own scheduling Set changes the durable queue generation. Capture a
-    // current SAME bounded page before executing it, rather than retaining the
-    // pre-wake observation and rejecting our own later checkpoint as stale.
-    let mut removed_wake_keys = BTreeSet::new();
-    if let Some(removed) =
-        service.wake_connectivity_blocked_repair_records(&page.records, execution_exclusions)?
-    {
-        removed_wake_keys = removed;
-        let captures = page
-            .enrollment_records
-            .iter()
-            .filter(|row| {
-                !removed_wake_keys
-                    .contains(&(row.intent_id.clone(), row.missing_replica_node_id.clone()))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let current_page = maintenance_host.load_repair_maintenance_page(repair_page_limit)?;
-        page = maintenance_host.enroll_repair_maintenance_page(
-            &current_page,
-            repair_page_limit,
-            &captures,
-        )?;
-    }
-    let (
-        scheduled_repairs,
-        followup_events,
-        repair_attempts_before,
-        repair_attempts_after,
-        repair_budget_exhausted,
-        repair_page_checkpoint,
-    ) = {
-        let repair_execution_exclusions =
-            execution_exclusions.allowing_unattempted_repairs(&page.records);
-        let mut scoped_targets = BTreeSet::new();
-        let mut eligible = Vec::new();
-        let mut parked = Vec::new();
-        for record in page.records.iter().take(repair_page_limit) {
-            let key = (
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            );
-            if repair_execution_exclusions.contains(&record.missing_replica_node_id) {
-                parked.push(record.clone());
-            } else {
-                scoped_targets.insert(key);
-                eligible.push(record.clone());
-            }
-        }
-        let mut progress = service
-            .retry_pending_repair_page_with_resident_yield(
-                options.repair_max_jobs,
-                &eligible,
-                &repair_execution_exclusions,
-                Some(&scoped_targets),
-                Some(&removed_wake_keys),
-                true,
-                yield_on_source_fence,
-            )
-            .await?;
-        if progress.source_read_pending {
-            // Earlier rows may have restored actual producer work before a
-            // later source was busy. Retain those captures across cancellation
-            // and generation retirement without claiming any page completion.
-            progress_owner.checkpoint_births(service, maintenance_host)?;
-            return Ok(None);
-        }
-        progress.examined.extend(parked.iter().map(|record| {
-            (
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            )
-        }));
-        // Replacement/stage completion may author new repair identities while
-        // processing this page. Enroll that exact capture in the SAME observed
-        // checkpoint before cancellation can destroy the service generation.
-        let repair_captures = service
-            .take_message_committed_repair_queue_records()
-            .into_iter()
-            .filter(|row| {
-                !removed_wake_keys
-                    .contains(&(row.intent_id.clone(), row.missing_replica_node_id.clone()))
-            })
-            .collect::<Vec<_>>();
-        service.coordinator.ensure_message_repair_job_capture();
-        if !repair_captures.is_empty() {
-            let mut captures = page.enrollment_records.clone();
-            captures.extend(repair_captures);
-            page = maintenance_host.enroll_repair_maintenance_page(
-                &page,
-                repair_page_limit,
-                &captures,
-            )?;
-        }
-        let deferred_repair_error = progress.error;
-        let scheduled_repairs = progress.scheduled;
-        let preserved_parked = page
-            .records
-            .iter()
-            .filter(|record| {
-                progress.parked.contains(&(
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                )) || crate::service_repair::repair_record_has_unidentified_producer(record)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let preserved_keys = preserved_parked
-            .iter()
-            .map(|record| {
-                (
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let mut durable_after =
-            service.repair_queue_records_for_targets(true, Some(&scoped_targets));
-        durable_after.extend(parked.iter().cloned());
-        durable_after.retain(|record| {
-            !preserved_keys.contains(&(
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            ))
-        });
-        mark_connectivity_blocked_dfs_repair_attempt_records(
-            &mut durable_after,
+    service
+        .retry_pending_stages_async(options.repair_max_jobs, execution_exclusions)
+        .await?;
+    let pass = if repair_limit == 0 {
+        crate::repair_executor::DfsRepairExecutorPassReport::default()
+    } else {
+        #[cfg(test)]
+        phase_runs::record(&data_dir.root(), phase_runs::FULL_TICK_EXECUTOR_PASS);
+        service.run_repair_executor_pass(
+            &data_dir.root(),
+            metadata_shards,
             execution_exclusions,
-        );
-        durable_after.extend(preserved_parked.iter().cloned());
-        let mut repair_page_checkpoint = maintenance_host.checkpoint_repair_maintenance_page(
-            &page,
-            &progress.examined,
-            &durable_after,
-            &progress.retired_intents,
-        )?;
-        repair_page_checkpoint.examined_record_count =
-            progress.examined_record_count + parked.len();
-        // Durable attempt/retirement checkpoint precedes both payload handoff and
-        // cancellation. No stale-only group can disappear with its service future.
-        service
-            .transport
-            .checkpoint_background_replica_dispatch()
-            .map_err(DfsError::from_network)?;
-        if let Some(error) = deferred_repair_error {
-            return Err(error);
-        }
-        if yield_before_followup {
-            tokio::task::yield_now().await;
-        }
-        let mut followup_keys = scoped_targets.clone();
-        followup_keys.retain(|key| !preserved_keys.contains(key));
-        followup_keys.extend(
-            page.enrollment_records
-                .iter()
-                .filter(|record| {
-                    !preserved_keys.contains(&(
-                        record.intent_id.clone(),
-                        record.missing_replica_node_id.clone(),
-                    ))
-                })
-                .map(|record| {
-                    (
-                        record.intent_id.clone(),
-                        record.missing_replica_node_id.clone(),
-                    )
-                }),
-        );
-        let followup_before = service.repair_queue_records_for_targets(true, Some(&followup_keys));
-        let followup_events = service.process_incoming_async_until_quiescent().await?;
-        service.observe_repair_maintenance_events(&followup_events);
-        let followup_captures = service
-            .take_message_committed_repair_queue_records()
-            .into_iter()
-            .filter(|record| {
-                !preserved_keys.contains(&(
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        service.coordinator.ensure_message_repair_job_capture();
-        if !followup_events.is_empty() || !followup_captures.is_empty() {
-            followup_keys.extend(followup_captures.iter().map(|record| {
-                (
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                )
-            }));
-            let followup_page = maintenance_host.load_repair_maintenance_page(0)?;
-            let followup_after =
-                service.repair_queue_records_for_targets(true, Some(&followup_keys));
-            let captures = followup_before
-                .iter()
-                .chain(&followup_after)
-                .chain(&followup_captures)
-                .cloned()
-                .collect::<Vec<_>>();
-            let followup_page =
-                maintenance_host.enroll_repair_maintenance_page(&followup_page, 0, &captures)?;
-            let keys = followup_before
-                .iter()
-                .map(|record| {
-                    (
-                        record.intent_id.clone(),
-                        record.missing_replica_node_id.clone(),
-                    )
-                })
-                .collect();
-            let checkpoint = maintenance_host.checkpoint_repair_maintenance_page(
-                &followup_page,
-                &keys,
-                &followup_after,
-                &[],
-            )?;
-            repair_page_checkpoint.removed_target_count += checkpoint.removed_target_count;
-            repair_page_checkpoint.operation_count += checkpoint.operation_count;
-            repair_page_checkpoint.has_more |= checkpoint.has_more;
-        }
-        let repair_budget_exhausted = options.repair_max_jobs > 0
-            && repair_page_checkpoint.has_more
-            && (repair_page_checkpoint.completed_record_count > 0
-                || repair_page_checkpoint.operation_count > 0);
-        let repair_attempts_before = page
-            .records
-            .into_iter()
-            .filter(|record| record.attempts > 0)
-            .collect();
-        let mut repair_attempts_after =
-            service.repair_queue_records_for_targets(false, Some(&scoped_targets));
-        repair_attempts_after.extend(parked.into_iter().filter(|record| record.attempts > 0));
-        repair_attempts_after.retain(|record| {
-            !preserved_keys.contains(&(
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            ))
-        });
-        mark_connectivity_blocked_dfs_repair_attempt_records(
-            &mut repair_attempts_after,
-            execution_exclusions,
-        );
-        repair_attempts_after.extend(
-            preserved_parked
-                .into_iter()
-                .filter(|record| record.attempts > 0),
-        );
-        (
-            scheduled_repairs,
-            followup_events,
-            repair_attempts_before,
-            repair_attempts_after,
-            repair_budget_exhausted,
-            repair_page_checkpoint,
-        )
+            repair_limit,
+        )?
     };
+    // The executor checkpointed its sends: they reach the detached worker only
+    // after maintenance releases its admission.
+    if yield_before_followup {
+        tokio::task::yield_now().await;
+    }
+    let followup_events = service.process_incoming_async_until_quiescent().await?;
     Ok(Some(RepairPhaseReport {
-        scheduled_repairs,
+        scheduled_repairs: pass.scheduled,
         followup_events,
-        repair_attempts_before,
-        repair_attempts_after,
-        repair_budget_exhausted,
-        repair_page_checkpoint,
+        repair_budget_exhausted: options.repair_max_jobs > 0 && pass.has_more,
+        repair_examined_count: pass.examined,
+        repair_tracked_need_count: pass.tracked,
     }))
+}
+
+/// One pass of the node's repair executor and nothing else. A wake that
+/// concerns only the executor serves only the executor's events: no write
+/// stage retry, namespace, placement, lifecycle, handoff or journal phase
+/// runs, since each of those keeps its own trigger. The pass checkpoints its
+/// sends; they leave through the detached worker once admission ends.
+pub(crate) fn run_dfs_repair_executor_turn<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
+    data_root: &std::path::Path,
+    metadata_shards: &[DfsMetadataShardConfig],
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    repair_max_jobs: usize,
+) -> Result<DfsMaintenanceTickReport, DfsError> {
+    let repair_limit =
+        repair_max_jobs.min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
+    let pass = if repair_limit == 0 {
+        crate::repair_executor::DfsRepairExecutorPassReport::default()
+    } else {
+        #[cfg(test)]
+        phase_runs::record(data_root, phase_runs::EXECUTOR_TURN);
+        service.run_repair_executor_pass(
+            data_root,
+            metadata_shards,
+            execution_exclusions,
+            repair_limit,
+        )?
+    };
+    Ok(DfsMaintenanceTickReport {
+        namespace_jobs: DfsNamespaceJobMaintenanceReport::default(),
+        write_intents: DfsWriteIntentMaintenanceReport::default(),
+        placement_reconciliation: None,
+        lifecycle_reports: Vec::new(),
+        scheduled_repairs: pass.scheduled,
+        followup_events: Vec::new(),
+        repair_budget_exhausted: repair_max_jobs > 0 && pass.has_more,
+        repair_examined_count: pass.examined,
+        repair_tracked_need_count: pass.tracked,
+        metadata_replication: DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        },
+    })
+}
+
+/// Test support: how many times each node ran a bounded maintenance phase.
+#[cfg(test)]
+pub(crate) mod phase_runs {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    pub(crate) const HANDOFF: &str = "handoff";
+    pub(crate) const PLACEMENT: &str = "placement";
+    pub(crate) const JOURNAL_PUBLISH: &str = "journal_publish";
+    pub(crate) const FULL_TICK_EXECUTOR_PASS: &str = "full_tick_executor_pass";
+    pub(crate) const EXECUTOR_TURN: &str = "executor_turn";
+    pub(crate) const MAINTENANCE_LOOP_ITERATION: &str = "maintenance_loop_iteration";
+    pub(crate) const FULL_TICK_LAUNCH: &str = "full_tick_launch";
+    pub(crate) const EXECUTOR_TURN_LAUNCH: &str = "executor_turn_launch";
+
+    static RUNS: Mutex<BTreeMap<(PathBuf, &'static str), u64>> = Mutex::new(BTreeMap::new());
+    static LAUNCHES: Mutex<BTreeMap<PathBuf, Vec<&'static str>>> = Mutex::new(BTreeMap::new());
+
+    /// Records a maintenance loop launch in order.
+    pub(crate) fn record_launch(root: &Path, launch: &'static str) {
+        record(root, launch);
+        LAUNCHES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(launch);
+    }
+
+    pub(crate) fn launches(root: &Path) -> Vec<&'static str> {
+        LAUNCHES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record(root: &Path, phase: &'static str) {
+        *RUNS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry((root.to_path_buf(), phase))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn count(root: &Path, phase: &'static str) -> u64 {
+        RUNS.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(root.to_path_buf(), phase))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -3598,204 +3084,6 @@ mod causal_time_tests {
         dfs_content_root_catalog_topology_digest_with_file_systems,
     };
     use sinomo_core::DfsObjectPolicy;
-
-    fn repair_attempt_for_connectivity_test(
-        target: NodeId,
-        attempts: u32,
-    ) -> DfsRepairAttemptRecord {
-        DfsRepairAttemptRecord {
-            transfer_delivery_state: None,
-            completed_transfer_request_id: None,
-            transfer_kind: None,
-            intent_id: "intent-reactive-connectivity".to_string(),
-            object_id: DfsObjectId::from_legacy_named("object-reactive-connectivity")
-                .expect("object id"),
-            version: DfsVersion::from_legacy_named("version-reactive-connectivity")
-                .expect("version"),
-            content_hash: "blake3:reactive-connectivity".to_string(),
-            missing_replica_node_id: target,
-            attempts,
-            in_flight: false,
-            last_attempt_unix_nanos: 0,
-            next_retry_unix_nanos: dfs_now_unix_nanos(),
-            transfer_request_id: None,
-            last_error: None,
-        }
-    }
-
-    #[test]
-    fn connectivity_projection_cannot_defer_the_first_bounded_repair_attempt() {
-        let target = NodeId::from_legacy_named("node-reactive-connectivity").expect("target node");
-        let exclusions = DfsMaintenanceExecutionExclusions::new([target.clone()]);
-        let unattempted = repair_attempt_for_connectivity_test(target.clone(), 0);
-        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&unattempted));
-
-        assert!(
-            !effective.contains(&target),
-            "cached reachability alone must not park newly committed repair work"
-        );
-
-        let attempted = repair_attempt_for_connectivity_test(target.clone(), 1);
-        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&attempted));
-        assert!(
-            effective.contains(&target),
-            "a target with an actual failed attempt may remain connectivity-parked"
-        );
-
-        let mut records = vec![attempted];
-        mark_connectivity_blocked_dfs_repair_attempt_records(&mut records, &exclusions);
-        assert_eq!(records[0].next_retry_unix_nanos, u64::MAX);
-        assert!(!records[0].in_flight);
-        assert_eq!(records[0].transfer_request_id, None);
-        assert_eq!(
-            records[0].last_error.as_deref(),
-            Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY),
-            "a deferred record must carry its concrete blocker"
-        );
-    }
-
-    #[test]
-    fn sync_repair_budget_excludes_durably_parked_records() {
-        let (runtime, mut writer, shard) = crate::test_support::current_native_metadata_service(
-            "native-sync-repair-budget",
-            3,
-            "/",
-        )
-        .unwrap();
-        let owner = shard.primary_node_id.clone();
-        let nodes = std::iter::once(owner.clone())
-            .chain(shard.replica_node_ids.iter().cloned())
-            .collect::<Vec<_>>();
-        for target in &shard.replica_node_ids {
-            for route in [
-                crate::DFS_DATA_STAGE_BLOB_ROUTE,
-                crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
-            ] {
-                runtime.install_fault(crate::test_runtime::FaultRule {
-                    source: None,
-                    target: Some(target.clone()),
-                    route: Some(route.into()),
-                    call_id: None,
-                    origin: None,
-                    remaining_hits: 32,
-                    action: crate::test_runtime::FaultAction::BudgetExhausted,
-                });
-            }
-        }
-        let stat = writer
-            .posix_write_file(
-                "/native-sync-budget",
-                b"actual budget accounting inputs",
-                crate::DfsWriteOptions {
-                    policy: crate::DfsReplicationPolicy::new(1, 3).unwrap(),
-                    replica_candidates: nodes,
-                    wait_for_commit: true,
-                    foreground_replica_repair: true,
-                },
-            )
-            .unwrap();
-        drop(writer);
-        let queue = crate::LocalDfsRepairQueueStore::new(
-            crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
-        );
-        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-        let originals = loop {
-            let records = queue
-                .view()
-                .unwrap()
-                .records
-                .into_iter()
-                .filter(|record| {
-                    record.object_id == stat.object_id && record.version == stat.version
-                })
-                .collect::<Vec<_>>();
-            if records.len() == 2
-                && records.iter().all(|record| {
-                    record.attempts > 0
-                        && !record.in_flight
-                        && !crate::service_repair::repair_record_has_unidentified_producer(record)
-                        && record.transfer_delivery_state
-                            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-                        && record.next_retry_unix_nanos != u64::MAX
-                })
-            {
-                break records;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "actual failed transfers must checkpoint their producer facts: {records:?}"
-            );
-            runtime
-                .maintenance_tick(&owner, remaining)
-                .unwrap()
-                .outcome
-                .unwrap();
-        };
-        // These are read-only classifier inputs from actual failed native sends.
-        // Evaluate at their recorded due time without advancing a runtime clock
-        // or modifying the live durable queue. Only the second copied row parks.
-        let now = originals
-            .iter()
-            .map(|record| record.next_retry_unix_nanos)
-            .max()
-            .unwrap();
-        let runnable = originals[0].clone();
-        let mut parked = originals[1].clone();
-        let exclusions =
-            DfsMaintenanceExecutionExclusions::new([parked.missing_replica_node_id.clone()]);
-        mark_connectivity_blocked_dfs_repair_attempt_records(
-            std::slice::from_mut(&mut parked),
-            &exclusions,
-        );
-        assert_eq!(parked.next_retry_unix_nanos, u64::MAX);
-        assert_eq!(
-            parked.last_error.as_deref(),
-            Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY)
-        );
-        let queue_before = [runnable.clone(), parked];
-        let eligible_count = queue_before
-            .iter()
-            .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
-            .count();
-
-        assert_eq!(eligible_count, 1);
-        assert!(
-            !dfs_repair_maintenance_budget_exhausted(
-                2,
-                eligible_count,
-                1,
-                std::slice::from_ref(&runnable),
-                now,
-            ),
-            "parked work cannot make a partially used sync budget look exhausted"
-        );
-        assert!(
-            dfs_repair_maintenance_budget_exhausted(
-                1,
-                eligible_count,
-                1,
-                std::slice::from_ref(&runnable),
-                now,
-            ),
-            "the same queue must report exhaustion when its executable work fills the budget"
-        );
-        let mut unidentified = runnable.clone();
-        unidentified.transfer_kind = None;
-        unidentified.transfer_delivery_state = None;
-        unidentified.transfer_request_id = None;
-        unidentified.completed_transfer_request_id = None;
-        assert!(
-            !dfs_repair_maintenance_budget_exhausted(1, 1, 1, &[unidentified], now),
-            "unknown producer DATA cannot consume an executable retry budget"
-        );
-        println!(
-            "actual repair budget records: {}",
-            serde_json::to_string(&originals).unwrap()
-        );
-        runtime.clear_faults();
-        runtime.close().unwrap();
-    }
 
     #[test]
     #[allow(clippy::assertions_on_constants)]

@@ -7,11 +7,6 @@ impl LocalContentStore {
         self.initialize_bindings_for_explicit_owner(INLINE_FORMAT_VERSION)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn initialize_received_repair_fixture_bindings(&self) -> Result<()> {
-        self.initialize_bindings_for_explicit_owner(RECEIVED_REPAIR_FIXTURE_VERSION)
-    }
-
     pub(super) fn initialize_bindings_for_explicit_owner(&self, expected_format: u32) -> Result<()> {
         if self.inline_store.owner.expected_format != expected_format {
             return Err(inline_error(

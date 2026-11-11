@@ -181,13 +181,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id,
                 version: record.target_version,
                 content_hash: hash,
-                repair_jobs: self
-                    .coordinator
-                    .repair_jobs()
-                    .iter()
-                    .filter(|job| job.intent_id == record.intent_id)
-                    .cloned()
-                    .collect(),
+                repair_jobs: self.coordinator.missing_replica_jobs(&record.intent_id),
             }));
         }
         self.restore_retained_content_intent(&record)?;
@@ -299,13 +293,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if record.status == DfsWriteIntentStatus::Committed {
             self.coordinator
                 .restore_recorded_committed_intent(&intent.intent_id)?;
-            if !self.retained_file_content_is_live(
-                &intent.object_id,
-                &intent.target_version,
-                &pending.content_hash,
-            )? {
-                self.retire_committed_repair(&intent.intent_id);
-            }
+            // Whether its retained content is still live is the repair index's
+            // to derive from the version's roots.
             return Ok(());
         }
         if let Some(prepared) = prepared {
@@ -469,15 +458,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         // The grant, pin, receipts and terminal intent share one digest commit.
         self.coordinator.commit_intent(&intent.intent_id)?;
-        if !self.retained_file_content_is_live(
-            &intent.object_id,
-            &intent.target_version,
-            &pending.content_hash,
-        )? {
-            // A completed capture may be replayed after its pin was released.
-            // Complete the original write witness without restarting its N work.
-            self.retire_committed_repair(&intent.intent_id);
-        }
+        // A replayed capture whose pin was released owns no live demand: the
+        // repair index derives liveness from the version's roots.
         Ok(())
     }
 
@@ -545,10 +527,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         let intent = crate::intent::distributed_intent_from_record(record);
-        match self
-            .coordinator
-            .restore_intent_deferring_repair_rebuild(intent.clone())
-        {
+        match self.coordinator.restore_intent(intent.clone()) {
             Ok(()) => {}
             Err(DfsDistributedError::DuplicateIntent { .. })
                 if self.coordinator.intent(&intent.intent_id) == Some(&intent) => {}
@@ -566,10 +545,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .contains(&receipt.replica_node_id)
             {
                 self.coordinator
-                    .restore_durable_receipt_deferring_repair_rebuild(
-                        &intent.intent_id,
-                        receipt.replica_node_id,
-                    )?;
+                    .restore_durable_receipt(&intent.intent_id, receipt.replica_node_id)?;
             }
         }
         let active = matches!(
@@ -588,7 +564,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let rooted = active || self.committed_repair_content_is_active(&anchor, record)?;
         if !rooted && record.status == DfsWriteIntentStatus::Committed {
-            self.park_inactive_retained_repair(record)?;
             return Ok(());
         }
         if locally_owned
@@ -605,10 +580,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // target length or granting a content receipt/publication.
                 return Ok(());
             };
-            if record.status == DfsWriteIntentStatus::Committed {
-                self.coordinator
-                    .restore_committed_repair_active_deferring_rebuild(&record.intent_id);
-            }
             self.writes
                 .pending_writes
                 .entry(record.intent_id.clone())

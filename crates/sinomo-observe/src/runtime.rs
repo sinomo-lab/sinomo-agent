@@ -3237,22 +3237,20 @@ mod tests {
                 dropped_traces: Arc::new(AtomicU64::new(0)), capture: Arc::new(Mutex::new(None)),
             }).with(fmt::layer().with_ansi(false).with_writer(file)
                 .with_filter(formatted_log_filter(live.clone(), false)));
-        let attempt = sinomo_dfs::DfsRepairAttemptRecord {
-            intent_id: "original-unfinished-repair".into(),
-            object_id: sinomo_dfs::DfsObjectId::generate(), version: sinomo_dfs::DfsVersion::generate(),
-            content_hash: "retained-content".into(), missing_replica_node_id: sinomo_core::node::NodeId::generate(),
-            attempts: 1, in_flight: true, last_attempt_unix_nanos: 1, next_retry_unix_nanos: 0,
-            transfer_request_id: Some("original-transfer".into()), last_error: None,
-            transfer_delivery_state: None, completed_transfer_request_id: None, transfer_kind: None,
+        let scheduled = sinomo_dfs::DistributedRepairJob {
+            intent_id: "scheduled-repair".into(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            object_id: sinomo_dfs::DfsObjectId::generate(),
+            version: sinomo_dfs::DfsVersion::generate(),
+            missing_replica_node_id: sinomo_core::node::NodeId::generate(),
         };
         let report = sinomo_dfs::DfsMaintenanceTickReport {
             namespace_jobs: Default::default(), write_intents: Default::default(), placement_reconciliation: None,
-            lifecycle_reports: Vec::new(), scheduled_repairs: Vec::new(), followup_events: Vec::new(),
-            repair_attempts_before: vec![attempt.clone()], repair_attempts_after: vec![attempt],
-            repair_budget_exhausted: false, repair_page_checkpoint: Default::default(), metadata_replication: sinomo_dfs::DfsMetadataJournalReplicationReport { outcomes: Vec::new() },
+            lifecycle_reports: Vec::new(), scheduled_repairs: vec![scheduled], followup_events: Vec::new(),
+            repair_budget_exhausted: false, repair_examined_count: 0, repair_tracked_need_count: 1, metadata_replication: sinomo_dfs::DfsMetadataJournalReplicationReport { outcomes: Vec::new() },
         };
         let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
-        assert_eq!(observations.repair_attempt_in_flight_count, 1);
+        assert_eq!(observations.repair_attempt_count, 1);
         tracing::subscriber::with_default(subscriber, || {
             observations.emit_daemon_notice_logs();
             observations.emit_daemon_notice_logs();
@@ -3267,18 +3265,16 @@ mod tests {
             live.store(true, Ordering::Release);
             observations.emit_daemon_notice_logs();
             let explicit = std::fs::read_to_string(&path).unwrap();
-            assert!(explicit.contains("DFS repairs: scheduled=0, followups=0"));
-            assert!(explicit.contains("active=1, in_flight=1"));
+            assert!(explicit.contains("DFS repairs: scheduled=1, followups=0"));
             live.store(false, Ordering::Release);
             observations.emit_daemon_notice_logs();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), explicit);
         });
         let (records, _, _) = logs.lock().unwrap().snapshot(&crate::ObserveLogsRequest::default());
-        let routine = records.iter().filter(|r| r.message.contains("DFS repairs:") || r.message.contains("DFS repair attempts:")).collect::<Vec<_>>();
-        assert_eq!(routine.len(), 10, "all routine summaries remain observable in RAM");
+        let routine = records.iter().filter(|r| r.message.contains("DFS repairs:")).collect::<Vec<_>>();
+        assert_eq!(routine.len(), 5, "all routine summaries remain observable in RAM");
         assert!(routine.iter().all(|r| r.severity == crate::OperationalSeverity::Info));
         assert!(records.iter().any(|r| r.message.contains("controlled failure")));
-        assert_eq!(report.repair_attempts_before, report.repair_attempts_after, "observation cannot complete or mutate retained repair work");
     }
 
     #[test]

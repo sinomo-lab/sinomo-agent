@@ -307,18 +307,6 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
                 observation.dfs_object_id = Some(response.object_id.clone());
                 observation.dfs_version = Some(response.version.clone());
             }
-            crate::DfsNetworkMessage::OriginalRepairHistoryRequest(request)
-                if observation.route == crate::DFS_DATA_READ_ROUTE =>
-            {
-                // This is the immutable original effect's identity. The actual
-                // decoded outer frame and call_id separately bind this query.
-                let original = &request.original_material.original.command;
-                observation.dfs_request_id = Some(original.request_id.clone());
-                observation.dfs_intent_id = Some(original.intent_id.clone());
-                observation.dfs_file_system_id = Some(original.file_system_id.clone());
-                observation.dfs_object_id = Some(original.object_id.clone());
-                observation.dfs_version = Some(original.version.clone());
-            }
             _ => return,
         }
         observation.phase = RpcPhase::Decoded;
@@ -440,56 +428,6 @@ pub(crate) async fn pause_decoded_write_commit_publication(
     Ok(())
 }
 
-/// Negative-only pause for the selected DATA page of one actual handoff. This
-/// receives the already decoded, source-authenticated command; it never reads
-/// the request stream or supplies a response, prefix proof or custody ACK.
-pub(crate) async fn pause_decoded_selected_original_custody(
-    command: &crate::DfsMetadataJournalBatchCommand,
-) -> Result<(), ServiceError> {
-    let selected = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
-        let Some(fabric) = context.fabric.upgrade() else { return Ok(None); };
-        let observation = &context.observation;
-        if observation.route != crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
-            || command.source_node_id.as_ref() != Some(&observation.source)
-            || !command.verify_prefix_only
-            || command.authority_probe.is_some()
-            || command.durable_replication.is_some()
-            || !command.batch.journal_frames.is_empty()
-        { return Ok(None); }
-        let Some(probe) = command.prefix_probe.as_ref() else { return Ok(None); };
-        let Some(page) = probe.repair_custody.as_ref() else { return Ok(None); };
-        if page.cut.version != 2 || page.cut.selected_original_data.is_none() {
-            return Ok(None);
-        }
-        let mut rules = fabric.faults.lock().unwrap();
-        let Some(rule) = rules.iter_mut().find(|rule| {
-            matches!(&rule.action, FaultAction::PauseSelectedOriginalCustody { handoff_id, .. }
-                if !handoff_id.is_empty()
-                    && probe.primary_handoff_id.as_ref() == Some(handoff_id)
-                    && &page.cut.handoff.handoff_id == handoff_id)
-                && rule.source.as_ref().is_none_or(|id| id == &observation.source)
-                && rule.target.as_ref().is_none_or(|id| id == &observation.target)
-                && rule.route.as_ref().is_none_or(|route| route == &observation.route)
-                && rule.origin.is_none_or(|origin| origin == observation.origin)
-                && rule.call_id.is_none_or(|id| id == observation.call_id)
-        }) else { return Ok(None); };
-        if rule.remaining_hits == 0 {
-            fabric.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
-            return Err(ServiceError::Service("bounded selected custody pause exhausted".into()));
-        }
-        rule.remaining_hits -= 1;
-        let FaultAction::PauseSelectedOriginalCustody { gate, captured, .. } = &rule.action else { unreachable!() };
-        captured.lock().unwrap().push(command.clone());
-        Ok(Some(Arc::clone(gate)))
-    }).unwrap_or(Ok(None))?;
-    if let Some(gate) = selected {
-        let permit = gate.acquire().await
-            .map_err(|_| ServiceError::Service("selected custody pause closed".into()))?;
-        permit.forget();
-    }
-    Ok(())
-}
-
 /// Bounded negative changes to replies already produced by native read RPC.
 #[derive(Clone, Copy)]
 pub enum ReadReplyFault {
@@ -592,13 +530,6 @@ pub enum FaultAction {
     /// exactly this V7 operation. Unrelated writes/prepares spend no hits.
     PauseExactWriteCommitPublication {
         operation_id: String,
-        gate: Arc<Semaphore>,
-        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
-    },
-    /// Pause only an already decoded selected-v2 custody prefix page for this
-    /// handoff. Ordinary journal/topology traffic consumes no fault hits.
-    PauseSelectedOriginalCustody {
-        handoff_id: String,
         gate: Arc<Semaphore>,
         captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
     },
@@ -717,7 +648,6 @@ impl Fabric {
                 if let FaultAction::PauseBeforeDispatch(gate)
                 | FaultAction::PauseWriteCommitPublication { gate, .. }
                 | FaultAction::PauseExactWriteCommitPublication { gate, .. }
-                | FaultAction::PauseSelectedOriginalCustody { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
                 | FaultAction::PauseStatProjectionReplyAfterDispatch { gate, .. }
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
@@ -785,8 +715,7 @@ impl Fabric {
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
                     FaultAction::PauseWriteCommitPublication { .. }
-                    | FaultAction::PauseExactWriteCommitPublication { .. }
-                    | FaultAction::PauseSelectedOriginalCustody { .. } => false,
+                    | FaultAction::PauseExactWriteCommitPublication { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
                             observation.dfs_intent_id.as_ref() == Some(expected)
@@ -901,10 +830,6 @@ impl Carrier {
                             repair.version,
                             repair.request_id,
                         )),
-                        crate::DfsNetworkMessage::SelectedOriginalRepair(selected) => {
-                            let repair = selected.material.original.command;
-                            Some((command.routed_message.frame_id, repair.intent_id, repair.file_system_id, repair.object_id, repair.version, repair.request_id))
-                        }
                         crate::DfsNetworkMessage::RepairRetainedBlob(repair) => Some((
                             command.routed_message.frame_id,
                             repair.intent_id,
@@ -2085,15 +2010,14 @@ impl NativeNamespaceReadCapture {
 }
 
 /// Bounded observations of one ordinary served maintenance invocation. These
-/// are returned native outcomes/events and resident queue facts, never ACKs or
-/// a prediction of repair completion.
+/// are returned native outcomes/events and the node's repair executor facts,
+/// never ACKs or a prediction of repair completion.
 #[derive(Debug)]
 pub struct DfsTestMaintenanceObservation {
     pub outcome: Result<DfsMaintenanceTickOutcome, String>,
-    /// Observational unavailability never cancels the normal maintenance owner.
-    /// Err supplies no queue counts, deltas or repair progress.
-    pub queue_before: Result<DfsRepairQueueBoundedStatus, crate::DfsError>,
-    pub queue_after: Result<DfsRepairQueueBoundedStatus, crate::DfsError>,
+    /// Needs the node's repair executor tracked before and after the tick.
+    pub repair_tracked_before: usize,
+    pub repair_tracked_after: usize,
     pub committed_kv_events: Vec<sinomo_core::kv::KvEvent>,
     pub omitted_kv_event_count: usize,
 }
@@ -2102,8 +2026,6 @@ pub struct DfsTestMaintenanceObservation {
 pub(crate) struct CapturedServedMessageWork {
     pub command: crate::DfsMessageCommand,
     pub committed_work: crate::DfsMessageCommittedWork,
-    pub repair_record_count: usize,
-    pub new_repair_records_unattempted: bool,
     pub succeeded: bool,
 }
 #[cfg(test)]
@@ -2167,21 +2089,6 @@ mod placement_authority_observation {
                 .lock()
                 .expect("placement authority observations")
                 .clone()
-        }
-        pub(crate) fn group_acquisition_is_open(&self, job_id: &str) -> bool {
-            self.records().iter().any(|call| {
-                call.job_id == job_id
-                    && call.path.is_none()
-                    && !call.finished
-                    && call.holder_id.is_none()
-            })
-        }
-        pub(crate) fn group_holder_ids(&self, job_id: &str) -> Vec<String> {
-            self.records()
-                .into_iter()
-                .filter(|call| call.job_id == job_id && call.path.is_none())
-                .filter_map(|call| call.holder_id)
-                .collect()
         }
     }
 
@@ -2328,7 +2235,6 @@ mod placement_authority_observation {
 }
 #[cfg(test)]
 pub(crate) use placement_authority_observation::{
-    NativePlacementAuthorityCapture, NativePlacementAuthorityReader,
     PlacementAuthorityCallObservation, observe_placement_authority_call,
 };
 
@@ -2421,7 +2327,8 @@ pub(crate) fn observe_checkpointed_background_repairs(
     for (message, descriptor) in prepared {
         assert_eq!(message.source_node_id, observed.node);
         assert!(matches!(&message.message,
-            crate::DfsNetworkMessage::RepairReplica(command) if command.background_repair));
+            crate::DfsNetworkMessage::RepairReplica(command) if command.background_repair)
+            || matches!(&message.message, crate::DfsNetworkMessage::RepairRetainedBlob(_)));
         if let Some(previous) = records.iter().find(|record| {
             record.message.source_node_id == message.source_node_id
                 && record.message.target_node_id == message.target_node_id
@@ -2563,7 +2470,7 @@ fn retained_native_original_data(
     let id = DfsMetadataShardId::new(&shard.shard_id);
     let root = crate::local_dfs_metadata_shard_path(data, &id);
     retained_native_path_identity(&root, true)?;
-    crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+    crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(&root)
         .map_err(|e| e.to_string())?;
     if crate::metadata_api::read_handoff_freeze_with_layout(
         &root.join("journal/membership-handoff-write-freeze.sobj"),
@@ -2818,6 +2725,7 @@ pub struct DfsTestRuntime {
     component_factories: Vec<Arc<dyn sinomo_module::ComponentFactory>>,
 }
 impl DfsTestRuntime {
+
     /// Read-only observation of actual Main background preparation. This does
     /// not publish network health or change the producer/dispatch policy.
     #[cfg(test)]
@@ -3664,29 +3572,10 @@ impl DfsTestRuntime {
         Ok(())
     }
 
-    pub(crate) fn select_original_repair_fixture_before_start(&mut self, node: &NodeId) -> Result<(), String> {
-        let native = self.nodes.get_mut(node).ok_or("unknown original Repair fixture node")?;
-        if native.reconciler.is_some() || native.mounted_context.is_some() || native.selected_original_fixture.is_some() {
-            return Err("original Repair representation must be supplied once before native mounting".into());
-        }
-        native.selected_original_fixture = Some(crate::runtime_host::DfsSelectedOriginalDataFixture::with_original_repair());
-        Ok(())
-    }
-
-    pub(crate) fn select_original_repair_wire_target(&self, source: &NodeId, target: NodeId) -> Result<(), String> {
-        self.nodes[source].selected_original_fixture.as_ref().ok_or("original Repair fixture was not admitted before start")?
-            .select_original_repair_target(target).map_err(|error| error.to_string())
-    }
-
     pub(crate) fn selected_original_data_layout(&self, node: &NodeId) -> Result<Arc<crate::DfsSelectedOriginalDataLayout>, String> {
         self.nodes[node].selected_original_fixture.as_ref()
             .ok_or("native fixture did not select original DATA representation")?
             .layout().map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn select_genuine_original_before_handoff(&self, node: &NodeId, request_id: &str, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<(), String> {
-        self.selected_original_data_layout(node)?.select_original(node, request_id, handoff)
-            .map_err(|error| error.to_string())
     }
 
     fn mount_node(&mut self, node: &NodeId) -> Result<(), String> {
@@ -4048,8 +3937,6 @@ impl DfsTestRuntime {
                 >| {
                     let crate::runtime_host::DaemonDfsPreDispatchTestPoint::AfterReport {
                         committed_work,
-                        repair_record_count,
-                        new_repair_records_unattempted,
                         succeeded,
                     } = point
                     else {
@@ -4065,8 +3952,6 @@ impl DfsTestRuntime {
                         captured.push(CapturedServedMessageWork {
                             command: command.clone(),
                             committed_work,
-                            repair_record_count,
-                            new_repair_records_unattempted,
                             succeeded,
                         });
                     }
@@ -4981,23 +4866,33 @@ impl DfsTestRuntime {
                 }
                 Err(error) => (Err(error), opener_deadline),
             };
-            let installed = if let Err(error) = reconciliation {
-                // The same normal Main owner can complete this original request
-                // while its explicit caller queues. No new effect is authorized.
-                let completed =
-                    self.observe_completed_native_handoff(&control, &handoff, phase_deadline);
-                match completed {
-                    Ok(Some(active)) => active,
-                    Ok(None) | Err(_) => return Err(error.to_string()),
+            // The caller's attempt is advisory. A caller service holds no
+            // metadata backend and cannot fence the retiring shard: it fails
+            // on a pending handoff it sees, and completes nothing when it sees
+            // none. The normal Main owner completes this original request.
+            // Whatever the caller returned, wait for that completion through
+            // authoritative reads within the phase budget: Main can finish
+            // before or after the caller returns, and neither result says
+            // the desired assignment is active. No new effect is authorized.
+            let observe_deadline = phase_deadline.max(std::time::Instant::now() + CLOSE_TIMEOUT);
+            let observed = loop {
+                match self.observe_completed_native_handoff(&control, &handoff, observe_deadline) {
+                    Ok(Some(active)) => break Some(active),
+                    Ok(None) | Err(_) if std::time::Instant::now() < observe_deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(None) | Err(_) => break None,
                 }
-            } else {
-                control
-                    .with_client(|kv| {
-                        DfsControlPlaneStore::new(kv.as_mut())
-                            .get_metadata_shard(file_system_id, shard_id)
-                    })
-                    .map_err(|error| error.to_string())?
-                    .ok_or("native assignment disappeared during activation")?
+            };
+            let installed = match (observed, reconciliation) {
+                (Some(active), _) => active,
+                (None, Err(error)) => return Err(error),
+                (None, Ok(count)) => {
+                    return Err(format!(
+                        "native handoff {} did not complete within its phase budget; the caller completed {count}",
+                        handoff.handoff_id
+                    ));
+                }
             };
             if installed != handoff.desired_shard {
                 return Err(format!(
@@ -5308,14 +5203,18 @@ impl DfsTestRuntime {
                 .clone()
         }
     }
-    /// Deny only the existing background claim boundary for this mounted owner.
-    /// The same shared fault serves native backlog and current restart checks.
+    /// Hold every background replica transfer of this mounted owner: its
+    /// repair executor dispatches nothing, and a write's background stage
+    /// sends are denied at their claim boundary. Dropping the hold wakes the
+    /// executor, which serves everything that changed meanwhile.
     pub fn deny_background_replica_before_claim(
         &self,
         node: &NodeId,
     ) -> Result<impl Send + use<>, String> {
         let context = self.component_context(node)?;
-        Ok(
+        let executor = crate::repair_executor::hold_repair_executor_for_test(&context.data_dir().root());
+        Ok((
+            executor,
             crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
                 context.data_dir(),
                 Arc::new(|point, command, context| {
@@ -5327,96 +5226,40 @@ impl DfsTestRuntime {
                     Ok(())
                 }),
             ),
-        )
+        ))
     }
-    /// Negative control on the existing claim boundary, after a genuine
-    /// correlated failed carrier attempt. No queue fact or retry clock changes.
-    pub fn deny_repair_claims_after_failed_rpc(
+    /// The node repair executor's single timer: its earliest backoff end or
+    /// in-flight re-check, if any.
+    pub fn repair_executor_next_due_unix_nanos(&self, node: &NodeId) -> Result<Option<u64>, String> {
+        let context = self.component_context(node)?;
+        Ok(crate::repair_executor::repair_executor_work(&context.data_dir().root())
+            .next_due_unix_nanos)
+    }
+    /// The node repair executor's progress mark: index changes of its
+    /// primary shards and ended attempts advance it.
+    pub fn repair_executor_progress(&self, node: &NodeId) -> Option<u64> {
+        crate::repair_executor::repair_executor_progress(node)
+    }
+    /// Block on the node repair executor's progress edge until it passes
+    /// `seen` or `deadline`; returns whether it advanced.
+    pub fn wait_for_repair_executor_progress(
         &self,
         node: &NodeId,
-        expected: &crate::DfsWriteIntentRecord,
-    ) -> Result<impl Send + use<>, String> {
-        if expected.status != crate::DfsWriteIntentStatus::Committed
-            || !matches!(
-                expected.publication,
-                crate::DfsWritePublication::Retained { .. }
-                    | crate::DfsWritePublication::RetainedRepair
-            )
-        {
-            return Err("negative repair boundary requires an actual full retained owner".into());
-        }
+        seen: u64,
+        deadline: std::time::Instant,
+    ) -> bool {
+        crate::repair_executor::repair_executor_wait_for_progress(node, seen, deadline)
+    }
+    /// Hold this node's repair executor only; see
+    /// [`crate::DfsRepairExecutorTestHold`].
+    pub fn hold_repair_executor(
+        &self,
+        node: &NodeId,
+    ) -> Result<crate::DfsRepairExecutorTestHold, String> {
         let context = self.component_context(node)?;
-        let observed = self.rpc_observation_reader();
-        let node = node.clone();
-        let expected = expected.clone();
-        let intent_digest = *blake3::hash(expected.intent_id.as_bytes()).as_bytes();
-        let hook =
-            Arc::new(
-                move |point: crate::runtime_host::DaemonDfsPreDispatchTestPoint<'_>,
-                      command: Option<&crate::DfsMessageCommand>,
-                      _context: Option<
-                    &crate::runtime_host::DaemonDfsMetadataAuthorityPreflight,
-                >| {
-                    let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim {
-                kind: sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair,
-                intent_id_digest, target_id_digest, prior_transfer, ..
-            } = point else { return Ok(()); };
-                    if intent_id_digest != intent_digest {
-                        return Ok(());
-                    }
-                    assert!(command.is_none());
-                    let Some(target) = expected.desired_replica_node_ids.iter().find(|target| {
-                        *blake3::hash(target.as_str().as_bytes()).as_bytes() == target_id_digest
-                    }) else {
-                        return Ok(());
-                    };
-                    // The SAME producer copied this exact prior row before mutation.
-                    // A first failure may precede its page checkpoint; no queue replay,
-                    // counter, absence, or receiver success supplies custody here.
-                    let Some(row) = prior_transfer else {
-                        return Ok(());
-                    };
-                    if row.intent_id != expected.intent_id
-                        || row.missing_replica_node_id != *target
-                        || row.object_id != expected.object_id
-                        || row.version != expected.target_version
-                        || Some(row.content_hash.as_str()) != expected.content_hash.as_deref()
-                        || row.in_flight
-                        || row.transfer_request_id.is_some()
-                        || row.transfer_kind
-                            != Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-                        || row.transfer_delivery_state
-                            != Some(NetworkDeliveryState::DefinitelyNotSent)
-                        || row.completed_transfer_request_id.is_some()
-                    {
-                        return Ok(());
-                    }
-                    // This exact immutable owner may already have failed before
-                    // the negative guard was installed. Its original carrier
-                    // observation remains the witness; installation is no clock.
-                    if observed().iter().any(|event| {
-                        event.source == node
-                            && event.target == *target
-                            && event.origin == RpcOrigin::RegisteredHost
-                            && event.phase == RpcPhase::EndedWithoutResponse
-                            && event.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE
-                            && event.dfs_intent_id.as_deref() == Some(expected.intent_id.as_str())
-                            && event.dfs_file_system_id.as_ref() == Some(&expected.file_system_id)
-                            && event.dfs_object_id.as_ref() == Some(&expected.object_id)
-                            && event.dfs_version.as_ref() == Some(&expected.target_version)
-                    }) {
-                        return Err(crate::DfsError::Cancelled {
-                            operation: "negative repeat claim after exact failed native repair",
-                        });
-                    }
-                    Ok(())
-                },
-            );
-        let guard = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
-            context.data_dir(),
-            hook,
-        );
-        Ok(guard)
+        Ok(crate::repair_executor::hold_repair_executor_for_test(
+            &context.data_dir().root(),
+        ))
     }
 
     /// Ask this live normal Main owner to reconstruct its existing durable
@@ -5454,11 +5297,8 @@ impl DfsTestRuntime {
         let paths = crate::runtime_host::DfsRuntimePaths::new(&data_dir);
         let _owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(&paths)
             .map_err(|error| error.to_string())?;
-        let queue = crate::LocalDfsRepairQueueStore::new(
-            crate::default_dfs_repair_attempt_snapshot_path(&data_dir),
-        );
-        let queue_before =
-            queue.bounded_status_view(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
+        let repair_tracked_before =
+            crate::repair_executor::repair_executor_work(&data_dir.root()).tracked_need_count;
         let records = Arc::new(Mutex::new((Vec::new(), 0usize)));
         let omitted = Arc::new(AtomicUsize::new(0));
         let captured = Arc::clone(&records);
@@ -5510,14 +5350,14 @@ impl DfsTestRuntime {
                 }
             }
         });
-        let queue_after =
-            queue.bounded_status_view(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
+        let repair_tracked_after =
+            crate::repair_executor::repair_executor_work(&data_dir.root()).tracked_need_count;
         let committed_kv_events =
             std::mem::take(&mut records.lock().unwrap_or_else(|error| error.into_inner()).0);
         Ok(DfsTestMaintenanceObservation {
             outcome,
-            queue_before,
-            queue_after,
+            repair_tracked_before,
+            repair_tracked_after,
             committed_kv_events,
             omitted_kv_event_count: omitted.load(Ordering::Relaxed),
         })
@@ -5661,6 +5501,8 @@ impl DfsTestRuntime {
     ) -> Result<(), String> {
         self.reopen_node_with_action(node, Some(action))
     }
+
+
     fn reopen_node_with_action(
         &mut self,
         node: NodeId,
@@ -6655,7 +6497,7 @@ mod normal_native_kv_admission_tests {
 }
 
 #[cfg(test)]
-mod selected_custody_pause_tests {
+mod write_fault_filter_tests {
     use super::*;
     use std::task::{Context, Poll, Waker};
 
@@ -6668,168 +6510,84 @@ mod selected_custody_pause_tests {
     }
 
     fn filter_fixture() -> FilterFixture {
-        // Typed subtype-filter inputs only. No endpoint or receiver is mounted,
-        // and the page deliberately supplies no executable original/certificate.
-        // These tests cannot prove authentication, custody or native handoff.
-        let source = NodeId::from_legacy_named("selected-pause-source").unwrap();
-        let target = NodeId::from_legacy_named("selected-pause-target").unwrap();
-        let shard = DfsMetadataShardConfig {
-            file_system_id: crate::sifs_file_system_id(), shard_id: "services".into(),
-            primary_node_id: source.clone(), replica_node_ids: vec![target.clone()], epoch: 1,
-            assignment: DfsMetadataShardAssignment::Root,
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let handoff_id = "selected-pause-exact-handoff".to_owned();
-        let handoff = DfsMetadataShardMembershipHandoff {
-            cause: DfsMetadataShardHandoffCause::Membership, handoff_id: handoff_id.clone(),
-            retiring_shard: shard.clone(), desired_shard: DfsMetadataShardConfig {
-                primary_node_id: target.clone(), replica_node_ids: vec![source.clone()], epoch: 2,
-                ..shard.clone()
-            },
-            required_prepared_sequence: 1, required_head_watermark: None,
-            retiring_primary_fence: Some(DfsMetadataShardMembershipHandoffFence {
-                handoff_id: handoff_id.clone(), primary_node_id: source.clone(),
-                journal_sequence: 1, state_fingerprint: "filter-only".into(),
-            }),
-        };
+        // Typed filter inputs only. No endpoint or receiver is mounted, and
+        // the batch carries no executable frame until a test adds one.
+        let source = NodeId::from_legacy_named("write-filter-source").unwrap();
+        let target = NodeId::from_legacy_named("write-filter-target").unwrap();
         let command = DfsMetadataJournalBatchCommand {
-            request_id: "selected-pause-probe".into(), source_node_id: Some(source.clone()),
-            file_system_id: Some(shard.file_system_id.clone()), authority_epoch: Some(1),
-            verify_prefix_only: true, authority_probe: None, durable_replication: None,
-            prefix_probe: Some(DfsMetadataPrefixProbe {
-                barrier_id: "selected-pause-barrier".into(),
-                file_system_id: Some(shard.file_system_id.clone()), authority_epoch: Some(1),
-                shard_id: DfsMetadataShardId::new(&shard.shard_id), journal_sequence: 1,
-                state_fingerprint: "filter-only".into(), primary_handoff_id: Some(handoff_id.clone()),
-                repair_custody: Some(DfsRepairHandoffPage {
-                    cut: DfsRepairHandoffCut {
-                        version: 2, handoff, queue_sequence: 1, page_count: 1, record_count: 0,
-                        digest: "0".repeat(64),
-                        selected_original_data: Some(crate::repair_handoff::SelectedRepairOriginalDataCut {
-                            source_queue_incarnation: "filter-only-incarnation".into(), producer: source.clone(),
-                            request_id: "filter-only-original".into(), original_digest: "0".repeat(64),
-                            captured_birth_digest: "0".repeat(64),
-                        }),
-                    },
-                    ordinal: 0, previous_digest: String::new(), records: Vec::new(), selected_original_data: None,
-                }),
+            request_id: "write-filter-publication".into(),
+            source_node_id: Some(source.clone()),
+            file_system_id: Some(crate::sifs_file_system_id()),
+            authority_epoch: Some(1),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: None,
+            durable_replication: Some(DfsMetadataDurableReplication {
+                confirmation_id: "filter-confirmation".into(),
+                background_publication: true,
             }),
             batch: DfsMetadataJournalFrameBatch {
-                shard_id: DfsMetadataShardId::new(&shard.shard_id), journal_frames: Vec::new(), next_after_sequence: 1,
+                shard_id: DfsMetadataShardId::new("services"),
+                journal_frames: Vec::new(),
+                next_after_sequence: 1,
             },
         };
         let gate = Arc::new(Semaphore::new(0));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let fabric = Arc::new(Fabric {
-            dropped_observations: AtomicUsize::new(0), exhausted_budgets: AtomicUsize::new(0),
-            next_call: AtomicU64::new(1), nodes: Mutex::new(BTreeMap::new()),
+            dropped_observations: AtomicUsize::new(0),
+            exhausted_budgets: AtomicUsize::new(0),
+            next_call: AtomicU64::new(1),
+            nodes: Mutex::new(BTreeMap::new()),
             faults: Mutex::new(vec![FaultRule {
-                source: Some(source.clone()), target: Some(target.clone()),
-                route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
-                origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
-                action: FaultAction::PauseSelectedOriginalCustody {
-                    handoff_id, gate: Arc::clone(&gate), captured: Arc::clone(&captured),
+                source: Some(source.clone()),
+                target: Some(target.clone()),
+                route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+                call_id: None,
+                origin: Some(RpcOrigin::RegisteredHost),
+                remaining_hits: 1,
+                action: FaultAction::PauseExactWriteCommitPublication {
+                    operation_id: "write:filter-placeholder".into(),
+                    gate: Arc::clone(&gate),
+                    captured: Arc::clone(&captured),
                 },
             }]),
-            observations: Mutex::new(Vec::new()), observation_checkpoints: Mutex::new(Vec::new()),
+            observations: Mutex::new(Vec::new()),
+            observation_checkpoints: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
         });
-        let carrier = Carrier { host_identity: None, source, fabric: Arc::clone(&fabric), origin: RpcOrigin::RegisteredHost };
-        let call = ObjectRpcCall::value(ObjectRpcRequest::encode_body(
-            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE, crate::DFS_RPC_CATEGORY, &command).unwrap());
-        let observation = carrier.observation(&target, &call, ClusterObjectRpcOptions::default(), true);
-        assert!(fabric.fault(&observation, &call.request).is_none(),
-            "the generic predecode fault path cannot consume this subtype rule");
-        let context = NativeRpcCallContext { fabric: Arc::downgrade(&fabric), observation, write_reply_capture: None };
-        FilterFixture { fabric, context, command, gate, captured }
-    }
-
-    #[test]
-    fn selected_custody_pause_filters_decoded_subtype_and_exact_handoff_without_spending_other_hits() {
-        let fixture = filter_fixture();
-        let mut context = Context::from_waker(Waker::noop());
-        let mut negatives = Vec::new();
-        let mut ordinary = fixture.command.clone();
-        ordinary.verify_prefix_only = false; ordinary.prefix_probe = None;
-        negatives.push(ordinary);
-        let mut ordinary_probe = fixture.command.clone();
-        ordinary_probe.prefix_probe.as_mut().unwrap().repair_custody = None;
-        negatives.push(ordinary_probe);
-        let mut v1 = fixture.command.clone();
-        let cut = &mut v1.prefix_probe.as_mut().unwrap().repair_custody.as_mut().unwrap().cut;
-        cut.version = 1; cut.selected_original_data = None;
-        negatives.push(v1);
-        let mut other = fixture.command.clone();
-        let probe = other.prefix_probe.as_mut().unwrap();
-        probe.primary_handoff_id = Some("another-handoff".into());
-        probe.repair_custody.as_mut().unwrap().cut.handoff.handoff_id = "another-handoff".into();
-        negatives.push(other);
-        let mut mismatched = fixture.command.clone();
-        mismatched.prefix_probe.as_mut().unwrap().primary_handoff_id = Some("another-handoff".into());
-        negatives.push(mismatched);
-        let mut no_selected_material = fixture.command.clone();
-        no_selected_material.prefix_probe.as_mut().unwrap().repair_custody.as_mut().unwrap().cut.selected_original_data = None;
-        negatives.push(no_selected_material);
-        for command in &negatives {
-            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
-                pause_decoded_selected_original_custody(command)));
-            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        let carrier = Carrier {
+            host_identity: None,
+            source,
+            fabric: Arc::clone(&fabric),
+            origin: RpcOrigin::RegisteredHost,
+        };
+        let call = ObjectRpcCall::value(
+            ObjectRpcRequest::encode_body(
+                crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                crate::DFS_RPC_CATEGORY,
+                &command,
+            )
+            .unwrap(),
+        );
+        let observation =
+            carrier.observation(&target, &call, ClusterObjectRpcOptions::default(), true);
+        assert!(
+            fabric.fault(&observation, &call.request).is_none(),
+            "the generic predecode fault path cannot consume this decoded-commit rule"
+        );
+        let context = NativeRpcCallContext {
+            fabric: Arc::downgrade(&fabric),
+            observation,
+            write_reply_capture: None,
+        };
+        FilterFixture {
+            fabric,
+            context,
+            command,
+            gate,
+            captured,
         }
-        for observation in [
-            RpcObservation { origin: RpcOrigin::ExplicitFixtureRpc, ..fixture.context.observation.clone() },
-            RpcObservation { target: fixture.context.observation.source.clone(), ..fixture.context.observation.clone() },
-            RpcObservation { route: crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE.into(), ..fixture.context.observation.clone() },
-        ] {
-            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
-                NativeRpcCallContext { observation, ..fixture.context.clone() },
-                pause_decoded_selected_original_custody(&fixture.command)));
-            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
-        }
-        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 1);
-        assert!(fixture.captured.lock().unwrap().is_empty());
-        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
-        let mut exact = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
-            pause_decoded_selected_original_custody(&fixture.command)));
-        assert!(matches!(exact.as_mut().poll(&mut context), Poll::Pending));
-        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 0);
-        assert_eq!(*fixture.captured.lock().unwrap(), vec![fixture.command.clone()]);
-        fixture.gate.add_permits(1);
-        assert!(matches!(exact.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
-        // Exhaustion belongs only to another exact selected call; unrelated
-        // commands remain unpaused even after the selected budget is spent.
-        for command in &negatives {
-            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
-                pause_decoded_selected_original_custody(command)));
-            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
-        }
-        let mut exhausted = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
-            pause_decoded_selected_original_custody(&fixture.command)));
-        assert!(matches!(exhausted.as_mut().poll(&mut context), Poll::Ready(Err(_))));
-        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
-        assert_eq!(fixture.captured.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn selected_custody_pause_node_stop_closes_only_the_owned_pending_gate() {
-        let fixture = filter_fixture();
-        let mut context = Context::from_waker(Waker::noop());
-        let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
-            pause_decoded_selected_original_custody(&fixture.command)));
-        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
-        let unrelated = NodeId::from_legacy_named("selected-pause-unrelated").unwrap();
-        fixture.fabric.close_paused_faults_for_node(&unrelated);
-        assert!(!fixture.gate.is_closed());
-        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
-        // Exercise the same close function used by stop_node_inner, without
-        // inventing an endpoint lifetime, response or native admission.
-        fixture.fabric.close_paused_faults_for_node(&fixture.context.observation.target);
-        assert!(fixture.gate.is_closed());
-        match pause.as_mut().poll(&mut context) {
-            Poll::Ready(Err(error)) => assert!(error.to_string().contains("selected custody pause closed")),
-            other => panic!("stopping the selected owner must release its waiter: {other:?}"),
-        }
-        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
-        assert_eq!(fixture.captured.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -7097,7 +6855,6 @@ mod selected_custody_pause_tests {
             "removing the exact rule releases its capture owner"
         );
     }
-
 }
 
 #[cfg(test)]

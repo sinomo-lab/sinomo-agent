@@ -708,11 +708,8 @@ fn finish_fuse_mount_open_unknown<C: FuseMountedMutationCoordinator>(
     arm_request_id: &dfs::MountedSifsMutationArmRequestId,
     error_code: &'static str,
 ) -> std::result::Result<(), ()> {
-    // The service may not have been returned, so its repair inventory is not
-    // available. Full daemon recovery is the evidence-preserving fallback.
-    let captured_work =
-        dfs::MountedSifsMutationCapturedWork::new(fuse_mount_open_committed_work(), Vec::new())
-            .map_err(|_| ())?;
+    // Full daemon recovery is the evidence-preserving fallback.
+    let captured_work = dfs::MountedSifsMutationCapturedWork::new(fuse_mount_open_committed_work());
     let observation =
         dfs::MountedSifsMutationErrorObservation::new(captured_work, error_code).map_err(|_| ())?;
     coordinator
@@ -724,7 +721,6 @@ fn finish_fuse_mount_open_unknown<C: FuseMountedMutationCoordinator>(
 fn run_fuse_clustered_mount_open_with<C, R, E>(
     coordinator: &C,
     open_service: impl FnOnce() -> std::result::Result<R, E>,
-    durable_repair_records: impl FnOnce(&R) -> Vec<dfs::DfsRepairAttemptRecord>,
 ) -> std::result::Result<R, FuseMountOpenHandoffError<E>>
 where
     C: FuseMountedMutationCoordinator,
@@ -795,32 +791,7 @@ where
         }
     };
 
-    let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
-        fuse_mount_open_committed_work(),
-        durable_repair_records(&opened),
-    ) {
-        Ok(captured_work) => captured_work,
-        Err(_) => {
-            // An oversized or otherwise invalid exact inventory cannot be
-            // truncated. Retain an Unknown marker and require full recovery.
-            coordinator.gate_before_mount();
-            let accepted = finish_fuse_mount_open_unknown(
-                coordinator,
-                lease,
-                &arm_request_id,
-                "fuse-mount-open-capture-invalid",
-            );
-            let retired = coordinator.retire_gated_session();
-            return Err(FuseMountOpenHandoffError::Handoff {
-                detail: if accepted.is_ok() && retired.is_ok() {
-                    "mounted DFS mount-open repair inventory exceeded the durable handoff bound"
-                } else {
-                    "mounted DFS mount-open invalid-capture recovery handoff failed"
-                },
-                service_error: None,
-            });
-        }
-    };
+    let captured_work = dfs::MountedSifsMutationCapturedWork::new(fuse_mount_open_committed_work());
 
     if coordinator
         .persist_captured(&mut lease, &arm_request_id, &captured_work)
@@ -972,13 +943,7 @@ where
         // Never make that RPC while holding the mount-wide service lane.
         drop(service);
 
-        let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
-            report.committed_work,
-            report.committed_repair_records,
-        ) {
-            Ok(captured_work) => captured_work,
-            Err(_) => return fail_mounted_mutation(coordinator),
-        };
+        let captured_work = dfs::MountedSifsMutationCapturedWork::new(report.committed_work);
         match report.outcome {
             Ok(value) => {
                 if coordinator
@@ -1678,7 +1643,6 @@ impl SifsFuseFileSystem {
                     )
                     .map_err(|source| DfsFuseError::Dfs(source.to_string()))
                 },
-                |opened| opened.service.durable_repair_queue_records(),
             )
             .map_err(|error| match error {
                 FuseMountOpenHandoffError::Service(source) => source,
@@ -5655,30 +5619,6 @@ mod errno_tests {
         dfs::MountedSifsMutationReport {
             outcome,
             committed_work,
-            committed_repair_records: Vec::new(),
-        }
-    }
-
-    fn test_mount_open_repair_record() -> dfs::DfsRepairAttemptRecord {
-        dfs::DfsRepairAttemptRecord {
-            transfer_delivery_state: None,
-            completed_transfer_request_id: None,
-            transfer_kind: None,
-            intent_id: "fuse-mount-open-intent".to_string(),
-            object_id: test_object_id("fusemountopenobject"),
-            version: dfs::DfsVersion::from_legacy_named("fuse_mount_open_version")
-                .expect("test version"),
-            content_hash: "a".repeat(64),
-            missing_replica_node_id: dfs::DfsNodeId::from_legacy_named(
-                "node_fuse_mount_open_replica",
-            )
-            .expect("test node"),
-            attempts: 0,
-            in_flight: false,
-            last_attempt_unix_nanos: 0,
-            next_retry_unix_nanos: 0,
-            transfer_request_id: None,
-            last_error: None,
         }
     }
 
@@ -5720,10 +5660,7 @@ mod errno_tests {
             },
         )
         .expect("prepare test mount handoff");
-        let repair_record = test_mount_open_repair_record();
-        let repair_record_for_capture = repair_record.clone();
         let service_open_events = Arc::clone(&events);
-        let repair_events = Arc::clone(&events);
         let opened = run_fuse_clustered_mount_open_with(
             &coordinator,
             move || {
@@ -5732,13 +5669,6 @@ mod errno_tests {
                     .expect("event lock")
                     .push("service-open-bootstrap");
                 Ok::<_, ()>(7usize)
-            },
-            move |_| {
-                repair_events
-                    .lock()
-                    .expect("event lock")
-                    .push("collect-repair-records");
-                vec![repair_record_for_capture]
             },
         )
         .expect("mount-open handoff");
@@ -5753,7 +5683,6 @@ mod errno_tests {
                 "arm",
                 "arm-ack",
                 "service-open-bootstrap",
-                "collect-repair-records",
                 "persist-captured",
                 "commit-captured",
                 "commit-ack",
@@ -5778,7 +5707,6 @@ mod errno_tests {
         assert!(work.committed_work.namespace_maintenance);
         assert!(work.committed_work.metadata_replica_progress);
         assert!(work.committed_work.metadata_materialization);
-        assert_eq!(work.committed_repair_records, [repair_record]);
     }
 
     #[test]
@@ -5790,7 +5718,6 @@ mod errno_tests {
                 coordinator.record("service-open-bootstrap");
                 Err::<usize, _>("open-failed")
             },
-            |_| Vec::new(),
         );
 
         assert!(matches!(
@@ -5862,7 +5789,6 @@ mod errno_tests {
         let result = run_fuse_clustered_mount_open_with(
             &coordinator,
             || Err::<usize, _>("service-open-error"),
-            |_| Vec::new(),
         );
 
         assert!(matches!(
@@ -5892,40 +5818,6 @@ mod errno_tests {
                 ..
             } if observation.error_code == "fuse-mount-open-service-error"
         ));
-    }
-
-    #[test]
-    fn clustered_mount_open_oversized_repair_inventory_becomes_unknown() {
-        let coordinator = TestMountedMutationCoordinator::default();
-        let result = run_fuse_clustered_mount_open_with(
-            &coordinator,
-            || Ok::<_, ()>(()),
-            |_| {
-                vec![
-                    test_mount_open_repair_record();
-                    dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS + 1
-                ]
-            },
-        );
-
-        assert!(matches!(
-            result,
-            Err(FuseMountOpenHandoffError::Handoff { .. })
-        ));
-        let events = coordinator.events.lock().expect("event lock");
-        assert!(events.contains(&"persist-unknown"));
-        assert!(events.contains(&"commit-unknown"));
-        assert!(events.contains(&"retire-gated-session"));
-        assert!(!events.contains(&"persist-captured"));
-        drop(events);
-        assert_eq!(
-            coordinator
-                .unknown_observations
-                .lock()
-                .expect("observation lock")[0]
-                .error_code,
-            "fuse-mount-open-capture-invalid"
-        );
     }
 
     #[test]

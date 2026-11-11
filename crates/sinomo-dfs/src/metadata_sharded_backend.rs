@@ -1807,37 +1807,6 @@ impl DerefMut for ResidentLocalShardedMetadataBackendLease {
 }
 
 impl ResidentLocalShardedMetadataBackendLease {
-    pub(crate) fn try_begin_resident_read_snapshot_for_path(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        path: &str,
-    ) -> Result<bool> {
-        let router = &mut **self;
-        let shard_ids = router.consistent_read_shard_ids_for_path(file_system_id, path)?;
-        #[cfg(test)]
-        SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS
-            .with(|observed| observed.borrow_mut().extend_from_slice(&shard_ids));
-        for (index, shard_id) in shard_ids.iter().enumerate() {
-            // A global resident lease owns already-opened kernels. Do not
-            // cold-open an unrelated root or borrow another owner's backend.
-            let begin = router
-                .shards
-                .get_mut(shard_id)
-                .expect("routed resident shard remains installed")
-                .opened_backend_mut()
-                .ok_or_else(|| {
-                    MetadataBackendError::Serde(
-                        "resident read snapshot lost its checked-out kernel".into(),
-                    )
-                })
-                .and_then(LocalSobjMetadataBackend::try_begin_resident_read_snapshot);
-            if !matches!(begin, Ok(true)) {
-                router.end_consistent_read_snapshot_for_shards(&shard_ids[..index]);
-                return begin;
-            }
-        }
-        Ok(true)
-    }
 }
 
 impl Drop for ResidentLocalShardedMetadataBackendLease {
@@ -2192,7 +2161,7 @@ impl LocalShardedMetadataBackend {
         if let Some(layout) = &selected_layout {
             layout.check_routing_root(&root)?;
         } else {
-            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+            crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(&root)
                 .map_err(|error| MetadataBackendError::Rejected {
                     code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
                 })?;
@@ -4060,7 +4029,6 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &mut self,
         digest: &DfsPreparedOperationDigest,
         guard: crate::publication_guard::DfsPublicationGuard,
-        enrollment: Option<&mut dyn FnMut(&[crate::DfsRepairAttemptRecord]) -> Result<()>>,
     ) -> Result<DfsPreparedOperationCommitResult> {
         self.require_prepared_operation_shard(&digest.file_system_id, &digest.shard_id)?;
         let payload = self
@@ -4071,7 +4039,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             })?;
         let entry = self
             .shard_backend_mut(&digest.shard_id)?
-            .commit_prepared_operation(digest, guard, enrollment)?;
+            .commit_prepared_operation(digest, guard)?;
         let object_ids = payload
             .transaction
             .objects
@@ -4921,6 +4889,49 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         };
         self.shard_backend(&shard_id)?
             .receipt_slot_generation(object_id, version, replica_node_id)
+    }
+
+    fn repair_index_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&(DfsObjectId, DfsVersion, NodeId)>,
+        max_entries: usize,
+    ) -> Result<crate::DfsRepairIndexPage> {
+        if !self.shards.contains_key(shard_id) {
+            return Ok(crate::DfsRepairIndexPage::default());
+        }
+        self.shard_backend(shard_id)?
+            .repair_index_page(shard_id, after, max_entries)
+    }
+
+    fn repair_index_needs(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        keys: &[(DfsObjectId, DfsVersion, NodeId)],
+    ) -> Result<crate::DfsRepairIndexPage> {
+        if !self.shards.contains_key(shard_id) {
+            return Ok(crate::DfsRepairIndexPage::default());
+        }
+        self.shard_backend(shard_id)?.repair_index_needs(shard_id, keys)
+    }
+
+    fn repair_index_objects(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        objects: &std::collections::BTreeSet<DfsObjectId>,
+    ) -> Result<crate::DfsRepairIndexPage> {
+        if !self.shards.contains_key(shard_id) {
+            return Ok(crate::DfsRepairIndexPage::default());
+        }
+        self.shard_backend(shard_id)?
+            .repair_index_objects(shard_id, objects)
+    }
+
+    fn repair_index_owned_count(&self, shard_id: &DfsMetadataShardId) -> Result<usize> {
+        if !self.shards.contains_key(shard_id) {
+            return Ok(0);
+        }
+        self.shard_backend(shard_id)?.repair_index_owned_count(shard_id)
     }
 
     fn has_current_placement_repair_owner(&self, object: &DfsObjectMetadata) -> Result<bool> {
@@ -6315,15 +6326,6 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
         self.shard_backend_mut(shard_id)?
             .freeze_metadata_shard_for_membership_handoff(shard_id, handoff_id, retiring_epoch)
-    }
-
-    fn bind_metadata_shard_repair_handoff_cut(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        cut: &crate::DfsRepairHandoffCut,
-    ) -> Result<()> {
-        self.shard_backend_mut(shard_id)?
-            .bind_metadata_shard_repair_handoff_cut(shard_id, cut)
     }
 
     fn mark_metadata_shard_membership_handoff_activated(

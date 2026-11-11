@@ -7,7 +7,6 @@
 
 use sinomo_core::node::NodeId;
 
-use crate::transfer::wake_repair_retry_state;
 use crate::*;
 
 /// Process-local proof; only a guarded current metadata read can construct it.
@@ -309,7 +308,125 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// A fetch reply to one of the repair executor's attempts is served from
+    /// the reply and the shard tables, on whichever lane consumes it, and is
+    /// that attempt's outcome. Any other fetch reply belongs to a write.
     pub(crate) fn handle_fetch_blob_response(
+        &mut self,
+        frame_source_node_id: NodeId,
+        response: DfsFetchBlobResponse,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        if frame_source_node_id == response.source_node_id
+            && let Some(key) = crate::repair_executor::repair_executor_request_need(
+                &self.node_id,
+                &response.object_id,
+                &response.version,
+                &response.request_id,
+            )
+        {
+            let request_id = response.request_id.clone();
+            let completed = self.complete_repair_fetch(response);
+            let (outcome, error) = match &completed {
+                Ok((outcome, event)) => {
+                    (*outcome, crate::repair_executor::repair_event_error(event))
+                }
+                Err(error) => (
+                    crate::repair_executor::DfsRepairAttemptOutcome::Failed,
+                    Some(error.to_string()),
+                ),
+            };
+            crate::repair_executor::repair_executor_attempt_ended_with_error(
+                &self.node_id,
+                &key,
+                &request_id,
+                outcome,
+                error,
+            );
+            return completed.map(|(_, event)| event);
+        }
+        self.handle_fetch_blob_response_inner(frame_source_node_id, response)
+    }
+
+    /// Store the fetched content as this node's copy of the version. The
+    /// need re-plans at once: the next pass publishes this node's receipt
+    /// or sends the replica from this copy.
+    fn complete_repair_fetch(
+        &mut self,
+        response: DfsFetchBlobResponse,
+    ) -> Result<
+        (
+            crate::repair_executor::DfsRepairAttemptOutcome,
+            NetworkedDfsServiceEvent,
+        ),
+        DfsError,
+    > {
+        use crate::repair_executor::DfsRepairAttemptOutcome;
+        let rejected = |reason: String| NetworkedDfsServiceEvent::BlobFetchRejected {
+            intent_id: response.intent_id.clone(),
+            object_id: response.object_id.clone(),
+            source_node_id: response.source_node_id.clone(),
+            reason,
+        };
+        let (content_hash, bytes) = match &response.result {
+            DfsFetchBlobResult::Found {
+                content_hash,
+                bytes,
+            } => (content_hash, bytes),
+            DfsFetchBlobResult::NotFound => {
+                return Ok((
+                    DfsRepairAttemptOutcome::Failed,
+                    rejected("blob not found".into()),
+                ));
+            }
+            DfsFetchBlobResult::Rejected { reason } => {
+                return Ok((DfsRepairAttemptOutcome::Failed, rejected(reason.clone())));
+            }
+        };
+        let version_hash = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "repair fetch completion requires the shard tables".into(),
+            })?
+            .get_version(&response.object_id, &response.version)?
+            .and_then(|record| record.content_hash);
+        if version_hash.as_deref() != Some(content_hash.as_str()) {
+            let reason = DfsError::ContentHashMismatch {
+                expected: version_hash.unwrap_or_default(),
+                actual: content_hash.clone(),
+            }
+            .to_string();
+            return Ok((DfsRepairAttemptOutcome::Superseded, rejected(reason)));
+        }
+        if self
+            .local_object_version_manifest_size_if_matches(
+                &response.object_id,
+                &response.version,
+                content_hash,
+            )
+            .is_none()
+            && let Err(error) = self.store_command_bytes(
+                &response.object_id,
+                &response.version,
+                content_hash,
+                bytes,
+            )
+        {
+            return Ok((DfsRepairAttemptOutcome::Failed, rejected(error.to_string())));
+        }
+        Ok((
+            DfsRepairAttemptOutcome::Superseded,
+            NetworkedDfsServiceEvent::BlobFetched {
+                intent_id: response.intent_id.clone(),
+                object_id: response.object_id.clone(),
+                version: response.version.clone(),
+                source_node_id: response.source_node_id.clone(),
+                content_hash: content_hash.clone(),
+            },
+        ))
+    }
+
+    fn handle_fetch_blob_response_inner(
         &mut self,
         frame_source_node_id: NodeId,
         response: DfsFetchBlobResponse,
@@ -484,13 +601,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
             }
             DfsFetchBlobResult::Rejected { reason } => {
-                if repair_rejection_indicates_lost_authority(&reason) {
-                    self.suppress_repair_retries_for_lost_authority(
-                        &response.intent_id,
-                        None,
-                        false,
-                    );
-                } else {
+                {
                     self.record_fetch_failed_source_and_wake_retries(
                         &response.intent_id,
                         &response.source_node_id,
@@ -659,10 +770,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn wake_pending_retries_after_fetch_success(&mut self, intent_id: &str) {
         if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
-            for state in pending.repair_retries.values_mut() {
-                wake_repair_retry_state(state);
-                state.inflight = false;
-            }
             for state in pending.stage_retries.values_mut() {
                 state.next_retry_tick = 0;
                 state.inflight = false;
@@ -691,10 +798,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending.fetch_failed_from.insert(source_node_id.clone());
             for state in pending.stage_retries.values_mut() {
                 state.next_retry_tick = 0;
-                state.inflight = false;
-            }
-            for state in pending.repair_retries.values_mut() {
-                wake_repair_retry_state(state);
                 state.inflight = false;
             }
         }

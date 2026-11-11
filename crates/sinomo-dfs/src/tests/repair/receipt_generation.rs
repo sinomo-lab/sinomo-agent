@@ -5,31 +5,62 @@
 
 use super::*;
 
-/// Take the actual receiver's queued reply for one Repair target and deliver
-/// every other queued message normally, so holding the reply changes nothing
-/// else about the owner's message stream.
-fn take_repair_reply(
+/// The receiver's reply to one Repair target, once it has arrived. Every
+/// other message delivered meanwhile is served normally.
+fn await_repair_reply(
     service: &mut NetworkedDfsService<DfsNodeTransport>,
     intent_id: &str,
     replica: &NodeId,
 ) -> crate::DfsRoutedMessage {
-    let (mut replies, others): (Vec<_>, Vec<_>) = service
-        .transport
-        .drain_incoming_messages()
-        .unwrap()
-        .into_iter()
-        .partition(|routed| {
-            matches!(&routed.message,
-                DfsNetworkMessage::RepairReplicaResponse(response)
-                    if response.intent_id == intent_id && &response.replica_node_id == replica)
-        });
-    if !others.is_empty() {
-        service
-            .process_routed_messages_with_options(others, true)
-            .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let (mut replies, others): (Vec<_>, Vec<_>) = service
+            .transport
+            .drain_incoming_messages()
+            .unwrap()
+            .into_iter()
+            .partition(|routed| {
+                matches!(&routed.message,
+                    DfsNetworkMessage::RepairReplicaResponse(response)
+                        if response.intent_id == intent_id && &response.replica_node_id == replica)
+            });
+        if !others.is_empty() {
+            service
+                .process_routed_messages_with_options(others, true)
+                .unwrap();
+        }
+        if let Some(reply) = replies.pop() {
+            assert!(replies.is_empty(), "exactly one actual receiver reply");
+            return reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the receiver's reply did not arrive"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(replies.len(), 1, "exactly one actual receiver reply");
-    replies.pop().unwrap()
+}
+
+/// One pass of the node's repair executor that sends at most one repair and
+/// leaves its reply queued for the test.
+fn executor_send_once(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
+    data_root: &Path,
+) -> usize {
+    let pass = service
+        .run_repair_executor_pass(
+            data_root,
+            &runtime.metadata_shards().unwrap(),
+            &crate::DfsMaintenanceExecutionExclusions::default(),
+            1,
+        )
+        .unwrap();
+    service
+        .transport
+        .checkpoint_background_replica_dispatch()
+        .unwrap();
+    pass.scheduled.len()
 }
 
 fn replica_receipt(
@@ -138,217 +169,6 @@ fn current_locations(
         .unwrap()
         .unwrap()
         .current_locations
-}
-
-#[test]
-fn repair_reply_planned_before_withdrawal_cannot_publish() {
-    let name = "native-receipt-generation-late-reply";
-    let (runtime, owner, replica, mut service) = native_missing_content_repair(name);
-    let path = format!("/services/{name}.bin");
-    let (execution, hold) = native_private_repair_owner(&runtime, &service, &path, ());
-    let bytes = (0..64 * 1024 + 7)
-        .map(|index| (index % 239) as u8)
-        .collect::<Vec<_>>();
-    let stat = service
-        .posix_write_file(
-            &path,
-            &bytes,
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), replica.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    // The direct Core write commits at W=1 and leaves the replica as an
-    // ordinary repair job; no background dispatch enrolls an original.
-    let intent_id = service
-        .coordinator()
-        .repair_jobs()
-        .iter()
-        .find(|job| job.object_id == stat.object_id && job.missing_replica_node_id == replica)
-        .expect("the committed write leaves the replica as repair work")
-        .intent_id
-        .clone();
-    runtime.clear_faults();
-    let queue = service.owned_repair_queue_store().unwrap().unwrap();
-    assert!(
-        queue
-            .original_repair_for_slot(&intent_id, &replica)
-            .unwrap()
-            .is_none(),
-        "this case drives the ordinary producer, not an enrolled original"
-    );
-    let scheduled = service.retry_pending_repairs_bounded(1).unwrap();
-    assert_eq!(scheduled.len(), 1);
-    assert!(
-        queue
-            .original_repair_for_slot(&intent_id, &replica)
-            .unwrap()
-            .is_none()
-    );
-    // The real receiver stored the bytes; only its reply is still queued.
-    let received = runtime.client(&replica).unwrap();
-    assert_eq!(
-        received
-            .content()
-            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
-            .unwrap()
-            .0
-            .content_hash,
-        stat.content_hash.clone().unwrap()
-    );
-    drop(received);
-    let late = take_repair_reply(&mut service, &intent_id, &replica);
-    let DfsNetworkMessage::RepairReplicaResponse(response) = &late.message else {
-        unreachable!()
-    };
-    assert!(
-        matches!(&response.result, DfsBlobTransferResult::Committed { content_hash }
-            if Some(content_hash) == stat.content_hash.as_ref()),
-        "actual receiver accepted the bytes: {response:?}"
-    );
-    assert_eq!(
-        response.receipt_generation, 0,
-        "the attempt planned against the never-withdrawn slot"
-    );
-    assert!(replica_receipt(&service, &stat, &replica).is_empty());
-    let locations_before = current_locations(&service, &stat);
-    assert_eq!(locations_before, vec![owner.clone()]);
-
-    // A failed read from the target withdraws its slot through the ordinary
-    // location-withdrawal producer. The reply above was planned before it.
-    service
-        .mark_remote_read_location_missing(
-            &stat.object_id,
-            &stat.version,
-            &stat.content_hash,
-            &replica,
-        )
-        .unwrap();
-    let locations_withdrawn = current_locations(&service, &stat);
-    assert_eq!(locations_withdrawn, locations_before);
-    assert_eq!(slot_generation(&service, &stat, &replica), 1);
-    assert_eq!(
-        replayed_slot_generation(&runtime, &owner, &stat, &replica),
-        1,
-        "the withdrawal tombstone is durable in the shard journal"
-    );
-    // The metadata writer itself enforces the compare, independent of the
-    // publisher's early check, before anything becomes durable.
-    let journal = service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
-    let stale = receipt_publication(&mut service, &stat, &replica, 0);
-    match service
-        .metadata_backend_mut()
-        .unwrap()
-        .prepare_operation(stale, None)
-    {
-        Err(MetadataBackendError::ReceiptGenerationSuperseded {
-            expected, current, ..
-        }) => assert_eq!((expected, current), (0, 1)),
-        other => panic!("stale receipt preparation must be superseded: {other:?}"),
-    }
-    assert_eq!(
-        service
-            .metadata_backend()
-            .unwrap()
-            .journal_last_sequence()
-            .unwrap(),
-        journal
-    );
-
-    let events = service
-        .process_routed_messages_with_options(vec![late.clone()], true)
-        .unwrap();
-    assert!(
-        !events.iter().any(|event| matches!(event,
-            NetworkedDfsServiceEvent::ReplicaRepaired { intent_id: repaired, replica_node_id, .. }
-                if repaired == &intent_id && replica_node_id == &replica)),
-        "a reply planned before the withdrawal must not settle the slot: {events:?}"
-    );
-    assert!(
-        replica_receipt(&service, &stat, &replica).is_empty(),
-        "no receipt is published for the withdrawn slot"
-    );
-    assert_eq!(current_locations(&service, &stat), locations_withdrawn);
-    assert!(
-        service
-            .coordinator()
-            .repair_jobs()
-            .iter()
-            .any(|job| job.intent_id == intent_id && job.missing_replica_node_id == replica),
-        "the superseded attempt leaves the deficit for a new attempt"
-    );
-
-    // A new attempt plans against the current slot and publishes once.
-    assert_eq!(service.retry_pending_repairs_bounded(1).unwrap().len(), 1);
-    let current = take_repair_reply(&mut service, &intent_id, &replica);
-    let DfsNetworkMessage::RepairReplicaResponse(response) = &current.message else {
-        unreachable!()
-    };
-    assert_eq!(
-        response.receipt_generation, 1,
-        "the receiver echoes the generation of the new attempt"
-    );
-    let events = service
-        .process_routed_messages_with_options(vec![current.clone()], true)
-        .unwrap();
-    assert!(
-        events.iter().any(|event| matches!(event,
-            NetworkedDfsServiceEvent::ReplicaRepaired { intent_id: repaired, replica_node_id, .. }
-                if repaired == &intent_id && replica_node_id == &replica)),
-        "the current-generation reply settles the slot: {events:?}"
-    );
-    let published = replica_receipt(&service, &stat, &replica);
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].content_hash, stat.content_hash);
-    assert_eq!(published[0].generation, 1);
-    assert_eq!(slot_generation(&service, &stat, &replica), 1);
-    assert_eq!(
-        replayed_slot_generation(&runtime, &owner, &stat, &replica),
-        1
-    );
-    let mut settled = current_locations(&service, &stat);
-    settled.sort();
-    let mut expected = vec![owner.clone(), replica.clone()];
-    expected.sort();
-    assert_eq!(settled, expected);
-
-    // Redelivering the same reply is idempotent: no metadata is published.
-    let journal = service
-        .metadata_backend()
-        .unwrap()
-        .journal_last_sequence()
-        .unwrap();
-    for message in [current, late] {
-        let events = service
-            .process_routed_messages_with_options(vec![message], true)
-            .unwrap();
-        assert!(
-            !events.iter().any(|event| matches!(event,
-                NetworkedDfsServiceEvent::ReplicaRepaired { intent_id: repaired, replica_node_id, .. }
-                    if repaired == &intent_id && replica_node_id == &replica)),
-            "a redelivered reply publishes nothing: {events:?}"
-        );
-    }
-    assert_eq!(
-        service
-            .metadata_backend()
-            .unwrap()
-            .journal_last_sequence()
-            .unwrap(),
-        journal
-    );
-    assert_eq!(replica_receipt(&service, &stat, &replica), published);
-    drop(execution);
-    drop(service);
-    drop(hold);
-    runtime.close().unwrap();
 }
 
 #[test]
@@ -551,4 +371,202 @@ fn transfer_messages_carry_the_planned_generation_explicitly() {
         serde_json::from_value::<DfsStageBlobCommand>(legacy).unwrap(),
         stage
     );
+}
+
+#[test]
+fn repair_reply_planned_before_withdrawal_cannot_publish() {
+    let name = "native-receipt-generation-late-reply";
+    let (runtime, owner, replica, mut service) = native_missing_content_repair(name);
+    let path = format!("/services/{name}.bin");
+    let (execution, hold) = native_private_repair_owner(&runtime, &service, &path, ());
+    let bytes = (0..64 * 1024 + 7)
+        .map(|index| (index % 239) as u8)
+        .collect::<Vec<_>>();
+    let stat = service
+        .posix_write_file(
+            &path,
+            &bytes,
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    // The direct Core write commits at W=1; the shard tables' repair index
+    // holds the replica as a need of the committed owner intent.
+    let needs = indexed_repair_needs(&runtime, &service, &stat);
+    assert_eq!(needs.len(), 1);
+    let (target, owner_intent) = &needs[0];
+    assert_eq!(target, &replica);
+    let intent_id = owner_intent
+        .clone()
+        .expect("the committed write owns the replica's need");
+    runtime.clear_faults();
+    let data_root = runtime.data_dir(&owner).root();
+    assert_eq!(
+        executor_send_once(&runtime, &mut service, &data_root),
+        1,
+        "the executor attempts the need once"
+    );
+    // The real receiver stored the bytes; only its reply is still queued.
+    let received = runtime.client(&replica).unwrap();
+    assert_eq!(
+        received
+            .content()
+            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+            .unwrap()
+            .0
+            .content_hash,
+        stat.content_hash.clone().unwrap()
+    );
+    drop(received);
+    let late = await_repair_reply(&mut service, &intent_id, &replica);
+    let DfsNetworkMessage::RepairReplicaResponse(response) = &late.message else {
+        unreachable!()
+    };
+    assert!(
+        matches!(&response.result, DfsBlobTransferResult::Committed { content_hash }
+            if Some(content_hash) == stat.content_hash.as_ref()),
+        "actual receiver accepted the bytes: {response:?}"
+    );
+    assert_eq!(
+        response.receipt_generation, 0,
+        "the attempt planned against the never-withdrawn slot"
+    );
+    assert!(replica_receipt(&service, &stat, &replica).is_empty());
+    let locations_before = current_locations(&service, &stat);
+    assert_eq!(locations_before, vec![owner.clone()]);
+
+    // A failed read from the target withdraws its slot through the ordinary
+    // location-withdrawal producer. The reply above was planned before it.
+    service
+        .mark_remote_read_location_missing(
+            &stat.object_id,
+            &stat.version,
+            &stat.content_hash,
+            &replica,
+        )
+        .unwrap();
+    let locations_withdrawn = current_locations(&service, &stat);
+    assert_eq!(locations_withdrawn, locations_before);
+    assert_eq!(slot_generation(&service, &stat, &replica), 1);
+    assert_eq!(
+        replayed_slot_generation(&runtime, &owner, &stat, &replica),
+        1,
+        "the withdrawal tombstone is durable in the shard journal"
+    );
+    // The metadata writer itself enforces the compare, independent of the
+    // publisher's early check, before anything becomes durable.
+    let journal = service
+        .metadata_backend()
+        .unwrap()
+        .journal_last_sequence()
+        .unwrap();
+    let stale = receipt_publication(&mut service, &stat, &replica, 0);
+    match service
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(stale, None)
+    {
+        Err(MetadataBackendError::ReceiptGenerationSuperseded {
+            expected, current, ..
+        }) => assert_eq!((expected, current), (0, 1)),
+        other => panic!("stale receipt preparation must be superseded: {other:?}"),
+    }
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap(),
+        journal
+    );
+
+    let events = service
+        .process_routed_messages_with_options(vec![late.clone()], true)
+        .unwrap();
+    assert!(
+        !events.iter().any(|event| matches!(event,
+            NetworkedDfsServiceEvent::ReplicaRepaired { intent_id: repaired, replica_node_id, .. }
+                if repaired == &intent_id && replica_node_id == &replica)),
+        "a reply planned before the withdrawal must not settle the slot: {events:?}"
+    );
+    assert!(
+        replica_receipt(&service, &stat, &replica).is_empty(),
+        "no receipt is published for the withdrawn slot"
+    );
+    assert_eq!(current_locations(&service, &stat), locations_withdrawn);
+    assert_eq!(
+        indexed_repair_needs(&runtime, &service, &stat),
+        vec![(replica.clone(), Some(intent_id.clone()))],
+        "the superseded attempt leaves the deficit for a new attempt"
+    );
+
+    // The withdrawal changed the need's slot: the executor's next attempt
+    // plans against the current slot and publishes once.
+    assert_eq!(executor_send_once(&runtime, &mut service, &data_root), 1);
+    let current = await_repair_reply(&mut service, &intent_id, &replica);
+    let DfsNetworkMessage::RepairReplicaResponse(response) = &current.message else {
+        unreachable!()
+    };
+    assert_eq!(
+        response.receipt_generation, 1,
+        "the receiver echoes the generation of the new attempt"
+    );
+    let events = service
+        .process_routed_messages_with_options(vec![current.clone()], true)
+        .unwrap();
+    assert!(
+        events.iter().any(|event| matches!(event,
+            NetworkedDfsServiceEvent::ReplicaRepaired { intent_id: repaired, replica_node_id, .. }
+                if repaired == &intent_id && replica_node_id == &replica)),
+        "the current-generation reply settles the slot: {events:?}"
+    );
+    let published = replica_receipt(&service, &stat, &replica);
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].content_hash, stat.content_hash);
+    assert_eq!(published[0].generation, 1);
+    assert_eq!(slot_generation(&service, &stat, &replica), 1);
+    assert_eq!(
+        replayed_slot_generation(&runtime, &owner, &stat, &replica),
+        1
+    );
+    let mut settled = current_locations(&service, &stat);
+    settled.sort();
+    let mut expected = vec![owner.clone(), replica.clone()];
+    expected.sort();
+    assert_eq!(settled, expected);
+
+    // Redelivering the same reply is idempotent: no metadata is published.
+    let journal = service
+        .metadata_backend()
+        .unwrap()
+        .journal_last_sequence()
+        .unwrap();
+    for message in [current, late] {
+        let events = service
+            .process_routed_messages_with_options(vec![message], true)
+            .unwrap();
+        assert!(
+            !events.iter().any(|event| matches!(event,
+                NetworkedDfsServiceEvent::ReplicaRepaired { intent_id: repaired, replica_node_id, .. }
+                    if repaired == &intent_id && replica_node_id == &replica)),
+            "a redelivered reply publishes nothing: {events:?}"
+        );
+    }
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .journal_last_sequence()
+            .unwrap(),
+        journal
+    );
+    assert_eq!(replica_receipt(&service, &stat, &replica), published);
+    drop(execution);
+    drop(service);
+    drop(hold);
+    runtime.close().unwrap();
 }

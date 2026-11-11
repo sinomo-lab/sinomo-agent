@@ -764,6 +764,8 @@ fn replay_metadata_table_batches(
             span.record("materialized_through_sequence", sequence);
         }
         span.record("outcome", "ok");
+        // Replay materializes appends their writer already announced.
+        tables.clear_repair_index_changes();
         Ok(MetadataTableReplay {
             offset,
             materialized_through_sequence: through,
@@ -1354,6 +1356,7 @@ pub(crate) fn metadata_tables_from_snapshot(
         tables.apply_checked(DfsMetadataTableOp::put_namespace_request_receipt(receipt))?;
     }
     tables.rebuild_prepared_operation_reservations()?;
+    tables.clear_repair_index_changes();
     Ok(tables)
 }
 

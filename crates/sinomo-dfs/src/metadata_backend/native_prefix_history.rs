@@ -347,7 +347,7 @@ impl LocalSobjMetadataBackend {
             return Err(invalid("historical slot is not a bounded regular file"));
         }
         let file = std::fs::File::open(&path).map_err(|e| invalid(&e.to_string()))?;
-        if !crate::repair_queue_store::same_file_observation(
+        if !crate::selected_fixture::same_file_observation(
             &before,
             &file.metadata().map_err(|e| invalid(&e.to_string()))?,
         ) {
@@ -359,7 +359,7 @@ impl LocalSobjMetadataBackend {
             .map_err(|e| invalid(&e.to_string()))?;
         let after = std::fs::symlink_metadata(&path).map_err(|e| invalid(&e.to_string()))?;
         if bytes.len() as u64 != before.len()
-            || !crate::repair_queue_store::same_file_observation(&before, &after)
+            || !crate::selected_fixture::same_file_observation(&before, &after)
         {
             return Err(invalid("historical slot changed while reading"));
         }

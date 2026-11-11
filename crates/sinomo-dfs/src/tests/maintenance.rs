@@ -240,7 +240,6 @@ fn async_maintenance_yields_between_completed_synchronous_phases() {
     let data_dir = runtime.data_dir(&local).clone();
     let root = data_dir.root();
     let mut maintenance_host = RecordingMaintenanceHost::default();
-    let repair_queue_load_count = Arc::clone(&maintenance_host.load_repair_attempt_records_count);
     let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("journal"));
     let (_, peer) = runtime.peer_transports(&local).unwrap();
     let mut transport = AsyncDfsMetadataNodeTransport::new(
@@ -269,40 +268,15 @@ fn async_maintenance_yields_between_completed_synchronous_phases() {
     );
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
-    // The durable queue snapshot precedes placement so scheduling and execution
-    // use the same eligibility input; each preceding phase still owns a poll.
-    for phase in 0..5 {
+    // Each bounded synchronous phase, the read of the executor's need count
+    // before placement, and placement and lifecycle each own a poll.
+    for phase in 0..8 {
         assert!(
             matches!(
                 std::future::Future::poll(maintenance.as_mut(), &mut context),
                 std::task::Poll::Pending
             ),
             "bounded synchronous maintenance phase {phase} must yield"
-        );
-        assert_eq!(
-            repair_queue_load_count.load(Ordering::Relaxed),
-            0,
-            "repair queue load must not run in the same poll as an earlier bounded phase"
-        );
-    }
-
-    assert!(matches!(
-        std::future::Future::poll(maintenance.as_mut(), &mut context),
-        std::task::Poll::Pending
-    ));
-    assert_eq!(repair_queue_load_count.load(Ordering::Relaxed), 1);
-    for phase in ["placement", "lifecycle"] {
-        assert!(
-            matches!(
-                std::future::Future::poll(maintenance.as_mut(), &mut context),
-                std::task::Poll::Pending
-            ),
-            "bounded {phase} must yield after the shared repair queue snapshot"
-        );
-        assert_eq!(
-            repair_queue_load_count.load(Ordering::Relaxed),
-            1,
-            "placement and lifecycle must reuse the same owner snapshot"
         );
     }
     drop(maintenance);
@@ -384,10 +358,9 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
             replica_node_id: target.clone(),
             reason: "network authorization denied".to_string(),
         }],
-        repair_attempts_before: Vec::new(),
-        repair_attempts_after: Vec::new(),
         repair_budget_exhausted: false,
-        repair_page_checkpoint: Default::default(),
+        repair_examined_count: 0,
+        repair_tracked_need_count: 0,
         metadata_replication: DfsMetadataJournalReplicationReport {
             outcomes: vec![
                 DfsMetadataJournalReplicationOutcome::Applied {

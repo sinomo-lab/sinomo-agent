@@ -521,64 +521,10 @@ struct RecordingMaintenanceHost {
     cursors: Vec<(DfsFileSystemId, DfsAntiEntropyCursorRecord)>,
     stored: Vec<DfsAntiEntropyCursorRecord>,
     cleared: Vec<DfsFileSystemId>,
-    repair_attempt_records: Vec<DfsRepairAttemptRecord>,
-    stored_repair_attempt_records: Vec<Vec<DfsRepairAttemptRecord>>,
-    load_repair_attempt_records_count: Arc<AtomicUsize>,
-    repair_page_owner: Option<(sinomo_testdir::TestDir, LocalDfsMaintenanceHost)>,
 }
 
-impl RecordingMaintenanceHost {
-    fn repair_page_owner(&mut self) -> &mut LocalDfsMaintenanceHost {
-        if self.repair_page_owner.is_none() {
-            let root = sinomo_testdir::TestDir::new("dfs-shared-maintenance-pages");
-            let data_dir = SinomoDataDir::new(root.path());
-            let store =
-                LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(&data_dir));
-            store
-                .append_enqueues(self.repair_attempt_records.clone())
-                .unwrap();
-            self.repair_page_owner = Some((root, LocalDfsMaintenanceHost::new(data_dir)));
-        }
-        &mut self.repair_page_owner.as_mut().unwrap().1
-    }
-}
 
 impl DfsMaintenanceHost for RecordingMaintenanceHost {
-    fn load_repair_maintenance_page(
-        &mut self,
-        max_records: usize,
-    ) -> Result<DfsRepairQueueMaintenancePage, DfsError> {
-        self.load_repair_attempt_records_count
-            .fetch_add(1, Ordering::Relaxed);
-        self.repair_page_owner()
-            .load_repair_maintenance_page(max_records)
-    }
-
-    fn enroll_repair_maintenance_page(
-        &mut self,
-        page: &DfsRepairQueueMaintenancePage,
-        max_records: usize,
-        captured: &[DfsRepairAttemptRecord],
-    ) -> Result<DfsRepairQueueMaintenancePage, DfsError> {
-        self.repair_page_owner()
-            .enroll_repair_maintenance_page(page, max_records, captured)
-    }
-
-    fn checkpoint_repair_maintenance_page(
-        &mut self,
-        page: &DfsRepairQueueMaintenancePage,
-        examined: &BTreeSet<(String, NodeId)>,
-        desired: &[DfsRepairAttemptRecord],
-        retired: &[DfsRepairAttemptRecord],
-    ) -> Result<DfsRepairMaintenancePageCheckpoint, DfsError> {
-        let checkpoint = self
-            .repair_page_owner()
-            .checkpoint_repair_maintenance_page(page, examined, desired, retired)?;
-        let records = self.repair_page_owner().load_repair_attempt_records()?;
-        self.repair_attempt_records = records.clone();
-        self.stored_repair_attempt_records.push(records);
-        Ok(checkpoint)
-    }
 
     fn load_anti_entropy_cursor(
         &mut self,
@@ -613,20 +559,6 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
         Ok(())
     }
 
-    fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
-        self.load_repair_attempt_records_count
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(self.repair_attempt_records.clone())
-    }
-
-    fn store_repair_attempt_records(
-        &mut self,
-        records: &[DfsRepairAttemptRecord],
-    ) -> Result<(), DfsError> {
-        self.repair_attempt_records = records.to_vec();
-        self.stored_repair_attempt_records.push(records.to_vec());
-        Ok(())
-    }
 }
 
 fn file_system(owner: NodeId) -> DfsFileSystem {
@@ -842,6 +774,33 @@ fn assert_malformed_remote_range_rejected(
 // paths as normal operation. The fixture retains component/data ownership until
 // all client lanes have dropped.
 // ---------------------------------------------------------------------------
+
+/// What one maintenance repair phase does on `service`'s node: its unfinished
+/// writes' stage retries, one pass of the node's repair executor over the
+/// runtime's current shards, then the replies they drew. Returns the repairs
+/// the pass sent.
+pub(crate) fn drive_repair_executor(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
+) -> usize {
+    let node = service.node_id().clone();
+    let shards = runtime.metadata_shards().expect("native configuration");
+    service
+        .retry_pending_stages(crate::DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK)
+        .expect("stage retries");
+    let pass = service
+        .run_repair_executor_pass(
+            &runtime.data_dir(&node).root(),
+            &shards,
+            &crate::DfsMaintenanceExecutionExclusions::default(),
+            crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE,
+        )
+        .expect("repair executor pass");
+    service
+        .process_incoming_until_quiescent()
+        .expect("serve repair replies");
+    pass.scheduled.len()
+}
 
 const SIFS_CLUSTER_PUMP_DEADLINE: Duration = Duration::from_secs(10);
 const SIFS_CLUSTER_PUMP_IDLE_SLEEP: Duration = Duration::from_millis(2);

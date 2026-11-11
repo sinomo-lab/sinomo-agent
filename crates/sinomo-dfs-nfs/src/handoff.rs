@@ -95,11 +95,7 @@ impl NfsMountedMutationHandoff {
         Ok(arm_request_id)
     }
 
-    pub(crate) fn run_mount_open<T>(
-        &self,
-        open: impl FnOnce() -> Result<T>,
-        repair_records: impl FnOnce(&T) -> Vec<dfs::DfsRepairAttemptRecord>,
-    ) -> Result<T> {
+    pub(crate) fn run_mount_open<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
         let _admission = self.admit()?;
         if self.is_gated() {
             return Err(DfsNfsError::Dfs(
@@ -112,11 +108,8 @@ impl NfsMountedMutationHandoff {
             Ok(opened) => opened,
             Err(error) => {
                 self.gate("mounted SIFS service failed to open after NFS Arm");
-                let captured = dfs::MountedSifsMutationCapturedWork::new(
-                    mount_open_committed_work(),
-                    Vec::new(),
-                )
-                .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
+                let captured =
+                    dfs::MountedSifsMutationCapturedWork::new(mount_open_committed_work());
                 let observation = dfs::MountedSifsMutationErrorObservation::new(
                     captured,
                     "nfs-mount-open-service-error",
@@ -126,19 +119,7 @@ impl NfsMountedMutationHandoff {
                 return Err(error);
             }
         };
-        let captured = match dfs::MountedSifsMutationCapturedWork::new(
-            mount_open_committed_work(),
-            repair_records(&opened),
-        ) {
-            Ok(captured) => captured,
-            Err(source) => {
-                self.gate("NFS mount-open repair inventory exceeded the durable handoff bound");
-                let observation =
-                    fallback_full_recovery_observation("nfs-mount-open-capture-invalid")?;
-                self.finish_unknown(lease, &arm_request_id, &observation)?;
-                return Err(DfsNfsError::Dfs(source.to_string()));
-            }
-        };
+        let captured = dfs::MountedSifsMutationCapturedWork::new(mount_open_committed_work());
         if let Err(error) = self.finish_captured(lease, &arm_request_id, &captured) {
             self.gate("daemon rejected NFS mount-open committed work");
             return Err(error);
@@ -173,21 +154,7 @@ impl NfsMountedMutationHandoff {
             })?;
             service.capture_mounted_mutation(mutation)
         };
-        let captured = match dfs::MountedSifsMutationCapturedWork::new(
-            report.committed_work,
-            report.committed_repair_records,
-        ) {
-            Ok(captured) => captured,
-            Err(source) => {
-                self.gate("NFS mutation capture exceeded the durable handoff bound");
-                let observation =
-                    fallback_full_recovery_observation("nfs-mutation-capture-invalid")
-                        .map_err(handoff_posix_error)?;
-                self.finish_unknown(lease, &arm_request_id, &observation)
-                    .map_err(handoff_posix_error)?;
-                return Err(handoff_posix_error(DfsNfsError::Dfs(source.to_string())));
-            }
-        };
+        let captured = dfs::MountedSifsMutationCapturedWork::new(report.committed_work);
         match report.outcome {
             Ok(value) => {
                 self.finish_captured(lease, &arm_request_id, &captured)
@@ -311,19 +278,8 @@ fn mount_open_committed_work() -> dfs::DfsCommittedWork {
     }
 }
 
-fn fallback_full_recovery_observation(
-    error_code: &'static str,
-) -> Result<dfs::MountedSifsMutationErrorObservation> {
-    let captured =
-        dfs::MountedSifsMutationCapturedWork::new(mount_open_committed_work(), Vec::new())
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
-    dfs::MountedSifsMutationErrorObservation::new(captured, error_code)
-        .map_err(|source| DfsNfsError::Dfs(source.to_string()))
-}
-
 fn capture_is_empty(captured: &dfs::MountedSifsMutationCapturedWork) -> bool {
     captured.committed_work == dfs::DfsCommittedWork::default()
-        && captured.committed_repair_records.is_empty()
 }
 
 fn positive_no_write_error(error: &dfs::DfsPosixError) -> bool {

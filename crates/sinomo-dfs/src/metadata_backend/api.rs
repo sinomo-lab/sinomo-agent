@@ -354,9 +354,8 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         &mut self,
         digest: &crate::metadata_records::DfsPreparedOperationDigest,
         guard: crate::publication_guard::DfsPublicationGuard,
-        enrollment: Option<&mut dyn FnMut(&[crate::DfsRepairAttemptRecord]) -> Result<()>>,
     ) -> Result<crate::metadata_records::DfsPreparedOperationCommitResult> {
-        self.commit_prepared_operation_owned(digest, guard, enrollment)
+        self.commit_prepared_operation_owned(digest, guard)
     }
 
     #[tracing::instrument(
@@ -1149,6 +1148,66 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .receipt_slot_generation(object_id, version, replica_node_id))
     }
 
+    fn repair_index_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&(DfsObjectId, DfsVersion, NodeId)>,
+        max_entries: usize,
+    ) -> Result<crate::DfsRepairIndexPage> {
+        if shard_id != &self.shard_id {
+            return Ok(crate::DfsRepairIndexPage::default());
+        }
+        Ok(crate::DfsRepairIndexPage {
+            needs: self
+                .current_tables_snapshot()?
+                .repair_index()
+                .page(after, max_entries),
+        })
+    }
+
+    fn repair_index_needs(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        keys: &[(DfsObjectId, DfsVersion, NodeId)],
+    ) -> Result<crate::DfsRepairIndexPage> {
+        if shard_id != &self.shard_id {
+            return Ok(crate::DfsRepairIndexPage::default());
+        }
+        let tables = self.current_tables_snapshot()?;
+        let index = tables.repair_index();
+        Ok(crate::DfsRepairIndexPage {
+            needs: keys
+                .iter()
+                .filter_map(|key| index.get(key).map(|need| (key.clone(), need.clone())))
+                .collect(),
+        })
+    }
+
+    fn repair_index_objects(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        objects: &std::collections::BTreeSet<DfsObjectId>,
+    ) -> Result<crate::DfsRepairIndexPage> {
+        if shard_id != &self.shard_id {
+            return Ok(crate::DfsRepairIndexPage::default());
+        }
+        let tables = self.current_tables_snapshot()?;
+        let index = tables.repair_index();
+        Ok(crate::DfsRepairIndexPage {
+            needs: objects
+                .iter()
+                .flat_map(|object_id| index.object_entries(object_id))
+                .collect(),
+        })
+    }
+
+    fn repair_index_owned_count(&self, shard_id: &DfsMetadataShardId) -> Result<usize> {
+        if shard_id != &self.shard_id {
+            return Ok(0);
+        }
+        Ok(self.current_tables_snapshot()?.repair_index().owned_count())
+    }
+
     fn write_intent_counter_floor(&self) -> Result<u64> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.intent_receipt_retention.max_evicted_counter())
@@ -1864,19 +1923,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             return Ok(false);
         }
         self.mark_membership_handoff_write_freeze_activated(handoff_id, activated_epoch)
-    }
-
-    fn bind_metadata_shard_repair_handoff_cut(
-        &mut self,
-        shard_id: &DfsMetadataShardId,
-        cut: &crate::DfsRepairHandoffCut,
-    ) -> Result<()> {
-        if shard_id != &self.shard_id {
-            return Err(MetadataBackendError::Serde(
-                "repair custody names another physical shard".into(),
-            ));
-        }
-        self.bind_repair_handoff_cut(cut)
     }
 
     fn clear_metadata_shard_membership_handoff_freeze(

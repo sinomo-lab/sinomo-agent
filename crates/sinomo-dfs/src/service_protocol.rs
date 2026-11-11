@@ -206,9 +206,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => {
                 return Err(DfsError::Metadata { message: "selected local recovery fence requires authenticated native RPC ingress".into() });
             }
-            DfsNetworkMessage::OriginalRepairHistoryRequest(_) | DfsNetworkMessage::OriginalRepairHistoryResponse(_) => {
-                return Err(DfsError::Metadata { message: "history messages require their exact native direct-call owner".into() });
-            }
             DfsNetworkMessage::StageBlob(command) => {
                 events.push(self.handle_stage_blob(source_node_id, command)?);
             }
@@ -231,9 +228,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsNetworkMessage::RepairReplica(command) => {
                 events.push(self.handle_repair_replica(source_node_id, command)?);
-            }
-            DfsNetworkMessage::SelectedOriginalRepair(command) => {
-                events.push(self.handle_selected_original_repair(source_node_id, command)?);
             }
             DfsNetworkMessage::RepairReplicaResponse(response) => {
                 events.push(self.handle_repair_replica_response(source_node_id, response)?);

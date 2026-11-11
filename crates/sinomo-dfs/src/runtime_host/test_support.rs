@@ -353,7 +353,6 @@ pub(super) fn daemon_dfs_pending_work_from_records(
     receipt_records: &[DfsReplicaReceiptRecord],
     metadata_shard_statuses: &[DfsMetadataShardStatus],
     repair_views: &[DfsOperatorRepairView],
-    repair_attempt_records: &[DfsRepairAttemptRecord],
     intents_without_recovery_source: &BTreeSet<String>,
     repairs_without_recovery_source: &BTreeSet<(String, NodeId)>,
     offline_node_ids: &BTreeSet<NodeId>,
@@ -484,34 +483,12 @@ pub(super) fn daemon_dfs_pending_work_from_records(
         }
     }
 
-    let eligible_repair_attempt_records = repair_attempt_records
-        .iter()
-        .filter(|record| {
-            eligible_repair_keys
-                .contains(&(record.intent_id.as_str(), &record.missing_replica_node_id))
-        })
-        .collect::<Vec<_>>();
-    let attempted_eligible_repair_keys = eligible_repair_attempt_records
-        .iter()
-        .map(|record| (record.intent_id.as_str(), &record.missing_replica_node_id))
-        .collect::<BTreeSet<_>>();
-    let due_repair_attempt_count = eligible_repair_attempt_records
-        .iter()
-        .filter(|record| {
-            record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos <= now_unix_nanos
-        })
-        .count();
-    let next_repair_retry_unix_nanos = eligible_repair_attempt_records
-        .iter()
-        .filter(|record| record.next_retry_unix_nanos != u64::MAX)
-        .filter_map(|record| {
-            (record.next_retry_unix_nanos > now_unix_nanos).then_some(record.next_retry_unix_nanos)
-        })
-        .min();
+    // Repair attempts live in the executor, not in records: every eligible
+    // repair is unattempted work here.
+    let due_repair_attempt_count = 0usize;
+    let next_repair_retry_unix_nanos = None;
     let unattempted_repair_count = eligible_repair_keys
-        .difference(&attempted_eligible_repair_keys)
-        .count()
+        .len()
         // Preserve fail-open triggering if operator inspection returns fewer
         // repair records than the metadata summary counted.
         .saturating_add(pending_repair_count.saturating_sub(repair_views.len()));
@@ -527,29 +504,19 @@ pub(super) fn daemon_dfs_pending_work_from_records(
         .flat_map(|status| status.replica_lag.iter())
         .filter(|lag| lag.lag_entries > 0)
         .count();
-    let finite_future_repair_attempt_count = eligible_repair_attempt_records
-        .iter()
-        .filter(|record| {
-            record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos > now_unix_nanos
-        })
-        .count();
     let deferred_work_count = pending_write_count
         .saturating_sub(eligible_pending_write_count)
         .saturating_sub(projected_stale_write_intent_count)
         .saturating_add(
-            pending_repair_count.saturating_sub(
-                due_repair_attempt_count
-                    .saturating_add(unattempted_repair_count)
-                    .saturating_add(finite_future_repair_attempt_count),
-            ),
+            pending_repair_count
+                .saturating_sub(due_repair_attempt_count.saturating_add(unattempted_repair_count)),
         )
         .saturating_add(all_metadata_replica_lag_count.saturating_sub(metadata_replica_lag_count));
 
     DaemonDfsPendingMaintenanceWork {
         pending_write_count: eligible_pending_write_count,
         pending_repair_count,
-        repair_attempt_count: repair_attempt_records.len(),
+        repair_attempt_count: 0,
         due_repair_attempt_count,
         unattempted_repair_count,
         next_repair_retry_unix_nanos,

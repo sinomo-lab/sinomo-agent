@@ -211,7 +211,8 @@ When placement remains active during idle, use the maintained read-only probe
 `sinomo test run cluster.dfs.placement-activity --require-cluster --json --param limit=16`.
 It reuses the bounded activity and progress APIs and records job state, cursor,
 revision, pending repairs and scan progress. Retain successive probe artifacts;
-an empty coordinator-local repair queue does not establish that remote repairs
-finished. Correlate progress with committed replica/journal events and the
+an empty repair executor on one node does not establish that
+repairs of shards it is not primary for finished. Correlate
+progress with committed replica/journal events and the
 generated idle report before changing scheduling. Do not use delays, polling,
 cached whole-state equality or deferred background work to hide a gate failure.

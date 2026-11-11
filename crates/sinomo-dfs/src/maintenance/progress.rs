@@ -42,7 +42,6 @@ struct State {
     active: bool,
     progress_epoch: u64,
     checkpoint: Option<Checkpoint>,
-    uncheckpointed_births: Vec<DfsRepairAttemptRecord>,
 }
 
 #[derive(Debug, Default)]
@@ -59,33 +58,6 @@ impl DfsMaintenanceProgressState {
         if state.native_generation != generation {
             state.native_generation = generation;
             state.checkpoint = None;
-        }
-        Ok(())
-    }
-
-    pub(super) fn checkpoint_births<T: DfsMessageTransport>(
-        &self,
-        service: &mut NetworkedDfsService<T>,
-        host: &mut dyn DfsMaintenanceHost,
-    ) -> Result<(), DfsError> {
-        {
-            let mut state = self.0.lock().map_err(|_| poisoned())?;
-            state
-                .uncheckpointed_births
-                .extend(service.take_message_committed_repair_queue_records());
-            service.coordinator.ensure_message_repair_job_capture();
-        }
-        self.retry_births(host)
-    }
-
-    pub(super) fn retry_births(&self, host: &mut dyn DfsMaintenanceHost) -> Result<(), DfsError> {
-        let mut state = self.0.lock().map_err(|_| poisoned())?;
-        if !state.uncheckpointed_births.is_empty() {
-            let page = host.load_repair_maintenance_page(0)?;
-            let page =
-                host.enroll_repair_maintenance_page(&page, 0, &state.uncheckpointed_births)?;
-            host.checkpoint_repair_maintenance_page(&page, &BTreeSet::new(), &[], &[])?;
-            state.uncheckpointed_births.clear();
         }
         Ok(())
     }
@@ -167,10 +139,9 @@ fn empty_report() -> DfsMaintenanceTickReport {
         lifecycle_reports: Vec::new(),
         scheduled_repairs: Vec::new(),
         followup_events: Vec::new(),
-        repair_attempts_before: Vec::new(),
-        repair_attempts_after: Vec::new(),
         repair_budget_exhausted: false,
-        repair_page_checkpoint: Default::default(),
+        repair_examined_count: 0,
+        repair_tracked_need_count: 0,
         metadata_replication: DfsMetadataJournalReplicationReport {
             outcomes: Vec::new(),
         },
@@ -225,11 +196,9 @@ impl Turn {
             });
         }
         let mut state = self.owner.0.lock().map_err(|_| poisoned())?;
-        if state.native_generation != self.native_generation
-            || !state.uncheckpointed_births.is_empty()
-        {
+        if state.native_generation != self.native_generation {
             return Err(DfsError::Metadata {
-                message: "bounded maintenance page lost its generation or durable births".into(),
+                message: "bounded maintenance page lost its generation".into(),
             });
         }
         state.progress_epoch = state.progress_epoch.wrapping_add(1);
@@ -264,9 +233,6 @@ impl Turn {
             == 0
             || !report.write_intents.scan_has_more)
             && report.repair_budget_exhausted
-            && report.repair_page_checkpoint.has_more
-            && (report.repair_page_checkpoint.completed_record_count > 0
-                || report.repair_page_checkpoint.operation_count > 0)
     }
 
     pub(super) fn repair_sweep_report_after_publish(
@@ -294,13 +260,9 @@ impl Turn {
             });
         }
         let state = self.owner.0.lock().map_err(|_| poisoned())?;
-        if state.native_generation != self.native_generation
-            || !state.uncheckpointed_births.is_empty()
-        {
+        if state.native_generation != self.native_generation {
             return Err(DfsError::Metadata {
-                message:
-                    "maintenance completion lost its generation or still has uncheckpointed work"
-                        .into(),
+                message: "maintenance completion lost its generation".into(),
             });
         }
         drop(state);
@@ -510,119 +472,4 @@ mod tests {
         changed.projection_revision = Some(sinomo_core::kv::KvRevision(8));
         assert_eq!(owner.begin(changed).unwrap().phase(), Phase::Handoff);
     }
-    #[test]
-    fn native_repair_births_survive_failed_checkpoint_and_reopen_exactly() {
-        use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule};
-        let (native, nodes) =
-            DfsTestRuntime::start_cluster("native-maintenance-birth-checkpoint", 3).unwrap();
-        let path = "/services/birth-checkpoint.bin";
-        let shard = native
-            .metadata_shards()
-            .unwrap()
-            .into_iter()
-            .find(|row| row.shard_id == "services")
-            .unwrap();
-        let primary = shard.primary_node_id.clone();
-        native
-            .apply_placement_policy(
-                &primary,
-                path,
-                crate::DfsPlacementScope::SelfOnly,
-                crate::DfsPlacementPolicy::new(
-                    sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-                    1,
-                    3,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        native.install_fault(FaultRule {
-            source: Some(primary.clone()),
-            target: None,
-            route: Some(crate::DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
-            call_id: None,
-            origin: None,
-            remaining_hits: 32,
-            action: FaultAction::BudgetExhausted,
-        });
-        let mut writer = native.metadata_primary_service(path).unwrap();
-        let execution = writer
-            .acquire_prepared_execution(&crate::DfsPreparedOperationScope {
-                file_system_id: shard.file_system_id.clone(),
-                shard_id: crate::DfsMetadataShardId::new(&shard.shard_id),
-                owner_epoch: shard.epoch,
-                operation_id: "native-birth-checkpoint-admission".into(),
-            })
-            .unwrap()
-            .expect("real current producer shard execution admission");
-        writer.coordinator.ensure_message_repair_job_capture();
-        let written = writer
-            .posix_write_file_with_operation_id(
-                path,
-                b"native checkpoint source",
-                crate::DfsWriteOptions {
-                    policy: crate::DfsReplicationPolicy::new(1, 3).unwrap(),
-                    replica_candidates: nodes,
-                    wait_for_commit: true,
-                    foreground_replica_repair: false,
-                },
-                "native-birth-checkpoint-original",
-            )
-            .unwrap();
-        assert_eq!(written.current_locations, vec![primary]);
-        let root = sinomo_testdir::TestDir::new("native-maintenance-queue-reopen");
-        let data = SinomoDataDir::new(root.path());
-        data.ensure_root_layout().unwrap();
-        let snapshot = default_dfs_repair_attempt_snapshot_path(&data);
-        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
-        let blocked_log = snapshot.with_file_name("repair-attempts.active.slog");
-        // A negative filesystem fault in this test's new queue, never real DATA.
-        std::fs::create_dir(&blocked_log).unwrap();
-        let owner = Arc::new(DfsMaintenanceProgressState::default());
-        let mut host = LocalDfsMaintenanceHost::new(data.clone());
-        assert!(owner.checkpoint_births(&mut writer, &mut host).is_err());
-        let retained = owner.0.lock().unwrap().uncheckpointed_births.clone();
-        assert_eq!(
-            retained.len(),
-            2,
-            "actual W1/N3 producer captured both missing replicas"
-        );
-        assert!(retained.iter().all(|row| row.object_id == written.object_id
-            && row.version == written.version
-            && Some(&row.content_hash) == written.content_hash.as_ref()));
-        owner.restart_after_error().unwrap();
-        assert_eq!(owner.0.lock().unwrap().uncheckpointed_births, retained);
-        std::fs::remove_dir(&blocked_log).unwrap();
-        owner.checkpoint_births(&mut writer, &mut host).unwrap();
-        assert!(owner.0.lock().unwrap().uncheckpointed_births.is_empty());
-        let durable = host.repair_queue_store.view().unwrap().records;
-        assert_eq!(durable, retained);
-        drop(host);
-        drop(owner);
-        let reopened = LocalDfsMaintenanceHost::new(data);
-        assert_eq!(
-            reopened.repair_queue_store.view().unwrap().records,
-            durable,
-            "reopening replays the exact durable captures, not a fabricated completion"
-        );
-        assert_eq!(
-            writer
-                .metadata_backend()
-                .unwrap()
-                .get_object(&written.object_id)
-                .unwrap()
-                .unwrap()
-                .version,
-            written.version
-        );
-        drop(reopened);
-        drop(execution);
-        drop(writer);
-        native.close().unwrap();
-    }
 }
-
-#[cfg(test)]
-mod native_page_tests;
-#[cfg(test)]
-mod bounded_page_owner_tests;

@@ -24,7 +24,7 @@ use crate::{
     DfsError,
     DfsMessageTransport, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor, DfsNodeAdvertisement,
     DfsNodeId, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
-    DfsPeerTransportFuture, DfsPosixError, DfsRepairAttemptRecord, NetworkedDfsService,
+    DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService,
     cluster_dfs_peer_node_ids, content_services_prefix,
     open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
 };
@@ -41,12 +41,6 @@ pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
 pub struct MountedSifsMutationReport<R> {
     pub outcome: R,
     pub committed_work: DfsCommittedWork,
-    /// Exact zero-attempt repair queue entries created by this mutation.
-    ///
-    /// This is a delta, not a snapshot of the service's accumulated repair
-    /// inventory. A daemon handoff can therefore append it idempotently
-    /// without replacing retry/backoff state owned by maintenance.
-    pub committed_repair_records: Vec<DfsRepairAttemptRecord>,
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -62,11 +56,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.begin_message_committed_work();
         let outcome = operation(self);
         let committed_work = self.take_message_committed_work();
-        let committed_repair_records = self.take_message_committed_repair_queue_records();
         MountedSifsMutationReport {
             outcome,
             committed_work,
-            committed_repair_records,
         }
     }
 }
@@ -594,7 +586,6 @@ mod tests {
         assert_eq!(report.outcome, Err("after-commit"));
         assert!(report.committed_work.publish_metadata);
         assert!(report.committed_work.semantic_changes);
-        assert!(report.committed_repair_records.is_empty());
         let outer = tracker.take();
         assert!(outer.publish_metadata);
         assert_eq!(
@@ -609,6 +600,7 @@ mod tests {
         drop(service);
         runtime.close().unwrap();
     }
+
 
     #[derive(Debug)]
     struct RecordingMountedPeerTransport {

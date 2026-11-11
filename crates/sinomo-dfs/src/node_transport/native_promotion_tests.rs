@@ -633,7 +633,6 @@ fn native_background_repair_reply_survives_local_completion_failure() {
                     DfsOutboundAttachment::from_bytes(bytes, actual.content_hash.clone()),
                 ),
             ),
-            producer_delivery: std::sync::OnceLock::new(),
         });
     let delivered = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&delivered);

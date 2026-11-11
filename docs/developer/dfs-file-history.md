@@ -221,10 +221,10 @@ version is collected, a typed `RemoveRetainedRepairOwner` journal entry removes
 the maintenance record. Replay rejects using that operation to remove an
 ordinary write intent, and rejects changing an owner's recorded durability plan.
 
-A completed pin request can be retried after a crash between metadata commit
-and the local queue handoff. Its replay re-emits newly actionable repair records
-and the maintenance wake while preserving the original metadata result. It
-does not recreate a subsequently removed pin. A new pin transaction uses its
+A completed pin request can be retried after a crash following its metadata
+commit. Its replay preserves the original metadata result; the repair work the
+pin made actionable is already derived from the shard tables. It does not
+recreate a subsequently removed pin. A new pin transaction uses its
 durable request admission time, not the original content's capture time. Local
 execution without request admission uses the timestamp in a generated ordered
 operation ID. Expired identities never acquire a new wall-clock timestamp to

@@ -19,12 +19,6 @@ use crate::posix_path::parent_posix_path;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RepairProducerCustodyReadiness {
-    Ready,
-    Parked,
-}
-
 #[cfg(test)]
 type CreatePrepareTestHook = Box<dyn FnOnce(&DfsPreparedOperationPayload)>;
 
@@ -118,9 +112,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!("missing pending write for committed intent: {intent_id}"),
             })?;
         // PendingNetworkedWrite retains the effective primary execution mode.
-        // Every path that crosses W, including fetch completion and recovery,
-        // must use this same value rather than supplying a call-site default.
-        let foreground_replica_repair = pending.foreground_replica_repair;
         if intent.object_id != pending.object_id || intent.target_version != pending.version {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -245,102 +236,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
         }
 
-        if !foreground_replica_repair {
-            return Ok(());
-        }
-
-        let repair_jobs: Vec<DistributedRepairJob> = self
-            .coordinator
-            .repair_jobs()
-            .iter()
-            .filter(|job| job.intent_id == intent_id)
-            .cloned()
-            .collect();
-        if !repair_jobs.is_empty() && !self.pending_repair_is_locally_authoritative(&pending)? {
-            self.suppress_repair_retries_for_lost_authority(intent_id, None, true);
-            return Ok(());
-        }
-        let mut full_repair_targets = Vec::new();
-        let pending_blob_available = self.open_pending_write_blob_stream(&pending).is_ok();
-        for job in repair_jobs {
-            let replica_node_id = job.missing_replica_node_id.clone();
-            // A pre-commit StageBlob already owns this target's full-body
-            // transfer. Let that exact request finish (or expire in the normal
-            // maintenance loop) instead of sending a duplicate RepairReplica.
-            if self.stage_request_is_active(intent_id, &replica_node_id) {
-                continue;
-            }
-            if !self.repair_retry_is_due(intent_id, &replica_node_id) {
-                continue;
-            }
-            if replica_node_id == self.node_id {
-                if self
-                    .local_object_version_manifest_size_if_matches(
-                        &pending.object_id,
-                        &pending.version,
-                        &pending.content_hash,
-                    )
-                    .is_some()
-                {
-                    self.record_local_pending_write_receipt_if_desired(
-                        intent_id,
-                        &pending.object_id,
-                        &pending.version,
-                        &pending.content_hash,
-                    )?;
-                    continue;
-                }
-                let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
-                if !fetch_outcome.requested {
-                    self.record_repair_retry_scheduled_with_error(
-                        intent_id,
-                        &replica_node_id,
-                        fetch_outcome.last_error,
-                    );
-                }
-                continue;
-            }
-            if !pending_blob_available {
-                let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
-                if !fetch_outcome.requested {
-                    self.record_repair_retry_scheduled_with_error(
-                        intent_id,
-                        &replica_node_id,
-                        fetch_outcome.last_error,
-                    );
-                }
-                continue;
-            }
-            if let Some(request_id) =
-                self.original_repair_request_for_target(intent_id, &replica_node_id, &pending)?
-            {
-                full_repair_targets.push((replica_node_id, request_id));
-            }
-        }
-        let outcomes = self.send_repair_replica_attachments_if_routable(
-            &full_repair_targets,
-            intent_id,
-            &intent.file_system_id,
-            &pending.object_id,
-            intent.base_version.clone(),
-            &pending.version,
-            &pending.content_hash,
-            pending.size_bytes,
-            committed_metadata,
-        )?;
-        for ((replica_node_id, request_id), outcome) in
-            full_repair_targets.into_iter().zip(outcomes)
-        {
-            if outcome.sent {
-                self.record_repair_inflight(intent_id, &replica_node_id, request_id);
-            } else {
-                self.record_repair_retry_scheduled_with_error(
-                    intent_id,
-                    &replica_node_id,
-                    outcome.last_error,
-                );
-            }
-        }
+        // Replicas the commit left without a receipt are needs in the shard's
+        // repair index; the primary's executor sends them.
         Ok(())
     }
 
@@ -638,7 +535,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.coordinator
                 .restore_intent(distributed_intent_from_record(&record))?;
             self.restore_metadata_successor_head(&record)?;
-            self.restore_backend_receipt_pages_for_intent(&record, true)?;
+            self.restore_backend_receipt_pages_for_intent(&record)?;
         }
         let intent =
             self.coordinator
@@ -675,11 +572,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .any(|node_id| node_id == &self.node_id)
             && local_manifest_size.is_some();
-        let has_repair_job = self
-            .coordinator
-            .repair_jobs()
-            .iter()
-            .any(|job| job.intent_id == intent_id);
+        let has_repair_job = !self.coordinator.missing_replica_jobs(intent_id).is_empty();
         let is_local_authoritative_repair = if has_repair_job {
             let repair_object = self.current_read_object_metadata(&record.object_id)?;
             self.is_local_metadata_primary_for_object(&repair_object)?
@@ -729,238 +622,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         Ok(())
-    }
-
-    pub(crate) fn restore_pending_write_for_repair_job(
-        &mut self,
-        job: &DistributedRepairJob,
-    ) -> Result<RepairProducerCustodyReadiness, DfsError> {
-        if let Some(pending) = self.writes.pending_writes.get(&job.intent_id).cloned()
-            && let Some(kv) = self.control_plane.as_ref()
-            && let Some(projection) = kv.write_configuration_projection()?
-        {
-            if pending.object_id != job.object_id || pending.version != job.version {
-                return Err(DfsError::Metadata {
-                    message: "resident repair differs from its actual job body".into(),
-                });
-            }
-            let object = self.current_read_object_metadata(&pending.object_id)?;
-            if object.file_system_id != job.file_system_id {
-                return Err(DfsError::Metadata {
-                    message: "resident repair object names another filesystem".into(),
-                });
-            }
-            let prefix = format!("{}/", crate::metadata_shards_prefix(&job.file_system_id));
-            let entries = projection
-                .entries(&prefix)
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "retained repair configuration does not cover its actual scope".into(),
-                })?;
-            let mut index = crate::metadata_shard_index_from_authority_entries(entries);
-            let shards = index
-                .remove(&job.file_system_id.to_string())
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "retained repair configuration has no actual filesystem shards".into(),
-                })?
-                .map_err(|message| DfsError::Metadata { message })?;
-            let shard = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &job.file_system_id,
-                &shards,
-                &object.path,
-            )?
-            .ok_or_else(|| DfsError::Metadata {
-                message: "retained repair configuration has no actual object shard".into(),
-            })?;
-            if shard.primary_node_id != self.node_id {
-                // A real handoff can invalidate this old provider's generation.
-                // Stop only its volatile executor before borrowing that queue;
-                // original durable custody and all unresolved IDs stay intact.
-                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
-                return Ok(RepairProducerCustodyReadiness::Parked);
-            }
-        }
-        // Reconstruct the metadata owner without replacing existing producer
-        // state. Physical custody below is DATA, not new repair authority.
-        if self.writes.pending_writes.contains_key(&job.intent_id) {
-            self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
-        } else {
-            let object = self.current_read_object_metadata(&job.object_id)?;
-            if self.is_local_metadata_primary_for_object(&object)? {
-                self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
-            }
-        }
-        let Some(store) = self.owned_repair_queue_store()? else {
-            return Ok(RepairProducerCustodyReadiness::Ready);
-        };
-        let Some(intent) = self.coordinator.intent(&job.intent_id) else {
-            return Ok(RepairProducerCustodyReadiness::Ready);
-        };
-        let Some(pending) = self.writes.pending_writes.get(&job.intent_id) else {
-            return Ok(RepairProducerCustodyReadiness::Ready);
-        };
-        // Restore the same owner's targets before either the first request or
-        // a same-intent fanout companion chooses a request ID. No full queue scan.
-        let mut records =
-            store.records_for_targets(&job.intent_id, &intent.desired_replica_nodes)?;
-        use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
-        let mut parked = false;
-        let mut locally_owned = BTreeSet::new();
-        for record in &mut records {
-            if record.intent_id != job.intent_id
-                || record.object_id != pending.object_id
-                || record.version != pending.version
-                || record.content_hash != pending.content_hash
-            {
-                return Err(DfsError::Metadata {
-                    message: "foreground repair custody differs from its immutable owner".into(),
-                });
-            }
-            if !record.in_flight
-                && record.transfer_request_id.is_none()
-                && record.completed_transfer_request_id.is_none()
-                && record.transfer_delivery_state
-                    == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-                && let Some(prior) = self.repair_attempt_records.get(&(
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
-                ))
-                && prior.object_id == pending.object_id
-                && prior.version == pending.version
-                && prior.content_hash == pending.content_hash
-                && prior.transfer_kind == record.transfer_kind
-                && let Some(request) = prior.transfer_request_id.as_ref()
-                && match prior.transfer_kind {
-                    Some(DfsRepairTransferKind::Repair) => {
-                        pending
-                            .repair_inflight_request_ids
-                            .get(&record.missing_replica_node_id)
-                            == Some(request)
-                    }
-                    Some(DfsRepairTransferKind::Stage) => {
-                        pending
-                            .stage_inflight_request_ids
-                            .get(&record.missing_replica_node_id)
-                            == Some(request)
-                    }
-                    None => false,
-                }
-            {
-                // The unclaimed durable birth does not supersede this lane's
-                // actual named producer. Keep its request/delivery/backoff and
-                // original reply owner; do not import the older unclaimed row
-                // or publish this private request as another lane's custody.
-                locally_owned.insert(record.missing_replica_node_id.clone());
-                continue;
-            }
-            parked |= record.missing_replica_node_id == job.missing_replica_node_id
-                && crate::service_repair::repair_record_has_unidentified_producer(record);
-            for (kind, request, state) in [
-                (
-                    DfsRepairTransferKind::Stage,
-                    pending
-                        .stage_inflight_request_ids
-                        .get(&record.missing_replica_node_id),
-                    pending.stage_retries.get(&record.missing_replica_node_id),
-                ),
-                (
-                    DfsRepairTransferKind::Repair,
-                    pending
-                        .repair_inflight_request_ids
-                        .get(&record.missing_replica_node_id),
-                    pending.repair_retries.get(&record.missing_replica_node_id),
-                ),
-            ] {
-                if state.is_some_and(|state| {
-                    // Like the physical-row check above, mutation custody is
-                    // identified by request/delivery facts. `inflight` can be
-                    // a source Fetch's backoff and does not imply a mutation.
-                    state.unresolved_custody_without_request
-                        || (request.is_none()
-                            && state.transfer_delivery_state
-                                != Some(
-                                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-                                )
-                            && state.completed_transfer_request_id.is_none())
-                }) {
-                    // Unidentified custody belongs to this exact target. It
-                    // cannot grant a request or stall another target's owner.
-                    parked |= record.missing_replica_node_id == job.missing_replica_node_id;
-                }
-                if let Some(request) = request {
-                    if record.transfer_kind != Some(kind)
-                        || (record.transfer_request_id.as_ref() != Some(request)
-                            && record.completed_transfer_request_id.as_ref() != Some(request))
-                    {
-                        return Err(DfsError::Metadata {
-                            message: "foreground repair cannot replace its existing named producer custody".into(),
-                        });
-                    }
-                    if record.completed_transfer_request_id.is_none()
-                        && let Some(state) = state
-                    {
-                        let prior_delivery = if state.retrying_unresolved_transfer {
-                            crate::service_repair::join_transfer_delivery(
-                                state.previous_transfer_delivery_state,
-                                state.transfer_delivery_state,
-                            )
-                        } else {
-                            state.transfer_delivery_state
-                        };
-                        record.transfer_delivery_state =
-                            crate::service_repair::join_transfer_delivery(
-                                prior_delivery,
-                                record.transfer_delivery_state,
-                            );
-                        record.in_flight |= state.inflight;
-                    }
-                }
-            }
-            if let Some(prior) = self.repair_attempt_records.get(&(
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            )) && crate::service_repair::repair_transfer_custody_unresolved(prior)
-            {
-                if prior.transfer_kind != record.transfer_kind
-                    || (prior.transfer_request_id.is_none()
-                        && record.completed_transfer_request_id.is_some())
-                    || (prior.transfer_request_id != record.transfer_request_id
-                        && (prior.transfer_request_id.is_none()
-                            || prior.transfer_request_id != record.completed_transfer_request_id))
-                {
-                    return Err(DfsError::Metadata {
-                        message: "foreground repair cannot replace unresolved physical or resident custody".into(),
-                    });
-                }
-                if record.completed_transfer_request_id.is_none() {
-                    record.transfer_delivery_state = crate::service_repair::join_transfer_delivery(
-                        prior.transfer_delivery_state,
-                        record.transfer_delivery_state,
-                    );
-                    record.in_flight |= prior.in_flight;
-                }
-                // A receipt-loss pass may have re-armed only this schedule.
-                // Retain it only while every physical carrier field is exact.
-                if record.next_retry_unix_nanos == u64::MAX
-                    && prior.next_retry_unix_nanos != u64::MAX
-                {
-                    let mut scheduled = record.clone();
-                    scheduled.next_retry_unix_nanos = prior.next_retry_unix_nanos;
-                    if &scheduled == prior {
-                        record.next_retry_unix_nanos = prior.next_retry_unix_nanos;
-                    }
-                }
-            }
-        }
-        if parked {
-            return Ok(RepairProducerCustodyReadiness::Parked);
-        }
-        // Other targets retain their actual producer maps, including UNKNOWN.
-        records.retain(|record| {
-            record.missing_replica_node_id == job.missing_replica_node_id
-                && !locally_owned.contains(&record.missing_replica_node_id)
-        });
-        self.restore_repair_attempt_records_merging(&records);
-        Ok(RepairProducerCustodyReadiness::Ready)
     }
 
     pub(crate) fn commit_local_metadata(
@@ -1608,7 +1269,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         skip_all,
         fields(stage = "dfs.write.commit")
     )]
+    /// Commit a ready intent. A sealed receipt whose slot was withdrawn after
+    /// its stage send planned it is superseded: that ends the replica's
+    /// attempt, so it is no longer durable for this commit and stages again.
+    /// The commit then completes from the other replicas if they still reach
+    /// W, and otherwise reports the supersession while the write waits.
     pub(crate) fn commit_ready_intent_batched(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        base_object: &DfsObjectMetadata,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        loop {
+            let error = match self.commit_ready_intent_batched_once(
+                intent,
+                base_object,
+                content_hash,
+                content_size_bytes,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            let DfsError::ReceiptGenerationSuperseded {
+                replica_node_id, ..
+            } = &error
+            else {
+                return Err(error);
+            };
+            let replica = replica_node_id.clone();
+            if !self
+                .coordinator
+                .receipts_for_intent(&intent.intent_id)
+                .iter()
+                .any(|receipt| receipt.replica_node_id == replica)
+            {
+                return Err(error);
+            }
+            self.coordinator
+                .withdraw_durable_receipt(&intent.intent_id, &replica)?;
+            if let Some(pending) = self.writes.pending_writes.get_mut(&intent.intent_id) {
+                pending.planned_receipt_generations.remove(&replica);
+            }
+            self.record_stage_retry_scheduled(&intent.intent_id, &replica);
+            if !self.coordinator.is_commit_ready(&intent.intent_id)? {
+                return Err(error);
+            }
+        }
+    }
+
+    fn commit_ready_intent_batched_once(
         &mut self,
         intent: &DistributedWriteIntent,
         base_object: &DfsObjectMetadata,
@@ -1742,8 +1452,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(committed_object.clone()),
         );
         intent_record.created_at = pending_intent_record.created_at;
-        // The sealed W receipts plan against this same table state; the
-        // prepared publication compares each slot generation again.
+        // Each sealed W receipt publishes at the slot generation its stage
+        // send planned against, so a withdrawal after that plan fails the
+        // prepared publication's generation compare. A copy staged without a
+        // send, such as this node's own, plans against the current tables.
+        let planned_generations = self
+            .writes
+            .pending_writes
+            .get(&intent.intent_id)
+            .map(|pending| pending.planned_receipt_generations.clone())
+            .unwrap_or_default();
         let receipts = durable_nodes
             .iter()
             .map(|replica_node_id| {
@@ -1758,11 +1476,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replica_node_id: replica_node_id.clone(),
                     content_hash: Some(content_hash.to_string()),
                     received_at: OffsetDateTime::now_utc(),
-                    generation: self.backend_receipt_slot_generation(
-                        &intent.object_id,
-                        &intent.target_version,
-                        replica_node_id,
-                    )?,
+                    generation: match planned_generations.get(replica_node_id) {
+                        Some(generation) => *generation,
+                        None => self.backend_receipt_slot_generation(
+                            &intent.object_id,
+                            &intent.target_version,
+                            replica_node_id,
+                        )?,
+                    },
                 })
             })
             .collect::<Result<Vec<_>, DfsError>>()?;
@@ -2038,19 +1759,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.coordinator
             .commit_intent(&intent.intent_id)
             .map_err(DfsError::from)?;
-        // Publication can reach W while desired replicas are still missing.
-        // Hand off the work produced by this intent, without waking repair for
-        // a fully replicated write or unrelated coordinator jobs.
-        if intent.desired_replica_nodes.iter().any(|node| {
-            self.coordinator
-                .repair_job_for_target(&intent.intent_id, node)
-                .is_some()
-        }) {
-            self.record_message_committed_work(DfsMessageCommittedWork {
-                repair_maintenance: true,
-                ..Default::default()
-            });
-        }
         drop(coordinator_span);
         let coordinator_ms = coordinator_started.elapsed().as_millis();
         let memory_started = Instant::now();
@@ -2295,7 +2003,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
         self.restore_pending_write_for_intent_if_missing(&intent.intent_id, &intent.object_id)?;
-        self.restore_backend_receipt_pages_for_intent(&stored, true)?;
+        self.restore_backend_receipt_pages_for_intent(&stored)?;
         if recovered {
             self.record_durable_write_intent_work(&actual, &[]);
         }
@@ -2628,13 +2336,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(|pending| pending.version.clone())
                     .unwrap_or_else(|| intent.target_version.clone()),
                 content_hash,
-                repair_jobs: self
-                    .coordinator
-                    .repair_jobs()
-                    .iter()
-                    .filter(|job| job.intent_id == intent_id)
-                    .cloned()
-                    .collect(),
+                repair_jobs: self.coordinator.missing_replica_jobs(intent_id),
             })
         } else {
             let _pending =

@@ -113,13 +113,8 @@ impl DfsTestRuntime {
                         .into(),
                 );
             }
-            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(
+            crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(
                 &crate::default_dfs_metadata_shards_root(&data),
-            )
-            .map_err(|e| e.to_string())?;
-            let queue = crate::default_dfs_repair_attempt_snapshot_path(&data);
-            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(
-                queue.parent().ok_or("retained queue has no parent")?,
             )
             .map_err(|e| e.to_string())?;
             let wal = paths.kv_paths().raft_wal_paths(&node.node_id);
@@ -335,7 +330,7 @@ fn observe_healthy_shard(
     let id = DfsMetadataShardId::new(&shard.shard_id);
     let root = crate::local_dfs_metadata_shard_path(data, &id);
     let identity = retained_native_path_identity(&root, true)?;
-    crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+    crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(&root)
         .map_err(|e| e.to_string())?;
     let _guard = crate::metadata_lock::try_metadata_inspection_lock(
         root.clone(),

@@ -7,9 +7,6 @@ mod native_noop_tests;
 #[path = "placement/native_policy_tests.rs"]
 mod native_policy_tests;
 #[cfg(test)]
-#[path = "placement/native_repair_authority_tests.rs"]
-mod native_repair_authority_tests;
-#[cfg(test)]
 #[path = "placement/native_start_checkpoint_tests.rs"]
 mod native_start_checkpoint_tests;
 #[cfg(test)]
@@ -2425,306 +2422,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// sinomo:kv-consistency: Inspect bounded placement decisions during repair recovery; each replacement revalidates the current configuration and acquires its existing mutation permit.
-    pub(crate) fn placement_plans_for_repair(
-        &mut self,
-    ) -> Result<Vec<DfsPlacementReconciliationJob>, DfsError> {
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Ok(Vec::new());
-        };
-        let store = DfsControlPlaneStore::new(control_plane.as_mut());
-        let fs = crate::sifs_file_system_id();
-        let Some(config) = store.get_file_system_config(&fs)? else {
-            return Ok(Vec::new());
-        };
-        let page = store.placement_reconciliation_activity(
-            &fs,
-            &[
-                crate::DfsPlacementReconciliationActivityStatus::Completed,
-                crate::DfsPlacementReconciliationActivityStatus::Running,
-                crate::DfsPlacementReconciliationActivityStatus::Retrying,
-            ],
-            None,
-            None,
-            MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE,
-        )?;
-        let mut plans = Vec::new();
-        for activity in page.activities {
-            let Some(job) = store.placement_reconciliation(&fs, &activity.job_id)? else {
-                continue;
-            };
-            if job.state != DfsPlacementReconciliationState::Failed
-                && job.supports_snapshot_reconciliation()
-                && placement_config_remains_authoritative_for_job(
-                    &job.accepted_config,
-                    &config,
-                    &job,
-                )
-            {
-                let covers_filesystem = job.path == "/" && job.scope == DfsPlacementScope::Subtree;
-                plans.push(job);
-                if covers_filesystem {
-                    break;
-                }
-            }
-        }
-        // Ordering selects a candidate, not authority. The exact record and
-        // configuration are checked again by the existing permit transaction.
-        plans.sort_by(|a, b| {
-            b.created_at_unix_nanos
-                .cmp(&a.created_at_unix_nanos)
-                .then_with(|| b.job_id.cmp(&a.job_id))
-        });
-        Ok(plans)
-    }
-
-    pub(crate) fn repair_may_need_placement_recovery(
-        &self,
-        repair: &crate::DistributedRepairJob,
-        observed_config: Option<&DfsFileSystemConfig>,
-    ) -> Result<bool, DfsError> {
-        if self.control_plane.is_none() {
-            return Ok(false);
-        }
-        let Some(intent) = self.coordinator.intent(&repair.intent_id) else {
-            return Ok(false);
-        };
-        if !intent.publication.is_current() {
-            return Ok(false);
-        }
-        if placement_reconciliation_job_id_from_intent_id(&repair.intent_id).is_some() {
-            return Ok(true);
-        }
-        let object = self.current_read_object_metadata(&repair.object_id)?;
-        // Managed placement applies only to the absolute POSIX namespace.
-        // Legacy relative object paths have no matching placement job.
-        if !object.path.starts_with('/') || object.version != repair.version {
-            return Ok(false);
-        }
-        if let Some(config) =
-            observed_config.filter(|config| config.file_system_id == object.file_system_id)
-        {
-            let resolved = self.resolved_current_object_placement_policy(
-                config,
-                &object,
-                intent.policy.desired_replicas,
-                None,
-            )?;
-            if resolved.policy.min_commit_replicas != intent.policy.min_commit_replicas
-                || resolved.policy.desired_replicas != intent.policy.desired_replicas
-            {
-                return Ok(true);
-            }
-        }
-        self.metadata_backend
-            .as_ref()
-            .map(|backend| backend.has_current_placement_repair_owner(&object))
-            .transpose()
-            .map(|owner| owner.unwrap_or(false))
-            .map_err(DfsError::from)
-    }
-
-    pub(crate) fn superseding_repair_plan<'a>(
-        &self,
-        repair: &crate::DistributedRepairJob,
-        plans: &'a [DfsPlacementReconciliationJob],
-    ) -> Result<Option<(DfsObjectMetadata, &'a DfsPlacementReconciliationJob)>, DfsError> {
-        let Some(intent) = self.coordinator.intent(&repair.intent_id) else {
-            return Ok(None);
-        };
-        if !intent.publication.is_current() {
-            return Ok(None);
-        }
-        let object = self.current_read_object_metadata(&repair.object_id)?;
-        if object.version != repair.version {
-            return Ok(None);
-        }
-        let Some(plan) = plans.iter().find(|plan| {
-            plan.file_system_id == object.file_system_id
-                && placement_job_matches(plan, &object.path)
-        }) else {
-            metrics::counter!("sinomo.dfs.background.items", "worker" => "repair", "kind" => "replacement_plan_unavailable").increment(1);
-            return Ok(None);
-        };
-        if plan.state != DfsPlacementReconciliationState::Completed {
-            metrics::counter!("sinomo.dfs.background.items", "worker" => "repair", "kind" => "replacement_plan_active").increment(1);
-            // An accepted running plan owns its transition and progress.
-            // Recovery must not replay an older completed plan over it.
-            return Ok(None);
-        }
-        let original_placement = placement_reconciliation_job_id_from_intent_id(&repair.intent_id);
-        if original_placement == Some(plan.job_id.as_str()) {
-            metrics::counter!("sinomo.dfs.background.items", "worker" => "repair", "kind" => "replacement_owns_current").increment(1);
-            return Ok(None);
-        }
-        let (_, _, replacement) = self.reconciliation_placement_for_object_with_pins(
-            &plan.accepted_config,
-            plan,
-            &object,
-            &self.content_pin_nodes(&object.object_id),
-        )?;
-        if original_placement.is_none()
-            && replacement
-                .plan
-                .desired_replica_nodes
-                .contains(&repair.missing_replica_node_id)
-        {
-            metrics::counter!("sinomo.dfs.background.items", "worker" => "repair", "kind" => "replacement_target_current").increment(1);
-            return Ok(None);
-        }
-        Ok(Some((object, plan)))
-    }
-
-    /// Retire a bounded group under the existing job-scoped permit. Each
-    /// object's mutation still validates its version, pins and accepted plan.
-    /// The permit is released before the repair executor sends any blob RPC.
-    pub(crate) fn replace_superseded_repair_obligations(
-        &mut self,
-        queued: &[crate::DistributedRepairJob],
-        plans: &[DfsPlacementReconciliationJob],
-        limit: usize,
-        observed_config: Option<&DfsFileSystemConfig>,
-        allowed: impl Fn(&crate::DistributedRepairJob) -> bool,
-    ) -> Result<usize, DfsError> {
-        self.replace_superseded_repair_obligations_recording(
-            queued,
-            plans,
-            limit,
-            observed_config,
-            allowed,
-            &mut Vec::new(),
-        )
-    }
-
-    pub(crate) fn replace_superseded_repair_obligations_recording(
-        &mut self,
-        queued: &[crate::DistributedRepairJob],
-        plans: &[DfsPlacementReconciliationJob],
-        limit: usize,
-        observed_config: Option<&DfsFileSystemConfig>,
-        allowed: impl Fn(&crate::DistributedRepairJob) -> bool,
-        retired_records: &mut Vec<crate::DfsRepairAttemptRecord>,
-    ) -> Result<usize, DfsError> {
-        let Some(first) = queued.first().filter(|first| limit > 0 && allowed(first)) else {
-            return Ok(0);
-        };
-        let Some((object, plan)) = self.superseding_repair_plan(first, plans)? else {
-            return Ok(0);
-        };
-        let file_system_id = object.file_system_id.clone();
-        let first_path = object.path.clone();
-        let mut seen = BTreeSet::from([(object.object_id.clone(), object.version.clone())]);
-        let mut batch = vec![(first.intent_id.clone(), object)];
-        // Sparse or interleaved jobs must not turn one bounded pass into a
-        // second scan of the entire recovery queue.
-        for repair in queued.iter().skip(1).take(limit.saturating_mul(4).min(128)) {
-            if batch.len() >= limit {
-                break;
-            }
-            if !allowed(repair)
-                || seen.contains(&(repair.object_id.clone(), repair.version.clone()))
-                || !self.repair_retry_is_due(&repair.intent_id, &repair.missing_replica_node_id)
-            {
-                continue;
-            }
-            if self.restore_pending_write_for_repair_job(repair)?
-                == crate::service_commit::RepairProducerCustodyReadiness::Parked
-            {
-                continue;
-            }
-            let Some(pending) = self.writes.pending_writes.get(&repair.intent_id).cloned() else {
-                continue;
-            };
-            if !self.pending_repair_is_locally_authoritative(&pending)?
-                || !self.pending_repair_targets_current_content(repair, &pending)?
-                || !self.repair_may_need_placement_recovery(repair, observed_config)?
-            {
-                continue;
-            }
-            let Some((object, selected)) = self.superseding_repair_plan(repair, plans)? else {
-                continue;
-            };
-            if selected.job_id != plan.job_id || object.file_system_id != file_system_id {
-                continue;
-            }
-            seen.insert((object.object_id.clone(), object.version.clone()));
-            batch.push((repair.intent_id.clone(), object));
-        }
-        let replaced = self
-            .with_authoritative_placement_reconciliation(
-                &file_system_id,
-                &plan.job_id,
-                Some(&first_path),
-                batch.len(),
-                |service, current_plan, accepted_config| {
-                    if current_plan.state != DfsPlacementReconciliationState::Completed {
-                        return Ok(0);
-                    }
-                    let mut replaced = 0;
-                    for (old_intent_id, object) in batch {
-                        // The permit covers the job, not just its first path.
-                        if !placement_job_matches(current_plan, &object.path) {
-                            continue;
-                        }
-                        let (resolved, replication, placement) = service
-                            .reconciliation_placement_for_object_with_pins(
-                                accepted_config,
-                                current_plan,
-                                &object,
-                                &service.content_pin_nodes(&object.object_id),
-                            )?;
-                        let retirement_identity =
-                            queued
-                                .iter()
-                                .find(|repair| repair.intent_id == old_intent_id)
-                                .and_then(|repair| {
-                                    service.writes.pending_writes.get(&old_intent_id).map(
-                                        |pending| {
-                                            crate::service_repair::retired_repair_identity(
-                                                repair, pending,
-                                            )
-                                        },
-                                    )
-                                });
-                        service.reconcile_object_placement_under_authority(
-                            current_plan,
-                            accepted_config,
-                            &object.path,
-                            &object.object_id,
-                            &object.version,
-                            resolved.policy.consistency,
-                            replication,
-                            &placement.plan.desired_replica_nodes,
-                            Some(&old_intent_id),
-                            None,
-                        )?;
-                        let retired = service
-                            .metadata_backend
-                            .as_ref()
-                            .map(|backend| {
-                                backend.get_intent_receipt(&object.object_id, &old_intent_id)
-                            })
-                            .transpose()?
-                            .flatten()
-                            .is_some();
-                        if retired {
-                            if let Some(record) = retirement_identity {
-                                retired_records.push(record);
-                            }
-                            service.retire_committed_repair(&old_intent_id);
-                            replaced += 1;
-                        }
-                    }
-                    Ok(replaced)
-                },
-            )?
-            .unwrap_or(0);
-        if replaced > 0 {
-            metrics::counter!("sinomo.dfs.background.items", "worker" => "repair", "kind" => "superseded_obligation").increment(replaced as u64);
-        }
-        Ok(replaced)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn reconcile_object_placement_under_authority(
         &mut self,
@@ -2968,12 +2665,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if !retired.is_empty() {
                     self.record_message_committed_work(DfsMessageCommittedWork {
                         publish_metadata: true,
-                        repair_maintenance: true,
                         ..Default::default()
                     });
-                }
-                for old_id in retired {
-                    self.retire_committed_repair(&old_id);
                 }
                 retirement_cursor = next;
                 if retirement_cursor.is_none() {
@@ -2981,8 +2674,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        self.coordinator
-            .restore_intent_deferring_repair_rebuild(intent)?;
+        self.coordinator.restore_intent(intent)?;
         for node_id in durable_receipts {
             self.coordinator
                 .record_durable_receipt(&intent_id, node_id)?;
@@ -3005,65 +2697,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
             return Ok(());
         }
-        // The exact current job, plan and local author were validated above.
-        // Restore only its missing targets; broad hydration must not substitute
-        // for the durable queue handoff, including an idempotent request replay.
-        self.coordinator
-            .set_committed_repair_active(&intent_id, true);
-        self.restore_pending_write_for_intent_if_missing(&intent_id, object_id)?;
-        if let Some(execution) = self.publication_execution.current() {
-            // A handoff replay keeps the original committed metadata, so it
-            // does not cross the new-commit enrollment callback. The current
-            // primary still needs its first local producer before handing
-            // derived work to the queue. Reuse that same enrollment: existing
-            // named/unknown custody and retry backoff are never replaced.
-            let now = dfs_now_unix_nanos();
-            let births = desired_replica_node_ids
-                .iter()
-                .filter(|target| {
-                    self.coordinator
-                        .repair_job_for_target(&intent_id, target)
-                        .is_some()
-                })
-                .map(|target| crate::DfsRepairAttemptRecord {
-                    intent_id: intent_id.clone(),
-                    object_id: object_id.clone(),
-                    version: expected_version.clone(),
-                    content_hash: content_hash.clone(),
-                    missing_replica_node_id: target.clone(),
-                    attempts: 0,
-                    in_flight: false,
-                    last_attempt_unix_nanos: 0,
-                    next_retry_unix_nanos: now,
-                    transfer_request_id: None,
-                    last_error: None,
-                    transfer_delivery_state: Some(
-                        sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-                    ),
-                    completed_transfer_request_id: None,
-                    transfer_kind: Some(
-                        sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair,
-                    ),
-                })
-                .collect::<Vec<_>>();
-            if let Some(store) = self.owned_repair_queue_store()? {
-                crate::service_repair::enroll_prepared_repair_targets_in_store(
-                    &sinomo_core::local::SinomoDataDir::new(execution.data_root()),
-                    &store, &self.repair_attempt_records, &self.writes.pending_writes, &births,
-                )?;
-            } else {
-                crate::service_repair::enroll_prepared_repair_targets(
-                    &sinomo_core::local::SinomoDataDir::new(execution.data_root()),
-                    &self.repair_attempt_records, &self.writes.pending_writes, &births,
-                )?;
-            }
-        }
-        if self.coordinator.capture_active_repair_jobs(&intent_id) {
-            self.record_message_committed_work(DfsMessageCommittedWork {
-                repair_maintenance: true,
-                ..Default::default()
-            });
-        }
+        // The new placement intent's missing targets are needs in the shard's
+        // repair index; the primary's executor schedules them.
         Ok(())
     }
 
@@ -4591,6 +4226,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(PlacementIntentAuthority::Stale);
         };
+        self.placement_authority_for_intent(intent)
+    }
+
+    fn placement_authority_for_intent(
+        &mut self,
+        intent: DistributedWriteIntent,
+    ) -> Result<PlacementIntentAuthority, DfsError> {
+        let intent_id = intent.intent_id.clone();
+        let intent_id = intent_id.as_str();
         if matches!(
             intent.state,
             DfsWriteIntentState::Rejected | DfsWriteIntentState::Aborted
@@ -4655,10 +4299,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intents: &[DistributedWriteIntent],
     ) -> Result<(), DfsError> {
-        let mut committed = BTreeSet::new();
         for intent in intents {
+            // A stale committed placement owns no executable work: its
+            // retirement changes the repair index, which drops its needs.
             if intent.state == DfsWriteIntentState::Committed {
-                committed.insert(intent.intent_id.clone());
                 continue;
             }
             let content_hash = self
@@ -4677,7 +4321,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.coordinator.restore_intent(aborted)?;
             self.remove_pending_write_state(&intent.intent_id);
         }
-        self.park_committed_repairs(&committed);
         Ok(())
     }
 
@@ -4733,55 +4376,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(matches)
     }
 
-    /// Check committed repair eligibility against the existing job/config view.
-    /// This boolean lends no mutation authority: receipt/effect paths retain
-    /// their own permit. An already-released permit cannot fence later work.
-    /// Uncommitted intents keep the original permit-held retirement path.
-    pub(crate) fn placement_intent_remains_authoritative(
-        &mut self,
-        intent_id: &str,
-    ) -> Result<bool, DfsError> {
-        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
-            return Ok(false);
-        };
-        if intent.state != DfsWriteIntentState::Committed {
-            return match self.placement_intent_authority(intent_id)? {
-                PlacementIntentAuthority::Ordinary => Ok(true),
-                PlacementIntentAuthority::Stale => Ok(false),
-                PlacementIntentAuthority::Managed(mut permit) => {
-                    self.release_placement_authority_permit(&mut permit)?;
-                    Ok(true)
-                }
-            };
-        }
-        let Some(job_id) = placement_reconciliation_job_id_from_intent_id(intent_id) else {
-            if intent_id.starts_with("placement:") {
-                return Err(DfsError::Distributed {
-                    message: format!("malformed reserved placement intent id: {intent_id}"),
-                });
-            }
-            return Ok(true);
-        };
-        let object = self.current_read_object_metadata(&intent.object_id)?;
-        let context = self.authoritative_placement_reconciliation_for_path(
-            &intent.file_system_id,
-            job_id,
-            Some(&object.path),
-        )?;
-        let eligible = if let Some((job, config, _)) = context {
-            // Retain the native host/process requirement of the permit path;
-            // a configuration reader alone cannot become a repair producer.
-            self.current_placement_process_identity(job_id)?;
-            self.managed_placement_intent_matches_job(&intent, &object, &job, &config)?
-        } else {
-            false
-        };
-        if !eligible {
-            self.retire_stale_placement_intents(std::slice::from_ref(&intent))?;
-        }
-        Ok(eligible)
-    }
-
     /// Run one bounded placement-derived mutation while holding the exact v1
     /// job/config permit. Ordinary foreground intents do not touch cluster KV.
     /// The explicit finally-style release keeps every success and error path
@@ -4795,7 +4389,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         action: impl FnOnce(&mut Self) -> Result<R, DfsError>,
     ) -> Result<Option<R>, DfsError> {
-        match self.placement_intent_authority(intent_id)? {
+        let authority = self.placement_intent_authority(intent_id)?;
+        self.run_with_placement_intent_authority(authority, action)
+    }
+
+    /// The same authority check for repair publication, from the shard
+    /// tables' intent record: a repair reply or the executor's own
+    /// publication runs on whichever lane serves it, whether or not that
+    /// lane holds the write's state.
+    pub(crate) fn with_table_intent_placement_authority<R>(
+        &mut self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+        action: impl FnOnce(&mut Self) -> Result<R, DfsError>,
+    ) -> Result<Option<R>, DfsError> {
+        let record = match self.metadata_backend.as_ref() {
+            Some(backend) => backend.get_intent(object_id, intent_id)?,
+            None => None,
+        };
+        let intent = match record {
+            Some(record) => crate::intent::distributed_intent_from_record(&record),
+            None => match self.coordinator.intent(intent_id).cloned() {
+                Some(intent) => intent,
+                None => return Ok(None),
+            },
+        };
+        let authority = self.placement_authority_for_intent(intent)?;
+        self.run_with_placement_intent_authority(authority, action)
+    }
+
+    fn run_with_placement_intent_authority<R>(
+        &mut self,
+        authority: PlacementIntentAuthority,
+        action: impl FnOnce(&mut Self) -> Result<R, DfsError>,
+    ) -> Result<Option<R>, DfsError> {
+        match authority {
             PlacementIntentAuthority::Ordinary => action(self).map(Some),
             PlacementIntentAuthority::Stale => Ok(None),
             PlacementIntentAuthority::Managed(mut permit) => {

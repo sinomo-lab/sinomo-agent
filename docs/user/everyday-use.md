@@ -337,9 +337,8 @@ claim that the client performed a path-scoped repair.
 Use **Storage health** for the cluster-wide view. It keeps object/version
 counts, pending writes, a bounded missing-copy list, and links to the Cluster
 view, mount settings, and reconciliation activity out of the everyday file
-list. Disaster-recovery operations such as rebuilding a lost repair queue or
-clearing fenced placement authority remain explicit operator commands; they
-are not ordinary Files actions.
+list. Disaster-recovery operations such as clearing fenced placement authority
+remain explicit operator commands; they are not ordinary Files actions.
 
 On supported desktop platforms, an operator can also mount a subtree through
 the host filesystem:

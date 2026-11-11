@@ -3906,11 +3906,7 @@ fn mount_sifs_cloud_files_inner(
             lifecycle.local_change_sync = writable_state.status();
             let materialization_audit_intents = writable_state.materialization_audit_intents();
             let opened = mounted_mutation_handoff
-                .run_captured_mount_open(|| {
-                    let opened = open_sifs_service(request.data_dir_root.clone())?;
-                    let repair_records = opened.service.durable_repair_queue_records();
-                    Ok::<_, CloudFilesModuleError>((opened, repair_records))
-                })
+                .run_captured_mount_open(|| open_sifs_service(request.data_dir_root.clone()))
                 .map_err(|detail| CloudFilesModuleError {
                     code: "mounted-mutation-mount-open".to_string(),
                     detail,
@@ -8636,6 +8632,7 @@ mod tests {
             message_id: 107,
             message: dfs::DfsNetworkMessage::StageBlob(dfs::DfsStageBlobCommand {
                 request_id: "cloud-files-daemon-peer-stage".to_string(),
+                receipt_generation: 0,
                 intent_id: "cloud-files-daemon-peer-intent".to_string(),
                 file_system_id: dfs::sifs_file_system_id(),
                 object_id: dfs::DfsObjectId::from_legacy_named(
@@ -8766,6 +8763,7 @@ mod tests {
             message_id: 43,
             message: dfs::DfsNetworkMessage::StageBlob(dfs::DfsStageBlobCommand {
                 request_id: "cloud-files-loopback-stage".to_string(),
+                receipt_generation: 0,
                 intent_id: "cloud-files-loopback-intent".to_string(),
                 file_system_id: dfs::sifs_file_system_id(),
                 object_id: dfs::DfsObjectId::from_legacy_named(

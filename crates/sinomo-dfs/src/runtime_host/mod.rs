@@ -225,48 +225,14 @@ pub struct DfsDataOwnerLock {
     file: File,
     physical_data_root: PathBuf,
     selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
-    original_repair_fixture: Option<DfsOriginalRepairFixture>,
-    #[cfg(any(test, feature = "test-support"))]
-    native_repair_custody: Mutex<Option<Arc<data_plane::NativeRepairCustodyScope>>>,
-}
-
-/// Explicit prospective fixture expectations, never admission/authority DATA.
-/// It retains neither DATA owner nor resident content handle.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DfsOriginalRepairFixture {
-    identity: Arc<Mutex<Option<crate::content_store::ReceivedRepairFixtureIdentity>>>,
-    targets: Arc<Mutex<std::collections::BTreeSet<NodeId>>>,
-}
-impl DfsOriginalRepairFixture {
-    #[cfg(any(test, feature = "test-support"))]
-    fn open(&self, owner: &DfsDataOwnerLock) -> Result<LocalContentStore, DfsRuntimeError> {
-        owner.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture has no actual checked native DATA layout owner".into() })?;
-        let expected = self.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture expectation poisoned".into() })?;
-        let identity = expected.as_ref().ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture has no explicitly admitted physical content identity".into() })?;
-        if !identity.is_at_root(&owner.physical_data_root.join("dfs/content")) { return Err(DfsRuntimeError::Parse { detail: "original Repair fixture belongs to another actual DATA owner".into() }); }
-        LocalContentStore::reopen_received_repair_fixture(identity).map_err(Into::into)
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    fn admit(&self, owner: &DfsDataOwnerLock) -> Result<(), DfsRuntimeError> {
-        owner.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture admission requires its actual checked native owner".into() })?;
-        let mut expected = self.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture expectation poisoned".into() })?;
-        if let Some(identity) = expected.as_ref() {
-            if !identity.is_at_root(&owner.physical_data_root.join("dfs/content")) { return Err(DfsRuntimeError::Parse { detail: "original Repair fixture cannot adopt another DATA owner".into() }); }
-            LocalContentStore::reopen_received_repair_fixture(identity)?;
-        } else {
-            let (_, identity) = LocalContentStore::new_original_repair_fixture(owner.physical_data_root.join("dfs/content"))?;
-            *expected = Some(identity);
-        }
-        Ok(())
-    }
 }
 
 /// Explicit per-native-fixture expectation retained across component reopen.
 /// It owns representation identities only, never an OS owner or authority.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DfsSelectedOriginalDataFixture {
+    #[cfg(any(test, feature = "test-support"))]
     layout: Arc<Mutex<Option<Arc<crate::DfsSelectedOriginalDataLayout>>>>,
-    original_repair: Option<DfsOriginalRepairFixture>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -277,19 +243,6 @@ impl DfsSelectedOriginalDataFixture {
         })?;
         let actual = owner.admit_selected_original_fixture(expected.clone())?;
         *expected = Some(actual);
-        if let Some(fixture) = &self.original_repair {
-            fixture.admit(owner)?;
-            owner.original_repair_fixture = Some(fixture.clone());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn with_original_repair() -> Self {
-        Self { original_repair: Some(DfsOriginalRepairFixture::default()), ..Self::default() }
-    }
-
-    pub(crate) fn select_original_repair_target(&self, target: NodeId) -> Result<(), DfsRuntimeError> {
-        self.original_repair.as_ref().ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture not admitted before native start".into() })?.targets.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture target mutex poisoned".into() })?.insert(target);
         Ok(())
     }
 
@@ -310,11 +263,6 @@ impl DfsSelectedOriginalDataFixture {
             return Err(DfsRuntimeError::Parse {
                 detail: "selected native fixture retained another layout expectation".into(),
             });
-        }
-        match (&self.original_repair, &owner.original_repair_fixture) {
-            (None, None) => {}
-            (Some(expected), Some(actual)) if Arc::ptr_eq(&expected.identity, &actual.identity) => { actual.open(owner)?; }
-            _ => return Err(DfsRuntimeError::Parse { detail: "retained owner cannot change original Repair fixture admission".into() }),
         }
         Ok(())
     }
@@ -347,51 +295,11 @@ pub fn storage_file_identity(file: &File) -> std::io::Result<(u64, u64)> {
 }
 
 impl DfsDataOwnerLock {
-    pub(crate) fn original_repair_content_identity(&self) -> Result<crate::content_store::ReceivedRepairFixtureIdentity, DfsRuntimeError> {
-        self.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair content identity has no actual checked DATA owner".into() })?;
-        let fixture = self.original_repair_fixture.as_ref().ok_or_else(|| DfsRuntimeError::Parse { detail: "actual DATA owner has no original Repair content fixture".into() })?;
-        let identity = fixture.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair content expectation poisoned".into() })?.clone()
-            .ok_or_else(|| DfsRuntimeError::Parse { detail: "actual DATA owner has no admitted physical content identity".into() })?;
-        if !identity.is_at_root(&self.physical_data_root.join("dfs/content")) { return Err(DfsRuntimeError::Parse { detail: "original Repair content expectation belongs to another actual DATA owner".into() }); }
-        identity.check_original_physical_identity()?;
-        Ok(identity)
-    }
-
-    pub(crate) fn selects_original_repair_target(&self, target: &NodeId) -> Result<bool, DfsRuntimeError> {
-        self.original_repair_fixture.as_ref().map(|fixture| fixture.targets.lock().map(|targets| targets.contains(target)).map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture target mutex poisoned".into() })).transpose().map(|selected| selected.unwrap_or(false))
-    }
 
     pub(crate) fn open_native_content(&self) -> Result<LocalContentStore, DfsRuntimeError> {
-        match &self.original_repair_fixture {
-            #[cfg(any(test, feature = "test-support"))]
-            Some(fixture) => fixture.open(self),
-            #[cfg(not(any(test, feature = "test-support")))]
-            Some(_) => Err(DfsRuntimeError::Parse { detail: "original Repair fixture content is unavailable in a production reader".into() }),
-            None => LocalContentStore::new(self.physical_data_root.join("dfs/content")).map_err(Into::into),
-        }
+        LocalContentStore::new(self.physical_data_root.join("dfs/content")).map_err(Into::into)
     }
 
-    pub(crate) fn repair_payload_inspection_context(
-        &self,
-    ) -> Result<crate::content_store::RepairPayloadInspectionContext, DfsRuntimeError> {
-        match &self.original_repair_fixture {
-            #[cfg(any(test, feature = "test-support"))]
-            Some(_) => LocalContentStore::original_repair_inspection_context(
-                &self.original_repair_content_identity()?,
-            )
-            .map_err(Into::into),
-            #[cfg(not(any(test, feature = "test-support")))]
-            Some(_) => Err(DfsRuntimeError::Parse {
-                detail: "original Repair fixture inspection is unavailable in a production reader"
-                    .into(),
-            }),
-            None => Ok(
-                crate::content_store::RepairPayloadInspectionContext::for_default(
-                    self.physical_data_root.join("dfs/content"),
-                ),
-            ),
-        }
-    }
     /// The actual retained owner may carry an explicit fixture reader. The
     /// context owns no DATA lock and therefore creates no owner-lifetime cycle.
     pub(crate) fn selected_original_data_layout(
@@ -436,40 +344,6 @@ impl DfsDataOwnerLock {
     /// capabilities. It grants no filesystem or cluster authorization.
     pub fn storage_owner_file_identity(&self) -> std::io::Result<(u64, u64)> {
         storage_file_identity(&self.file)
-    }
-
-    /// Bind the ordinary queue to the actual currently registered native OS owner.
-    /// A pathname/queue representation or a copied file cannot supply this proof.
-    pub(crate) fn checked_default_repair_queue_path(
-        self: &Arc<Self>,
-    ) -> Result<PathBuf, DfsRuntimeError> {
-        let invalid = |detail: &str| DfsRuntimeError::Parse {
-            detail: detail.into(),
-        };
-        if self.selected_original_data_layout()?.is_some() {
-            return Err(invalid(
-                "ordinary Repair witness refuses selected fixture DATA",
-            ));
-        }
-        let data = SinomoDataDir::new(self.physical_data_root.clone());
-        let paths = DfsRuntimePaths::new(&data);
-        let current = require_daemon_dfs_data_owner_lock(&paths)?;
-        if !Arc::ptr_eq(self, &current) {
-            return Err(invalid(
-                "ordinary Repair witness lost its registered native DATA owner",
-            ));
-        }
-        let named =
-            File::open(&paths.data_owner_lock).map_err(|error| invalid(&error.to_string()))?;
-        let held = self
-            .storage_owner_file_identity()
-            .map_err(|error| invalid(&error.to_string()))?;
-        if storage_file_identity(&named).map_err(|error| invalid(&error.to_string()))? != held {
-            return Err(invalid(
-                "ordinary Repair witness OS lock name differs from held native owner",
-            ));
-        }
-        Ok(crate::default_dfs_repair_attempt_snapshot_path(&data))
     }
 
     pub fn acquire(paths: &DfsRuntimePaths) -> Result<Self, DfsRuntimeError> {
@@ -543,37 +417,25 @@ impl DfsDataOwnerLock {
                 detail: "DFS owner runtime root has no physical data-directory parent".into(),
             })?
             .to_path_buf();
+        // The data root's owner removes the node-local repair state repair no
+        // longer has before anything else of this process reads the root.
+        crate::legacy_repair_state::remove_legacy_repair_state(&SinomoDataDir::new(
+            &physical_data_root,
+        ))
+        .map_err(|source| DfsRuntimeError::Io {
+            path: physical_data_root.display().to_string(),
+            detail: source.to_string(),
+        })?;
         Ok(Self {
             file,
             physical_data_root,
             selected_original_data_layout: None,
-            original_repair_fixture: None,
-            #[cfg(any(test, feature = "test-support"))]
-            native_repair_custody: Mutex::new(None),
         })
     }
 
     pub(crate) fn owns_backend_root(&self, canonical_backend_root: &Path) -> bool {
         canonical_backend_root.starts_with(&self.physical_data_root)
     }
-}
-
-/// The existing native test hook may arm only after mandatory actual-owner
-/// cleanup capture. The local !Send guard also covers callback error/unwind.
-#[cfg(test)]
-pub(crate) fn run_original_repair_test_hook_with_cleanup(
-    owner_lookup: Result<Option<Arc<DfsDataOwnerLock>>, crate::DfsError>,
-    before_execute: impl FnOnce() -> Result<(), crate::DfsError>,
-) -> Result<crate::content_store::OriginalRepairTestFaultCleanup, crate::DfsError> {
-    let owner = owner_lookup?.ok_or_else(|| crate::DfsError::Metadata {
-        message: "original Repair test hook requires its actual native DATA owner".into(),
-    })?;
-    let identity = owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
-    let cleanup = identity.original_repair_test_fault_cleanup().ok_or_else(|| crate::DfsError::Metadata {
-        message: "original Repair test hook requires its private4 cleanup identity".into(),
-    })?;
-    before_execute()?;
-    Ok(cleanup)
 }
 
 impl Drop for DfsDataOwnerLock {
@@ -1980,6 +1842,46 @@ pub(crate) async fn publish_dfs_configuration_events(
     }
 }
 
+/// Wake the node's repair executor whenever the published configuration
+/// changes which shards this node is primary for. A successor serves its new
+/// shard from its own replicated index at once; the executor's pass drops the
+/// changed shards' timing when it observes the same assignment.
+pub(crate) async fn watch_dfs_repair_primary_assignments(
+    data_dir: SinomoDataDir,
+    authority: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    local_node_id: sinomo_core::Id,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let data_root = data_dir.root();
+    let mut published = authority.subscribe_configuration_snapshot();
+    let mut observed = None;
+    loop {
+        let current = Arc::clone(&published.borrow_and_update());
+        if let Ok(Some(shards)) = current.metadata_shards(&crate::sifs_file_system_id()) {
+            let primaries = crate::repair_executor::local_primary_shards(&shards, &local_node_id);
+            if crate::repair_executor::repair_primary_assignments_changed(&mut observed, primaries)
+            {
+                crate::repair_executor::wake_repair_executor(&data_root, "primary_assignment");
+            }
+        }
+        // Any published configuration can bring a lane's authority view up to
+        // an assignment a refused dispatch was waiting for.
+        crate::repair_executor::repair_executor_authority_changed(&data_root);
+        tokio::select! {
+            changed = published.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn publish_dfs_configuration_event(
     client: &ComponentEventClient,
     publication: &sinomo_module::ComponentEventPublication,
@@ -2542,10 +2444,14 @@ fn sinomo_sandbox_replica_candidates(
     );
     candidates.into_iter().collect()
 }
+
+
+
+
 #[cfg(test)]
 use sinomo_core::ClusterNodeAvailability;
 use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use sinomo_core::kv::{KvSnapshot, KvVersion};
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
@@ -2558,7 +2464,6 @@ use sinomo_dfs::DfsFileSystemConfig;
 #[cfg(any(test, feature = "test-support"))]
 use sinomo_dfs::DfsMetadataBackend;
 #[cfg(test)]
-use sinomo_dfs::LocalDfsRepairQueueStore;
 #[cfg(test)]
 use sinomo_dfs::{
     ContentStoreError, ContentStoreGcOptions, ContentStoreVersionGcOptions,
@@ -2568,14 +2473,13 @@ use sinomo_dfs::{
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
     DfsMetadataShardAssignment, DfsMetadataShardStatus, DfsMetadataSnapshotInstallResult,
     DfsMetadataSummary, DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord,
-    DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptSnapshot, DfsReplicaReceiptRecord,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsReplicaReceiptRecord,
     DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
     cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
     file_system_config_key, metadata_shard_key, sifs_node_files_path,
-    write_dfs_repair_attempt_snapshot,
-};
+    };
 #[cfg(test)]
 use sinomo_dfs::{
     DEFAULT_DFS_CONNECTIVITY_PREFIX as DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX,
@@ -2597,12 +2501,11 @@ use sinomo_dfs::{
     DfsMutationLaneKey as DaemonDfsMutationLaneKey,
     DfsMutationScheduler as DaemonDfsMutationScheduler, DfsMutationSchedulerRegistry,
     DfsNodeDetachedSendWorker, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsRepairAttemptRecord,
-    DfsResidentMetadataScope as DaemonDfsResidentMetadataScope,
+    DfsPeerTransportError, DfsResidentMetadataScope as DaemonDfsResidentMetadataScope,
     DfsRuntimeMessageResult as DaemonDfsMessageCommandProcessResult,
     DfsRuntimeMessageServiceLane as DaemonDfsMessageServiceLane, NetworkedDfsService,
     ResidentLocalMetadataShardHandle, ResidentLocalShardedMetadataBackend,
-    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
+    dfs_message_execution_scope,
     dfs_message_is_read_only_request,
     dfs_metadata_journal_rejection as daemon_dfs_metadata_journal_rejection,
     dfs_metadata_journal_rejection_for as daemon_dfs_metadata_journal_rejection_for,
@@ -2614,8 +2517,7 @@ use sinomo_dfs::{
     dfs_visible_mutation_event as daemon_dfs_visible_mutation_event,
     metadata_replica_context_from_authority_projection as daemon_dfs_metadata_replica_context_from_authority_projection,
     metadata_shards_from_authority_projection as daemon_dfs_metadata_shards_from_authority_projection,
-    read_dfs_repair_attempt_snapshot,
-};
+    };
 #[cfg(test)]
 use sinomo_dfs::{
     DefaultDfsCommittedProjectionObserver as DaemonDefaultDfsCommittedProjectionObserver,
@@ -3107,10 +3009,6 @@ static DAEMON_DFS_TEST_REPAIR_MAINTENANCE_EDGE_REQUESTS: OnceLock<Mutex<BTreeMap
 static DAEMON_DFS_TEST_MESSAGE_COMMITTED_EDGE_HOOKS: OnceLock<
     Mutex<BTreeMap<String, Arc<DaemonDfsMessageCommittedEdgeTestHook>>>,
 > = OnceLock::new();
-#[cfg(test)]
-static DAEMON_DFS_TEST_MOUNTED_MUTATION_FAIL_AFTER_REPAIR_PERSIST: OnceLock<
-    Mutex<BTreeSet<PathBuf>>,
-> = OnceLock::new();
 static DAEMON_DFS_MUTATION_SCHEDULERS: OnceLock<DfsMutationSchedulerRegistry> = OnceLock::new();
 static DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS: OnceLock<
     DfsMetadataSchedulerRegistry<DaemonDfsMetadataPublishLaneKey>,
@@ -3126,8 +3024,6 @@ static DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS: OnceLock<
 static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
     sinomo_dfs::DfsMetadataAuthorityRuntimeRegistry<DaemonDfsMetadataAuthorityGenerationKey>,
 > = OnceLock::new();
-static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
-static DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<
     Mutex<BTreeMap<PathBuf, maintenance_host::DaemonDfsReconciliationRequest>>,
 > = OnceLock::new();
@@ -3456,18 +3352,6 @@ pub(crate) use data_plane::{
     daemon_dfs_node_transport_on_runtime, daemon_dfs_peer_transports_on_runtime,
     with_daemon_dfs_control_plane_on_runtime,
 };
-pub(crate) use data_plane::{
-    FreshOriginalRepairReturn, NativeOriginalRepairReturn, OwnedOriginalRepairCompletion,
-    PreparedNativeRepairCustody, prepare_native_repair_custody,
-    send_prepared_native_repair_custody, send_prepared_native_repair_custody_async,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use data_plane::{
-    NativeRepairCustodySelection, call_native_original_repair_owned,
-    select_native_original_repair_custody,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use message_host::defer_native_owned_repair_completion;
 #[cfg(feature = "storage-conversion")]
 pub use storage_import::DfsStorageImportContentReceiver;
 
@@ -3482,18 +3366,13 @@ pub(crate) use maintenance_host::daemon_dfs_maintenance_wake_count;
 use maintenance_host::*;
 use maintenance_host::{
     complete_daemon_dfs_maintenance_reconciliation, daemon_dfs_maintenance_execution_exclusions,
-    daemon_dfs_offline_node_ids, daemon_dfs_repair_maintenance_requested,
-    persist_daemon_dfs_repair_queue_records, record_daemon_dfs_repair_queue_nonempty,
-    refresh_daemon_dfs_repair_queue_nonempty, request_daemon_dfs_repair_maintenance,
-    restore_daemon_dfs_repair_maintenance_request,
-};
+    daemon_dfs_offline_node_ids, };
 pub(crate) use maintenance_host::{
     daemon_dfs_maintenance_notify, daemon_dfs_maintenance_reconciliation_generation,
-    daemon_dfs_pending_reactive_maintenance_work_on_runtime, daemon_dfs_repair_queue_work_is_known,
-    handle_daemon_dfs_mounted_mutation_handoff_on_runtime, notify_daemon_dfs_maintenance_work,
+    daemon_dfs_pending_reactive_maintenance_work_on_runtime, handle_daemon_dfs_mounted_mutation_handoff_on_runtime, notify_daemon_dfs_maintenance_work,
     notify_daemon_dfs_maintenance_work_for_paths, request_daemon_dfs_maintenance_reconciliation,
     request_daemon_dfs_maintenance_reconciliation_with_namespace_jobs,
-    schedule_daemon_dfs_startup_repair_reconciliation,
+    schedule_daemon_dfs_startup_reconciliation,
 };
 
 mod placement_environment;
@@ -3528,6 +3407,7 @@ pub(crate) use maintenance_runtime::{
     DaemonDfsMaintenanceTickOutcome, daemon_dfs_background_network_work_deferred,
     replay_daemon_dfs_mounted_mutation_committed_work_on_runtime,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
+    run_daemon_dfs_repair_executor_turn_in_blocking_task,
 };
 mod publish_host;
 #[cfg(test)]

@@ -56,8 +56,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.tombstones_by_metadata_path.clear();
         self.transient_metadata_object_ids.clear();
         self.transient_metadata_predecessor_object_ids.clear();
-        self.coordinator
-            .reset_projection_preserving_message_capture();
+        self.coordinator.reset_projection();
         self.writes.pending_writes.clear();
         self.reads.pending_reads.clear();
         self.clear_metadata_lookup_cache();
@@ -230,15 +229,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         None => backend
                             .metadata_shard_id_for_path(&job.file_system_id, &job.root_path)?,
                     };
-                    let mut paths = vec![job.root_path.clone()];
-                    if matches!(
-                        job.kind,
-                        DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                    ) && let Some(target_path) = job.target_path.as_ref()
-                        && target_path != &job.root_path
-                    {
-                        paths.push(target_path.clone());
-                    }
                     locks.push((
                         shard_id,
                         job.job_id.clone(),
@@ -360,33 +350,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 true,
             );
         }
-        if job.status == DfsNamespaceJobStatus::Running {
-            let shard_id = self
-                .metadata_backend
+        let shard_id = if job.status == DfsNamespaceJobStatus::Running {
+            self.metadata_backend
                 .as_ref()
                 .map(|backend| {
                     backend.metadata_shard_id_for_path(&job.file_system_id, &job.root_path)
                 })
                 .transpose()?
-                .flatten();
-            let mut paths = vec![job.root_path.clone()];
-            if matches!(
-                job.kind,
-                DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-            ) && let Some(target_path) = job.target_path.as_ref()
-                && target_path != &job.root_path
-            {
-                paths.push(target_path.clone());
-            }
-            self.cross_shard_namespace_locks.upsert_job(
-                shard_id,
-                job.job_id.clone(),
-                job.file_system_id.clone(),
-                paths,
-            );
+                .flatten()
         } else {
-            self.cross_shard_namespace_locks.remove_job(&job.job_id);
-        }
+            None
+        };
+        self.cross_shard_namespace_locks.observe_job(shard_id, job);
         Ok(())
     }
 
@@ -626,7 +601,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut pending_write_records = Vec::new();
         let mut recovered_commit_promotion_records = Vec::new();
-        let mut repair_actionable_intent_ids = BTreeSet::new();
         if !try_walk_metadata_pages_until_cancelled(should_cancel, |intent_scan_cursor| {
             let intent_page = self
                 .metadata_backend
@@ -677,7 +651,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if retained_live
                         && matches!(intent_record.status, DfsWriteIntentStatus::Committed)
                     {
-                        repair_actionable_intent_ids.insert(intent_record.intent_id.clone());
                     }
                     if retained_live
                         || matches!(
@@ -754,10 +727,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // Rebuilding per restored intent/receipt made hydration
                 // quadratic over an unsettled-write backlog and burned seconds
                 // of CPU on every SIFS open of an affected data dir.
-                match self
-                    .coordinator
-                    .restore_intent_deferring_repair_rebuild(intent)
-                {
+                match self.coordinator.restore_intent(intent) {
                     Ok(()) => {}
                     Err(DfsDistributedError::PendingIntentConflict { .. })
                         if matches!(
@@ -793,7 +763,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             self.restore_backend_receipts_for_intent_from_hydration_scan(
                                 &intent_record,
                                 receipts,
-                                false,
                             )?;
                             recovered_commit_promotion_records.push(intent_record.clone());
                             continue;
@@ -813,7 +782,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.restore_backend_receipts_for_intent_from_hydration_scan(
                     &intent_record,
                     receipts,
-                    false,
                 )?;
                 if matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
                     recovered_commit_promotion_records.push(intent_record.clone());
@@ -825,9 +793,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         })
                         .transpose()?
                         .unwrap_or(false)
-                    {
-                        repair_actionable_intent_ids.insert(intent_record.intent_id.clone());
-                    }
+                    {}
                 }
                 if matches!(
                     intent_record.status,
@@ -842,8 +808,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })? {
             return Ok(false);
         }
-        self.coordinator
-            .rebuild_repair_jobs_after_bulk_restore(&repair_actionable_intent_ids);
         if reconstruct_commit_promotions {
             for intent_record in &recovered_commit_promotion_records {
                 if should_cancel() {
@@ -853,12 +817,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
 
-        let repair_intent_ids: BTreeSet<String> = self
-            .coordinator
-            .repair_jobs()
-            .iter()
-            .map(|job| job.intent_id.clone())
-            .collect();
         let mut recovered_commit_ready_intent_ids = Vec::new();
         for (intent_record, locally_adopted_intent) in pending_write_records {
             if should_cancel() {
@@ -911,12 +869,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 intent_record.coordinator_node_id == self.node_id
             };
+            // A committed write's missing replicas are needs in the repair
+            // index; only an unfinished write keeps its transfer state.
             let needs_pending_write = locally_authoritative_intent
-                && (matches!(
+                && matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-                ) || (matches!(intent_record.status, DfsWriteIntentStatus::Committed)
-                    && repair_intent_ids.contains(&intent_record.intent_id)));
+                );
             if needs_pending_write && let Some(content_hash) = intent_record.content_hash.clone() {
                 let size_hint = self.pending_write_size_hint(
                     &intent_record.object_id,
@@ -1187,18 +1146,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &intent_record.object_id,
             &intent_record.target_version,
         )?;
-        self.restore_backend_receipts_for_intent_from_hydration_scan(intent_record, &receipts, true)
+        self.restore_backend_receipts_for_intent_from_hydration_scan(intent_record, &receipts)
     }
 
-    /// See [`restore_backend_durable_receipt_with_repair_rebuild`](Self::restore_backend_durable_receipt_with_repair_rebuild)
-    /// for the `rebuild_repair_jobs` contract; bulk hydration passes `false`
-    /// and rebuilds once afterwards.
 
     fn restore_backend_receipts_for_intent_from_hydration_scan(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
         receipts: &[DfsReplicaReceiptRecord],
-        rebuild_repair_jobs: bool,
     ) -> Result<(), DfsError> {
         for receipt in receipts {
             if let Some(expected_hash) = intent_record.content_hash.as_deref()
@@ -1206,11 +1161,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            self.restore_backend_durable_receipt_with_repair_rebuild(
+            self.restore_backend_durable_receipt(
                 &intent_record.intent_id,
                 receipt.replica_node_id.clone(),
                 false,
-                rebuild_repair_jobs,
             )?;
         }
         Ok(())
@@ -1345,16 +1299,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
             )?;
             for job in page.jobs {
-                if job.status != DfsNamespaceJobStatus::Running
-                    || !matches!(
-                        job.kind,
-                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
-                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
-                    )
-                {
+                if job.status != DfsNamespaceJobStatus::Running {
                     continue;
                 }
                 let Some(paths) = crate::service_state::cross_shard_namespace_job_guard_paths(&job)

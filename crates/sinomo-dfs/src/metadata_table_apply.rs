@@ -1771,7 +1771,7 @@ fn validate_checkpoint_layout(root: &Path, selected: Option<&crate::DfsSelectedO
     if let Some(layout) = selected {
         crate::metadata_api::validate_handoff_layout_root(layout, root)
     } else {
-        crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(root)
+        crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(root)
             .map_err(|error| MetadataBackendError::Rejected {
                 code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
             })
@@ -3210,34 +3210,6 @@ mod tests {
         assert_eq!(table_log_offset, 0);
         assert_eq!(materialized_through_sequence, 0);
         assert!(!metadata_table_path(root.path()).exists());
-    }
-
-    #[test]
-    fn preapplied_batch_rolls_back_when_default_layout_rejects_selected_root() {
-        let root = sinomo_testdir::TestDir::new("dfs-preapply-selected-layout-rejection");
-        let (_, identity) = crate::repair_queue_store::LocalDfsRepairQueueStore::new_selected_original_fixture(
-            root.join("selected")).unwrap();
-        let before = DfsMetadataTables::default();
-        let mut tables = before.clone();
-        let op = namespace_transaction_op("txn_preapply_selected_layout");
-        let mut rollback = DfsMetadataTableRollback::default();
-        tables.apply_with_rollback(op.clone(), &mut rollback);
-        assert_ne!(tables, before);
-        let mut offset = 0;
-        let mut sequence = 0;
-        let mut fingerprint = None;
-        let mut prefix = None;
-        let error = append_preapplied_table_ops(identity.root(), TableMaterializationState {
-            selected_original_data_layout: None, read_snapshot_cache: None,
-            tables: &mut tables, table_log_offset: &mut offset,
-            materialized_through_sequence: &mut sequence,
-            table_snapshot_fingerprint: &mut fingerprint, prefix_proof: &mut prefix,
-        }, 1, vec![op], u64::MAX, rollback).unwrap_err();
-        assert!(matches!(error, MetadataBackendError::Rejected { code: crate::DfsMetadataRejectionCode::Other, .. }));
-        assert_eq!(tables, before);
-        assert_eq!(offset, 0);
-        assert_eq!(sequence, 0);
-        assert!(!metadata_table_path(identity.root()).exists());
     }
 
     #[test]

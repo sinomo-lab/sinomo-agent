@@ -1560,7 +1560,8 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             .into());
         }
 
-        owner_dfs.retry_pending_repairs()?;
+        // Replicas beyond W arrive through the write's own stage sends; the
+        // primary's repair executor serves any that failed.
         let owner_events = owner_dfs.process_incoming()?;
         w_to_n_owner_process_calls = w_to_n_owner_process_calls.saturating_add(1);
         w_to_n_owner_event_count = w_to_n_owner_event_count.saturating_add(owner_events.len());

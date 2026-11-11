@@ -835,7 +835,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// A stage reply is also the outcome of that replica's attempt in the
+    /// repair executor's registry, whichever lane observes it.
     pub(crate) fn handle_stage_blob_response(
+        &mut self,
+        frame_source_node_id: NodeId,
+        response: DfsStageBlobResponse,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        let key = (
+            response.object_id.clone(),
+            response.version.clone(),
+            response.replica_node_id.clone(),
+        );
+        let request_id = response.request_id.clone();
+        let event = self.handle_stage_blob_response_inner(frame_source_node_id, response);
+        // Every exit after the reply ends its attempt; one that failed counts
+        // as a failed attempt with its error.
+        let (outcome, error) = match &event {
+            Ok(Some(NetworkedDfsServiceEvent::BlobStaged { .. })) => {
+                (crate::repair_executor::DfsRepairAttemptOutcome::Settled, None)
+            }
+            Ok(event) => (
+                crate::repair_executor::DfsRepairAttemptOutcome::Failed,
+                event
+                    .as_ref()
+                    .and_then(crate::repair_executor::repair_event_error),
+            ),
+            Err(error) => (
+                crate::repair_executor::DfsRepairAttemptOutcome::Failed,
+                Some(error.to_string()),
+            ),
+        };
+        crate::repair_executor::repair_executor_attempt_ended_with_error(
+            &self.node_id,
+            &key,
+            &request_id,
+            outcome,
+            error,
+        );
+        event
+    }
+
+    fn handle_stage_blob_response_inner(
         &mut self,
         frame_source_node_id: NodeId,
         response: DfsStageBlobResponse,
@@ -1068,19 +1109,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .get(&response.replica_node_id)
                     == Some(&response.request_id)
             });
-        let queue = self
-            .repair_attempt_records
-            .get(&(response.intent_id.clone(), response.replica_node_id.clone()));
-        let requires_queue = queue.is_some();
-        if exact_pending
-            && (!requires_queue
-                || self.replica_queue_matches_current_transfer(
-                    &response.intent_id,
-                    &response.replica_node_id,
-                    &response.request_id,
-                    true,
-                ))
-        {
+        if exact_pending {
             return Ok(());
         }
         Err(DfsError::Distributed {

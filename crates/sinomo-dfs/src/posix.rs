@@ -214,7 +214,7 @@ fn touch_directory_for_batched_child(directory: &mut DfsObjectMetadata, advance_
 }
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
-const POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS: usize = 1;
+const POSIX_WAIT_FOR_COMMIT_STAGE_MAX_TARGETS_PER_PASS: usize = 1;
 const POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP: Duration = Duration::from_millis(10);
 const POSIX_WAIT_FOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const POSIX_LIST_DIR_COLLECT_PAGE_SIZE: usize = 4096;
@@ -383,6 +383,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
+    /// Retry the waiting write's own unfinished stages, bounded when the
+    /// caller set a deadline. A failed retry is reported among the events,
+    /// never as the waiting write's own failure.
+    fn retry_own_stages_reporting_failure(
+        &mut self,
+        intent_id: &str,
+        bounded: bool,
+        events: &mut Vec<crate::NetworkedDfsServiceEvent>,
+    ) {
+        let max_targets = if bounded {
+            POSIX_WAIT_FOR_COMMIT_STAGE_MAX_TARGETS_PER_PASS
+        } else {
+            usize::MAX
+        };
+        let intent_ids = std::collections::BTreeSet::from([intent_id.to_owned()]);
+        if let Err(error) = self.retry_pending_stages_for_intents(&intent_ids, max_targets) {
+            events.push(crate::NetworkedDfsServiceEvent::RepairRetryFailed {
+                reason: error.to_string(),
+            });
+            self.last_events = events.clone();
+        }
+    }
+
     pub(crate) fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,
@@ -430,40 +453,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
-                // Preserve the foreground repair pass after commit, but keep it
-                // bounded when the caller (or the POSIX wrapper) installed an
-                // operation deadline. This retains repair-failure evidence
-                // without allowing recovery scans to outlive the write budget.
-                if foreground_replica_repair && Instant::now() < settle_deadline {
-                    let (_, repair_events) = if caller_deadline.is_some() {
-                        self.retry_pending_repairs_best_effort_bounded(
-                            POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS,
-                        )
-                    } else {
-                        self.retry_pending_repairs_best_effort()
-                    };
-                    if !repair_events.is_empty() {
-                        events.extend(repair_events);
-                        self.last_events = events;
-                    }
-                }
+                // Replicas left below N are needs in the shard's repair index;
+                // the primary's executor sends them. The write drives none.
                 return Ok(outcome);
             }
-            let (_scheduled, repair_events) =
-                if foreground_replica_repair && Instant::now() < settle_deadline {
-                    if caller_deadline.is_some() {
-                        self.retry_pending_repairs_best_effort_bounded(
-                            POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS,
-                        )
-                    } else {
-                        self.retry_pending_repairs_best_effort()
-                    }
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-            if !repair_events.is_empty() {
-                events.extend(repair_events);
-                self.last_events = events.clone();
+            // Before W the write is not committed and has no repair need: it
+            // retries only its own stages, as part of the write protocol,
+            // bounded by any caller deadline.
+            if foreground_replica_repair && Instant::now() < settle_deadline {
+                self.retry_own_stages_reporting_failure(
+                    &intent_id,
+                    caller_deadline.is_some(),
+                    &mut events,
+                );
             }
             // Re-scheduled repairs alone are not progress: on a degraded cluster
             // every retry fails fast and reschedules, and treating that churn as

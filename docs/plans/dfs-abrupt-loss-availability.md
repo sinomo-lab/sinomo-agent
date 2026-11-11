@@ -12,8 +12,8 @@ The baseline journals `PrepareOperationV7` with the complete sealed operation
 and publishes using `CommitPreparedOperationV7` with its exact digest. Ordinary
 metadata publication and sync require every configured participant. Cooperative
 rotation requires the old primary's durable freeze, exact prefix, both assignment
-majorities, both primaries and its complete original repair custody cut. That
-protocol deliberately cannot activate after abrupt loss of the source.
+majorities and both primaries; it carries no repair state. That protocol
+deliberately cannot activate after abrupt loss of the source.
 
 1. Exactly one ordered metadata history and serving authority. A timeout or
    connectivity change requests an attempt; it never grants promotion. Epochs,
@@ -43,6 +43,12 @@ protocol deliberately cannot activate after abrupt loss of the source.
 8. Keep offline membership and recorded copies. Rejoin compares exact prefixes
    and immutable identities, transfers only missing bounded history/content,
    and does not automatically fail back to the original primary.
+9. Repair needs no original-effect custody. A replica below desired N is a need
+   in the replicated shard tables; the successor's repair executor derives it
+   from them, so takeover never depends on the retiring owner's repair work.
+   Each attempt carries its receipt-slot generation, and a late reply publishes
+   only through that generation's compare. Retry timing restarts at the
+   successor.
 
 ## Protocol design obligations
 
@@ -122,9 +128,9 @@ epoch does not preserve the old digest.
 
 Before a potentially ambiguous outbound effect, survivor-durable DFS state must
 cover the complete original command/body, request identity, source/destination,
-content identity, delivery uncertainty and completion evidence. Tuple-only repair
-rows and A's local outbox do not provide this. Separate current executor from
-immutable origin; a successor cannot impersonate A or issue a replacement request.
+content identity, delivery uncertainty and completion evidence. A's local
+outbox does not provide this. Separate current executor from immutable origin; a
+successor cannot impersonate A or issue a replacement request.
 Bounded immutable cut roots, indexed pages and reservation-bound checkpoints
 provide recovery coverage; hydrate and execute the backlog incrementally after
 activation. Missing bodies or uncertain outcomes stay pending. Complete evidence
@@ -182,7 +188,7 @@ current head after takeover. Fetching an already-certified exact immutable
 version remains a one-valid-holder operation and does not acquire a content-W
 availability requirement. A separate lease design is not assumed.
 
-Detached repair, promotion and response commands need their own complete
+Detached promotion and response commands need their own complete
 immutable body/identity/delivery/completion coverage before ambiguous dispatch;
 accepting the original metadata bundle alone does not cover later generated
 effects. Attachment descriptors bind exact original bytes, length/layout and
@@ -195,8 +201,8 @@ fresh request identities.
 
 Admission/activation requires durable coverage of an immutable history/custody
 cut, with bounded indexed pages and checkpointed continuation. It does not require
-executing or hydrating every backlog row. Existing tuple-only V1 queue pages are
-not a substitute where they omit original command bodies.
+executing or hydrating every backlog row. Repair commands are outside this
+coverage (constraint 9).
 
 Promises, accepted ballots and highest-value adoption constitute consensus.
 Existing cluster CAS orders authority reservations but does not prove this new
@@ -216,11 +222,11 @@ revocation. Existing copies and offline membership remain evidence to preserve,
 not a way to widen new-target eligibility.
 
 The [original-effect plan](dfs-original-effect-custody.md) separates complete
-request/body custody, attempts, receiver settlement and caller delivery. Its
-[queue/content join](dfs-repair-custody-root-join.md) reuses the existing physical
-owners. Local enrollment and cooperative transfer do not by themselves prove
-survivor durability before abrupt loss. The [accepted-bundle target](dfs-accepted-bundle-target.md)
-records the bounded abstract model and required Rust refinement.
+request/body custody, attempts, receiver settlement and caller delivery for the
+effects that need it; repair is not one of them. Local enrollment and cooperative
+transfer do not by themselves prove survivor durability before abrupt loss. The
+[accepted-bundle target](dfs-accepted-bundle-target.md) records the bounded
+abstract model and required Rust refinement.
 
 ## Acceptance matrix
 

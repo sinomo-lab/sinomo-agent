@@ -191,7 +191,7 @@ fn commit_kernel(
     service
         .metadata_backend_mut()
         .unwrap()
-        .commit_prepared_operation(digest, guard, None)
+        .commit_prepared_operation(digest, guard)
 }
 
 #[test]
@@ -2281,6 +2281,13 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
     // Repeating an actual complete record is corruption, never an accepted
     // materialization retry. Keep the same real writer across this negative
     // and restore only the previously observed original bytes afterward.
+    // Snapshot readers take no writer lock, and the node's own maintenance and
+    // served lanes would cache the corrupt length; restoring the bytes in place
+    // then shortens their log without a generation change. Hold the node's
+    // Main admission across the negative so that no reader observes it.
+    let quiet_node = runtime
+        .hold_main_mutation_admission(&node)
+        .expect("the node's actual Main admission");
     let negative_writer = repair_snapshot.metadata_write_lock().unwrap();
     let first_bytes = 4 + u32::from_le_bytes(table_bytes[..4].try_into().unwrap()) as usize;
     fs::OpenOptions::new()
@@ -2305,6 +2312,7 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
     );
     fs::write(&table_path, &table_bytes).unwrap();
     drop(negative_writer);
+    drop(quiet_node);
     drop(repair_snapshot);
     drop(service);
     let mut reopened = runtime

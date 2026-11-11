@@ -28,10 +28,10 @@ use crate::{
     DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataStore,
     DfsNamespaceRequestRecord, DfsNamespaceResult, DfsObjectId, DfsObjectMetadata,
     DfsOutboundAttachment, DfsPendingNamespaceRequestPageCursor, DfsPosixCoordinationResult,
-    DfsReadData, DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord,
-    DfsStableNamespaceOperationReconciliation, DfsStableWriteOperationReconciliation, DfsVersion,
-    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
-    ResidentLocalMetadataShardLease, ResidentLocalShardedMetadataBackendLease,
+    DfsReadData, DfsReadRangeData, DfsReadResult, DfsStableNamespaceOperationReconciliation,
+    DfsStableWriteOperationReconciliation, DfsVersion, DistributedEventualCoordinator,
+    DistributedRepairJob, LocalContentStore, ObjectVersionReader, ResidentLocalMetadataShardLease,
+    ResidentLocalShardedMetadataBackendLease,
 };
 
 pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -659,25 +659,6 @@ impl AsMut<dyn DfsMetadataBackend> for DfsMetadataBackendOwner {
 }
 
 impl DfsMetadataBackendOwner {
-    /// Only native resident maintenance uses nonblocking physical snapshot
-    /// admission. Other backend owners retain their existing read contract.
-    pub(crate) fn try_begin_resident_read_snapshot_for_path(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        path: &str,
-    ) -> crate::metadata_error::Result<bool> {
-        match self {
-            Self::Owned(backend) => {
-                backend.begin_consistent_read_snapshot_for_path(file_system_id, path)?;
-                Ok(true)
-            }
-            Self::ResidentShard(lease) => lease.try_begin_resident_read_snapshot(),
-            Self::ResidentSharded(lease) => {
-                lease.try_begin_resident_read_snapshot_for_path(file_system_id, path)
-            }
-        }
-    }
-
     pub(crate) fn resident_exact_shard_id(&self) -> Option<&DfsMetadataShardId> {
         match self {
             Self::ResidentShard(lease) => Some(lease.shard_id()),
@@ -715,7 +696,6 @@ pub struct NetworkedDfsService<T> {
     /// Retry ticks remain the durable scheduling clock; these instants are
     /// deliberately process-local measurement evidence only.
     pub(crate) passive_fetch_started_at: BTreeMap<(String, NodeId), Instant>,
-    pub(crate) repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
     pub(crate) stable_namespace_reconciliation_results:
         BTreeMap<String, DfsStableNamespaceOperationReconciliation>,
@@ -725,6 +705,9 @@ pub struct NetworkedDfsService<T> {
     /// SAME durable request retained across the existing host's remote-phase yield.
     pub(crate) pending_namespace_request_recovery: Option<Box<crate::DfsNamespaceRequestRecord>>,
     pub(crate) completed_remote_namespace_phases: BTreeMap<String, PendingRoutedNamespaceResult>,
+    /// The deadline a file sync's repair wait yielded with, for its re-run.
+    pub(crate) file_sync_wait_deadline:
+        Option<(crate::DfsObjectId, crate::DfsVersion, std::time::Instant)>,
     pub(crate) prepared_remote_sources:
         BTreeMap<String, crate::source_adoption::PreparedSourceAdoption>,
     pub(crate) publication_execution: crate::publication_guard::DfsPublicationContextSlot,
@@ -864,11 +847,6 @@ impl DfsCommittedWorkTracker {
 pub struct DfsMessageProcessReport {
     pub outcome: Result<DfsMessageProcessResult, DfsError>,
     pub committed_work: DfsMessageCommittedWork,
-    /// Exact zero-attempt repair queue entries created by this message.
-    ///
-    /// This is deliberately a delta rather than a snapshot of every pending
-    /// repair owned by the service lane.
-    pub committed_repair_records: Vec<DfsRepairAttemptRecord>,
 }
 
 /// Result of a networked DFS write after the service has applied routing,

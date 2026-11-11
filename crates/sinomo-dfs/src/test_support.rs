@@ -89,40 +89,6 @@ pub use crate::test_runtime::{
 use crate::*;
 use sinomo_core::DfsWriteRequest;
 
-/// Observe the complete existing original slot without changing its custody.
-pub fn original_repair_slot_snapshot(
-    store: &LocalDfsRepairQueueStore,
-    intent_id: &str,
-    target: &sinomo_core::node::NodeId,
-) -> Result<Option<serde_json::Value>, DfsError> {
-    store
-        .original_repair_for_slot(intent_id, target)?
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|error| DfsError::Serialization {
-            message: error.to_string(),
-        })
-}
-/// Read-only evidence for the actual queue Original's current payload pin.
-/// False means no Original slot was found; it never means NotApplied.
-/// True is an observed local content/pin check, not dispatch or publication authority.
-pub fn inspect_original_repair_payload(
-    store: &LocalDfsRepairQueueStore,
-    content_root: &std::path::Path,
-    intent_id: &str,
-    target: &sinomo_core::node::NodeId,
-) -> Result<bool, DfsError> {
-    let Some(birth) = store.original_repair_for_slot(intent_id, target)? else {
-        return Ok(false);
-    };
-    // Validate the retained original and its actually named initial attempt;
-    // callers never supply a root, body or synthetic dispatch identity.
-    let actual = store.validate_original_repair_dispatch(&birth.original)?;
-    crate::content_store::RepairPayloadInspectionContext::for_default(content_root)
-        .inspect(&actual.root)?;
-    Ok(true)
-}
-
 use sinomo_core::node::NodeId;
 
 /// One ordinary hosted current metadata authority, retained with its real
@@ -280,9 +246,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn test_has_active_replica_stage(&self, object: &DfsObjectId) -> bool {
         self.writes.active_replica_stages.contains_key(object)
-    }
-    pub fn test_begin_message_repair_job_capture(&mut self) {
-        self.coordinator.begin_message_repair_job_capture();
     }
 }
 
@@ -452,11 +415,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn test_take_message_committed_work(&mut self) -> DfsMessageCommittedWork {
         self.take_message_committed_work()
     }
-    pub fn test_take_message_committed_repair_queue_records(
-        &mut self,
-    ) -> Vec<DfsRepairAttemptRecord> {
-        self.take_message_committed_repair_queue_records()
-    }
     pub fn test_activate_file_history_repair_roots(
         &mut self,
         roots: impl IntoIterator<Item = (DfsObjectId, DfsVersion)>,
@@ -569,26 +527,7 @@ impl From<TestDistributedWriteOptions> for crate::service_write::DfsDistributedW
         }
     }
 }
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn test_send_repair_replica_attachments_if_routable(
-        &mut self,
-        targets: &[(NodeId, String)],
-        intent: &str,
-        fs: &DfsFileSystemId,
-        object: &DfsObjectId,
-        base: Option<DfsVersion>,
-        version: &DfsVersion,
-        hash: &str,
-        size: u64,
-        metadata: Option<DfsObjectMetadata>,
-    ) -> Result<Vec<bool>, DfsError> {
-        self.send_repair_replica_attachments_if_routable(
-            targets, intent, fs, object, base, version, hash, size, metadata,
-        )
-        .map(|outcomes| outcomes.into_iter().map(|outcome| outcome.sent).collect())
-    }
-}
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {}
 
 pub fn write_intent_receipt(
     intent: &DfsWriteIntentRecord,

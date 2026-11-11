@@ -192,7 +192,7 @@ thread_local! {
 }
 
 fn sync_namespace(
-    stage: &crate::repair_queue_store::SelectedOriginalFixtureIdentity,
+    stage: &crate::selected_fixture::SelectedOriginalFixtureIdentity,
     path: &Path,
 ) -> Result<()> {
     if FAIL_SELECTED_LOCAL_RECOVERY_NAMESPACE.replace(false) {
@@ -200,7 +200,7 @@ fn sync_namespace(
             "injected selected local recovery namespace failure",
         ));
     }
-    crate::repair_handoff::sync_selected_namespace(stage, path)
+    crate::selected_fixture::sync_selected_namespace(stage, path)
         .map_err(|error| selected_layout_rejection(error.to_string()))
 }
 
@@ -394,7 +394,7 @@ fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     }
     let mut file =
         std::fs::File::open(path).map_err(|error| selected_layout_rejection(error.to_string()))?;
-    if !crate::repair_queue_store::same_file_observation(
+    if !crate::selected_fixture::same_file_observation(
         &before,
         &file
             .metadata()
@@ -412,8 +412,8 @@ fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     let after =
         std::fs::symlink_metadata(path).map_err(|e| selected_layout_rejection(e.to_string()))?;
     if bytes.len() as u64 != before.len()
-        || !crate::repair_queue_store::same_file_observation(&before, &after)
-        || !crate::repair_queue_store::same_file_observation(
+        || !crate::selected_fixture::same_file_observation(&before, &after)
+        || !crate::selected_fixture::same_file_observation(
             &after,
             &file
                 .metadata()
@@ -481,7 +481,7 @@ pub(crate) fn read_selected_local_recovery_fence(
 fn recertify(
     path: &Path,
     expected: &[u8],
-    stage: &crate::repair_queue_store::SelectedOriginalFixtureIdentity,
+    stage: &crate::selected_fixture::SelectedOriginalFixtureIdentity,
 ) -> Result<()> {
     let before =
         std::fs::symlink_metadata(path).map_err(|e| selected_layout_rejection(e.to_string()))?;
@@ -496,7 +496,7 @@ fn recertify(
         .write(true)
         .open(path)
         .map_err(|e| selected_layout_rejection(e.to_string()))?;
-    if !crate::repair_queue_store::same_file_observation(
+    if !crate::selected_fixture::same_file_observation(
         &before,
         &file
             .metadata()
@@ -525,8 +525,8 @@ fn recertify(
     sync_namespace(stage, path.parent().expect("checked journal path"))?;
     let after =
         std::fs::symlink_metadata(path).map_err(|e| selected_layout_rejection(e.to_string()))?;
-    if !crate::repair_queue_store::same_file_observation(&before, &after)
-        || !crate::repair_queue_store::same_file_observation(
+    if !crate::selected_fixture::same_file_observation(&before, &after)
+        || !crate::selected_fixture::same_file_observation(
             &after,
             &file
                 .metadata()
@@ -591,12 +591,12 @@ pub(crate) fn write_selected_local_recovery_fence(
         SelectedRecoveryWriterCut::BeforeMarkerPublication,
         None,
     )?;
-    let generation = crate::repair_handoff::publish_and_certify_selected(path, &envelope)
+    let generation = crate::selected_fixture::publish_and_certify_selected(path, &envelope)
         .map_err(|e| selected_layout_rejection(e.to_string()))?;
     sync_namespace(&stage, path.parent().expect("checked journal path"))?;
     let after =
         std::fs::symlink_metadata(path).map_err(|e| selected_layout_rejection(e.to_string()))?;
-    if !crate::repair_queue_store::same_file_observation(&generation, &after) {
+    if !crate::selected_fixture::same_file_observation(&generation, &after) {
         return Err(selected_layout_rejection(
             "selected recovery publication changed during namespace sync",
         ));

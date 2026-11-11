@@ -84,7 +84,7 @@ pub(crate) fn mount_dfs_runtime_tasks(
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            schedule_daemon_dfs_startup_repair_reconciliation(&paths)
+            schedule_daemon_dfs_startup_reconciliation(&paths)
                 .map_err(|error| error.to_string())?;
             let _ = prepared_tx.send(true);
             Ok(())
@@ -398,8 +398,10 @@ async fn run_component_route_generation_watch(
                 }
             }
             generation = subscription.changed() => {
-                if daemon_dfs_repair_queue_work_is_known(&paths) {
-                    notify_daemon_dfs_maintenance_work_for_paths(&paths);
+                // A reachability change can release repairs parked on an
+                // unreachable target; the executor never probes for it.
+                if let Ok(data_dir) = paths.data_dir() {
+                    crate::repair_executor::repair_executor_reachability_changed(&data_dir.root());
                 }
                 match notify_daemon_dfs_metadata_publish_route_generation_on_runtime(&paths, &runtime) {
                     Ok(0) => {}
@@ -449,7 +451,7 @@ pub(super) fn retain_requested_reconciliation(
     decision
 }
 
-async fn run_component_maintenance(
+pub(super) async fn run_component_maintenance(
     paths: DfsRuntimePaths,
     runtime: tokio::runtime::Handle,
     mut node_resources: sinomo_device::NodeResourceMonitor,
@@ -466,8 +468,10 @@ async fn run_component_maintenance(
             return;
         }
     };
-    let phase = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-        .map(|state| crate::dfs_maintenance_member_phase(&state))
+    let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok();
+    let phase = cluster_state
+        .as_ref()
+        .map(crate::dfs_maintenance_member_phase)
         .unwrap_or(Duration::ZERO);
     let started = Instant::now();
     let not_before = started
@@ -479,39 +483,103 @@ async fn run_component_maintenance(
     let mut next_probe = Some(not_before);
     let mut triggered = false;
     let mut immediate = false;
-    // A committed repair request whose tick yielded to foreground work.
+    // An executor turn that yielded to foreground work retries at this time.
     let mut repair_retry_at = None::<Instant>;
+    // A wake that concerns only the repair executor runs only its pass.
+    let mut executor_requested = false;
     let mut resources = node_resources.take_latest();
-    let notify =
-        match daemon_dfs_maintenance_notify(&paths.data_dir().expect("validated data root")) {
-            Ok(notify) => notify,
-            Err(error) => {
-                tracing::warn!(%error, "DFS maintenance has no registered runtime host");
-                return;
-            }
-        };
+    let data_dir = paths.data_dir().expect("validated data root");
+    let notify = match daemon_dfs_maintenance_notify(&data_dir) {
+        Ok(notify) => notify,
+        Err(error) => {
+            tracing::warn!(%error, "DFS maintenance has no registered runtime host");
+            return;
+        }
+    };
+    // Every executor wake reaches this loop on its own edge and runs only the
+    // executor's pass; the executor's pending flag says whether that pass
+    // still has work. Its first pass follows the first observation of this
+    // node's primary assignments.
+    let data_root = data_dir.root();
+    let executor_notify = Arc::new(tokio::sync::Notify::new());
+    let executor_wake = Arc::clone(&executor_notify);
+    let _repair_executor_wake = crate::repair_executor::register_repair_executor_wake(
+        &data_root,
+        cluster_state.as_ref().map(|state| &state.local_node_id),
+        move || {
+            executor_wake.notify_one();
+        },
+    );
+    // The executor timer value that already fired, with the executor's pass
+    // count then. It stays consumed until a pass publishes the executor's
+    // work again, so a turn that ran no pass, because it was held, found no
+    // tables or yielded, cannot fire it again at once.
+    let mut fired_executor_timer = None::<(u64, u64)>;
 
     loop {
         if *shutdown.borrow() {
             return;
         }
+        #[cfg(test)]
+        crate::maintenance::phase_runs::record(
+            &data_root,
+            crate::maintenance::phase_runs::MAINTENANCE_LOOP_ITERATION,
+        );
         let now = Instant::now();
         let due = if triggered {
             crate::dfs_maintenance_due_in(now, not_before, last_maintenance, triggered, immediate)
         } else {
             next_probe.map(|deadline| deadline.saturating_duration_since(now))
         };
-        let due = match repair_retry_at.map(|at| at.saturating_duration_since(now)) {
-            Some(retry) => Some(due.map_or(retry, |due| due.min(retry))),
+        // While background network work is deferred the executor runs no
+        // turn: its wakes, retry and timer wait for the resource change,
+        // which requests a turn.
+        let executor_deferred = daemon_dfs_background_network_work_deferred(resources);
+        // The repair executor's single backoff timer: a re-send time, never a
+        // network deadline.
+        let executor_due_at = crate::repair_executor::repair_executor_work(&data_root)
+            .next_due_unix_nanos
+            .filter(|due_unix_nanos| {
+                fired_executor_timer.is_none_or(|(fired, passes)| {
+                    fired != *due_unix_nanos
+                        || passes != crate::repair_executor::repair_executor_pass_count(&data_root)
+                })
+            })
+            .map(|due_unix_nanos| {
+                let at = now
+                    .checked_add(Duration::from_nanos(
+                        due_unix_nanos.saturating_sub(daemon_dfs_now_unix_nanos()),
+                    ))
+                    .unwrap_or(now);
+                (due_unix_nanos, at)
+            });
+        let executor_wait = if executor_deferred {
+            None
+        } else if executor_requested {
+            Some(Duration::ZERO)
+        } else {
+            repair_retry_at
+                .into_iter()
+                .chain(executor_due_at.map(|(_, at)| at))
+                .min()
+                .map(|at| at.saturating_duration_since(now))
+        };
+        let due = match executor_wait {
+            Some(wait) => Some(due.map_or(wait, |due| due.min(wait))),
             None => due,
         };
+        // Biased: a maintenance request is taken before an executor wake or
+        // timer that is ready at the same time. Its full tick serves executor
+        // work too, and executor work it leaves runs as the executor's turn
+        // right after it; an executor-only turn ahead of it, such as the
+        // startup pass ahead of startup reconciliation, only delays it.
         tokio::select! {
-            _ = async {
-                match due {
-                    Some(delay) => tokio::time::sleep(delay).await,
-                    None => std::future::pending::<()>().await,
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
                 }
-            } => {}
+            }
             _ = notify.notified() => {
                 let decision = if daemon_dfs_background_network_work_deferred(resources) {
                     crate::DfsMaintenanceProbeDecision {
@@ -528,17 +596,24 @@ async fn run_component_maintenance(
                 immediate = decision.immediate_continuation;
                 next_probe = decision.next_probe_at;
             }
+            _ = executor_notify.notified() => {
+                executor_requested = true;
+            }
             updated = node_resources.changed() => {
                 resources = updated;
                 if !daemon_dfs_background_network_work_deferred(resources) {
                     next_probe = Some(Instant::now());
+                    // Sends the executor held back while network work was
+                    // deferred are due again.
+                    executor_requested = true;
                 }
             }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
+            _ = async {
+                match due {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
                 }
-            }
+            } => {}
         }
 
         if !triggered && crate::dfs_maintenance_probe_is_due(Instant::now(), next_probe) {
@@ -580,10 +655,23 @@ async fn run_component_maintenance(
             next_probe = decision.next_probe_at;
         }
 
-        if repair_retry_at.is_some_and(|at| Instant::now() >= at) {
-            repair_retry_at = None;
-            triggered = true;
-            immediate = true;
+        if !daemon_dfs_background_network_work_deferred(resources) {
+            if repair_retry_at.is_some_and(|at| Instant::now() >= at) {
+                repair_retry_at = None;
+                executor_requested = true;
+            }
+            if let Some((due_unix_nanos, at)) = executor_due_at
+                && Instant::now() >= at
+            {
+                tracing::trace!(target: "sinomo.dfs.perf", stage = "dfs.repair.executor.wake",
+                    data_root = %data_root.display(), source = "backoff_timer", "repair executor wake");
+                crate::repair_executor::repair_executor_timer_fired(&data_root);
+                fired_executor_timer = Some((
+                    due_unix_nanos,
+                    crate::repair_executor::repair_executor_pass_count(&data_root),
+                ));
+                executor_requested = true;
+            }
         }
         let launch = crate::dfs_maintenance_due_in(
             Instant::now(),
@@ -594,6 +682,11 @@ async fn run_component_maintenance(
         )
         .is_some_and(|delay| delay.is_zero());
         if launch && crate::dfs_maintenance_should_launch(launch, triggered) {
+            #[cfg(test)]
+            crate::maintenance::phase_runs::record_launch(
+                &data_root,
+                crate::maintenance::phase_runs::FULL_TICK_LAUNCH,
+            );
             let outcome = run_daemon_dfs_maintenance_tick_in_blocking_task(
                 paths.clone(),
                 runtime.clone(),
@@ -616,17 +709,10 @@ async fn run_component_maintenance(
                     .ok()
                     .and_then(Result::ok);
                     let work_for_policy = work.clone();
-                    // Committed effects requested the routine repair pass. A
-                    // completed reconciliation or recovery tick dispatches no
-                    // repairs, so continue straight into the routine pass; a
-                    // tick that yielded to foreground work retries the request
-                    // after the poll interval.
-                    let repair_requested = daemon_dfs_repair_maintenance_requested(&paths, false);
-                    let unserved_repair_edge = repair_requested
-                        && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. });
-                    if repair_requested && outcome == DaemonDfsMaintenanceTickOutcome::Deferred {
-                        repair_retry_at =
-                            completed.checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                    // Executor work this tick's own executor phase left is the
+                    // executor's next turn, not another full tick.
+                    if crate::repair_executor::repair_executor_work(&data_root).due {
+                        executor_requested = true;
                     }
                     let decision = retain_requested_reconciliation(
                         &paths,
@@ -638,7 +724,7 @@ async fn run_component_maintenance(
                                 completed,
                                 daemon_dfs_now_unix_nanos(),
                                 work,
-                                unserved_repair_edge,
+                                false,
                             ),
                         ),
                     );
@@ -667,7 +753,50 @@ async fn run_component_maintenance(
             }
         }
 
-        if due.is_none() && !triggered {
+        // A wake that concerns only the executor runs only its pass, once no
+        // full tick ran its executor phase first. A wake an earlier pass
+        // already served leaves no pending work and runs nothing.
+        if executor_requested
+            && !*shutdown.borrow()
+            && !daemon_dfs_background_network_work_deferred(resources)
+        {
+            executor_requested = false;
+            if crate::repair_executor::repair_executor_work(&data_root).due {
+                #[cfg(test)]
+                crate::maintenance::phase_runs::record_launch(
+                    &data_root,
+                    crate::maintenance::phase_runs::EXECUTOR_TURN_LAUNCH,
+                );
+                let outcome = run_daemon_dfs_repair_executor_turn_in_blocking_task(
+                    paths.clone(),
+                    runtime.clone(),
+                    resources,
+                    shutdown.clone(),
+                )
+                .await;
+                match outcome {
+                    // A pass that stopped at its bound with progress continues
+                    // in the same wake.
+                    Ok(DaemonDfsMaintenanceTickOutcome::Completed { reached_limit }) => {
+                        executor_requested = reached_limit;
+                    }
+                    // Foreground work took admission first: a bounded re-send
+                    // timer, never a network deadline.
+                    Ok(DaemonDfsMaintenanceTickOutcome::Deferred)
+                    | Ok(DaemonDfsMaintenanceTickOutcome::Continued) => {
+                        repair_retry_at = Instant::now()
+                            .checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "DFS repair executor turn failed");
+                        repair_retry_at = Instant::now()
+                            .checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                    }
+                }
+            }
+        }
+
+        if due.is_none() && !triggered && !executor_requested {
             tokio::time::sleep(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL).await;
         }
     }

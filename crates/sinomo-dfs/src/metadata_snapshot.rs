@@ -414,6 +414,8 @@ pub(crate) fn decode_snapshot_image_with_descriptor(
         stream_record_count: reader.cursor().records,
         stream_digest: reader.cursor().digest.clone(),
     };
+    let mut tables = tables;
+    tables.clear_repair_index_changes();
     Ok((
         DfsMetadataTableState {
             tables,

@@ -171,15 +171,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         terminal: &DistributedWriteIntent,
     ) -> Result<(), DfsError> {
-        let retry_records = self
-            .repair_attempt_records
-            .keys()
-            .any(|(id, _)| id == &terminal.intent_id)
-            || self
-                .writes
-                .pending_writes
-                .get(&terminal.intent_id)
-                .is_some_and(|pending| !pending.repair_retries.is_empty());
         if let Some(current) = self.coordinator.intent(&terminal.intent_id).cloned() {
             let mut expected = current.clone();
             expected.state = DfsWriteIntentState::Aborted;
@@ -197,15 +188,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         self.remove_pending_write_state(&terminal.intent_id);
-        self.repair_attempt_records
-            .retain(|(id, _), _| id != &terminal.intent_id);
-        if retry_records {
-            // Actual tracked retries need the SAME normal queue reconciliation.
-            self.record_message_committed_work(DfsMessageCommittedWork {
-                repair_maintenance: true,
-                ..Default::default()
-            });
-        }
         Ok(())
     }
 

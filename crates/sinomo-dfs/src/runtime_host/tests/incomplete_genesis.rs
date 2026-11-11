@@ -574,7 +574,7 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         report["all_rpc"] = wire_facts(&all);
         report["post_control_rpc"] = wire_facts(&post_control);
         report["served_commands"]=serde_json::json!(final_captures.iter().flat_map(|capture|capture.records()).map(|record|
-            serde_json::json!({"command":record.command,"succeeded":record.succeeded,"repair_records":record.repair_record_count})).collect::<Vec<_>>());
+            serde_json::json!({"command":record.command,"succeeded":record.succeeded})).collect::<Vec<_>>());
         report["post_content"] = content_facts(&stores, &object, &target_version, &hash);
         report["checkpoint"] = serde_json::json!(native.checkpoint_rpc_observation_window());
         let path = native
@@ -689,8 +689,7 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
                 .iter()
                 .flat_map(|capture| capture.records())
                 .map(|record| {
-                    serde_json::json!({"command":record.command,"succeeded":record.succeeded,
-                "repair_records":record.repair_record_count})
+                    serde_json::json!({"command":record.command,"succeeded":record.succeeded})
                 })
                 .collect::<Vec<_>>();
             let bytes=serde_json::to_vec_pretty(&serde_json::json!({"normal_close":closed,

@@ -438,7 +438,7 @@ impl LocalSobjMetadataBackend {
         if let Some((filesystem, layout)) = selected {
             layout.stage(filesystem, shard_id, root)?;
         } else {
-            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(root)
+            crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(root)
                 .map_err(|error| MetadataBackendError::Rejected {
                     code: crate::DfsMetadataRejectionCode::Other,
                     message: error.to_string(),
@@ -516,6 +516,7 @@ impl LocalSobjMetadataBackend {
             let state = load_metadata_tables(&backend.root)?;
             let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
             backend.tables = state.tables;
+            backend.tables.clear_repair_index_changes();
             backend.table_log_offset = state.table_log_offset;
 
             backend.materialized_through_sequence = materialized_through_sequence;
@@ -1104,7 +1105,18 @@ impl LocalSobjMetadataBackend {
             metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)?;
         }
         create_dir_all(self.root.join("journal").join("segments"))?;
+        let repair_index_changed = self.tables.repair_index() != tables.repair_index();
         self.tables = tables;
+        self.tables.clear_repair_index_changes();
+        if repair_index_changed {
+            // An installed snapshot replaces the index wholesale; the
+            // primary re-reads the shard's index.
+            crate::repair_executor::repair_index_changed(
+                &self.root,
+                &self.shard_id,
+                crate::repair_executor::DfsRepairIndexChange::Replaced,
+            );
+        }
         self.replica_repair_only = false;
         self.table_log_offset = 0;
 
@@ -1856,6 +1868,7 @@ impl LocalSobjMetadataBackend {
         skip_all,
         fields(stage = "dfs.metadata.read_snapshot")
     )]
+    #[cfg(test)]
     pub(crate) fn try_begin_resident_read_snapshot(&mut self) -> Result<bool> {
         if self.consistent_read_snapshot_depth == 0
             && self.try_materialize_resident_journal()?.is_none()
@@ -1903,6 +1916,7 @@ impl LocalSobjMetadataBackend {
         METADATA_DURABLE_TABLE_RELOADS.set(METADATA_DURABLE_TABLE_RELOADS.get().saturating_add(1));
         let state = read_metadata_table_state_lenient(&self.root)?;
         self.tables = state.tables;
+        self.tables.clear_repair_index_changes();
         self.table_log_offset = state.table_log_offset;
 
         self.materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
@@ -2188,7 +2202,9 @@ impl LocalSobjMetadataBackend {
             ops,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
         )?;
-        self.record_owned_metadata_materialization()
+        self.record_owned_metadata_materialization()?;
+        self.announce_repair_index_change();
+        Ok(())
     }
 
     fn append_preapplied_table_ops(
@@ -2206,7 +2222,23 @@ impl LocalSobjMetadataBackend {
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             rollback,
         )?;
-        self.record_owned_metadata_materialization()
+        self.record_owned_metadata_materialization()?;
+        self.announce_repair_index_change();
+        Ok(())
+    }
+
+    /// The shard writer and the replica applier both append through the two
+    /// wrappers above: one wake per applied batch that changed repair needs,
+    /// naming the objects whose needs changed.
+    fn announce_repair_index_change(&mut self) {
+        let objects = self.tables.take_repair_index_changed();
+        if !objects.is_empty() {
+            crate::repair_executor::repair_index_changed(
+                &self.root,
+                &self.shard_id,
+                crate::repair_executor::DfsRepairIndexChange::Objects(objects),
+            );
+        }
     }
 
     fn compact_metadata_table_log_if_needed(&mut self, max_log_bytes: u64) -> Result<()> {
@@ -2295,6 +2327,7 @@ impl LocalSobjMetadataBackend {
         };
         if let Some(cache) = cached {
             self.tables = Arc::unwrap_or_clone(cache.tables);
+            self.tables.clear_repair_index_changes();
             self.table_log_offset = cache.table_log_offset;
 
             self.materialized_through_sequence = cache.materialized_through_sequence.unwrap();

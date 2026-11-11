@@ -80,6 +80,9 @@ impl Drop for OwnedFollowerPartition<'_> {
     }
 }
 
+#[cfg(test)]
+mod filesystem_projection;
+
 #[test]
 fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
     let (native, nodes) =
@@ -317,8 +320,18 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
             )
         })
         .collect::<Vec<_>>();
-    let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(&data));
-    let queue_cut = queue.view();
+    // The primary's shard tables carry the missing replica in their derived
+    // repair index; no node-local queue is involved.
+    let indexed_needs = native.node_metadata(&primary).and_then(|metadata| {
+        crate::DfsMetadataBackend::repair_index_page(
+            &metadata,
+            &DfsMetadataShardId::new(assignment.shard_id.clone()),
+            None,
+            64,
+        )
+        .map(|page| page.needs)
+        .map_err(|error| error.to_string())
+    });
     let raw = native.rpc_observations();
     let failed_routes = raw
         .iter()
@@ -503,9 +516,14 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
             }));
         }
     }
-    let queue_json = match &queue_cut {
-        Ok(cut) => serde_json::json!({"head":cut.head_sequence,"records":cut.records}),
-        Err(error) => serde_json::json!({"error":error.to_string()}),
+    let index_json = match &indexed_needs {
+        Ok(needs) => serde_json::json!(
+            needs
+                .iter()
+                .map(|((object, version, target), _)| format!("{object}/{version}->{target}"))
+                .collect::<Vec<_>>()
+        ),
+        Err(error) => serde_json::json!({"error":error}),
     };
     evidence(
         &native,
@@ -519,7 +537,7 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
             "per_action_budget_nanos":sinomo_core::network::DEFAULT_NETWORK_TIMEOUT.as_nanos(),
             "before":before, "after":after, "assignment_before":assignment,
             "assignment_after":after_assignment, "physical_survivor_reads":physical,
-            "queue":queue_json, "actual_failed_follower_calls":failed_routes,
+            "repair_index":index_json, "actual_failed_follower_calls":failed_routes,
             "raw_checkpoint_result":format!("{raw_checkpoint:?}"),
             "fault_budget_result":native.assert_fault_budgets(),
         "blocking_stage":blocking_stage, "own_prepared_pipeline":own_prepared_pipeline,
@@ -632,16 +650,18 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
         assert_eq!(manifest.size_bytes, BYTES.len() as u64);
         assert_eq!(bytes, BYTES);
     }
-    let queue_cut = queue_cut.unwrap();
+    let indexed_needs = indexed_needs.unwrap();
     assert!(
-        queue_cut.records.iter().any(|row| {
-            row.intent_id == intent.intent_id
-                && row.object_id == expected_object
-                && row.version == expected_version
-                && row.content_hash == expected_hash
-                && row.missing_replica_node_id == follower
-        }),
-        "the exact named missing N target must already have durable ownership"
+        indexed_needs
+            .iter()
+            .any(|((object, version, target), need)| {
+                need.owner_intent_id.as_deref() == Some(intent.intent_id.as_str())
+                    && *object == expected_object
+                    && *version == expected_version
+                    && need.content_hash == expected_hash
+                    && *target == follower
+            }),
+        "the exact named missing N target must already be durable repair work"
     );
     let original = after
         .tables
@@ -666,6 +686,3 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
     drop(backend);
     native.close().unwrap();
 }
-
-#[cfg(test)]
-mod filesystem_projection;

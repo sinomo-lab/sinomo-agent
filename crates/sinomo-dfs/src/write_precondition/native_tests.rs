@@ -397,10 +397,8 @@ fn committed_guarded_create_and_n_repair(automatic: bool, restart_primary: bool)
         "native-committed-write-precondition"
     };
     let (mut native, nodes, primary, caller, third) = setup(name);
-    // Retain the normal Main's newly declared queue fact across shutdown. This
-    // existing negative claim seam prevents background dispatch, while the
-    // actual Original enrollment/attempt may precede it. It creates no job,
-    // receipt, cursor, delivery classification, or fabricated Original.
+    // Hold the primary's background replica work through a restart, so the
+    // restarted executor is what first attempts the missing replica.
     let restart_claim_hold = restart_primary.then(|| {
         native
             .deny_background_replica_before_claim(&primary)
@@ -575,265 +573,6 @@ fn committed_guarded_create_and_n_repair(automatic: bool, restart_primary: bool)
         "exact committed body replay has no fresh namespace effect"
     );
     assert_eq!(replay.payload, prepared.payload);
-    // Keep the actual native read owner open. One ordinary reconciliation wake
-    // owns progress; this observer does not launch a second broad tick.
-    let queue_path = crate::default_dfs_repair_attempt_snapshot_path(native.data_dir(&primary));
-    let queue = LocalDfsRepairQueueStore::new(&queue_path);
-    if restart_primary {
-        // This is the actual served Main checkpoint, before an explicit wake.
-        // Unlike the private pending component finalizer, that execution owns
-        // the initial NotSent maps and persists them before releasing its lane.
-        let before = queue.view().unwrap();
-        let rows = before
-            .records
-            .iter()
-            .filter(|row| row.intent_id == committed.intent_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let before_original = queue
-            .original_repair_for_slot(&committed.intent_id, &third)
-            .unwrap();
-        let before_payload = before_original
-            .as_ref()
-            .map(|birth| -> Result<Vec<u8>, String> {
-                inspect
-                    .content()
-                    .inspect_repair_payload_root(&birth.root)
-                    .map_err(|error| error.to_string())?;
-                let mut reader = inspect
-                    .content()
-                    .open_retained_repair_payload(&birth.root)
-                    .map_err(|error| error.to_string())?;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut reader, &mut bytes)
-                    .map_err(|error| error.to_string())?;
-                Ok(bytes)
-            })
-            .transpose();
-        export(
-            &native,
-            &caller,
-            "committed-main-before-restart.json",
-            serde_json::json!({
-                "committed":committed,"original_preparation":prepared,
-                "queue_cut":{"head_sequence":before.head_sequence,"records":before.records},
-                "actual_original":before_original,"actual_retained_payload":before_payload,
-                "qualification":"actual registered Main committed W2/N3 and persisted positive first Repair declaration; actual immutable Original may already be enrolled/attempted before claim denial; complete native birth and physical retained bytes preserved; C data fault retained through restart; no private finalizer or semantic retry"
-            }),
-        );
-        assert_eq!(
-            rows.len(),
-            1,
-            "normal Main must persist the exact N-W goal before shutdown"
-        );
-        let row = &rows[0];
-        assert_eq!(row.object_id, object);
-        assert_eq!(row.version, committed.target_version);
-        assert_eq!(Some(&row.content_hash), committed.content_hash.as_ref());
-        assert_eq!(row.missing_replica_node_id, third);
-        assert_eq!(
-            row.transfer_kind,
-            Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-        );
-        assert_eq!(
-            row.transfer_delivery_state,
-            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-        );
-        assert_eq!(row.attempts, 0);
-        assert_eq!(row.last_attempt_unix_nanos, 0);
-        assert!(!row.in_flight);
-        assert!(row.transfer_request_id.is_none() && row.completed_transfer_request_id.is_none());
-        assert!(row.next_retry_unix_nanos > 0 && row.next_retry_unix_nanos != u64::MAX);
-        let birth = before_original
-            .as_ref()
-            .expect("normal Main already enrolled the genuine Original");
-        assert!(birth.closed_at_sequence.is_none() && birth.observed.is_empty());
-        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
-            panic!("actual enrolled current Repair must retain its native command")
-        };
-        assert_eq!(birth.original.source_node_id, primary);
-        assert_eq!(birth.original.target_node_id, third);
-        assert_eq!(command.intent_id, committed.intent_id);
-        assert_eq!(command.file_system_id, committed.file_system_id);
-        assert_eq!(command.object_id, object);
-        assert_eq!(command.version, committed.target_version);
-        assert_eq!(Some(&command.content_hash), committed.content_hash.as_ref());
-        assert_eq!(birth.root.subject.request_id, command.request_id);
-        assert_eq!(birth.root.content_hash(), command.content_hash);
-        assert_eq!(birth.root.size_bytes(), STAGED.len() as u64);
-        assert_eq!(before_payload.unwrap().as_deref(), Some(STAGED));
-        drop(inspect);
-        native.stop_node(&primary).unwrap();
-        native.reopen_node(primary.clone()).unwrap();
-        inspect = native.metadata_primary_service(PATH).unwrap();
-        let after = queue.view().unwrap();
-        let after_rows = after
-            .records
-            .iter()
-            .filter(|row| row.intent_id == committed.intent_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let reopened = inspect
-            .metadata_backend()
-            .unwrap()
-            .prepared_operation_record(&original_operation)
-            .unwrap()
-            .unwrap();
-        let after_original = queue
-            .original_repair_for_slot(&committed.intent_id, &third)
-            .unwrap();
-        let after_payload = after_original
-            .as_ref()
-            .map(|birth| -> Result<Vec<u8>, String> {
-                inspect
-                    .content()
-                    .inspect_repair_payload_root(&birth.root)
-                    .map_err(|error| error.to_string())?;
-                let mut reader = inspect
-                    .content()
-                    .open_retained_repair_payload(&birth.root)
-                    .map_err(|error| error.to_string())?;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut reader, &mut bytes)
-                    .map_err(|error| error.to_string())?;
-                Ok(bytes)
-            })
-            .transpose();
-        export(
-            &native,
-            &caller,
-            "committed-main-after-restart.json",
-            serde_json::json!({
-                "before_rows":rows,"after_rows":after_rows,
-                "queue_cut":{"head_sequence":after.head_sequence,"records":after.records},
-                "reopened_original":reopened,"before_native_original":before_original,
-                "after_native_original":after_original,"after_retained_payload":after_payload,
-                "qualification":"actual stop/reopen, content fault and same before-claim hold retained; no request resubmission or injected queue facts"
-            }),
-        );
-        assert_eq!(
-            after_rows, rows,
-            "cold reconciliation must retain Main's exact positive declaration"
-        );
-        assert_eq!(
-            reopened, prepared,
-            "restart must retain the same committed native body and digest"
-        );
-        let after_birth = after_original
-            .as_ref()
-            .expect("cold Main must preserve the same Original");
-        assert_eq!(after_birth.original, birth.original);
-        assert_eq!(after_birth.attachment, birth.attachment);
-        assert_eq!(after_birth.root, birth.root);
-        assert_eq!(after_birth.observed, birth.observed);
-        assert_eq!(after_birth.closed_at_sequence, birth.closed_at_sequence);
-        assert!(
-            after_birth.attempts.starts_with(&birth.attempts),
-            "restart cannot erase or rewrite an actual earlier Original attempt"
-        );
-        assert_eq!(after_payload.unwrap().as_deref(), Some(STAGED));
-    }
-    drop(restart_claim_hold);
-    // Close preserves a settled cursor and its historical delivery evidence.
-    // This is only a candidate cut; the stopped native history below must prove
-    // the same actual Original was closed at or before that exact queue head.
-    let nonactive_cursor = |row: &DfsRepairAttemptRecord| {
-        row.intent_id == committed.intent_id
-            && row.object_id == object
-            && row.version == committed.target_version
-            && Some(&row.content_hash) == committed.content_hash.as_ref()
-            && committed
-                .desired_replica_node_ids
-                .contains(&row.missing_replica_node_id)
-            && row.attempts > 0
-            && row.last_attempt_unix_nanos > 0
-            && !row.in_flight
-            && row.transfer_request_id.is_none()
-            && row
-                .completed_transfer_request_id
-                .as_ref()
-                .is_some_and(|id| !id.is_empty())
-            && row.next_retry_unix_nanos == 0
-            && row.transfer_kind
-                == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-            && row.transfer_delivery_state.is_some()
-    };
-    let no_active_original_at_cut = |view: &DfsRepairQueueView| {
-        committed.desired_replica_node_ids.iter().all(|target| {
-            queue
-                .original_repair_for_slot(&committed.intent_id, target)
-                .unwrap()
-                .is_none()
-        }) && queue.view().unwrap().head_sequence == view.head_sequence
-    };
-    // One normal owner discovers the actual missing target. It need not be
-    // the fixture's assumed third node, and it may finish before observation.
-    native.request_repair_reconciliation(&primary).unwrap();
-    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    let (setup_receipts, setup_queue, retry_row, already_complete) = loop {
-        let receipts = inspect
-            .metadata_backend()
-            .unwrap()
-            .receipts_for_version(&object, &committed.target_version)
-            .unwrap();
-        let view = queue.view().unwrap();
-        let complete = receipts
-            .iter()
-            .map(|receipt| receipt.replica_node_id.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            == nodes.iter().cloned().collect()
-            && view
-                .records
-                .iter()
-                .filter(|row| row.intent_id == committed.intent_id)
-                .all(nonactive_cursor)
-            && no_active_original_at_cut(&view);
-        let row = view
-            .records
-            .iter()
-            .filter(|row| {
-                row.intent_id == committed.intent_id
-                    && row.object_id == object
-                    && row.version == committed.target_version
-                    && Some(&row.content_hash) == committed.content_hash.as_ref()
-                    && committed
-                        .desired_replica_node_ids
-                        .contains(&row.missing_replica_node_id)
-                    && row.attempts > 0
-                    && row.next_retry_unix_nanos > 0
-                    && row.next_retry_unix_nanos != u64::MAX
-            })
-            .min_by_key(|row| row.next_retry_unix_nanos)
-            .cloned();
-        // Logical in-flight state is not a different retry deadline. Preserve
-        // the actual carrier's complete DATA rather than require a guessed bit.
-        if complete || row.is_some() || Instant::now() >= setup_deadline {
-            break (receipts, view, row, complete);
-        }
-        std::thread::yield_now();
-    };
-    let setup_rpc_records = native.checkpoint_rpc_observation_window().unwrap();
-    if setup_rpc_records > 0 {
-        native
-            .export_latest_rpc_observation_checkpoint(
-                &native
-                    .data_dir(&caller)
-                    .root()
-                    .join("committed-precondition-retry-setup-rpc.json"),
-            )
-            .unwrap();
-    }
-    export(
-        &native,
-        &caller,
-        "committed-precondition-retry-setup.json",
-        serde_json::json!({
-            "original_committed":committed,"actual_retry_row":retry_row,"checkpointed_rpc_records":setup_rpc_records,
-            "actual_receipts":setup_receipts,"already_complete":already_complete,
-            "queue_cut":{"head_sequence":setup_queue.head_sequence,"records":setup_queue.records},
-            "qualification":"one normal reconciliation wake; actual native receipts and all queue rows before qualification; precise settled cursor DATA requires no active Original slot and a stable re-read head, then strict same-Original Close proof below"
-        }),
-    );
     assert_eq!(committed.policy.min_commit_replicas, 2);
     assert_eq!(committed.policy.desired_replicas, 3);
     assert_eq!(
@@ -844,121 +583,83 @@ fn committed_guarded_create_and_n_repair(automatic: bool, restart_primary: bool)
             .collect::<std::collections::BTreeSet<_>>(),
         nodes.iter().cloned().collect()
     );
-    assert!(
-        already_complete || retry_row.is_some(),
-        "the native owner must expose complete N or its actual finite retry deadline"
+    if restart_primary {
+        // The committed body survives the restart unchanged; the repair need
+        // lives only in the shard tables, which the restarted primary's
+        // executor reads in full at its first observation.
+        drop(inspect);
+        native.stop_node(&primary).unwrap();
+        native.reopen_node(primary.clone()).unwrap();
+        inspect = native.metadata_primary_service(PATH).unwrap();
+        let reopened = inspect
+            .metadata_backend()
+            .unwrap()
+            .prepared_operation_record(&original_operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.digest, prepared.digest,
+            "restart must retain the same committed native body and digest"
+        );
+    }
+    let receipt_nodes = |inspect: &crate::NetworkedDfsService<crate::DfsNodeTransport>| {
+        inspect
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&object, &committed.target_version)
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_ne!(
+        receipt_nodes(&inspect),
+        nodes.iter().cloned().collect(),
+        "the denied third replica is still missing"
     );
-    let start_unix_nanos = crate::dfs_now_unix_nanos();
-    let actual_retry_due_unix_nanos = retry_row.as_ref().map(|row| row.next_retry_unix_nanos);
-    let retry_remaining = actual_retry_due_unix_nanos.map_or(Duration::ZERO, |due| {
-        Duration::from_nanos(due.saturating_sub(start_unix_nanos))
-    });
-    let started = Instant::now();
+    // Heal once. The automatic case leaves progress to the mounted
+    // component's own executor wake; the other drives ordinary maintenance.
+    drop(restart_claim_hold);
+    native.clear_faults();
     let normal_interval_allowance = if automatic {
         crate::DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
     } else {
         Duration::ZERO
     };
-    let action_allowance =
-        normal_interval_allowance + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    let goal_unix_nanos = actual_retry_due_unix_nanos
-        .unwrap_or(start_unix_nanos)
-        .saturating_add(u64::try_from(action_allowance.as_nanos()).unwrap());
-    let goal_window = Duration::from_nanos(goal_unix_nanos.saturating_sub(start_unix_nanos));
-    let deadline = started + goal_window;
-    native.clear_faults();
-    while actual_retry_due_unix_nanos.is_some_and(|due| crate::dfs_now_unix_nanos() < due) {
-        std::thread::yield_now();
-    }
-    let observe_goal = || {
-        loop {
-            let receipts = inspect
-                .metadata_backend()
-                .unwrap()
-                .receipts_for_version(&object, &committed.target_version)
-                .unwrap();
-            let view = queue.view().unwrap();
-            let now = Instant::now();
-            let goal = receipts
-                .iter()
-                .map(|receipt| receipt.replica_node_id.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-                == nodes.iter().cloned().collect()
-                && view
-                    .records
-                    .iter()
-                    .filter(|row| row.intent_id == committed.intent_id)
-                    .all(nonactive_cursor)
-                && no_active_original_at_cut(&view);
-            if goal || now >= deadline {
-                break (
-                    receipts,
-                    view,
-                    goal && now < deadline,
-                    now.duration_since(started),
-                );
-            }
-            std::thread::yield_now();
+    // An attempt that already failed against the denied target backs off
+    // on the executor's single timer; the allowance starts when it is due.
+    let retry_due = native
+        .repair_executor_next_due_unix_nanos(&primary)
+        .unwrap();
+    let until_due = retry_due.map_or(Duration::ZERO, |due| {
+        Duration::from_nanos(due.saturating_sub(crate::dfs_now_unix_nanos()))
+    });
+    let deadline = Instant::now()
+        + until_due
+        + normal_interval_allowance
+        + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        if receipt_nodes(&inspect) == nodes.iter().cloned().collect() {
+            break;
         }
-    };
-    let (mut native, tick_observation, observed_goal) = if automatic {
-        // Heal once and leave progress to the mounted component's real timer.
-        // There is no explicit tick or extra notification in this branch.
-        let observed_goal = observe_goal();
-        (native, None, observed_goal)
-    } else {
-        let tick_primary = primary.clone();
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(move || {
-                let observation = native
-                    .maintenance_tick(&tick_primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
-                (native, observation)
-            });
-            let observed_goal = observe_goal();
-            // Timestamp the goal before unrelated tick completion or drain.
-            let (native, observation) = worker.join().unwrap();
-            (native, Some(observation), observed_goal)
-        })
-    };
-    let (repaired_receipts, observed_queue, observed_in_budget, observed_elapsed) = observed_goal;
-    let goal_rpc_records = native.checkpoint_rpc_observation_window().unwrap();
-    if goal_rpc_records > 0 {
-        native
-            .export_latest_rpc_observation_checkpoint(
-                &native
-                    .data_dir(&caller)
-                    .root()
-                    .join("committed-precondition-repair-cut-rpc.json"),
-            )
-            .unwrap();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "normal committed N repair must reach N3 within its scheduler and RPC allowances"
+        );
+        if automatic {
+            std::thread::sleep(Duration::from_millis(5));
+        } else {
+            native
+                .maintenance_tick(
+                    &primary,
+                    remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                )
+                .unwrap()
+                .outcome
+                .unwrap();
+        }
     }
-    export(
-        &native,
-        &caller,
-        "committed-precondition-repair-cut.json",
-        serde_json::json!({
-            "original_committed":committed,"exact_preparation":prepared,
-            "repaired_receipts":repaired_receipts,"queue_cut":{"head_sequence":observed_queue.head_sequence,"records":observed_queue.records},
-            "observed_in_budget":observed_in_budget,"goal_observed_elapsed_micros":observed_elapsed.as_micros(),
-            "diagnostic_export_elapsed_micros":started.elapsed().as_micros(),
-            "actual_retry_row":retry_row,"start_unix_nanos":start_unix_nanos,
-            "actual_retry_due_unix_nanos":actual_retry_due_unix_nanos,"already_complete_before_heal":already_complete,
-            "goal_unix_nanos":goal_unix_nanos,"retry_remaining_nanos":retry_remaining.as_nanos(),
-            "per_rpc_budget_nanos":sinomo_core::network::DEFAULT_NETWORK_TIMEOUT.as_nanos(),
-            "automatic_component_timer":automatic,"normal_interval_allowance_nanos":normal_interval_allowance.as_nanos(),
-            "checkpointed_rpc_records":goal_rpc_records,
-            "ordinary_tick_observation":format!("{tick_observation:#?}"),
-            "qualification":if automatic {
-                "actual mounted component timer, healed once with no extra wake or explicit tick; passive N3 and nonactive cursor candidate cut by recorded due plus existing normal interval plus unchanged default RPC action budget; exact Original Close at/before this head is required below"
-            } else {
-                "one explicit ordinary native maintenance invocation after the actual durable retry deadline; concurrent passive exact receipts and nonactive cursor candidate cut by actual due plus unchanged default RPC budget; exact Original Close at/before this head is required below; automatic progress is not inferred"
-            }
-        }),
-    );
-    assert!(
-        observed_in_budget,
-        "normal committed N repair must reach N3 without active work inside its captured due, scheduler and RPC allowances"
-    );
     let terminal = inspect
         .metadata_backend()
         .unwrap()
@@ -970,121 +671,13 @@ fn committed_guarded_create_and_n_repair(automatic: bool, restart_primary: bool)
     let final_head = inspect.posix_stat_distributed(PATH).unwrap();
     assert_eq!(final_head.version.as_str(), metadata.version);
     assert_eq!(inspect.posix_read_file_distributed(PATH).unwrap(), STAGED);
+    let root_final = inspect.posix_stat_distributed("/").unwrap();
+    assert_eq!(
+        root_final.version, root_after.version,
+        "N repair never touches the parent again"
+    );
     drop(inspect);
     drop(backend);
-    native.stop_node(&primary).unwrap();
-    let history = if observed_queue.head_sequence == 0 {
-        Vec::new()
-    } else {
-        crate::repair_queue_store::tests::native_queue_history(&queue_path)
-    };
-    let originals = history
-        .iter()
-        .flat_map(|(_, operations)| operations)
-        .filter_map(|operation| {
-            let crate::repair_queue_store::DfsRepairQueueOperation::RepairCustody { change } =
-                operation
-            else {
-                return None;
-            };
-            let crate::repair_queue_store::RepairCustodyChange::Enroll { birth } = change.as_ref()
-            else {
-                return None;
-            };
-            let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
-                return None;
-            };
-            (command.intent_id == committed.intent_id
-                && command.object_id == object
-                && command.file_system_id == committed.file_system_id
-                && command.version == committed.target_version
-                && Some(&command.content_hash) == committed.content_hash.as_ref()
-                && birth.original.source_node_id == primary
-                && committed
-                    .desired_replica_node_ids
-                    .contains(&birth.original.target_node_id))
-            .then(|| birth.as_ref().clone())
-        })
-        .collect::<Vec<_>>();
-    export(
-        &native,
-        &caller,
-        "committed-precondition-queue-history.json",
-        serde_json::json!({
-            "history":history,"matched_originals":originals,"observed_queue_cut":{"head_sequence":observed_queue.head_sequence,"records":observed_queue.records}
-        }),
-    );
-    let retained_cursors_match_originals = observed_queue
-        .records
-        .iter()
-        .filter(|row| row.intent_id == committed.intent_id)
-        .all(|row| {
-            nonactive_cursor(row)
-                && originals.iter().any(|original| {
-                    row.completed_transfer_request_id.as_deref()
-                        == Some(original.root.subject.request_id.as_str())
-                        && original.original.target_node_id == row.missing_replica_node_id
-                })
-        });
-    let settlements = originals
-        .iter()
-        .map(|original| {
-            let closed_before_cut = history.iter().any(|(sequence, operations)|
-                *sequence <= observed_queue.head_sequence && operations.iter().any(|operation|
-                    matches!(operation, crate::repair_queue_store::DfsRepairQueueOperation::RepairCustody { change }
-                        if matches!(change.as_ref(), crate::repair_queue_store::RepairCustodyChange::Close { subject, .. }
-                            if subject == &original.root.subject))));
-            let settled = queue.original_repair(&original.original).unwrap();
-            let actual_closed = queue
-                .closed_repair_birth(&original.root.subject)
-                .unwrap()
-                .is_some();
-            let valid = closed_before_cut && actual_closed && settled.as_ref().is_some_and(|settled| {
-                settled.original == original.original
-                    && settled.closed_at_sequence.is_some_and(|sequence|
-                        sequence <= observed_queue.head_sequence)
-            });
-            (valid, serde_json::json!({
-                "original":original,"settled_original":settled,
-                "closed_before_cut":closed_before_cut,"actual_closed_birth":actual_closed
-            }))
-        })
-        .collect::<Vec<_>>();
-    export(
-        &native,
-        &caller,
-        "committed-precondition-result.json",
-        serde_json::json!({
-            "created":metadata,"original_committed":committed,
-            "parent_after_own_touch":format!("{root_after:?}"),
-            "committed_body_replay_published":replay.published,"repaired_receipts":repaired_receipts,
-            "terminal":terminal,"final_head":format!("{final_head:?}"),
-            "matched_originals":originals,"settlements":settlements,
-            "retained_nonactive_cursors_match_same_originals":retained_cursors_match_originals,
-            "observed_queue_cut":{"head_sequence":observed_queue.head_sequence,"records":observed_queue.records},
-            "ordinary_tick_observation":format!("{tick_observation:#?}"),
-            "automatic_component_timer":automatic,"normal_interval_allowance_nanos":normal_interval_allowance.as_nanos(),
-            "qualification":"actual W2/N3 receipt goal with no active own work or Original slot and a stable re-read queue head; precise completed cursor DATA and historical PossiblyApplied evidence may remain only when matching the same immutable Repair Original. Unchanged stopped native-history proof requires every real Original Close no later than the in-budget candidate head and actual ClosedRepairBirth. No cursor is deleted to force success; automatic timer and explicit ordinary tick remain distinct; no Stage-only alternate success"
-        }),
-    );
-    assert!(
-        !originals.is_empty(),
-        "this repaired-Original control requires at least one actual native Repair Original"
-    );
-    assert_eq!(
-        originals
-            .iter()
-            .map(|original| &original.original.target_node_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        originals.len(),
-        "each actual missing target retains one immutable Original"
-    );
-    assert!(
-        retained_cursors_match_originals,
-        "every retained completed cursor must name its actual immutable Original"
-    );
-    assert!(settlements.iter().all(|(valid, _)| *valid));
     native.checkpoint_rpc_observation_window().unwrap();
     native.close().unwrap();
 }

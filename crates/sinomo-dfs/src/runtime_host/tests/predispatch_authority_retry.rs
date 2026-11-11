@@ -240,13 +240,7 @@ impl RetryFixture {
                     DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptStarted { .. }
                     | DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim { .. }
-                    | DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh { .. }
-                    | DaemonDfsPreDispatchTestPoint::BeforeRetainedRepairQueueEnrollment {
-                        ..
-                    }
-                    | DaemonDfsPreDispatchTestPoint::AfterRetainedRepairQueueEnrollment {
-                        ..
-                    } => {}
+                    | DaemonDfsPreDispatchTestPoint::BeforeAuthorityRefresh { .. } => {}
                     DaemonDfsPreDispatchTestPoint::ReplicaAdmissionReleased { released } => {
                         state
                             .last_admission_released

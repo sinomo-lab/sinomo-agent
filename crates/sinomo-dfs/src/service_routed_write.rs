@@ -993,7 +993,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
-            self.restore_backend_receipt_pages_for_intent(&record, true)?;
+            self.restore_backend_receipt_pages_for_intent(&record)?;
             if matches!(record.status, DfsWriteIntentStatus::Committed) {
                 self.restore_recorded_content_receipts(&record)?;
             }

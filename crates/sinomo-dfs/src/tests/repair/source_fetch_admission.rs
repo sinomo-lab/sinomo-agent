@@ -1,14 +1,16 @@
+//! The executor's fetch-first repair and fetch admission. The fixture leaves
+//! a placement need unrepaired, with the content on one holder only: the
+//! primary fetches it before it can send the replica. A fetch is served only
+//! to a caller with the intent's permission.
+
 use super::*;
 
 struct NativeSourceFetch {
-    primary: NodeId,
     holder: NodeId,
     target: NodeId,
     shard: DfsMetadataShardConfig,
     stat: DfsStat,
-    bytes: Vec<u8>,
     intent: String,
-    queue: LocalDfsRepairQueueStore,
     execution: crate::publication_guard::DfsPublicationContextRestore,
     core: NetworkedDfsService<DfsNodeTransport>,
     caller: NetworkedDfsService<DfsNodeTransport>,
@@ -180,31 +182,25 @@ impl NativeSourceFetch {
             })
             .expect("the real placement producer committed its target obligation")
             .intent_id;
-        let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
-            native.data_dir(&primary),
-        ));
+        // The shard tables derive the target as a need owned by that intent.
         assert!(
-            queue
-                .view()
-                .unwrap()
-                .records
-                .iter()
-                .any(|row| row.intent_id == intent
-                    && row.missing_replica_node_id == target
-                    && row.transfer_request_id.is_none()
-                    && row.transfer_delivery_state
-                        == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent))
+            super::indexed_object_repair_needs(
+                &native,
+                &core,
+                &stat.file_system_id,
+                &path,
+                &stat.object_id,
+                &stat.version,
+            )
+            .contains(&(target.clone(), Some(intent.clone())))
         );
         native.checkpoint_rpc_observation_window().unwrap();
         Self {
-            primary,
             holder,
             target,
             shard,
             stat,
-            bytes,
             intent,
-            queue,
             execution,
             core,
             caller,
@@ -213,31 +209,77 @@ impl NativeSourceFetch {
         }
     }
 
-    fn page(
-        &mut self,
-        excluded: &[NodeId],
-    ) -> Result<crate::service_repair::DfsRepairPageProgress, DfsError> {
-        let records = self.queue.view()?.records;
-        let mut progress =
-            crate::test_runtime::executor().block_on(self.core.retry_pending_repair_page(
-                8,
-                &records,
-                &crate::DfsMaintenanceExecutionExclusions::new(excluded.iter().cloned()),
-                None,
-                None,
-                true,
-            ))?;
-        if let Some(error) = progress.error.take() {
-            return Err(error);
-        }
-        Ok(progress)
+    fn primary(&self) -> NodeId {
+        self.shard.primary_node_id.clone()
     }
 
-    fn incoming(&mut self) {
-        let messages = self.core.transport.drain_incoming_messages().unwrap();
-        self.core
-            .process_routed_messages_with_options(messages, true)
+    /// One executor pass on the primary, as maintenance runs it, then the
+    /// replies it drew.
+    fn pass(&mut self, excluded: &[NodeId]) -> usize {
+        let root = self.native.data_dir(&self.primary()).root();
+        let shards = self.native.metadata_shards().unwrap();
+        let pass = self
+            .core
+            .run_repair_executor_pass(
+                &root,
+                &shards,
+                &crate::DfsMaintenanceExecutionExclusions::new(excluded.iter().cloned()),
+                8,
+            )
             .unwrap();
+        self.core.process_incoming_until_quiescent().unwrap();
+        pass.scheduled.len()
+    }
+
+    /// The executor's status row for the target's need.
+    fn status(&self) -> Option<crate::DfsRepairAttemptRecord> {
+        crate::repair_executor::repair_executor_status_sample(
+            &self.native.data_dir(&self.primary()).root(),
+            16,
+        )
+        .into_iter()
+        .find(|record| {
+            record.object_id == self.stat.object_id
+                && record.version == self.stat.version
+                && record.missing_replica_node_id == self.target
+        })
+    }
+
+    fn fetches_from_holder(&self) -> usize {
+        self.native
+            .rpc_observations()
+            .iter()
+            .filter(|event| {
+                event.source == self.primary()
+                    && event.target == self.holder
+                    && event.route == DFS_DATA_FETCH_BLOB_ROUTE
+                    && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            })
+            .count()
+    }
+
+    /// Let the need's backoff run out, as the executor's timer does at its
+    /// end, and serve passes until the target holds a receipt.
+    fn retry_until_repaired(&mut self, excluded: &[NodeId]) {
+        crate::repair_executor::elapse_repair_executor_backoffs_for_test(
+            &self.native.data_dir(&self.primary()).root(),
+        );
+        for _ in 0..4 {
+            if self.target_has_receipt() {
+                return;
+            }
+            self.pass(excluded);
+        }
+        assert!(
+            self.target_has_receipt(),
+            "the need is repaired from the holder's copy"
+        );
+    }
+
+    fn clear_fetch_faults(&self) {
+        self.native.remove_faults_matching(|rule| {
+            rule.route.as_deref() == Some(DFS_DATA_FETCH_BLOB_ROUTE)
+        });
     }
 
     fn target_has_receipt(&self) -> bool {
@@ -262,228 +304,6 @@ impl NativeSourceFetch {
         drop(holds);
         native.close().unwrap();
     }
-}
-
-#[test]
-fn native_async_repair_fetches_recorded_excluded_source_before_actual_target_repair() {
-    let mut case = NativeSourceFetch::new("native-async-recorded-source");
-    let mut fetch_replies = Vec::new();
-    let mut verified_fetch = false;
-    for _ in 0..8 {
-        case.page(&[case.holder.clone()]).unwrap();
-        let expected_request = case.core.writes.pending_writes[&case.intent]
-            .fetch_inflight_request_ids
-            .get(&case.holder)
-            .cloned();
-        let messages = case.core.transport.drain_incoming_messages().unwrap();
-        verified_fetch |= messages.iter().any(|message| {
-            message.source_node_id == case.holder
-                && message.target_node_id == case.primary
-                && matches!(&message.message, DfsNetworkMessage::FetchBlobResponse(response)
-                    if Some(&response.request_id) == expected_request.as_ref()
-                        && response.intent_id == case.intent
-                        && response.object_id == case.stat.object_id
-                        && response.version == case.stat.version
-                        && matches!(&response.result, DfsFetchBlobResult::Found { content_hash, .. }
-                            if Some(content_hash) == case.stat.content_hash.as_ref()))
-        });
-        fetch_replies.extend(messages.iter().cloned());
-        case.core
-            .process_routed_messages_with_options(messages, true)
-            .unwrap();
-        // Stop before another ordinary Core page can select synchronous Repair.
-        if verified_fetch {
-            break;
-        }
-    }
-    assert!(verified_fetch, "the original native Fetch returned its matching body hash");
-    assert_eq!(
-        case.core.content().read_object_version(
-            case.stat.object_id.as_str(), case.stat.version.as_str(),
-        ).unwrap().1,
-        case.bytes,
-        "the actual fetched body must materialize before the repair producer runs"
-    );
-    assert!(!case.target_has_receipt());
-    assert!(case.queue.original_repair_for_slot(&case.intent, &case.target).unwrap().is_none());
-    assert!(!case.native.rpc_observations().iter().any(|call| {
-        call.source == case.primary
-            && call.target == case.target
-            && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
-            && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
-    }));
-    let before_repair = case.queue.view().unwrap().records;
-    assert!(before_repair.iter().any(|row| row.intent_id == case.intent
-        && row.missing_replica_node_id == case.target
-        && row.transfer_request_id.is_none()
-        && row.completed_transfer_request_id.is_none()
-        && row.transfer_delivery_state
-            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)));
-
-    // This effect opener has no served Main background transport. Reuse the
-    // actual background Repair producer under this same native execution;
-    // false selects synchronous delivery of its unchanged background command.
-    let pending = case.core.writes.pending_writes[&case.intent].clone();
-    assert!(!pending.repair_inflight_request_ids.contains_key(&case.target));
-    let request_id = case.core
-        .original_repair_request_for_target(&case.intent, &case.target, &pending)
-        .unwrap().expect("the real nameless NotSent obligation can create its first Original");
-    let intent = case.core.coordinator().intent(&case.intent).unwrap().clone();
-    let object = case.core.current_read_object_metadata(&case.stat.object_id).unwrap();
-    let prepared = case.core.prepare_current_background_repair_replica_sends(
-        &[(case.target.clone(), request_id.clone())], &intent, &pending, object,
-    ).unwrap();
-    let original = case.queue.original_repair_for_slot(&case.intent, &case.target)
-        .unwrap().expect("the native producer enrolled its actual immutable Original");
-    assert!(matches!(&original.original.message, DfsNetworkMessage::RepairReplica(command)
-        if command.background_repair && command.request_id == request_id));
-    let outcomes = crate::test_runtime::executor().block_on(
-        case.core.dispatch_prepared_repair_replica_sends(prepared, false),
-    ).unwrap();
-    assert_eq!(outcomes.len(), 1);
-    assert!(outcomes[0].sent);
-    let repair_replies = case.core.transport.drain_incoming_messages().unwrap();
-    let committed_reply = repair_replies.iter().any(|message| {
-        message.source_node_id == case.target && message.target_node_id == case.primary
-            && matches!(&message.message, DfsNetworkMessage::RepairReplicaResponse(response)
-                if response.request_id == request_id && response.intent_id == case.intent
-                    && response.object_id == case.stat.object_id && response.version == case.stat.version
-                    && matches!(&response.result, DfsBlobTransferResult::Committed { content_hash }
-                        if Some(content_hash) == case.stat.content_hash.as_ref()))
-    });
-    case.core.process_routed_messages_with_options(repair_replies.clone(), true).unwrap();
-    let repaired = case.target_has_receipt();
-    let cache_credited = case
-        .core
-        .backend_receipt_for_replica(&case.stat.object_id, &case.stat.version, &case.primary)
-        .unwrap()
-        .is_some();
-    let physical = case
-        .caller
-        .content()
-        .read_object_version(case.stat.object_id.as_str(), case.stat.version.as_str());
-    let expected = case.bytes.clone();
-    let calls = case.native.rpc_observations();
-    let fetched = calls.iter().any(|call| {
-        call.source == case.primary
-            && call.target == case.holder
-            && call.route == DFS_DATA_FETCH_BLOB_ROUTE
-            && call.phase == crate::test_runtime::RpcPhase::Decoded
-            && call.dfs_object_id.as_ref() == Some(&case.stat.object_id)
-    });
-    let actual_repair = calls.iter().any(|call| {
-        call.source == case.primary
-            && call.target == case.target
-            && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
-            && call.phase == crate::test_runtime::RpcPhase::Completed
-            && call.dfs_object_id.as_ref() == Some(&case.stat.object_id)
-    });
-    let settled_original = case.queue.original_repair(&original.original).unwrap();
-    let closed = settled_original.as_ref().is_some_and(|birth| {
-        birth.original == original.original && birth.closed_at_sequence.is_some()
-    });
-    let omitted = case.native.observation_dropped_count();
-    let diagnostics = serde_json::json!({
-        "scope": "async source-fetch and native background Repair producer integration",
-        "verified_fetch": verified_fetch, "fetch_replies": fetch_replies,
-        "repair_replies": repair_replies, "repair_outcomes": format!("{outcomes:?}"),
-        "actual_repair": actual_repair, "committed_reply": committed_reply,
-        "target_receipt": case.core.backend_receipt_for_replica(
-            &case.stat.object_id, &case.stat.version, &case.target,
-        ).unwrap(),
-        "repaired": repaired, "cache_credited": cache_credited, "closed": closed,
-        "birth": original, "settled_original": settled_original,
-        "queue_before_repair": before_repair, "queue_after": case.queue.view().unwrap().records,
-        "pending_before_repair": format!("{pending:?}"),
-        "pending_after": format!("{:?}", case.core.writes.pending_writes.get(&case.intent)),
-        "current_object": case.core.current_read_object_metadata(&case.stat.object_id).unwrap(),
-        "prepared_operations": case.core.metadata_backend().unwrap().list_prepared_operations().unwrap(),
-        "physical_result": format!("{physical:?}"), "omitted_rpc_observations": omitted,
-    });
-    let diagnostics_path = case.native.data_dir(&case.primary).root().parent().unwrap()
-        .join("source-fetch-positive-state.json");
-    std::fs::write(&diagnostics_path, serde_json::to_vec_pretty(&diagnostics).unwrap()).unwrap();
-    case.native.checkpoint_rpc_observation_window().unwrap();
-    case.close();
-    assert!(
-        fetched,
-        "the actual recorded remote holder must receive the encoded fetch"
-    );
-    assert!(
-        actual_repair && committed_reply && repaired && closed,
-        "actual Repair, guarded receipt publication and Original closure are required"
-    );
-    assert_eq!(physical.unwrap().1, expected);
-    assert!(
-        !cache_credited,
-        "reading the source must not credit the non-desired metadata owner as a replica"
-    );
-    assert_eq!(omitted, 0);
-}
-
-#[test]
-fn native_async_repair_keeps_destination_excluded_even_with_a_live_source() {
-    let mut case = NativeSourceFetch::new("native-async-excluded-target");
-    case.page(&[case.holder.clone(), case.target.clone()])
-        .unwrap();
-    case.incoming();
-    let repaired = case.target_has_receipt();
-    let original = case
-        .queue
-        .original_repair_for_slot(&case.intent, &case.target)
-        .unwrap();
-    let sent = case.native.rpc_observations().iter().any(|call| {
-        call.source == case.primary
-            && matches!(
-                call.route.as_str(),
-                DFS_DATA_FETCH_BLOB_ROUTE | DFS_DATA_REPAIR_REPLICA_ROUTE
-            )
-            && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
-    });
-    case.close();
-    assert!(
-        !repaired && original.is_none() && !sent,
-        "destination exclusion must prevent any repair admission"
-    );
-}
-
-#[test]
-fn native_async_repair_unroutable_source_cannot_create_a_target_receipt() {
-    let mut case = NativeSourceFetch::new("native-async-unroutable-source");
-    case.native.install_fault(crate::test_runtime::FaultRule {
-        source: Some(case.primary.clone()),
-        target: Some(case.holder.clone()),
-        route: Some(DFS_DATA_FETCH_BLOB_ROUTE.into()),
-        call_id: None,
-        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-        remaining_hits: 1,
-        action: crate::test_runtime::FaultAction::TransientRouteFailureBeforeDispatch,
-    });
-    case.page(&[case.holder.clone()]).unwrap();
-    case.incoming();
-    let repaired = case.target_has_receipt();
-    let original = case
-        .queue
-        .original_repair_for_slot(&case.intent, &case.target)
-        .unwrap();
-    let target_send = case.native.rpc_observations().iter().any(|call| {
-        call.source == case.primary
-            && call.target == case.target
-            && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
-            && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
-    });
-    let failed_fetch = case.native.rpc_observations().iter().any(|call| {
-        call.source == case.primary
-            && call.target == case.holder
-            && call.route == DFS_DATA_FETCH_BLOB_ROUTE
-            && call.outcome_error.is_some()
-    });
-    case.native.clear_faults();
-    case.close();
-    assert!(
-        failed_fetch && !repaired && original.is_none() && !target_send,
-        "a failed real fetch cannot manufacture target durability"
-    );
 }
 
 #[test]
@@ -523,13 +343,154 @@ fn native_fetch_rejects_a_member_without_original_intent_permission() {
                 && matches!(reply.result, DfsFetchBlobResult::Rejected { .. }))
     });
     let repaired = case.target_has_receipt();
-    let original = case
-        .queue
-        .original_repair_for_slot(&case.intent, &case.target)
-        .unwrap();
     case.close();
     assert!(
-        rejected && !repaired && original.is_none(),
+        rejected && !repaired,
         "authenticated membership alone must not authorize this fetch"
     );
+}
+
+#[test]
+fn executor_fetch_rejected_by_its_source_backs_off_with_the_reason_then_completes() {
+    let mut case = NativeSourceFetch::new("native-executor-fetch-rejected");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    case.native.install_fault(crate::test_runtime::FaultRule {
+        source: Some(case.primary()),
+        target: Some(case.holder.clone()),
+        route: Some(DFS_DATA_FETCH_BLOB_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::AlterFetchReplyAfterDispatch {
+            change: crate::test_runtime::FetchReplyFault::NotFound,
+            captured: Arc::clone(&captured),
+        },
+    });
+    // The primary lacks the content, so the executor fetches it first; the
+    // source's reply says it has none. The next pass serves that outcome.
+    assert_eq!(case.pass(&[]), 1);
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        1,
+        "the rejected reply arrived"
+    );
+    assert_eq!(case.pass(&[]), 0, "the failed attempt backs off");
+    case.clear_fetch_faults();
+    let status = case.status().expect("the need stays tracked");
+    assert!(!status.in_flight, "the rejected fetch ended its attempt");
+    assert!(status.next_retry_unix_nanos > 0, "it backs off");
+    assert_eq!(status.last_error.as_deref(), Some("blob not found"));
+    assert!(!case.target_has_receipt());
+    case.retry_until_repaired(&[]);
+    // The next pass serves the receipt's index change.
+    case.pass(&[]);
+    assert!(
+        case.status().is_none(),
+        "the settled need and its error are gone"
+    );
+    case.close();
+}
+
+#[test]
+fn executor_fetch_from_an_unroutable_source_fails_and_creates_no_receipt() {
+    let mut case = NativeSourceFetch::new("native-executor-fetch-unroutable");
+    case.native.install_fault(crate::test_runtime::FaultRule {
+        source: Some(case.primary()),
+        target: Some(case.holder.clone()),
+        route: Some(DFS_DATA_FETCH_BLOB_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::TransientRouteFailureBeforeDispatch,
+    });
+    assert_eq!(case.pass(&[]), 1);
+    case.clear_fetch_faults();
+    let status = case.status().expect("the need stays tracked");
+    assert!(!status.in_flight);
+    assert!(
+        status.last_error.is_some(),
+        "the send failure is the need's error"
+    );
+    assert!(
+        !case.target_has_receipt(),
+        "an unsent fetch creates no receipt"
+    );
+    case.retry_until_repaired(&[]);
+    case.close();
+}
+
+#[test]
+fn executor_fetches_from_an_excluded_source_for_an_admitted_target() {
+    let mut case = NativeSourceFetch::new("native-executor-fetch-excluded-source");
+    // Exclusion bounds new destinations; reading a recorded holder is not
+    // one, so the fetch still reads from it.
+    let holder = case.holder.clone();
+    assert_eq!(case.pass(std::slice::from_ref(&holder)), 1);
+    assert_eq!(case.fetches_from_holder(), 1);
+    case.retry_until_repaired(std::slice::from_ref(&holder));
+    case.close();
+}
+
+#[test]
+fn executor_parks_an_attempted_excluded_target_even_with_a_live_source() {
+    let mut case = NativeSourceFetch::new("native-executor-excluded-target");
+    let target = case.target.clone();
+    // The first attempt is never deferred by a cached projection: the
+    // executor fetches the content and sends the replica, which fails.
+    case.native.install_fault(crate::test_runtime::FaultRule {
+        source: Some(case.primary()),
+        target: Some(target.clone()),
+        route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::TransientRouteFailureBeforeDispatch,
+    });
+    let sends_to_target = |case: &NativeSourceFetch| {
+        case.native
+            .rpc_observations()
+            .iter()
+            .filter(|event| {
+                event.source == case.primary()
+                    && event.target == case.target
+                    && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            })
+            .count()
+    };
+    for _ in 0..4 {
+        if sends_to_target(&case) > 0 {
+            break;
+        }
+        case.pass(std::slice::from_ref(&target));
+    }
+    assert_eq!(sends_to_target(&case), 1, "the first attempt was made");
+    case.native.remove_faults_matching(|rule| {
+        rule.route.as_deref() == Some(DFS_DATA_REPAIR_REPLICA_ROUTE)
+    });
+    // Attempted and still excluded: when its backoff ends the need parks
+    // without another send while a live source holds the content.
+    crate::repair_executor::elapse_repair_executor_backoffs_for_test(
+        &case.native.data_dir(&case.primary()).root(),
+    );
+    case.pass(std::slice::from_ref(&target));
+    assert_eq!(
+        sends_to_target(&case),
+        1,
+        "an attempted excluded target is not sent again"
+    );
+    assert!(!case.target_has_receipt());
+    let status = case.status().expect("the need stays tracked, parked");
+    assert!(!status.in_flight);
+    assert!(status.last_error.is_some());
+    // Reachability releases it.
+    crate::repair_executor::repair_executor_reachability_changed(
+        &case.native.data_dir(&case.primary()).root(),
+    );
+    case.pass(&[]);
+    assert!(
+        case.target_has_receipt(),
+        "the reachable target is repaired"
+    );
+    case.close();
 }

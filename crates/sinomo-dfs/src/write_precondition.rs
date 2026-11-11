@@ -588,13 +588,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         self.coordinator
             .fail_intent_precondition(intent_id, failure)?;
         self.remove_pending_write_state(intent_id);
-        self.repair_attempt_records
-            .retain(|(id, _), _| id != intent_id);
         self.clear_active_replica_stage(&original.object_id, &original.target_version);
-        self.record_message_committed_work(crate::DfsMessageCommittedWork {
-            repair_maintenance: true,
-            ..Default::default()
-        });
         Ok(())
     }
 }

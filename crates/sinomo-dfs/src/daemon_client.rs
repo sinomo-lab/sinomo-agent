@@ -90,7 +90,6 @@ impl DaemonDfsMountedMutationHandoffClient {
             crate::DaemonDfsMountedMutationHandoffPhase::Ready,
             None,
             None,
-            0,
         )
     }
 
@@ -114,7 +113,6 @@ impl DaemonDfsMountedMutationHandoffClient {
             crate::DaemonDfsMountedMutationHandoffPhase::Armed,
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
-            0,
         )
     }
 
@@ -127,8 +125,6 @@ impl DaemonDfsMountedMutationHandoffClient {
     ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
         let expected_marker_id = marker_id.clone();
         let expected_arm_request_id = arm_request_id.clone();
-        let expected_max_appended_repair_record_count =
-            captured_work.committed_repair_records.len();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitApplied {
             marker_id,
             marker_nonce,
@@ -140,12 +136,11 @@ impl DaemonDfsMountedMutationHandoffClient {
             crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
-            expected_max_appended_repair_record_count,
         )
     }
 
     /// Preserve an ambiguous mutation error together with every exact work bit
-    /// and repair record captured before the error. This transition deliberately
+    /// captured before the error. This transition deliberately
     /// has no convenience path which substitutes an empty capture.
     pub fn commit_unknown(
         &self,
@@ -156,8 +151,6 @@ impl DaemonDfsMountedMutationHandoffClient {
     ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
         let expected_marker_id = marker_id.clone();
         let expected_arm_request_id = arm_request_id.clone();
-        let expected_max_appended_repair_record_count =
-            observation.captured_work.committed_repair_records.len();
         let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
             marker_id,
             marker_nonce,
@@ -169,7 +162,6 @@ impl DaemonDfsMountedMutationHandoffClient {
             crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
-            expected_max_appended_repair_record_count,
         )
     }
 
@@ -193,7 +185,6 @@ impl DaemonDfsMountedMutationHandoffClient {
             crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite,
             Some(&expected_marker_id),
             Some(&expected_arm_request_id),
-            0,
         )
     }
 
@@ -215,7 +206,6 @@ impl DaemonDfsMountedMutationHandoffClient {
             crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
             Some(&expected_marker_id),
             None,
-            0,
         )
     }
 
@@ -306,7 +296,6 @@ fn validate_daemon_dfs_mounted_mutation_handoff_response(
     expected_phase: crate::DaemonDfsMountedMutationHandoffPhase,
     expected_marker_id: Option<&sinomo_core::Id>,
     expected_arm_request_id: Option<&sinomo_core::Id>,
-    expected_max_appended_repair_record_count: usize,
 ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
     if response.phase != expected_phase
         || response.marker_id.as_ref() != expected_marker_id
@@ -316,14 +305,6 @@ fn validate_daemon_dfs_mounted_mutation_handoff_response(
             detail: format!(
                 "mounted-mutation handoff returned mismatched acknowledgement: phase={:?}, marker_id={:?}, arm_request_id={:?}",
                 response.phase, response.marker_id, response.arm_request_id
-            ),
-        });
-    }
-    if response.appended_repair_record_count > expected_max_appended_repair_record_count {
-        return Err(DaemonApiError::Parse {
-            detail: format!(
-                "mounted-mutation handoff acknowledgement reports {} appended repair records; this request supplied at most {}",
-                response.appended_repair_record_count, expected_max_appended_repair_record_count
             ),
         });
     }
@@ -768,41 +749,11 @@ mod tests {
         )
     }
 
-    fn mounted_mutation_test_capture(
-        repair_records: Vec<crate::DfsRepairAttemptRecord>,
-    ) -> crate::MountedSifsMutationCapturedWork {
-        crate::MountedSifsMutationCapturedWork {
-            committed_work: crate::DfsCommittedWork {
-                publish_metadata: true,
-                ..crate::DfsCommittedWork::default()
-            },
-            committed_repair_records: repair_records,
-        }
-    }
-
-    fn mounted_mutation_test_repair_record(
-        last_error: Option<String>,
-    ) -> crate::DfsRepairAttemptRecord {
-        crate::DfsRepairAttemptRecord {
-            transfer_delivery_state: None,
-            completed_transfer_request_id: None,
-            transfer_kind: None,
-            intent_id: "mounted-mutation-test-intent".to_string(),
-            object_id: sinomo_core::Id::derived("test.mounted-mutation.client.object", b"object"),
-            version: sinomo_core::Id::derived("test.mounted-mutation.client.version", b"version"),
-            content_hash: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-            missing_replica_node_id: NodeId::from_legacy_named(
-                "node_mounted_mutation_client_missing_replica",
-            )
-            .expect("test node id"),
-            attempts: 0,
-            in_flight: false,
-            last_attempt_unix_nanos: 0,
-            next_retry_unix_nanos: 0,
-            transfer_request_id: None,
-            last_error,
-        }
+    fn mounted_mutation_test_capture() -> crate::MountedSifsMutationCapturedWork {
+        crate::MountedSifsMutationCapturedWork::new(crate::DfsCommittedWork {
+            publish_metadata: true,
+            ..crate::DfsCommittedWork::default()
+        })
     }
 
     #[test]
@@ -863,7 +814,7 @@ mod tests {
             marker_id: marker_id.clone(),
             marker_nonce: marker_nonce.clone(),
             arm_request_id: arm_request_id.clone(),
-            captured_work: mounted_mutation_test_capture(Vec::new()),
+            captured_work: mounted_mutation_test_capture(),
         };
         let commit_call = daemon_dfs_mounted_mutation_handoff_call(&commit).expect("commit call");
         assert!(commit_call.request.is_response_retry_safe());
@@ -890,36 +841,20 @@ mod tests {
     }
 
     #[test]
-    fn mounted_mutation_client_rejects_oversized_semantic_and_encoded_payloads() {
+    fn mounted_mutation_client_rejects_oversized_semantic_payloads() {
         let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
-        let record = mounted_mutation_test_repair_record(None);
-        let too_many = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
-            marker_id: marker_id.clone(),
-            marker_nonce: marker_nonce.clone(),
-            arm_request_id: arm_request_id.clone(),
-            captured_work: mounted_mutation_test_capture(vec![
-                record;
-                crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
-                    + 1
-            ]),
-        };
-        let error = daemon_dfs_mounted_mutation_handoff_call(&too_many)
-            .expect_err("repair-record cardinality limit");
-        assert!(error.to_string().contains("repair records"));
-
-        let large_record = mounted_mutation_test_repair_record(Some("e".repeat(10 * 1024)));
-        let oversized = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+        let oversized = DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
             marker_id,
             marker_nonce,
             arm_request_id,
-            captured_work: mounted_mutation_test_capture(vec![
-                large_record;
-                crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
-            ]),
+            observation: crate::MountedSifsMutationErrorObservation {
+                captured_work: mounted_mutation_test_capture(),
+                error_code: "e".repeat(crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES + 1),
+            },
         };
-        let error = daemon_dfs_mounted_mutation_handoff_call(&oversized)
-            .expect_err("encoded payload limit");
-        assert!(error.to_string().contains("encoded bytes"));
+        let error =
+            daemon_dfs_mounted_mutation_handoff_call(&oversized).expect_err("label length limit");
+        assert!(error.to_string().contains("error_code"));
         assert!(error.to_string().contains("max is"));
     }
 
@@ -930,14 +865,12 @@ mod tests {
             marker_id: Some(marker_id.clone()),
             arm_request_id: Some(arm_request_id.clone()),
             phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
-            appended_repair_record_count: 0,
         };
         validate_daemon_dfs_mounted_mutation_handoff_response(
             response.clone(),
             crate::DaemonDfsMountedMutationHandoffPhase::Armed,
             Some(&marker_id),
             Some(&arm_request_id),
-            0,
         )
         .expect("matching arm acknowledgement");
 
@@ -947,7 +880,6 @@ mod tests {
             crate::DaemonDfsMountedMutationHandoffPhase::Armed,
             Some(&marker_id),
             Some(&wrong_arm),
-            0,
         )
         .expect_err("mismatched arm acknowledgement");
         assert!(error.to_string().contains("mismatched acknowledgement"));
@@ -956,14 +888,12 @@ mod tests {
             marker_id: Some(marker_id.clone()),
             arm_request_id: None,
             phase: crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
-            appended_repair_record_count: 0,
         };
         validate_daemon_dfs_mounted_mutation_handoff_response(
             aborted.clone(),
             crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
             Some(&marker_id),
             None,
-            0,
         )
         .expect("abort acknowledgement echoes marker identity");
 
@@ -977,46 +907,9 @@ mod tests {
                 crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
                 Some(&marker_id),
                 None,
-                0,
             )
             .is_err(),
             "every non-probe transition must echo its marker identity"
-        );
-
-        let impossible_arm_count = DaemonDfsMountedMutationHandoffResponse {
-            marker_id: Some(marker_id.clone()),
-            arm_request_id: Some(arm_request_id.clone()),
-            phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
-            appended_repair_record_count: 1,
-        };
-        assert!(
-            validate_daemon_dfs_mounted_mutation_handoff_response(
-                impossible_arm_count,
-                crate::DaemonDfsMountedMutationHandoffPhase::Armed,
-                Some(&marker_id),
-                Some(&arm_request_id),
-                0,
-            )
-            .is_err(),
-            "non-commit acknowledgements must not claim appended repairs"
-        );
-
-        let excessive_commit_count = DaemonDfsMountedMutationHandoffResponse {
-            marker_id: Some(marker_id.clone()),
-            arm_request_id: Some(arm_request_id.clone()),
-            phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
-            appended_repair_record_count: 2,
-        };
-        assert!(
-            validate_daemon_dfs_mounted_mutation_handoff_response(
-                excessive_commit_count,
-                crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
-                Some(&marker_id),
-                Some(&arm_request_id),
-                1,
-            )
-            .is_err(),
-            "commit acknowledgement count must be bounded by supplied records"
         );
     }
 
@@ -1429,11 +1322,10 @@ mod wire_tests {
             marker_id: Some(marker_id),
             arm_request_id: Some(arm_request_id),
             phase: DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
-            appended_repair_record_count: 2,
         };
         let encoded = serde_json::to_value(&response).expect("encode response");
         assert_eq!(encoded["phase"], "daemon-accepted");
-        assert_eq!(encoded["appended_repair_record_count"], 2);
+        assert!(encoded.get("appended_repair_record_count").is_none());
         assert_eq!(
             serde_json::from_value::<DaemonDfsMountedMutationHandoffResponse>(encoded)
                 .expect("decode response"),
@@ -1444,10 +1336,8 @@ mod wire_tests {
     #[test]
     fn mounted_mutation_error_never_decodes_as_an_empty_applied_capture() {
         let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
-        let captured_work = crate::MountedSifsMutationCapturedWork {
-            committed_work: crate::DfsCommittedWork::default(),
-            committed_repair_records: Vec::new(),
-        };
+        let captured_work =
+            crate::MountedSifsMutationCapturedWork::new(crate::DfsCommittedWork::default());
         let unknown = DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
             marker_id: marker_id.clone(),
             marker_nonce: marker_nonce.clone(),

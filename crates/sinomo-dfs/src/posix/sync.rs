@@ -18,8 +18,6 @@ use crate::{
     DfsPosixSyncKind, DfsWriteIntentStatus, NetworkedDfsService,
 };
 
-const POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
-
 const POSIX_SYNC_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 const DFS_POSIX_SYNC_RPC_TIMEOUT: Duration = Duration::from_secs(50);
 
@@ -367,10 +365,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsPosixFileSyncCertificate> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let started_at = Instant::now();
+        // A re-run after a repair wait keeps that wait's deadline.
+        let deadline = match self.file_sync_wait_deadline.take() {
+            Some((object_id, version, deadline))
+                if object_id == target.object_id && version == target.version =>
+            {
+                deadline
+            }
+            _ => started_at + timeout,
+        };
         // This is only a scheduling cursor within the existing request budget.
         // Every visit reloads exact durable owners; it grants no publication
         // permission and cannot settle a previous carrier's unknown outcome.
         let mut repair_owner_after = None;
+        let mut repair_demanded = false;
         let content_evidence = loop {
             self.check_cancelled("file sync content receipts")?;
             match self.posix_validate_file_sync_target_local(target) {
@@ -397,25 +405,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &target.content_hash,
                     )?;
                     self.process_incoming()?;
+                    // Replicas beyond a committed write's W are needs of the
+                    // primary's repair executor. The wait asks it once to
+                    // attempt the object's needs now and drives nothing else:
+                    // no lane dispatch and no second scheduler.
+                    if !repair_demanded {
+                        crate::repair_executor::repair_executor_object_demanded(
+                            &self.node_id,
+                            &target.object_id,
+                        );
+                        repair_demanded = true;
+                    }
+                    let progress = crate::repair_executor::repair_executor_progress(&self.node_id);
+                    // Taken before this check, the mark cannot miss a receipt
+                    // that lands between the check and the wait.
                     if let Ok(evidence) = self.posix_validate_file_sync_target_local(target) {
                         break evidence;
                     }
-                    // Served namespace lanes reopen the backend lazily and may
-                    // have no coordinator state for this already committed
-                    // prefix. Restore its exact durable owner before driving
-                    // repairs; waiting while holding this lane cannot rely on
-                    // a later maintenance pass to hydrate it for us.
-                    self.restore_pending_write_for_intent_if_missing(
-                        &repair_owner,
-                        &target.object_id,
-                    )?;
-                    let intent_ids = BTreeSet::from([repair_owner]);
-                    let (_scheduled, _events) = self.retry_pending_repairs_for_intents_best_effort(
-                        &intent_ids,
-                        required_receipts,
-                    );
-                    let elapsed = started_at.elapsed();
-                    if elapsed >= timeout {
+                    if Instant::now() >= deadline {
                         let (intent_id, durable_receipts, required_receipts) = self
                             .pending_file_sync_receipt_state(target)?
                             .unwrap_or((intent_id, durable_receipts, required_receipts));
@@ -425,16 +432,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             required_receipts,
                         });
                     }
-                    let wait = POSIX_SYNC_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
-                    self.transport
-                        .wait_for_incoming(wait)
-                        .map_err(crate::DfsError::from_network)?;
+                    match progress {
+                        // A served request holds the admission the executor's
+                        // maintenance and its replies need: yield it and wait
+                        // for the executor's index-change or outcome edge.
+                        // Before the node's executor registers, the wait is
+                        // for that registration; the lane is never held.
+                        seen if self.transport.serves_routed_request() => {
+                            let seen = seen.unwrap_or(0);
+                            self.remote_namespace_phase = Some(Box::new(
+                                crate::source_adoption::RemoteNamespacePhase::AwaitRepairProgress(
+                                    crate::source_adoption::AwaitRepairProgressPhase {
+                                        node_id: self.node_id.clone(),
+                                        object_id: target.object_id.clone(),
+                                        version: target.version.clone(),
+                                        seen,
+                                        deadline,
+                                    },
+                                ),
+                            ));
+                            return Err(DfsPosixError::Dfs(crate::DfsError::Distributed {
+                                message: "file sync yielded to the repair executor".into(),
+                            }));
+                        }
+                        Some(seen) => {
+                            crate::repair_executor::repair_executor_wait_for_progress(
+                                &self.node_id,
+                                seen,
+                                deadline,
+                            );
+                        }
+                        // No executor serves this node: only this lane's own
+                        // incoming messages can change the receipts.
+                        None => {
+                            self.transport
+                                .wait_for_incoming(
+                                    deadline.saturating_duration_since(Instant::now()),
+                                )
+                                .map_err(crate::DfsError::from_network)?;
+                        }
+                    }
                 }
             }
         };
         let object = self.current_object_for_file_sync_target(target)?;
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
-        let remaining = timeout.saturating_sub(started_at.elapsed());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let metadata_certificate = self
             .sync_metadata_shard_to_quorum_intersecting(
                 &metadata_target,

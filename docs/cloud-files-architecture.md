@@ -289,12 +289,10 @@ Re-enable may recover those ordinary files only when their type and complete
 content still match the provider's prior durable manifest; retained local
 operations and mismatches remain conflicts.
 
-Mount-open transfers recovered DFS repairs in pages bounded by the existing
-mounted-mutation handoff limit. Its original Armed marker remains durable until
-every repair page has been persisted and acknowledged by the daemon. Only then
-does startup complete that marker and expose callbacks. A crash or lost page
-reply retains full recovery ownership, so a large repair backlog neither drops
-repairs nor turns into repeated failed mount activation and metadata scans.
+Mount-open hands the daemon only its committed-work bits. Repair work lives in
+the shard tables, so opening a mount carries no repair backlog. Its original
+Armed marker remains durable until the daemon acknowledges that handoff; only
+then does startup complete the marker and expose callbacks.
 
 Activation compensation follows the same ownership rule. If an activation
 created a fresh registration and then failed before `Ready`, it removes that

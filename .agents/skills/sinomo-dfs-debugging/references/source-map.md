@@ -78,15 +78,16 @@ for selecting affected targets or a claim that their old passes cover new code.
 | Concern | Entry points | Key distinction |
 |---|---|---|
 | Bounded preparation | [source_adoption/preparation.rs](../../../../crates/sinomo-dfs/src/source_adoption/preparation.rs), [source_adoption.rs](../../../../crates/sinomo-dfs/src/source_adoption.rs) | Pending with zero progress on contention versus lost slot/cursor; 256 is a batch boundary, not proof that startup is corrupt |
-| Repair production/execution | [service_repair.rs](../../../../crates/sinomo-dfs/src/service_repair.rs), [repair_queue_store.rs](../../../../crates/sinomo-dfs/src/repair_queue_store.rs) | Committed intent is source; queue is scheduling state; producer capture is retained until its checkpoint is acknowledged |
+| Repair production/execution | [repair_executor.rs](../../../../crates/sinomo-dfs/src/repair_executor.rs), [repair_index.rs](../../../../crates/sinomo-dfs/src/metadata_tables/repair_index.rs), [service_repair.rs](../../../../crates/sinomo-dfs/src/service_repair.rs) | Committed intent is source; the shard tables' repair index is scheduling state; only the shard primary's executor dispatches, from in-memory attempt state |
 | Maintenance resume | [maintenance_runtime.rs](../../../../crates/sinomo-dfs/src/runtime_host/maintenance_runtime.rs), [maintenance progress](../../../../docs/developer/dfs-maintenance-progress.md) | Cancellation retains bounded progress; returned phase error may need dependency phases again; incomplete never means reconciliation ready |
 | Metadata handoff | [service_sync.rs](../../../../crates/sinomo-dfs/src/service_sync.rs), [DFS architecture](../../../../docs/dfs-architecture.md) | Proposed configuration, retiring freeze, exact prefix, activation and successor binding are distinct |
 | Historical formats | [sinomo-dfs-migration](../../../../crates/sinomo-dfs-migration/src/lib.rs), [storage migrations](../../../../docs/developer/storage-migrations.md) | Current core is strict; decoder selection and old-format normalization belong in migration |
 
-Inspect the actual repair-custody handoff API and tests before assuming pending
-transfers are carried by a configuration change.
-Do not reconstruct pending transfers from desired replica counts: original
-request IDs, delivery uncertainty, attempts and retry ownership matter.
+An authority transfer carries no repair state: a successor primary derives its
+pending transfers from its own replicated repair index.
+Do not reconstruct pending transfers from desired replica counts alone: the
+repair index derives each need from receipts, their slot generations and the
+owner's live roots.
 
 ## Native fixture and observation tools
 

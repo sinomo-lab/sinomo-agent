@@ -689,150 +689,7 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
         // The pending patch belongs to this actual Core producer. Advance its
         // normal retry state before Main publishes the resulting durable work.
         owner_dfs
-            .retry_pending_repairs()
-            .expect("actual producer patch retry");
-        owner_dfs
-            .process_incoming()
-            .expect("actual producer patch completion");
-        runtime
-            .maintenance_tick(&owner, Duration::from_secs(5))
-            .expect("normal pending-patch repair pass");
-        if native_patch_attempts(&runtime, &owner, &replica, first_observation) > first_attempts {
-            break;
-        }
-    }
-    assert!(
-        native_patch_attempts(&runtime, &owner, &replica, first_observation) > first_attempts,
-        "the lost actual stage must retry as a patch before any semantic rejection"
-    );
-    runtime.clear_faults();
-    drop(replica_dfs);
-    drop(owner_dfs);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn sifs_posix_write_at_retries_lost_patch_attachment() {
-    let (mut runtime, owner, replica, owner_browser, replica_dfs) =
-        native_patch_services("sifs_posix_write_at_retries_lost_patch_attachment");
-    drop(owner_browser);
-    // Inspect and retry the same real Core that owns this pending patch.
-    let mut owner_dfs = runtime.metadata_primary_service("/services").unwrap();
-    let path = "/services/retry-write-at-patch.bin";
-
-    let mut initial = vec![0_u8; 512 * 1024 + 11];
-    for (index, byte) in initial.iter_mut().enumerate() {
-        *byte = (index % 251) as u8;
-    }
-    owner_dfs
-        .posix_write_file(
-            path,
-            &initial,
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
-                replica_candidates: vec![owner.clone(), replica.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: true,
-            },
-        )
-        .expect("initial self write");
-
-    let first_observation = runtime.rpc_observations().len();
-    runtime.install_fault(crate::test_runtime::FaultRule {
-        source: Some(owner.clone()),
-        target: Some(replica.clone()),
-        route: Some(crate::DFS_DATA_STAGE_PATCH_ROUTE.into()),
-        call_id: None,
-        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-        remaining_hits: 32,
-        action: crate::test_runtime::FaultAction::BudgetExhausted,
-    });
-
-    let mut patch = vec![0_u8; 4 * 1024 * 1024 + 160 * 1024 + 5];
-    for (index, byte) in patch.iter_mut().enumerate() {
-        *byte = (index % 239) as u8;
-    }
-    let patch_hash = content_hash(&patch);
-    struct StreamingPatchReader {
-        bytes: Vec<u8>,
-        offset: usize,
-        bulk_reads: std::rc::Rc<std::cell::Cell<usize>>,
-    }
-    impl std::io::Read for StreamingPatchReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.offset == 0 {
-                if buffer.len() != 1 {
-                    return Err(std::io::Error::other(format!(
-                        "expected initial POSIX peek buffer, got {}",
-                        buffer.len()
-                    )));
-                }
-            } else if buffer.len() != 64 * 1024 {
-                return Err(std::io::Error::other(format!(
-                    "expected content-store streaming buffer, got {}",
-                    buffer.len()
-                )));
-            } else {
-                self.bulk_reads.set(self.bulk_reads.get() + 1);
-            }
-            if self.offset >= self.bytes.len() {
-                return Ok(0);
-            }
-            let len = buffer.len().min(self.bytes.len() - self.offset);
-            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
-            self.offset += len;
-            Ok(len)
-        }
-    }
-    let bulk_reads = std::rc::Rc::new(std::cell::Cell::new(0));
-    owner_dfs
-        .posix_write_file_at_from_reader(
-            path,
-            96 * 1024 + 5,
-            StreamingPatchReader {
-                bytes: patch.clone(),
-                offset: 0,
-                bulk_reads: bulk_reads.clone(),
-            },
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
-                replica_candidates: vec![owner.clone(), replica.clone()],
-                wait_for_commit: false,
-                foreground_replica_repair: true,
-            },
-        )
-        .expect("patch write");
-    assert!(
-        bulk_reads.get() > 1,
-        "replicated write_at reader should stream the patch through the content store"
-    );
-    let pending = owner_dfs
-        .writes
-        .pending_writes
-        .values()
-        .next()
-        .expect("pending patch write");
-    let pending_patch = pending.patch.as_ref().expect("pending patch metadata");
-    assert_eq!(pending_patch.patch_hash, patch_hash);
-    assert_eq!(pending_patch.patch_size_bytes, patch.len() as u64);
-    assert!(
-        owner_dfs
-            .content()
-            .has_blob(&pending_patch.patch_hash)
-            .expect("pending patch blob exists"),
-        "pending patch retry should stream from the content-addressed patch blob"
-    );
-
-    let first_attempts = native_patch_attempts(&runtime, &owner, &replica, first_observation);
-    assert!(
-        first_attempts > 0,
-        "the actual first stage must attempt a patch RPC"
-    );
-    for _ in 0..16 {
-        // The pending patch belongs to this actual Core producer. Advance its
-        // normal retry state before Main publishes the resulting durable work.
-        owner_dfs
-            .retry_pending_repairs()
+            .retry_pending_stages(8)
             .expect("actual producer patch retry");
         owner_dfs
             .process_incoming()
@@ -1247,4 +1104,147 @@ fn native_patch_attempts(
         );
     }
     attempts
+}
+
+#[test]
+fn sifs_posix_write_at_retries_lost_patch_attachment() {
+    let (runtime, owner, replica, owner_browser, replica_dfs) =
+        native_patch_services("sifs_posix_write_at_retries_lost_patch_attachment");
+    drop(owner_browser);
+    // Inspect and retry the same real Core that owns this pending patch.
+    let mut owner_dfs = runtime.metadata_primary_service("/services").unwrap();
+    let path = "/services/retry-write-at-patch.bin";
+
+    let mut initial = vec![0_u8; 512 * 1024 + 11];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    owner_dfs
+        .posix_write_file(
+            path,
+            &initial,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect("initial self write");
+
+    let first_observation = runtime.rpc_observations().len();
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(crate::DFS_DATA_STAGE_PATCH_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::BudgetExhausted,
+    });
+
+    let mut patch = vec![0_u8; 4 * 1024 * 1024 + 160 * 1024 + 5];
+    for (index, byte) in patch.iter_mut().enumerate() {
+        *byte = (index % 239) as u8;
+    }
+    let patch_hash = content_hash(&patch);
+    struct StreamingPatchReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        bulk_reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl std::io::Read for StreamingPatchReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == 0 {
+                if buffer.len() != 1 {
+                    return Err(std::io::Error::other(format!(
+                        "expected initial POSIX peek buffer, got {}",
+                        buffer.len()
+                    )));
+                }
+            } else if buffer.len() != 64 * 1024 {
+                return Err(std::io::Error::other(format!(
+                    "expected content-store streaming buffer, got {}",
+                    buffer.len()
+                )));
+            } else {
+                self.bulk_reads.set(self.bulk_reads.get() + 1);
+            }
+            if self.offset >= self.bytes.len() {
+                return Ok(0);
+            }
+            let len = buffer.len().min(self.bytes.len() - self.offset);
+            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
+        }
+    }
+    let bulk_reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    owner_dfs
+        .posix_write_file_at_from_reader(
+            path,
+            96 * 1024 + 5,
+            StreamingPatchReader {
+                bytes: patch.clone(),
+                offset: 0,
+                bulk_reads: bulk_reads.clone(),
+            },
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: false,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect("patch write");
+    assert!(
+        bulk_reads.get() > 1,
+        "replicated write_at reader should stream the patch through the content store"
+    );
+    let pending = owner_dfs
+        .writes
+        .pending_writes
+        .values()
+        .next()
+        .expect("pending patch write");
+    let pending_patch = pending.patch.as_ref().expect("pending patch metadata");
+    assert_eq!(pending_patch.patch_hash, patch_hash);
+    assert_eq!(pending_patch.patch_size_bytes, patch.len() as u64);
+    assert!(
+        owner_dfs
+            .content()
+            .has_blob(&pending_patch.patch_hash)
+            .expect("pending patch blob exists"),
+        "pending patch retry should stream from the content-addressed patch blob"
+    );
+
+    let first_attempts = native_patch_attempts(&runtime, &owner, &replica, first_observation);
+    assert!(
+        first_attempts > 0,
+        "the actual first stage must attempt a patch RPC"
+    );
+    for _ in 0..16 {
+        // The pending patch belongs to this actual Core producer. Advance its
+        // normal retry state before Main publishes the resulting durable work.
+        owner_dfs
+            .retry_pending_stages(8)
+            .expect("actual producer patch retry");
+        owner_dfs
+            .process_incoming()
+            .expect("actual producer patch completion");
+        runtime
+            .maintenance_tick(&owner, Duration::from_secs(5))
+            .expect("normal pending-patch repair pass");
+        if native_patch_attempts(&runtime, &owner, &replica, first_observation) > first_attempts {
+            break;
+        }
+    }
+    assert!(
+        native_patch_attempts(&runtime, &owner, &replica, first_observation) > first_attempts,
+        "the lost actual stage must retry as a patch before any semantic rejection"
+    );
+    runtime.clear_faults();
+    drop(replica_dfs);
+    drop(owner_dfs);
+    runtime.close().unwrap();
 }

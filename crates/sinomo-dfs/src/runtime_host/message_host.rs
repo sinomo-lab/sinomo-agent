@@ -83,8 +83,6 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
         intent_id_digest: [u8; 32],
         target_id_digest: [u8; 32],
         request_id_digest: [u8; 32],
-        /// Exact prior producer row copied before this claim mutates any state.
-        prior_transfer: Option<&'a crate::DfsRepairAttemptRecord>,
     },
     BeforeExecute {
         /// Presence of the original owned runtime admission at execution entry.
@@ -101,18 +99,9 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
         source_reference_selected: bool,
         source_reference_applied: bool,
     },
-    /// Actual new retained-owner boundaries; hooks supply only negative faults.
-    BeforeRetainedRepairQueueEnrollment {
-        owner_id_digest: [u8; 32],
-    },
-    AfterRetainedRepairQueueEnrollment {
-        owner_id_digest: [u8; 32],
-    },
     /// Read-only facts from the actual Main report and its queue capture.
     AfterReport {
         committed_work: DfsMessageCommittedWork,
-        repair_record_count: usize,
-        new_repair_records_unattempted: bool,
         succeeded: bool,
     },
 }
@@ -776,7 +765,6 @@ pub(super) fn daemon_dfs_message_preempts_maintenance(
     match message {
         sinomo_dfs::DfsNetworkMessage::CommitVersion(_) => false,
         sinomo_dfs::DfsNetworkMessage::RepairReplica(command) => !command.background_repair,
-        sinomo_dfs::DfsNetworkMessage::SelectedOriginalRepair(_) => false,
         sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
@@ -1505,27 +1493,6 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
     if let Some(data_root) = cluster_paths.root.parent() {
         let data_dir = SinomoDataDir::new(data_root);
         let paths = DaemonPaths::new(&data_dir);
-        worker.set_background_delivery_handler(move |event| {
-            let owner = publication_runtime_owner(&crate::default_dfs_metadata_shards_root(&data_dir))
-                .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
-            let selected = owner.as_ref().map(|owner| owner.selected_original_data_layout()).transpose()
-                .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?.flatten();
-            let inspection = if matches!(&event, crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch { .. }) {
-                owner.as_ref().map(|owner| owner.repair_payload_inspection_context()).transpose()
-                    .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
-            } else { None };
-            crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
-                &data_dir,
-                event,
-                selected.as_deref(),
-                inspection.as_ref(),
-            )
-        });
-        let fresh_response_runtime = tokio_runtime.clone();
-        let fresh_paths = paths.clone();
-        worker.set_fresh_repair_response_handler(move |fresh| {
-            handle_fresh_original_repair_return(&fresh_paths, &fresh_response_runtime, fresh)
-        });
         let response_runtime = tokio_runtime.clone();
         worker.set_background_response_handler(move |message, original| {
             let request_id = match &message.message {
@@ -1678,7 +1645,7 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
                 metadata_root, shards, local_node_id, layout,
             )?) as Box<dyn sinomo_dfs::DfsMetadataBackend>
         } else {
-            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(
+            crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(
                 &metadata_root,
             )?;
             sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?
@@ -3123,22 +3090,6 @@ pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
     Ok(verified)
 }
 
-fn prepare_daemon_dfs_verified_original_history_query(
-    data_dir: &SinomoDataDir, peer: &DaemonDfsMessagePeerSnapshot,
-    command: &DfsMessageCommand, preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
-) -> Result<Option<crate::publication_guard::VerifiedOriginalRepairHistoryRead>, sinomo_dfs::DfsError> {
-    let sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &command.routed_message.message else { return Ok(None); };
-    let invalid = || sinomo_dfs::DfsError::Metadata { message: "history query requires its actual current native read preflight".into() };
-    if command.routed_message != request.routed() || command.routed_message.target_node_id != peer.local_node_id { return Err(invalid()); }
-    let preflight = preflight.ok_or_else(invalid)?;
-    if preflight.authority.generation() != preflight.generation { return Err(invalid()); }
-    let owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir)).map_err(|error| sinomo_dfs::DfsError::Metadata { message: error.to_string() })?;
-    let verified = crate::publication_guard::VerifiedOriginalRepairHistoryRead::capture(owner, Arc::clone(&preflight.authority),
-        &command.routed_message.source_node_id, &peer.local_node_id, request)?;
-    if preflight.authority.generation() != preflight.generation { return Err(invalid()); }
-    Ok(Some(verified))
-}
-
 #[cfg(test)]
 pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
@@ -3172,7 +3123,6 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         runtime,
         traceparent,
         None,
-    None,
     )
 }
 
@@ -3192,15 +3142,8 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
-    fresh_original_repair: Option<crate::runtime_host::FreshOriginalRepairReturn>,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
-    #[cfg(any(test, feature = "test-support"))]
-    if matches!(&command.routed_message.message, crate::DfsNetworkMessage::RepairReplicaResponse(_)) {
-        require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
-            .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
-            .reject_raw_selected_repair_response(&command.routed_message)?;
-    }
     match reject_daemon_dfs_incomplete_genesis_before_effects(
         data_dir, peer_snapshot, &command, metadata_authority_preflight.as_ref(),
     ) {
@@ -3212,10 +3155,8 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         }
         Err(DaemonDfsAuthorityPreExecutionError::Failed(error)) => return Err(error),
     }
-    let verified_history = prepare_daemon_dfs_verified_original_history_query(data_dir, peer_snapshot, &command, metadata_authority_preflight.as_ref())?;
     // Daemon startup owns data-directory initialization. Repeating its six
     // create_dir_all calls here turns every routed DFS message into layout I/O.
-    let cache_key = data_dir.root();
     let is_read_only = verified_fetch.is_some() || dfs_message_is_read_only_request(&command);
     let use_content_read_lane =
         verified_fetch.is_some() || daemon_dfs_message_uses_content_read_lane(&command);
@@ -3290,9 +3231,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     #[cfg(any(test, feature = "test-support"))]
     let observed_command = execution_test_hook.as_ref().map(|_| command.clone());
     #[cfg(test)]
-    struct CreatePrepareTestHookCleanup {
-        original_repair_faults: Option<crate::content_store::OriginalRepairTestFaultCleanup>,
-    }
+    struct CreatePrepareTestHookCleanup;
     #[cfg(test)]
     impl Drop for CreatePrepareTestHookCleanup {
         fn drop(&mut self) {
@@ -3302,36 +3241,20 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             crate::publication_guard::AFTER_PREPARED_AUTHORIZATION.with(|hook| {
                 hook.borrow_mut().take();
             });
-            drop(self.original_repair_faults.take());
         }
     }
     // A fixture may arm the existing one-shot on this actual Main worker.
     // Clear it on the SAME worker on every return and unwind, including errors.
     #[cfg(test)]
-    let mut _create_prepare_cleanup = execution_test_hook
+    let _create_prepare_cleanup = execution_test_hook
         .as_ref()
-        .map(|_| CreatePrepareTestHookCleanup { original_repair_faults: None });
+        .map(|_| CreatePrepareTestHookCleanup);
     #[cfg(any(test, feature = "test-support"))]
     if let Some(hook) = execution_test_hook.as_ref() {
         let before_execute = || hook(
             DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held: mutation_admission.is_some() },
             observed_command.as_ref(), metadata_authority_preflight.as_ref(),
         );
-        #[cfg(test)]
-        if matches!(&command.routed_message.message,
-            crate::DfsNetworkMessage::SelectedOriginalRepair(_) | crate::DfsNetworkMessage::OriginalRepairHistoryRequest(_)) {
-            // The existing generic cleanup already exists before this fallible
-            // join. Missing/failed actual owner capture returns BEFORE the hook;
-            // no retained content handle can substitute for this native owner.
-            let cleanup = run_original_repair_test_hook_with_cleanup(
-                daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
-                    .map_err(|error| crate::DfsError::Metadata { message: error.to_string() }),
-                before_execute,
-            )?;
-            _create_prepare_cleanup.as_mut().expect("the installed test hook owns its generic cleanup")
-                .original_repair_faults = Some(cleanup);
-        } else { before_execute()?; }
-        #[cfg(not(test))]
         before_execute()?;
     }
     if verified_fetch.is_some() {
@@ -3403,16 +3326,11 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         preingested_blob,
         execution_scope,
         verified_fetch,
-        verified_history,
         publication_scope
             .as_ref()
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
         publication_provider,
         completed_phase,
-        fresh_original_repair,
-        |repair_queue_records| {
-            persist_daemon_dfs_repair_queue_records(data_dir, repair_queue_records)
-        },
     );
     if let Some(scope) = publication_scope.take() {
         scope.finish()?;
@@ -3424,24 +3342,17 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         committed_work,
         replica_materialization_shard,
         deferred_work,
-        #[cfg(test)]
-        new_repair_records_unattempted,
-        repair_queue_record_count,
-        repair_queue_persistence,
         exact_projection_release_error,
         resident_backend_release_error,
         lane_lock_wait,
         backend_checkout,
         process,
-        repair_queue_elapsed,
     } = execution?;
     #[cfg(test)]
     if let Some(hook) = execution_test_hook.as_ref() {
         hook(
             DaemonDfsPreDispatchTestPoint::AfterReport {
                 committed_work: process_report.committed_work,
-                repair_record_count: repair_queue_record_count,
-                new_repair_records_unattempted,
                 succeeded: process_report.outcome.is_ok(),
             },
             observed_command.as_ref(),
@@ -3494,7 +3405,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         .map(|result| (result.response.outbound_messages.len(), result.events.len()))
         .unwrap_or_default();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} backend_checkout_ms={} backend_checkout_us={} process_ms={} process_us={} repair_queue_records={} repair_queue_appended={} repair_queue_ms={} repair_queue_us={} process_ok={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} backend_checkout_ms={} backend_checkout_us={} process_ms={} process_us={} process_ok={} outbound_messages={} events={} total_ms={}",
         request_id,
         is_read_only,
         peer_snapshot_ms,
@@ -3508,33 +3419,11 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         backend_checkout.as_micros(),
         process.as_millis(),
         process.as_micros(),
-        repair_queue_record_count,
-        repair_queue_persistence
-            .as_ref()
-            .copied()
-            .unwrap_or_default(),
-        repair_queue_elapsed.as_millis(),
-        repair_queue_elapsed.as_micros(),
         process_report.outcome.is_ok(),
         outbound_message_count,
         event_count,
         trace_started.elapsed().as_millis()
     ));
-    if let Err(error) = repair_queue_persistence {
-        tracing::error!(
-            target: "sinomo.dfs.fault_healing",
-            data_root = %cache_key.display(),
-            request = %request_id,
-            kind = message_kind,
-            error = %error,
-            "failed to persist committed DFS repair queue; internal maintenance reconciliation remains required"
-        );
-        if let Err(recovery_error) =
-            request_daemon_dfs_maintenance_reconciliation(&DaemonPaths::new(data_dir))
-        {
-            tracing::error!(%recovery_error, "could not schedule metadata-owned DFS repair recovery");
-        }
-    }
     #[cfg(test)]
     wait_at_daemon_dfs_message_committed_edge_test_hook(&request_id);
     let retained_events = process_report
@@ -3655,9 +3544,11 @@ impl sinomo_dfs::DfsCommittedEffectsHost for DaemonDfsCommittedEffectsHost<'_> {
 
     fn wake_maintenance(&self, repair: bool, _namespace: bool) {
         if repair {
+            tracing::trace!(target: "sinomo.dfs.perf", stage = "dfs.repair.executor.wake",
+                data_root = %self.data_dir.root().display(), source = "committed_effects",
+                "repair executor wake");
             #[cfg(test)]
             record_daemon_dfs_repair_maintenance_edge_request(self.data_dir);
-            request_daemon_dfs_repair_maintenance(self.data_dir);
         }
         notify_daemon_dfs_maintenance_work(self.data_dir);
     }
@@ -4225,15 +4116,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         sinomo_dfs::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | sinomo_dfs::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_)) {
         return Err(DaemonError::Network { address: "selected local recovery fence".into(), detail: "selected local recovery fence requires authenticated native RPC ingress, not generic/direct frames".into() });
     }
-    if matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryResponse(_)) {
-        return Err(DaemonError::Network { address: "DFS history query".into(), detail: "unsolicited historical response has no direct-call owner".into() });
-    }
-    if attachment.is_some() && matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryRequest(_)) {
-        return Err(DaemonError::Network { address: "DFS history query".into(), detail: "history query cannot carry a semantic attachment".into() });
-    }
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
-    #[cfg(any(test, feature = "test-support"))]
-    data_owner_lock.reject_raw_selected_repair_response(&command.routed_message)?;
     let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -4300,8 +4183,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         });
     }
     let uses_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
-    let mut metadata_authority_preflight = if !uses_content_read_lane
-        || matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryRequest(_)) {
+    let mut metadata_authority_preflight = if !uses_content_read_lane {
         // Complete or join authority I/O before even the shared content-store
         // lookup below can take the process-wide DFS cache mutex. Attachment
         // ingest may perform durable local I/O, but it never owns authority.
@@ -4705,7 +4587,6 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     &process_runtime,
                     process_traceparent.clone(),
                     process_completed_phase.map(|completed| *completed),
-                None,
                 )
             });
             // A blocking task keeps running when its async JoinHandle is dropped.
@@ -4852,43 +4733,6 @@ pub(crate) fn handle_daemon_dfs_message_on_runtime(
     handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, false, None)
 }
 
-/// Non-effect custody for an actual native return, before serving authority.
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn defer_native_owned_repair_completion(
-    completion: &Arc<crate::runtime_host::OwnedOriginalRepairCompletion>,
-) -> Result<crate::repair_queue_store::DeferredNativeRepairCompletion, crate::DfsError> {
-    let result = (|| {
-        let queue = completion.custody_queue()?;
-        completion.revalidate_custody_owner(&queue)?;
-        completion.before_custody_intake()?;
-        // Reuse the existing negative namespace cut on this exact callback
-        // worker; cleanup restores its prior TLS value on every error/unwind.
-        #[cfg(test)]
-        struct NamespaceFailure(bool);
-        #[cfg(test)]
-        impl Drop for NamespaceFailure {
-            fn drop(&mut self) {
-                crate::repair_queue_store::REPAIR_QUEUE_FAIL_SELECTED_NAMESPACE.set(self.0);
-            }
-        }
-        #[cfg(test)]
-        let _namespace_failure = completion.take_namespace_failure().then(|| {
-            NamespaceFailure(
-                crate::repair_queue_store::REPAIR_QUEUE_FAIL_SELECTED_NAMESPACE.replace(true),
-            )
-        });
-        let deferred = queue.retain_native_owned_repair_completion(completion.as_ref())?;
-        completion.record_custody_deferred(&deferred);
-        Ok(deferred)
-    })();
-    if let Err(error) = &result {
-        completion.record_custody_error(error);
-    }
-    // No ordinary handler follows this typed result. In particular there is
-    // no serving-authority warm/admission, receipt application, W or Close.
-    result
-}
-
 /// A detached worker has matched this return to its authenticated peer and
 /// original background request. Keep ordinary receipt/authority validation,
 /// while re-admitting that producer's completion without foreground preemption.
@@ -4905,65 +4749,64 @@ fn handle_daemon_dfs_message_on_runtime_with_background_response(
 }
 
 /// Route DATA from an actual locally owned original request. This supplies no
-/// author capability: current intent/queue/policy and native kernel guards still
-/// validate the reply and publication under the selected ordinary shard lease.
+/// author capability: the reply publishes only through the receipt-slot
+/// compare under the object's current shard lease. The scope is that current
+/// assignment, not the one the attempt was planned under, so a reply that
+/// crosses an epoch or replica change still reaches the executor as its
+/// attempt's outcome. `None`: this node is no longer the object's primary, and
+/// the reply ends its attempt unpublished.
 pub(super) fn owned_repair_completion_scope(
     original: &sinomo_dfs::DfsRoutedMessage,
     returned: &sinomo_dfs::DfsRoutedMessage,
     local: &NodeId,
     shards: &[sinomo_dfs::DfsMetadataShardConfig],
-) -> Result<DfsMessageExecutionScope, sinomo_dfs::DfsError> {
+) -> Result<Option<DfsMessageExecutionScope>, sinomo_dfs::DfsError> {
     let invalid = || sinomo_dfs::DfsError::Metadata {
         message: "owned repair completion does not match its current original request/assignment"
             .into(),
     };
-    let (
-        sinomo_dfs::DfsNetworkMessage::RepairReplica(request),
-        sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response),
-    ) = (&original.message, &returned.message)
-    else {
+    // A background repair and a retained version's repair both complete
+    // through this scope; the reply must match the exact command identity.
+    let (file_system_id, assignment, object) = match &original.message {
+        sinomo_dfs::DfsNetworkMessage::RepairReplica(request) if request.background_repair => (
+            &request.file_system_id,
+            request.authority_shard.as_ref(),
+            request.object_metadata.as_ref(),
+        ),
+        sinomo_dfs::DfsNetworkMessage::RepairRetainedBlob(request) => (
+            &request.file_system_id,
+            request.authority_shard.as_ref(),
+            request.object_metadata.as_ref(),
+        ),
+        _ => return Err(invalid()),
+    };
+    let sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) = &returned.message else {
         return Err(invalid());
     };
-    let assignment = request.authority_shard.as_ref().ok_or_else(invalid)?;
-    let object = request.object_metadata.as_ref().ok_or_else(invalid)?;
-    if !request.background_repair
-        || &original.source_node_id != local
-        || &returned.target_node_id != local
-        || returned.source_node_id != original.target_node_id
-        || response.replica_node_id != original.target_node_id
-        || response.request_id != request.request_id
-        || response.intent_id != request.intent_id
-        || response.file_system_id != request.file_system_id
-        || response.object_id != request.object_id
-        || response.version != request.version
-        || assignment.file_system_id != request.file_system_id
-        || &assignment.primary_node_id != local
+    let assignment = assignment.ok_or_else(invalid)?;
+    let object = object.ok_or_else(invalid)?;
+    if !crate::node_transport::all_background_replica_response_identity_matches(
+        local, original, returned,
+    ) || assignment.file_system_id != *file_system_id
         || assignment.shard_id.trim().is_empty()
-        || object.file_system_id != request.file_system_id
-        || object.object_id != request.object_id
-    {
-        return Err(invalid());
-    }
-    if matches!(&response.result,
-        sinomo_dfs::DfsBlobTransferResult::Committed { content_hash }
-            | sinomo_dfs::DfsBlobTransferResult::Durable { content_hash }
-            if content_hash != &request.content_hash)
+        || object.file_system_id != *file_system_id
+        || object.object_id != response.object_id
     {
         return Err(invalid());
     }
     let selected = sinomo_dfs::select_metadata_shard_config_for_path_strict_default_sifs_split(
-        &request.file_system_id,
+        file_system_id,
         shards,
         &object.path,
     )?
     .ok_or_else(invalid)?;
-    if selected != *assignment {
-        return Err(invalid());
+    if &selected.primary_node_id != local {
+        return Ok(None);
     }
-    Ok(DfsMessageExecutionScope::ExactShard {
-        file_system_id: assignment.file_system_id.clone(),
-        shard_id: sinomo_dfs::DfsMetadataShardId::new(&assignment.shard_id),
-    })
+    Ok(Some(DfsMessageExecutionScope::ExactShard {
+        file_system_id: selected.file_system_id.clone(),
+        shard_id: sinomo_dfs::DfsMetadataShardId::new(&selected.shard_id),
+    }))
 }
 
 fn handle_daemon_dfs_message_on_runtime_with_priority(
@@ -4979,33 +4822,7 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
         runtime,
         background_response,
         original_repair,
-        None,
     )
-}
-
-fn handle_fresh_original_repair_return(
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-    fresh: crate::runtime_host::FreshOriginalRepairReturn,
-) -> Result<(), crate::DfsError> {
-    let original = fresh.carrier().clone();
-    let returned = fresh.returned_frame().clone();
-    let command = DfsMessageCommand {
-        request_id: format!("dfs_fresh_original_repair_{}", fresh.rpc_request_id()),
-        routed_message: returned,
-    };
-    handle_daemon_dfs_message_on_runtime_with_native_return(
-        paths,
-        command,
-        runtime,
-        true,
-        Some(&original),
-        Some(fresh),
-    )
-    .map(|_| ())
-    .map_err(|error| crate::DfsError::Metadata {
-        message: error.to_string(),
-    })
 }
 
 fn handle_daemon_dfs_message_on_runtime_with_native_return(
@@ -5014,7 +4831,6 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
     runtime: &tokio::runtime::Handle,
     background_response: bool,
     original_repair: Option<&sinomo_dfs::DfsRoutedMessage>,
-    fresh_original_repair: Option<crate::runtime_host::FreshOriginalRepairReturn>,
 ) -> Result<sinomo_dfs::DfsMessageResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -5075,12 +4891,35 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
                 message: "owned repair completion current configuration projection is unavailable"
                     .into(),
             })?;
-        execution_scope = owned_repair_completion_scope(
+        let Some(scope) = owned_repair_completion_scope(
             original,
             &command.routed_message,
             &peer_snapshot.local_node_id,
             &shards,
-        )?;
+        )?
+        else {
+            // The assignment moved away: the successor's executor owns the
+            // need. This reply only ends the attempt that sent it.
+            if let sinomo_dfs::DfsNetworkMessage::RepairReplicaResponse(response) =
+                &command.routed_message.message
+            {
+                crate::repair_executor::repair_executor_attempt_ended(
+                    &peer_snapshot.local_node_id,
+                    &(
+                        response.object_id.clone(),
+                        response.version.clone(),
+                        response.replica_node_id.clone(),
+                    ),
+                    &response.request_id,
+                    crate::repair_executor::DfsRepairAttemptOutcome::Superseded,
+                );
+            }
+            return Ok(sinomo_dfs::DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            });
+        };
+        execution_scope = scope;
         daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
             .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)?;
     }
@@ -5109,8 +4948,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         &mut mutation_admission,
         runtime,
         None,
-    None,
-        fresh_original_repair,
+        None,
     )?{
         DaemonDfsMessageDispatchAttempt::Complete(result) => result,
         DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(retry) => {

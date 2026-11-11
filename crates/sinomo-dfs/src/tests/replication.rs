@@ -49,10 +49,13 @@ fn dfs_metadata_replication_retry_gate_tracks_incomplete_outcomes() {
 #[test]
 fn missing_current_manifest_blob_returns_pending_replication() {
     let bytes = vec![b'm'; 17 * 1024];
-    let (runtime, mut dfs, stat, withdrawn) = super::repair::native_withdrawn_local_replica_fixture(
-        "native-read-missing-current-blob",
-        &bytes,
-    );
+    // The shard primary's executor would restore the withdrawn location from
+    // its still-present bytes; hold it so the read meets exactly one location.
+    let (runtime, dfs, stat, withdrawn, _executor_hold) =
+        super::repair::native_withdrawn_local_replica_fixture_held(
+            "native-read-missing-current-blob",
+            &bytes,
+        );
     let remaining = dfs
         .metadata_backend()
         .unwrap()

@@ -21,66 +21,52 @@ Do not collapse these objects into one request-ID/hash tuple:
 
 ## Proposed durable states and gates
 
-### Concrete candidate records in the existing store
+### Repair is outside original-effect custody
 
-This design is a proposal for review at Rust checkpoint
-`f520a20d482ca2b069dd51ced9f220c365797644`, not a new queue or implemented format.
-The first possible production slice is background **RepairReplica only** on the
-same producer after restart. Stage/StagePatch, promotion, cross-primary replay and
-survivor replication require separate integration. The wire command types live
-in `sinomo-dfs`; embedding them in the shared `sinomo-api` scheduling record
-would invert that ownership boundary.
+Repair needs no original-effect custody. A replica below desired N is a need in
+the replicated shard tables, and the shard primary's repair executor derives its
+work from them. A successor primary derives the same work after takeover, so
+recovery never depends on the retiring owner's repair state. Each repair attempt
+carries the receipt-slot generation it was planned against, and a reply
+publishes only through that generation's compare: a late or duplicated reply
+from an older attempt cannot publish. Retry timing restarts at the successor.
+The obligations in this document apply to Stage/StagePatch, CommitVersion
+promotion and client delivery; RepairReplica is not among them.
 
-Use a DFS-owned `StoredRepairQueueRowV2` in the existing queue snapshot/log.
-Retain `DfsRepairAttemptRecord` as its scheduling/status projection. Existing
-Enqueue/Set/Remove, maintenance, hydration, snapshot and cooperative export paths
-must preserve the original-effect fields. A missing repair deficit must not erase
-an unresolved original effect. The current store is a restart accelerator for
-semantic repair state; enrolled original custody would become retained evidence
-which rebuilding that projection cannot discard.
+### Candidate records
 
-Enforce preservation **inside the writer**: scheduling-only Set updates replace
-only the projection; custody removal compares the exact terminal witness and
-dependency generation. Today `replace_records` and whole-view reconciliation
-remove omitted keys, ordinary Set/Remove can replace/delete rows, and compaction
-serializes the remaining rows. All those paths need V2-aware rules; caller
-discipline is insufficient. Removing a repair deficit can park scheduling while
-retaining an unresolved custody slot. Cooperative pages need a V2 stored-row
-representation; their current `Vec<DfsRepairAttemptRecord>` loses these fields.
+The wire command types live in `sinomo-dfs`; embedding them in a shared
+`sinomo-api` scheduling record would invert that ownership boundary. Custody
+records belong to a DFS-owned store whose writer enforces preservation itself:
+scheduling-only updates replace only a projection, and custody removal compares
+the exact terminal witness and dependency generation. Caller discipline is
+insufficient. The owning store for the remaining effects is not chosen yet.
 
-| Candidate field group | Exact retained contents | Existing owner / required extension |
+| Candidate field group | Exact retained contents | Required owner behavior |
 |---|---|---|
-| Format and birth | Explicit custody schema/codec version, queue incarnation/generation and actual append sequence; never timestamp-only identity | `LocalDfsRepairQueueStore`, sequenced snapshot/log and disk-generation observation |
-| Scheduling projection | Existing intent/target, retries and pacing, plus exact observed-row CAS | `DfsRepairAttemptRecord`; all scheduling updates preserve the stored wrapper |
+| Format and birth | Explicit custody schema/codec version, store incarnation/generation and actual append sequence; never timestamp-only identity | Sequenced snapshot/log with disk-generation observation |
 | Original identity | Effect kind, original wire request ID, intent/operation, filesystem/object/version, target, original logical requester/coordinator and producer | Capture from the already prepared command and producer; do not infer omitted fields from the current head |
-| Original head | Complete immutable encoded domain command, encoding version, route/category and digest; original base/patch predicates, metadata, authority assignment and flags stay sealed | `service_outbound.rs::prepare_replica_attachments` and the actual `DfsRoutedSend` before detachment; current transport source/envelope remains separately classified |
-| Inline material | Original inline bytes remain inside the exact command encoding | Same queue row if it fits the existing frame bound; no replacement with a hash or a different attachment command |
+| Original head | Complete immutable encoded domain command, encoding version, route/category and digest; original base/patch predicates, metadata, authority assignment and flags stay sealed | Captured from the actual `DfsRoutedSend` before detachment; the current transport source/envelope stays separately classified |
+| Inline material | Original inline bytes remain inside the exact command encoding | Same record if it fits the store's frame bound; no replacement with a hash or a different attachment command |
 | Attached material | Exact descriptor (size/hash/layout/ranges/encoding) and a durable root for those exact bytes, including object/version/patch binding | Existing content store and reservation/catalog owner; a reader lease or descriptor is insufficient |
 | Physical dependency | Store incarnation, physical generation, owner-minted reservation causal stamp and root identity | `ContentStoreReservationRecord` / `ContentStoreCausalStamp`; serving epoch is separate |
-| Delivery | Original logical transfer ID plus retained unresolved attempts, joined uncertainty and exact completion correlation | Existing queue claim/checkpoint CAS; a later definitely-unsent/rejected envelope cannot clear an older possibly-applied attempt |
+| Delivery | Original logical transfer ID plus retained unresolved attempts, joined uncertainty and exact completion correlation | A later definitely-unsent/rejected envelope cannot clear an older possibly-applied attempt |
 | Observed terminal | Exact encoded/typed result and digest, captured disposition, original-request digest, authenticated peer/context and actual receiver terminal reference when available | Existing correlation handler; missing receiver durable evidence remains a gap, not a synthetic certificate |
 | Local application | Terminal recorded versus receipt/location/cache application pending versus settled; retained client-response reconstruction dependencies | Existing admitted completion handler; receiver settlement, sender application and client delivery stay distinct |
-| Dependency release | Monotonic dependency generation, exact users/roots, compact-witness identity and checked generation | Queue CAS plus the existing content-root/GC owner; stale checks retain material |
+| Dependency release | Monotonic dependency generation, exact users/roots, compact-witness identity and checked generation | Store CAS plus the existing content-root/GC owner; stale checks retain material |
 
-The current queue key is `(intent_id, missing_replica_node_id)` and its transfer
-kind is Stage/Repair. A future promotion obligation needs a separately identified
-slot **within the same row/store**, with explicit transfer/promotion dependencies.
-Adding Commit to the mutable kind and allowing ordinary repair cleanup to remove
-the row would lose custody. The first Repair-only slice must not claim promotion
-coverage; choosing and validating the combined slot schema remains open.
+A promotion obligation needs its own identified slot with explicit
+transfer/promotion dependencies; a mutable kind field that ordinary cleanup can
+remove would lose custody.
 
-The queue log currently limits a batch record to 32 MiB
-(`repair_queue_store.rs::DFS_REPAIR_QUEUE_LOG_MAX_RECORD_BYTES`). Background
-streamed Repair heads have separate payload readers, which makes a bounded
-head-plus-reference row plausible. Arbitrarily large original inline commands
-cannot simply be copied into that frame. Their representation needs either an
-existing, explicitly rooted immutable content artifact containing the **exact
-original encoding**, or a reviewed framing extension. No synthetic object/version
-identity, new silent request limit, rewritten inline command or cap relaxation
-is selected here. Until that storage decision closes, oversized inline custody
-is unsupported by this candidate and cannot be certified complete or dispatched
-under a purported guarantee. This is an unresolved design boundary, not a new
-runtime rejection added by this lane.
+Arbitrarily large original inline commands cannot simply be copied into a
+bounded log frame. Their representation needs either an existing, explicitly
+rooted immutable content artifact containing the **exact original encoding**,
+or a reviewed framing extension. No synthetic object/version identity, new
+silent request limit, rewritten inline command or cap relaxation is selected
+here. Until that storage decision closes, oversized inline custody is
+unsupported and cannot be certified complete or dispatched under a purported
+guarantee.
 
 Size the **whole encoded log batch**, including every operation, original head,
 result and framing. Partition only independent updates into bounded batches;
@@ -96,51 +82,47 @@ dependency record. `ContentStoreCausalStamp` contains incarnation and catalog-sc
 epoch; it does not certify physical payload generation. The physical-generation
 join in this design is an additional checked dependency, not an existing field.
 
-Use an explicit new snapshot/log schema and capability admission. Old queue
-writers must not reopen V2, strip the wrapper through a scheduling Set, then
-acknowledge a lossy snapshot. Existing V1 rows import as **legacy/uncovered**;
-an absent body is not an empty exact body. Enrollment needs the original living
-producer or other exact retained source. Uncertain legacy requests cannot be
-recreated under new IDs. The full history/custody admission cut and fail-closed
-downgrade rules remain prerequisites to abrupt-loss guarantees.
+Use an explicit schema and capability admission. Old writers must not reopen a
+custody record, strip it through a scheduling update, then acknowledge a lossy
+snapshot. Enrollment needs the original living producer or other exact retained
+source. Uncertain requests cannot be recreated under new IDs. The full
+history/custody admission cut and fail-closed downgrade rules remain
+prerequisites to abrupt-loss guarantees.
 
 ### Persistence and ownership order
 
 | Step | Required durable action and crash meaning | Concrete current boundary |
 |---|---|---|
-| 1. Capture | Freeze the complete original head, input descriptor and identity while the producer retains admission. No transport polling yet. | `prepare_replica_attachments`; prepared calls currently retain only process ownership in `DfsCheckpointedReplicaCall` |
-| 2. Root bytes | Persist the input/root under its real content owner before queue enrollment. An orphan root after a crash is safe; it grants no dispatch or new request identity. | `ensure_content_reservation`, content mutation/reservation guards and owner-minted causal stamp |
-| 3. Enroll locally | Append the complete stored row and dependency reference through the existing queue writer, with full sync. This establishes only **locally recorded** restart material. A failed/uncertain append cannot authorize dispatch; replay/resync its tail first. | `LocalDfsRepairQueueStore::append_operations`, `DurableFileSync::All`, `resync_on_load` |
-| 4. Cover survivors | Before effects become ambiguous, the reviewed DFS history/custody protocol must certify exact complete material and unresolved delivery ownership on the surviving set. Local queue fsync alone does not do this. | New integration into the reviewed multi-slot protocol; current cooperative handoff cannot supply it after owner loss |
-| 5. Claim and send | Revalidate the exact row, dependency generation and current authority; durably install conservative attempt uncertainty before the carrier may dispatch. Then release the existing owned head/reader to its normal transport worker. | Existing before-dispatch claim and queue CAS, native authority gate and networking path; exact origin/executor joins still require implementation and verification |
-| 6. Record result | Correlate original source/destination/request/intent/filesystem/object/version/hash/kind; persist exact observed terminal material before releasing sender completion ownership. | `all_background_replica_response_identity_matches`, `checkpoint_transfer_record`, admitted reply handler |
-| 7. Apply locally | Retry the original result through the normal handler until its receipt/location/cache effect is durably settled. Persist “terminal recorded, local application pending” across restart. | `runtime_host/message_host.rs` delivery-checkpoint callback and `handle_daemon_dfs_message_on_runtime_with_background_response`, then `service_repair.rs::handle_repair_replica_response`; current outbox retains head/response only in memory |
-| 8. Compact | Persist the exact outcome witness, recheck dependency generation, install the compact row/index transition, then release only unneeded roots. Physical collection follows the existing GC/reader owners. | Queue writer/CAS and content reservation/catalog root machinery; cross-owner ordering still needs review |
+| 1. Capture | Freeze the complete original head, input descriptor and identity while the producer retains admission. No transport polling yet. | The prepared send before detachment; detached calls currently retain only process ownership |
+| 2. Root bytes | Persist the input/root under its real content owner before custody enrollment. An orphan root after a crash is safe; it grants no dispatch or new request identity. | `ensure_content_reservation`, content mutation/reservation guards and owner-minted causal stamp |
+| 3. Enroll locally | Append the complete stored record and dependency reference through the owning writer, with full sync. This establishes only **locally recorded** restart material. A failed/uncertain append cannot authorize dispatch; replay/resync its tail first. | The owning store's writer, with `DurableFileSync::All` and tail resync on load |
+| 4. Cover survivors | Before effects become ambiguous, the reviewed DFS history/custody protocol must certify exact complete material and unresolved delivery ownership on the surviving set. Local fsync alone does not do this. | New integration into the reviewed multi-slot protocol; current cooperative handoff cannot supply it after owner loss |
+| 5. Claim and send | Revalidate the exact record, dependency generation and current authority; durably install conservative attempt uncertainty before the carrier may dispatch. Then release the existing owned head/reader to its normal transport worker. | A before-dispatch claim under the store's CAS, the native authority gate and networking path; exact origin/executor joins still require implementation and verification |
+| 6. Record result | Correlate original source/destination/request/intent/filesystem/object/version/hash/kind; persist exact observed terminal material before releasing sender completion ownership. | The effect's response-identity correlation and admitted reply handler |
+| 7. Apply locally | Retry the original result through the normal handler until its receipt/location/cache effect is durably settled. Persist “terminal recorded, local application pending” across restart. | `runtime_host/message_host.rs` background response handling, then the effect's own reply handler; the current outbox retains head/response only in memory |
+| 8. Compact | Persist the exact outcome witness, recheck dependency generation, install the compact record/index transition, then release only unneeded roots. Physical collection follows the existing GC/reader owners. | The owning writer/CAS and content reservation/catalog root machinery; cross-owner ordering still needs review |
 
-These are ordered durable operations, not a claim of atomicity across queue,
-content and replica-metadata stores. In particular, the payload/GC join needs a
+These are ordered durable operations, not a claim of atomicity across the
+custody, content and replica-metadata stores. In particular, the payload/GC join needs a
 defined causal-cut protocol: new references after a captured root cut must protect
 their bytes, and release must compare the same exact terminal certificate and
 dependency generation under the owning writer. Existing content reservation
 epochs and catalog causal cuts provide mechanisms to reuse, but currently do not
-prove that every unresolved queue row is a durable root. The lock order,
+prove that every unresolved custody record is a durable root. The lock order,
 reference enrollment/retirement API and crash recovery across these owners must
-be closed before implementation. A new queue Boolean cannot solve that join.
+be closed before implementation. A new Boolean flag cannot solve that join.
 
-Steps 6–7 propose a **new** durable observed-result/application-pending transition.
-Current repair success handling publishes the metadata receipt before
-`record_owned_repair_terminal_response` and persists completion identity, not the
-complete result. Merely extending that final marker would preserve the old order;
-the new producer/checkpoint/handler boundary must be designed and sequenced.
-Local enrollment in step 3 cannot be consumed as the survivor-based **Custody
-ready** state below. The first same-producer slice supplies no step-4 certificate.
+Steps 6–7 propose a **new** durable observed-result/application-pending transition;
+the producer/checkpoint/handler boundary must be designed and sequenced. Local
+enrollment in step 3 cannot be consumed as the survivor-based **Custody ready**
+state below. A same-producer slice supplies no step-4 certificate.
 
 ### Effect-specific terminal evidence
 
 | Effect | Terminal material needed by this target | Existing distinction / remaining gap |
 |---|---|---|
 | StageBlob / StagePatch | Exact correlated Durable/Committed content result, original head and full inline/attachment or patch descriptor/bytes until settlement | Stage storage returns Durable after binding bytes; it does not settle a separate promotion. Patch identity/ranges must remain sealed. |
-| RepairReplica | Exact receiver Committed result plus durable content/replica-cache settlement evidence; sender receipt/application may remain pending | Receiver returns Committed after its cache commit. Current sender handlers also accept Durable as receipt/transfer progress; that alone is not the stronger full-repair terminal certificate proposed here. |
+| RepairReplica | None: repair is outside custody. The receiver's receipt publishes only through the receipt-slot generation compare; the need stays in the shard tables until then | A late reply from an older attempt cannot publish; the successor's executor re-derives the need |
 | CommitVersion | Exact matching Committed promotion result; Durable remains pending. Not-desired and repair-pending/pruned dispositions require their own authoritative evidence and retained result. | Detached promotion classification already distinguishes these outcomes in `node_transport.rs`; generic receipt handling is not its settlement boundary. |
 
 Current receiver content receipts do not retain every original request digest and
@@ -154,7 +136,7 @@ two successful local writes were atomic.
 
 ### Paged coverage and activation
 
-Extend the existing queue cut/page mechanism. A versioned cut must bind queue
+The custody store needs a cut/page mechanism. A versioned cut must bind store
 incarnation, snapshot/log generation and head sequence; relevant metadata prefix;
 custody schema; exact indexed row/slot set; dependency generation/root; raw-entry
 and byte bounds; continuation identity; and page digest chain or equivalent
@@ -166,8 +148,8 @@ In the future admitted regime, enrolling/updating an effect must preserve the
 coverage root through the same decided history and durable dependency protocol.
 That pre-established certificate can cover unhydrated backlog pages at takeover;
 the successor need not fetch every row or object to certify what was already
-durably covered. Current V1 cooperative pages require the retiring owner and
-contain only descriptors. They are not that certificate. The multi-slot protocol
+durably covered. Cooperative handoff requires the retiring owner and is not
+that certificate. The multi-slot protocol
 must define root creation, continuation after new work and survival of compaction;
 this document supplies no replacement majority protocol.
 
@@ -281,10 +263,9 @@ what recovery can actually finish. This boundary is unresolved and is not relaxe
 here. Temporary payload custody for active effects has a real storage/transfer
 cost to measure, distinct from migrating every object during takeover.
 
-A never-dispatched repair waiting on unavailable A-only content can remain pending
-without blocking unrelated authority activation, provided it is not falsely
-certified custody-ready or sent. This does not erase its desired-N deficit or
-recorded A copy.
+A repair need whose content is only on unavailable A stays in the shard tables
+without blocking unrelated authority activation; it needs no custody. This does
+not erase its desired-N deficit or recorded A copy.
 
 ## Required negative traces and execution mapping
 

@@ -1142,8 +1142,7 @@ mod tests {
     #[test]
     fn unmatched_incomplete_reason_remains_blocking_with_typed_omissions() {
         let mut status = empty_operator_status();
-        status
-            .push_bounded_omission(DfsOperatorStatusOmission::resident_repair_queue_not_hydrated());
+        status.push_bounded_omission(DfsOperatorStatusOmission::historical_routing_topology(1));
         assert!(status.incomplete_reasons.is_empty());
         status
             .incomplete_reasons
@@ -1193,6 +1192,24 @@ mod tests {
             .replication_policy(Default::default())
             .unwrap();
         let owner = owning_node(&runtime, path);
+        // The owner's repair executor would repair the write at once; this
+        // case inspects the pending need, so the owner's maintenance is held.
+        let _owner_maintenance_hold =
+            crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+                runtime.data_dir(&owner),
+                std::sync::Arc::new(|point, command, _context| {
+                    if matches!(
+                        point,
+                        crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+                    ) && command.is_none()
+                    {
+                        return Err(crate::DfsError::Cancelled {
+                            operation: "operator status inspection holds the owner maintenance",
+                        });
+                    }
+                    Ok(())
+                }),
+            );
         let baseline = DfsOperatorInspector::new(&runtime.node_metadata(&owner).unwrap())
             .status()
             .unwrap();
@@ -1543,6 +1560,10 @@ mod tests {
                 action: DfsTestFaultAction::BudgetExhausted,
             });
         }
+        // The owner's repair executor serves the missing replica as soon as
+        // the write's index change reaches it; hold it until inspection.
+        let executor_hold =
+            crate::repair_executor::hold_repair_executor_for_test(&runtime.data_dir(&owner).root());
         let old = writer
             .posix_write_file(path, b"old incomplete placement", options.clone())
             .unwrap();
@@ -1555,6 +1576,7 @@ mod tests {
                 .is_empty(),
             "the regression begins with real old-version repair work"
         );
+        drop(executor_hold);
         runtime.clear_faults();
         let current = writer
             .posix_write_file(
@@ -2017,6 +2039,13 @@ mod tests {
             remaining_hits: 32,
             action: DfsTestFaultAction::BudgetExhausted,
         });
+        // The stage fault leaves alpha's second replica missing, but the
+        // owner's repair executor serves that need over its repair route as
+        // soon as the write's index change reaches it. Hold it until the
+        // pending repair has been counted and inspected.
+        let owner = runtime.root_shard().unwrap().primary_node_id;
+        let executor_hold =
+            crate::repair_executor::hold_repair_executor_for_test(&runtime.data_dir(&owner).root());
         let mut alpha_policy = DfsReplicationPolicy::new(1, 2).unwrap();
         alpha_policy.required_node_ids = vec![nodes[0].clone(), nodes[2].clone()];
         let alpha = writer
@@ -2200,6 +2229,7 @@ mod tests {
                 .version,
             beta.version
         );
+        drop(executor_hold);
         writer.abort_pending_write(&intent_id).unwrap();
         drop(writer);
         runtime.close().unwrap();

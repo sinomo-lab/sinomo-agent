@@ -627,7 +627,7 @@ fn restored_pending_stage_rejects_old_ack_and_commits_exact_fresh_transfer() {
     let capture = runtime.capture_served_work(&replica, 32).unwrap();
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let prior_deadline = restored.transport.set_operation_deadline(Some(deadline));
-    restored.retry_pending_repairs().unwrap();
+    restored.retry_pending_stages(8).unwrap();
     let fresh_request = restored
         .writes
         .pending_writes
@@ -772,90 +772,6 @@ fn restored_pending_stage_rejects_old_ack_and_commits_exact_fresh_transfer() {
     runtime.close().unwrap();
 }
 
-#[test]
-fn posix_non_foreground_write_reports_only_durable_locations() {
-    let name = "posix-non-foreground-current-locations";
-    let (runtime, initial, shard) =
-        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
-    let local = shard.primary_node_id.clone();
-    let remote = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
-        .into_iter()
-        .find(|node| node != &local)
-        .unwrap();
-    drop(initial);
-    let path = "/services/async-repair.txt";
-    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
-    placement.required_node_ids = vec![local.clone(), remote.clone()];
-    let applied = runtime
-        .apply_placement_policy(&local, path, DfsPlacementScope::SelfOnly, placement.clone())
-        .unwrap();
-    // Finish the accepted setup job before creating the object whose original
-    // write repair is measured below. Otherwise that independent job can also
-    // schedule a placement repair for the same newly created version.
-    finish_native_placement_fixture_apply(&runtime, &applied);
-    for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
-        runtime.install_fault(crate::test_runtime::FaultRule {
-            source: Some(local.clone()),
-            target: Some(remote.clone()),
-            route: Some(route.into()),
-            call_id: None,
-            origin: None,
-            remaining_hits: 32,
-            action: crate::test_runtime::FaultAction::BudgetExhausted,
-        });
-    }
-    let mut dfs = runtime.client(&local).unwrap();
-    let stat = dfs
-        .posix_write_file(
-            path,
-            b"commit locally and repair the remote replica later",
-            DfsWriteOptions {
-                policy: placement.replication_policy(Default::default()).unwrap(),
-                replica_candidates: vec![local.clone(), remote.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .expect("non-foreground write");
-    assert_eq!(
-        stat.current_locations,
-        vec![local.clone()],
-        "the returned POSIX stat must not claim an async repair target is durable"
-    );
-    let owner = runtime.metadata_primary_service(path).unwrap();
-    let owned = owner
-        .metadata_backend()
-        .unwrap()
-        .metadata_summary_for_local_primary_shards()
-        .unwrap();
-    assert_eq!(
-        owned.pending_repair_count, 1,
-        "the actual committed metadata must retain its missing desired replica"
-    );
-    let queued = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
-        runtime.data_dir(&local),
-    ))
-    .view()
-    .unwrap()
-    .records
-    .into_iter()
-    .filter(|row| {
-        row.object_id == stat.object_id
-            && row.version == stat.version
-            && row.missing_replica_node_id == remote
-    })
-    .collect::<Vec<_>>();
-    assert_eq!(
-        queued.len(),
-        1,
-        "the remote desired replica must remain in the actual native durable repair queue"
-    );
-    assert!(queued[0].completed_transfer_request_id.is_none());
-    drop(owner);
-    drop(dfs);
-    runtime.clear_faults();
-    runtime.close().expect("normal owner drain");
-}
 
 #[test]
 fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without_self_rpc() {
@@ -957,6 +873,81 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     runtime.clear_faults();
     runtime.close().unwrap();
 }
+
+#[test]
+fn posix_non_foreground_write_reports_only_durable_locations() {
+    let name = "posix-non-foreground-current-locations";
+    let (runtime, initial, shard) =
+        crate::test_support::current_native_metadata_service(name, 2, "/services").unwrap();
+    let local = shard.primary_node_id.clone();
+    let remote = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 2)
+        .into_iter()
+        .find(|node| node != &local)
+        .unwrap();
+    drop(initial);
+    let path = "/services/async-repair.txt";
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    placement.required_node_ids = vec![local.clone(), remote.clone()];
+    let applied = runtime
+        .apply_placement_policy(&local, path, DfsPlacementScope::SelfOnly, placement.clone())
+        .unwrap();
+    // Finish the accepted setup job before creating the object whose original
+    // write repair is measured below. Otherwise that independent job can also
+    // schedule a placement repair for the same newly created version.
+    finish_native_placement_fixture_apply(&runtime, &applied);
+    for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(local.clone()),
+            target: Some(remote.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::BudgetExhausted,
+        });
+    }
+    let mut dfs = runtime.client(&local).unwrap();
+    let stat = dfs
+        .posix_write_file(
+            path,
+            b"commit locally and repair the remote replica later",
+            DfsWriteOptions {
+                policy: placement.replication_policy(Default::default()).unwrap(),
+                replica_candidates: vec![local.clone(), remote.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("non-foreground write");
+    assert_eq!(
+        stat.current_locations,
+        vec![local.clone()],
+        "the returned POSIX stat must not claim an async repair target is durable"
+    );
+    let owner = runtime.metadata_primary_service(path).unwrap();
+    let owned = owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_summary_for_local_primary_shards()
+        .unwrap();
+    assert_eq!(
+        owned.pending_repair_count, 1,
+        "the actual committed metadata must retain its missing desired replica"
+    );
+    assert_eq!(
+        super::repair::indexed_repair_needs(&runtime, &owner, &stat)
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>(),
+        vec![remote.clone()],
+        "the remote desired replica must remain repair work in the shard tables' index"
+    );
+    drop(owner);
+    drop(dfs);
+    runtime.clear_faults();
+    runtime.close().expect("normal owner drain");
+}
+
 
 #[test]
 fn posix_transient_create_routes_precommit_records_to_path_shard() {
@@ -1876,7 +1867,6 @@ fn commit_version_applies_when_response_target_is_unroutable() {
         "original_delivered_commands": delivered,
         "recovered_reports": recovered_reports.iter().map(|report| serde_json::json!({
             "command": report.command, "succeeded": report.succeeded,
-            "repair_record_count": report.repair_record_count,
         })).collect::<Vec<_>>(),
         "recovered_replies": recovered_replies,
         "completed_within_original_deadline": Instant::now() < deadline,
@@ -2295,7 +2285,6 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
         "original_delivered_commands": delivered,
         "recovered_reports": recovered_reports.iter().map(|report| serde_json::json!({
             "command": report.command, "succeeded": report.succeeded,
-            "repair_record_count": report.repair_record_count,
         })).collect::<Vec<_>>(),
         "recovered_replies": recovered_replies,
         "completed_within_original_deadline": Instant::now() < deadline,
@@ -2393,6 +2382,8 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
     drop(writer);
     runtime.close().unwrap();
 }
+
+
 
 #[test]
 fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
@@ -3247,15 +3238,9 @@ fn sifs_self_only_eventual_write_uses_local_fast_path() {
         status.pending_write_count, 0,
         "self-only eventual writes should not leave durable pending intents"
     );
-    assert_eq!(status.pending_repair_count, 0);
-    let queue = crate::LocalDfsRepairQueueStore::new(
-        crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(dfs.node_id())),
-    )
-    .view()
-    .expect("actual Main persisted repair queue");
-    assert!(
-        queue.records.is_empty(),
-        "self-only commit must leave no actual queued repair"
+    assert_eq!(
+        status.pending_repair_count, 0,
+        "self-only commit must leave no repair work"
     );
 
     let journal_count = backend
@@ -3273,6 +3258,7 @@ fn sifs_self_only_eventual_write_uses_local_fast_path() {
         .close()
         .expect("stop the actual native self-only owner");
 }
+
 
 #[test]
 fn duplicate_commit_metadata_application_is_idempotent() {

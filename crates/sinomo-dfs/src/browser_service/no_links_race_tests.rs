@@ -51,6 +51,23 @@ fn run_native_race(name: &str, race: Race) {
         .unwrap()
         .primary_node_id;
     let caller = nodes.iter().find(|node| **node != primary).unwrap().clone();
+    // The primary's repair executor would publish receipts for the setup's
+    // W<N writes while the race is paused; repair is not under test here.
+    let _primary_maintenance_hold = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        native.data_dir(&primary),
+        std::sync::Arc::new(|point, command, _context| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+            ) && command.is_none()
+            {
+                return Err(crate::DfsError::Cancelled {
+                    operation: "no-links race holds the primary maintenance",
+                });
+            }
+            Ok(())
+        }),
+    );
     native_browser_policy(
         &native.shared_control_plane().unwrap(),
         ROOT,

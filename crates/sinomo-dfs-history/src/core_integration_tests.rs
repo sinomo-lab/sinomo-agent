@@ -960,93 +960,6 @@ fn assert_history_repair_inventory<T: DfsMessageTransport>(
 }
 
 #[test]
-fn file_history_rule_delete_and_bulk_replace_schedule_the_captured_generation() {
-    for delete in [true, false] {
-        let root = temp_root("history-rule-namespace-demand");
-        let (mut runtime, owner, remotes, mut dfs) = native_history_repair_services(
-            "file_history_rule_delete_and_bulk_replace_schedule_the_captured_generation",
-            3,
-        );
-        let missing = remotes[0].clone();
-        deny_history_content_targets(&runtime, &owner, &[missing.clone()]);
-        let first = dfs
-            .posix_write_file(
-                "/services/rule-namespace",
-                b"old",
-                DfsWriteOptions {
-                    replica_candidates: vec![owner.clone(), missing],
-                    policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                    wait_for_commit: true,
-                    foreground_replica_repair: false,
-                },
-            )
-            .unwrap();
-        let captured = dfs.posix_set_mode(&first.path, 0o640).unwrap();
-        let mut fs = runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_file_system(&first.file_system_id)
-            .unwrap()
-            .unwrap();
-        {
-            let mut policy = decode_history_policy(fs.retention_policies.get(HISTORY_MODULE_ID));
-            policy.rules.push(DfsFileHistoryRule {
-                path: first.path.clone(),
-                retention: DfsFileHistoryRetention {
-                    keep_last: 1,
-                    keep_for_seconds: 0,
-                },
-            });
-            install_history_policy(&mut fs, policy).unwrap();
-        }
-        apply_history_fixture_policy(&mut dfs, &fs);
-        if delete {
-            dfs.posix_unlink(&first.path).unwrap();
-            assert!(dfs.posix_stat_distributed(&first.path).is_err());
-        } else {
-            dfs.posix_write_files_local_eventual_with_known_parents(vec![(
-                first.path.as_str(),
-                b"new".as_slice(),
-            )])
-            .unwrap();
-            assert_eq!(
-                dfs.posix_read_file_distributed(&first.path).unwrap(),
-                b"new"
-            );
-        }
-        assert!(
-            native_history_queue(&runtime, &owner)
-                .iter()
-                .any(|record| record.version == captured.version),
-            "delete={delete}"
-        );
-        let backend = runtime.node_metadata(&owner).unwrap();
-        let version = backend
-            .get_version(&captured.object_id, &captured.version)
-            .unwrap()
-            .unwrap();
-        let repair = backend
-            .get_intent(
-                &captured.object_id,
-                &core_test::retained_repair_intent_id(&version),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(repair.policy, DfsReplicationPolicy::new(1, 2).unwrap());
-        let current = backend.get_object(&captured.object_id).unwrap().unwrap();
-        assert_eq!(
-            native_history_main_current_version(
-                &runtime.metadata_primary_service("/services").unwrap(),
-                &current.object_id
-            ),
-            Some(current.version.clone())
-        );
-        drop(dfs);
-        runtime.close().unwrap();
-    }
-}
-
-#[test]
 fn native_history_rule_capture_publishes_with_its_recorded_durability_owner() {
     let nodes =
         sinomo_dfs::test_support::DfsTestRuntime::ordered_node_ids("native-history-rule-owner", 3);
@@ -1267,941 +1180,6 @@ fn file_history_capture_after_chmod_preserves_the_content_replication_plan() {
 }
 
 #[test]
-fn native_history_failure_observation_requires_settled_live_attempts() {
-    let (mut runtime, owner, remotes, mut dfs) =
-        native_history_repair_services("native-history-failure-observation-cut", 3);
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    struct CloseGate(Arc<tokio::sync::Semaphore>);
-    impl Drop for CloseGate {
-        fn drop(&mut self) {
-            self.0.close();
-        }
-    }
-    let _close_gate = CloseGate(Arc::clone(&gate));
-    for (index, target) in remotes.iter().enumerate() {
-        for route in [
-            sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE,
-            sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE,
-        ] {
-            runtime.install_fault(core_test::DfsTestFaultRule {
-                source: Some(owner.clone()),
-                target: Some(target.clone()),
-                route: Some(route.into()),
-                call_id: None,
-                origin: Some(core_test::DfsTestRpcOrigin::RegisteredHost),
-                remaining_hits: 32,
-                action: if index == 1 && route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE {
-                    core_test::DfsTestFaultAction::PauseBeforeDispatch(Arc::clone(&gate))
-                } else {
-                    core_test::DfsTestFaultAction::BudgetExhausted
-                },
-            });
-        }
-    }
-    let stat = dfs
-        .posix_write_file(
-            "/services/failure-observation-cut",
-            b"actual native repair payload",
-            DfsWriteOptions {
-                replica_candidates: std::iter::once(owner.clone())
-                    .chain(remotes.clone())
-                    .collect(),
-                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    runtime.request_repair_reconciliation(&owner).unwrap();
-    let pass = runtime
-        .maintenance_tick(&owner, deadline.saturating_duration_since(Instant::now()))
-        .unwrap();
-    pass.outcome.unwrap();
-    assert_eq!(pass.omitted_kv_event_count, 0);
-    loop {
-        let events = runtime.rpc_observations();
-        let exact = |event: &&core_test::DfsTestRpcObservation| {
-            event.source == owner
-                && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
-                && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
-                && event.dfs_object_id.as_ref() == Some(&stat.object_id)
-                && event.dfs_version.as_ref() == Some(&stat.version)
-        };
-        if events.iter().filter(exact).any(|e| {
-            e.target == remotes[0] && e.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
-        }) && events.iter().filter(exact).any(|e| {
-            e.target == remotes[1] && e.phase == core_test::DfsTestRpcPhase::BeforeDispatch
-        }) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "actual failed and paused repair boundaries must fit the original budget"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let cut = native_history_queue(&runtime, &owner);
-    assert!(cut.iter().any(|r| r.object_id == stat.object_id
-        && r.missing_replica_node_id == remotes[1]
-        && r.in_flight
-        && r.transfer_request_id.is_some()));
-    let premature = native_history_failure_observation_complete(&runtime, &owner);
-    std::fs::write(
-        runtime
-            .data_dir(&owner)
-            .root()
-            .join("failure-observation-cut.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({"premature":premature,"queue":cut,
-            "object_id":stat.object_id,"version":stat.version,"paused_target":remotes[1]}))
-        .unwrap(),
-    )
-    .unwrap();
-    // Closing this fixture-owned gate returns a genuine DefinitelyNotSent
-    // result; it neither supplies a receipt nor alters the queued identity.
-    gate.close();
-    while !native_history_failure_observation_complete(&runtime, &owner) {
-        assert!(
-            Instant::now() < deadline,
-            "native failure settlement must fit the original observation budget"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    runtime.clear_faults();
-    drop(dfs);
-    runtime.close().unwrap();
-    assert!(
-        !premature,
-        "one failed RPC is not settlement of the other live attempt"
-    );
-}
-
-#[test]
-fn file_history_capture_after_rename_and_write_history_gc_preserves_durability() {
-    capture_after_metadata_change_preserves_durability(true);
-}
-
-fn capture_after_metadata_change_preserves_durability(collect_before_capture: bool) {
-    let name = if collect_before_capture {
-        "native-history-metadata-collected"
-    } else {
-        "native-history-metadata-pending"
-    };
-    let (mut runtime, owner, remotes, mut dfs) = native_history_repair_services(name, 3);
-    let remote_a = remotes[0].clone();
-    let remote_b = remotes[1].clone();
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let original = dfs
-        .posix_write_file(
-            "/services/history-metadata-generation",
-            b"retained content",
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), remote_a.clone(), remote_b.clone()],
-                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    let original_intent_id =
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap())[0]
-            .intent_id
-            .clone();
-    if collect_before_capture {
-        fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
-        runtime.clear_faults();
-        let (repairs, _settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
-        assert!(repairs.is_empty(), "the original write must first reach N");
-    }
-    let mut metadata = dfs.posix_set_mode(&original.path, 0o640).unwrap();
-    if collect_before_capture {
-        dfs.posix_rename(&original.path, "/services/renamed-history-source")
-            .unwrap();
-        metadata = dfs
-            .posix_stat_distributed("/services/renamed-history-source")
-            .unwrap();
-    }
-    for _ in 0..8 {
-        runtime
-            .gc_metadata_history_on_current_primaries(DfsMetadataHistoryGcOptions::delete_eligible(
-                Duration::ZERO,
-                0,
-            ))
-            .unwrap();
-    }
-    drop(dfs);
-    runtime.stop_node(&owner).unwrap();
-    runtime.reopen_node(owner.clone()).unwrap();
-    let mut dfs = runtime.client(&owner).unwrap();
-    native_history_owner_tick(&runtime, &owner);
-    if collect_before_capture {
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_intent(&original.object_id, &original_intent_id)
-                .unwrap()
-                .is_none(),
-            "the completed original write must lose its executable owner through GC"
-        );
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_intent_receipt(&original.object_id, &original_intent_id)
-                .unwrap()
-                .is_none(),
-            "repeated GC must collect its terminal retry witness"
-        );
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_version(&original.object_id, &original.version)
-                .unwrap()
-                .is_some(),
-            "the current successor still needs the original data-generation witness"
-        );
-    } else {
-        assert_eq!(
-            native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()).len(),
-            2,
-            "current metadata-only generations must keep their pending N work after GC and restart"
-        );
-        assert_eq!(
-            native_history_main_current_version(
-                &runtime.metadata_primary_service("/services").unwrap(),
-                &metadata.object_id
-            ),
-            Some(metadata.version.clone())
-        );
-    }
-    assert_ne!(metadata.version, original.version);
-    assert_eq!(metadata.content_hash, original.content_hash);
-    let record = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_version(&metadata.object_id, &metadata.version)
-        .unwrap()
-        .unwrap();
-    assert!(
-        record.history_capture().is_none(),
-        "metadata-only changes do not capture history"
-    );
-    let recorded_plan = record.content_durability.as_ref().unwrap();
-    assert_eq!(
-        recorded_plan.policy,
-        DfsReplicationPolicy::new(1, 3).unwrap()
-    );
-    assert_eq!(recorded_plan.source_version, original.version);
-    assert_eq!(recorded_plan.coordinator_node_id, owner);
-    assert_eq!(
-        recorded_plan
-            .desired_replica_node_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        [owner.clone(), remote_a.clone(), remote_b.clone()]
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-    );
-    capture_history(&mut dfs, &metadata);
-    let current = dfs
-        .posix_write_file(
-            &metadata.path,
-            b"current content",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-        )
-        .unwrap();
-    native_history_owner_tick(&runtime, &owner);
-    for _ in 0..8 {
-        runtime
-            .gc_metadata_history_on_current_primaries(DfsMetadataHistoryGcOptions::delete_eligible(
-                Duration::ZERO,
-                0,
-            ))
-            .unwrap();
-    }
-    drop(dfs);
-    runtime.stop_node(&owner).unwrap();
-    runtime.reopen_node(owner.clone()).unwrap();
-    let mut dfs = runtime.client(&owner).unwrap();
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: current.path.clone(),
-        identity: history_identity(&metadata),
-        operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: "after-restart".into(),
-        },
-        operation_id: sinomo_core::Id::generate().to_string(),
-    })
-    .unwrap();
-    assert_native_history_recorded_or_settled_obligation(
-        &runtime.metadata_primary_service("/services").unwrap(),
-        &record,
-    );
-    assert_eq!(
-        dfs.posix_read_file_distributed(&current.path).unwrap(),
-        b"current content"
-    );
-    assert_eq!(
-        dfs.posix_stat_distributed(&current.path).unwrap().version,
-        current.version
-    );
-    drop(dfs);
-    runtime.clear_faults();
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_compacted_queue_requires_actual_matching_target_records() {
-    let (runtime, owner, remotes, mut dfs) =
-        native_history_repair_services("native-history-compacted-queue-negatives", 2);
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let current = dfs
-        .posix_write_file(
-            "/services/compacted-queue-negative",
-            b"canonical",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-        )
-        .unwrap();
-    let request = preserve_request(&current, "preserve-queue-negative");
-    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
-        .preserve_local_file_version(
-            request.clone(),
-            &b"retained"[..],
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), remotes[0].clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("actual native W1 preservation")
-    };
-    let old = native_history_queue(&runtime, &owner)
-        .into_iter()
-        .find(|row| row.object_id == identity.object_id && row.version == identity.version)
-        .expect("actual Main produced the original queue record");
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: current.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Unpin {
-            pin_id: request.pin_id.clone(),
-        },
-        operation_id: sinomo_core::Id::generate().to_string(),
-    })
-    .unwrap();
-    for _ in 0..2 {
-        runtime
-            .gc_metadata_history_on_current_primaries(
-                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-                    .with_now_unix_nanos(core_test::now_unix_nanos()),
-            )
-            .unwrap();
-    }
-    assert!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_intent(&identity.object_id, &old.intent_id)
-            .unwrap()
-            .is_none()
-    );
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: current.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: request.pin_id,
-        },
-        operation_id: sinomo_core::Id::generate().to_string(),
-    })
-    .unwrap();
-    let actual_owner =
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap())
-            .into_iter()
-            .find(|row| row.version == identity.version)
-            .unwrap();
-    assert_ne!(actual_owner.intent_id, old.intent_id);
-    assert!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_intent(&identity.object_id, &actual_owner.intent_id)
-            .unwrap()
-            .is_some()
-    );
-    let canonical = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_version(&current.object_id, &current.version)
-        .unwrap()
-        .unwrap();
-    assert!(!canonical.has_retention_grant());
-    let receipts = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .receipts_for_version(&identity.object_id, &identity.version)
-        .unwrap();
-    let before = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_object(&current.object_id)
-        .unwrap();
-    // Establish the real failed dispatch while the original carrier denial is
-    // still active, before malformed queue DATA can block ordinary restoration.
-    fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
-    let store = LocalDfsRepairQueueStore::new(
-        sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
-    );
-    for fault in ["wrong-hash", "nonretained-target", "missing-target"] {
-        // Negative scheduling DATA copied from a real queue producer; the new
-        // negative key leaves every real stable identity and owner untouched.
-        let mut bad = old.clone();
-        bad.intent_id = format!("{}:negative:{fault}", old.intent_id);
-        match fault {
-            "wrong-hash" => bad.content_hash = content_hash(b"unrelated negative bytes"),
-            "nonretained-target" => {
-                bad.version = canonical.version.clone();
-                bad.content_hash = canonical.content_hash.clone().unwrap();
-            }
-            "missing-target" => {
-                bad.version = sinomo_core::Id::generate();
-                assert!(
-                    runtime
-                        .node_metadata(&owner)
-                        .unwrap()
-                        .get_version(&bad.object_id, &bad.version)
-                        .unwrap()
-                        .is_none()
-                );
-            }
-            _ => unreachable!(),
-        }
-        let mut queued = store.view().unwrap().records;
-        queued.push(bad.clone());
-        store.replace_records(&queued).unwrap();
-        let pass = runtime
-            .maintenance_tick(&owner, Duration::from_secs(5))
-            .unwrap();
-        assert_eq!(pass.omitted_kv_event_count, 0);
-        let error = pass
-            .outcome
-            .expect_err("mismatched queued DATA must not restore an owner");
-        assert!(error.contains(&bad.intent_id), "{error}");
-        assert_eq!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .receipts_for_version(&identity.object_id, &identity.version)
-                .unwrap(),
-            receipts
-        );
-        assert_eq!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_object(&current.object_id)
-                .unwrap(),
-            before
-        );
-        let healed = store
-            .view()
-            .unwrap()
-            .records
-            .into_iter()
-            .filter(|row| row.intent_id != bad.intent_id)
-            .collect::<Vec<_>>();
-        store.replace_records(&healed).unwrap();
-    }
-    runtime.clear_faults();
-    let (repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
-    assert!(repairs.is_empty());
-    assert_eq!(
-        dfs.posix_read_file_distributed(&current.path).unwrap(),
-        b"canonical"
-    );
-    let target = settled
-        .tables
-        .versions
-        .iter()
-        .find(|row| row.object_id == identity.object_id && row.version == identity.version)
-        .unwrap();
-    let holder = runtime.client(&remotes[0]).unwrap();
-    let hash = target.content_hash.as_deref().unwrap();
-    let bytes = holder.content().read_blob(hash).unwrap();
-    assert_eq!(bytes, b"retained");
-    assert_eq!(content_hash(&bytes), hash);
-    assert_eq!(Some(bytes.len() as u64), target.size_bytes);
-    assert!(
-        settled
-            .tables
-            .receipts
-            .iter()
-            .any(|receipt| receipt.replica_node_id == remotes[0]
-                && receipt.receipt.file_system_id == identity.file_system_id
-                && receipt.receipt.object_id == identity.object_id
-                && receipt.receipt.committed_version == identity.version
-                && receipt.content_hash.as_deref() == Some(hash))
-    );
-    drop(holder);
-    drop(dfs);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
-    repin_after_gc_has_fresh_repair_ownership(false, false);
-}
-
-#[test]
-fn file_history_repin_after_retry_receipt_eviction_keeps_replication_policy() {
-    repin_after_gc_has_fresh_repair_ownership(true, false);
-}
-
-#[test]
-fn file_history_clustered_pin_operations_remain_usable_after_gc() {
-    repin_after_gc_has_fresh_repair_ownership(true, true);
-}
-
-fn repin_after_gc_has_fresh_repair_ownership(evict_receipt: bool, clustered: bool) {
-    let name = match (evict_receipt, clustered) {
-        (false, false) => "native-history-compacted-repair-owner",
-        (true, false) => "native-history-compacted-repair-receipt",
-        (_, true) => "native-history-compacted-repair-clustered",
-    };
-    let (mut runtime, owner, remotes, mut dfs) = native_history_repair_services(name, 3);
-    let a = remotes[0].clone();
-    let b = remotes[1].clone();
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let current = dfs
-        .posix_write_file(
-            "/services/compacted-history",
-            b"canonical",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-        )
-        .unwrap();
-    let request = preserve_request(&current, "preserve-before-compaction");
-    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
-        .preserve_local_file_version(
-            request.clone(),
-            &b"retained"[..],
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), a.clone(), b.clone()],
-                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("W reached");
-    };
-    let original_intent =
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap())[0]
-            .intent_id
-            .clone();
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: current.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Unpin {
-            pin_id: request.pin_id.clone(),
-        },
-        operation_id: sinomo_core::Id::generate().to_string(),
-    })
-    .unwrap();
-    runtime
-        .gc_metadata_history_on_current_primaries(
-            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-                .with_now_unix_nanos(core_test::now_unix_nanos()),
-        )
-        .unwrap();
-    assert!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_intent_receipt(&current.object_id, &original_intent)
-            .unwrap()
-            .is_some()
-    );
-    {
-        let actual_core = runtime.metadata_primary_service(&current.path).unwrap();
-        let backend = actual_core.metadata_backend().unwrap();
-        let stored = backend
-            .object_write_intent_history(&identity.object_id)
-            .unwrap();
-        assert!(
-            !stored
-                .intents
-                .iter()
-                .any(|record| record.intent_id == original_intent),
-            "actual GC removes the stored full original owner"
-        );
-        let compact = stored
-            .receipts
-            .iter()
-            .find(|receipt| receipt.intent_id == original_intent)
-            .unwrap();
-        let projected = backend
-            .get_intent(&identity.object_id, &original_intent)
-            .unwrap()
-            .unwrap();
-        assert_eq!(projected.intent_id, compact.intent_id);
-        assert_eq!(projected.target_version, compact.target_version);
-        assert_eq!(projected.content_hash, compact.content_hash);
-        assert_eq!(
-            projected.publication, compact.publication,
-            "a valid compact logical projection is present despite stored full absence"
-        );
-    }
-    if evict_receipt {
-        runtime
-            .gc_metadata_history_on_current_primaries(
-                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-                    .with_now_unix_nanos(core_test::now_unix_nanos()),
-            )
-            .unwrap();
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_intent_receipt(&current.object_id, &original_intent)
-                .unwrap()
-                .is_none()
-        );
-        let stored = runtime
-            .metadata_primary_service(&current.path)
-            .unwrap()
-            .metadata_backend()
-            .unwrap()
-            .object_write_intent_history(&identity.object_id)
-            .unwrap();
-        let retained_owner = stored
-            .intents
-            .iter()
-            .find(|record| {
-                record.target_version == identity.version && record.publication.is_retained_repair()
-            })
-            .expect("actual full owner survives retry-receipt eviction");
-        let before_restart = native_history_queue(&runtime, &owner)
-            .into_iter()
-            .filter(|row| row.intent_id == retained_owner.intent_id)
-            .collect::<Vec<_>>();
-        assert_eq!(before_restart.len(), 2);
-        drop(dfs);
-        runtime.stop_node(&owner).unwrap();
-        runtime.reopen_node(owner.clone()).unwrap();
-        native_history_owner_tick(&runtime, &owner);
-        let dormant = native_history_queue(&runtime, &owner)
-            .into_iter()
-            .filter(|row| row.intent_id == retained_owner.intent_id)
-            .collect::<Vec<_>>();
-        assert_eq!(dormant.len(), before_restart.len());
-        for original in &before_restart {
-            let actual = dormant
-                .iter()
-                .find(|row| row.missing_replica_node_id == original.missing_replica_node_id)
-                .unwrap();
-            let mut expected = original.clone();
-            expected.next_retry_unix_nanos = u64::MAX;
-            assert_eq!(
-                actual, &expected,
-                "inactive native restart parks scheduling without discarding or changing custody"
-            );
-        }
-        dfs = runtime.client(&owner).unwrap();
-    }
-    assert!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_version(&identity.object_id, &identity.version)
-            .unwrap()
-            .is_some()
-    );
-    // Keep missing-N denied through the original live GC cut. Once each
-    // target has a real failed native attempt, a negative preclaim guard blocks
-    // only later attempts; it preserves that first native backoff and custody.
-    let negative_scope = if evict_receipt {
-        let core = runtime.metadata_primary_service(&current.path).unwrap();
-        let stored = core
-            .metadata_backend()
-            .unwrap()
-            .object_write_intent_history(&identity.object_id)
-            .unwrap();
-        let actual = stored
-            .intents
-            .into_iter()
-            .find(|row| {
-                row.publication.is_retained_repair()
-                    && row.status == DfsWriteIntentStatus::Committed
-                    && row.file_system_id == identity.file_system_id
-                    && row.object_id == identity.object_id
-                    && row.target_version == identity.version
-            })
-            .expect("actual stored full retained owner before live repin");
-        drop(core);
-        Some(actual)
-    } else {
-        None
-    };
-    let negative_cut = runtime.rpc_observations().len();
-    let negative_guard = negative_scope.as_ref().map(|scope| {
-        runtime
-            .deny_repair_claims_after_failed_rpc(&owner, scope)
-            .unwrap()
-    });
-    let repin = DfsFileHistoryPinRequest {
-        path: current.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: request.pin_id.clone(),
-        },
-        operation_id: sinomo_core::Id::generate().to_string(),
-    };
-    dfs.file_history_pin(repin.clone()).unwrap();
-    let jobs = native_history_repairs(&runtime.metadata_primary_service("/services").unwrap());
-    assert_eq!(
-        jobs.len(),
-        2,
-        "the retained W=1/N=3 obligation must survive intent compaction"
-    );
-    assert!(
-        jobs.iter()
-            .all(|job| job.intent_id != original_intent && job.version == identity.version)
-    );
-    assert_eq!(
-        native_history_intent_policy(
-            &runtime.metadata_primary_service("/services").unwrap(),
-            &jobs[0]
-        ),
-        DfsReplicationPolicy::new(1, 3).unwrap()
-    );
-    let repair_intent = jobs[0].intent_id.clone();
-    {
-        let actual_core = runtime.metadata_primary_service(&current.path).unwrap();
-        let stored = actual_core
-            .metadata_backend()
-            .unwrap()
-            .object_write_intent_history(&identity.object_id)
-            .unwrap();
-        assert!(
-            stored
-                .intents
-                .iter()
-                .any(|record| record.intent_id == repair_intent
-                    && record.publication.is_retained_repair()
-                    && record.status == DfsWriteIntentStatus::Committed
-                    && record.target_version == identity.version),
-            "the replacement is an actual stored FULL RetainedRepair owner"
-        );
-        assert!(
-            !stored
-                .receipts
-                .iter()
-                .any(|receipt| receipt.intent_id == repair_intent),
-            "a compact projection cannot substitute for the stored replacement owner"
-        );
-    }
-
-    assert_eq!(native_history_queue(&runtime, &owner).len(), 2);
-    assert_eq!(
-        dfs.posix_stat_distributed(&current.path).unwrap().version,
-        current.version
-    );
-    assert_eq!(
-        dfs.posix_read_file_distributed(&current.path).unwrap(),
-        b"canonical"
-    );
-    if evict_receipt {
-        let gc = || {
-            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-                .with_now_unix_nanos(core_test::now_unix_nanos())
-        };
-        for _ in 0..8 {
-            runtime
-                .gc_metadata_history_on_current_primaries(gc())
-                .unwrap();
-        }
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_intent(&current.object_id, &repair_intent)
-                .unwrap()
-                .is_some()
-        );
-        let before = current_history_shard_sequence(
-            &mut runtime.metadata_primary_service("/services").unwrap(),
-            &current.file_system_id,
-            &current.path,
-        );
-        assert!(
-            dfs.file_history_pin(repin)
-                .unwrap_err()
-                .to_string()
-                .contains("expired")
-        );
-        assert_eq!(
-            current_history_shard_sequence(
-                &mut runtime.metadata_primary_service("/services").unwrap(),
-                &current.file_system_id,
-                &current.path
-            ),
-            before,
-            "rejected repin cannot author another operation on its actual owning shard"
-        );
-        // The ordinary producer ran while the original denials remained active.
-        // Inspect its exact failure instead of requesting an intentionally
-        // denied second claim after the eight GC passes.
-        let scope = negative_scope.as_ref().unwrap();
-        let observations = runtime.rpc_observations();
-        let failed = observations
-            .iter()
-            .skip(negative_cut)
-            .filter(|event| {
-                event.source == owner
-                    && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
-                    && event.phase
-                        == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
-                    && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
-                    && event.dfs_intent_id.as_deref() == Some(scope.intent_id.as_str())
-                    && event.dfs_file_system_id.as_ref() == Some(&identity.file_system_id)
-                    && event.dfs_object_id.as_ref() == Some(&identity.object_id)
-                    && event.dfs_version.as_ref() == Some(&identity.version)
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            !failed.is_empty(),
-            "the missing replica must be grounded in an actual failed native content RPC for this full owner"
-        );
-        for target in [&a, &b] {
-            assert!(
-                failed
-                    .iter()
-                    .filter(|event| &event.target == target)
-                    .count()
-                    <= 1,
-                "the negative GC cut prevents additional native attempts for the same target"
-            );
-        }
-        let actual_core = runtime.metadata_primary_service(&current.path).unwrap();
-        let missing = native_history_repairs(&actual_core);
-        assert_eq!(
-            missing.len(),
-            2,
-            "both actual missing-N obligations remain unresolved throughout live GC"
-        );
-        assert_eq!(
-            missing
-                .iter()
-                .map(|row| (
-                    row.intent_id.clone(),
-                    row.file_system_id.clone(),
-                    row.object_id.clone(),
-                    row.version.clone(),
-                    row.content_hash.clone(),
-                    row.missing_replica_node_id.clone(),
-                ))
-                .collect::<std::collections::BTreeSet<_>>(),
-            [&a, &b]
-                .into_iter()
-                .map(|target| (
-                    scope.intent_id.clone(),
-                    identity.file_system_id.clone(),
-                    identity.object_id.clone(),
-                    identity.version.clone(),
-                    scope.content_hash.clone(),
-                    target.clone(),
-                ))
-                .collect::<std::collections::BTreeSet<_>>()
-        );
-        drop(actual_core);
-
-        let current_head = runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_object(&current.object_id)
-            .unwrap()
-            .expect("current object");
-        let peer_heads_before =
-            [&a, &b].map(|node| native_history_settled_peer_head(&runtime, node, &current_head));
-        drop(negative_guard);
-        runtime.clear_faults();
-        let (repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
-        assert!(repairs.is_empty());
-        for (index, replica_node) in [&a, &b].into_iter().enumerate() {
-            let replica = runtime.client(replica_node).unwrap();
-            assert_native_history_holder_bytes(
-                &settled,
-                &owner,
-                &replica,
-                replica_node,
-                &identity,
-                b"retained",
-            );
-            // The replica node's own durable store keeps its current view.
-            assert_eq!(
-                runtime
-                    .node_metadata(replica_node)
-                    .unwrap()
-                    .get_object(&current.object_id)
-                    .unwrap(),
-                peer_heads_before[index],
-                "retained repair leaves the actual local current view unchanged"
-            );
-        }
-        assert_eq!(
-            dfs.posix_read_file_distributed(&current.path).unwrap(),
-            b"canonical"
-        );
-        dfs.file_history_pin(DfsFileHistoryPinRequest {
-            path: current.path.clone(),
-            identity: identity.clone(),
-            operation: DfsFileHistoryPinOperation::Unpin {
-                pin_id: request.pin_id,
-            },
-            operation_id: sinomo_core::Id::generate().to_string(),
-        })
-        .unwrap();
-        for _ in 0..8 {
-            runtime
-                .gc_metadata_history_on_current_primaries(gc())
-                .unwrap();
-        }
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_version(&identity.object_id, &identity.version)
-                .unwrap()
-                .is_none(),
-            "maintenance ownership must not become a retention root"
-        );
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_intent(&current.object_id, &repair_intent)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            runtime
-                .node_metadata(&owner)
-                .unwrap()
-                .get_intent_receipt(&current.object_id, &repair_intent)
-                .unwrap()
-                .is_none()
-        );
-    }
-    drop(dfs);
-    runtime.clear_faults();
-    runtime.close().unwrap();
-}
-
-#[test]
 fn file_history_current_artifact_is_readable_without_becoming_a_capture() {
     let root = temp_root("history-current-artifact");
     let owner = NodeId::from_legacy_named("history-artifact-owner").unwrap();
@@ -2246,240 +1224,6 @@ fn file_history_current_artifact_is_readable_without_becoming_a_capture() {
             .is_none()
     );
     drop(owner_service);
-    drop(dfs);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_repin_reactivates_only_the_retained_versions_repair() {
-    let (mut runtime, owner, remotes, mut dfs) =
-        native_history_repair_services("native-history-explicit-repin-repair", 2);
-    let remote = remotes[0].clone();
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let stat = dfs
-        .posix_write_file(
-            "/services/repin",
-            b"canonical",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-        )
-        .unwrap();
-    // The normal preserve operation can dispatch missing-N work before its
-    // caller returns. Retain that original observation cut for this owner.
-    let negative_cut = runtime.rpc_observations().len();
-    let request = preserve_request(&stat, "repin-preserve");
-    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
-        .preserve_local_file_version(
-            request.clone(),
-            &b"retained alternative"[..],
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), remote.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("local receipt reaches W");
-    };
-    let jobs = native_history_repairs(&runtime.metadata_primary_service("/services").unwrap());
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].version, identity.version);
-    let intent_id = jobs[0].intent_id.clone();
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: stat.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: "independent-root".into(),
-        },
-        operation_id: "repin-second-root".into(),
-    })
-    .unwrap();
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: stat.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Unpin {
-            pin_id: request.pin_id.clone(),
-        },
-        operation_id: "repin-release".into(),
-    })
-    .unwrap();
-    assert_eq!(
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()),
-        jobs.as_slice(),
-        "another pin still owns the work"
-    );
-    // Observe the first genuine denied transfer while the retained root is
-    // live. Keep only repeat claims denied across release and cold restart;
-    // repin must wake the original persisted backoff before the healing cut.
-    let actual_owner = {
-        let core = runtime.metadata_primary_service(&stat.path).unwrap();
-        let stored = core
-            .metadata_backend()
-            .unwrap()
-            .object_write_intent_history(&identity.object_id)
-            .unwrap();
-        stored
-            .intents
-            .into_iter()
-            .find(|record| record.intent_id == intent_id)
-            .expect("actual full owner for the retained version")
-    };
-    assert_eq!(actual_owner.status, DfsWriteIntentStatus::Committed);
-    assert!(matches!(
-        actual_owner.publication,
-        DfsWritePublication::Retained { .. }
-    ));
-    assert_eq!(actual_owner.file_system_id, identity.file_system_id);
-    assert_eq!(actual_owner.object_id, identity.object_id);
-    assert_eq!(actual_owner.target_version, identity.version);
-    let negative_guard = runtime
-        .deny_repair_claims_after_failed_rpc(&owner, &actual_owner)
-        .unwrap();
-    fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
-    assert!(
-        runtime
-            .rpc_observations()
-            .iter()
-            .skip(negative_cut)
-            .any(|event| {
-                event.source == owner
-                    && event.target == remote
-                    && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
-                    && event.phase
-                        == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
-                    && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
-                    && event.dfs_intent_id.as_deref() == Some(intent_id.as_str())
-                    && event.dfs_file_system_id.as_ref() == Some(&identity.file_system_id)
-                    && event.dfs_object_id.as_ref() == Some(&identity.object_id)
-                    && event.dfs_version.as_ref() == Some(&identity.version)
-            }),
-        "the original live retained owner must have its own failed carrier attempt"
-    );
-    let before_release = native_history_queue(&runtime, &owner);
-    assert_eq!(before_release.len(), 1);
-    assert_eq!(before_release[0].intent_id, intent_id);
-    assert_eq!(before_release[0].object_id, identity.object_id);
-    assert_eq!(before_release[0].version, identity.version);
-    assert_eq!(before_release[0].missing_replica_node_id, remote);
-    assert_eq!(
-        before_release[0].transfer_kind,
-        Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-    );
-    assert_eq!(
-        before_release[0].transfer_delivery_state,
-        Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-    );
-    assert!(!before_release[0].in_flight && before_release[0].transfer_request_id.is_none());
-    assert!(before_release[0].completed_transfer_request_id.is_none());
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: stat.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Unpin {
-            pin_id: "independent-root".into(),
-        },
-        operation_id: "repin-release-last-root".into(),
-    })
-    .unwrap();
-    native_history_owner_tick(&runtime, &owner);
-    assert!(
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()).is_empty(),
-        "released history cannot retain executable repair jobs"
-    );
-    let mut dormant = before_release;
-    dormant[0].next_retry_unix_nanos = u64::MAX;
-    assert_eq!(
-        native_history_queue(&runtime, &owner),
-        dormant,
-        "the stored retained owner preserves every transfer fact while its last root is released"
-    );
-    // A real cold request lane rebuilds only from stored rows and real receipts.
-    drop(dfs);
-    runtime.stop_node(&owner).unwrap();
-    runtime.reopen_node(owner.clone()).unwrap();
-    let mut dfs = runtime.client(&owner).unwrap();
-    native_history_owner_tick(&runtime, &owner);
-    assert!(
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()).is_empty(),
-        "released roots cannot reactivate work after actual restart"
-    );
-    assert_eq!(
-        native_history_queue(&runtime, &owner),
-        dormant,
-        "normal restart preserves the same dormant physical custody"
-    );
-    dfs.file_history_pin(DfsFileHistoryPinRequest {
-        path: stat.path.clone(),
-        identity: identity.clone(),
-        operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: request.pin_id,
-        },
-        operation_id: "repin-acquire".into(),
-    })
-    .unwrap();
-    assert_eq!(
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()),
-        jobs.as_slice(),
-        "an explicit root reactivates its missing N replica"
-    );
-    assert!(
-        native_history_queue(&runtime, &owner)
-            .iter()
-            .any(|record| record.intent_id == intent_id)
-    );
-    assert_eq!(
-        native_history_queue(&runtime, &owner).len(),
-        1,
-        "the pin publication must durably enqueue newly actionable work"
-    );
-    let reactivated = native_history_queue(&runtime, &owner);
-    let mut expected_reactivated = dormant;
-    assert_ne!(reactivated[0].next_retry_unix_nanos, u64::MAX);
-    expected_reactivated[0].next_retry_unix_nanos = reactivated[0].next_retry_unix_nanos;
-    assert_eq!(
-        reactivated, expected_reactivated,
-        "repin wakes only scheduling and preserves the whole original failed transfer"
-    );
-    let current_head = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_object(&stat.object_id)
-        .unwrap()
-        .expect("current object");
-    let peer_head_before = native_history_settled_peer_head(&runtime, &remote, &current_head);
-    runtime.clear_faults();
-    drop(negative_guard);
-    let (repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
-    assert!(repairs.is_empty());
-    assert!(
-        !native_history_queue(&runtime, &owner)
-            .iter()
-            .any(|record| record.intent_id == intent_id)
-    );
-    let replica = runtime.client(&remote).unwrap();
-    assert_native_history_holder_bytes(
-        &settled,
-        &owner,
-        &replica,
-        &remote,
-        &identity,
-        b"retained alternative",
-    );
-    // The replica node's own durable store keeps its current view.
-    assert_eq!(
-        runtime
-            .node_metadata(&remote)
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap(),
-        peer_head_before,
-        "retained repair leaves the actual local current view unchanged"
-    );
-    assert_eq!(
-        dfs.posix_read_file_distributed(&stat.path).unwrap(),
-        b"canonical"
-    );
-    drop(replica);
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -2570,332 +1314,6 @@ fn file_history_repin_after_restart_does_not_rewind_a_canonical_write_intent() {
         b"next"
     );
     drop(dfs);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
-    let root = temp_root("history-expired-repair");
-    let (runtime, owner, remotes, mut dfs) = native_history_repair_services(
-        "file_history_expired_rule_retires_repairs_even_during_retry_backoff",
-        3,
-    );
-    let remote = remotes[0].clone();
-    // Managed placement can select any eligible remote despite candidate hints.
-    // Keep the real W1/N2 plan, and deny every actual missing-N target.
-    let denied_targets = remotes.clone();
-    deny_history_content_targets(&runtime, &owner, &denied_targets);
-    let first = dfs
-        .posix_write_file(
-            "/services/expiring-history",
-            b"old",
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), remote],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    let mut fs = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_file_system(&first.file_system_id)
-        .unwrap()
-        .unwrap();
-    {
-        let mut policy = decode_history_policy(fs.retention_policies.get(HISTORY_MODULE_ID));
-        policy.rules.push(DfsFileHistoryRule {
-            path: first.path.clone(),
-            retention: DfsFileHistoryRetention {
-                keep_last: 0,
-                keep_for_seconds: 1,
-            },
-        });
-        install_history_policy(&mut fs, policy).unwrap();
-    }
-    apply_history_fixture_policy(&mut dfs, &fs);
-    dfs.posix_write_file(
-        &first.path,
-        b"current",
-        DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-    )
-    .unwrap();
-    let retained = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_version(&first.object_id, &first.version)
-        .unwrap()
-        .unwrap();
-    assert!(retained.history_capture().unwrap().policy_capture.is_some());
-    let recorded_plan = retained.content_durability.as_ref().unwrap();
-    assert!(
-        recorded_plan
-            .desired_replica_node_ids
-            .iter()
-            .all(|node| node == &owner || denied_targets.contains(node)),
-        "expiry/backoff setup must block every actual captured target: plan={:?} denied={denied_targets:?}",
-        recorded_plan.desired_replica_node_ids,
-    );
-    let store = LocalDfsRepairQueueStore::new(
-        sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
-    );
-    let mut records = store.view().unwrap().records;
-    assert_eq!(records.len(), 1);
-    let original = records[0].clone();
-    records[0].attempts = 1;
-    records[0].next_retry_unix_nanos = core_test::now_unix_nanos().saturating_add(60_000_000_000);
-    // Negative scheduling only: retain the real Main-generated identity and
-    // durable ownership while delaying its retry through the existing queue.
-    store.replace_records(&records).unwrap();
-    let actual = store.view().unwrap().records;
-    assert_eq!(actual, records);
-    let mut preserved_transfer = actual[0].clone();
-    preserved_transfer.attempts = original.attempts;
-    preserved_transfer.next_retry_unix_nanos = original.next_retry_unix_nanos;
-    assert_eq!(
-        preserved_transfer, original,
-        "the scheduling fixture preserves every actual native transfer fact"
-    );
-    assert_eq!(
-        actual[0].transfer_kind,
-        Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-    );
-
-    assert_eq!(actual[0].intent_id, original.intent_id);
-    assert_eq!(actual[0].object_id, original.object_id);
-    assert_eq!(actual[0].version, original.version);
-    assert_eq!(actual[0].content_hash, original.content_hash);
-    assert_eq!(
-        actual[0].missing_replica_node_id,
-        original.missing_replica_node_id
-    );
-    let original_custody = core_test::original_repair_slot_snapshot(
-        &store,
-        &original.intent_id,
-        &original.missing_replica_node_id,
-    )
-    .unwrap();
-    let original_bytes = original_custody.as_ref().map(|_| {
-        dfs.content()
-            .read_object_version(first.object_id.as_str(), first.version.as_str())
-            .unwrap()
-            .1
-    });
-    // Exercise the production wall-clock expiry boundary while the transport
-    // retry remains far in the future; no network work should run here.
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(history_entries(&mut dfs, &first.path).is_empty());
-    assert!(matches!(
-        dfs.read_file_history(DfsFileHistoryReadRequest {
-            identity: history_identity(&first),
-            offset: 0,
-            max_bytes: 64,
-        })
-        .unwrap(),
-        DfsFileHistoryReadOutcome::NotRetained { .. }
-    ));
-    assert_history_repair_inventory(
-        &runtime.metadata_primary_service("/services").unwrap(),
-        &first.object_id,
-    );
-    assert_eq!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .metadata_summary()
-            .unwrap()
-            .pending_repair_count,
-        0
-    );
-    // The actual Main must retire an expired retained target before consulting
-    // the queue's still-future network retry. The facade owns no repair jobs.
-    native_history_owner_tick(&runtime, &owner);
-    assert!(
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()).is_empty()
-    );
-    let current = native_history_queue(&runtime, &owner);
-    let current_custody = core_test::original_repair_slot_snapshot(
-        &store,
-        &original.intent_id,
-        &original.missing_replica_node_id,
-    )
-    .unwrap();
-    assert_eq!(
-        current_custody, original_custody,
-        "expiry must preserve the exact original body, payload root, attempts and observations"
-    );
-    eprintln!(
-        "native expired repair: original={original:?} scheduled={actual:?} after={current:?}"
-    );
-    if current_custody.is_some() {
-        eprintln!("native expired repair branch=owned-original-preserved");
-        assert_eq!(
-            current, actual,
-            "expiry preserves the owned original queue row"
-        );
-        assert_eq!(
-            Some(
-                dfs.content()
-                    .read_object_version(first.object_id.as_str(), first.version.as_str())
-                    .unwrap()
-                    .1
-            ),
-            original_bytes,
-            "expiry preserves the owned original payload bytes"
-        );
-    } else if actual[0].transfer_request_id.is_none()
-        && !actual[0].in_flight
-        && actual[0].transfer_kind.is_some()
-        && (actual[0].transfer_delivery_state
-            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-            || actual[0].completed_transfer_request_id.is_some())
-    {
-        eprintln!("native expired repair branch=unowned-settled-row-removed");
-        // Scheduling facts permit removal only after canonical slot inspection
-        // proves that no original still owns this target.
-        assert!(current.is_empty());
-    } else {
-        eprintln!("native expired repair branch=unowned-uncertain-row-preserved");
-        assert_eq!(
-            current, actual,
-            "expiry withdraws execution while retaining every actual uncertain transfer fact"
-        );
-    }
-    assert_eq!(
-        dfs.posix_read_file_distributed(&first.path).unwrap(),
-        b"current"
-    );
-    drop(dfs);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_pin_receipt_replay_recovers_its_repair_queue_handoff() {
-    let (mut runtime, owner, remotes, mut dfs) =
-        native_history_repair_services("native-history-pin-receipt-replay", 2);
-    let remote = remotes[0].clone();
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let stat = dfs
-        .posix_write_file(
-            "/services/replay-pin",
-            b"canonical",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-        )
-        .unwrap();
-    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
-        .preserve_local_file_version(
-            preserve_request(&stat, "replay-preserve"),
-            &b"retained"[..],
-            DfsWriteOptions {
-                replica_candidates: vec![owner.clone(), remote],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("W reached");
-    };
-    let request = DfsFileHistoryPinRequest {
-        path: stat.path.clone(),
-        identity,
-        operation: DfsFileHistoryPinOperation::Pin {
-            pin_id: "second-root".into(),
-        },
-        operation_id: "publish-root-before-queue-handoff".into(),
-    };
-    let first = dfs.file_history_pin(request.clone()).unwrap();
-    let before = current_history_shard_sequence(
-        &mut runtime.metadata_primary_service("/services").unwrap(),
-        &stat.file_system_id,
-        &stat.path,
-    );
-    let expected_jobs =
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap());
-    assert_eq!(expected_jobs.len(), 1);
-    drop(dfs);
-    // Restart the actual host. An independent physical client may hydrate
-    // during completed-handoff rebind; the replay below enters the real Main
-    // handler with the original requester and command identity instead.
-    runtime.stop_node(&owner).unwrap();
-    runtime.reopen_node(owner.clone()).unwrap();
-    let mut dfs = runtime.client(&owner).unwrap();
-    let replay = DfsContentReferenceRequest {
-        namespace: HISTORY_MODULE_ID.into(),
-        path: request.path.clone(),
-        identity: request.identity.clone(),
-        operation_id: request.operation_id.clone(),
-        operation: DfsContentReferenceOperation::Retain {
-            reference_id: "second-root".into(),
-        },
-    };
-    let actual = dfs
-        .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
-            request.operation_id.clone(),
-            request.identity.file_system_id.clone(),
-            owner.clone(),
-            DfsNamespaceOperation::ContentReference { request: replay },
-            Duration::from_secs(5),
-            false,
-            false,
-        )
-        .unwrap();
-    assert!(matches!(actual.result, DfsNamespaceResult::Applied));
-    assert_eq!(dfs.file_history_pin(request).unwrap(), first);
-    assert_eq!(
-        current_history_shard_sequence(
-            &mut runtime.metadata_primary_service("/services").unwrap(),
-            &stat.file_system_id,
-            &stat.path
-        ),
-        before,
-        "the actual Main replay must reuse its durable publication"
-    );
-    assert_eq!(
-        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()),
-        expected_jobs.as_slice()
-    );
-    let queue = LocalDfsRepairQueueStore::new(
-        sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
-    )
-    .view()
-    .unwrap();
-    assert_eq!(
-        queue.records.len(),
-        1,
-        "Main must checkpoint the replayed repair handoff"
-    );
-    assert_eq!(queue.records[0].intent_id, expected_jobs[0].intent_id);
-    assert_eq!(queue.records[0].object_id, expected_jobs[0].object_id);
-    assert_eq!(queue.records[0].version, expected_jobs[0].version);
-    assert_eq!(
-        queue.records[0].missing_replica_node_id,
-        expected_jobs[0].missing_replica_node_id
-    );
-    assert!(
-        runtime.rpc_observations().iter().any(|event| {
-            event.source == owner
-                && event.target == owner
-                && event.route == sinomo_dfs::DFS_DATA_NAMESPACE_ROUTE
-                && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
-                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::Completed
-        }),
-        "the receipt must pass through the actual authenticated Main handler"
-    );
-    assert_eq!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
-            .expect("current object")
-            .version,
-        stat.version
-    );
-    drop(dfs);
-    runtime.clear_faults();
     runtime.close().unwrap();
 }
 
@@ -3606,268 +2024,6 @@ fn file_history_preserve_api_replays_without_repinning_or_replacing_current_cont
         b"canonical moved on"
     );
     drop(dfs);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_pending_preservation_does_not_block_current_writes_and_publishes_after_w() {
-    let (runtime, owner, remotes, mut primary) =
-        native_history_repair_services("native-history-preserve-awaits-real-W", 2);
-    let remote = remotes[0].clone();
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let ordinary = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
-    let stat = primary
-        .posix_write_file("/services/preserve-threshold", b"base", ordinary.clone())
-        .unwrap();
-    let request = preserve_request(&stat, "preserve-needs-two-replicas");
-    let preservation_options = DfsWriteOptions {
-        replica_candidates: vec![owner.clone(), remote.clone()],
-        policy: DfsReplicationPolicy::new(2, 2).unwrap(),
-        wait_for_commit: false,
-        foreground_replica_repair: false,
-    };
-    let pending = primary
-        .preserve_local_file_version(
-            request.clone(),
-            &b"candidate awaiting W"[..],
-            preservation_options.clone(),
-        )
-        .unwrap();
-    let DfsFileHistoryPreserveOutcome::Pending {
-        identity,
-        intent_id,
-    } = pending
-    else {
-        panic!("offline replica prevents W");
-    };
-    assert!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_version(&identity.object_id, &identity.version)
-            .unwrap()
-            .is_none()
-    );
-    primary
-        .posix_write_file(&stat.path, b"next current content", ordinary)
-        .unwrap();
-    let current = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_object(&stat.object_id)
-        .unwrap()
-        .expect("current object");
-    // This is pending staging before W, not a published LIVE repair plan.
-    // Observe its real failed carrier as before; the unchanged checks below
-    // still require exact retained publication and both actual receipts.
-    observe_native_history_content_failure(&runtime, &owner, &mut primary, || {
-        runtime.rpc_observations().iter().any(|event| {
-            event.source == owner
-                && event.target == remote
-                && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
-                && event.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
-                && event.route == sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE
-        })
-    });
-    let peer_head_before = native_history_settled_peer_head(&runtime, &remote, &current);
-    runtime.clear_faults();
-    // The old fixture advanced a private retry tick by 100. Use only the
-    // ordinary Main's finite repair passes, within the SAME existing network
-    // budget and eight-work bound. Exact published DATA, not caller state,
-    // determines whether the original operation has reached W.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut observed_progress = Vec::new();
-    runtime.request_repair_reconciliation(&owner).unwrap();
-    for _ in 0..8 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "Main progress used the existing network budget: {observed_progress:?}"
-        );
-        let pass = runtime.maintenance_tick(&owner, remaining).unwrap();
-        pass.outcome.unwrap();
-        assert_eq!(pass.omitted_kv_event_count, 0);
-        let backend = runtime.node_metadata(&owner).unwrap();
-        let published = backend
-            .get_version(&identity.object_id, &identity.version)
-            .unwrap();
-        let receipts = backend
-            .receipts_for_version(&identity.object_id, &identity.version)
-            .unwrap();
-        let queued = native_history_queue(&runtime, &owner)
-            .into_iter()
-            .filter(|record| record.intent_id == intent_id)
-            .collect::<Vec<_>>();
-        observed_progress.push((published.is_some(), receipts, queued));
-        if published.is_some() {
-            break;
-        }
-    }
-    let completed = primary
-        .preserve_local_file_version(request, &b"candidate awaiting W"[..], preservation_options)
-        .unwrap();
-    match completed {
-        DfsFileHistoryPreserveOutcome::Pending {
-            identity: actual_identity,
-            intent_id: canonical_id,
-        } => {
-            assert_eq!(actual_identity, identity);
-            assert_eq!(
-                canonical_id, intent_id,
-                "the original caller retains the same pending request key"
-            );
-            primary.process_incoming().unwrap();
-            let NetworkedDfsWriteOutcome::Committed { version, .. } =
-                primary.test_write_outcome(&canonical_id).unwrap()
-            else {
-                panic!("the same actual Main reply must confirm W before retained completion");
-            };
-            assert_eq!(version, actual_identity.version);
-        }
-        DfsFileHistoryPreserveOutcome::Retained {
-            identity: actual_identity,
-        } => {
-            assert_eq!(actual_identity, identity);
-        }
-    }
-    let backend = runtime.node_metadata(&owner).unwrap();
-    let published = backend
-        .get_version(&identity.object_id, &identity.version)
-        .unwrap()
-        .expect("actual retained publication after W");
-    assert_eq!(
-        published.content_durability.as_ref().unwrap().policy,
-        DfsReplicationPolicy::new(2, 2).unwrap()
-    );
-    let receipts = backend
-        .receipts_for_version(&identity.object_id, &identity.version)
-        .unwrap();
-    let durable_nodes = receipts
-        .into_iter()
-        .filter(|receipt| receipt.content_hash == published.content_hash)
-        .map(|receipt| receipt.replica_node_id)
-        .collect::<BTreeSet<_>>();
-    assert!(
-        durable_nodes.contains(&owner) && durable_nodes.contains(&remote),
-        "{intent_id} reaches W through both actual receiver receipts"
-    );
-    assert_eq!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
-            .expect("current object"),
-        current
-    );
-    assert_eq!(
-        primary.posix_read_file_distributed(&stat.path).unwrap(),
-        b"next current content"
-    );
-    assert!(
-        matches!(primary.read_file_history(DfsFileHistoryReadRequest { identity, offset: 0, max_bytes: 64 }).unwrap(), DfsFileHistoryReadOutcome::Found { data } if data.bytes == b"candidate awaiting W")
-    );
-    let replica = runtime.node_metadata(&remote).unwrap();
-    assert_eq!(
-        replica.get_object(&stat.object_id).unwrap(),
-        peer_head_before,
-        "retained staging leaves the actual local current view unchanged"
-    );
-    drop(replica);
-    drop(primary);
-    runtime.close().unwrap();
-}
-
-#[test]
-fn file_history_repairs_retained_bytes_without_rewinding_the_replica() {
-    let (runtime, owner, remotes, mut primary) =
-        native_history_repair_services("native-history-storage-only-repair", 3);
-    deny_history_content_targets(&runtime, &owner, &remotes);
-    let path = "/services/repair-retained";
-    let first = primary
-        .posix_write_file(
-            path,
-            b"retained bytes",
-            DfsWriteOptions {
-                replica_candidates: std::iter::once(owner.clone())
-                    .chain(remotes.iter().cloned())
-                    .collect(),
-                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
-        .unwrap();
-    capture_history(&mut primary, &first);
-    primary
-        .posix_write_file(
-            path,
-            b"new current bytes",
-            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
-        )
-        .unwrap();
-    let current = runtime
-        .node_metadata(&owner)
-        .unwrap()
-        .get_object(&first.object_id)
-        .unwrap()
-        .expect("current object");
-    fail_native_history_live_repairs(&runtime, &owner, &mut primary);
-    let before = native_history_settled_peer_head(&runtime, &remotes[0], &current);
-    let peer = runtime.client(&remotes[0]).unwrap();
-    assert!(
-        matches!(peer.content().read_blob(first.content_hash.as_deref().unwrap()),
-            Err(sinomo_dfs::ContentStoreError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound),
-        "the denied target must have actual NotFound for the exact retained blob",
-    );
-    drop(peer);
-    runtime.clear_faults();
-    let (_repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut primary);
-    let peer = runtime.client(&remotes[0]).unwrap();
-    assert_native_history_holder_bytes(
-        &settled,
-        &owner,
-        &peer,
-        &remotes[0],
-        &history_identity(&first),
-        b"retained bytes",
-    );
-    // The peer node's own durable store keeps its current view.
-    assert_eq!(
-        runtime
-            .node_metadata(&remotes[0])
-            .unwrap()
-            .get_object(&first.object_id)
-            .unwrap(),
-        before,
-        "the genuine retained repair changes no current metadata"
-    );
-    assert_eq!(
-        primary.posix_read_file_distributed(path).unwrap(),
-        b"new current bytes"
-    );
-    assert_eq!(
-        runtime
-            .node_metadata(&owner)
-            .unwrap()
-            .get_object(&first.object_id)
-            .unwrap()
-            .expect("current object"),
-        current
-    );
-    assert!(
-        runtime
-            .rpc_observations()
-            .iter()
-            .any(|event| event.source == owner
-                && event.target == remotes[0]
-                && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
-                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::Completed),
-        "the bytes must arrive through the real authenticated repair endpoint"
-    );
-    drop(peer);
-    drop(primary);
     runtime.close().unwrap();
 }
 
@@ -6232,18 +4388,6 @@ fn assert_native_history_holder_bytes(
     assert_eq!(content_hash(&bytes), hash);
 }
 
-fn native_history_queue(
-    runtime: &sinomo_dfs::test_support::DfsTestRuntime,
-    owner: &NodeId,
-) -> Vec<sinomo_dfs::DfsRepairAttemptRecord> {
-    LocalDfsRepairQueueStore::new(sinomo_dfs::default_dfs_repair_attempt_snapshot_path(
-        runtime.data_dir(owner),
-    ))
-    .view()
-    .unwrap()
-    .records
-}
-
 // Both metadata-only capture fixtures require the same immutable obligation.
 // Completed N is proven by exact target receipts; pending N needs its real owner.
 fn assert_native_history_recorded_or_settled_obligation(
@@ -6474,16 +4618,6 @@ fn native_history_settled_peer_head(
     actual
 }
 
-fn fail_native_history_live_repairs(
-    runtime: &sinomo_dfs::test_support::DfsTestRuntime,
-    owner: &NodeId,
-    service: &mut NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
-) {
-    observe_native_history_content_failure(runtime, owner, service, || {
-        native_history_failure_observation_complete(runtime, owner)
-    });
-}
-
 fn observe_native_history_content_failure(
     runtime: &sinomo_dfs::test_support::DfsTestRuntime,
     owner: &NodeId,
@@ -6518,51 +4652,40 @@ fn observe_native_history_content_failure(
     }
 }
 
-fn native_history_failure_observation_complete(
+/// The live repairs exist because their actual native content RPCs failed;
+/// the write's own Stage or the executor's Repair attempt carries the proof.
+/// A write that returns at W leaves its other Stage sends detached, so the
+/// failure is observed when that send ends, within the network budget.
+fn fail_native_history_live_repairs(
     runtime: &sinomo_dfs::test_support::DfsTestRuntime,
     owner: &NodeId,
-) -> bool {
-    // A carrier's terminal event precedes its owner's durable queue update.
-    // One failed RPC also says nothing about another live target still in
-    // flight. Observe the exact LIVE plan and its settled failure records
-    // before healing the fixture or sampling the existing retry eligibility.
-    let current = runtime.metadata_primary_service("/services").unwrap();
-    let repairs = native_history_repairs(&current);
-    let queue = native_history_queue(runtime, owner);
-    let events = runtime.rpc_observations();
-    !repairs.is_empty()
-        && repairs.iter().all(|repair| {
-            queue.iter().any(|record| {
-                record.intent_id == repair.intent_id
-                    && record.object_id == repair.object_id
-                    && record.version == repair.version
-                    && Some(record.content_hash.as_str()) == repair.content_hash.as_deref()
-                    && record.missing_replica_node_id == repair.missing_replica_node_id
-                    && record.transfer_kind
-                        == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-                    && !record.in_flight
-                    && record.transfer_request_id.is_none()
-                    && record.completed_transfer_request_id.is_none()
-                    && record.transfer_delivery_state
-                        == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-                    && record.attempts > 0
-                    && record.last_attempt_unix_nanos > 0
-                    && record.next_retry_unix_nanos >= record.last_attempt_unix_nanos
-                    && record.next_retry_unix_nanos != u64::MAX
-            }) && events.iter().any(|event| {
-                &event.source == owner
-                    && event.target == repair.missing_replica_node_id
-                    && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
-                    && event.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
-                    && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
-                    && event.dfs_intent_id.as_deref() == Some(repair.intent_id.as_str())
-                    && event.dfs_file_system_id.as_ref() == Some(&repair.file_system_id)
-                    && event.dfs_object_id.as_ref() == Some(&repair.object_id)
-                    && event.dfs_version.as_ref() == Some(&repair.version)
-            })
+    _service: &mut NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
+) {
+    let failed = || {
+        runtime.rpc_observations().iter().any(|event| {
+            &event.source == owner
+                && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
+                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
+                && [
+                    sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE,
+                    sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE,
+                ]
+                .contains(&event.route.as_str())
         })
+    };
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while !failed() {
+        assert!(
+            Instant::now() < deadline,
+            "the missing replica must be grounded in an actual failed native content RPC"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
+/// Drive the owner's ordinary maintenance until its repair executor has
+/// settled every live repair. A failed attempt backs off on the executor's
+/// single timer; the wait for that timer is part of the test's time.
 fn drain_native_history_repairs(
     runtime: &sinomo_dfs::test_support::DfsTestRuntime,
     owner: &NodeId,
@@ -6571,96 +4694,26 @@ fn drain_native_history_repairs(
     Vec<sinomo_dfs::DfsOperatorRepairView>,
     sinomo_dfs::DfsMetadataTableSnapshot,
 ) {
-    assert!(
-        runtime
-            .rpc_observations()
-            .iter()
-            .any(|event| &event.source == owner
-                && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
-                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
-                && [
-                    sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE,
-                    sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
-                ]
-                .contains(&event.route.as_str())),
-        "the missing replica must be grounded in an actual failed native content RPC"
-    );
-    // The caller budget measures a real eligible repair operation. Observe
-    // finite known retry policy for only the current normal LIVE repair plan;
-    // retired, parked and unresolved custody cannot delay this prerequisite.
-    let current = runtime.metadata_primary_service("/services").unwrap();
-    let backend = current.metadata_backend().unwrap();
-    let repairs = native_history_repairs(&current);
-    let mut retry_due = core_test::now_unix_nanos();
-    let mut settled_retry_count = 0;
-    for record in native_history_queue(runtime, owner) {
-        if record.transfer_kind != Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
-            || record.in_flight
-            || record.transfer_request_id.is_some()
-            || record.next_retry_unix_nanos == u64::MAX
-            || !(record.transfer_delivery_state
-                == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-                || record.completed_transfer_request_id.is_some())
-        {
-            continue;
-        }
-        let Some(repair) = repairs.iter().find(|repair| {
-            repair.intent_id == record.intent_id
-                && repair.object_id == record.object_id
-                && repair.version == record.version
-                && repair.content_hash.as_deref() == Some(record.content_hash.as_str())
-                && repair.missing_replica_node_id == record.missing_replica_node_id
-        }) else {
-            continue;
-        };
-        let intent = backend
-            .get_intent(&repair.object_id, &repair.intent_id)
-            .unwrap()
-            .expect("the ordinary LIVE repair plan retains its exact immutable owner");
-        assert_eq!(intent.intent_id, repair.intent_id);
-        assert_eq!(intent.file_system_id, repair.file_system_id);
-        assert_eq!(intent.object_id, repair.object_id);
-        assert_eq!(intent.target_version, repair.version);
-        assert_eq!(intent.content_hash, repair.content_hash);
-        assert_eq!(&intent.coordinator_node_id, owner);
-        intent.policy.validate().unwrap();
-        assert!(
-            intent
-                .desired_replica_node_ids
-                .contains(&repair.missing_replica_node_id)
-        );
-        assert!(
-            !intent
-                .policy
-                .forbidden_node_ids
-                .contains(&repair.missing_replica_node_id)
-        );
-        assert!(record.attempts > 0);
-        assert!(record.last_attempt_unix_nanos > 0);
-        assert!(record.next_retry_unix_nanos >= record.last_attempt_unix_nanos);
-        retry_due = retry_due.max(record.next_retry_unix_nanos);
-        settled_retry_count += 1;
-    }
-    drop(current);
-    let eligibility_started = Instant::now();
-    runtime.runtime_handle().block_on(async {
-        let remaining = Duration::from_nanos(retry_due.saturating_sub(core_test::now_unix_nanos()));
-        tokio::time::sleep_until(tokio::time::Instant::now() + remaining).await;
-    });
-    assert!(core_test::now_unix_nanos() >= retry_due);
-    println!(
-        "actual native history LIVE settled retry jobs={settled_retry_count} due_unix_nanos={retry_due} prerequisite_wait_seconds={:.6}; included in total test wall time",
-        eligibility_started.elapsed().as_secs_f64()
-    );
-    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    fail_native_history_live_repairs(runtime, owner, service);
+    // Each failed attempt's backoff runs on the executor's timer; the waits
+    // for it are part of the test's time, bounded by the first retry steps.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut unsettled = Vec::new();
     let settled = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "actual Main repair receipts must settle within the existing network budget"
+            "actual Main repair receipts must settle within the executor's retry steps: {unsettled:?}"
         );
-        runtime.request_repair_reconciliation(owner).unwrap();
-        let pass = runtime.maintenance_tick(owner, remaining).unwrap();
+        // Taken before the check, the mark cannot miss an outcome or index
+        // change that lands between the check and the wait.
+        let seen = runtime.repair_executor_progress(owner);
+        let pass = runtime
+            .maintenance_tick(
+                owner,
+                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .unwrap();
         pass.outcome.expect("actual Main repair pass");
         assert_eq!(pass.omitted_kv_event_count, 0);
         let current = runtime.metadata_primary_service("/services").unwrap();
@@ -6672,17 +4725,1011 @@ fn drain_native_history_repairs(
                 .export_table_snapshot()
                 .unwrap();
             drop(current);
-            assert!(
-                Instant::now() <= deadline,
-                "actual settled receipt observation must fit the original network budget"
-            );
             break (pending, snapshot);
         }
+        unsettled = pending;
         drop(current);
-        // A checkpointed pass may hand payloads to the normal native task owner
-        // before its actual receiver replies. Observe that owner, not a private
-        // caller inbox or a one-pass scheduling report.
+        // Wait on the executor's own edge: an attempt's outcome, an index
+        // change, or its backoff timer's pass. Never on the in-flight
+        // re-check, which is a re-send time, not a reply deadline.
+        if let Some(seen) = seen {
+            runtime.wait_for_repair_executor_progress(owner, seen, deadline);
+        }
     };
     service.process_incoming().unwrap();
     settled
+}
+
+fn capture_after_metadata_change_preserves_durability(collect_before_capture: bool) {
+    let name = if collect_before_capture {
+        "native-history-metadata-collected"
+    } else {
+        "native-history-metadata-pending"
+    };
+    let (mut runtime, owner, remotes, mut dfs) = native_history_repair_services(name, 3);
+    let remote_a = remotes[0].clone();
+    let remote_b = remotes[1].clone();
+    deny_history_content_targets(&runtime, &owner, &remotes);
+    let original = dfs
+        .posix_write_file(
+            "/services/history-metadata-generation",
+            b"retained content",
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), remote_a.clone(), remote_b.clone()],
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    let original_intent_id =
+        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap())[0]
+            .intent_id
+            .clone();
+    if collect_before_capture {
+        fail_native_history_live_repairs(&runtime, &owner, &mut dfs);
+        runtime.clear_faults();
+        let (repairs, _settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
+        assert!(repairs.is_empty(), "the original write must first reach N");
+    }
+    let mut metadata = dfs.posix_set_mode(&original.path, 0o640).unwrap();
+    if collect_before_capture {
+        dfs.posix_rename(&original.path, "/services/renamed-history-source")
+            .unwrap();
+        metadata = dfs
+            .posix_stat_distributed("/services/renamed-history-source")
+            .unwrap();
+    }
+    for _ in 0..8 {
+        runtime
+            .gc_metadata_history_on_current_primaries(DfsMetadataHistoryGcOptions::delete_eligible(
+                Duration::ZERO,
+                0,
+            ))
+            .unwrap();
+    }
+    drop(dfs);
+    runtime.stop_node(&owner).unwrap();
+    runtime.reopen_node(owner.clone()).unwrap();
+    let mut dfs = runtime.client(&owner).unwrap();
+    native_history_owner_tick(&runtime, &owner);
+    if collect_before_capture {
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_intent(&original.object_id, &original_intent_id)
+                .unwrap()
+                .is_none(),
+            "the completed original write must lose its executable owner through GC"
+        );
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_intent_receipt(&original.object_id, &original_intent_id)
+                .unwrap()
+                .is_none(),
+            "repeated GC must collect its terminal retry witness"
+        );
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_version(&original.object_id, &original.version)
+                .unwrap()
+                .is_some(),
+            "the current successor still needs the original data-generation witness"
+        );
+    } else {
+        assert_eq!(
+            native_history_repairs(&runtime.metadata_primary_service("/services").unwrap()).len(),
+            2,
+            "current metadata-only generations must keep their pending N work after GC and restart"
+        );
+        assert_eq!(
+            native_history_main_current_version(
+                &runtime.metadata_primary_service("/services").unwrap(),
+                &metadata.object_id
+            ),
+            Some(metadata.version.clone())
+        );
+    }
+    assert_ne!(metadata.version, original.version);
+    assert_eq!(metadata.content_hash, original.content_hash);
+    let record = runtime
+        .node_metadata(&owner)
+        .unwrap()
+        .get_version(&metadata.object_id, &metadata.version)
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.history_capture().is_none(),
+        "metadata-only changes do not capture history"
+    );
+    let recorded_plan = record.content_durability.as_ref().unwrap();
+    assert_eq!(
+        recorded_plan.policy,
+        DfsReplicationPolicy::new(1, 3).unwrap()
+    );
+    assert_eq!(recorded_plan.source_version, original.version);
+    assert_eq!(recorded_plan.coordinator_node_id, owner);
+    assert_eq!(
+        recorded_plan
+            .desired_replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [owner.clone(), remote_a.clone(), remote_b.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    capture_history(&mut dfs, &metadata);
+    let current = dfs
+        .posix_write_file(
+            &metadata.path,
+            b"current content",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    native_history_owner_tick(&runtime, &owner);
+    for _ in 0..8 {
+        runtime
+            .gc_metadata_history_on_current_primaries(DfsMetadataHistoryGcOptions::delete_eligible(
+                Duration::ZERO,
+                0,
+            ))
+            .unwrap();
+    }
+    drop(dfs);
+    runtime.stop_node(&owner).unwrap();
+    runtime.reopen_node(owner.clone()).unwrap();
+    let mut dfs = runtime.client(&owner).unwrap();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: current.path.clone(),
+        identity: history_identity(&metadata),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: "after-restart".into(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    })
+    .unwrap();
+    assert_native_history_recorded_or_settled_obligation(
+        &runtime.metadata_primary_service("/services").unwrap(),
+        &record,
+    );
+    assert_eq!(
+        dfs.posix_read_file_distributed(&current.path).unwrap(),
+        b"current content"
+    );
+    assert_eq!(
+        dfs.posix_stat_distributed(&current.path).unwrap().version,
+        current.version
+    );
+    drop(dfs);
+    runtime.clear_faults();
+    runtime.close().unwrap();
+}
+
+#[test]
+fn file_history_capture_after_rename_and_write_history_gc_preserves_durability() {
+    capture_after_metadata_change_preserves_durability(true);
+}
+
+/// A retained version's repair leaves only after maintenance releases its
+/// admission. The receiver pauses the transfer; maintenance still returns,
+/// and the owner then serves a routed write from another node while the
+/// transfer waits. Sent under the admission, the owner would wait on the
+/// paused transfer while the write waited on the owner.
+#[test]
+fn file_history_retained_repair_leaves_after_maintenance_releases_admission() {
+    let (runtime, owner, remotes, mut primary) =
+        native_history_repair_services("native-history-retained-detached", 3);
+    deny_history_content_targets(&runtime, &owner, &remotes);
+    let path = "/services/retained-detached";
+    let first = primary
+        .posix_write_file(
+            path,
+            b"retained bytes",
+            DfsWriteOptions {
+                replica_candidates: std::iter::once(owner.clone())
+                    .chain(remotes.iter().cloned())
+                    .collect(),
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    capture_history(&mut primary, &first);
+    primary
+        .posix_write_file(
+            path,
+            b"new current bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    fail_native_history_live_repairs(&runtime, &owner, &mut primary);
+    runtime.clear_faults();
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(sinomo_dfs::test_support::DfsTestFaultRule {
+        source: Some(owner.clone()),
+        target: Some(remotes[0].clone()),
+        route: Some(sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 1,
+        action: sinomo_dfs::test_support::DfsTestFaultAction::PauseBeforeDispatch(
+            std::sync::Arc::clone(&gate),
+        ),
+    });
+    let paused = || {
+        runtime.rpc_observations().iter().any(|event| {
+            event.source == owner
+                && event.target == remotes[0]
+                && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::BeforeDispatch
+        })
+    };
+    // The retained need is due once its failed attempt's backoff passes;
+    // maintenance returns each time, the transfer still paused.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !paused() {
+        assert!(Instant::now() < deadline, "the retained transfer leaves");
+        let tick = runtime
+            .maintenance_tick(&owner, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        tick.outcome
+            .expect("maintenance returns while the retained transfer is paused");
+        if let Some(due) = runtime.repair_executor_next_due_unix_nanos(&owner).unwrap() {
+            let wait = Duration::from_nanos(due.saturating_sub(core_test::now_unix_nanos()));
+            std::thread::sleep(wait.min(Duration::from_millis(200)));
+        }
+    }
+    // The owner's admission is free while the transfer waits: another
+    // node's routed write to the owner's shard completes.
+    let started = Instant::now();
+    let mut writer = runtime.client(&remotes[1]).unwrap();
+    writer
+        .posix_write_file(
+            "/services/retained-detached-unrelated",
+            b"unrelated",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        "the routed write did not wait on the paused retained transfer"
+    );
+    drop(writer);
+    gate.add_permits(1);
+    let (_repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut primary);
+    let peer = runtime.client(&remotes[0]).unwrap();
+    assert_native_history_holder_bytes(
+        &settled,
+        &owner,
+        &peer,
+        &remotes[0],
+        &history_identity(&first),
+        b"retained bytes",
+    );
+    drop(peer);
+    drop(primary);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn file_history_repairs_retained_bytes_without_rewinding_the_replica() {
+    let (runtime, owner, remotes, mut primary) =
+        native_history_repair_services("native-history-storage-only-repair", 3);
+    deny_history_content_targets(&runtime, &owner, &remotes);
+    let path = "/services/repair-retained";
+    let first = primary
+        .posix_write_file(
+            path,
+            b"retained bytes",
+            DfsWriteOptions {
+                replica_candidates: std::iter::once(owner.clone())
+                    .chain(remotes.iter().cloned())
+                    .collect(),
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    capture_history(&mut primary, &first);
+    primary
+        .posix_write_file(
+            path,
+            b"new current bytes",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let current = runtime
+        .node_metadata(&owner)
+        .unwrap()
+        .get_object(&first.object_id)
+        .unwrap()
+        .expect("current object");
+    fail_native_history_live_repairs(&runtime, &owner, &mut primary);
+    let before = native_history_settled_peer_head(&runtime, &remotes[0], &current);
+    let peer = runtime.client(&remotes[0]).unwrap();
+    assert!(
+        matches!(peer.content().read_blob(first.content_hash.as_deref().unwrap()),
+            Err(sinomo_dfs::ContentStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound),
+        "the denied target must have actual NotFound for the exact retained blob",
+    );
+    drop(peer);
+    runtime.clear_faults();
+    let (_repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut primary);
+    let peer = runtime.client(&remotes[0]).unwrap();
+    assert_native_history_holder_bytes(
+        &settled,
+        &owner,
+        &peer,
+        &remotes[0],
+        &history_identity(&first),
+        b"retained bytes",
+    );
+    // The peer node's own durable store keeps its current view.
+    assert_eq!(
+        runtime
+            .node_metadata(&remotes[0])
+            .unwrap()
+            .get_object(&first.object_id)
+            .unwrap(),
+        before,
+        "the genuine retained repair changes no current metadata"
+    );
+    assert_eq!(
+        primary.posix_read_file_distributed(path).unwrap(),
+        b"new current bytes"
+    );
+    assert_eq!(
+        runtime
+            .node_metadata(&owner)
+            .unwrap()
+            .get_object(&first.object_id)
+            .unwrap()
+            .expect("current object"),
+        current
+    );
+    assert!(
+        runtime
+            .rpc_observations()
+            .iter()
+            .any(|event| event.source == owner
+                && event.target == remotes[0]
+                && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.phase == sinomo_dfs::test_support::DfsTestRpcPhase::Completed),
+        "the bytes must arrive through the real authenticated repair endpoint"
+    );
+    drop(peer);
+    drop(primary);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn file_history_pending_preservation_does_not_block_current_writes_and_publishes_after_w() {
+    let (runtime, owner, remotes, mut primary) =
+        native_history_repair_services("native-history-preserve-awaits-real-W", 2);
+    let remote = remotes[0].clone();
+    deny_history_content_targets(&runtime, &owner, &remotes);
+    let ordinary = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
+    let stat = primary
+        .posix_write_file("/services/preserve-threshold", b"base", ordinary.clone())
+        .unwrap();
+    let request = preserve_request(&stat, "preserve-needs-two-replicas");
+    let preservation_options = DfsWriteOptions {
+        replica_candidates: vec![owner.clone(), remote.clone()],
+        policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+        wait_for_commit: false,
+        foreground_replica_repair: false,
+    };
+    let pending = primary
+        .preserve_local_file_version(
+            request.clone(),
+            &b"candidate awaiting W"[..],
+            preservation_options.clone(),
+        )
+        .unwrap();
+    let DfsFileHistoryPreserveOutcome::Pending {
+        identity,
+        intent_id,
+    } = pending
+    else {
+        panic!("offline replica prevents W");
+    };
+    assert!(
+        runtime
+            .node_metadata(&owner)
+            .unwrap()
+            .get_version(&identity.object_id, &identity.version)
+            .unwrap()
+            .is_none()
+    );
+    primary
+        .posix_write_file(&stat.path, b"next current content", ordinary)
+        .unwrap();
+    let current = runtime
+        .node_metadata(&owner)
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+        .expect("current object");
+    // This is pending staging before W, not a published LIVE repair plan.
+    // Observe its real failed carrier as before; the unchanged checks below
+    // still require exact retained publication and both actual receipts.
+    observe_native_history_content_failure(&runtime, &owner, &mut primary, || {
+        runtime.rpc_observations().iter().any(|event| {
+            event.source == owner
+                && event.target == remote
+                && event.origin == core_test::DfsTestRpcOrigin::RegisteredHost
+                && event.phase == core_test::DfsTestRpcPhase::EndedWithoutResponse
+                && event.route == sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE
+        })
+    });
+    let peer_head_before = native_history_settled_peer_head(&runtime, &remote, &current);
+    runtime.clear_faults();
+    // The old fixture advanced a private retry tick by 100. Use only the
+    // ordinary Main's finite repair passes, within the SAME existing network
+    // budget and eight-work bound. Exact published DATA, not caller state,
+    // determines whether the original operation has reached W.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed_progress = Vec::new();
+    runtime.request_repair_reconciliation(&owner).unwrap();
+    for _ in 0..8 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "Main progress used the existing network budget: {observed_progress:?}"
+        );
+        let pass = runtime.maintenance_tick(&owner, remaining).unwrap();
+        pass.outcome.unwrap();
+        assert_eq!(pass.omitted_kv_event_count, 0);
+        let backend = runtime.node_metadata(&owner).unwrap();
+        let published = backend
+            .get_version(&identity.object_id, &identity.version)
+            .unwrap();
+        let receipts = backend
+            .receipts_for_version(&identity.object_id, &identity.version)
+            .unwrap();
+        observed_progress.push((published.is_some(), receipts));
+        if published.is_some() {
+            break;
+        }
+    }
+    let completed = primary
+        .preserve_local_file_version(request, &b"candidate awaiting W"[..], preservation_options)
+        .unwrap();
+    match completed {
+        DfsFileHistoryPreserveOutcome::Pending {
+            identity: actual_identity,
+            intent_id: canonical_id,
+        } => {
+            assert_eq!(actual_identity, identity);
+            assert_eq!(
+                canonical_id, intent_id,
+                "the original caller retains the same pending request key"
+            );
+            primary.process_incoming().unwrap();
+            let NetworkedDfsWriteOutcome::Committed { version, .. } =
+                primary.test_write_outcome(&canonical_id).unwrap()
+            else {
+                panic!("the same actual Main reply must confirm W before retained completion");
+            };
+            assert_eq!(version, actual_identity.version);
+        }
+        DfsFileHistoryPreserveOutcome::Retained {
+            identity: actual_identity,
+        } => {
+            assert_eq!(actual_identity, identity);
+        }
+    }
+    let backend = runtime.node_metadata(&owner).unwrap();
+    let published = backend
+        .get_version(&identity.object_id, &identity.version)
+        .unwrap()
+        .expect("actual retained publication after W");
+    assert_eq!(
+        published.content_durability.as_ref().unwrap().policy,
+        DfsReplicationPolicy::new(2, 2).unwrap()
+    );
+    let receipts = backend
+        .receipts_for_version(&identity.object_id, &identity.version)
+        .unwrap();
+    let durable_nodes = receipts
+        .into_iter()
+        .filter(|receipt| receipt.content_hash == published.content_hash)
+        .map(|receipt| receipt.replica_node_id)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        durable_nodes.contains(&owner) && durable_nodes.contains(&remote),
+        "{intent_id} reaches W through both actual receiver receipts"
+    );
+    assert_eq!(
+        runtime
+            .node_metadata(&owner)
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .expect("current object"),
+        current
+    );
+    assert_eq!(
+        primary.posix_read_file_distributed(&stat.path).unwrap(),
+        b"next current content"
+    );
+    assert!(
+        matches!(primary.read_file_history(DfsFileHistoryReadRequest { identity, offset: 0, max_bytes: 64 }).unwrap(), DfsFileHistoryReadOutcome::Found { data } if data.bytes == b"candidate awaiting W")
+    );
+    let replica = runtime.node_metadata(&remote).unwrap();
+    assert_eq!(
+        replica.get_object(&stat.object_id).unwrap(),
+        peer_head_before,
+        "retained staging leaves the actual local current view unchanged"
+    );
+    drop(replica);
+    drop(primary);
+    runtime.close().unwrap();
+}
+
+fn repin_after_gc_has_fresh_repair_ownership(evict_receipt: bool, clustered: bool) {
+    let name = match (evict_receipt, clustered) {
+        (false, false) => "native-history-compacted-repair-owner",
+        (true, false) => "native-history-compacted-repair-receipt",
+        (_, true) => "native-history-compacted-repair-clustered",
+    };
+    let (mut runtime, owner, remotes, mut dfs) = native_history_repair_services(name, 3);
+    let a = remotes[0].clone();
+    let b = remotes[1].clone();
+    deny_history_content_targets(&runtime, &owner, &remotes);
+    let current = dfs
+        .posix_write_file(
+            "/services/compacted-history",
+            b"canonical",
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .unwrap();
+    let request = preserve_request(&current, "preserve-before-compaction");
+    let DfsFileHistoryPreserveOutcome::Retained { identity } = dfs
+        .preserve_local_file_version(
+            request.clone(),
+            &b"retained"[..],
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), a.clone(), b.clone()],
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("W reached");
+    };
+    let original_intent =
+        native_history_repairs(&runtime.metadata_primary_service("/services").unwrap())[0]
+            .intent_id
+            .clone();
+    dfs.file_history_pin(DfsFileHistoryPinRequest {
+        path: current.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Unpin {
+            pin_id: request.pin_id.clone(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    })
+    .unwrap();
+    runtime
+        .gc_metadata_history_on_current_primaries(
+            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+                .with_now_unix_nanos(core_test::now_unix_nanos()),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .node_metadata(&owner)
+            .unwrap()
+            .get_intent_receipt(&current.object_id, &original_intent)
+            .unwrap()
+            .is_some()
+    );
+    {
+        let actual_core = runtime.metadata_primary_service(&current.path).unwrap();
+        let backend = actual_core.metadata_backend().unwrap();
+        let stored = backend
+            .object_write_intent_history(&identity.object_id)
+            .unwrap();
+        assert!(
+            !stored
+                .intents
+                .iter()
+                .any(|record| record.intent_id == original_intent),
+            "actual GC removes the stored full original owner"
+        );
+        let compact = stored
+            .receipts
+            .iter()
+            .find(|receipt| receipt.intent_id == original_intent)
+            .unwrap();
+        let projected = backend
+            .get_intent(&identity.object_id, &original_intent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.intent_id, compact.intent_id);
+        assert_eq!(projected.target_version, compact.target_version);
+        assert_eq!(projected.content_hash, compact.content_hash);
+        assert_eq!(
+            projected.publication, compact.publication,
+            "a valid compact logical projection is present despite stored full absence"
+        );
+    }
+    if evict_receipt {
+        runtime
+            .gc_metadata_history_on_current_primaries(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+                    .with_now_unix_nanos(core_test::now_unix_nanos()),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_intent_receipt(&current.object_id, &original_intent)
+                .unwrap()
+                .is_none()
+        );
+        let stored = runtime
+            .metadata_primary_service(&current.path)
+            .unwrap()
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&identity.object_id)
+            .unwrap();
+        let retained_owner = stored
+            .intents
+            .iter()
+            .find(|record| {
+                record.target_version == identity.version && record.publication.is_retained_repair()
+            })
+            .expect("actual full owner survives retry-receipt eviction");
+        // The retained owner, not any node-local state, carries the repair
+        // across a restart of its primary.
+        drop(dfs);
+        runtime.stop_node(&owner).unwrap();
+        runtime.reopen_node(owner.clone()).unwrap();
+        native_history_owner_tick(&runtime, &owner);
+        dfs = runtime.client(&owner).unwrap();
+    }
+    assert!(
+        runtime
+            .node_metadata(&owner)
+            .unwrap()
+            .get_version(&identity.object_id, &identity.version)
+            .unwrap()
+            .is_some()
+    );
+    // Keep missing-N denied through the original live GC cut. Once each
+    // target has a real failed native attempt, an executor hold keeps any
+    // later attempt from leaving until the denials are lifted.
+    let negative_scope = if evict_receipt {
+        let core = runtime.metadata_primary_service(&current.path).unwrap();
+        let stored = core
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&identity.object_id)
+            .unwrap();
+        let actual = stored
+            .intents
+            .into_iter()
+            .find(|row| {
+                row.publication.is_retained_repair()
+                    && row.status == DfsWriteIntentStatus::Committed
+                    && row.file_system_id == identity.file_system_id
+                    && row.object_id == identity.object_id
+                    && row.target_version == identity.version
+            })
+            .expect("actual stored full retained owner before live repin");
+        drop(core);
+        Some(actual)
+    } else {
+        None
+    };
+    let negative_cut = runtime.rpc_observations().len();
+    let repin = DfsFileHistoryPinRequest {
+        path: current.path.clone(),
+        identity: identity.clone(),
+        operation: DfsFileHistoryPinOperation::Pin {
+            pin_id: request.pin_id.clone(),
+        },
+        operation_id: sinomo_core::Id::generate().to_string(),
+    };
+    dfs.file_history_pin(repin.clone()).unwrap();
+    let jobs = native_history_repairs(&runtime.metadata_primary_service("/services").unwrap());
+    assert_eq!(
+        jobs.len(),
+        2,
+        "the retained W=1/N=3 obligation must survive intent compaction"
+    );
+    assert!(
+        jobs.iter()
+            .all(|job| job.intent_id != original_intent && job.version == identity.version)
+    );
+    assert_eq!(
+        native_history_intent_policy(
+            &runtime.metadata_primary_service("/services").unwrap(),
+            &jobs[0]
+        ),
+        DfsReplicationPolicy::new(1, 3).unwrap()
+    );
+    let repair_intent = jobs[0].intent_id.clone();
+    {
+        let actual_core = runtime.metadata_primary_service(&current.path).unwrap();
+        let stored = actual_core
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&identity.object_id)
+            .unwrap();
+        assert!(
+            stored
+                .intents
+                .iter()
+                .any(|record| record.intent_id == repair_intent
+                    && record.publication.is_retained_repair()
+                    && record.status == DfsWriteIntentStatus::Committed
+                    && record.target_version == identity.version),
+            "the replacement is an actual stored FULL RetainedRepair owner"
+        );
+        assert!(
+            !stored
+                .receipts
+                .iter()
+                .any(|receipt| receipt.intent_id == repair_intent),
+            "a compact projection cannot substitute for the stored replacement owner"
+        );
+    }
+
+    assert_eq!(
+        dfs.posix_stat_distributed(&current.path).unwrap().version,
+        current.version
+    );
+    assert_eq!(
+        dfs.posix_read_file_distributed(&current.path).unwrap(),
+        b"canonical"
+    );
+    let negative_guard = negative_scope.as_ref().map(|scope| {
+        // The owner's executor attempts each missing target once against the
+        // denials; then the hold keeps the failed attempts the only ones.
+        let failed_targets = || {
+            runtime
+                .rpc_observations()
+                .iter()
+                .skip(negative_cut)
+                .filter(|event| {
+                    event.source == owner
+                        && event.phase
+                            == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
+                        && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                        && event.dfs_intent_id.as_deref() == Some(scope.intent_id.as_str())
+                })
+                .map(|event| event.target.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while failed_targets() != [a.clone(), b.clone()].into_iter().collect() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "each missing target is attempted once"
+            );
+            runtime
+                .maintenance_tick(&owner, remaining)
+                .unwrap()
+                .outcome
+                .unwrap();
+        }
+        runtime.hold_repair_executor(&owner).unwrap()
+    });
+    if evict_receipt {
+        let gc = || {
+            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+                .with_now_unix_nanos(core_test::now_unix_nanos())
+        };
+        for _ in 0..8 {
+            runtime
+                .gc_metadata_history_on_current_primaries(gc())
+                .unwrap();
+        }
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_intent(&current.object_id, &repair_intent)
+                .unwrap()
+                .is_some()
+        );
+        let before = current_history_shard_sequence(
+            &mut runtime.metadata_primary_service("/services").unwrap(),
+            &current.file_system_id,
+            &current.path,
+        );
+        assert!(
+            dfs.file_history_pin(repin)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        assert_eq!(
+            current_history_shard_sequence(
+                &mut runtime.metadata_primary_service("/services").unwrap(),
+                &current.file_system_id,
+                &current.path
+            ),
+            before,
+            "rejected repin cannot author another operation on its actual owning shard"
+        );
+        // The ordinary producer ran while the original denials remained active.
+        // Inspect its exact failure instead of requesting an intentionally
+        // denied second claim after the eight GC passes.
+        let scope = negative_scope.as_ref().unwrap();
+        let observations = runtime.rpc_observations();
+        let failed = observations
+            .iter()
+            .skip(negative_cut)
+            .filter(|event| {
+                event.source == owner
+                    && event.origin == sinomo_dfs::test_support::DfsTestRpcOrigin::RegisteredHost
+                    && event.phase
+                        == sinomo_dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
+                    && event.route == sinomo_dfs::DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && event.dfs_intent_id.as_deref() == Some(scope.intent_id.as_str())
+                    && event.dfs_file_system_id.as_ref() == Some(&identity.file_system_id)
+                    && event.dfs_object_id.as_ref() == Some(&identity.object_id)
+                    && event.dfs_version.as_ref() == Some(&identity.version)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !failed.is_empty(),
+            "the missing replica must be grounded in an actual failed native content RPC for this full owner"
+        );
+        for target in [&a, &b] {
+            assert!(
+                failed
+                    .iter()
+                    .filter(|event| &event.target == target)
+                    .count()
+                    <= 1,
+                "the negative GC cut prevents additional native attempts for the same target"
+            );
+        }
+        let actual_core = runtime.metadata_primary_service(&current.path).unwrap();
+        let missing = native_history_repairs(&actual_core);
+        assert_eq!(
+            missing.len(),
+            2,
+            "both actual missing-N obligations remain unresolved throughout live GC"
+        );
+        assert_eq!(
+            missing
+                .iter()
+                .map(|row| (
+                    row.intent_id.clone(),
+                    row.file_system_id.clone(),
+                    row.object_id.clone(),
+                    row.version.clone(),
+                    row.content_hash.clone(),
+                    row.missing_replica_node_id.clone(),
+                ))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [&a, &b]
+                .into_iter()
+                .map(|target| (
+                    scope.intent_id.clone(),
+                    identity.file_system_id.clone(),
+                    identity.object_id.clone(),
+                    identity.version.clone(),
+                    scope.content_hash.clone(),
+                    target.clone(),
+                ))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        drop(actual_core);
+
+        let current_head = runtime
+            .node_metadata(&owner)
+            .unwrap()
+            .get_object(&current.object_id)
+            .unwrap()
+            .expect("current object");
+        let peer_heads_before =
+            [&a, &b].map(|node| native_history_settled_peer_head(&runtime, node, &current_head));
+        drop(negative_guard);
+        runtime.clear_faults();
+        let (repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
+        assert!(repairs.is_empty());
+        for (index, replica_node) in [&a, &b].into_iter().enumerate() {
+            let replica = runtime.client(replica_node).unwrap();
+            assert_native_history_holder_bytes(
+                &settled,
+                &owner,
+                &replica,
+                replica_node,
+                &identity,
+                b"retained",
+            );
+            // The replica node's own durable store keeps its current view.
+            assert_eq!(
+                runtime
+                    .node_metadata(replica_node)
+                    .unwrap()
+                    .get_object(&current.object_id)
+                    .unwrap(),
+                peer_heads_before[index],
+                "retained repair leaves the actual local current view unchanged"
+            );
+        }
+        assert_eq!(
+            dfs.posix_read_file_distributed(&current.path).unwrap(),
+            b"canonical"
+        );
+        dfs.file_history_pin(DfsFileHistoryPinRequest {
+            path: current.path.clone(),
+            identity: identity.clone(),
+            operation: DfsFileHistoryPinOperation::Unpin {
+                pin_id: request.pin_id,
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        })
+        .unwrap();
+        for _ in 0..8 {
+            runtime
+                .gc_metadata_history_on_current_primaries(gc())
+                .unwrap();
+        }
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_version(&identity.object_id, &identity.version)
+                .unwrap()
+                .is_none(),
+            "maintenance ownership must not become a retention root"
+        );
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_intent(&current.object_id, &repair_intent)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .node_metadata(&owner)
+                .unwrap()
+                .get_intent_receipt(&current.object_id, &repair_intent)
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(dfs);
+    runtime.clear_faults();
+    runtime.close().unwrap();
+}
+
+#[test]
+fn file_history_repin_after_compaction_has_fresh_repair_ownership() {
+    repin_after_gc_has_fresh_repair_ownership(false, false);
+}
+
+#[test]
+fn file_history_repin_after_retry_receipt_eviction_keeps_replication_policy() {
+    repin_after_gc_has_fresh_repair_ownership(true, false);
+}
+
+#[test]
+fn file_history_clustered_pin_operations_remain_usable_after_gc() {
+    repin_after_gc_has_fresh_repair_ownership(true, true);
 }

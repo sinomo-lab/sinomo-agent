@@ -6,13 +6,11 @@
 //! terminal recovery receipts.
 
 use crate::{
-    DfsError, DfsMessageCommittedWork, DfsPendingMaintenanceWork, DfsRepairAttemptRecord,
-    LocalDfsRepairQueueStore, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS,
-    MountedSifsMutationCapturedWork, MountedSifsMutationCorruptRecoveryClaim,
-    MountedSifsMutationOutboxPhase, MountedSifsMutationOutboxStore,
-    MountedSifsMutationRecoveryClaim, MountedSifsMutationRecoveryKind,
-    MountedSifsMutationRecoveryReceipt, default_dfs_repair_attempt_snapshot_path,
-    dfs_now_unix_nanos,
+    DfsError, DfsMessageCommittedWork, DfsPendingMaintenanceWork,
+    MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS, MountedSifsMutationCapturedWork,
+    MountedSifsMutationCorruptRecoveryClaim, MountedSifsMutationOutboxPhase,
+    MountedSifsMutationOutboxStore, MountedSifsMutationRecoveryClaim,
+    MountedSifsMutationRecoveryKind, MountedSifsMutationRecoveryReceipt, dfs_now_unix_nanos,
 };
 
 pub const DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE: &str = "/daemon/dfs/mounted-mutation/handoff-v1";
@@ -62,9 +60,8 @@ impl MountedSifsMutationHandoffRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Probe | Self::Arm { .. } | Self::AbortUnstarted { .. } => Ok(()),
-            Self::CommitApplied { captured_work, .. } => validate_captured_work(captured_work),
+            Self::CommitApplied { .. } => Ok(()),
             Self::CommitUnknown { observation, .. } => {
-                validate_captured_work(&observation.captured_work)?;
                 validate_label("error_code", &observation.error_code)
             }
             Self::ProveNoWrite { proof_code, .. } => validate_label("proof_code", proof_code),
@@ -106,19 +103,11 @@ pub struct MountedSifsMutationHandoffResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arm_request_id: Option<crate::MountedSifsMutationArmRequestId>,
     pub phase: MountedSifsMutationHandoffPhase,
-    #[serde(default)]
-    pub appended_repair_record_count: usize,
 }
 
 /// Host effects that cross from the DFS handoff protocol into the embedding
 /// daemon's retained schedulers.
 pub trait MountedSifsMutationHandoffHost {
-    fn repair_queue_persisted(&self, appended_record_count: usize);
-
-    fn after_repair_queue_persisted(&self) -> Result<(), DfsError> {
-        Ok(())
-    }
-
     fn committed_work(&self, committed_work: DfsMessageCommittedWork);
 
     fn maintenance_needed(&self);
@@ -166,7 +155,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 marker_id: None,
                 arm_request_id: None,
                 phase: MountedSifsMutationHandoffPhase::Ready,
-                appended_repair_record_count: 0,
             }
         }
         MountedSifsMutationHandoffRequest::Arm {
@@ -179,7 +167,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 marker_id: Some(marker_id),
                 arm_request_id: Some(arm_request_id),
                 phase: MountedSifsMutationHandoffPhase::Armed,
-                appended_repair_record_count: 0,
             }
         }
         MountedSifsMutationHandoffRequest::CommitApplied {
@@ -196,12 +183,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 &captured_work,
                 None,
             )?;
-            let appended_repair_record_count = persist_default_dfs_repair_queue_records(
-                data_dir,
-                captured_work.committed_repair_records.clone(),
-            )?;
-            host.repair_queue_persisted(appended_repair_record_count);
-            host.after_repair_queue_persisted()?;
             store.accept_captured_live(
                 &marker_id,
                 &marker_nonce,
@@ -214,7 +195,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 marker_id: Some(marker_id),
                 arm_request_id: Some(arm_request_id),
                 phase: MountedSifsMutationHandoffPhase::DaemonAccepted,
-                appended_repair_record_count,
             }
         }
         MountedSifsMutationHandoffRequest::CommitUnknown {
@@ -231,12 +211,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 &observation.captured_work,
                 Some(&observation),
             )?;
-            let appended_repair_record_count = persist_default_dfs_repair_queue_records(
-                data_dir,
-                observation.captured_work.committed_repair_records.clone(),
-            )?;
-            host.repair_queue_persisted(appended_repair_record_count);
-            host.after_repair_queue_persisted()?;
             store.accept_unknown_live(&marker_id, &marker_nonce, &arm_request_id, &observation)?;
             host.committed_work(observation.captured_work.committed_work);
             host.maintenance_needed();
@@ -244,7 +218,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 marker_id: Some(marker_id),
                 arm_request_id: Some(arm_request_id),
                 phase: MountedSifsMutationHandoffPhase::DaemonAccepted,
-                appended_repair_record_count,
             }
         }
         MountedSifsMutationHandoffRequest::ProveNoWrite {
@@ -258,7 +231,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 marker_id: Some(marker_id),
                 arm_request_id: Some(arm_request_id),
                 phase: MountedSifsMutationHandoffPhase::ProvenNoWrite,
-                appended_repair_record_count: 0,
             }
         }
         MountedSifsMutationHandoffRequest::AbortUnstarted {
@@ -270,7 +242,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
                 marker_id: Some(marker_id),
                 arm_request_id: None,
                 phase: MountedSifsMutationHandoffPhase::AbortedUnstarted,
-                appended_repair_record_count: 0,
             }
         }
     };
@@ -282,17 +253,6 @@ pub fn handle_mounted_sifs_mutation_handoff(
         "mounted-mutation owner completed a handoff request"
     );
     Ok(response)
-}
-
-fn validate_captured_work(captured_work: &MountedSifsMutationCapturedWork) -> Result<(), String> {
-    let observed = captured_work.committed_repair_records.len();
-    if observed > crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS {
-        return Err(format!(
-            "mounted-mutation handoff contains {observed} repair records; max is {}",
-            crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
-        ));
-    }
-    Ok(())
 }
 
 fn validate_label(field: &str, value: &str) -> Result<(), String> {
@@ -381,19 +341,6 @@ fn require_captured_marker(
     Ok(())
 }
 
-/// Append exact repair identities without disturbing existing retry state.
-pub fn persist_default_dfs_repair_queue_records(
-    data_dir: &SinomoDataDir,
-    committed_records: impl IntoIterator<Item = DfsRepairAttemptRecord>,
-) -> Result<usize, DfsError> {
-    let committed_records = committed_records.into_iter().collect::<Vec<_>>();
-    if committed_records.is_empty() {
-        return Ok(0);
-    }
-    LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(data_dir))
-        .append_enqueues(committed_records)
-}
-
 /// Every bounded owner that must be conservatively replayed when the exact
 /// post-mutation report is unavailable or corrupt.
 pub fn all_mounted_sifs_mutation_committed_work() -> DfsMessageCommittedWork {
@@ -465,7 +412,6 @@ pub struct MountedSifsMutationRecoveryBatch {
     corrupt_claims: Vec<MountedSifsMutationCorruptRecoveryClaim>,
     requires_full_recovery: bool,
     committed_work: Vec<DfsMessageCommittedWork>,
-    appended_repair_record_count: usize,
 }
 
 impl MountedSifsMutationRecoveryBatch {
@@ -498,12 +444,6 @@ impl MountedSifsMutationRecoveryBatch {
             };
             let recovery_kind = claim.recovery_kind();
             if let Some(captured_work) = captured_work(claim.marker()) {
-                batch.appended_repair_record_count = batch
-                    .appended_repair_record_count
-                    .saturating_add(persist_default_dfs_repair_queue_records(
-                        data_dir,
-                        captured_work.committed_repair_records.clone(),
-                    )?);
                 store.retain_daemon_committed_work(captured_work.committed_work)?;
                 batch.committed_work.push(captured_work.committed_work);
             }
@@ -527,10 +467,6 @@ impl MountedSifsMutationRecoveryBatch {
 
     pub fn committed_work(&self) -> &[DfsMessageCommittedWork] {
         &self.committed_work
-    }
-
-    pub fn appended_repair_record_count(&self) -> usize {
-        self.appended_repair_record_count
     }
 
     pub fn complete(self, completed_without_limit: bool) -> Result<(), DfsError> {
@@ -573,7 +509,6 @@ fn recovery_receipt(
     full_recovery_completed: bool,
 ) -> MountedSifsMutationRecoveryReceipt {
     MountedSifsMutationRecoveryReceipt {
-        repair_queue_durable: true,
         metadata_publish_durably_owned: true,
         maintenance_durably_owned: true,
         metadata_replica_progress_durably_owned: true,

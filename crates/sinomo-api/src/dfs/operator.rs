@@ -89,8 +89,6 @@ pub enum DfsOperatorStatusOmission {
         /// cardinality ambiguous.
         cross_shard_namespace_locks_zero_proven: bool,
     },
-    /// Status deliberately did not replay a cold node-local repair queue.
-    ResidentRepairQueueNotHydrated,
     /// A replica shard which is not authoritative on this node has never been
     /// opened. Bounded status retains its configured topology without opening
     /// it merely to recover replica-local counters and replay cursors.
@@ -117,10 +115,6 @@ impl DfsOperatorStatusOmission {
         }
     }
 
-    pub fn resident_repair_queue_not_hydrated() -> Self {
-        Self::ResidentRepairQueueNotHydrated
-    }
-
     pub fn non_primary_resident_metadata_not_hydrated(
         file_system_id: DfsFileSystemId,
         shard_id: crate::dfs::DfsMetadataShardId,
@@ -138,9 +132,6 @@ impl DfsOperatorStatusOmission {
             } => format!(
                 "{generation_count} historical routing topology generation(s) remain active; metadata counters requiring authoritative visibility were omitted"
             ),
-            Self::ResidentRepairQueueNotHydrated =>
-                "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated"
-                    .to_string(),
             Self::NonPrimaryResidentMetadataNotHydrated {
                 file_system_id,
                 shard_id,
@@ -179,7 +170,6 @@ impl DfsOperatorStatusOmission {
                 FailedNamespaceJobCount,
                 CrossShardNamespaceLockCount,
             ],
-            Self::ResidentRepairQueueNotHydrated => &[RepairAttemptCount],
             Self::NonPrimaryResidentMetadataNotHydrated { .. } => &[
                 ObjectCount,
                 VersionCount,

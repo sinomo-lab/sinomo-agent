@@ -1319,21 +1319,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?
             }
         };
-        if matches!(
-            reconciliation,
-            DfsStableNamespaceOperationReconciliation::Applied { .. }
-        ) && matches!(
-            &*request.operation,
-            DfsNamespaceOperation::ContentReference { .. }
-        ) {
-            // The exact-outcome query stays read-only. A crash between pin
-            // publication and its queue handoff still needs the owner worker
-            // to reconstruct repair from the currently live roots.
-            self.record_message_committed_work(DfsMessageCommittedWork {
-                repair_maintenance: true,
-                ..Default::default()
-            });
-        }
         self.send_dfs_message_if_routable(
             &source_node_id,
             DfsNetworkMessage::StableNamespaceReconciliationResponse(
@@ -2870,15 +2855,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if durable_replay
             && matches!(result, DfsNamespaceResult::Applied)
             && let DfsNamespaceOperation::ContentReference { request } = &command.operation
-            && self.reconcile_file_history_repair_root(
+        {
+            // A reconciled owner changes the repair index, which wakes the
+            // primary's executor.
+            self.reconcile_file_history_repair_root(
                 &request.identity.object_id,
                 &request.identity.version,
-            )?
-        {
-            self.record_message_committed_work(DfsMessageCommittedWork {
-                repair_maintenance: true,
-                ..Default::default()
-            });
+            )?;
         }
         let mutates_metadata = !durable_replay
             && !matches!(

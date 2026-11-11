@@ -635,3 +635,50 @@ fn expected_hash_large_files_and_public_quarantine_keep_file_ingest() {
     ));
     drop(quarantine);
 }
+
+#[test]
+fn a_retained_repair_payload_record_retains_nothing_and_its_content_is_reclaimable() {
+    let (_root, _owner, store) = active_store("dfs-inline-legacy-repair-payload");
+    let pinned_hash = crate::content_hash(b"bytes only a removed repair custody pinned");
+    let incarnation = {
+        let reservation = store.lock_content_reservations_for_write().unwrap();
+        reservation.sentinel.store_incarnation.clone()
+    };
+    let root = RepairPayloadRoot {
+        subject: RepairPayloadSubject {
+            queue_incarnation: "queue".into(),
+            producer: "producer".into(),
+            target: "target".into(),
+            intent_id: "intent".into(),
+            request_id: "request".into(),
+        },
+        original_command_digest: "0".repeat(64),
+        store_incarnation: incarnation,
+        source: RepairPayloadSource::Blob {
+            content_hash: pinned_hash.clone(),
+            size_bytes: 42,
+        },
+    };
+    {
+        let _owner = store.content_mutation_guard().unwrap();
+        let reservation = store.lock_content_reservations_for_write().unwrap();
+        let mut state = store.inline_store.owner.state.lock().unwrap();
+        append_operation(
+            &store.inline_store.owner.root,
+            &reservation.sentinel,
+            &mut state,
+            InlineOperation::RetainRepairPayload(root),
+            &[],
+        )
+        .unwrap();
+    }
+    let content_root = store.root.clone();
+    drop(store);
+    let reopened = LocalContentStore::new(content_root).unwrap();
+    let roots = reopened.content_reservation_roots().unwrap();
+    assert!(
+        !roots.content_hashes.contains(&pinned_hash),
+        "a retained repair payload root of the removed custody protects nothing"
+    );
+    assert!(reopened.scrub().unwrap().is_healthy());
+}

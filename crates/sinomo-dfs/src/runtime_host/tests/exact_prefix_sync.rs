@@ -186,7 +186,7 @@ fn fresh_proofs(
                 .barrier_id
                 .starts_with(&format!("{}-", target.barrier_id))
         );
-        assert!(prefix.primary_handoff_id.is_none() && prefix.repair_custody.is_none());
+        assert!(prefix.primary_handoff_id.is_none());
         let returned = source_facts
             .iter()
             .copied()

@@ -1682,6 +1682,17 @@ pub(crate) enum RemoteNamespacePhase {
         deadline: std::time::Instant,
     },
     PublishTarget(RemoteTargetNamespacePhase),
+    /// A file sync waits for repair progress on its object's primary with
+    /// the lane and admission released, so the executor and its replies run.
+    AwaitRepairProgress(AwaitRepairProgressPhase),
+}
+#[derive(Debug)]
+pub(crate) struct AwaitRepairProgressPhase {
+    pub(crate) node_id: sinomo_core::node::NodeId,
+    pub(crate) object_id: crate::DfsObjectId,
+    pub(crate) version: crate::DfsVersion,
+    pub(crate) seen: u64,
+    pub(crate) deadline: std::time::Instant,
 }
 #[derive(Debug)]
 pub(crate) struct RemoteTargetNamespacePhase {
@@ -1697,6 +1708,12 @@ pub(crate) enum CompletedRemoteNamespacePhase {
         prepared: PreparedSourceAdoption,
     },
     TargetPublished(CompletedRemoteTargetNamespacePhase),
+    /// A file sync's repair wait ended: progress advanced or the deadline came.
+    RepairProgress {
+        object_id: crate::DfsObjectId,
+        version: crate::DfsVersion,
+        deadline: std::time::Instant,
+    },
 }
 #[derive(Debug)]
 pub(crate) struct CompletedRemoteTargetNamespacePhase {
@@ -1708,7 +1725,7 @@ pub(crate) struct CompletedRemoteTargetNamespacePhase {
 impl RemoteNamespacePhase {
     pub(crate) fn cancel_before_dispatch(&self) -> Result<()> {
         match self {
-            Self::PrepareSource { .. } => Ok(()),
+            Self::PrepareSource { .. } | Self::AwaitRepairProgress(_) => Ok(()),
             Self::PublishTarget(phase) => match phase.source_offer()? {
                 Some(offer) => phase.actor.cancel_unclaimed(offer),
                 None => Ok(()),
@@ -1743,6 +1760,18 @@ impl RemoteNamespacePhase {
             Self::PublishTarget(phase) => phase
                 .dispatch()
                 .map(CompletedRemoteNamespacePhase::TargetPublished),
+            Self::AwaitRepairProgress(phase) => {
+                crate::repair_executor::repair_executor_wait_for_progress(
+                    &phase.node_id,
+                    phase.seen,
+                    phase.deadline,
+                );
+                Ok(CompletedRemoteNamespacePhase::RepairProgress {
+                    object_id: phase.object_id,
+                    version: phase.version,
+                    deadline: phase.deadline,
+                })
+            }
         }
     }
 }
@@ -1802,7 +1831,6 @@ impl RemoteTargetNamespacePhase {
         let (envelope, call) = crate::dfs_routed_call_rpc_call(crate::DfsRoutedCall {
             message,
             attachment: None,
-            original_repair: None,
         })
         .map_err(crate::DfsError::from_network)?;
         #[cfg(any(test, feature = "test-support"))]
@@ -1924,6 +1952,15 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 return Ok(());
             }
             CompletedRemoteNamespacePhase::TargetPublished(completed) => completed,
+            CompletedRemoteNamespacePhase::RepairProgress {
+                object_id,
+                version,
+                deadline,
+            } => {
+                // The re-run file sync keeps the original wait's deadline.
+                self.file_sync_wait_deadline = Some((object_id, version, deadline));
+                return Ok(());
+            }
         };
         let request = completed.command.request_id.clone();
         self.pending_routed_namespace_ops

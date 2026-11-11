@@ -175,8 +175,6 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationRequest(_) => DFS_DATA_READ_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
-        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => DFS_DATA_READ_ROUTE,
-        DfsNetworkMessage::OriginalRepairHistoryResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
         #[cfg(test)]
         DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
         #[cfg(test)]
@@ -194,7 +192,7 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
         DfsNetworkMessage::CommitVersion(_) => DFS_DATA_COMMIT_VERSION_ROUTE,
         DfsNetworkMessage::CommitVersionResponse(_) => DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-        DfsNetworkMessage::RepairReplica(_) | DfsNetworkMessage::SelectedOriginalRepair(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
+        DfsNetworkMessage::RepairReplica(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
         DfsNetworkMessage::RepairRetainedBlob(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
         DfsNetworkMessage::RepairReplicaResponse(_) => DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
         DfsNetworkMessage::FetchBlob(_) => DFS_DATA_FETCH_BLOB_ROUTE,
@@ -320,7 +318,6 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         DfsNetworkMessage::ReadRequest(_)
         | DfsNetworkMessage::BulkReadRequest(_)
         | DfsNetworkMessage::StableWriteReconciliationRequest(_)
-        | DfsNetworkMessage::OriginalRepairHistoryRequest(_)
         | DfsNetworkMessage::ContentRootCatalogPageRequest(_) => DfsMessageExecutionScope::ReadOnly,
         DfsNetworkMessage::StableNamespaceReconciliationRequest(request) => {
             authority_shard_execution_scope(
@@ -404,7 +401,6 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         | DfsNetworkMessage::StagePatch(_)
         | DfsNetworkMessage::CommitVersion(_)
         | DfsNetworkMessage::RepairReplica(_)
-        | DfsNetworkMessage::SelectedOriginalRepair(_)
         | DfsNetworkMessage::FetchBlob(_) => DfsMessageExecutionScope::GlobalExclusive,
         DfsNetworkMessage::MetadataJournalBatch(command) => {
             dfs_metadata_journal_batch_execution_scope(command)
@@ -418,7 +414,6 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         | DfsNetworkMessage::WriteResponse(_)
         | DfsNetworkMessage::DistributedWriteResponse(_)
         | DfsNetworkMessage::StableWriteReconciliationResponse(_)
-        | DfsNetworkMessage::OriginalRepairHistoryResponse(_)
         | DfsNetworkMessage::NamespaceResponse(_)
         | DfsNetworkMessage::StableNamespaceReconciliationResponse(_)
         | DfsNetworkMessage::StageBlobResponse(_)
@@ -446,7 +441,6 @@ fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool
             | DfsNetworkMessage::BulkReadRequest(_)
             | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
             | DfsNetworkMessage::StableWriteReconciliationRequest(_)
-            | DfsNetworkMessage::OriginalRepairHistoryRequest(_)
             | DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
             | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 operation: DfsNamespaceOperation::LookupPath { .. }
@@ -478,25 +472,6 @@ pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessag
                 &command.operation
             )
     )
-}
-
-/// Backward-compatible name for callers that classify daemon message commands.
-/// Distributed operations perform targeted metadata validation in their own
-/// paths, so this compatibility classifier is always false.
-
-pub(crate) fn dfs_network_message_allows_write_repair_progress(
-    message: &DfsNetworkMessage,
-) -> bool {
-    match message {
-        DfsNetworkMessage::DistributedWriteRequest(command)
-        | DfsNetworkMessage::ExclusiveCreateRequest(command)
-        | DfsNetworkMessage::RetainedWriteRequest(command) => command.foreground_replica_repair,
-        _ => false,
-    }
-}
-
-pub fn dfs_message_allows_write_repair_progress(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_allows_write_repair_progress(&command.routed_message.message)
 }
 
 pub fn dfs_status_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {

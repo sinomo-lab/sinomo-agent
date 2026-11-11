@@ -9,19 +9,9 @@ mod blob_stage;
 mod compaction;
 mod completion;
 mod operations;
-mod received_repair;
-mod original_repair;
-pub(crate) use original_repair::BoundOriginalRepairContent;
-pub(crate) use received_repair::ReceivedRepairFixtureIdentity;
 pub(super) use operations::open_verified_inline_payload;
 #[cfg(feature = "storage-conversion")]
 pub use operations::{ContentStoreStagingRow, ContentStoreStagingWriter};
-pub(crate) use received_repair::PreparedReceivedRepairRef;
-#[derive(Clone, Copy)]
-pub(super) enum RepairBindingPrepared<'a> {
-    Decoded(&'a PreparedReceivedRepairRef),
-    Original(&'a original_repair::PreparedOriginalRepairRef),
-}
 mod read_snapshot;
 mod root_identity;
 #[cfg(test)]
@@ -39,10 +29,6 @@ use std::sync::Weak;
 pub(super) const INLINE_BINDING_LAYOUT: &str = "inline-bindings-v2";
 pub(super) const INLINE_BINDING_DIR: &str = "inline-bindings";
 const INLINE_FORMAT_VERSION: u32 = 2;
-const RECEIVED_REPAIR_FIXTURE_VERSION: u32 = 3;
-const RECEIVED_REPAIR_FIXTURE_LAYOUT: &str = "inline-bindings-received-repair-fixture-v3";
-const ORIGINAL_REPAIR_FIXTURE_VERSION: u32 = 4;
-const ORIGINAL_REPAIR_FIXTURE_LAYOUT: &str = "inline-bindings-original-repair-fixture-v4";
 const INLINE_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const INLINE_FRAME_HEADER_LIMIT: u32 = 64 * 1024;
 const INLINE_OWNER_LOCK: &str = "content-owner.lock";
@@ -116,9 +102,12 @@ enum InlineOperation {
     },
     Reserve(ContentStoreReservationRecord),
     Release(ContentStoreReservationIdentity),
+    /// A retained repair payload root of the removed original-repair
+    /// custody. Records written before its removal still decode; they retain
+    /// nothing, so content GC reclaims what no other root holds, and
+    /// compaction drops them.
     RetainRepairPayload(RepairPayloadRoot),
     ReleaseRepairPayload(RepairPayloadRoot),
-    /// Compaction preserves both live roots and irreversible release witnesses.
     RestoreRepairPayload {
         root: RepairPayloadRoot,
         released: bool,
@@ -136,24 +125,6 @@ enum InlineOperation {
     RemoveBlob {
         content_hash: String,
     },
-    ReceivedRepairPrepared(received_repair::ReceivedRepairPrepared),
-    RestoreReceivedRepairPrepared(received_repair::ReceivedRepairPrepared),
-    ReceivedRepairBound {
-        binding: received_repair::ReceivedRepairBinding,
-        published_at_unix_nanos: u64,
-        reservation: Option<ContentStoreReservationRecord>,
-    },
-    RestoreReceivedRepairBound(received_repair::ReceivedRepairBinding),
-    OriginalRepairPrepared(original_repair::OriginalRepairPrepared),
-    RestoreOriginalRepairPrepared(original_repair::OriginalRepairPrepared),
-    OriginalRepairBound {
-        binding: original_repair::OriginalRepairBinding,
-        published_at_unix_nanos: u64,
-        reservation: Option<ContentStoreReservationRecord>,
-    },
-    RestoreOriginalRepairBound(original_repair::OriginalRepairBinding),
-    OriginalRepairTerminal(original_repair::OriginalRepairTerminal),
-    RestoreOriginalRepairTerminal(original_repair::OriginalRepairTerminal),
 }
 
 #[derive(Clone, Debug)]
@@ -172,12 +143,6 @@ pub(super) enum InlineVersionState {
 pub(super) enum InlineReservationState {
     Live(ContentStoreReservationRecord),
     Released,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct InlineRepairPayloadState {
-    pub(super) root: RepairPayloadRoot,
-    pub(super) released: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -216,21 +181,9 @@ impl InlineBlobEntry {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct InlineBindingView {
-    original_repairs: BTreeMap<original_repair::OriginalRepairKey, original_repair::OriginalRepairPrepared>,
-    original_bindings: BTreeMap<original_repair::OriginalRepairKey, original_repair::OriginalRepairBinding>,
-    original_terminals: BTreeMap<original_repair::OriginalRepairKey, original_repair::OriginalRepairTerminal>,
-    received_repairs:
-        BTreeMap<received_repair::ReceivedRepairKey, received_repair::ReceivedRepairPrepared>,
-    received_bindings:
-        BTreeMap<received_repair::ReceivedRepairKey, received_repair::ReceivedRepairBinding>,
     pub(super) versions: BTreeMap<VersionKey, InlineVersionState>,
     content_versions: BTreeMap<(String, String, u64), BTreeSet<String>>,
     pub(super) reservations: BTreeMap<ContentStoreReservationIdentity, InlineReservationState>,
-    pub(super) repair_payloads: BTreeMap<RepairPayloadSubject, InlineRepairPayloadState>,
-    pub(super) repair_slots: BTreeMap<(String, String, String), RepairPayloadSubject>,
-    repair_requests: BTreeMap<(String, String, String, String), RepairPayloadSubject>,
-    pub(super) repair_hashes: BTreeMap<String, u64>,
-    pub(super) repair_versions: BTreeMap<VersionKey, u64>,
     pub(super) blobs: BTreeMap<String, InlineBlobEntry>,
     pub(super) deleted_blobs: BTreeSet<String>,
     sequence: u64,
@@ -317,8 +270,6 @@ impl InlineFileIdentity {
 struct InlineStoreOwner {
     root: PathBuf,
     expected_format: u32,
-    received_repair_identity: Mutex<Option<received_repair::ReceivedRepairFixtureIdentity>>,
-    handles: Mutex<Weak<()>>,
     state: Mutex<InlineResidentState>,
 }
 
@@ -329,19 +280,12 @@ static INLINE_STORES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<InlineStoreOwner>>>>
 #[derive(Clone, Debug)]
 pub(super) struct InlineStoreLease {
     owner: Arc<InlineStoreOwner>,
-    handle: Arc<()>,
     identity_error: Option<Arc<str>>,
 }
 
 impl InlineStoreLease {
     pub(super) fn expected_layout(&self) -> &'static str {
-        if self.owner.expected_format == ORIGINAL_REPAIR_FIXTURE_VERSION {
-            ORIGINAL_REPAIR_FIXTURE_LAYOUT
-        } else if self.owner.expected_format == RECEIVED_REPAIR_FIXTURE_VERSION {
-            RECEIVED_REPAIR_FIXTURE_LAYOUT
-        } else {
-            INLINE_BINDING_LAYOUT
-        }
+        INLINE_BINDING_LAYOUT
     }
     pub(super) fn root(&self) -> &Path {
         &self.owner.root
@@ -371,8 +315,6 @@ impl InlineStoreLease {
             let owner = Arc::new(InlineStoreOwner {
                 root: key.clone(),
                 expected_format,
-                received_repair_identity: Mutex::new(None),
-                handles: Mutex::new(Weak::new()),
                 state: Mutex::new(InlineResidentState {
                     expected_format: Some(expected_format),
                     ..InlineResidentState::default()
@@ -387,19 +329,8 @@ impl InlineStoreLease {
             ));
         }
         drop(stores);
-        let mut handle_slot = owner
-            .handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let handle = handle_slot.upgrade().unwrap_or_else(|| {
-            let handle = Arc::new(());
-            *handle_slot = Arc::downgrade(&handle);
-            handle
-        });
-        drop(handle_slot);
         Self {
             owner,
-            handle,
             identity_error,
         }
     }
@@ -597,61 +528,9 @@ enum InlineFault {
     CatalogParentSync,
     CatalogCertification,
     LostAppendCompletion,
-    ReceiverAfterPrepared,
 }
 #[cfg(test)]
 thread_local! { static INLINE_FAULT: RefCell<Option<(PathBuf, InlineFault)>> = const { RefCell::new(None) }; }
-#[cfg(test)]
-thread_local! {
-    // Lifetime provenance only, not another injection point. Ordinary users
-    // of INLINE_FAULT are not owned or cleared by this native fixture guard.
-    static ORIGINAL_REPAIR_TEST_FAULT: RefCell<Option<(PathBuf, InlineFault)>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct OriginalRepairTestFaultCleanup {
-    root: PathBuf,
-    _same_worker: std::marker::PhantomData<Rc<()>>,
-}
-#[cfg(test)]
-impl OriginalRepairTestFaultCleanup {
-    fn new(root: PathBuf) -> Self {
-        Self { root, _same_worker: std::marker::PhantomData }
-    }
-}
-#[cfg(test)]
-impl Drop for OriginalRepairTestFaultCleanup {
-    fn drop(&mut self) {
-        let owned = ORIGINAL_REPAIR_TEST_FAULT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|(root, _)| root == &self.root) { slot.take() } else { None }
-        });
-        if let Some(owned) = owned {
-            INLINE_FAULT.with(|slot| {
-                let mut slot = slot.borrow_mut();
-                if slot.as_ref() == Some(&owned) { slot.take(); }
-            });
-        }
-    }
-}
-#[cfg(test)]
-fn arm_original_repair_test_fault(root: &Path, point: InlineFault) -> Result<()> {
-    if !matches!(point, InlineFault::ReceiverAfterPrepared | InlineFault::CatalogCertification) {
-        return Err(inline_error("unsupported original Repair fixture fault"));
-    }
-    INLINE_FAULT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_some() { return Err(inline_error("original Repair test fault cannot replace an existing fault")); }
-        ORIGINAL_REPAIR_TEST_FAULT.with(|owned| {
-            let mut owned = owned.borrow_mut();
-            if owned.is_some() { return Err(inline_error("original Repair test fault still has a lifetime owner")); }
-            let fault = (root.to_owned(), point);
-            *owned = Some(fault.clone());
-            *slot = Some(fault);
-            Ok(())
-        })
-    })
-}
 #[cfg(test)]
 fn take_inline_fault(root: &Path, point: InlineFault) -> bool {
     let taken = INLINE_FAULT.with(|fault| {
@@ -666,12 +545,6 @@ fn take_inline_fault(root: &Path, point: InlineFault) -> bool {
             false
         }
     });
-    if taken {
-        ORIGINAL_REPAIR_TEST_FAULT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|(path, armed)| path == root && *armed == point) { slot.take(); }
-        });
-    }
     taken
 }
 fn publish_catalog(root: &Path, catalog: &InlineCatalog) -> Result<()> {
@@ -947,89 +820,11 @@ fn validate_operation(
                 ));
             }
         }
-        InlineOperation::RetainRepairPayload(root)
-        | InlineOperation::ReleaseRepairPayload(root)
-        | InlineOperation::RestoreRepairPayload { root, .. } => {
-            if payload_bytes != 0
-                || root.store_incarnation != incarnation
-                || root.subject.queue_incarnation.is_empty()
-                || root.subject.producer.is_empty()
-                || root.subject.target.is_empty()
-                || root.subject.intent_id.is_empty()
-                || root.subject.request_id.is_empty()
-            {
-                return Err(inline_error(
-                    "repair payload root has no exact native owner/identity",
-                ));
-            }
-            if root.original_command_digest.len() != 64
-                || !root
-                    .original_command_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(inline_error(
-                    "Repair original head digest is not canonical BLAKE3 hex",
-                ));
-            }
-            hash_hex(root.content_hash())?;
-            for hash in root.protected_hashes() {
-                hash_hex(&hash)?;
-            }
-            let request = (
-                root.subject.producer.clone(),
-                root.subject.target.clone(),
-                root.subject.intent_id.clone(),
-                root.subject.request_id.clone(),
-            );
-            if view
-                .repair_requests
-                .get(&request)
-                .is_some_and(|prior| prior != &root.subject)
-            {
-                return Err(inline_error(
-                    "original Repair request cannot change queue incarnation",
-                ));
-            }
-            if let Some(previous) = view.repair_payloads.get(&root.subject) {
-                if previous.root != *root
-                    || (previous.released
-                        && matches!(
-                            operation,
-                            InlineOperation::RetainRepairPayload(_)
-                                | InlineOperation::RestoreRepairPayload {
-                                    released: false,
-                                    ..
-                                }
-                        ))
-                {
-                    return Err(inline_error(
-                        "repair payload root changed or attempted resurrection",
-                    ));
-                }
-            } else if matches!(operation, InlineOperation::ReleaseRepairPayload(_)) {
-                return Err(inline_error(
-                    "repair payload release has no retained original root",
-                ));
-            }
-            if matches!(
-                operation,
-                InlineOperation::RetainRepairPayload(_)
-                    | InlineOperation::RestoreRepairPayload {
-                        released: false,
-                        ..
-                    }
-            ) {
-                let slot = repair_payload_slot(&root.subject);
-                if view
-                    .repair_slots
-                    .get(&slot)
-                    .is_some_and(|prior| prior != &root.subject)
-                {
-                    return Err(inline_error(
-                        "unresolved original repair already owns this payload slot",
-                    ));
-                }
+        InlineOperation::RetainRepairPayload(_)
+        | InlineOperation::ReleaseRepairPayload(_)
+        | InlineOperation::RestoreRepairPayload { .. } => {
+            if payload_bytes != 0 {
+                return Err(inline_error("control frame has payload"));
             }
         }
         InlineOperation::RemoveBlob { content_hash } => {
@@ -1039,90 +834,10 @@ fn validate_operation(
             hash_hex(content_hash)?;
             if view.versions.values().any(|entry| matches!(entry, InlineVersionState::Live(live) if live.manifest.content_hash == *content_hash))
                 || view.reservations.values().any(|entry| matches!(entry, InlineReservationState::Live(live) if live.identity.content_hash == *content_hash))
-                || view.repair_hashes.contains_key(content_hash)
             { return Err(inline_error("attempt to remove an inline payload with live roots")); }
-        }
-        InlineOperation::ReceivedRepairPrepared(_)
-        | InlineOperation::RestoreReceivedRepairPrepared(_)
-        | InlineOperation::ReceivedRepairBound { .. }
-        | InlineOperation::RestoreReceivedRepairBound(_) => {
-            received_repair::validate_operation_data(
-                view,
-                operation,
-                payload_hash,
-                payload_bytes,
-                incarnation,
-            )?;
-        }
-        InlineOperation::OriginalRepairPrepared(_)
-        | InlineOperation::RestoreOriginalRepairPrepared(_)
-        | InlineOperation::OriginalRepairBound { .. }
-        | InlineOperation::RestoreOriginalRepairBound(_)
-        | InlineOperation::OriginalRepairTerminal(_)
-        | InlineOperation::RestoreOriginalRepairTerminal(_) => {
-            original_repair::validate_operation_data(view, operation, payload_hash, payload_bytes, incarnation)?;
         }
     }
     Ok(())
-}
-
-fn repair_payload_slot(subject: &RepairPayloadSubject) -> (String, String, String) {
-    (
-        subject.producer.clone(),
-        subject.target.clone(),
-        subject.intent_id.clone(),
-    )
-}
-
-fn change_root_count<K: Ord>(counts: &mut BTreeMap<K, u64>, key: K, add: bool) {
-    if add {
-        *counts.entry(key).or_default() += 1;
-    } else if let Some(count) = counts.get_mut(&key) {
-        *count -= 1;
-        if *count == 0 {
-            counts.remove(&key);
-        }
-    }
-}
-
-fn apply_repair_payload(view: &mut InlineBindingView, root: RepairPayloadRoot, released: bool) {
-    view.repair_requests.insert(
-        (
-            root.subject.producer.clone(),
-            root.subject.target.clone(),
-            root.subject.intent_id.clone(),
-            root.subject.request_id.clone(),
-        ),
-        root.subject.clone(),
-    );
-    let was_live = view
-        .repair_payloads
-        .get(&root.subject)
-        .is_some_and(|prior| !prior.released);
-    if was_live != !released {
-        for hash in root.protected_hashes() {
-            change_root_count(&mut view.repair_hashes, hash, !released);
-        }
-        if let RepairPayloadSource::Manifest(manifest) = &root.source {
-            change_root_count(
-                &mut view.repair_versions,
-                (manifest.object_id.clone(), manifest.version.clone()),
-                !released,
-            );
-        }
-    }
-    let slot = repair_payload_slot(&root.subject);
-    if released {
-        if view.repair_slots.get(&slot) == Some(&root.subject) {
-            view.repair_slots.remove(&slot);
-        }
-    } else {
-        view.repair_slots.insert(slot, root.subject.clone());
-    }
-    view.repair_payloads.insert(
-        root.subject.clone(),
-        InlineRepairPayloadState { root, released },
-    );
 }
 
 fn apply_operation(
@@ -1243,49 +958,11 @@ fn apply_operation(
             view.reservations
                 .insert(identity, InlineReservationState::Released);
         }
-        InlineOperation::RetainRepairPayload(root) => apply_repair_payload(view, root, false),
-        InlineOperation::ReleaseRepairPayload(root) => apply_repair_payload(view, root, true),
-        InlineOperation::RestoreRepairPayload { root, released } => {
-            apply_repair_payload(view, root, released)
-        }
-        InlineOperation::ReceivedRepairPrepared(prepared) => {
-            received_repair::apply_prepared(view, prepared, Some(location));
-        }
-        InlineOperation::RestoreReceivedRepairPrepared(prepared) => {
-            received_repair::apply_prepared(view, prepared, None);
-        }
-        InlineOperation::ReceivedRepairBound {
-            binding,
-            published_at_unix_nanos,
-            reservation,
-        } => {
-            // The single physical frame owns BOTH the binding and its exact
-            // Prepared association. Reuse ordinary binding projection rules.
-            apply_operation(
-                view,
-                InlineOperation::Link {
-                    manifest: binding.manifest.clone(),
-                    published_at_unix_nanos,
-                    reservation,
-                },
-                location,
-                sequence,
-            );
-            received_repair::apply_binding(view, binding);
-        }
-        InlineOperation::RestoreReceivedRepairBound(binding) => {
-            received_repair::apply_binding(view, binding);
-        }
-        InlineOperation::OriginalRepairPrepared(prepared) => original_repair::apply_prepared(view, prepared, Some(location)),
-        InlineOperation::RestoreOriginalRepairPrepared(prepared) => original_repair::apply_prepared(view, prepared, None),
-        InlineOperation::OriginalRepairBound { binding, published_at_unix_nanos, reservation } => {
-            apply_operation(view, InlineOperation::Link { manifest: binding.manifest.clone(), published_at_unix_nanos, reservation }, location, sequence);
-            original_repair::apply_binding(view, binding);
-        }
-        InlineOperation::RestoreOriginalRepairBound(binding) => original_repair::apply_binding(view, binding),
-        InlineOperation::OriginalRepairTerminal(terminal) | InlineOperation::RestoreOriginalRepairTerminal(terminal) => {
-            view.original_terminals.insert(terminal.key.clone(), terminal);
-        }
+        // A retained repair payload root of the removed custody retains
+        // nothing.
+        InlineOperation::RetainRepairPayload(_)
+        | InlineOperation::ReleaseRepairPayload(_)
+        | InlineOperation::RestoreRepairPayload { .. } => {}
         InlineOperation::DeleteVersion {
             object_id,
             version,
@@ -1347,18 +1024,6 @@ fn replay_catalog(root: &Path, catalog: &InlineCatalog) -> Result<(InlineBinding
                     {
                         return Err(inline_error("record generation/sequence mismatch"));
                     }
-                    if received_repair::fixture_operation(&record.operation)
-                        && catalog.format_version != RECEIVED_REPAIR_FIXTURE_VERSION
-                    {
-                        return Err(inline_error(
-                            "received Repair record lacks explicit fixture admission",
-                        ));
-                    }
-                    received_repair::validate_phase_sequence(&record.operation, record.sequence)?;
-                    if original_repair::fixture_operation(&record.operation) && catalog.format_version != ORIGINAL_REPAIR_FIXTURE_VERSION {
-                        return Err(inline_error("original Repair record lacks explicit fixture admission"));
-                    }
-                    original_repair::validate_phase_sequence(&record.operation, record.sequence)?;
                     let payload_hash = format!(
                         "{HASH_PREFIX}{}",
                         blake3::Hash::from_bytes(*frame.payload_checksum()).to_hex()
@@ -1549,16 +1214,6 @@ fn append_operation(
     payload: &[u8],
 ) -> Result<()> {
     ensure_writer(root, &sentinel.store_incarnation, state)?;
-    if received_repair::fixture_operation(&operation)
-        && state.expected_format.unwrap_or(INLINE_FORMAT_VERSION) != RECEIVED_REPAIR_FIXTURE_VERSION
-    {
-        return Err(inline_error(
-            "received Repair write lacks explicit fixture owner",
-        ));
-    }
-    if original_repair::fixture_operation(&operation) && state.expected_format != Some(ORIGINAL_REPAIR_FIXTURE_VERSION) {
-        return Err(inline_error("original Repair write lacks explicit fixture owner"));
-    }
     validate_operation(
         &state.view,
         &operation,
@@ -1572,8 +1227,6 @@ fn append_operation(
         .sequence
         .checked_add(1)
         .ok_or_else(|| inline_error("record sequence exhausted"))?;
-    received_repair::validate_phase_sequence(&operation, sequence)?;
-    original_repair::validate_phase_sequence(&operation, sequence)?;
     let record = InlineRecord {
         format_version: catalog.format_version,
         store_incarnation: sentinel.store_incarnation.clone(),
@@ -1685,34 +1338,14 @@ fn append_operation(
 }
 
 impl LocalContentStore {
-    pub(in crate::content_store) fn validate_repair_payload_owner(&self, sentinel: &ContentStoreReservationBatchSentinel) -> Result<()> {
-        self.validate_owner_sentinel(sentinel)?;
-        if !matches!(self.inline_store.owner.expected_format, INLINE_FORMAT_VERSION | ORIGINAL_REPAIR_FIXTURE_VERSION) {
-            return Err(inline_error("Repair payload requires its actual default or explicitly admitted original fixture owner"));
-        }
-        Ok(())
-    }
-
     pub(in crate::content_store) fn validate_owner_sentinel(
         &self,
         sentinel: &ContentStoreReservationBatchSentinel,
     ) -> Result<()> {
-        if self.inline_store.owner.expected_format == INLINE_FORMAT_VERSION {
-            return validate_content_reservation_batch_sentinel(sentinel);
+        if self.inline_store.owner.expected_format != INLINE_FORMAT_VERSION {
+            return Err(inline_error("content owner has an unsupported format"));
         }
-        if !matches!(self.inline_store.owner.expected_format, RECEIVED_REPAIR_FIXTURE_VERSION | ORIGINAL_REPAIR_FIXTURE_VERSION)
-            || sentinel.content_binding_layout != self.inline_store.expected_layout()
-        {
-            return Err(inline_error(
-                "sentinel differs from explicit fixture owner layout",
-            ));
-        }
-        self.validate_received_repair_fixture_physical_identity(Some(sentinel))?;
-        // Reuse the unchanged common identity/schema checks only AFTER the
-        // private owner's exact fixture expectation has matched.
-        let mut common = sentinel.clone();
-        common.content_binding_layout = CONTENT_BINDING_LAYOUT.into();
-        validate_content_reservation_batch_sentinel(&common)
+        validate_content_reservation_batch_sentinel(sentinel)
     }
 
     /// The cold activation path creates the owner lock before enabling the
@@ -1723,7 +1356,6 @@ impl LocalContentStore {
                 "content root identity failed: {error}"
             )));
         }
-        self.validate_received_repair_fixture_physical_identity(None)?;
         let path = self.content_reservation_batch_sentinel_path();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1739,8 +1371,7 @@ impl LocalContentStore {
         self.validate_owner_sentinel(&sentinel)?;
         if sentinel.content_binding_layout == self.inline_store.expected_layout() {
             let guard = ContentMutationGuard::acquire(&self.inline_store.owner.root, false)?;
-            self.validate_received_repair_fixture_physical_identity(None)?;
-            Ok(guard)
+                Ok(guard)
         } else {
             Ok(ContentMutationGuard::inactive())
         }

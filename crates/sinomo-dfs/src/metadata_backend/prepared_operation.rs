@@ -472,7 +472,6 @@ impl LocalSobjMetadataBackend {
         &mut self,
         digest: &DfsPreparedOperationDigest,
         guard: DfsPublicationGuard,
-        enrollment: Option<&mut dyn FnMut(&[crate::DfsRepairAttemptRecord]) -> Result<()>>,
     ) -> Result<crate::metadata_records::DfsPreparedOperationCommitResult> {
         if digest.shard_id != self.shard_id {
             return Err(MetadataBackendError::Serde(
@@ -610,11 +609,7 @@ impl LocalSobjMetadataBackend {
             self.tables
                 .apply_checked_with_rollback(commit_op.clone(), &mut rollback)?;
             let owners = rollback.new_repair_owners(&self.tables);
-            let records = new_repair_owner_targets(&self.tables, &owners, digest)?;
-            if let Some(enroll) = enrollment {
-                enroll(&records)?;
-            }
-            Ok(())
+            validate_new_repair_owners(&self.tables, &owners, digest)
         })();
         if let Err(error) = prepared {
             rollback.rollback(&mut self.tables);
@@ -686,15 +681,14 @@ impl LocalSobjMetadataBackend {
     }
 }
 
-/// Only newly created retained or committed Current placement owners enter
-/// this SAME preapplied commit/native writer boundary. Restored/existing owners
-/// and ordinary prepared Current writes gain no birth observation here.
-fn new_repair_owner_targets(
+/// A commit that creates retained or committed Current placement owners must
+/// carry their exact recorded plan and scope; the derived repair index then
+/// carries their needs.
+fn validate_new_repair_owners(
     tables: &DfsMetadataTables,
     owners: &[DfsWriteIntentRecord],
     digest: &DfsPreparedOperationDigest,
-) -> Result<Vec<crate::DfsRepairAttemptRecord>> {
-    let mut targets = Vec::new();
+) -> Result<()> {
     for owner in owners {
         let version = tables
             .versions
@@ -739,48 +733,8 @@ fn new_repair_owner_targets(
             }
         }
         require_recorded_content_w(tables, version, None)?;
-        // Recorded source receipts prove W above. Only receipts for this
-        // owner's exact target generation settle its new repair custody.
-        let holders = owner
-            .desired_replica_node_ids
-            .iter()
-            .filter_map(|node| {
-                let receipt = tables.receipts.get(&(
-                    owner.object_id.clone(),
-                    owner.target_version.clone(),
-                    node.clone(),
-                ))?;
-                crate::content_durability::receipt_matches_target_version(receipt, version, node)
-                    .then(|| receipt.replica_node_id.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0);
-        for target in owner
-            .desired_replica_node_ids
-            .iter()
-            .filter(|target| !holders.contains(*target))
-        {
-            targets.push(crate::DfsRepairAttemptRecord {
-                intent_id: owner.intent_id.clone(),
-                object_id: owner.object_id.clone(),
-                version: owner.target_version.clone(),
-                content_hash: owner.content_hash.clone().expect("validated repair hash"),
-                missing_replica_node_id: target.clone(),
-                attempts: 0,
-                in_flight: false,
-                last_attempt_unix_nanos: 0,
-                next_retry_unix_nanos: now,
-                transfer_request_id: None,
-                last_error: None,
-                transfer_delivery_state: Some(
-                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-                ),
-                completed_transfer_request_id: None,
-                transfer_kind: Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair),
-            });
-        }
     }
-    Ok(targets)
+    Ok(())
 }
 
 pub(crate) fn validate_preparation_against_tables(

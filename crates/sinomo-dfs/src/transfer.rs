@@ -3,7 +3,6 @@ use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-pub(crate) const DFS_REPAIR_RETRY_SUPPRESSED_TICK: u64 = u64::MAX;
 const DFS_REPAIR_RETRY_TICK_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -18,9 +17,11 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) foreground_replica_repair: bool,
     pub(crate) patch: Option<PendingNetworkedWritePatch>,
     pub(crate) stage_retries: BTreeMap<NodeId, RepairRetryState>,
-    pub(crate) repair_retries: BTreeMap<NodeId, RepairRetryState>,
+    /// The receipt-slot generation each replica's latest stage send planned
+    /// against. It lasts until the write seals, after that replica's own
+    /// reply, so every sealed receipt publishes at its planned generation.
+    pub(crate) planned_receipt_generations: BTreeMap<NodeId, u64>,
     pub(crate) stage_inflight_request_ids: BTreeMap<NodeId, String>,
-    pub(crate) repair_inflight_request_ids: BTreeMap<NodeId, String>,
     pub(crate) fetch_inflight_from: BTreeSet<NodeId>,
     pub(crate) fetch_inflight_request_ids: BTreeMap<NodeId, String>,
     pub(crate) fetch_inflight_started_ticks: BTreeMap<NodeId, u64>,
@@ -52,9 +53,8 @@ impl PendingNetworkedWrite {
             foreground_replica_repair: true,
             patch,
             stage_retries: BTreeMap::new(),
-            repair_retries: BTreeMap::new(),
+            planned_receipt_generations: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
-            repair_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -68,9 +68,6 @@ impl PendingNetworkedWrite {
         for target in targets {
             let stage = self.stage_retries.entry(target.clone()).or_default();
             stage.transfer_delivery_state =
-                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
-            let repair = self.repair_retries.entry(target.clone()).or_default();
-            repair.transfer_delivery_state =
                 Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
         }
         self
@@ -116,7 +113,6 @@ pub(crate) struct RepairRetryState {
     pub(crate) completed_transfer_request_id: Option<String>,
     pub(crate) previous_transfer_delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
     pub(crate) retrying_unresolved_transfer: bool,
-    pub(crate) unresolved_custody_without_request: bool,
 }
 
 pub(crate) fn repair_retry_delay_ticks(attempts: u32) -> u64 {
@@ -128,26 +124,12 @@ pub(crate) fn repair_retry_delay_nanos_for_ticks(ticks: u64) -> u64 {
     ticks.saturating_mul(tick_nanos)
 }
 
-pub(crate) fn repair_retry_state_is_suppressed(state: &RepairRetryState) -> bool {
-    state.next_retry_tick == DFS_REPAIR_RETRY_SUPPRESSED_TICK
-}
-
-pub(crate) fn wake_repair_retry_state(state: &mut RepairRetryState) {
-    if !repair_retry_state_is_suppressed(state) {
-        state.next_retry_tick = 0;
-    }
-}
-
 pub(crate) fn stage_inflight_retry_delay_ticks(attempts: u32) -> u64 {
     repair_retry_delay_ticks(attempts).saturating_add(1)
 }
 
 pub(crate) fn fetch_inflight_timeout_ticks() -> u64 {
     stage_inflight_retry_delay_ticks(2)
-}
-
-pub(crate) fn repair_transfer_inflight_timeout_ticks(_total_size_bytes: u64) -> u64 {
-    fetch_inflight_timeout_ticks()
 }
 
 pub(crate) fn range_transfer_size_bytes(

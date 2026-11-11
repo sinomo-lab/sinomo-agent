@@ -1,7 +1,8 @@
-//! Conversion of node-local pins, repair queues, and retired maintenance cursors.
+//! Conversion of node-local pins and retired maintenance cursors. A legacy
+//! node-local repair queue needs no conversion: repair work derives from the
+//! shard tables, and DFS removes the old queue files when it opens the root.
 //! The normal component data owner retains custody during every call.
 mod mounted;
-mod repair;
 
 use serde_json::Value;
 use sinomo_core::object::{LengthMode, serde_ext as sobj};
@@ -33,7 +34,6 @@ enum Kind {
 }
 struct Session {
     directories: Vec<(Kind, ReadDir)>,
-    repair: Option<repair::Conversion>,
     pending_mounted: Option<(mounted::Role, PathBuf)>,
 }
 #[derive(Default)]
@@ -82,7 +82,6 @@ impl LocalStateConverter {
             }
             *owned_session = Some(Session {
                 directories,
-                repair: repair::Conversion::open(&root)?,
                 pending_mounted: None,
             });
         }
@@ -99,16 +98,6 @@ impl LocalStateConverter {
                 }
                 session.pending_mounted = None;
                 processed += 1;
-            }
-            if let Some(repair) = session.repair.as_mut() {
-                let (ready, count) = repair.step(budget.max(1))?;
-                processed += count;
-                if !ready {
-                    return Ok(DfsStoragePreparation::Pending {
-                        processed_records: processed,
-                    });
-                }
-                session.repair = None;
             }
             while processed < budget.max(1) {
                 let Some((kind, entries)) = session.directories.last_mut() else {
@@ -350,6 +339,39 @@ mod tests {
     use super::*;
     use sinomo_dfs::{DfsPinMode, LocalDfsPinStore};
     use time::OffsetDateTime;
+
+    #[test]
+    fn a_root_with_a_legacy_repair_queue_converts_without_reading_it() {
+        let dir = sinomo_testdir::TestDir::new("local-state-legacy-repair-queue");
+        let root = dir.path().join("dfs");
+        let maintenance = root.join("maintenance");
+        fs::create_dir_all(&maintenance).unwrap();
+        // Rows, custody and births of the removed node-local queue, in its old
+        // snapshot and log, plus a partial earlier conversion copy.
+        fs::write(
+            maintenance.join("repair-attempts.sobj"),
+            b"not a current format",
+        )
+        .unwrap();
+        fs::write(
+            maintenance.join("repair-attempts.active.slog"),
+            b"old frames",
+        )
+        .unwrap();
+        let retained = root.join("migration-retained/local-state/repair-v8");
+        fs::create_dir_all(&retained).unwrap();
+        fs::write(retained.join("progress.json"), b"{}").unwrap();
+        let converter = LocalStateConverter::default();
+        assert!(matches!(
+            converter.prepare(&root, 16).unwrap(),
+            DfsStoragePreparation::Ready
+        ));
+        assert!(root.join(MARKER).exists());
+        assert!(matches!(
+            converter.prepare(&root, 16).unwrap(),
+            DfsStoragePreparation::Ready
+        ));
+    }
 
     fn old_pin(root: &Path) -> (PathBuf, DfsPinRecord) {
         let record = DfsPinRecord {

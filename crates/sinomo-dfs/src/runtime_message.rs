@@ -4,7 +4,7 @@ use crate::{
     DfsOutboundAttachment, LocalContentStore, NetworkedDfsService,
     ResidentLocalMetadataShardHandle, ResidentLocalShardedMetadataBackend,
 };
-use sinomo_core::network::{ClusterPaths, ObjectRpcBodyChunk};
+use sinomo_core::network::ObjectRpcBodyChunk;
 use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -18,190 +18,6 @@ use std::sync::{
 use std::time::Duration;
 
 pub(crate) const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
-
-/// Checkpoint only the exact actual named transfer observed before dispatch.
-/// This is queue DATA reconciliation, not metadata receipt/effect authority.
-#[cfg(test)]
-pub(crate) fn checkpoint_detached_replica_delivery(
-    data_dir: &sinomo_core::local::SinomoDataDir,
-    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
-) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
-    checkpoint_detached_replica_delivery_with_layout(data_dir, event, None, None)
-}
-
-pub(crate) fn checkpoint_detached_replica_delivery_with_layout(
-    data_dir: &sinomo_core::local::SinomoDataDir,
-    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
-    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
-    inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
-) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
-    checkpoint_detached_replica_delivery_inner(data_dir, event, layout, inspection, None)
-}
-
-pub(crate) fn checkpoint_detached_native_original_delivery(
-    data_dir: &sinomo_core::local::SinomoDataDir,
-    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
-    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
-    inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
-    admission: &crate::publication_guard::NativeRepairProducerAdmission,
-    attempt: &crate::repair_queue_store::RepairOriginalAttemptWitness,
-) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
-    checkpoint_detached_replica_delivery_inner(
-        data_dir,
-        event,
-        layout,
-        inspection,
-        Some((admission, attempt)),
-    )
-}
-
-fn checkpoint_detached_replica_delivery_inner(
-    data_dir: &sinomo_core::local::SinomoDataDir,
-    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
-    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
-    inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
-    native: Option<(
-        &crate::publication_guard::NativeRepairProducerAdmission,
-        &crate::repair_queue_store::RepairOriginalAttemptWitness,
-    )>,
-) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
-    use crate::node_transport::DfsBackgroundReplicaDeliveryEvent;
-    use crate::node_transport::DfsBackgroundReplicaDispatch;
-    use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
-    use sinomo_core::network::NetworkDeliveryState;
-    let store = if let Some(layout) = layout {
-        layout.queue()?
-    } else {
-        crate::repair_queue_store::LocalDfsRepairQueueStore::new(
-            crate::default_dfs_repair_attempt_snapshot_path(data_dir),
-        )
-    };
-    let matches = |message: &crate::DfsRoutedMessage, record: &crate::DfsRepairAttemptRecord| {
-        let DfsNetworkMessage::RepairReplica(command) = &message.message else {
-            return false;
-        };
-        command.background_repair
-            && record.transfer_kind == Some(DfsRepairTransferKind::Repair)
-            && record.transfer_request_id.as_ref() == Some(&command.request_id)
-            && record.completed_transfer_request_id.is_none()
-            && record.intent_id == command.intent_id
-            && record.object_id == command.object_id
-            && record.version == command.version
-            && record.content_hash == command.content_hash
-            && record.missing_replica_node_id == message.target_node_id
-    };
-    match event {
-        DfsBackgroundReplicaDeliveryEvent::BeforeDispatch { message } => {
-            let DfsNetworkMessage::RepairReplica(command) = &message.message else {
-                return Err(crate::DfsError::Distributed {
-                    message: "detached delivery observation requires its actual repair command"
-                        .into(),
-                });
-            };
-            let shard =
-                command
-                    .authority_shard
-                    .as_ref()
-                    .ok_or_else(|| crate::DfsError::Metadata {
-                        message: "native background repair has no original authority shard".into(),
-                    })?;
-            if crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
-                data_dir, &crate::DfsMetadataShardId::new(&shard.shard_id), layout,
-            )?
-            .is_some_and(|freeze| freeze.activated_epoch != Some(shard.epoch))
-            {
-                return Ok(DfsBackgroundReplicaDispatch::Fenced);
-            }
-            let validation = if let Some((admission, attempt)) = native {
-                admission.validate_original_dispatch(data_dir, &store, attempt, &message)
-            } else {
-                store.validate_original_repair_dispatch(&message)
-            };
-            let original = match validation {
-                Ok(original) => original,
-                Err(error) => {
-                    // Only an exact, already native-closed Original may retire
-                    // this stale worker reader. A missing proof preserves the
-                    // original validation error and its unresolved ownership.
-                    match store.matching_closed_original_repair_dispatch(&message) {
-                        Ok(Some(closed)) => return Ok(DfsBackgroundReplicaDispatch::Settled {
-                            closed, original_validation_error: error,
-                        }),
-                        Ok(None) => {}
-                        Err(proof_error) => tracing::debug!(target: "sinomo.dfs.repair",
-                            stage = "dfs.repair.dispatch.closed_proof_unavailable",
-                            intent_id = %command.intent_id,
-                            request_id = %command.request_id,
-                            source = %message.source_node_id,
-                            target = %message.target_node_id,
-                            frame_id = message.frame_id,
-                            message_id = message.message_id,
-                            error = %proof_error,
-                            "closed Original proof unavailable; original dispatch error retained"),
-                    }
-                    return Err(error);
-                }
-            };
-            if let Some(inspection) = inspection {
-                inspection.inspect(&original.root)?;
-            } else {
-                LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"))
-                    .inspect_repair_payload_root(&original.root)?;
-            }
-            let (records, _) = store.observe_transfer_targets(
-                &command.intent_id,
-                std::slice::from_ref(&message.target_node_id),
-            )?;
-            let Some(record) = records.into_iter().next() else {
-                return Ok(DfsBackgroundReplicaDispatch::Observed(None));
-            };
-            if !matches(&message, &record) {
-                return Err(crate::DfsError::Distributed {
-                    message: "detached repair differs from its named durable custody".into(),
-                });
-            }
-            Ok(DfsBackgroundReplicaDispatch::Observed(Some(record)))
-        }
-        DfsBackgroundReplicaDeliveryEvent::Failed {
-            message,
-            before,
-            producer,
-            delivery_state,
-            last_error,
-        } => {
-            if !matches(&message, &before) {
-                return Err(crate::DfsError::Distributed {
-                    message: "detached repair outcome differs from its pre-dispatch custody".into(),
-                });
-            }
-            store.record_original_repair_delivery(&message, delivery_state)?;
-            let mut desired = before.clone();
-            desired.transfer_delivery_state = if producer.retrying_unresolved_transfer {
-                crate::service_repair::join_transfer_delivery(
-                    producer.previous_transfer_delivery_state,
-                    delivery_state,
-                )
-            } else {
-                delivery_state
-            };
-            desired.in_flight = false;
-            if desired.transfer_delivery_state == Some(NetworkDeliveryState::DefinitelyNotSent) {
-                desired.transfer_request_id = None;
-            }
-            desired.last_error = Some(last_error);
-            let now = crate::dfs_now_unix_nanos();
-            desired.last_attempt_unix_nanos = now;
-            let ticks = crate::service_repair::repair_retry_delay_ticks_for_error(
-                desired.attempts,
-                desired.last_error.as_deref(),
-            );
-            desired.next_retry_unix_nanos =
-                now.saturating_add(crate::transfer::repair_retry_delay_nanos_for_ticks(ticks));
-            store.checkpoint_transfer_record(&before, &desired)?;
-            Ok(DfsBackgroundReplicaDispatch::Observed(None))
-        }
-    }
-}
 
 pub(crate) type DfsRuntimeMessageService = NetworkedDfsService<DfsNodeTransport>;
 pub(crate) type DfsRuntimeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -655,6 +471,7 @@ impl DfsDetachedSendRuntime {
     pub(crate) fn worker_wait_count(&self) -> u64 {
         self.worker_wait_count.load(Ordering::Acquire)
     }
+
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -677,8 +494,7 @@ impl DfsCommittedEffects {
                 || crate::dfs_events_should_publish_metadata(events),
             replica_progress: committed_work.metadata_replica_progress
                 || crate::dfs_events_advance_metadata_replica(events),
-            repair_maintenance: committed_work.repair_maintenance
-                || crate::dfs_events_should_wake_repair_maintenance(events),
+            repair_maintenance: committed_work.repair_maintenance,
             namespace_maintenance: committed_work.namespace_maintenance,
             semantic_changes: committed_work.semantic_changes,
             storage_environment: *committed_work != DfsMessageCommittedWork::default()
@@ -1103,7 +919,6 @@ impl DfsRuntimeMessageCacheEntry {
 
 pub(crate) fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCommand) -> bool {
     match &command.routed_message.message {
-        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => true,
         DfsNetworkMessage::ReadRequest(request) => {
             request.version.is_some() && request.content_hash.is_some()
         }
@@ -1148,41 +963,6 @@ pub(crate) fn dfs_detached_send_runtime_for_identity(
     Ok(Arc::clone(runtimes.entry(key).or_insert_with(|| {
         Arc::new(DfsDetachedSendRuntime::new())
     })))
-}
-
-/// Resolve only the already registered Main carrier. A caller's transport can
-/// have a private outbox; it cannot stand in for this actual native owner.
-pub(crate) fn registered_repair_handoff_drain_gate(
-    owner: &crate::runtime_host::DfsDataOwnerLock,
-    node: &NodeId,
-) -> Result<Arc<Mutex<()>>, crate::DfsError> {
-    let error = || crate::DfsError::Metadata {
-        message: "repair handoff has no unique live Main carrier owner".into(),
-    };
-    let data_dir = sinomo_core::local::SinomoDataDir::new(owner.physical_data_root());
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir))
-        .map_err(|_| error())?;
-    if state.local_node_id != *node {
-        return Err(error());
-    }
-    let registry = DFS_DETACHED_SEND_RUNTIMES
-        .get()
-        .ok_or_else(error)?
-        .lock()
-        .map_err(|_| error())?;
-    let mut candidates = registry.iter().filter(|(key, _)| {
-        key.cluster_id == state.cluster_id.to_string()
-            && key.local_node_id == node.to_string()
-            && key
-                .data_root
-                .canonicalize()
-                .is_ok_and(|root| root == owner.physical_data_root())
-    });
-    let (_, runtime) = candidates.next().ok_or_else(error)?;
-    if candidates.next().is_some() {
-        return Err(error());
-    }
-    Ok(runtime.state.repair_handoff_drain_gate())
 }
 
 #[derive(Debug)]
@@ -1327,16 +1107,11 @@ pub(crate) struct DfsRuntimeMessageExecution {
         )>,
         crate::DfsError,
     >,
-    #[cfg(test)]
-    pub new_repair_records_unattempted: bool,
-    pub repair_queue_record_count: usize,
-    pub repair_queue_persistence: Result<usize, crate::DfsError>,
     pub exact_projection_release_error: Option<crate::DfsError>,
     pub resident_backend_release_error: Option<crate::DfsError>,
     pub lane_lock_wait: Duration,
     pub backend_checkout: Duration,
     pub process: Duration,
-    pub repair_queue_elapsed: Duration,
 }
 
 /// Execute one message against an already selected resident lane.
@@ -1345,23 +1120,17 @@ pub(crate) struct DfsRuntimeMessageExecution {
 /// backend lease are released. This preserves the committed-edge ordering
 /// contract while leaving the durable queue location and its host wake bit to
 /// the embedding runtime.
-pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
+pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     service_lane_handle: &Arc<DfsRuntimeMessageServiceLaneHandle>,
     peer_node_ids: Vec<NodeId>,
     command: DfsMessageCommand,
     preingested_blob: Option<crate::ContentStoreQuarantinedBlob>,
     execution_scope: &crate::DfsMessageExecutionScope,
     verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
-    verified_history: Option<crate::publication_guard::VerifiedOriginalRepairHistoryRead>,
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
-    fresh_original_repair: Option<crate::runtime_host::FreshOriginalRepairReturn>,
-    persist_repair_records: F,
-) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
-where
-    F: FnOnce(Vec<crate::DfsRepairAttemptRecord>) -> Result<usize, crate::DfsError>,
-{
+) -> Result<DfsRuntimeMessageExecution, crate::DfsError> {
     #[cfg(test)]
     if matches!(&command.routed_message.message,
         DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_)) {
@@ -1372,13 +1141,6 @@ where
         DfsNetworkMessage::FetchBlobResponse(_)
     );
     let is_verified_fetch = verified_fetch.is_some();
-    let is_verified_history = verified_history.is_some();
-    if matches!(&command.routed_message.message, DfsNetworkMessage::OriginalRepairHistoryRequest(_)) != is_verified_history
-        || matches!(&command.routed_message.message, DfsNetworkMessage::OriginalRepairHistoryResponse(_))
-        || (is_verified_history && verified_fetch.is_some())
-        || (is_verified_history && (completed_phase.is_some() || publication_owners.is_some()
-            || publication_provider.is_some()))
-    { return Err(crate::DfsError::Metadata { message: "history request/context has no exact verified per-call owner".into() }); }
     let is_read_only = is_verified_fetch || crate::dfs_message_is_read_only_request(&command);
     let lane_lock_wait_started = std::time::Instant::now();
     let mut service_lane = service_lane_handle
@@ -1387,12 +1149,7 @@ where
             message: "DFS runtime message lane lock poisoned".to_string(),
         })?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
-    if is_verified_history && (service_lane.service.remote_namespace_phase.is_some()
-        || service_lane.service.publication_execution.current().is_some()
-        || service_lane.service.publication_provider.current().is_some()) {
-        return Err(crate::DfsError::Metadata { message: "history read cannot consume a preexisting mutation/remote phase".into() });
-    }
-    if (is_verified_fetch || is_verified_history)
+    if is_verified_fetch
         && (service_lane.resident_metadata_scope.is_some()
             || preingested_blob.is_some()
             || !service_lane
@@ -1449,25 +1206,13 @@ where
     service_lane
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
-    if fresh_original_repair.is_some()
-        && (is_verified_fetch || is_verified_history || preingested_blob.is_some())
-    {
-        return Err(crate::DfsError::Metadata {
-            message: "fresh native Repair return cannot enter another verified request family"
-                .into(),
-        });
-    }
-    let mut process_report = match (verified_fetch, verified_history) {
-        (None, Some(verified)) => service_lane.service.process_verified_original_history_report(command, verified),
-        (Some(verified), None) => service_lane
+    let mut process_report = match verified_fetch {
+        Some(verified) => service_lane
             .service
             .process_verified_blob_fetch_report(command, verified),
-        (None, None) => service_lane
+        None => service_lane
             .service
-            .process_message_command_report_with_native_return(command, preingested_blob,
-                fresh_original_repair,
-            ),
-        (Some(_), Some(_)) => unreachable!("mutually exclusive verified request families"),
+            .process_message_command_report_with_native_return(command, preingested_blob),
     };
     if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {
         match &process_report.outcome {
@@ -1480,9 +1225,6 @@ where
                 response = ?response, error = %error,
                 "normal Main decoded repair reply execution failed"),
         }
-    }
-    if is_verified_history && service_lane.service.remote_namespace_phase.is_some() {
-        return Err(crate::DfsError::Metadata { message: "history handler cannot consume a remote namespace phase".into() });
     }
     let remote_namespace_phase = service_lane
         .service
@@ -1569,26 +1311,8 @@ where
                 })
             })
     };
-    let repair_queue_records = if is_read_only {
-        Vec::new()
-    } else {
-        std::mem::take(&mut process_report.committed_repair_records)
-    };
-    #[cfg(test)]
-    let new_repair_records_unattempted = repair_queue_records
-        .iter()
-        .all(|record| record.attempts == 0 && !record.in_flight);
     let committed_work = committed_work_tracker.take();
-    let repair_queue_record_count = repair_queue_records.len();
-    let repair_queue_started = std::time::Instant::now();
-    let repair_queue_persistence = if repair_queue_records.is_empty() {
-        Ok(0)
-    } else {
-        persist_repair_records(repair_queue_records)
-    };
-    let repair_queue_elapsed = repair_queue_started.elapsed();
-    let exact_projection_release_error = if repair_queue_persistence.is_ok()
-        && matches!(
+    let exact_projection_release_error = if matches!(
             &resident_metadata_scope,
             Some(DfsResidentMetadataScope::ExactShard(_))
         ) {
@@ -1615,16 +1339,11 @@ where
         committed_work,
         replica_materialization_shard,
         deferred_work,
-        #[cfg(test)]
-        new_repair_records_unattempted,
-        repair_queue_record_count,
-        repair_queue_persistence,
         exact_projection_release_error,
         resident_backend_release_error,
         lane_lock_wait,
         backend_checkout,
         process,
-        repair_queue_elapsed,
     })
 }
 

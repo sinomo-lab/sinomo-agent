@@ -411,14 +411,14 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
         .apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, current_policy)
         .unwrap();
     deny_native_read_repair(&runtime, &owner, &target);
-    let _background = runtime
-        .deny_background_replica_before_claim(&owner)
-        .unwrap();
     let mut first = runtime.metadata_primary_service(path).unwrap();
+    // The test drives the node's repair executor; routine maintenance stays
+    // out of the way.
+    let (execution, hold) = super::repair::native_private_repair_owner(&runtime, &first, path, ());
     let bytes = vec![0x76; 2 * 1024 * 1024 + 4096];
     let version = crate::namespace::next_version(&base.version);
     let request = DfsWriteRequest {
-        file_system_id: base.file_system_id,
+        file_system_id: base.file_system_id.clone(),
         object_id: base.object_id.clone(),
         target_version: version.clone(),
         requesting_node_id: owner.clone(),
@@ -435,22 +435,21 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
         )
         .unwrap();
     first.settle_ready_write_outcome(outcome, true).unwrap();
-    let intent = first
-        .coordinator()
-        .repair_jobs()
+    assert!(
+        super::repair::indexed_object_repair_needs(
+            &runtime,
+            &first,
+            &base.file_system_id,
+            path,
+            &request.object_id,
+            &version,
+        )
         .iter()
-        .find(|job| {
-            job.object_id == request.object_id
-                && job.version == version
-                && job.missing_replica_node_id == target
-        })
-        .unwrap()
-        .intent_id
-        .clone();
-    first
-        .content()
-        .debug_remove_loose_blob(&content_hash(&bytes))
-        .unwrap();
+        .any(|(missing, owner_intent)| *missing == target && owner_intent.is_some()),
+        "the committed W2 write leaves its third replica as repair work"
+    );
+    let hash = content_hash(&bytes);
+    first.content().debug_remove_loose_blob(&hash).unwrap();
     let captured = Arc::new(Mutex::new(Vec::new()));
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(owner.clone()),
@@ -464,47 +463,30 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
             captured: Arc::clone(&captured),
         },
     });
-    for _ in 0..32 {
-        first.retry_pending_repairs_bounded(1).unwrap();
-        if !captured.lock().unwrap().is_empty() {
-            break;
-        }
+    // The executor refills this node's own copy from the source before it
+    // can send the replica; the source's reply is corrupted in flight and
+    // held in this lane's queue.
+    let data_root = runtime.data_dir(&owner).root();
+    let shards = runtime.metadata_shards().unwrap();
+    let none = crate::DfsMaintenanceExecutionExclusions::default();
+    let pass = first
+        .run_repair_executor_pass(&data_root, &shards, &none, 1)
+        .unwrap();
+    assert_eq!(pass.scheduled.len(), 1);
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while captured.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the source's fetch reply");
+        std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(captured.lock().unwrap().len(), 1);
-    assert!(
-        first
-            .writes
-            .pending_writes
-            .get(&intent)
-            .unwrap()
-            .fetch_inflight_from
-            .contains(&source)
-    );
-    // A second genuinely hydrated service independently finishes an ordinary
-    // native Fetch into this same content store before the queued duplicate.
+    // Another lane of the same node binds the verified content into this
+    // same content store before the queued duplicate reply is served.
     runtime.clear_faults();
     deny_native_read_repair(&runtime, &owner, &target);
     let mut second = runtime.metadata_primary_service(path).unwrap();
-    second.hydrate_from_metadata_backend().unwrap();
-    for _ in 0..32 {
-        second.retry_pending_repairs_bounded(1).unwrap();
-        second.process_incoming().unwrap();
-        if second
-            .content()
-            .read_object_version(request.object_id.as_str(), version.as_str())
-            .is_ok()
-        {
-            break;
-        }
-    }
-    assert_eq!(
-        second
-            .content()
-            .read_object_version(request.object_id.as_str(), version.as_str())
-            .unwrap()
-            .1,
-        bytes
-    );
+    second
+        .store_command_bytes(&request.object_id, &version, &hash, &bytes)
+        .unwrap();
+    drop(second);
     let events = first.process_incoming().unwrap();
     assert!(
         events.iter().any(
@@ -512,30 +494,23 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
         object_id, source_node_id, ..
     } if object_id == &request.object_id && source_node_id == &source)
         ),
-        "actual duplicate payload corruption and length change are ignored only after a genuine prior verified binding"
+        "actual duplicate payload corruption and length change are ignored only after a genuine prior verified binding: {events:?}"
     );
-    let pending = first.writes.pending_writes.get(&intent).unwrap();
-    assert!(!pending.fetch_inflight_from.contains(&source));
-    assert_eq!(pending.size_bytes, bytes.len() as u64);
-    assert_eq!(
-        pending.stage_retries.get(&target).unwrap().next_retry_tick,
-        0
-    );
-    assert_eq!(
-        pending.repair_retries.get(&target).unwrap().next_retry_tick,
-        0
+    assert!(
+        crate::repair_executor::repair_executor_work(&data_root).due,
+        "the fetch reply ends the attempt and wakes the executor"
     );
     let stored = first
         .content()
         .read_object_version(request.object_id.as_str(), version.as_str())
         .unwrap();
-    assert_eq!(stored.0.content_hash, content_hash(&bytes));
+    assert_eq!(stored.0.content_hash, hash);
     assert_eq!(stored.0.size_bytes, bytes.len() as u64);
     assert_eq!(stored.1, bytes);
-    drop(second);
+    drop(execution);
     drop(first);
+    drop(hold);
     runtime.clear_faults();
-    drop(_background);
     runtime.close().unwrap();
 }
 
