@@ -2026,6 +2026,20 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle_for_replica_contex
     )
 }
 
+/// The cross-shard namespace guards shared by every served lane of this
+/// node's current message cache entry, when that entry exists.
+pub(crate) fn daemon_dfs_message_cache_cross_shard_namespace_locks(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<DfsCrossShardNamespaceLockRegistry>, sinomo_dfs::DfsError> {
+    let Some(slot) = daemon_dfs_message_service_cache().existing_root(&data_dir.root())? else {
+        return Ok(None);
+    };
+    let cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    Ok(cache
+        .as_ref()
+        .map(|entry| entry.cross_shard_namespace_locks.clone()))
+}
+
 pub(crate) fn daemon_dfs_message_cache_exact_admission_is_current(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,

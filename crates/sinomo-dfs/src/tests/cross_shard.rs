@@ -2888,6 +2888,74 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
     cluster.close();
 }
 
+/// A node that replicates another primary's shard fences that shard's running
+/// cross-shard jobs from the job records its replica ingests, and releases the
+/// paths when the finished record arrives, without waiting for its own next
+/// full hydration.
+#[test]
+fn replica_ingest_holds_and_releases_a_foreign_namespace_job_guard() {
+    let mut cluster = sifs_two_primary_cluster("native-replica-ingest-job-guard");
+    let canonical_path = "/users/replica-guard-canonical";
+    let alias_path = "/services/replica-guard-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            canonical_path,
+            b"replica guard bytes",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster
+        .replica
+        .posix_hardlink(canonical_path, alias_path)
+        .unwrap();
+    let users_data_dir = cluster._runtime.data_dir(&cluster.users_primary_node);
+    let sifs = crate::sifs_file_system_id();
+    let users_guard_blocks_alias = || {
+        crate::runtime_host::daemon_dfs_message_cache_cross_shard_namespace_locks(users_data_dir)
+            .unwrap()
+            .is_some_and(|guards| guards.blocks(&sifs, alias_path))
+    };
+    let wait_for = |expected: bool| {
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while users_guard_blocks_alias() != expected {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    };
+    assert!(
+        wait_for(false),
+        "the finished hardlink job leaves no guard on the users primary"
+    );
+    // The alias-primary job runs while its remote phase toward the users
+    // primary is held; the users primary sees it only as a services replica.
+    let pause = cluster
+        ._runtime
+        .pause_remote_namespace_phase(&cluster.services_primary_node)
+        .unwrap();
+    let mut requester = cluster._runtime.client(&cluster.replica_node).unwrap();
+    let (held_while_running, outcome) = std::thread::scope(|scope| {
+        let pending = scope.spawn(move || requester.posix_unlink(alias_path));
+        let captured = pause.wait_captured(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+        let held = captured.is_ok() && wait_for(true);
+        pause.release();
+        (held, pending.join().unwrap())
+    });
+    assert!(
+        held_while_running,
+        "the users primary fences the running services job from its replicated record"
+    );
+    assert_eq!(outcome.unwrap().kind, DfsObjectKind::Tombstone);
+    assert!(
+        wait_for(false),
+        "the replicated finished record releases the users primary's guard"
+    );
+    cluster.close();
+}
+
 #[test]
 fn cross_primary_hardlink_alias_unlink_fences_the_crash_gap_and_recovers_exactly_once() {
     let mut cluster = sifs_two_primary_cluster("native-hardlink-alias-crash-gap");

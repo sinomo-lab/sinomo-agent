@@ -1259,6 +1259,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             let rejection_shard_id = command.batch.shard_id.clone();
             let rejection_next_after_sequence = command.batch.next_after_sequence;
             let admitted_context = context.clone();
+            let guard_data_dir = Arc::clone(&data_dir);
             #[cfg(any(test, feature = "test-support"))]
             let diagnostic_apply = diagnostic.clone();
             let operation = handle_daemon_dfs_resident_replica_operation(
@@ -1290,13 +1291,24 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                                 "ingress_elapsed_us": started.elapsed().as_micros(),
                             }), false);
                         }
-                        let namespace_paths = logical
+                        let payloads = logical
                             .map_err(crate::DfsError::from)
                             .and_then(|batch| {
                                 crate::metadata_replication::committed_payloads_for_batch(
                                     backend, &batch,
                                 )
-                            })
+                            });
+                        if response.applied_entries > 0
+                            && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
+                            && let Ok(payloads) = &payloads
+                        {
+                            observe_replicated_namespace_job_guards(
+                                guard_data_dir.as_ref(),
+                                &context.shard,
+                                payloads.iter().flat_map(|payload| &payload.metadata_effects),
+                            );
+                        }
+                        let namespace_paths = payloads
                             .map(|payloads| {
                                 payloads
                                     .iter()
@@ -1444,6 +1456,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             let rejection_shard_id = command.shard_id.clone();
             let rejection_next_after_sequence = command.next_after_sequence;
             let admitted_context = context.clone();
+            let guard_data_dir = Arc::clone(&data_dir);
             let operation = handle_daemon_dfs_resident_replica_operation(
                 &paths,
                 data_dir,
@@ -1452,7 +1465,20 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 true,
                 false,
                 (&rejection_request_id, "metadata-snapshot-install"),
-                move |shard, context| shard.install_replica_snapshot(context, command),
+                move |shard, context| {
+                    let response = shard.install_replica_snapshot(context, command)?;
+                    if matches!(
+                        response.result,
+                        sinomo_dfs::DfsMetadataSnapshotInstallResult::Installed { .. }
+                    ) {
+                        replace_installed_namespace_job_guards(
+                            guard_data_dir.as_ref(),
+                            shard,
+                            &context.shard,
+                        );
+                    }
+                    Ok(response)
+                },
             )
             .await
             .map_err(daemon_dfs_data_plane_error)?;
@@ -1576,6 +1602,90 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             }
             Ok(response)
         })
+    }
+}
+
+/// A replicated batch carries the job records of the shard's cross-shard
+/// namespace work. Apply them to the guards this node's served lanes share,
+/// under the same shard admission as the batch, so a finished job releases its
+/// paths here when its record arrives rather than at the next full hydration.
+fn observe_replicated_namespace_job_guards<'a>(
+    data_dir: &SinomoDataDir,
+    shard: &sinomo_dfs::DfsMetadataShardConfig,
+    effects: impl Iterator<Item = &'a sinomo_dfs::DfsPreparedMetadataEffect>,
+) {
+    let mut jobs = effects
+        .filter_map(|effect| match effect {
+            sinomo_dfs::DfsPreparedMetadataEffect::PutNamespaceJob { job } => Some(job),
+            _ => None,
+        })
+        .peekable();
+    if jobs.peek().is_none() {
+        return;
+    }
+    match daemon_dfs_message_cache_cross_shard_namespace_locks(data_dir) {
+        Ok(Some(guards)) => {
+            let shard_id = Some(DfsMetadataShardId::new(shard.shard_id.clone()));
+            for job in jobs {
+                guards.observe_job(shard_id.clone(), job);
+            }
+        }
+        // No served lane exists yet: its hydration reads these durable records.
+        Ok(None) => {}
+        Err(error) => tracing::warn!(target: "sinomo.dfs", %error,
+            data_root = %data_dir.root().display(),
+            "replicated namespace job guards could not be applied"),
+    }
+}
+
+/// An installed snapshot replaces the shard's job records; replace that shard's
+/// guards with the installed running jobs under the same admission. The
+/// install itself stands even when this projection cannot be read: the next
+/// full hydration rebuilds it from the same records.
+fn replace_installed_namespace_job_guards(
+    data_dir: &SinomoDataDir,
+    handle: &sinomo_dfs::ResidentLocalMetadataShardHandle,
+    shard: &sinomo_dfs::DfsMetadataShardConfig,
+) {
+    let guards = match daemon_dfs_message_cache_cross_shard_namespace_locks(data_dir) {
+        Ok(Some(guards)) => guards,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(target: "sinomo.dfs", %error,
+                data_root = %data_dir.root().display(),
+                "installed namespace job guards could not be applied");
+            return;
+        }
+    };
+    let running = handle.with_backend(|backend| {
+        let mut running = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = sinomo_dfs::DfsMetadataBackend::list_namespace_jobs_page(
+                backend,
+                cursor.as_ref(),
+                sinomo_dfs::DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
+            )?;
+            for job in page.jobs {
+                if job.status == sinomo_dfs::DfsNamespaceJobStatus::Running
+                    && let Some(paths) =
+                        crate::service_state::cross_shard_namespace_job_guard_paths(&job)
+                {
+                    running.push((job.job_id, job.file_system_id, paths));
+                }
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(running),
+            }
+        }
+    });
+    match running {
+        Ok(running) => guards
+            .replace_shard_jobs(&DfsMetadataShardId::new(shard.shard_id.clone()), running),
+        Err(error) => tracing::warn!(target: "sinomo.dfs", %error,
+            data_root = %data_dir.root().display(),
+            "installed namespace job guards could not be read"),
     }
 }
 

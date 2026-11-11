@@ -193,6 +193,32 @@ impl IntoCrossShardNamespaceLockPaths for Vec<String> {
     }
 }
 
+/// The paths a cross-shard namespace job fences while it runs, or `None` for
+/// a job kind that fences no path.
+pub(crate) fn cross_shard_namespace_job_guard_paths(
+    job: &crate::DfsNamespaceJobRecord,
+) -> Option<Vec<String>> {
+    use crate::DfsNamespaceJobKind;
+    if !matches!(
+        job.kind,
+        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+    ) {
+        return None;
+    }
+    let mut paths = vec![job.root_path.clone()];
+    if job.kind == DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+        && let Some(target_path) = job.target_path.as_ref()
+        && target_path != &job.root_path
+    {
+        paths.push(target_path.clone());
+    }
+    Some(paths)
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DfsCrossShardNamespaceLockRegistry {
     /// Job identity is the ownership boundary. A delayed terminal update for
@@ -280,6 +306,28 @@ impl DfsCrossShardNamespaceLockRegistry {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(job_id);
+    }
+
+    /// Apply one durable job record: a running guarded job holds its paths,
+    /// and any later status releases them.
+    pub(crate) fn observe_job(
+        &self,
+        shard_id: Option<DfsMetadataShardId>,
+        job: &crate::DfsNamespaceJobRecord,
+    ) {
+        let Some(paths) = cross_shard_namespace_job_guard_paths(job) else {
+            return;
+        };
+        if job.status == crate::DfsNamespaceJobStatus::Running {
+            self.upsert_job(
+                shard_id,
+                job.job_id.clone(),
+                job.file_system_id.clone(),
+                paths,
+            );
+        } else {
+            self.remove_job(&job.job_id);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {

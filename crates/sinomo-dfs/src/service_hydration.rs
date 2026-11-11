@@ -222,14 +222,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend.list_namespace_jobs_page(cursor, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
             for job in page.jobs {
                 if job.status == DfsNamespaceJobStatus::Running
-                    && matches!(
-                        job.kind,
-                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
-                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
-                    )
+                    && let Some(paths) =
+                        crate::service_state::cross_shard_namespace_job_guard_paths(&job)
                 {
                     let shard_id = match exact_shard_id.as_ref() {
                         Some(shard_id) => Some(shard_id.clone()),
@@ -347,14 +341,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         job: &DfsNamespaceJobRecord,
     ) -> Result<(), DfsError> {
-        if !matches!(
-            job.kind,
-            DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-                | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
-                | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
-                | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
-        ) {
+        if crate::service_state::cross_shard_namespace_job_guard_paths(job).is_none() {
             return Ok(());
         }
         #[cfg(test)]
@@ -1370,13 +1357,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     continue;
                 }
-                let mut paths = vec![job.root_path.clone()];
-                if job.kind == DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
-                    && let Some(target) = job.target_path
-                    && target != job.root_path
-                {
-                    paths.push(target);
-                }
+                let Some(paths) = crate::service_state::cross_shard_namespace_job_guard_paths(&job)
+                else {
+                    continue;
+                };
                 guards.push((job.job_id, job.file_system_id, paths));
             }
             let Some(next) = page.next_cursor else {
