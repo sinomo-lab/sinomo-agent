@@ -1248,14 +1248,19 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
             if *shutdown.borrow() {
                 return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
             }
+            let shutdown_state = shutdown.clone();
             tokio::select! {
                 biased;
                 _ = cancellation_owner.wait_for_shutdown() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
                 _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
-                result = run_daemon_dfs_maintenance_tick_on_runtime(
-                    &paths,
-                    &tick_runtime,
-                    node_resources,
+                result = until_shutdown_observed(
+                    run_daemon_dfs_maintenance_tick_on_runtime(
+                        &paths,
+                        &tick_runtime,
+                        node_resources,
+                    ),
+                    &cancellation_owner,
+                    &shutdown_state,
                 ) => result,
             }
         });
@@ -1271,6 +1276,30 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
         address: "DFS maintenance".to_string(),
         detail: format!("DFS maintenance blocking task ended without a result: {source}"),
     })?
+}
+
+/// Poll a maintenance turn that runs long synchronous stretches on the calling
+/// thread. A shutdown signalled during one of those stretches ends the turn
+/// when that poll returns: the wake it delivered can arrive while the select
+/// is already being polled, and the select would otherwise sleep until a
+/// later wake, such as the turn's own readiness deadline.
+async fn until_shutdown_observed<F>(
+    turn: F,
+    host: &DfsRuntimeHost,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError>
+where
+    F: std::future::Future<Output = Result<DaemonDfsMaintenanceTickOutcome, DaemonError>>,
+{
+    let mut turn = std::pin::pin!(turn);
+    std::future::poll_fn(|cx| match turn.as_mut().poll(cx) {
+        std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+        std::task::Poll::Pending if host.is_shutting_down() || *shutdown.borrow() => {
+            std::task::Poll::Ready(Ok(DaemonDfsMaintenanceTickOutcome::Deferred))
+        }
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    })
+    .await
 }
 
 pub(super) fn daemon_dfs_routine_maintenance_tick_options(

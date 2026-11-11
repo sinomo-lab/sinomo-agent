@@ -646,6 +646,10 @@ impl DfsRuntimeHost {
         }
     }
 
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.is_cancelled()
+    }
+
     pub(crate) async fn wait_for_shutdown(&self) {
         // Register before reading the flag so shutdown cannot be lost between
         // that read and the first poll. The flag also covers children started
