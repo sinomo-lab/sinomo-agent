@@ -331,6 +331,22 @@ socket or successful delivery. An operator-facing `routed reachable` state is
 backed by a current established routed session; otherwise the state is
 `candidate`, `unknown`, or `unreachable` with its observation time.
 
+Routing classifies from evidence. A candidate requires a path whose edges carry
+no failure verdict. An unobserved endpoint that a local transport module can
+dial carries none, so it is a direct candidate like an unverified edge, though
+never a relay hop. A last-resort dial over an edge already judged unreachable
+remains an attempt routing may make, but it is not a candidate: when such dials
+are all that remain, the state is no path. With neither a candidate nor failure
+evidence about an edge into the destination, the state is unknown.
+
+Routing also keeps each node's verdict for every authorized peer, computed from
+the same snapshots that dispatch uses, and notifies subscribers of the peers
+whose verdict changed. These verdicts describe one observer's view. They live
+in that process's memory, change only when a route input changes and never when
+evidence is merely refreshed, and are never published as membership, presence,
+or offline authority. A domain that acts on another node's loss combines them
+with corroboration and its own authority checks.
+
 ### Routable Connected Components
 
 Routing derives connected components from the authorized directory, current
@@ -505,6 +521,19 @@ succeeds:
 
 This boundary prevents carrier or relay failures from automatically replaying a
 possibly executed RPC operation.
+
+A failed establishment or a broken stream also asks the node's connectivity
+probe owner to verify that peer's direct edges at once, instead of waiting for
+the next scheduled probe. The same applies when a delivery succeeds while the
+node's verdict says there is no path. Verification probes only that peer and is
+re-probed on network-owned spacing until it reaches a verdict or its bound. It
+never changes the regular probe cadence. A request is not evidence: only the
+probe observation changes connectivity.
+
+Only the network's own verdicts are failure evidence: a connect failure or
+refusal, a disconnect, or the no-progress limit. A caller's whole-call deadline
+and a slow but progressing reply are never failure evidence. A probe still
+answering when its maintenance budget ends records nothing.
 
 ## Object-RPC Contract
 
@@ -687,7 +716,9 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
    catalogs, body modes, or domain retry policy.
 3. Connectivity publishes immutable directed direct-edge evidence and never
    grants membership, derives transitive reachability, executes routes, or turns
-   one observer's failure into global offline authority.
+   one observer's failure into global offline authority. Routing's per-peer
+   verdicts stay observer-scoped in the same way, and slowness is never failure
+   evidence.
 4. Every path emitted by the planner is executable by the routed-session
    executor under the same directory, edge-capability, and relay assumptions.
    Graph reachability that fails realization produces specific edge feedback.

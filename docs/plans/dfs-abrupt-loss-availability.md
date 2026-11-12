@@ -84,10 +84,6 @@ The implementation differs from these requirements:
   service reopen.
 - Members keep no durable record of the highest epoch they have promised, and
   acknowledgement floors are not scoped to an epoch.
-- The network layer announces route changes with a bare generation counter that
-  does not name the peer. Failed deliveries leave short-lived evidence that
-  nothing can subscribe to; otherwise unreachability waits for the periodic
-  probe.
 - A caller whose primary is unreachable fails at the first network error unless
   the shard record already names a new primary.
 - Namespace-job resume selects jobs on every locally replicated shard rather than

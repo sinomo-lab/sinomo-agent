@@ -309,6 +309,7 @@ impl NetworkModuleRegistry {
     fn advance_routing_generation(&self) {
         self.routing_generation
             .store(next_network_module_routing_generation(), Ordering::Release);
+        crate::route_input_watch::notify_all_route_inputs_changed();
     }
 
     /// Monotonic process-local generation of this registry's role and
@@ -732,6 +733,8 @@ static NETWORK_MODULE_REGISTRY: LazyLock<ArcSwap<Option<Arc<NetworkModuleRegistr
 pub fn set_network_module_registry(registry: Arc<NetworkModuleRegistry>) {
     registry.advance_routing_generation();
     NETWORK_MODULE_REGISTRY.store(Arc::new(Some(registry)));
+    // The advance above woke consumers before the new registry was visible.
+    crate::route_input_watch::notify_all_route_inputs_changed();
 }
 
 /// The process-wide network-module registry, when one has been installed.

@@ -386,10 +386,13 @@ fn store_cluster_route_graph_cache_entry(
     );
 }
 
+/// Discards the cached route graph for `paths` after a committed directory
+/// input changed, and wakes route-input consumers to re-check their inputs.
 pub fn invalidate_cluster_route_graph_cache(paths: &ClusterPaths) {
     if let Ok(mut cache) = CLUSTER_ROUTE_GRAPHS.lock() {
         cache.remove(&paths.root);
     }
+    crate::route_input_watch::notify_route_input_changed(&paths.root);
 }
 
 fn evict_cluster_route_graph_cache_entry_if_needed(

@@ -245,6 +245,108 @@ level 2. Record the binary hash, source patch, and Cargo profile configuration
 with performance artifacts; a build without those overrides is a different build
 identity.
 
+## Peer Reachability and Connectivity Verification
+
+`peer_reachability.rs` classifies every authorized peer with
+`routing.rs peer_path_classifications`. Its inputs are the directory routing
+snapshot, the committed edges of every source and this process's local-source
+overlay, which is the capture `call_target` plans against.
+`MultiHopRoutedConnector::availability` uses the same classifier.
+
+| Verdict | Condition |
+|---|---|
+| `Path` (`Candidate`) | A direct admissible edge that is not unreachable, a direct endpoint a registered local module dials and this node has no observation for, or a relay-forwarding path within the planner's hop limit. Healthy, below-threshold degraded and unverified edges count; module endpoints are never relay hops. |
+| `NoPath` | No such path, and at least one unreachable edge into the peer from this node or from a relay it can reach. |
+| `Unknown` | Neither a candidate nor failure evidence about an edge into the peer, or snapshots from different directory generations. |
+
+The planner's unobserved-module bucket and the classifier share
+`unobserved_module_endpoint_role`: an endpoint qualifies when it is not
+local-only, not a built-in probe target, has no observation from this source,
+and a registered module reports a known role for it.
+
+`subscribe_peer_reachability` registers for route-input hints before its first
+read. Hints come from the local store's routing-generation bump, committed
+directory invalidation (`invalidate_cluster_route_graph_cache`), the
+network-module registry and the verification registry. On a hint, the
+subscriber compares the directory routing version and the local, module and
+verification generations with its memoized inputs. It recomputes, once per
+process for all subscribers, only when one of them moved or the earliest edge
+expiry the memo used has passed. Expiry alone schedules nothing; the next hint
+or point read reflects it. `changed()` returns
+the peers whose entry (verdict, `verifying`, `relayed_only`) differs from that
+subscriber's previous snapshot, so a lagged hint loses nothing. Without a
+subscriber nothing is computed, and `peer_reachability_snapshot` computes on
+demand without retaining a view.
+
+The Main daemon publishes `host.network.peer.reachability.changed` (schema
+`sinomo.component-host.peer-reachability` 1.0.0) once per changed peer, as a
+transient, local, private component-host event. The payload carries the
+observer, peer, previous and current entries, the snapshot generation, the
+moved inputs as causes, and the input generations as evidence. Consumers read
+state from the subscription; the event bus may drop events on lag.
+
+Verification requests come from the terminal outcome of `call_target` once a
+dial has started, endpoint calls, a prepared connector's first-hop realization
+failures and the relay's outbound-edge sink. Route preparation failures before
+a dial, such as an unreadable session identity or connectivity cache, request
+nothing:
+
+| Cause | Source |
+|---|---|
+| `DeliveryFailed` | `Timeout{Connect}`, `RetryExhausted`, `DeliveryFailed` (refused, reset, disconnect, idle no-progress), `Io` |
+| `DeliveryDeadline` (weak) | `Timeout{Overall}` with `DefinitelyNotSent` |
+| `DeliverySucceeded` | A delivery succeeded while a subscribed verdict for the peer is `NoPath` |
+| `Requested` | `request_peer_verification` from a service |
+
+A reached-but-slow `Timeout{Overall}` and authorization or application errors
+request nothing. Probe calls opt out with
+`ClusterObjectRpcOptions::without_peer_verification`.
+
+The registry (`connectivity_verification.rs`) accepts requests only while a
+probe owner is registered for the root; each daemon process registers its own.
+Requests coalesce per peer, keeping the strongest cause, and at most 256 stay
+pending per root. The owner's wake sets the `PeerVerificationRequested` dirty
+bit. `ClusterPeerVerificationCadence` in `sinomo-cluster` then starts one
+episode per peer. A weak request is ignored for 30 seconds after an episode
+reached the peer.
+
+Each round probes every local endpoint of the peer, including endpoints a
+registered network module dials. Rounds rank ahead of regular targets under the
+same per-tick caps. A round that needs no regular probe runs as a
+verification-only batch, which leaves `last_probe`, convergence, forced-probe
+state and due-class claims untouched. Spacing after a round is 1 second, then
+2 seconds (2 and 4 seconds on mobile and sensor roles), and machine-level probe
+backoff holds rounds.
+
+An episode settles when:
+
+- an endpoint answers with no failures;
+- every planned endpoint is at the failure threshold, which takes at most three
+  failing rounds under the single-failure grace;
+- three rounds produced no observation; or
+- six rounds have run.
+
+A failure-driven first round for a peer whose planned endpoints are all already
+unreachable settles without probing.
+
+Every connectivity probe, periodic or verification, is a status RPC under the
+connect and no-progress limits of `NetworkHealthPolicy`, with no whole-call
+deadline. A batch has its own budget: the pending-step bound less 250 ms. Its
+probe concurrency covers the largest per-tick cap, so a batch is one wave and an
+endpoint that runs to the connect limit still records its failure within the
+budget. An endpoint still answering when that budget ends records nothing
+(inconclusive) instead of a failure.
+
+Every module endpoint of an authorized member is an active probe key, so
+verification evidence for it survives later regular batches, but only built-in
+endpoints are ever regularly due and only those records schedule renewal. The
+regular seed never copies module evidence back into a batch. Main schedules one
+wake at the earliest expiry of records no regular probe renews;
+`remove_expired_local_cluster_connectivity_source_records` then removes those
+expired in both the persisted and in-memory views, once, and the source's
+publication withdraws the committed copy. A record renewed in memory by a later
+command outcome is kept.
+
 ## Implementation Boundaries
 
 The compile-adjacent checks in `layer_boundary_tests.rs` enforce the dependency

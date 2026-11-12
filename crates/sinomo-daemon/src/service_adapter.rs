@@ -778,6 +778,120 @@ fn publish_component_host_change(paths: &DaemonPaths, kind: &str, reason: &str) 
     }
 }
 
+fn peer_reachability_event_entry(
+    entry: Option<&sinomo_core::network::PeerReachability>,
+) -> serde_json::Value {
+    entry.map_or(serde_json::Value::Null, |entry| {
+        serde_json::json!({
+            "verdict": entry.verdict,
+            "verifying": entry.verifying,
+            "relayed_only": entry.relayed_only,
+        })
+    })
+}
+
+/// Which route inputs moved between two reachability snapshots.
+fn peer_reachability_event_causes(
+    previous: &sinomo_core::network::PeerReachabilityInputs,
+    current: &sinomo_core::network::PeerReachabilityInputs,
+) -> Vec<&'static str> {
+    [
+        (
+            previous.local_routing_generation != current.local_routing_generation,
+            "local-edge",
+        ),
+        (
+            previous.directory_routing_version != current.directory_routing_version,
+            "committed-directory",
+        ),
+        (
+            previous.module_routing_generation != current.module_routing_generation,
+            "module",
+        ),
+        (
+            previous.verification_generation != current.verification_generation,
+            "verification",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(moved, cause)| moved.then_some(cause))
+    .collect()
+}
+
+/// The component-host event for one changed peer verdict. It is local,
+/// transient and observer-scoped: it reports this node's routed availability
+/// of the peer, never that the peer is offline for the cluster.
+fn component_host_peer_reachability_event(
+    paths: &DaemonPaths,
+    previous: &sinomo_core::network::PeerReachabilitySnapshot,
+    current: &sinomo_core::network::PeerReachabilitySnapshot,
+    change: &sinomo_core::network::PeerReachabilityChange,
+) -> sinomo_module::ComponentEvent {
+    sinomo_module::ComponentEvent {
+        publisher: sinomo_module::ComponentEventPublisher {
+            component_id: "sinomo.component-host".to_string(),
+            component_version: env!("CARGO_PKG_VERSION").to_string(),
+            artifact_id: None,
+            artifact_generation: 0,
+        },
+        schema_id: sinomo_module::COMPONENT_HOST_PEER_REACHABILITY_EVENT_SCHEMA_ID.to_string(),
+        schema_version: sinomo_module::COMPONENT_HOST_PEER_REACHABILITY_EVENT_SCHEMA_VERSION
+            .to_string(),
+        envelope: sinomo_core::EventEnvelope::new(
+            sinomo_core::Id::generate(),
+            time::OffsetDateTime::now_utc(),
+            sinomo_core::Id::derived(
+                "sinomo.component-host.local",
+                paths.root.display().to_string().as_bytes(),
+            ),
+            sinomo_core::Source::new("component/sinomo.component-host")
+                .expect("static component-host source"),
+            sinomo_core::EventKind::new(
+                sinomo_module::COMPONENT_HOST_PEER_REACHABILITY_CHANGED_EVENT_KIND,
+            )
+            .expect("static peer reachability event kind"),
+            sinomo_core::Salience::new(0.2).expect("static component-host salience"),
+            sinomo_core::Confidence::new(1.0).expect("static component-host confidence"),
+            sinomo_core::RoutingMetadata::new(
+                sinomo_core::RoutingScope::Local,
+                sinomo_core::LatencyClass::Reactive,
+                sinomo_core::PrivacyClass::Private,
+            ),
+        )
+        .with_payload(serde_json::json!({
+            "cluster_id": current.cluster_id,
+            "observer_node_id": current.observer_node_id,
+            "peer_node_id": change.peer_node_id,
+            "generation": current.generation,
+            "previous": peer_reachability_event_entry(change.previous.as_ref()),
+            "current": peer_reachability_event_entry(change.current.as_ref()),
+            "causes": peer_reachability_event_causes(&previous.inputs, &current.inputs),
+            "evidence": {
+                "directory_routing_version": current.inputs.directory_routing_version,
+                "local_routing_generation": current.inputs.local_routing_generation,
+                "module_routing_generation": current.inputs.module_routing_generation,
+                "verification_generation": current.inputs.verification_generation,
+            },
+        })),
+    }
+}
+
+pub(crate) fn publish_component_host_peer_reachability_change(
+    paths: &DaemonPaths,
+    previous: &sinomo_core::network::PeerReachabilitySnapshot,
+    current: &sinomo_core::network::PeerReachabilitySnapshot,
+    change: &sinomo_core::network::PeerReachabilityChange,
+) {
+    let event = component_host_peer_reachability_event(paths, previous, current, change);
+    if let Err(error) = publish_component_event_for_paths(
+        paths,
+        event,
+        sinomo_module::ComponentEventDurability::Transient,
+    ) {
+        tracing::warn!(%error, peer = %change.peer_node_id, "peer reachability event publication failed");
+    }
+}
+
 impl crate::host_api::DaemonOperationsHost for DaemonOperationsServiceHost {
     fn is_shadow(&self) -> bool {
         crate::daemon_paths_are_shadow(&self.paths)

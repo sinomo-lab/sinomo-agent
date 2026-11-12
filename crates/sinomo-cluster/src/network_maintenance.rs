@@ -1,13 +1,21 @@
 use sinomo_base::ClusterNodeRole;
 use sinomo_network::{
-    CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL, ClusterNetworkMaintenanceSchedule,
+    CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL, CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS,
+    CLUSTER_PEER_VERIFICATION_MAX_ROUNDS, CLUSTER_PEER_VERIFICATION_WEAK_COOLDOWN,
+    ClusterNetworkMaintenanceSchedule, PeerVerificationCause,
     cluster_network_discovery_interval_for_role, cluster_network_maintenance_interval_remaining,
     cluster_network_maintenance_last_timestamp_for_next_due,
     cluster_network_probe_interval_for_role, cluster_network_publish_interval_for_role,
+    cluster_peer_verification_retry_spacing_for_role,
 };
+use sinomo_node::NodeId;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
+/// Delay after an unrenewed record's expiry before its owner removes it, so a
+/// slightly early wake never finds the record still live.
+pub const CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE: Duration = Duration::from_secs(1);
 /// Longest retry delay for a failed cluster-network maintenance due class.
 pub const CLUSTER_NETWORK_MAINTENANCE_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
 /// First retry delay for a failed cluster-network maintenance due class.
@@ -65,6 +73,168 @@ pub fn cluster_connectivity_probe_result_needs_followup(
     remaining_due > 0 || (convergence_active && probed_degraded)
 }
 
+/// Result of one verification round for one peer, judged by the network's
+/// own connect, disconnect and no-progress verdicts only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterPeerVerificationRound {
+    /// A local direct edge to the peer answered.
+    Reached,
+    /// Every local direct edge to the peer is at the failure threshold.
+    Exhausted,
+    /// Failure evidence is still below the threshold.
+    Continue,
+    /// The round produced no observation, for example because the
+    /// maintenance budget ended before the probe completed.
+    Inconclusive,
+}
+
+/// How a verification episode ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterPeerVerificationSettlement {
+    Reached,
+    Exhausted,
+    Inconclusive,
+    RoundLimit,
+    Cancelled,
+}
+
+/// One peer's running verification episode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterPeerVerificationEpisode {
+    pub episode_id: u64,
+    pub cause: PeerVerificationCause,
+    /// Rounds started so far.
+    pub rounds: u8,
+    pub inconclusive_rounds: u8,
+    /// When the next round may start. Set when a round starts, so a round
+    /// whose outcome never arrives still counts and is retried.
+    pub next_at: Instant,
+}
+
+/// Owner-side schedule of peer verification episodes.
+///
+/// An episode starts only from a request (a failed or contradicting delivery,
+/// or an explicit service request), runs rounds under network-owned re-probe
+/// spacing, and ends at a verdict or a bound. It never touches the regular
+/// probe cadence, so an idle cluster has no episode and no timer.
+#[derive(Clone, Debug, Default)]
+pub struct ClusterPeerVerificationCadence {
+    episodes: BTreeMap<NodeId, ClusterPeerVerificationEpisode>,
+    reached_at: BTreeMap<NodeId, Instant>,
+    next_episode_id: u64,
+}
+
+impl ClusterPeerVerificationCadence {
+    /// Starts an episode for `peer` unless one is running. Returns whether a
+    /// new episode started. A weak request is ignored while a recent episode
+    /// for the same peer found a path.
+    pub fn request(&mut self, peer: NodeId, cause: PeerVerificationCause, now: Instant) -> bool {
+        self.reached_at.retain(|_, reached| {
+            now.saturating_duration_since(*reached) < CLUSTER_PEER_VERIFICATION_WEAK_COOLDOWN
+        });
+        if let Some(episode) = self.episodes.get_mut(&peer) {
+            episode.cause = episode.cause.max(cause);
+            return false;
+        }
+        if cause.is_weak() && self.reached_at.contains_key(&peer) {
+            return false;
+        }
+        self.next_episode_id = self.next_episode_id.wrapping_add(1);
+        self.episodes.insert(
+            peer,
+            ClusterPeerVerificationEpisode {
+                episode_id: self.next_episode_id,
+                cause,
+                rounds: 0,
+                inconclusive_rounds: 0,
+                next_at: now,
+            },
+        );
+        true
+    }
+
+    pub fn episode(&self, peer: &NodeId) -> Option<&ClusterPeerVerificationEpisode> {
+        self.episodes.get(peer)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.episodes.is_empty()
+    }
+
+    /// Peers whose next round may start now.
+    pub fn due_peers(&self, now: Instant) -> BTreeSet<NodeId> {
+        self.episodes
+            .iter()
+            .filter(|(_, episode)| episode.next_at <= now)
+            .map(|(peer, _)| peer.clone())
+            .collect()
+    }
+
+    /// Starts a round for each of `peers` and schedules the next one.
+    pub fn begin_rounds(&mut self, peers: &BTreeSet<NodeId>, role: &ClusterNodeRole, now: Instant) {
+        for peer in peers {
+            if let Some(episode) = self.episodes.get_mut(peer) {
+                episode.rounds = episode.rounds.saturating_add(1);
+                episode.next_at =
+                    now + cluster_peer_verification_retry_spacing_for_role(role, episode.rounds);
+            }
+        }
+    }
+
+    /// Records a round's result. Returns the settlement when the episode ended.
+    pub fn record_round(
+        &mut self,
+        peer: &NodeId,
+        round: ClusterPeerVerificationRound,
+        now: Instant,
+    ) -> Option<ClusterPeerVerificationSettlement> {
+        let episode = self.episodes.get_mut(peer)?;
+        let settlement = match round {
+            ClusterPeerVerificationRound::Reached => {
+                Some(ClusterPeerVerificationSettlement::Reached)
+            }
+            ClusterPeerVerificationRound::Exhausted => {
+                Some(ClusterPeerVerificationSettlement::Exhausted)
+            }
+            ClusterPeerVerificationRound::Inconclusive => {
+                episode.inconclusive_rounds = episode.inconclusive_rounds.saturating_add(1);
+                (episode.inconclusive_rounds >= CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS)
+                    .then_some(ClusterPeerVerificationSettlement::Inconclusive)
+            }
+            ClusterPeerVerificationRound::Continue => None,
+        }
+        .or_else(|| {
+            (episode.rounds >= CLUSTER_PEER_VERIFICATION_MAX_ROUNDS)
+                .then_some(ClusterPeerVerificationSettlement::RoundLimit)
+        });
+        if let Some(settlement) = settlement {
+            self.episodes.remove(peer);
+            if settlement == ClusterPeerVerificationSettlement::Reached {
+                self.reached_at.insert(peer.clone(), now);
+            }
+        }
+        settlement
+    }
+
+    /// Ends `peer`'s episode without a verdict. Returns whether one existed.
+    pub fn cancel(&mut self, peer: &NodeId) -> bool {
+        self.episodes.remove(peer).is_some()
+    }
+
+    /// Ends every episode, returning the affected peers.
+    pub fn cancel_all(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.episodes).into_keys().collect()
+    }
+
+    /// Time until the earliest round may start, if any episode is running.
+    pub fn next_due_duration(&self, now: Instant) -> Option<Duration> {
+        self.episodes
+            .values()
+            .map(|episode| episode.next_at.saturating_duration_since(now))
+            .min()
+    }
+}
+
 impl ClusterNetworkMaintenanceDueClaims {
     pub fn is_empty(self) -> bool {
         !(self.publish || self.probe || self.discovery || self.connectivity_publish)
@@ -104,6 +274,13 @@ pub struct ClusterNetworkMaintenanceCadence {
     pub last_discovery: Instant,
     pub last_probe: Instant,
     pub active_due_claims: ClusterNetworkMaintenanceDueClaims,
+    /// Peer verification episodes. Independent of every due class above.
+    pub peer_verification: ClusterPeerVerificationCadence,
+    /// When the earliest accepted record that no regular probe renews (a
+    /// module endpoint observed by verification or a command) expires. One
+    /// wake at that moment lets the owner remove it from its source set once.
+    /// It is not a renewal and never claims a due class.
+    pub unrenewed_connectivity_expiry_at: Option<Instant>,
 }
 
 impl ClusterNetworkMaintenanceCadence {
@@ -144,6 +321,8 @@ impl ClusterNetworkMaintenanceCadence {
             last_discovery,
             last_probe,
             active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
+            peer_verification: ClusterPeerVerificationCadence::default(),
+            unrenewed_connectivity_expiry_at: None,
         }
     }
 
@@ -219,7 +398,64 @@ impl ClusterNetworkMaintenanceCadence {
                 cluster_network_discovery_interval_for_role(&self.local_node_role),
             )
         };
-        publish_due.min(probe_due).min(discovery_due)
+        publish_due
+            .min(probe_due)
+            .min(discovery_due)
+            .min(
+                self.peer_verification_due_duration(now)
+                    .unwrap_or(Duration::MAX),
+            )
+            .min(
+                self.unrenewed_connectivity_expiry_at
+                    .map_or(Duration::MAX, |at| at.saturating_duration_since(now)),
+            )
+    }
+
+    /// Schedules the one wake for the earliest of `expiries`, accepted records
+    /// that no regular probe renews. The wake lands just after the expiry so
+    /// the record has left every view when the owner removes it.
+    pub fn observe_unrenewed_connectivity_expiries(
+        &mut self,
+        expiries: impl IntoIterator<Item = OffsetDateTime>,
+        wall_now: OffsetDateTime,
+        now: Instant,
+    ) {
+        self.unrenewed_connectivity_expiry_at = expiries.into_iter().min().map(|expiry| {
+            let remaining = Duration::try_from(expiry - wall_now).unwrap_or(Duration::ZERO);
+            now + remaining + CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE
+        });
+    }
+
+    /// Consumes the unrenewed-expiry wake when it is due.
+    pub fn take_unrenewed_connectivity_expiry(&mut self, now: Instant) -> bool {
+        if self.unrenewed_connectivity_expiry_due(now) {
+            self.unrenewed_connectivity_expiry_at = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn unrenewed_connectivity_expiry_due(&self, now: Instant) -> bool {
+        self.unrenewed_connectivity_expiry_at
+            .is_some_and(|at| at <= now)
+    }
+
+    /// Time until a verification round may run. Machine-level probe backoff
+    /// holds verification rounds too.
+    pub fn peer_verification_due_duration(&self, now: Instant) -> Option<Duration> {
+        let due = self.peer_verification.next_due_duration(now)?;
+        Some(match self.probe_retry_at {
+            Some(retry_at) if retry_at > now => due.max(retry_at.saturating_duration_since(now)),
+            _ => due,
+        })
+    }
+
+    /// Peers whose verification round may run now.
+    pub fn peer_verifications_due(&self, now: Instant) -> BTreeSet<NodeId> {
+        if self.probe_retry_waiting(now) {
+            return BTreeSet::new();
+        }
+        self.peer_verification.due_peers(now)
     }
 
     pub fn observe_accepted_connectivity_expiries(
@@ -731,6 +967,233 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn verification_peer(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).expect("peer id")
+    }
+
+    #[test]
+    fn peer_verification_rounds_are_spaced_and_end_at_a_verdict() {
+        let start = Instant::now();
+        let mut cadence =
+            ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Workstation);
+        cadence.connectivity_converged = true;
+        cadence.last_publish = start;
+        cadence.last_discovery = start;
+        cadence.last_probe = start;
+        let before = (
+            cadence.last_probe,
+            cadence.connectivity_converged,
+            cadence.connectivity_force_probe,
+            cadence.probe_retry_at,
+            cadence.connectivity_input_generation,
+        );
+        let peer = verification_peer("node_cadence_verification_peer");
+        assert!(cadence.peer_verification.request(
+            peer.clone(),
+            PeerVerificationCause::DeliveryFailed,
+            start
+        ));
+        assert!(
+            !cadence.peer_verification.request(
+                peer.clone(),
+                PeerVerificationCause::DeliveryFailed,
+                start
+            ),
+            "a running episode absorbs repeated requests"
+        );
+        assert_eq!(
+            before,
+            (
+                cadence.last_probe,
+                cadence.connectivity_converged,
+                cadence.connectivity_force_probe,
+                cadence.probe_retry_at,
+                cadence.connectivity_input_generation,
+            ),
+            "verification never moves the regular probe cadence"
+        );
+        assert_eq!(cadence.next_due_duration(start, false), Duration::ZERO);
+        let due = cadence.peer_verifications_due(start);
+        assert_eq!(due, BTreeSet::from([peer.clone()]));
+
+        cadence
+            .peer_verification
+            .begin_rounds(&due, &ClusterNodeRole::Workstation, start);
+        assert!(cadence.peer_verifications_due(start).is_empty());
+        assert_eq!(
+            cadence.peer_verification.record_round(
+                &peer,
+                ClusterPeerVerificationRound::Continue,
+                start
+            ),
+            None
+        );
+        assert_eq!(
+            cadence.next_due_duration(start, false),
+            Duration::from_secs(1)
+        );
+        let second = start + Duration::from_secs(1);
+        cadence
+            .peer_verification
+            .begin_rounds(&due, &ClusterNodeRole::Workstation, second);
+        assert_eq!(
+            cadence.peer_verification_due_duration(second),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            cadence.peer_verification.record_round(
+                &peer,
+                ClusterPeerVerificationRound::Exhausted,
+                second
+            ),
+            Some(ClusterPeerVerificationSettlement::Exhausted)
+        );
+        assert!(cadence.peer_verification.is_empty());
+        assert!(cadence.peer_verification_due_duration(second).is_none());
+        assert!(
+            cadence.next_due_duration(second, false) > Duration::from_secs(60),
+            "a settled episode leaves no verification wake behind"
+        );
+    }
+
+    #[test]
+    fn peer_verification_is_bounded_and_mobile_spacing_is_wider() {
+        let start = Instant::now();
+        let mut cadence = ClusterPeerVerificationCadence::default();
+        let peer = verification_peer("node_cadence_verification_bounded");
+        cadence.request(peer.clone(), PeerVerificationCause::Requested, start);
+        let peers = BTreeSet::from([peer.clone()]);
+        let mut now = start;
+        let mut settlement = None;
+        for round in 0..CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS {
+            cadence.begin_rounds(&peers, &ClusterNodeRole::Mobile, now);
+            let next = cadence.episode(&peer).expect("episode").next_at;
+            assert_eq!(
+                next - now,
+                if round == 0 {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(4)
+                }
+            );
+            settlement =
+                cadence.record_round(&peer, ClusterPeerVerificationRound::Inconclusive, now);
+            now = next;
+        }
+        assert_eq!(
+            settlement,
+            Some(ClusterPeerVerificationSettlement::Inconclusive)
+        );
+
+        // Rounds whose outcome never arrives still count against the bound.
+        cadence.request(peer.clone(), PeerVerificationCause::DeliveryFailed, now);
+        for _ in 0..CLUSTER_PEER_VERIFICATION_MAX_ROUNDS - 1 {
+            cadence.begin_rounds(&peers, &ClusterNodeRole::Workstation, now);
+        }
+        cadence.begin_rounds(&peers, &ClusterNodeRole::Workstation, now);
+        assert_eq!(
+            cadence.record_round(&peer, ClusterPeerVerificationRound::Continue, now),
+            Some(ClusterPeerVerificationSettlement::RoundLimit)
+        );
+    }
+
+    #[test]
+    fn weak_requests_yield_to_a_recent_reached_verdict_and_backoff_holds_rounds() {
+        let start = Instant::now();
+        let mut cadence =
+            ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Workstation);
+        let peer = verification_peer("node_cadence_verification_weak");
+        let peers = BTreeSet::from([peer.clone()]);
+        cadence.peer_verification.request(
+            peer.clone(),
+            PeerVerificationCause::DeliveryDeadline,
+            start,
+        );
+        cadence
+            .peer_verification
+            .begin_rounds(&peers, &ClusterNodeRole::Workstation, start);
+        assert_eq!(
+            cadence.peer_verification.record_round(
+                &peer,
+                ClusterPeerVerificationRound::Reached,
+                start
+            ),
+            Some(ClusterPeerVerificationSettlement::Reached)
+        );
+        let soon = start + Duration::from_secs(5);
+        assert!(!cadence.peer_verification.request(
+            peer.clone(),
+            PeerVerificationCause::DeliveryDeadline,
+            soon
+        ));
+        assert!(
+            cadence.peer_verification.request(
+                peer.clone(),
+                PeerVerificationCause::DeliveryFailed,
+                soon
+            ),
+            "a network failure is verified at once"
+        );
+        cadence.probe_retry_at = Some(soon + Duration::from_secs(7));
+        assert!(cadence.peer_verifications_due(soon).is_empty());
+        assert_eq!(
+            cadence.peer_verification_due_duration(soon),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(cadence.peer_verification.cancel_all(), vec![peer]);
+        let later = start + CLUSTER_PEER_VERIFICATION_WEAK_COOLDOWN + Duration::from_secs(1);
+        assert!(cadence.peer_verification.request(
+            verification_peer("node_cadence_verification_weak"),
+            PeerVerificationCause::DeliveryDeadline,
+            later
+        ));
+    }
+
+    #[test]
+    fn unrenewed_expiry_is_one_wake_that_never_claims_a_due_class() {
+        let start = Instant::now();
+        let wall = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let mut cadence =
+            ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Workstation);
+        cadence.connectivity_converged = true;
+        cadence.last_publish = start;
+        cadence.last_discovery = start;
+        cadence.last_probe = start;
+        cadence.observe_unrenewed_connectivity_expiries(
+            [
+                wall + time::Duration::seconds(30),
+                wall + time::Duration::seconds(10),
+            ],
+            wall,
+            start,
+        );
+        let wake = start + Duration::from_secs(10) + CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE;
+        assert_eq!(cadence.unrenewed_connectivity_expiry_at, Some(wake));
+        assert_eq!(
+            cadence.next_due_duration(start, false),
+            wake - start,
+            "the earliest unrenewed expiry is the next wake"
+        );
+        assert!(!cadence.take_unrenewed_connectivity_expiry(start));
+        assert!(cadence.take_unrenewed_connectivity_expiry(wake));
+        assert!(cadence.unrenewed_connectivity_expiry_at.is_none());
+        assert!(!cadence.has_active_due_claims());
+        assert!(cadence.connectivity_renewal_at.is_none());
+        assert!(cadence.next_due_duration(wake, false) > Duration::from_secs(60));
+
+        // Already expired everywhere: due at once, then gone after removal.
+        cadence.observe_unrenewed_connectivity_expiries(
+            [wall - time::Duration::seconds(5)],
+            wall,
+            start,
+        );
+        assert!(cadence.unrenewed_connectivity_expiry_due(
+            start + CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE
+        ));
+        cadence.observe_unrenewed_connectivity_expiries(None, wall, start);
+        assert!(cadence.unrenewed_connectivity_expiry_at.is_none());
     }
 
     fn renewal_cadence(now: Instant) -> ClusterNetworkMaintenanceCadence {

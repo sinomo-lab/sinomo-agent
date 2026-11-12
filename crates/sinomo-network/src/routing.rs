@@ -231,6 +231,208 @@ fn directory_contains_endpoint(
         })
 }
 
+/// Whether `observation` is an edge route planning may consider at all,
+/// regardless of its reachability state.
+fn route_edge_admissible(
+    directory: &DirectorySnapshot,
+    observation: &DirectConnectivityObservation,
+    constraints: RouteConstraints,
+) -> bool {
+    directory.is_authorized(&observation.source_node_id)
+        && directory.is_authorized(&observation.target_node_id)
+        && directory_contains_endpoint(directory, observation)
+        && constraints.accepts(observation)
+}
+
+/// Directed adjacency of every admissible edge that evidence does not
+/// exclude. Unreachable edges never authorize a path here; the planner's
+/// recovery buckets may still attempt them as a last resort.
+fn route_evidence_adjacency(
+    directory: &DirectorySnapshot,
+    connectivity: &ConnectivitySnapshot,
+    constraints: RouteConstraints,
+) -> BTreeMap<NodeId, Vec<RouteHop>> {
+    let mut adjacency = BTreeMap::<NodeId, Vec<RouteHop>>::new();
+    for observation in connectivity.edges() {
+        if observation.state == DirectConnectivityState::Unreachable
+            || !route_edge_admissible(directory, observation, constraints)
+        {
+            continue;
+        }
+        adjacency
+            .entry(observation.source_node_id.clone())
+            .or_default()
+            .push(RouteHop {
+                source_node_id: observation.source_node_id.clone(),
+                target_node_id: observation.target_node_id.clone(),
+                endpoint: observation.endpoint.clone(),
+                capabilities: observation.capabilities,
+                connectivity_state: observation.state,
+                latency_micros: observation.latency_micros,
+            });
+    }
+    for hops in adjacency.values_mut() {
+        hops.sort_by(|left, right| {
+            left.target_node_id
+                .cmp(&right.target_node_id)
+                .then_with(|| left.endpoint.endpoint_id.cmp(&right.endpoint.endpoint_id))
+        });
+    }
+    adjacency
+}
+
+/// One observer's routed-availability verdict for one peer.
+///
+/// `Path` means routing has at least one candidate whose every edge lacks a
+/// failure verdict: a healthy, below-threshold degraded or unverified edge, or
+/// an unobserved endpoint a local network module can dial. `NoPath` means
+/// failure evidence closes every edge into the peer that the observer could
+/// use. `Unknown` means neither. A recovery dial over an unreachable edge is an
+/// attempt routing still makes, not a path.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PeerPathVerdict {
+    Path,
+    NoPath,
+    Unknown,
+}
+
+impl From<PeerPathVerdict> for RoutedAvailability {
+    fn from(verdict: PeerPathVerdict) -> Self {
+        match verdict {
+            PeerPathVerdict::Path => RoutedAvailability::Candidate,
+            PeerPathVerdict::NoPath => RoutedAvailability::NoPath,
+            PeerPathVerdict::Unknown => RoutedAvailability::Unknown,
+        }
+    }
+}
+
+/// A peer's verdict and whether its only paths cross relays.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PeerPathClassification {
+    pub(crate) verdict: PeerPathVerdict,
+    pub(crate) relayed_only: bool,
+}
+
+/// Classifies every authorized peer of `source` over one immutable snapshot
+/// pair with default route constraints.
+///
+/// A peer is reachable when [`plan_routes`] would return a candidate without
+/// a failure verdict: a direct admissible edge, an unobserved endpoint a local
+/// module can dial, or a relay-forwarding path within the planner's hop limit.
+/// Module endpoints are one-hop only and never extend a relay path. Returns no
+/// peers when `source` is not authorized and `Unknown` for every peer when the
+/// snapshots are from different directory generations.
+pub(crate) fn peer_path_classifications(
+    directory: &DirectorySnapshot,
+    connectivity: &ConnectivitySnapshot,
+    source_node_id: &NodeId,
+) -> BTreeMap<NodeId, PeerPathClassification> {
+    let mut classifications = BTreeMap::new();
+    if !directory.is_authorized(source_node_id) {
+        return classifications;
+    }
+    let peers = directory
+        .nodes()
+        .keys()
+        .filter(|node_id| *node_id != source_node_id);
+    if connectivity.directory_generation() != directory.version().0 {
+        for peer in peers {
+            classifications.insert(
+                peer.clone(),
+                PeerPathClassification {
+                    verdict: PeerPathVerdict::Unknown,
+                    relayed_only: false,
+                },
+            );
+        }
+        return classifications;
+    }
+    let constraints = RouteConstraints::default();
+    let max_hops = constraints.max_hops.min(MAX_ROUTED_SESSION_HOPS);
+    let adjacency = route_evidence_adjacency(directory, connectivity, constraints);
+    let direct_targets = adjacency
+        .get(source_node_id)
+        .map(|hops| {
+            hops.iter()
+                .map(|hop| hop.target_node_id.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    // Multi-hop candidates require relay forwarding on every hop. A breadth-
+    // first walk gives each node its shortest such path, which is simple.
+    let mut relay_hops = BTreeMap::from([(source_node_id.clone(), 0_usize)]);
+    let mut pending = VecDeque::from([source_node_id.clone()]);
+    while let Some(node_id) = pending.pop_front() {
+        let hops_so_far = relay_hops.get(&node_id).copied().unwrap_or(0);
+        if hops_so_far >= max_hops {
+            continue;
+        }
+        for hop in adjacency.get(&node_id).into_iter().flatten() {
+            if !hop.capabilities.relay_forwarding || relay_hops.contains_key(&hop.target_node_id) {
+                continue;
+            }
+            relay_hops.insert(hop.target_node_id.clone(), hops_so_far + 1);
+            pending.push_back(hop.target_node_id.clone());
+        }
+    }
+    let mut failed_sources_by_target = BTreeMap::<&NodeId, BTreeSet<&NodeId>>::new();
+    for observation in connectivity.edges() {
+        if observation.state == DirectConnectivityState::Unreachable
+            && route_edge_admissible(directory, observation, constraints)
+        {
+            failed_sources_by_target
+                .entry(&observation.target_node_id)
+                .or_default()
+                .insert(&observation.source_node_id);
+        }
+    }
+    let registry = constraints
+        .accepts_capabilities(UNOBSERVED_MODULE_ENDPOINT_CAPABILITIES)
+        .then(crate::network_module::network_module_registry)
+        .flatten();
+    for peer in peers {
+        let module_direct = registry.as_ref().is_some_and(|registry| {
+            directory.node(peer).is_some_and(|node| {
+                node.endpoints.iter().any(|endpoint| {
+                    unobserved_module_endpoint_role(
+                        registry,
+                        connectivity,
+                        source_node_id,
+                        peer,
+                        endpoint,
+                    )
+                    .is_some()
+                })
+            })
+        });
+        let direct = direct_targets.contains(peer) || module_direct;
+        let relayed = relay_hops.contains_key(peer);
+        let verdict = if direct || relayed {
+            PeerPathVerdict::Path
+        } else if failed_sources_by_target.get(peer).is_some_and(|sources| {
+            sources.iter().any(|source| {
+                *source == source_node_id
+                    || relay_hops
+                        .get(*source)
+                        .is_some_and(|hops_so_far| *hops_so_far < max_hops)
+            })
+        }) {
+            PeerPathVerdict::NoPath
+        } else {
+            PeerPathVerdict::Unknown
+        };
+        classifications.insert(
+            peer.clone(),
+            PeerPathClassification {
+                verdict,
+                relayed_only: verdict == PeerPathVerdict::Path && !direct,
+            },
+        );
+    }
+    classifications
+}
+
 /// Deterministically plans executable directed paths from immutable directory
 /// and connectivity inputs plus the current local module-dialer registry.
 ///
@@ -280,35 +482,7 @@ fn plan_routes_with_destination_process_affinity(
         };
     }
 
-    let mut adjacency = BTreeMap::<NodeId, Vec<RouteHop>>::new();
-    for observation in connectivity.edges() {
-        if observation.state == DirectConnectivityState::Unreachable
-            || !directory.is_authorized(&observation.source_node_id)
-            || !directory.is_authorized(&observation.target_node_id)
-            || !directory_contains_endpoint(directory, observation)
-            || !constraints.accepts(observation)
-        {
-            continue;
-        }
-        adjacency
-            .entry(observation.source_node_id.clone())
-            .or_default()
-            .push(RouteHop {
-                source_node_id: observation.source_node_id.clone(),
-                target_node_id: observation.target_node_id.clone(),
-                endpoint: observation.endpoint.clone(),
-                capabilities: observation.capabilities,
-                connectivity_state: observation.state,
-                latency_micros: observation.latency_micros,
-            });
-    }
-    for hops in adjacency.values_mut() {
-        hops.sort_by(|left, right| {
-            left.target_node_id
-                .cmp(&right.target_node_id)
-                .then_with(|| left.endpoint.endpoint_id.cmp(&right.endpoint.endpoint_id))
-        });
-    }
+    let adjacency = route_evidence_adjacency(directory, connectivity, constraints);
 
     let mut candidates = Vec::new();
     let mut pending = VecDeque::from([CandidatePath::at_source(source_node_id.clone())]);
@@ -387,6 +561,52 @@ fn plan_routes_with_destination_process_affinity(
     selected
 }
 
+/// Capabilities assumed for an unobserved module endpoint. The module contract
+/// guarantees a full-duplex authenticated stream and nothing more; realization
+/// re-checks the actual link before opening the routed session.
+const UNOBSERVED_MODULE_ENDPOINT_CAPABILITIES: DirectStreamCapabilities =
+    DirectStreamCapabilities {
+        full_duplex: true,
+        relay_forwarding: false,
+        confidential: false,
+        max_concurrent_streams: 1,
+    };
+
+/// Process role of a direct endpoint of `destination` that a registered local
+/// network module can dial and that `source` holds no observation for.
+///
+/// Such an endpoint carries no failure verdict. Routing executes it as a
+/// one-hop candidate and counts it as a path, as it does an unverified edge.
+/// Directory publication is not reachability evidence, so the endpoint never
+/// authorizes relay forwarding; the authenticated link still proves the peer
+/// before any stream is exposed. This one predicate serves the planner and the
+/// per-peer verdict.
+fn unobserved_module_endpoint_role(
+    registry: &crate::network_module::NetworkModuleRegistry,
+    connectivity: &ConnectivitySnapshot,
+    source_node_id: &NodeId,
+    destination_node_id: &NodeId,
+    endpoint: &ClusterEndpointRecord,
+) -> Option<crate::network_module::NetworkModuleEndpointRole> {
+    if endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly
+        || crate::endpoint_selector::cluster_endpoint_is_builtin_probe_target(endpoint)
+    {
+        return None;
+    }
+    let observed = connectivity.edges().iter().any(|observation| {
+        &observation.source_node_id == source_node_id
+            && &observation.target_node_id == destination_node_id
+            && observation.endpoint.endpoint_id == endpoint.endpoint_id
+            && observation.endpoint.transport == endpoint.transport
+            && observation.endpoint.address == endpoint.address
+    });
+    if observed {
+        return None;
+    }
+    let role = registry.endpoint_role(endpoint);
+    (role != crate::network_module::NetworkModuleEndpointRole::Unknown).then_some(role)
+}
+
 /// Adds current directory endpoints owned by an enabled local transport module
 /// when that module cannot participate in the built-in connectivity probe.
 ///
@@ -411,39 +631,26 @@ fn append_unobserved_direct_module_recovery_candidates(
     let Some(destination) = directory.node(destination_node_id) else {
         return;
     };
-    // The module contract guarantees a full-duplex authenticated stream. No
-    // unobserved capability is assumed beyond that; realization re-checks the
-    // actual link before opening the routed session.
-    let conservative_capabilities = DirectStreamCapabilities {
-        full_duplex: true,
-        relay_forwarding: false,
-        confidential: false,
-        max_concurrent_streams: 1,
-    };
-    if !constraints.accepts_capabilities(conservative_capabilities) {
+    if !constraints.accepts_capabilities(UNOBSERVED_MODULE_ENDPOINT_CAPABILITIES) {
         return;
     }
     for endpoint in &destination.endpoints {
-        let endpoint_role = registry.endpoint_role(endpoint);
+        let Some(endpoint_role) = unobserved_module_endpoint_role(
+            &registry,
+            connectivity,
+            source_node_id,
+            destination_node_id,
+            endpoint,
+        ) else {
+            continue;
+        };
         let process_affinity_matches = match destination_process_affinity {
             DestinationProcessAffinity::Any => true,
             DestinationProcessAffinity::MainDaemon => {
                 endpoint_role == crate::network_module::NetworkModuleEndpointRole::MainDaemon
             }
         };
-        let already_observed = connectivity.edges().iter().any(|observation| {
-            &observation.source_node_id == source_node_id
-                && &observation.target_node_id == destination_node_id
-                && observation.endpoint.endpoint_id == endpoint.endpoint_id
-                && observation.endpoint.transport == endpoint.transport
-                && observation.endpoint.address == endpoint.address
-        });
-        if endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly
-            || crate::endpoint_selector::cluster_endpoint_is_builtin_probe_target(endpoint)
-            || already_observed
-            || endpoint_role == crate::network_module::NetworkModuleEndpointRole::Unknown
-            || !process_affinity_matches
-        {
+        if !process_affinity_matches {
             continue;
         }
         retain_ranked_candidate(
@@ -452,7 +659,7 @@ fn append_unobserved_direct_module_recovery_candidates(
                 source_node_id: source_node_id.clone(),
                 target_node_id: destination_node_id.clone(),
                 endpoint: endpoint.clone(),
-                capabilities: conservative_capabilities,
+                capabilities: UNOBSERVED_MODULE_ENDPOINT_CAPABILITIES,
                 // There is no durable reachability observation. Degraded is
                 // the conservative availability exposed on this synthetic
                 // path; the planner's explicit recovery bucket places it
@@ -3585,20 +3792,14 @@ impl RoutedConnector for MultiHopRoutedConnector {
         {
             return RoutedAvailability::NoPath;
         }
+        // The same evidence classification as the per-peer reachability
+        // view, so routing has one definition of "no path".
         let connectivity = self.connectivity.snapshot();
-        if plan_routes(
-            directory,
-            &connectivity,
-            &self.local_node_id,
-            destination_node_id,
-            RouteConstraints::default(),
-        )
-        .is_empty()
-        {
-            RoutedAvailability::NoPath
-        } else {
-            RoutedAvailability::Candidate
-        }
+        peer_path_classifications(directory, &connectivity, &self.local_node_id)
+            .get(destination_node_id)
+            .map_or(RoutedAvailability::Unknown, |classification| {
+                classification.verdict.into()
+            })
     }
 }
 
@@ -4307,6 +4508,356 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].nodes, vec![a.clone(), c.clone()]);
         assert_eq!(paths[1].nodes, vec![a, b, c]);
+    }
+
+    #[test]
+    fn peer_path_verdicts_follow_evidence_not_recovery_dials() {
+        let a = node("node_peer_verdict_a");
+        let b = node("node_peer_verdict_b");
+        let c = node("node_peer_verdict_c");
+        let d = node("node_peer_verdict_d");
+        let e = node("node_peer_verdict_e");
+        let f = node("node_peer_verdict_f");
+        let g = node("node_peer_verdict_g");
+        let h = node("node_peer_verdict_h");
+        let with_state = |mut observation: DirectConnectivityObservation, state| {
+            observation.state = state;
+            observation
+        };
+        let edges = vec![
+            edge(&a, &b, "endpoint_peer_verdict_a_b", 9, 10),
+            // C only through B; A's own edge to C has failed.
+            with_state(
+                edge(&a, &c, "endpoint_peer_verdict_a_c", 9, 10),
+                DirectConnectivityState::Unreachable,
+            ),
+            edge(&b, &c, "endpoint_peer_verdict_b_c", 9, 10),
+            // D: only a stale unreachable direct edge, which the planner
+            // still offers as a recovery dial.
+            with_state(
+                edge(&a, &d, "endpoint_peer_verdict_a_d", 9, 10),
+                DirectConnectivityState::Unreachable,
+            ),
+            // E: the relay's committed statement about its own edge.
+            with_state(
+                edge(&b, &e, "endpoint_peer_verdict_b_e", 9, 10),
+                DirectConnectivityState::Unreachable,
+            ),
+            // F appears only as a source: nothing is known about reaching it.
+            edge(&f, &a, "endpoint_peer_verdict_f_a", 9, 10),
+            with_state(
+                edge(&a, &g, "endpoint_peer_verdict_a_g", 9, 10),
+                DirectConnectivityState::Degraded,
+            ),
+            with_state(
+                edge(&a, &h, "endpoint_peer_verdict_a_h", 9, 10),
+                DirectConnectivityState::Unverified,
+            ),
+        ];
+        install_test_directory_iroh_network_module();
+        // M is dialable only through a local module and was never observed; N's
+        // module endpoint was observed unreachable; Z is reached only from M.
+        let m = node("node_peer_verdict_m");
+        let n = node("node_peer_verdict_n");
+        let z = node("node_peer_verdict_z");
+        let m_module = directory_iroh_endpoint(&m, "peerverdictmkey", false);
+        let mut n_observed = edge(&a, &n, "endpoint_peer_verdict_a_n", 9, 10);
+        n_observed.endpoint = directory_iroh_endpoint(&n, "peerverdictnkey", false);
+        n_observed.state = DirectConnectivityState::Unreachable;
+        let mut edges = edges;
+        edges.push(n_observed);
+        edges.push(edge(&m, &z, "endpoint_peer_verdict_m_z", 9, 10));
+        let (directory, connectivity) = fixtures(9, edges);
+        let directory = DirectorySnapshot::try_new(
+            DirectoryVersion(9),
+            directory
+                .nodes()
+                .values()
+                .cloned()
+                .map(|mut node| {
+                    if node.node_id == m {
+                        node.endpoints.push(m_module.clone());
+                    }
+                    node
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("directory with a module endpoint");
+        assert!(
+            !plan_routes(
+                &directory,
+                &connectivity,
+                &a,
+                &d,
+                RouteConstraints::default()
+            )
+            .is_empty(),
+            "the recovery dial remains an executable attempt"
+        );
+        assert!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &a,
+                &m,
+                RouteConstraints::default()
+            )
+            .iter()
+            .any(|path| path.hops.len() == 1 && path.hops[0].endpoint == m_module),
+            "the planner offers the unobserved module endpoint"
+        );
+        assert!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &a,
+                &z,
+                RouteConstraints::default()
+            )
+            .is_empty(),
+            "a module endpoint never becomes a relay hop"
+        );
+        let verdicts = peer_path_classifications(&directory, &connectivity, &a);
+        let verdict = |peer: &NodeId| verdicts.get(peer).copied().expect("classified peer");
+        assert_eq!(verdict(&b).verdict, PeerPathVerdict::Path);
+        assert!(!verdict(&b).relayed_only);
+        assert_eq!(verdict(&c).verdict, PeerPathVerdict::Path);
+        assert!(verdict(&c).relayed_only);
+        assert_eq!(verdict(&d).verdict, PeerPathVerdict::NoPath);
+        assert_eq!(verdict(&e).verdict, PeerPathVerdict::NoPath);
+        assert_eq!(verdict(&f).verdict, PeerPathVerdict::Unknown);
+        assert_eq!(verdict(&g).verdict, PeerPathVerdict::Path);
+        assert_eq!(verdict(&h).verdict, PeerPathVerdict::Path);
+        assert_eq!(verdict(&m).verdict, PeerPathVerdict::Path);
+        assert!(
+            !verdict(&m).relayed_only,
+            "a module endpoint is a direct path"
+        );
+        assert_eq!(verdict(&n).verdict, PeerPathVerdict::NoPath);
+        assert_eq!(verdict(&z).verdict, PeerPathVerdict::Unknown);
+        assert!(!verdicts.contains_key(&a));
+
+        let stale = DirectorySnapshot::try_new(
+            DirectoryVersion(10),
+            directory.nodes().values().cloned().collect::<Vec<_>>(),
+        )
+        .expect("newer directory");
+        assert!(
+            peer_path_classifications(&stale, &connectivity, &a)
+                .values()
+                .all(|classification| classification.verdict == PeerPathVerdict::Unknown),
+            "evidence from another directory generation proves nothing"
+        );
+        assert!(
+            peer_path_classifications(&directory, &connectivity, &node("node_peer_verdict_x"))
+                .is_empty(),
+            "an unauthorized observer has no peers"
+        );
+    }
+
+    #[test]
+    fn routed_availability_relaxes_module_only_peers_and_not_recovery_only_peers() {
+        install_test_directory_iroh_network_module();
+        let a = node("node_availability_classifier_a");
+        let b = node("node_availability_classifier_b");
+        let d = node("node_availability_classifier_d");
+        let m = node("node_availability_classifier_m");
+        let mut recovery_only = edge(&a, &d, "endpoint_availability_classifier_a_d", 12, 10);
+        recovery_only.state = DirectConnectivityState::Unreachable;
+        let (directory, connectivity) = fixtures(
+            12,
+            vec![
+                edge(&a, &b, "endpoint_availability_classifier_a_b", 12, 10),
+                recovery_only,
+                edge(&m, &a, "endpoint_availability_classifier_m_a", 12, 10),
+            ],
+        );
+        let module = directory_iroh_endpoint(&m, "availabilityclassifiermkey", false);
+        let directory = DirectorySnapshot::try_new(
+            DirectoryVersion(12),
+            directory
+                .nodes()
+                .values()
+                .cloned()
+                .map(|mut node| {
+                    if node.node_id == m {
+                        node.endpoints.push(module.clone());
+                    }
+                    node
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("directory with a module endpoint");
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::from_snapshot(
+            a.clone(),
+            directory,
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(a.clone())),
+            Arc::new(TestRoutedIdentity { local_node_id: a }),
+        )
+        .expect("multi-hop connector");
+        assert_eq!(connector.availability(&b), RoutedAvailability::Candidate);
+        assert_eq!(
+            connector.availability(&m),
+            RoutedAvailability::Candidate,
+            "a peer dialable only through a local module is a candidate, as before"
+        );
+        assert_eq!(
+            connector.availability(&d),
+            RoutedAvailability::NoPath,
+            "a recovery dial over an unreachable edge is not a candidate"
+        );
+    }
+
+    #[test]
+    fn peer_path_verdicts_match_planner_evidence_candidates() {
+        let nodes = (0..6)
+            .map(|index| node(&format!("node_peer_verdict_random_{index}")))
+            .collect::<Vec<_>>();
+        let states = [
+            DirectConnectivityState::Reachable,
+            DirectConnectivityState::Degraded,
+            DirectConnectivityState::Unverified,
+            DirectConnectivityState::Unreachable,
+        ];
+        install_test_directory_iroh_network_module();
+        let mut module_only_paths = 0_usize;
+        let mut seed = 0x5eed_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        for round in 0..200 {
+            let mut edges = Vec::new();
+            // Some peers also publish an endpoint only a local module dials;
+            // some of those endpoints carry an observation of their own.
+            let mut module_endpoints = BTreeMap::new();
+            for (target_index, target) in nodes.iter().enumerate().skip(1) {
+                if next() % 3 != 0 {
+                    continue;
+                }
+                let endpoint = directory_iroh_endpoint(
+                    target,
+                    &format!("peerverdictrandom{round}x{target_index}"),
+                    false,
+                );
+                if next() % 2 == 0 {
+                    let source_index = (next() % nodes.len() as u64) as usize;
+                    if source_index != target_index {
+                        let mut observation = edge(
+                            &nodes[source_index],
+                            target,
+                            &format!("endpoint_peer_verdict_random_{round}_module_{target_index}"),
+                            round,
+                            10,
+                        );
+                        observation.endpoint = endpoint.clone();
+                        observation.state = states[(next() % 4) as usize];
+                        edges.push(observation);
+                    }
+                }
+                module_endpoints.insert(target.clone(), endpoint);
+            }
+            for (source_index, source) in nodes.iter().enumerate() {
+                for (target_index, target) in nodes.iter().enumerate() {
+                    if source_index == target_index || next() % 3 != 0 {
+                        continue;
+                    }
+                    let mut observation = edge(
+                        source,
+                        target,
+                        &format!(
+                            "endpoint_peer_verdict_random_{round}_{source_index}_{target_index}"
+                        ),
+                        round,
+                        10,
+                    );
+                    observation.state = states[(next() % 4) as usize];
+                    observation.capabilities.relay_forwarding = next() % 5 != 0;
+                    edges.push(observation);
+                }
+            }
+            // Every node is in the directory even without edges.
+            let directory = DirectorySnapshot::try_new(
+                DirectoryVersion(round),
+                nodes
+                    .iter()
+                    .map(|node_id| {
+                        let mut endpoints = edges
+                            .iter()
+                            .filter(|observation| &observation.target_node_id == node_id)
+                            .map(|observation| observation.endpoint.clone())
+                            .collect::<Vec<_>>();
+                        if let Some(endpoint) = module_endpoints.get(node_id)
+                            && !endpoints
+                                .iter()
+                                .any(|known| known.endpoint_id == endpoint.endpoint_id)
+                        {
+                            endpoints.push(endpoint.clone());
+                        }
+                        DirectoryNode::try_new(node_id.clone(), node_id.to_string(), endpoints)
+                            .expect("directory node")
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("directory");
+            let connectivity = ConnectivitySnapshot::try_new(
+                ConnectivityGeneration(1),
+                round,
+                OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+                edges,
+            )
+            .expect("connectivity");
+            let source = &nodes[0];
+            let verdicts = peer_path_classifications(&directory, &connectivity, source);
+            for target in &nodes[1..] {
+                let evidence_backed = plan_routes(
+                    &directory,
+                    &connectivity,
+                    source,
+                    target,
+                    RouteConstraints::default(),
+                )
+                .iter()
+                .any(|path| {
+                    let observation_for = |hop: &RouteHop| {
+                        connectivity.edges().iter().find(|observation| {
+                            observation.source_node_id == hop.source_node_id
+                                && observation.target_node_id == hop.target_node_id
+                                && observation.endpoint.endpoint_id == hop.endpoint.endpoint_id
+                        })
+                    };
+                    // The planner's module bucket: one hop over an endpoint
+                    // with no observation at all, which has no failure verdict.
+                    let unobserved_module_hop =
+                        path.hops.len() == 1 && observation_for(&path.hops[0]).is_none();
+                    module_only_paths += usize::from(unobserved_module_hop);
+                    unobserved_module_hop
+                        || path.hops.iter().all(|hop| {
+                            hop.connectivity_state != DirectConnectivityState::Unreachable
+                                && observation_for(hop).is_some_and(|observation| {
+                                    observation.state != DirectConnectivityState::Unreachable
+                                })
+                        })
+                });
+                assert_eq!(
+                    verdicts
+                        .get(target)
+                        .map(|classification| classification.verdict)
+                        == Some(PeerPathVerdict::Path),
+                    evidence_backed,
+                    "round {round}: target {target}"
+                );
+            }
+        }
+        assert!(
+            module_only_paths > 0,
+            "the generated graphs exercise the planner's module bucket"
+        );
     }
 
     #[test]

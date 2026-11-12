@@ -93,8 +93,7 @@ fn bump_local_cluster_connectivity_content_generation(paths: &ClusterPaths) {
 /// all: the store retains its current evidence until expiry renewal is due or
 /// a material reachability/topology field changes. Delivery routing tables
 /// therefore remain stable across ordinary probe and command-RPC success.
-#[cfg(test)]
-fn local_cluster_connectivity_routing_generation(paths: &ClusterPaths) -> u64 {
+pub(crate) fn local_cluster_connectivity_routing_generation(paths: &ClusterPaths) -> u64 {
     LOCAL_CLUSTER_CONNECTIVITY_ROUTING_GENERATIONS
         .lock()
         .ok()
@@ -116,6 +115,7 @@ fn bump_local_cluster_connectivity_routing_generation(paths: &ClusterPaths) {
             generation: next,
         },
     );
+    crate::route_input_watch::notify_route_input_changed(&paths.root);
 }
 
 #[derive(Clone, Debug)]
@@ -803,6 +803,77 @@ pub async fn prune_local_cluster_connectivity_records_for_state_async(
         .map_err(|source| NetworkError::Io {
             operation: "prune local cluster connectivity records".to_string(),
             detail: format!("local cluster connectivity prune task failed: {source}"),
+        })?
+}
+
+/// Removes `source_node_id`'s records whose evidence has expired in every view
+/// of this process: the persisted copy and the in-memory accepted view.
+///
+/// Expiry already hides such a record from reads. Removing it from the
+/// persisted source set lets the source's publication withdraw the committed
+/// copy, which routing would otherwise keep as the source's current statement.
+/// A record whose in-memory view was renewed after its last persisted write is
+/// still live and is kept. Writes and advances the routing generation only when
+/// something expired; otherwise it is read-only.
+#[doc(hidden)]
+pub fn remove_expired_local_cluster_connectivity_source_records(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Result<usize, NetworkError> {
+    let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
+    let now = OffsetDateTime::now_utc();
+    let Some(mut persisted) =
+        read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
+    else {
+        return Ok(0);
+    };
+    let live_keys = read_local_cluster_connectivity_records(paths)?
+        .iter()
+        .map(cluster_connectivity_record_key)
+        .collect::<BTreeSet<_>>();
+    let before = persisted.len();
+    persisted.retain(|record| {
+        record.source_node_id != *source_node_id
+            || cluster_network_record_live(record.expires_at, now)
+            || live_keys.contains(&cluster_connectivity_record_key(record))
+    });
+    let removed = before - persisted.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+    sort_cluster_connectivity_records(&mut persisted);
+    if persisted.is_empty() {
+        remove_optional_file(&paths.connectivity_local)?;
+    } else {
+        write_object_file(&paths.connectivity_local, &persisted)?;
+    }
+    reconcile_local_cluster_connectivity_observation_watermarks(
+        paths,
+        &persisted,
+        std::iter::empty(),
+    )?;
+    bump_local_cluster_connectivity_content_generation(paths);
+    bump_local_cluster_connectivity_routing_generation(paths);
+    Ok(removed)
+}
+
+/// Blocking-pool adapter for [`remove_expired_local_cluster_connectivity_source_records`].
+#[doc(hidden)]
+pub async fn remove_expired_local_cluster_connectivity_source_records_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Result<usize, NetworkError> {
+    let paths = paths.clone();
+    let source_node_id = source_node_id.clone();
+    runtime
+        .spawn_blocking(move || {
+            remove_expired_local_cluster_connectivity_source_records(&paths, &source_node_id)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "remove expired local cluster connectivity records".to_string(),
+            detail: format!("local cluster connectivity removal task failed: {source}"),
         })?
 }
 
@@ -2202,6 +2273,89 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
         (root, paths, state, local, endpoint, now)
+    }
+
+    #[test]
+    fn expired_source_records_leave_once_and_memory_renewals_stay() {
+        let (_root, paths, mut state, local, renewed_endpoint, _now) =
+            connectivity_generation_fixture("expired_source_records_leave_once");
+        let remote = renewed_endpoint.node_id.clone();
+        let aged_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &remote,
+            "aged-target:21353".to_string(),
+            10,
+        );
+        state.members[1].endpoints.push(aged_endpoint.clone());
+        let short_lived = |endpoint: &ClusterEndpointRecord| {
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(3),
+                0,
+                None,
+                None,
+                OffsetDateTime::now_utc(),
+                1,
+            )
+        };
+        write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[short_lived(&renewed_endpoint), short_lived(&aged_endpoint)],
+        )
+        .expect("write short-lived evidence");
+        // A daemon-owned success renews one record in memory only.
+        record_daemon_owned_local_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &renewed_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            true,
+        )
+        .expect("memory renewal");
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+        let persisted_before = std::fs::read(&paths.connectivity_local).expect("persisted set");
+        let routing_before = local_cluster_connectivity_routing_generation(&paths);
+        assert_eq!(
+            remove_expired_local_cluster_connectivity_source_records(&paths, &local)
+                .expect("remove expired"),
+            1,
+            "only the record expired in every view leaves"
+        );
+        assert_ne!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            persisted_before
+        );
+        let routing_after = local_cluster_connectivity_routing_generation(&paths);
+        assert_ne!(
+            routing_after, routing_before,
+            "the removal is one route-input change"
+        );
+        let persisted =
+            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)
+                .unwrap()
+                .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].endpoint_id, renewed_endpoint.endpoint_id);
+
+        let persisted_now = std::fs::read(&paths.connectivity_local).unwrap();
+        assert_eq!(
+            remove_expired_local_cluster_connectivity_source_records(&paths, &local)
+                .expect("remove again"),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            persisted_now
+        );
+        assert_eq!(
+            local_cluster_connectivity_routing_generation(&paths),
+            routing_after,
+            "nothing left to remove: no write and no route-input change"
+        );
     }
 
     #[test]

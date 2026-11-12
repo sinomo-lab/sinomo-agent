@@ -1,4 +1,7 @@
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
+    cluster_endpoint_is_builtin_probe_target,
+};
 use crate::maintenance::{
     CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS,
     cluster_connectivity_probe_max_endpoints_per_tick_for_role,
@@ -344,6 +347,63 @@ pub struct ClusterConnectivityProbeBatchEntry {
     pub previous: Option<ClusterConnectivityRecord>,
 }
 
+/// Whether the regular probe cadence renews this source-owned record: its
+/// endpoint is a built-in probe target of a current member. Evidence for any
+/// other endpoint, such as one a network module dials, is observed only by
+/// verification or command outcomes and simply ages out at its expiry.
+pub fn cluster_connectivity_record_is_regularly_probed(
+    state: &ClusterBootstrapState,
+    record: &ClusterConnectivityRecord,
+) -> bool {
+    state
+        .members
+        .iter()
+        .filter(|member| member.node_id == record.target_node_id)
+        .flat_map(|member| member.endpoints.iter())
+        .find(|endpoint| endpoint.endpoint_id == record.endpoint_id)
+        .is_some_and(cluster_endpoint_is_builtin_probe_target)
+}
+
+/// Which endpoints one connectivity probe batch may select.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterConnectivityProbeScope {
+    /// Every regular probe target is due, as after an explicit refresh.
+    pub force_all: bool,
+    /// Whether ordinarily due regular targets join the batch. A
+    /// verification-only batch leaves the regular cadence untouched.
+    pub include_regular: bool,
+    /// Peers under verification. Every one of their local probe endpoints is
+    /// due, including endpoints dialed through a registered network module,
+    /// and they rank ahead of regular targets.
+    pub verification_peers: BTreeSet<NodeId>,
+}
+
+impl ClusterConnectivityProbeScope {
+    /// The regular probe cadence, optionally forcing every target.
+    pub fn regular(force_all: bool) -> Self {
+        Self {
+            force_all,
+            include_regular: true,
+            verification_peers: BTreeSet::new(),
+        }
+    }
+
+    /// Only the endpoints of `peers`.
+    pub fn verification_only(peers: BTreeSet<NodeId>) -> Self {
+        Self {
+            force_all: false,
+            include_regular: false,
+            verification_peers: peers,
+        }
+    }
+
+    /// Adds verification of `peers` to this scope.
+    pub fn with_verification_peers(mut self, peers: BTreeSet<NodeId>) -> Self {
+        self.verification_peers.extend(peers);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterConnectivityProbeBatch {
     pub active_keys: Vec<String>,
@@ -492,7 +552,7 @@ pub fn select_cluster_connectivity_probe_batch(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
     convergence_active: bool,
-    force_probe: bool,
+    scope: &ClusterConnectivityProbeScope,
     now: OffsetDateTime,
 ) -> ClusterConnectivityProbeBatch {
     try_select_cluster_connectivity_probe_batch(
@@ -503,7 +563,7 @@ pub fn select_cluster_connectivity_probe_batch(
         local_node_role,
         startup_settle_active,
         convergence_active,
-        force_probe,
+        scope,
         now,
     )
     .unwrap_or_else(|_| ClusterConnectivityProbeBatch {
@@ -522,13 +582,17 @@ pub fn try_select_cluster_connectivity_probe_batch(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
     convergence_active: bool,
-    force_probe: bool,
+    scope: &ClusterConnectivityProbeScope,
     now: OffsetDateTime,
 ) -> Result<ClusterConnectivityProbeBatch, NetworkError> {
     let refresh_deadline =
         now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
-    let targets = ClusterEndpointSelector::new(paths, state)
+    let mut targets = ClusterEndpointSelector::new(paths, state)
         .try_select(ClusterEndpointSelectionPurpose::NetworkProbe)?;
+    // Every endpoint this node can hold evidence for stays active, so module
+    // evidence from verification survives later regular batches. Only
+    // built-in endpoints are ever due for a regular probe.
+    append_cluster_connectivity_module_targets(state, &mut targets)?;
     let mut active_keys = Vec::new();
     for endpoint in &targets {
         let key = try_cluster_connectivity_probe_key(&state.local_node_id, endpoint)?;
@@ -542,11 +606,23 @@ pub fn try_select_cluster_connectivity_probe_batch(
     // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
     // local-authoritative for our own edges). A learner cannot commit its connectivity
     // edges to KV, so seeding from KV alone would discard its last-known reachability.
+    //
+    // Module endpoints are seeded only for a peer under verification: their
+    // evidence is never renewed by the regular cadence, so a regular batch must
+    // not carry a committed copy of an expired module record back as new.
     if connectivity.is_empty() {
         for record in read_cluster_connectivity_graph(paths)
             .unwrap_or_default()
             .into_iter()
-            .filter(|record| record.source_node_id == state.local_node_id)
+            .filter(|record| {
+                record.source_node_id == state.local_node_id
+                    && (scope.verification_peers.contains(&record.target_node_id)
+                        || targets.iter().any(|endpoint| {
+                            endpoint.endpoint_id == record.endpoint_id
+                                && endpoint.node_id == record.target_node_id
+                                && cluster_endpoint_is_builtin_probe_target(endpoint)
+                        }))
+            })
         {
             // Must match `cluster_connectivity_probe_key` ("src:tgt:endpoint"),
             // not the KV key, or the seed never lands in the probe cache.
@@ -561,9 +637,37 @@ pub fn try_select_cluster_connectivity_probe_batch(
             }
         }
     }
+    // A verified peer's module endpoints are not regular probe targets, so a
+    // seeded cache may lack them. Carry their source-owned evidence forward so
+    // failures accumulate against the existing record.
+    if targets.iter().any(|endpoint| {
+        scope.verification_peers.contains(&endpoint.node_id)
+            && try_cluster_connectivity_probe_key(&state.local_node_id, endpoint)
+                .is_ok_and(|key| !connectivity.contains_key(&key))
+    }) {
+        for record in read_cluster_connectivity_graph(paths)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| {
+                record.source_node_id == state.local_node_id
+                    && scope.verification_peers.contains(&record.target_node_id)
+            })
+        {
+            let key = try_cluster_connectivity_probe_key_parts(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
+            )?;
+            if sorted_string_slice_contains(&active_keys, &key) && !connectivity.contains_key(&key)
+            {
+                connectivity.insert(key, ClusterConnectivityProbeState { record });
+            }
+        }
+    }
 
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let mut probe_entries = Vec::new();
+    let mut verification_entries = Vec::new();
     for endpoint in &targets {
         let key = try_cluster_connectivity_probe_key(&state.local_node_id, endpoint)?;
         let previous = connectivity
@@ -572,29 +676,34 @@ pub fn try_select_cluster_connectivity_probe_batch(
                 try_clone_connectivity_record(&probe.record, "clone previous connectivity record")
             })
             .transpose()?;
-        let due = force_probe
-            || previous.as_ref().is_none_or(|record| {
-                cluster_connectivity_probe_due_with_graph_and_policy(
-                    record,
-                    endpoint,
-                    now,
-                    refresh_deadline,
-                    local_node_role,
-                    &graph,
-                    &state.local_node_id,
-                    startup_settle_active,
-                    convergence_active,
-                )
-            });
+        let verification = scope.verification_peers.contains(&endpoint.node_id);
+        let due = verification
+            || (scope.include_regular
+                && cluster_endpoint_is_builtin_probe_target(endpoint)
+                && (scope.force_all
+                    || previous.as_ref().is_none_or(|record| {
+                        cluster_connectivity_probe_due_with_graph_and_policy(
+                            record,
+                            endpoint,
+                            now,
+                            refresh_deadline,
+                            local_node_role,
+                            &graph,
+                            &state.local_node_id,
+                            startup_settle_active,
+                            convergence_active,
+                        )
+                    })));
         if !due {
             continue;
         }
-        crate::object::try_reserve_vec(
-            &mut probe_entries,
-            1,
-            "collect connectivity probe entries",
-        )?;
-        probe_entries.push(ClusterConnectivityProbeBatchEntry {
+        let entries = if verification {
+            &mut verification_entries
+        } else {
+            &mut probe_entries
+        };
+        crate::object::try_reserve_vec(entries, 1, "collect connectivity probe entries")?;
+        entries.push(ClusterConnectivityProbeBatchEntry {
             key,
             endpoint: try_clone_connectivity_endpoint(
                 endpoint,
@@ -604,23 +713,72 @@ pub fn try_select_cluster_connectivity_probe_batch(
         });
     }
     probe_entries.sort_by(cluster_connectivity_probe_entry_cmp);
-    let due_count = probe_entries.len();
-    let probe_count = due_count.min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
-        local_node_role,
-    ));
-    let (probe_entries, next_cursor) = select_rotating_cluster_connectivity_probe_entries(
-        probe_entries,
-        probe_count,
-        connectivity_cursor,
-    );
-    let remaining_due = due_count.saturating_sub(probe_entries.len());
+    verification_entries.sort_by(cluster_connectivity_probe_entry_cmp);
+    let due_count = probe_entries.len() + verification_entries.len();
+    let max_entries = cluster_connectivity_probe_max_endpoints_per_tick_for_role(local_node_role);
+    // Verification answers a failed delivery that is waiting on a verdict;
+    // it takes the per-tick budget first.
+    verification_entries.truncate(max_entries);
+    let regular_budget = max_entries.saturating_sub(verification_entries.len());
+    let regular_count = probe_entries.len().min(regular_budget);
+    let (regular_entries, next_cursor) = if regular_budget == 0 && !probe_entries.is_empty() {
+        // Verification took this tick's whole budget; rotation resumes next tick.
+        (Vec::new(), connectivity_cursor)
+    } else {
+        select_rotating_cluster_connectivity_probe_entries(
+            probe_entries,
+            regular_count,
+            connectivity_cursor,
+        )
+    };
+    let mut entries = verification_entries;
+    entries.extend(regular_entries);
+    let remaining_due = due_count.saturating_sub(entries.len());
 
     Ok(ClusterConnectivityProbeBatch {
         active_keys,
-        entries: probe_entries,
+        entries,
         remaining_due,
         next_cursor,
     })
+}
+
+/// Adds every authorized member's endpoints that a registered local network
+/// module dials. Regular probes cover only built-in transports; these
+/// endpoints are due only while their peer is under verification, so a peer
+/// reachable only through a module transport can still reach a verdict.
+fn append_cluster_connectivity_module_targets(
+    state: &ClusterBootstrapState,
+    targets: &mut Vec<ClusterEndpointRecord>,
+) -> Result<(), NetworkError> {
+    let Some(registry) = crate::network_module::network_module_registry() else {
+        return Ok(());
+    };
+    for member in &state.members {
+        if !member.state.is_authorized()
+            || sinomo_node::cluster_member_is_local_process(state, member)
+        {
+            continue;
+        }
+        for endpoint in &member.endpoints {
+            if endpoint.node_id != member.node_id
+                || endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
+                || cluster_endpoint_is_builtin_probe_target(endpoint)
+                || registry.module_for_endpoint(endpoint).is_none()
+                || targets
+                    .iter()
+                    .any(|target| target.endpoint_id == endpoint.endpoint_id)
+            {
+                continue;
+            }
+            crate::object::try_reserve_vec(targets, 1, "collect verification probe endpoints")?;
+            targets.push(try_clone_connectivity_endpoint(
+                endpoint,
+                "clone verification probe endpoint",
+            )?);
+        }
+    }
+    Ok(())
 }
 
 fn select_rotating_cluster_connectivity_probe_entries(

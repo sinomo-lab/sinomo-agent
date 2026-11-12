@@ -296,10 +296,12 @@ pub use migration::{
 pub use network_maintenance::{
     CLUSTER_NETWORK_MAINTENANCE_FAILURE_BACKOFF,
     CLUSTER_NETWORK_MAINTENANCE_FAILURE_INITIAL_BACKOFF,
-    CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION, ClusterConnectivityProbePlanAction,
+    CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION,
+    CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE, ClusterConnectivityProbePlanAction,
     ClusterNetworkMaintenanceCadence, ClusterNetworkMaintenanceDueClaims,
-    cluster_connectivity_probe_plan_action, cluster_connectivity_probe_result_needs_followup,
-    cluster_network_due_class_failure_backoff,
+    ClusterPeerVerificationCadence, ClusterPeerVerificationEpisode, ClusterPeerVerificationRound,
+    ClusterPeerVerificationSettlement, cluster_connectivity_probe_plan_action,
+    cluster_connectivity_probe_result_needs_followup, cluster_network_due_class_failure_backoff,
 };
 pub use network_service::{
     ClusterNetworkServiceFuture, ClusterNetworkServiceHost, HostedClusterNetworkService,

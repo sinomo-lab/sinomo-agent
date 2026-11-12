@@ -31,6 +31,14 @@ pub const COMPONENT_HOST_CONNECTIVITY_CHANGED_EVENT_KIND: &str =
     "host.network.connectivity.changed";
 pub const COMPONENT_HOST_EVENT_SCHEMA_ID: &str = "sinomo.component-host.change";
 pub const COMPONENT_HOST_EVENT_SCHEMA_VERSION: &str = "1.0.0";
+/// One peer's routed-availability verdict from this node changed. Local,
+/// transient and observer-scoped: it never states that a peer is offline for
+/// the cluster.
+pub const COMPONENT_HOST_PEER_REACHABILITY_CHANGED_EVENT_KIND: &str =
+    "host.network.peer.reachability.changed";
+pub const COMPONENT_HOST_PEER_REACHABILITY_EVENT_SCHEMA_ID: &str =
+    "sinomo.component-host.peer-reachability";
+pub const COMPONENT_HOST_PEER_REACHABILITY_EVENT_SCHEMA_VERSION: &str = "1.0.0";
 const COMPONENT_EVENT_INGRESS_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

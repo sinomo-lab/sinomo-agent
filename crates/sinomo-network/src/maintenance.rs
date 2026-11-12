@@ -19,6 +19,14 @@ pub const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 32;
 pub const CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 4;
 pub const CLUSTER_CONNECTIVITY_SENSOR_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 1;
 pub const CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS: i64 = 120;
+/// A weak verification request (the caller's own deadline expired before a
+/// stream existed) is ignored this long after a verification found a path.
+pub const CLUSTER_PEER_VERIFICATION_WEAK_COOLDOWN: Duration = Duration::from_secs(30);
+/// Verification rounds that produced no observation before an episode ends.
+pub const CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS: u8 = 3;
+/// Upper bound on one episode's rounds. The failure threshold ends a dead
+/// peer's episode first; this bound covers clamped startup observations.
+pub const CLUSTER_PEER_VERIFICATION_MAX_ROUNDS: u8 = 6;
 
 pub fn cluster_local_node_role(state: &ClusterBootstrapState) -> ClusterNodeRole {
     state
@@ -36,6 +44,27 @@ pub fn cluster_network_probe_interval_for_role(role: &ClusterNodeRole) -> Durati
         ClusterNodeRole::Workstation | ClusterNodeRole::Server | ClusterNodeRole::Test => {
             CLUSTER_NETWORK_PROBE_INTERVAL
         }
+    }
+}
+
+/// Re-probe spacing after `completed_rounds` verification rounds of one peer.
+///
+/// This is a re-probe timer owned by the network, not a deadline: each round
+/// is judged only by connect failure, disconnect and the no-progress limit.
+pub fn cluster_peer_verification_retry_spacing_for_role(
+    role: &ClusterNodeRole,
+    completed_rounds: u8,
+) -> Duration {
+    let base = match role {
+        ClusterNodeRole::Mobile | ClusterNodeRole::Sensor => Duration::from_secs(2),
+        ClusterNodeRole::Workstation | ClusterNodeRole::Server | ClusterNodeRole::Test => {
+            Duration::from_secs(1)
+        }
+    };
+    if completed_rounds <= 1 {
+        base
+    } else {
+        base.saturating_mul(2)
     }
 }
 

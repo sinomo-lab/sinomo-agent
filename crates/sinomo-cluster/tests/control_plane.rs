@@ -2400,7 +2400,7 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
         &ClusterNodeRole::Workstation,
         false,
         false,
-        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
         now,
     );
 
@@ -2463,7 +2463,7 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
         &ClusterNodeRole::Workstation,
         false,
         false,
-        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
         now,
     );
     assert!(
@@ -2478,7 +2478,7 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
         &ClusterNodeRole::Workstation,
         false,
         false,
-        true,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(true),
         now,
     );
     assert_eq!(
@@ -2486,6 +2486,274 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
         1,
         "a failed local observation write must be able to force a fresh probe on retry"
     );
+    let verified = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::verification_only(
+            std::collections::BTreeSet::from([endpoint.node_id.clone()]),
+        ),
+        now,
+    );
+    assert_eq!(
+        verified.entries.len(),
+        1,
+        "a peer under verification is probed although its observation is fresh"
+    );
+    assert_eq!(verified.remaining_due, 0);
+    let unrelated = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::verification_only(
+            std::collections::BTreeSet::from([NodeId::from_legacy_named(
+                "node_connectivity_probe_batch_other",
+            )
+            .expect("other")]),
+        ),
+        now,
+    );
+    assert!(
+        unrelated.entries.is_empty(),
+        "a verification-only batch never selects regular targets"
+    );
+}
+
+#[test]
+fn cluster_connectivity_verification_probes_module_endpoints_first() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-verification-modules");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_verification_modules").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_connectivity_verification_modules_local").expect("local");
+    let verified =
+        NodeId::from_legacy_named("node_connectivity_verification_modules_peer").expect("peer");
+    let regular =
+        NodeId::from_legacy_named("node_connectivity_verification_modules_other").expect("other");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity verification modules",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let lan = |node: &NodeId, address: &str| ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::derived("test.lan", address),
+        node_id: node.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: address.to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let verified_lan = lan(&verified, "10.0.0.92:21353");
+    let verified_iroh = test_iroh_endpoint(&cluster_id, &verified, "verifiedpeerkey", None);
+    let regular_lan = lan(&regular, "10.0.0.93:21353");
+    let regular_iroh = test_iroh_endpoint(&cluster_id, &regular, "regularpeerkey", None);
+    for (node, endpoints) in [
+        (&verified, vec![verified_lan.clone(), verified_iroh.clone()]),
+        (&regular, vec![regular_lan.clone(), regular_iroh.clone()]),
+    ] {
+        let mut member = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            node.clone(),
+            node.to_string(),
+            "pk",
+            now,
+        );
+        member.endpoints = endpoints;
+        state.members.push(member);
+    }
+
+    let mut connectivity = std::collections::BTreeMap::new();
+    let regular_batch = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
+        now,
+    );
+    assert!(
+        regular_batch
+            .entries
+            .iter()
+            .all(|entry| entry.endpoint.transport != ClusterTransportKind::Iroh),
+        "periodic probes keep the built-in endpoint set"
+    );
+
+    let mixed = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut std::collections::BTreeMap::new(),
+        0,
+        &ClusterNodeRole::Sensor,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false)
+            .with_verification_peers(std::collections::BTreeSet::from([verified.clone()])),
+        now,
+    );
+    assert_eq!(
+        mixed.entries.len(),
+        1,
+        "the sensor per-tick bound still applies to verification"
+    );
+    assert_eq!(mixed.entries[0].endpoint.node_id, verified);
+    assert!(mixed.remaining_due >= 2);
+
+    let verification = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut std::collections::BTreeMap::new(),
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::verification_only(
+            std::collections::BTreeSet::from([verified.clone()]),
+        ),
+        now,
+    );
+    let selected = verification
+        .entries
+        .iter()
+        .map(|entry| entry.endpoint.endpoint_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        selected,
+        std::collections::BTreeSet::from([
+            verified_lan.endpoint_id.clone(),
+            verified_iroh.endpoint_id.clone()
+        ]),
+        "verification probes every dialable endpoint of the verified peer only"
+    );
+    assert!(
+        verification
+            .active_keys
+            .iter()
+            .any(|key| key.ends_with(verified_iroh.endpoint_id.as_str()))
+    );
+
+    // Verification observed the module endpoint. A later regular batch keeps
+    // that key active and the record in its cache, without probing it.
+    let mut cache = std::collections::BTreeMap::new();
+    let verified_batch = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut cache,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::verification_only(
+            std::collections::BTreeSet::from([verified.clone()]),
+        ),
+        now,
+    );
+    let module_key = verified_batch
+        .entries
+        .iter()
+        .find(|entry| entry.endpoint.endpoint_id == verified_iroh.endpoint_id)
+        .expect("module endpoint planned")
+        .key
+        .clone();
+    let observed = cluster_connectivity_record_for_probe_outcome(
+        &state,
+        &verified_iroh,
+        None,
+        true,
+        7,
+        "verified",
+        now,
+    );
+    apply_cluster_connectivity_probe_results(
+        &mut cache,
+        &verified_batch.active_keys,
+        vec![(module_key.clone(), observed.clone())],
+    );
+    let regular_again = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut cache,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(true),
+        now,
+    );
+    assert!(regular_again.active_keys.contains(&module_key));
+    assert!(
+        regular_again
+            .entries
+            .iter()
+            .all(|entry| entry.endpoint.transport != ClusterTransportKind::Iroh),
+        "even a forced regular batch never probes a module endpoint"
+    );
+    let records = apply_cluster_connectivity_probe_results(
+        &mut cache,
+        &regular_again.active_keys,
+        Vec::new(),
+    );
+    assert!(
+        records.contains(&observed),
+        "the regular batch keeps the verified module evidence"
+    );
+
+    // A regular batch never seeds module evidence it does not renew; a
+    // verification round does.
+    sinomo_network::write_local_cluster_connectivity_records(
+        &paths,
+        &state.local_node_id,
+        std::slice::from_ref(&observed),
+    )
+    .expect("store module evidence");
+    let mut fresh = std::collections::BTreeMap::new();
+    select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut fresh,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
+        now,
+    );
+    assert!(!fresh.contains_key(&module_key));
+    let mut fresh = std::collections::BTreeMap::new();
+    select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut fresh,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        false,
+        &sinomo_network::ClusterConnectivityProbeScope::verification_only(
+            std::collections::BTreeSet::from([verified.clone()]),
+        ),
+        now,
+    );
+    assert!(fresh.contains_key(&module_key));
 }
 
 #[test]
@@ -2567,7 +2835,7 @@ fn cluster_connectivity_probe_batch_prioritizes_soon_expiring_records() {
         &ClusterNodeRole::Workstation,
         false,
         false,
-        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
         now,
     );
 
@@ -2635,7 +2903,7 @@ fn cluster_connectivity_probe_batch_rotates_bounded_slots() {
         &ClusterNodeRole::Workstation,
         false,
         false,
-        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
         now,
     );
     let first_ids = first
@@ -2651,7 +2919,7 @@ fn cluster_connectivity_probe_batch_rotates_bounded_slots() {
         &ClusterNodeRole::Workstation,
         false,
         false,
-        false,
+        &sinomo_network::ClusterConnectivityProbeScope::regular(false),
         now,
     );
     let second_ids = second

@@ -689,6 +689,7 @@ pub struct ClusterObjectRpcOptions {
     overall_timeout: Option<Duration>,
     protection: crate::RoutedSessionProtection,
     destination_process_affinity: crate::DestinationProcessAffinity,
+    peer_verification: bool,
 }
 
 impl ClusterObjectRpcOptions {
@@ -701,6 +702,7 @@ impl ClusterObjectRpcOptions {
             overall_timeout: None,
             protection: crate::RoutedSessionProtection::Plaintext,
             destination_process_affinity: crate::DestinationProcessAffinity::Any,
+            peer_verification: true,
         }
     }
 
@@ -758,6 +760,20 @@ impl ClusterObjectRpcOptions {
         self.destination_process_affinity
     }
 
+    /// Opts this call out of requesting peer verification from its delivery
+    /// outcome. The connectivity probe itself uses this: its result is the
+    /// verification, and it must not request another one.
+    pub const fn without_peer_verification(mut self) -> Self {
+        self.peer_verification = false;
+        self
+    }
+
+    /// Whether a failed or contradicting delivery outcome of this call
+    /// requests verification of the peer.
+    pub const fn requests_peer_verification(self) -> bool {
+        self.peer_verification
+    }
+
     fn call_policy(self) -> NetworkCallPolicy {
         let defaults = NetworkHealthPolicy::default();
         NetworkCallPolicy {
@@ -782,12 +798,7 @@ impl From<NetworkCallPolicy> for ClusterObjectRpcOptions {
 
 impl Default for ClusterObjectRpcOptions {
     fn default() -> Self {
-        Self {
-            timeouts: DaemonRpcTimeouts::default(),
-            overall_timeout: None,
-            protection: crate::RoutedSessionProtection::Plaintext,
-            destination_process_affinity: crate::DestinationProcessAffinity::Any,
-        }
+        Self::new(DaemonRpcTimeouts::default())
     }
 }
 
@@ -952,6 +963,12 @@ fn cluster_endpoint_rpc_error_observation(
     error: &NetworkError,
 ) -> Option<ClusterObjectRpcObservation> {
     match error {
+        // The caller's whole-call deadline expired. A slow but reachable peer
+        // is not a failed edge; only the network's own limits are evidence.
+        NetworkError::Timeout {
+            phase: NetworkTimeoutPhase::Overall,
+            ..
+        } => None,
         NetworkError::Io { .. }
         | NetworkError::Timeout { .. }
         | NetworkError::DeliveryFailed { .. } => Some(ClusterObjectRpcObservation::io_failure()),
@@ -1316,10 +1333,42 @@ fn connector_from_observed_records(
         state.local_node_id.clone(), Arc::clone(&identity), health,
     )?);
     let view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
-    let failures: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
+    let failures: Arc<dyn crate::ConnectivityFailureSink> =
+        Arc::new(VerificationRequestingFailureSink {
+            inner: connectivity,
+            paths: paths.clone(),
+            local_node_id: state.local_node_id.clone(),
+        });
     Ok(Arc::new(crate::MultiHopRoutedConnector::from_snapshot(
         state.local_node_id.clone(), directory, view, failures, provider, identity,
     )?))
+}
+
+/// Route-realization feedback for a prepared connector. The rejected edge is
+/// excluded from this connector's snapshot as before; when the edge starts at
+/// this node, its target's direct edges are also verified, since the rejection
+/// itself is request-local and never reaches the durable source store.
+struct VerificationRequestingFailureSink {
+    inner: Arc<crate::ConnectivityTracker>,
+    paths: ClusterPaths,
+    local_node_id: NodeId,
+}
+
+impl crate::ConnectivityFailureSink for VerificationRequestingFailureSink {
+    fn submit_edge_failure(
+        &self,
+        evidence: crate::DirectConnectivityFailureEvidence,
+    ) -> Result<(), NetworkError> {
+        if evidence.source_node_id == self.local_node_id {
+            crate::connectivity_verification::request_peer_verification_for_node(
+                &self.paths,
+                &self.local_node_id,
+                &evidence.target_node_id,
+                crate::PeerVerificationCause::DeliveryFailed,
+            );
+        }
+        self.inner.submit_edge_failure(evidence)
+    }
 }
 
 /// Cluster object-RPC client facade.
@@ -1587,6 +1636,31 @@ where
         } else {
             cluster_endpoint_rpc_observation(result.as_ref(), started)
         };
+        if options.requests_peer_verification()
+            && let Some(context) = self.route_context.as_ref()
+        {
+            match &result {
+                Ok(_) => crate::peer_reachability::observe_peer_delivery_success(
+                    context.paths,
+                    &state.local_node_id,
+                    &endpoint.node_id,
+                ),
+                // An authenticated final rejection proves the endpoint answered.
+                Err(NetworkError::AuthDenied) if authenticated_stream_established => {
+                    crate::peer_reachability::observe_peer_delivery_success(
+                        context.paths,
+                        &state.local_node_id,
+                        &endpoint.node_id,
+                    )
+                }
+                Err(error) => crate::peer_reachability::observe_peer_delivery_failure(
+                    context.paths,
+                    &state.local_node_id,
+                    &endpoint.node_id,
+                    error,
+                ),
+            }
+        }
         if let Some(observation) = observation {
             let _ = self
                 .host
@@ -1734,6 +1808,10 @@ where
         );
         prepare_call_for_active_network_timeline(&mut call);
         let dispatched = std::sync::atomic::AtomicBool::new(false);
+        // Set once a dial to the target starts. Route preparation failures
+        // before it (directory, identity or connectivity reads) are local and
+        // say nothing about the peer.
+        let dial_attempted = std::sync::atomic::AtomicBool::new(false);
         let mut result = cluster_object_rpc_call_with_deadline(
             Box::pin(self.call_target_stream_native(
                 context.paths,
@@ -1745,6 +1823,7 @@ where
                 options,
                 deadline,
                 &dispatched,
+                &dial_attempted,
             )),
             deadline,
             timeout_error,
@@ -1755,6 +1834,17 @@ where
             *delivery_state = NetworkDeliveryState::DefinitelyNotSent;
         }
         record_cluster_target_rpc_outcome(context.paths, state, target_node_id, &result);
+        if options.requests_peer_verification()
+            && dial_attempted.load(std::sync::atomic::Ordering::Acquire)
+            && let Err(error) = &result
+        {
+            crate::peer_reachability::observe_peer_delivery_failure(
+                context.paths,
+                &state.local_node_id,
+                target_node_id,
+                error,
+            );
+        }
         result
     }
 
@@ -1769,6 +1859,7 @@ where
         options: ClusterObjectRpcOptions,
         deadline: ClusterEndpointRpcDeadline,
         dispatched: &std::sync::atomic::AtomicBool,
+        dial_attempted: &std::sync::atomic::AtomicBool,
     ) -> Result<ObjectRpcResult, NetworkError> {
         if target_node_id == &state.local_node_id {
             return Err(NetworkError::Io {
@@ -1833,6 +1924,7 @@ where
                     .to_string(),
             });
         }
+        dial_attempted.store(true, std::sync::atomic::Ordering::Release);
         let stream_result = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_destination_affinity_and_route_compatibility(
             directory_identity.routed_stream_scope(&state.cluster_id),
             module_generation,
@@ -1882,6 +1974,13 @@ where
         // exact target. Clear earlier liveness failure before translating that
         // response into its application-level error below.
         record_cluster_target_rpc_authenticated_response(paths, state, target_node_id);
+        if options.requests_peer_verification() {
+            crate::peer_reachability::observe_peer_delivery_success(
+                paths,
+                &state.local_node_id,
+                target_node_id,
+            );
+        }
         result.response.error_detail()?;
         Ok(result)
     }
@@ -1972,6 +2071,187 @@ fn cluster_target_rpc_timeout_error(
 mod tests {
     use super::*;
     use crate::ObjectRpcRequest;
+
+    #[test]
+    fn caller_deadline_is_not_endpoint_failure_evidence() {
+        for delivery_state in [
+            NetworkDeliveryState::DefinitelyNotSent,
+            NetworkDeliveryState::PossiblyApplied,
+        ] {
+            let slow = NetworkError::timeout(
+                "cluster endpoint object RPC",
+                NetworkTimeoutPhase::Overall,
+                Duration::from_secs(2),
+                delivery_state,
+            );
+            assert!(
+                cluster_endpoint_rpc_error_observation(&slow).is_none(),
+                "a slow peer reached within no network limit is not a failed edge"
+            );
+        }
+        for failure in [
+            NetworkError::timeout(
+                "establish direct routed endpoint session",
+                NetworkTimeoutPhase::Connect,
+                Duration::from_secs(5),
+                NetworkDeliveryState::DefinitelyNotSent,
+            ),
+            NetworkError::delivery_failed(
+                "read object RPC response",
+                NetworkDeliveryState::PossiblyApplied,
+                "idle timeout after 5s",
+            ),
+            NetworkError::Io {
+                operation: "connect".to_string(),
+                detail: "connection refused".to_string(),
+            },
+        ] {
+            assert!(
+                cluster_endpoint_rpc_error_observation(&failure)
+                    .is_some_and(|observation| observation.is_io_failure()),
+                "{failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_route_realization_failure_requests_first_hop_verification() {
+        let local = NodeId::from_legacy_named("node_route_sink_local").expect("local");
+        let relay = NodeId::from_legacy_named("node_route_sink_relay").expect("relay");
+        let endpoint = crate::daemon_lan_endpoint(&relay, "192.0.2.40:21353".to_string(), 10);
+        let observed_at = OffsetDateTime::now_utc();
+        let observation = crate::DirectConnectivityObservation {
+            observer_node_id: local.clone(),
+            source_node_id: local.clone(),
+            target_node_id: relay.clone(),
+            endpoint: endpoint.clone(),
+            capabilities: crate::DirectStreamCapabilities::multiplexed_full_duplex(8),
+            state: crate::DirectConnectivityState::Reachable,
+            failure_reason: None,
+            latency_micros: None,
+            delivered_bytes_per_second: None,
+            provenance: "route-test".to_string(),
+            source_generation: 1,
+            directory_generation: 1,
+            observed_at,
+            expires_at: observed_at + time::Duration::minutes(1),
+        };
+        let tracker = Arc::new(crate::ConnectivityTracker::new(
+            crate::ConnectivitySnapshot::try_new(
+                crate::ConnectivityGeneration(1),
+                1,
+                observed_at,
+                vec![observation],
+            )
+            .expect("snapshot"),
+        ));
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(
+            "/nonexistent/sinomo-route-sink-test",
+        ));
+        let _owner = crate::__connectivity_store::register_peer_verification_owner(&paths);
+        let sink = VerificationRequestingFailureSink {
+            inner: Arc::clone(&tracker),
+            paths: paths.clone(),
+            local_node_id: local.clone(),
+        };
+        crate::ConnectivityFailureSink::submit_edge_failure(
+            &sink,
+            crate::DirectConnectivityFailureEvidence {
+                observer_node_id: local.clone(),
+                source_node_id: local,
+                target_node_id: relay.clone(),
+                endpoint_id: endpoint.endpoint_id,
+                reason: "connection refused".to_string(),
+                kind: crate::DirectConnectivityFailureKind::Transport,
+                observed_at,
+            },
+        )
+        .expect("edge failure accepted");
+        assert_eq!(
+            crate::ConnectivityView::snapshot(tracker.as_ref()).edges()[0].state,
+            crate::DirectConnectivityState::Unreachable,
+            "the connector's own snapshot still excludes the failed edge"
+        );
+        assert_eq!(
+            crate::__connectivity_store::take_pending_peer_verifications(&paths),
+            vec![(relay, crate::PeerVerificationCause::DeliveryFailed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_route_preparation_failure_requests_no_verification() {
+        let local = NodeId::from_legacy_named("node_route_prepare_failure_local").expect("local");
+        let target =
+            NodeId::from_legacy_named("node_route_prepare_failure_target").expect("target");
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            sinomo_base::Id::from_legacy_named("cluster_route_prepare_failure").expect("cluster"),
+            "route prepare failure",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = sinomo_base::ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        member.endpoints.push(crate::daemon_lan_endpoint(
+            &target,
+            "192.0.2.41:21353".to_string(),
+            10,
+        ));
+        state.members.push(member);
+        // A cluster root without a data directory: preparing the route fails
+        // locally, before any dial, with an I/O error.
+        let paths = ClusterPaths {
+            root: PathBuf::from("/"),
+            state: PathBuf::from("/nonexistent/sinomo-route-prepare/state.sobj"),
+            connectivity_local: PathBuf::from(
+                "/nonexistent/sinomo-route-prepare/connectivity-local.sobj",
+            ),
+        };
+        let _owner = crate::__connectivity_store::register_peer_verification_owner(&paths);
+        let mut host = NoopObjectRpcHost;
+        let mut client = ClusterObjectRpcClient::routed(&mut host, &paths);
+        let result = client
+            .call_target(
+                &state,
+                &target,
+                ObjectRpcCall::value(
+                    ObjectRpcRequest::encode_body("/test/route-prepare", "test", &())
+                        .expect("request"),
+                ),
+                ClusterObjectRpcOptions::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(NetworkError::Io { .. })),
+            "route preparation fails locally: {result:?}"
+        );
+        assert!(
+            crate::__connectivity_store::take_pending_peer_verifications(&paths).is_empty(),
+            "a local failure before any dial says nothing about the peer"
+        );
+    }
+
+    #[test]
+    fn peer_verification_is_on_by_default_and_probes_opt_out() {
+        assert!(ClusterObjectRpcOptions::default().requests_peer_verification());
+        assert!(
+            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::default())
+                .with_overall_timeout(Duration::from_secs(1))
+                .requests_peer_verification()
+        );
+        assert!(
+            !ClusterObjectRpcOptions::default()
+                .without_peer_verification()
+                .requests_peer_verification()
+        );
+    }
 
     #[test]
     fn terminal_target_connect_timeout_retires_leader_preference_until_authenticated_reply() {

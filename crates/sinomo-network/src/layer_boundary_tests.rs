@@ -89,3 +89,49 @@ fn object_rpc_stream_does_not_import_routing_or_connectivity() {
         );
     }
 }
+
+#[test]
+fn connectivity_verification_and_route_input_hints_do_not_import_routing_or_rpc() {
+    for (module, source) in [
+        (
+            "connectivity_verification",
+            include_str!("connectivity_verification.rs"),
+        ),
+        ("route_input_watch", include_str!("route_input_watch.rs")),
+    ] {
+        assert_no_dependencies(
+            module,
+            source,
+            &[
+                "crate::routing",
+                "crate::route::",
+                "crate::peer_reachability",
+                "crate::object_rpc_stream",
+                "crate::rpc",
+                "sinomo_service",
+            ],
+        );
+    }
+}
+
+#[test]
+fn peer_reachability_does_not_import_sobj_rpc_or_service_catalogs() {
+    let source = include_str!("peer_reachability.rs");
+    assert_no_dependencies(
+        "peer_reachability",
+        source,
+        &[
+            "crate::object_rpc_stream",
+            "crate::rpc",
+            "crate::route::",
+            "sinomo_object",
+            "sinomo_service",
+        ],
+    );
+    for forbidden_type in ["ObjectRpc", "SinomoObject", "ServiceCatalog"] {
+        assert!(
+            !source.contains(forbidden_type),
+            "peer_reachability must not mention application type `{forbidden_type}`"
+        );
+    }
+}

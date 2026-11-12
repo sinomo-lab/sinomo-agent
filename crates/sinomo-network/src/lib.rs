@@ -16,6 +16,7 @@ mod builtin_link;
 mod connectivity;
 mod connectivity_snapshot;
 mod connectivity_store;
+mod connectivity_verification;
 mod daemon_auth;
 mod direct_link;
 mod directory;
@@ -39,9 +40,11 @@ mod owned_mux;
 mod path_metrics;
 mod paths;
 mod peer;
+mod peer_reachability;
 mod roaming;
 mod route;
 mod route_graph_read_model;
+mod route_input_watch;
 mod routed_identity;
 mod routed_stream_pool;
 mod routing;
@@ -78,7 +81,14 @@ pub mod __connectivity_store {
         local_cluster_connectivity_content_generation,
         prepare_local_cluster_connectivity_publication_if_snapshot,
         record_daemon_owned_local_cluster_endpoint_command_connectivity,
+        remove_expired_local_cluster_connectivity_source_records,
+        remove_expired_local_cluster_connectivity_source_records_async,
         subscribe_local_cluster_connectivity_routing_generation,
+    };
+    pub use super::connectivity_verification::{
+        PeerVerificationOwner, begin_peer_verification, register_peer_verification_owner,
+        request_peer_verification_after_edge_failure, settle_peer_verification,
+        take_pending_peer_verifications,
     };
 }
 pub use connectivity::cluster_network_record_live;
@@ -86,13 +96,14 @@ pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
     CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS, ClusterConnectivityFailureReason,
     ClusterConnectivityGraph, ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
-    ClusterConnectivityProbeObservation, ClusterConnectivityProbeState, ClusterConnectivityRecord,
-    ClusterConnectivityRecordQuery, ClusterConnectivityState,
-    MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    apply_cluster_connectivity_probe_results, cluster_connectivity_probe_due_with_graph,
-    cluster_connectivity_probe_due_with_startup_settle, cluster_connectivity_record,
-    cluster_connectivity_record_for_command_auth_denied,
-    cluster_connectivity_record_for_probe_observation, select_cluster_connectivity_probe_batch,
+    ClusterConnectivityProbeObservation, ClusterConnectivityProbeScope,
+    ClusterConnectivityProbeState, ClusterConnectivityRecord, ClusterConnectivityRecordQuery,
+    ClusterConnectivityState, MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, apply_cluster_connectivity_probe_results,
+    cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_due_with_startup_settle,
+    cluster_connectivity_record, cluster_connectivity_record_for_command_auth_denied,
+    cluster_connectivity_record_for_probe_observation,
+    cluster_connectivity_record_is_regularly_probed, select_cluster_connectivity_probe_batch,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity::{
@@ -124,6 +135,9 @@ pub use connectivity_store::{
 };
 pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
+};
+pub use connectivity_verification::{
+    MAX_PENDING_PEER_VERIFICATIONS, PeerVerificationCause, request_peer_verification,
 };
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,
@@ -206,7 +220,9 @@ pub use maintenance::{
     CLUSTER_NETWORK_PROBE_INTERVAL, CLUSTER_NETWORK_PUBLISH_INTERVAL,
     CLUSTER_NETWORK_SENSOR_PROBE_INTERVAL, CLUSTER_NETWORK_SENSOR_PUBLISH_INTERVAL,
     CLUSTER_NETWORK_STABLE_DISCOVERY_ANNOUNCE_TICK_STRIDE,
-    CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS, ClusterNetworkMaintenanceDue,
+    CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS,
+    CLUSTER_PEER_VERIFICATION_MAX_INCONCLUSIVE_ROUNDS, CLUSTER_PEER_VERIFICATION_MAX_ROUNDS,
+    CLUSTER_PEER_VERIFICATION_WEAK_COOLDOWN, ClusterNetworkMaintenanceDue,
     ClusterNetworkMaintenanceSchedule, cluster_connectivity_probe_max_endpoints_per_tick_for_role,
     cluster_local_node_role, cluster_network_discovery_interval_for_role,
     cluster_network_maintenance_due, cluster_network_maintenance_interval_due,
@@ -215,6 +231,7 @@ pub use maintenance::{
     cluster_network_maintenance_next_due_duration, cluster_network_module_republish_sleep_duration,
     cluster_network_module_start_retry_sleep_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_role, cluster_network_stable_discovery_announcement_due,
+    cluster_peer_verification_retry_spacing_for_role,
 };
 pub use network_info::cluster_network_info_stable_eq;
 pub use network_info::cluster_network_record_should_refresh;
@@ -240,6 +257,10 @@ pub use object_file_store::{
 pub use path_metrics::{
     NetworkPathEstimate, NetworkPathEstimator, NetworkPathKey, shared_network_path_estimator,
 };
+pub use peer_reachability::{
+    PeerReachability, PeerReachabilityChange, PeerReachabilityInputs, PeerReachabilitySnapshot,
+    PeerReachabilitySubscription, peer_reachability_snapshot, subscribe_peer_reachability,
+};
 pub use policy::{NetworkCallPolicy, NetworkHealthPolicy};
 pub use route::cluster_route_next_hop;
 pub use route::{cluster_healthy_route_next_hop, cluster_nodes_share_healthy_component};
@@ -261,11 +282,11 @@ pub use routed_stream_pool::{
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DestinationProcessAffinity, DirectRoutedConnector,
-    MAX_ROUTE_CANDIDATES, MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop,
-    RouteTrace, RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
-    RoutedSessionDisposition, RoutedSessionIdentity, RoutedSessionProtection,
-    accept_direct_routed_session, accept_or_relay_routed_session, accept_or_relay_routed_session_or_closed, connect_direct_routed_endpoint,
-    plan_routes,
+    MAX_ROUTE_CANDIDATES, MultiHopRoutedConnector, PeerPathVerdict, PeerStream, RouteConstraints,
+    RouteHop, RouteTrace, RoutedAvailability, RoutedConnectFuture, RoutedConnector,
+    RoutedRelayReport, RoutedSessionDisposition, RoutedSessionIdentity, RoutedSessionProtection,
+    accept_direct_routed_session, accept_or_relay_routed_session,
+    accept_or_relay_routed_session_or_closed, connect_direct_routed_endpoint, plan_routes,
 };
 pub use rpc::{
     CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,

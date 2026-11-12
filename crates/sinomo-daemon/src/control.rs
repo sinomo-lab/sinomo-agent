@@ -55,6 +55,7 @@ const DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY: u8 = 1 << 1;
 const DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY: u8 = 1 << 2;
 const DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT: u8 = 1 << 3;
 const DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION: u8 = 1 << 4;
+const DAEMON_CLUSTER_MAINTENANCE_DIRTY_PEER_VERIFICATION: u8 = 1 << 5;
 
 /// Identifies the durable input that invalidated a cluster-maintenance
 /// projection. Callers publish intent instead of resetting the whole
@@ -76,6 +77,9 @@ pub(crate) enum DaemonClusterMaintenanceReason {
     /// The local connectivity store committed a route-relevant source change.
     /// Main publishes the stored source set; no new probe generation starts.
     LocalConnectivitySourceChanged,
+    /// A delivery outcome asked this process's probe owner to verify a
+    /// peer's direct edges. Only those peers are probed.
+    PeerVerificationRequested,
     /// A committed member display-name generation changed.
     Rename,
     /// A committed role generation changed scheduler and member projections.
@@ -109,6 +113,9 @@ const fn daemon_cluster_maintenance_request_plan(
         },
         Reason::LocalConnectivitySourceChanged => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION,
+        },
+        Reason::PeerVerificationRequested => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PEER_VERIFICATION,
         },
         Reason::Rename => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
@@ -321,6 +328,8 @@ struct DaemonConnectivityTopologySubscriptions {
     _observation_subscription: sinomo_core::kv::KvCommittedObservationSubscription,
     _external_snapshot_watcher: Option<notify::RecommendedWatcher>,
     _local_source_publication: Option<DaemonLocalConnectivitySourcePublication>,
+    _peer_verification: DaemonOwnedTask,
+    _peer_reachability_events: Option<DaemonOwnedTask>,
     // The callbacks retain this too. Keeping it here makes the ownership
     // explicit and lets focused tests inspect the independent observer.
     _projection: Arc<Mutex<DaemonConnectivityTopologyProjection>>,
@@ -338,6 +347,63 @@ impl Drop for DaemonLocalConnectivitySourcePublication {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Background task aborted when its owner is dropped.
+struct DaemonOwnedTask(tokio::task::JoinHandle<()>);
+
+impl Drop for DaemonOwnedTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Registers this process as the single connectivity probe owner for peer
+/// verification and wakes its maintenance turn on each request. Main and
+/// shadow each own their probes; a process without this owner ignores
+/// verification requests.
+fn watch_daemon_peer_verification_requests(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    wake: impl Fn() + Send + 'static,
+) -> DaemonOwnedTask {
+    let owner =
+        sinomo_core::network::__connectivity_store::register_peer_verification_owner(cluster_paths);
+    DaemonOwnedTask(runtime.spawn(async move {
+        loop {
+            owner.requested().await;
+            wake();
+        }
+    }))
+}
+
+/// Main-only bridge from this node's per-peer reachability verdicts to the
+/// component event bus, one local transient event per changed peer.
+fn publish_daemon_peer_reachability_events(
+    paths: &DaemonPaths,
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Option<DaemonOwnedTask> {
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .inspect_err(
+            |error| tracing::debug!(%error, "peer reachability events start without cluster state"),
+        )
+        .ok()?;
+    let mut subscription = sinomo_core::network::subscribe_peer_reachability(cluster_paths, &state);
+    let paths = paths.clone();
+    Some(DaemonOwnedTask(runtime.spawn(async move {
+        let mut previous = subscription.current();
+        loop {
+            let changes = subscription.changed().await;
+            let current = subscription.current();
+            for change in &changes {
+                crate::service_adapter::publish_component_host_peer_reachability_change(
+                    &paths, &previous, &current, change,
+                );
+            }
+            previous = current;
+        }
+    })))
 }
 
 fn watch_daemon_local_connectivity_source(
@@ -741,6 +807,17 @@ fn subscribe_daemon_connectivity_topology_sources(
             )
         })
     });
+    let peer_verification =
+        watch_daemon_peer_verification_requests(&cluster_paths, runtime, || {
+            request_daemon_cluster_maintenance(
+                DaemonClusterMaintenanceReason::PeerVerificationRequested,
+            )
+        });
+    let peer_reachability_events = if crate::daemon_paths_are_shadow(paths) {
+        None
+    } else {
+        publish_daemon_peer_reachability_events(paths, &cluster_paths, runtime)
+    };
     // Registration precedes the coherent native seed. A discontinuity that
     // crosses the read invalidates its generation; a shadow instead joins one
     // bounded main-daemon ReadIndex request without opening local Raft.
@@ -773,6 +850,8 @@ fn subscribe_daemon_connectivity_topology_sources(
         _observation_subscription: observation_subscription,
         _external_snapshot_watcher: external_snapshot_watcher,
         _local_source_publication: local_source_publication,
+        _peer_verification: peer_verification,
+        _peer_reachability_events: peer_reachability_events,
         _projection: projection,
         #[cfg(test)]
         _scheduled_changes: scheduled_changes,
@@ -1407,6 +1486,16 @@ impl sinomo_core::cluster::ClusterMaintenanceReactorHost for DaemonClusterMainte
         if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION != 0 {
             self.cluster_network
                 .request_connectivity_source_publication(now);
+        }
+        if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_PEER_VERIFICATION != 0
+            && let Ok(cluster_paths) = cluster_paths_from_daemon_paths(&self.paths)
+        {
+            let requests =
+                sinomo_core::network::__connectivity_store::take_pending_peer_verifications(
+                    &cluster_paths,
+                );
+            self.cluster_network
+                .request_peer_verifications(&cluster_paths, requests, now);
         }
     }
 
@@ -2142,6 +2231,13 @@ impl sinomo_core::network::ConnectivityFailureSink for DaemonRoutedConnectivityF
             None,
             false,
         )?;
+        // The relay's own outbound edge failed: verify it now rather than at
+        // the next scheduled probe.
+        sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+            self.cluster_paths,
+            &self.state.local_node_id,
+            &evidence.target_node_id,
+        );
         Ok(())
     }
 }
@@ -2906,6 +3002,62 @@ mod tests {
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_verification_request_wakes_only_the_verification_owner() {
+        assert_eq!(
+            daemon_cluster_maintenance_request_plan(
+                DaemonClusterMaintenanceReason::PeerVerificationRequested
+            )
+            .dirty,
+            DAEMON_CLUSTER_MAINTENANCE_DIRTY_PEER_VERIFICATION,
+            "a verification request starts no probe generation or publication"
+        );
+        let root = sinomo_testdir::TestDir::new("peer-verification-owner-wake");
+        let paths = sinomo_core::network::ClusterPaths::new(&SinomoDataDir::new(&root));
+        let local = NodeId::generate();
+        let peer = NodeId::generate();
+        assert!(
+            !sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+                &paths, &local, &peer,
+            ),
+            "without an owner a request is ignored"
+        );
+        let wakes = Arc::new(tokio::sync::Semaphore::new(0));
+        let wake = Arc::clone(&wakes);
+        let watch = watch_daemon_peer_verification_requests(
+            &paths,
+            &tokio::runtime::Handle::current(),
+            move || wake.add_permits(1),
+        );
+        assert!(
+            sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+                &paths, &local, &peer,
+            )
+        );
+        tokio::time::timeout(Duration::from_secs(5), wakes.acquire())
+            .await
+            .expect("a request wakes the probe owner")
+            .unwrap()
+            .forget();
+        assert_eq!(
+            sinomo_core::network::__connectivity_store::take_pending_peer_verifications(&paths),
+            vec![(
+                peer.clone(),
+                sinomo_core::network::PeerVerificationCause::DeliveryFailed
+            )]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(wakes.available_permits(), 0, "no request means no wake");
+        drop(watch);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+                &paths, &local, &peer,
+            ),
+            "dropping the owner unregisters it"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_source_change_wakes_publication_without_a_probe_generation() {

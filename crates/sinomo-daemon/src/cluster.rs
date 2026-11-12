@@ -227,7 +227,23 @@ fn daemon_clear_cluster_raft_leader(
         .clear_raft_leader_and_write_snapshot_if_changed(node_id)
         .map_err(sinomo_core::network::NetworkError::directory)
 }
-const CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY: usize = 16;
+/// Every planned endpoint of one batch probes concurrently, so a batch is a
+/// single wave: an endpoint that runs to the connect or no-progress limit still
+/// finishes within the batch budget instead of waiting behind another wave.
+const CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY: usize =
+    sinomo_core::network::CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK;
+const _: () = assert!(
+    CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY
+        >= sinomo_core::network::CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK
+        && CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY
+            >= sinomo_core::network::CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK
+        && CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY
+            >= sinomo_core::network::CLUSTER_CONNECTIVITY_SENSOR_PROBE_MAX_ENDPOINTS_PER_TICK,
+    "one probe batch must run as a single wave"
+);
+/// Kept between a probe batch's own budget and the pending-step bound, so an
+/// unfinished endpoint becomes inconclusive instead of failing the batch.
+const CLUSTER_CONNECTIVITY_PROBE_BATCH_BUDGET_RESERVE: Duration = Duration::from_millis(250);
 
 struct ClusterConnectivityProbePlan {
     active_keys: Vec<String>,
@@ -238,10 +254,23 @@ struct ClusterConnectivityProbePlan {
     timestamp: String,
     now: time::OffsetDateTime,
     startup_settle_active: bool,
+    verification: ClusterConnectivityProbeVerification,
+}
+
+/// Peer verification carried by one probe plan.
+#[derive(Clone, Debug, Default)]
+struct ClusterConnectivityProbeVerification {
+    /// The plan probes only peers under verification. It leaves the regular
+    /// probe cadence, convergence and forced-probe state untouched.
+    only: bool,
+    /// Peers under verification with the number of their endpoints planned.
+    peers: BTreeMap<NodeId, usize>,
 }
 
 struct ClusterConnectivityProbeExecution {
     records: Vec<ClusterConnectivityRecord>,
+    /// Records observed by this batch. Endpoints without one were inconclusive.
+    observed: Vec<ClusterConnectivityRecord>,
     probed_degraded: bool,
     newly_healthy_target_node_ids: Vec<NodeId>,
 }
@@ -2325,12 +2354,19 @@ impl ClusterNetworkMaintenance {
             && !self.probe_retry_waiting(now);
         let discovery_due = (due.discovery_due || self.discovery_retry_due(now))
             && !self.discovery_retry_waiting(now);
-        let scheduled_work_due =
-            publish_due || probe_due || discovery_due || connectivity_publish_due;
+        // Verification rounds are not a due class: they never claim, advance
+        // or back off the regular probe cadence.
+        let verification_peers = self.cadence.peer_verifications_due(now);
+        let verification_due = !verification_peers.is_empty();
+        // Consumed here so no early return can leave it due; the next commit
+        // or publication observes the remaining unrenewed expiries again.
+        let unrenewed_expiry_due = self.cadence.take_unrenewed_connectivity_expiry(now);
+        let class_work_due = publish_due || probe_due || discovery_due || connectivity_publish_due;
+        let scheduled_work_due = class_work_due || verification_due || unrenewed_expiry_due;
         if !scheduled_work_due && !self.local_raft_resident_initialization.is_in_flight() {
             return Ok(None);
         }
-        if scheduled_work_due {
+        if class_work_due {
             self.claim_due_classes(
                 now,
                 publish_due,
@@ -2362,6 +2398,7 @@ impl ClusterNetworkMaintenance {
                 detail: format!("cluster state existence task failed: {source}"),
             })?;
         if !state_exists {
+            self.cancel_peer_verifications(&cluster_paths);
             self.solo_cluster_idle = false;
             self.settle_connectivity_without_publication();
             if publish_due {
@@ -2388,11 +2425,46 @@ impl ClusterNetworkMaintenance {
             if publish_due { self.last_publish = now; }
             if discovery_due { self.last_discovery = now; }
             self.complete_discovery_claim();
-            if !self.solo_cluster_idle && !sinomo_core::network::cluster_state_needs_join_registration(&state)
-                && probe_due {
+            if !self.solo_cluster_idle
+                && !sinomo_core::network::cluster_state_needs_join_registration(&state)
+                && !probe_due
+                && verification_due
+            {
+                // Verification only: the passive shadow keeps its results in RAM.
+                let plan = self.select_connectivity_probe_plan_with_verification(
+                    &cluster_paths,
+                    &state,
+                    false,
+                    &verification_peers,
+                );
+                if !plan.entries.is_empty() {
+                    let local_connectivity_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&cluster_paths)?;
+                    self.complete_all_active_due_claims();
+                    return Ok(Some(ClusterNetworkMaintenancePendingWork {
+                        connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                            memory_only: true,
+                            paths: cluster_paths.clone(),
+                            source_node_id: state.local_node_id.clone(),
+                            state,
+                            plan,
+                            input_generation: self.connectivity_input_generation,
+                            local_connectivity_snapshot,
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            } else if !self.solo_cluster_idle
+                && !sinomo_core::network::cluster_state_needs_join_registration(&state)
+                && probe_due
+            {
                 self.last_probe = now;
                 self.cadence.ensure_connectivity_settle_deadline(now, false);
-                let plan = self.select_connectivity_probe_plan(&cluster_paths, &state);
+                let plan = self.select_connectivity_probe_plan_with_verification(
+                    &cluster_paths,
+                    &state,
+                    true,
+                    &verification_peers,
+                );
                 if matches!(sinomo_core::cluster::cluster_connectivity_probe_plan_action(
                     plan.force_probe, plan.entries.len(), plan.remaining_due, plan.convergence_active, false,
                 ), sinomo_core::cluster::ClusterConnectivityProbePlanAction::Probe) {
@@ -2406,10 +2478,13 @@ impl ClusterNetworkMaintenance {
                 }
                 let accepted = sinomo_core::network::read_local_cluster_connectivity_records_for_source(&cluster_paths, &state.local_node_id)?;
                 self.cadence.observe_accepted_connectivity_expiries(
-                    accepted.iter().map(|record| record.expires_at), time::OffsetDateTime::now_utc(), Instant::now(),
+                    regularly_probed_connectivity_expiries(&state, &accepted),
+                    time::OffsetDateTime::now_utc(),
+                    Instant::now(),
                 );
                 self.finish_connectivity_convergence();
             } else if self.solo_cluster_idle || sinomo_core::network::cluster_state_needs_join_registration(&state) {
+                self.cancel_peer_verifications(&cluster_paths);
                 self.settle_connectivity_without_publication();
             }
             self.complete_all_active_due_claims();
@@ -2451,6 +2526,7 @@ impl ClusterNetworkMaintenance {
                 self.complete_discovery_claim();
             }
             if !discovered && sinomo_core::network::cluster_is_settled_solo(&state) {
+                self.cancel_peer_verifications(&cluster_paths);
                 self.settle_connectivity_without_publication();
                 if publish_due {
                     self.last_publish = now;
@@ -2471,7 +2547,8 @@ impl ClusterNetworkMaintenance {
         // materialized snapshot on every publish/probe deadline turns an idle
         // timer into an O(KV) filesystem scan. Concrete publications and probes
         // retain their typed quorum and freshness checks below.
-        let mut state = if publish_due || probe_due || connectivity_publish_due {
+        let mut state = if publish_due || probe_due || connectivity_publish_due || verification_due
+        {
             sinomo_core::cluster::read_cluster_state_cached_async(&runtime, &cluster_paths).await
         } else {
             sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
@@ -2494,6 +2571,7 @@ impl ClusterNetworkMaintenance {
             if discovery_due {
                 self.last_discovery = now;
             }
+            self.cancel_peer_verifications(&cluster_paths);
             self.settle_connectivity_without_publication();
             self.solo_cluster_idle = false;
             self.complete_all_active_due_claims();
@@ -2616,10 +2694,45 @@ impl ClusterNetworkMaintenance {
             }
         }
 
+        if unrenewed_expiry_due {
+            self.remove_expired_unrenewed_connectivity_async(&runtime, &cluster_paths, &state)
+                .await;
+        }
+        if verification_due && !probe_due {
+            // A verification-only batch: no due class is claimed and the
+            // regular cadence, convergence and forced-probe state stay as they are.
+            if cluster_is_solo {
+                self.cancel_peer_verifications(&cluster_paths);
+            } else {
+                let plan = self.select_connectivity_probe_plan_with_verification(
+                    &cluster_paths,
+                    &state,
+                    false,
+                    &verification_peers,
+                );
+                if !plan.entries.is_empty() {
+                    let local_connectivity_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&cluster_paths)?;
+                    pending_work.connectivity_probe = Some(ClusterConnectivityPendingProbe {
+                        memory_only: false,
+                        paths: cluster_paths.clone(),
+                        source_node_id: state.local_node_id.clone(),
+                        state: state.clone(),
+                        plan,
+                        input_generation: self.connectivity_input_generation,
+                        local_connectivity_snapshot,
+                    });
+                }
+            }
+        }
         if probe_due {
             self.last_probe = now;
             if !cluster_is_solo {
-                let plan = self.select_connectivity_probe_plan(&cluster_paths, &state);
+                let plan = self.select_connectivity_probe_plan_with_verification(
+                    &cluster_paths,
+                    &state,
+                    true,
+                    &verification_peers,
+                );
                 match sinomo_core::cluster::cluster_connectivity_probe_plan_action(
                     plan.force_probe,
                     plan.entries.len(),
@@ -2649,6 +2762,7 @@ impl ClusterNetworkMaintenance {
                     sinomo_core::cluster::ClusterConnectivityProbePlanAction::None => {}
                 }
             } else {
+                self.cancel_peer_verifications(&cluster_paths);
                 self.finish_connectivity_convergence();
             }
         } else if connectivity_publish_due && !cluster_is_solo {
@@ -2925,6 +3039,7 @@ impl ClusterNetworkMaintenance {
             }
         }
         if let Some(probe) = connectivity_probe {
+            let regular_probe = !probe.plan.verification.only;
             let probe_result = self
                 .run_pending_connectivity_probe_async(
                     probe,
@@ -2936,7 +3051,7 @@ impl ClusterNetworkMaintenance {
                 ClusterConnectivityProbePendingOutcome::Completed
                 | ClusterConnectivityProbePendingOutcome::PublicationDeferred
                 | ClusterConnectivityProbePendingOutcome::Superseded => {}
-                ClusterConnectivityProbePendingOutcome::ProbeFailed => {
+                ClusterConnectivityProbePendingOutcome::ProbeFailed if regular_probe => {
                     // A cancelled/local-persistence probe must rerun. Quorum
                     // publication failure is deliberately excluded: its exact
                     // retained-record retry owns that backoff.
@@ -2946,6 +3061,8 @@ impl ClusterNetworkMaintenance {
                         self.record_connectivity_publish_failure();
                     }
                 }
+                // A verification round retries on its own spacing.
+                ClusterConnectivityProbePendingOutcome::ProbeFailed => {}
             }
         }
         // A fresh probe reads and publishes the current record set itself, so a
@@ -3105,6 +3222,9 @@ impl ClusterNetworkMaintenance {
                 return false;
             }
         };
+        // Command outcomes and verification commit outside probe turns and
+        // reach this publication; observe their unrenewed expiries here too.
+        self.observe_unrenewed_connectivity_expiries(&paths, &current_state);
         // Retain before the first remote await. A timeout drops only this
         // attempt; the same durable generation remains the independent retry
         // owner and full-source reconciliation is idempotent. An empty set is
@@ -3252,6 +3372,18 @@ impl ClusterNetworkMaintenance {
         self.cadence.record_connectivity_publish_success(superseded);
     }
 
+    /// A verification batch's publication completed. Unlike a regular batch
+    /// it never clears a pending forced probe or ends convergence.
+    fn record_verification_publication_success(&mut self) {
+        let superseded = self.connectivity_publish_superseded();
+        self.retained_connectivity_publish = None;
+        self.cadence.clear_connectivity_publish_retry();
+        if superseded {
+            self.connectivity_force_probe = true;
+            self.connectivity_converged = false;
+        }
+    }
+
     fn observe_confirmed_connectivity_publication(
         &mut self,
         host: &DaemonClusterControlPlaneTransport,
@@ -3324,6 +3456,11 @@ impl ClusterNetworkMaintenance {
         } = pending;
         let remaining_due = plan.remaining_due;
         let convergence_active = plan.convergence_active;
+        let verification = plan.verification.clone();
+        // A verification-only batch leaves the regular cadence, convergence
+        // and forced-probe state exactly as it found them.
+        let regular = !verification.only;
+        let budget = cluster_connectivity_probe_batch_budget(deadline);
         // Only endpoint observation is cancelable as the probe phase. Once a
         // complete batch exists, its source-owned projection must cross the
         // local durable boundary before any quorum/import await can consume
@@ -3332,10 +3469,11 @@ impl ClusterNetworkMaintenance {
             "connectivity probe",
             CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
             deadline,
-            self.execute_connectivity_probe_plan_async(&paths, &state, plan),
+            self.execute_connectivity_probe_plan_async(&paths, &state, plan, budget),
         )
         .await
         else {
+            self.finish_peer_verification_rounds(&paths, &verification, None);
             return ClusterConnectivityProbePendingOutcome::ProbeFailed;
         };
         let newly_healthy_target_node_ids = execution.newly_healthy_target_node_ids.clone();
@@ -3353,10 +3491,13 @@ impl ClusterNetworkMaintenance {
         let current_state = match current_state_result {
             Ok(state) => state,
             Err(error) => {
-                self.connectivity_force_probe = true;
+                if regular {
+                    self.connectivity_force_probe = true;
+                }
                 tracing::warn!(
                     "sinomo daemon current topology read before connectivity commit failed: {error}"
                 );
+                self.finish_peer_verification_rounds(&paths, &verification, None);
                 return ClusterConnectivityProbePendingOutcome::ProbeFailed;
             }
         };
@@ -3364,6 +3505,7 @@ impl ClusterNetworkMaintenance {
             || source_node_id != current_state.local_node_id
         {
             self.record_connectivity_topology_superseded();
+            self.cancel_peer_verifications(&paths);
             return ClusterConnectivityProbePendingOutcome::Superseded;
         }
         let topology_changed = input_generation != self.connectivity_input_generation
@@ -3410,24 +3552,38 @@ impl ClusterNetworkMaintenance {
                 tracing::debug!(target: "sinomo.daemon.cluster_network_maintenance",
                     "connectivity probe discarded because its source store changed");
                 self.connectivity.clear();
-                self.record_connectivity_topology_superseded();
+                if regular {
+                    self.record_connectivity_topology_superseded();
+                }
+                // A verification round discarded at the fence is retried on
+                // its own spacing; it never escalates to a whole-plan probe.
+                self.finish_peer_verification_rounds(&paths, &verification, None);
                 return ClusterConnectivityProbePendingOutcome::Superseded;
             }
             Err(error) => {
-                self.connectivity_force_probe = true;
+                if regular {
+                    self.connectivity_force_probe = true;
+                }
                 tracing::warn!(
                     "sinomo daemon generation-fenced connectivity probe commit failed: {error}"
                 );
+                self.finish_peer_verification_rounds(&paths, &verification, None);
                 return ClusterConnectivityProbePendingOutcome::ProbeFailed;
             }
         };
+        self.finish_peer_verification_rounds(&paths, &verification, Some(&execution.observed));
         let durable_changed = !committed_snapshot.has_same_persisted_records(&local_connectivity_snapshot);
         if memory_only {
             self.connectivity.clear();
-            self.connectivity_force_probe = false;
             self.cadence.observe_accepted_connectivity_expiries(
-                accepted_records.iter().map(|record| record.expires_at), time::OffsetDateTime::now_utc(), Instant::now(),
+                regularly_probed_connectivity_expiries(&current_state, &accepted_records),
+                time::OffsetDateTime::now_utc(),
+                Instant::now(),
             );
+            if !regular {
+                return ClusterConnectivityProbePendingOutcome::Completed;
+            }
+            self.connectivity_force_probe = false;
             if convergence_followup_needed {
                 self.connectivity_converged = false;
                 self.record_connectivity_publish_success();
@@ -3448,9 +3604,12 @@ impl ClusterNetworkMaintenance {
             input_generation,
             local_connectivity_snapshot: committed_snapshot,
         };
+        self.observe_unrenewed_connectivity_expiries(&paths, &current_state);
         // Install the retry owner before the first cancelable remote await.
         self.retained_connectivity_publish = Some(retained_publish);
-        self.connectivity_force_probe = false;
+        if regular {
+            self.connectivity_force_probe = false;
+        }
         if durable_changed {
             self.idle_stats.incr_connectivity_record_sets_written();
         }
@@ -3491,7 +3650,9 @@ impl ClusterNetworkMaintenance {
         match published {
             Some(Ok(_)) => {
                 self.observe_confirmed_connectivity_publication(&publish_host);
-                if convergence_followup_needed {
+                if !regular {
+                    self.record_verification_publication_success();
+                } else if convergence_followup_needed {
                     self.connectivity_converged = false;
                     self.record_connectivity_publish_success();
                 } else {
@@ -3516,6 +3677,7 @@ impl ClusterNetworkMaintenance {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
         plan: ClusterConnectivityProbePlan,
+        budget: Duration,
     ) -> ClusterConnectivityProbeExecution {
         let probed = probe_connectivity_batch_async(
             paths.clone(),
@@ -3524,6 +3686,7 @@ impl ClusterNetworkMaintenance {
             plan.timestamp.clone(),
             plan.now,
             plan.startup_settle_active,
+            budget,
         )
         .await;
         let probed_degraded = probed
@@ -3531,18 +3694,38 @@ impl ClusterNetworkMaintenance {
             .any(|(_, record)| record.state == ClusterConnectivityState::Degraded);
         let newly_healthy_target_node_ids =
             newly_healthy_connectivity_target_node_ids(&self.connectivity, &probed);
+        let observed = probed.iter().map(|(_, record)| record.clone()).collect();
         let records = self.apply_connectivity_probe_plan(plan, probed);
         ClusterConnectivityProbeExecution {
             records,
+            observed,
             probed_degraded,
             newly_healthy_target_node_ids,
         }
     }
 
+    #[cfg(test)]
     fn select_connectivity_probe_plan(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
+    ) -> ClusterConnectivityProbePlan {
+        self.select_connectivity_probe_plan_with_verification(paths, state, true, &BTreeSet::new())
+    }
+
+    /// Plans one probe batch. `regular` includes the ordinary probe cadence;
+    /// `verification_peers` are peers whose verification round is due.
+    ///
+    /// A failure-driven first round for a peer whose every planned endpoint
+    /// is already at the failure threshold settles at once: the evidence
+    /// already says what another probe would. Its recovery stays with the
+    /// unreachable retry cadence and with deliveries that contradict it.
+    fn select_connectivity_probe_plan_with_verification(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        regular: bool,
+        verification_peers: &BTreeSet<NodeId>,
     ) -> ClusterConnectivityProbePlan {
         let now = time::OffsetDateTime::now_utc();
         let timestamp = now
@@ -3551,10 +3734,18 @@ impl ClusterNetworkMaintenance {
         let startup_settle_active = self
             .startup_settle_until
             .is_some_and(|deadline| Instant::now() < deadline);
-        let convergence_active = !self.connectivity_converged;
-        let force_probe = self.connectivity_force_probe;
+        let convergence_active = regular && !self.connectivity_converged;
+        let force_probe = regular && self.connectivity_force_probe;
         let local_node_role = self.effective_network_maintenance_role();
-        let batch = sinomo_core::network::select_cluster_connectivity_probe_batch(
+        let scope = if regular {
+            sinomo_core::network::ClusterConnectivityProbeScope::regular(force_probe)
+                .with_verification_peers(verification_peers.clone())
+        } else {
+            sinomo_core::network::ClusterConnectivityProbeScope::verification_only(
+                verification_peers.clone(),
+            )
+        };
+        let mut batch = sinomo_core::network::select_cluster_connectivity_probe_batch(
             paths,
             state,
             &mut self.connectivity,
@@ -3562,10 +3753,68 @@ impl ClusterNetworkMaintenance {
             &local_node_role,
             startup_settle_active,
             convergence_active,
-            force_probe,
+            &scope,
             now,
         );
-        self.connectivity_cursor = batch.next_cursor;
+        let mut verification = ClusterConnectivityProbeVerification {
+            only: !regular,
+            peers: BTreeMap::new(),
+        };
+        let wall_instant = Instant::now();
+        for peer in verification_peers {
+            let peer_entries = batch
+                .entries
+                .iter()
+                .filter(|entry| &entry.endpoint.node_id == peer)
+                .collect::<Vec<_>>();
+            let first_failure_round = self
+                .cadence
+                .peer_verification
+                .episode(peer)
+                .is_some_and(|episode| episode.rounds == 0 && episode.cause.is_failure());
+            if first_failure_round
+                && !peer_entries.is_empty()
+                && peer_entries.iter().all(|entry| {
+                    entry
+                        .previous
+                        .as_ref()
+                        .is_some_and(|record| record.state == ClusterConnectivityState::Unreachable)
+                })
+            {
+                batch
+                    .entries
+                    .retain(|entry| &entry.endpoint.node_id != peer);
+                self.settle_peer_verification(
+                    paths,
+                    peer,
+                    sinomo_core::cluster::ClusterPeerVerificationSettlement::Exhausted,
+                );
+                continue;
+            }
+            let peer_key_prefix = format!("{}:{}:", state.local_node_id, peer);
+            if !peer_entries.is_empty() {
+                verification.peers.insert(peer.clone(), peer_entries.len());
+            } else if !batch
+                .active_keys
+                .iter()
+                .any(|key| key.starts_with(&peer_key_prefix))
+            {
+                // Nothing this node can dial: relayed-only peers are verified
+                // through their first hop and by the relay's own feedback.
+                self.settle_peer_verification(
+                    paths,
+                    peer,
+                    sinomo_core::cluster::ClusterPeerVerificationSettlement::Cancelled,
+                );
+            }
+        }
+        let started_peers = verification.peers.keys().cloned().collect::<BTreeSet<_>>();
+        self.cadence
+            .peer_verification
+            .begin_rounds(&started_peers, &local_node_role, wall_instant);
+        if regular {
+            self.connectivity_cursor = batch.next_cursor;
+        }
         self.idle_stats
             .add_connectivity_probes_sent(batch.entries.len() as u64);
 
@@ -3578,6 +3827,160 @@ impl ClusterNetworkMaintenance {
             timestamp,
             now,
             startup_settle_active,
+            verification,
+        }
+    }
+
+    /// Evidence no regular probe renews has aged out: remove it from the source
+    /// set once, so the source's publication withdraws the committed copy, then
+    /// schedule the next such expiry. Returns how many records left.
+    async fn remove_expired_unrenewed_connectivity_async(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> usize {
+        let removed = match sinomo_core::network::__connectivity_store::remove_expired_local_cluster_connectivity_source_records_async(
+            runtime,
+            paths,
+            &state.local_node_id,
+        )
+        .await
+        {
+            Ok(removed) => {
+                tracing::debug!(
+                    target: "sinomo.daemon.cluster_network_maintenance",
+                    removed, "expired unrenewed connectivity evidence left the source set"
+                );
+                removed
+            }
+            Err(error) => {
+                tracing::warn!("sinomo daemon could not remove expired connectivity evidence: {error}");
+                0
+            }
+        };
+        self.observe_unrenewed_connectivity_expiries(paths, state);
+        removed
+    }
+
+    /// Schedules the one removal wake for this source's accepted records that
+    /// no regular probe renews. Main only: a passive shadow never writes the
+    /// shared store, and expired evidence already leaves its reads.
+    fn observe_unrenewed_connectivity_expiries(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) {
+        let unrenewed = |record: &ClusterConnectivityRecord| {
+            !sinomo_core::network::cluster_connectivity_record_is_regularly_probed(state, record)
+        };
+        // The live view carries in-memory renewals. A persisted record absent
+        // from it has already expired everywhere (for example while the
+        // daemon was stopped) and is due at once; removal deletes it, so this
+        // never reschedules the same moment.
+        let mut expiries =
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                paths,
+                &state.local_node_id,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| unrenewed(record))
+            .map(|record| {
+                (
+                    (record.target_node_id, record.endpoint_id),
+                    record.expires_at,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let persisted = sinomo_core::network::read_optional_object_file::<
+            Vec<ClusterConnectivityRecord>,
+        >(&paths.connectivity_local)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        for record in persisted
+            .into_iter()
+            .filter(|record| record.source_node_id == state.local_node_id && unrenewed(record))
+        {
+            expiries
+                .entry((record.target_node_id, record.endpoint_id))
+                .or_insert(record.expires_at);
+        }
+        self.cadence.observe_unrenewed_connectivity_expiries(
+            expiries.into_values(),
+            time::OffsetDateTime::now_utc(),
+            Instant::now(),
+        );
+    }
+
+    /// Starts verification episodes for requests taken from the registry.
+    pub(crate) fn request_peer_verifications(
+        &mut self,
+        paths: &ClusterPaths,
+        requests: Vec<(NodeId, sinomo_core::network::PeerVerificationCause)>,
+        now: Instant,
+    ) {
+        for (peer, cause) in requests {
+            if self
+                .cadence
+                .peer_verification
+                .request(peer.clone(), cause, now)
+            {
+                tracing::debug!(
+                    target: "sinomo.daemon.cluster_network_maintenance",
+                    peer = %peer, ?cause, "peer verification started"
+                );
+                sinomo_core::network::__connectivity_store::begin_peer_verification(paths, &peer);
+            }
+        }
+    }
+
+    fn settle_peer_verification(
+        &mut self,
+        paths: &ClusterPaths,
+        peer: &NodeId,
+        settlement: sinomo_core::cluster::ClusterPeerVerificationSettlement,
+    ) {
+        self.cadence.peer_verification.cancel(peer);
+        tracing::debug!(
+            target: "sinomo.daemon.cluster_network_maintenance",
+            peer = %peer, ?settlement, "peer verification settled"
+        );
+        sinomo_core::network::__connectivity_store::settle_peer_verification(paths, peer);
+    }
+
+    fn cancel_peer_verifications(&mut self, paths: &ClusterPaths) {
+        for peer in self.cadence.peer_verification.cancel_all() {
+            sinomo_core::network::__connectivity_store::settle_peer_verification(paths, &peer);
+        }
+    }
+
+    /// Records one verification round per planned peer from this batch's
+    /// observations and the accepted source set.
+    fn finish_peer_verification_rounds(
+        &mut self,
+        paths: &ClusterPaths,
+        verification: &ClusterConnectivityProbeVerification,
+        observed: Option<&[ClusterConnectivityRecord]>,
+    ) {
+        let now = Instant::now();
+        for (peer, planned) in &verification.peers {
+            let round = match observed {
+                None => sinomo_core::cluster::ClusterPeerVerificationRound::Inconclusive,
+                Some(observed) => peer_verification_round(peer, *planned, observed),
+            };
+            if let Some(settlement) = self
+                .cadence
+                .peer_verification
+                .record_round(peer, round, now)
+            {
+                tracing::debug!(
+                    target: "sinomo.daemon.cluster_network_maintenance",
+                    peer = %peer, ?round, ?settlement, "peer verification settled"
+                );
+                sinomo_core::network::__connectivity_store::settle_peer_verification(paths, peer);
+            }
         }
     }
 
@@ -3848,6 +4251,18 @@ fn cluster_network_deadline_with_tail_reserve(
         .or_else(|| Instant::now().checked_sub(Duration::from_nanos(1)))
 }
 
+/// The probe batch's own budget: the pending-step bound less a reserve, so
+/// an unfinished endpoint becomes inconclusive instead of failing the batch.
+fn cluster_connectivity_probe_batch_budget(deadline: Option<Instant>) -> Duration {
+    deadline
+        .map_or(CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT)
+        })
+        .saturating_sub(CLUSTER_CONNECTIVITY_PROBE_BATCH_BUDGET_RESERVE)
+}
+
 async fn cluster_network_pending_step_with_deadline<F, T>(
     label: &str,
     max_duration: Duration,
@@ -4045,6 +4460,7 @@ async fn probe_connectivity_batch_async(
     timestamp: String,
     now: time::OffsetDateTime,
     startup_settle_active: bool,
+    budget: Duration,
 ) -> Vec<(String, ClusterConnectivityRecord)> {
     let fetch_state = state.clone();
     probe_connectivity_batch_with_fetch_async(
@@ -4053,63 +4469,55 @@ async fn probe_connectivity_batch_async(
         timestamp,
         now,
         startup_settle_active,
-        CLUSTER_HEALTH_PROBE_TIMEOUT,
-        move |endpoint, timeout| {
+        budget,
+        move |endpoint| {
             let paths = paths.clone();
             let state = fetch_state.clone();
             async move {
-                fetch_daemon_status_from_endpoint_direct_async(&paths, &state, &endpoint, timeout)
-                    .await
+                fetch_daemon_status_for_connectivity_probe_async(&paths, &state, &endpoint).await
             }
         },
     )
     .await
 }
 
+/// Observes every entry concurrently within one batch budget.
+///
+/// Each endpoint is judged only by the network's own verdicts: a connect
+/// failure or refusal, a disconnect, or the no-progress limit records a
+/// failure. An endpoint still answering when the budget ends records nothing;
+/// a slow reply is never failure evidence.
 async fn probe_connectivity_batch_with_fetch_async<F, Fut>(
     state: ClusterBootstrapState,
     entries: Vec<sinomo_core::network::ClusterConnectivityProbeBatchEntry>,
     timestamp: String,
     now: time::OffsetDateTime,
     startup_settle_active: bool,
-    endpoint_timeout: Duration,
+    budget: Duration,
     fetch_status: F,
 ) -> Vec<(String, ClusterConnectivityRecord)>
 where
-    F: Fn(ClusterEndpointRecord, Duration) -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<crate::DaemonStatus, DaemonError>> + Send + 'static,
+    F: Fn(ClusterEndpointRecord) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<
+            Output = Result<crate::DaemonStatus, sinomo_core::network::NetworkError>,
+        > + Send
+        + 'static,
 {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY,
     ));
-    let mut handles = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Ok(permit) = semaphore.clone().acquire_owned().await else {
-            break;
-        };
+    let budget_end = tokio::time::Instant::now() + budget;
+    // Dropping the set aborts every unfinished probe.
+    let mut probes = tokio::task::JoinSet::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        let semaphore = Arc::clone(&semaphore);
         let state = state.clone();
         let timestamp = timestamp.clone();
         let fetch_status = fetch_status.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
+        probes.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok()?;
             let started = Instant::now();
-            let endpoint = entry.endpoint.clone();
-            let address = endpoint.address.clone();
-            let result = match tokio::time::timeout(
-                endpoint_timeout,
-                fetch_status(endpoint, endpoint_timeout),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(DaemonError::Network {
-                    address,
-                    detail: format!(
-                        "connectivity probe timed out after {}ms",
-                        endpoint_timeout.as_millis()
-                    ),
-                }),
-            };
+            let result = fetch_status(entry.endpoint.clone()).await;
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             connectivity_record_for_daemon_status_probe(
                 &state,
@@ -4120,27 +4528,93 @@ where
                 now,
                 startup_settle_active,
             )
-        }));
+            .map(|record| (index, record))
+        });
     }
 
-    let mut probed = Vec::with_capacity(handles.len());
-    for handle in handles {
-        if let Ok(record) = handle.await {
-            probed.push(record);
+    let mut probed = Vec::with_capacity(probes.len());
+    loop {
+        match tokio::time::timeout_at(budget_end, probes.join_next()).await {
+            Ok(Some(Ok(Some(record)))) => probed.push(record),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                tracing::debug!(
+                    target: "sinomo.daemon.cluster_network_maintenance",
+                    unfinished = probes.len(),
+                    budget_ms = budget.as_millis() as u64,
+                    "connectivity probe budget ended; unfinished endpoints are inconclusive"
+                );
+                break;
+            }
         }
     }
-    probed
+    probed.sort_by_key(|(index, _)| *index);
+    probed.into_iter().map(|(_, record)| record).collect()
 }
 
+/// Expiries the regular probe cadence renews. Records it never renews, such
+/// as module endpoints observed by verification, must not schedule renewal
+/// turns that would find nothing due; they age out instead.
+fn regularly_probed_connectivity_expiries<'a>(
+    state: &'a ClusterBootstrapState,
+    records: &'a [ClusterConnectivityRecord],
+) -> impl Iterator<Item = time::OffsetDateTime> + 'a {
+    records
+        .iter()
+        .filter(|record| {
+            sinomo_core::network::cluster_connectivity_record_is_regularly_probed(state, record)
+        })
+        .map(|record| record.expires_at)
+}
+
+/// One verification round's result for `peer` from this batch's observations.
+fn peer_verification_round(
+    peer: &NodeId,
+    planned_endpoints: usize,
+    observed: &[ClusterConnectivityRecord],
+) -> sinomo_core::cluster::ClusterPeerVerificationRound {
+    use sinomo_core::cluster::ClusterPeerVerificationRound as Round;
+    let peer_records = observed
+        .iter()
+        .filter(|record| &record.target_node_id == peer)
+        .collect::<Vec<_>>();
+    if peer_records.is_empty() {
+        Round::Inconclusive
+    } else if peer_records.iter().any(|record| {
+        record.state == ClusterConnectivityState::Healthy && record.consecutive_failures == 0
+    }) {
+        Round::Reached
+    } else if peer_records.len() >= planned_endpoints
+        && peer_records
+            .iter()
+            .all(|record| record.state == ClusterConnectivityState::Unreachable)
+    {
+        Round::Exhausted
+    } else {
+        Round::Continue
+    }
+}
+
+/// Projects one endpoint status probe into connectivity evidence, or `None`
+/// when the probe reached no verdict of the network's own.
 fn connectivity_record_for_daemon_status_probe(
     state: &ClusterBootstrapState,
     entry: sinomo_core::network::ClusterConnectivityProbeBatchEntry,
-    result: Result<crate::DaemonStatus, DaemonError>,
+    result: Result<crate::DaemonStatus, sinomo_core::network::NetworkError>,
     latency_ms: u64,
     timestamp: &str,
     now: time::OffsetDateTime,
     startup_settle_active: bool,
-) -> (String, ClusterConnectivityRecord) {
+) -> Option<(String, ClusterConnectivityRecord)> {
+    if let Err(sinomo_core::network::NetworkError::Timeout {
+        phase: sinomo_core::network::NetworkTimeoutPhase::Overall,
+        ..
+    }) = &result
+    {
+        // A whole-call deadline is the caller's, never the network's verdict.
+        return None;
+    }
     let observation = match &result {
         Ok(status) if daemon_cluster_status_matches(state, &entry.endpoint, status) => {
             sinomo_core::network::ClusterConnectivityProbeObservation::Healthy
@@ -4170,7 +4644,7 @@ fn connectivity_record_for_daemon_status_probe(
         now,
         startup_settle_active,
     );
-    (entry.key, record)
+    Some((entry.key, record))
 }
 
 #[cfg(test)]
@@ -4187,6 +4661,32 @@ fn cluster_connectivity_probe_due(
         local_node_role,
         false,
     )
+}
+
+/// Connectivity probe of one endpoint: the status RPC under the network's
+/// connect and no-progress limits only, without a whole-call deadline and
+/// without requesting peer verification from its own outcome.
+async fn fetch_daemon_status_for_connectivity_probe_async(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+) -> Result<crate::DaemonStatus, sinomo_core::network::NetworkError> {
+    let runtime = tokio::runtime::Handle::current();
+    let mut host = DaemonObjectRpcAsyncHost::direct_only(&runtime);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
+    let response = client
+        .call_endpoint(
+            state,
+            endpoint,
+            sinomo_core::network::ObjectRpcCall::encode_value(
+                crate::DAEMON_STATUS_ROUTE,
+                crate::DAEMON_RPC_CATEGORY,
+                (),
+            )?,
+            sinomo_core::network::ClusterObjectRpcOptions::default().without_peer_verification(),
+        )
+        .await?;
+    response.decode_body().await
 }
 
 async fn fetch_daemon_status_from_endpoint_direct_async(
@@ -7540,6 +8040,20 @@ impl sinomo_core::cluster::ClusterConnectivityPublishAsyncHost
             let accepted = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
                 paths, source_node_id,
             ).unwrap_or_default();
+            // Only records the regular probe renews schedule renewal; others
+            // age out at their expiry through the owner's one removal.
+            let state =
+                sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(paths).ok();
+            let records = records
+                .iter()
+                .filter(|record| {
+                    state.as_ref().is_none_or(|state| {
+                        sinomo_core::network::cluster_connectivity_record_is_regularly_probed(
+                            state, record,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
             // A renewal is an accepted local observation, not a durable KV
             // generation. Bind it to confirmed semantics before using it to
             // schedule the next probe; a new/uncommitted health or endpoint
@@ -8433,6 +8947,8 @@ mod tests {
                     accepted_connectivity_expiry: None,
                     connectivity_renewal_at: None,
                     connectivity_overdue_claimed: false,
+                    peer_verification: Default::default(),
+                    unrenewed_connectivity_expiry_at: None,
                     $($cadence)*
                 },
                 resource_mode: sinomo_device::NodeResourceMode::Normal,
@@ -10725,6 +11241,11 @@ mod tests {
             sinomo_core::network::__connectivity_store::local_cluster_connectivity_content_generation(
                 &paths,
             );
+        let quiet_state = state.clone();
+        let reachability_inputs =
+            sinomo_core::network::peer_reachability_snapshot(&paths, &quiet_state)
+                .expect("peer reachability before refreshes")
+                .inputs;
         let source_node_id = state.local_node_id.clone();
         let mut first_refresh = record.clone();
         first_refresh.latency_ms = Some(777);
@@ -10839,6 +11360,13 @@ mod tests {
             )
             .expect("read source after repeated no-op"),
             vec![record]
+        );
+        assert_eq!(
+            sinomo_core::network::peer_reachability_snapshot(&paths, &quiet_state)
+                .expect("peer reachability after refreshes")
+                .inputs,
+            reachability_inputs,
+            "time-only evidence moves no reachability input, so no verdict is recomputed"
         );
     }
 
@@ -12121,6 +12649,7 @@ mod tests {
                 timestamp: observed_now.format(&Rfc3339).unwrap(),
                 now: observed_now,
                 startup_settle_active: false,
+                verification: Default::default(),
             },
             input_generation: maintenance.connectivity_input_generation,
             local_connectivity_snapshot: captured,
@@ -12163,6 +12692,7 @@ mod tests {
             timestamp: "stale probe".to_string(),
             now: OffsetDateTime::now_utc(),
             startup_settle_active: false,
+            verification: Default::default(),
         };
         let pending = ClusterNetworkMaintenancePendingWork {
             probe_claimed: true,
@@ -12311,6 +12841,7 @@ mod tests {
                     timestamp: observed_now.format(&Rfc3339).unwrap(),
                     now: observed_now,
                     startup_settle_active: false,
+                    verification: Default::default(),
                 },
                 input_generation: maintenance.connectivity_input_generation,
                 local_connectivity_snapshot: expected_store_snapshot,
@@ -12410,6 +12941,7 @@ mod tests {
                         timestamp: now.format(&Rfc3339).unwrap(),
                         now,
                         startup_settle_active: false,
+                        verification: Default::default(),
                     },
                     input_generation: maintenance.connectivity_input_generation,
                     local_connectivity_snapshot: snapshot,
@@ -12440,7 +12972,7 @@ mod tests {
                 &ClusterNodeRole::Workstation,
                 false,
                 false,
-                false,
+                &sinomo_core::network::ClusterConnectivityProbeScope::regular(false),
                 at,
             )
         };
@@ -12858,6 +13390,7 @@ mod tests {
                 .unwrap_or_else(|_| "unknown".to_string()),
             now: observed_now,
             startup_settle_active: false,
+            verification: Default::default(),
         };
         let pending = ClusterNetworkMaintenancePendingWork {
             probe_claimed: true,
@@ -13766,9 +14299,9 @@ mod tests {
                 at,
                 active,
                 Duration::from_secs(1),
-                |endpoint, _| async move {
-                    Err(DaemonError::Network {
-                        address: endpoint.address,
+                |endpoint| async move {
+                    Err(sinomo_core::network::NetworkError::Io {
+                        operation: format!("connect {}", endpoint.address),
                         detail: "isolated stable transport failure".into(),
                     })
                 },
@@ -15497,10 +16030,15 @@ mod tests {
             timestamp: "unused".to_string(),
             now,
             startup_settle_active: false,
+            verification: Default::default(),
         };
 
-        let execution = runtime
-            .block_on(maintenance.execute_connectivity_probe_plan_async(&paths, &state, plan));
+        let execution = runtime.block_on(maintenance.execute_connectivity_probe_plan_async(
+            &paths,
+            &state,
+            plan,
+            Duration::from_secs(1),
+        ));
         assert!(execution.records.is_empty());
         assert!(
             !execution.probed_degraded,
@@ -17817,8 +18355,608 @@ mod tests {
         assert_eq!(records[0].target_node_id, remote_node);
     }
 
+    fn refused_loopback_address() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+        let address = listener.local_addr().expect("probe address").to_string();
+        drop(listener);
+        address
+    }
+
     #[test]
-    fn connectivity_probe_bounds_each_endpoint_before_collecting_batch() {
+    fn failed_delivery_verifies_only_that_peer_until_a_verdict() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("peer_verification_targeted");
+        let now = OffsetDateTime::now_utc();
+        let mut peer_endpoints = Vec::new();
+        for name in ["verified", "untouched"] {
+            let node = NodeId::from_legacy_named(format!("peer_verification_targeted_{name}"))
+                .expect("peer id");
+            let endpoint =
+                sinomo_core::network::daemon_lan_endpoint(&node, refused_loopback_address(), 10);
+            let mut member = ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                node.clone(),
+                name,
+                "pk-peer",
+                now,
+            );
+            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints.push(endpoint.clone());
+            state.members.push(member);
+            peer_endpoints.push((node, endpoint));
+        }
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+        let healthy = peer_endpoints
+            .iter()
+            .map(|(_, endpoint)| {
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(3),
+                    0,
+                    None,
+                    None,
+                    now,
+                    sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+                )
+            })
+            .collect::<Vec<_>>();
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &healthy,
+        )
+        .unwrap();
+        let (verified, _) = peer_endpoints[0].clone();
+        let (untouched, _) = peer_endpoints[1].clone();
+
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        let regular_before = (
+            maintenance.last_probe,
+            maintenance.connectivity_cursor,
+            maintenance.connectivity_converged,
+            maintenance.connectivity_force_probe,
+            maintenance.connectivity_input_generation,
+        );
+        let _owner =
+            sinomo_core::network::__connectivity_store::register_peer_verification_owner(&paths);
+        assert!(
+            sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+                &paths,
+                &state.local_node_id,
+                &verified,
+            )
+        );
+        let requests =
+            sinomo_core::network::__connectivity_store::take_pending_peer_verifications(&paths);
+        maintenance.request_peer_verifications(&paths, requests, Instant::now());
+
+        let mut settled_after = None;
+        for round in 1..=4 {
+            let due = maintenance
+                .cadence
+                .peer_verifications_due(Instant::now() + Duration::from_secs(30));
+            if due.is_empty() {
+                settled_after = Some(round - 1);
+                break;
+            }
+            assert_eq!(due, BTreeSet::from([verified.clone()]));
+            let plan = maintenance
+                .select_connectivity_probe_plan_with_verification(&paths, &state, false, &due);
+            assert!(!plan.entries.is_empty());
+            assert!(
+                plan.entries
+                    .iter()
+                    .all(|entry| entry.endpoint.node_id == verified),
+                "only the verified peer is probed"
+            );
+            let snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            runtime.block_on(maintenance.run_pending_work_async(
+                ClusterNetworkMaintenancePendingWork {
+                    connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                        memory_only: false,
+                        paths: paths.clone(),
+                        source_node_id: state.local_node_id.clone(),
+                        state: state.clone(),
+                        plan,
+                        input_generation: maintenance.connectivity_input_generation,
+                        local_connectivity_snapshot: snapshot,
+                    }),
+                    ..Default::default()
+                },
+                runtime.handle().clone(),
+            ));
+        }
+        assert_eq!(
+            settled_after,
+            Some(3),
+            "grace, degraded, then the failure threshold: three refused rounds"
+        );
+        assert!(maintenance.cadence.peer_verification.is_empty());
+        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &paths,
+            &state.local_node_id,
+        )
+        .unwrap();
+        let state_of = |node: &NodeId| {
+            records
+                .iter()
+                .find(|record| &record.target_node_id == node)
+                .map(|record| record.state.clone())
+        };
+        assert_eq!(
+            state_of(&verified),
+            Some(ClusterConnectivityState::Unreachable)
+        );
+        assert_eq!(
+            state_of(&untouched),
+            Some(ClusterConnectivityState::Healthy),
+            "a peer nobody failed to reach is not probed"
+        );
+        assert_eq!(
+            regular_before,
+            (
+                maintenance.last_probe,
+                maintenance.connectivity_cursor,
+                maintenance.connectivity_converged,
+                maintenance.connectivity_force_probe,
+                maintenance.connectivity_input_generation,
+            ),
+            "verification leaves the regular probe cadence untouched"
+        );
+        let reachability =
+            sinomo_core::network::peer_reachability_snapshot(&paths, &state).unwrap();
+        assert!(
+            reachability.peers.values().all(|peer| !peer.verifying),
+            "a settled episode clears the verifying flag"
+        );
+        assert_eq!(
+            reachability.verdict(&verified),
+            sinomo_core::network::PeerPathVerdict::NoPath
+        );
+
+        // Further failures to a peer already at the threshold settle at once.
+        assert!(
+            sinomo_core::network::__connectivity_store::request_peer_verification_after_edge_failure(
+                &paths,
+                &state.local_node_id,
+                &verified,
+            )
+        );
+        let requests =
+            sinomo_core::network::__connectivity_store::take_pending_peer_verifications(&paths);
+        maintenance.request_peer_verifications(&paths, requests, Instant::now());
+        let due = maintenance.cadence.peer_verifications_due(Instant::now());
+        let plan = maintenance
+            .select_connectivity_probe_plan_with_verification(&paths, &state, false, &due);
+        // Publication's committed fanout to the other peer may itself have
+        // failed and requested that peer's verification; only the exhausted
+        // peer is asserted here.
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.endpoint.node_id != verified),
+            "no probe for an exhausted peer"
+        );
+        assert!(
+            maintenance
+                .cadence
+                .peer_verification
+                .episode(&verified)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn module_evidence_survives_regular_batches_and_leaves_once_at_expiry() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("module_evidence_expiry");
+        let now = OffsetDateTime::now_utc();
+        let peer = NodeId::from_legacy_named("module_evidence_expiry_peer").expect("peer");
+        let lan = sinomo_core::network::daemon_lan_endpoint(&peer, refused_loopback_address(), 10);
+        let module = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::Id::derived("test.module.endpoint", "module_evidence_expiry"),
+            node_id: peer.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://moduleevidenceexpirykey".to_string(),
+            source: sinomo_core::base::ClusterEndpointSource::Rendezvous,
+            privacy: sinomo_core::base::ClusterEndpointPrivacy::InternetDirect,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            peer.clone(),
+            "peer",
+            "pk-peer",
+            now,
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![lan.clone(), module.clone()];
+        state.members.push(member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+        let record = |endpoint: &ClusterEndpointRecord, ttl_seconds| {
+            sinomo_core::network::cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(3),
+                0,
+                None,
+                None,
+                OffsetDateTime::now_utc(),
+                ttl_seconds,
+            )
+        };
+        // As verification left it: a healthy module record with a short life.
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &[
+                record(&lan, sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
+                record(&module, 3),
+            ],
+        )
+        .unwrap();
+        let module_record = |paths: &ClusterPaths| {
+            sinomo_core::network::read_optional_object_file::<Vec<ClusterConnectivityRecord>>(
+                &paths.connectivity_local,
+            )
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|record| record.endpoint_id == module.endpoint_id)
+        };
+        assert!(
+            !sinomo_core::network::cluster_connectivity_record_is_regularly_probed(
+                &state,
+                &record(&module, 3)
+            )
+        );
+
+        // A forced regular batch probes only the built-in endpoint and keeps
+        // the module evidence.
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.connectivity_force_probe = true;
+        let plan = maintenance.select_connectivity_probe_plan(&paths, &state);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.endpoint.endpoint_id == lan.endpoint_id)
+        );
+        let snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                    memory_only: false,
+                    paths: paths.clone(),
+                    source_node_id: state.local_node_id.clone(),
+                    state: state.clone(),
+                    plan,
+                    input_generation: maintenance.connectivity_input_generation,
+                    local_connectivity_snapshot: snapshot,
+                }),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+        let kept = module_record(&paths).expect("a regular batch keeps the module evidence");
+        assert_eq!(kept.state, ClusterConnectivityState::Healthy);
+        assert!(
+            maintenance
+                .cadence
+                .accepted_connectivity_expiry
+                .is_none_or(|expiry| expiry != kept.expires_at),
+            "module evidence never schedules a renewal turn"
+        );
+        let wake = maintenance
+            .cadence
+            .unrenewed_connectivity_expiry_at
+            .expect("one wake for the module record's expiry");
+        assert!(wake > Instant::now());
+
+        // Before expiry the removal is read-only.
+        assert_eq!(
+            runtime.block_on(maintenance.remove_expired_unrenewed_connectivity_async(
+                runtime.handle(),
+                &paths,
+                &state,
+            )),
+            0
+        );
+        assert!(module_record(&paths).is_some());
+
+        std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+        assert!(
+            maintenance
+                .cadence
+                .take_unrenewed_connectivity_expiry(Instant::now())
+        );
+        let mut routing_changes =
+            sinomo_core::network::__connectivity_store::subscribe_local_cluster_connectivity_routing_generation(&paths);
+        let generation_before = runtime.block_on(routing_changes.changed());
+        assert_eq!(
+            runtime.block_on(maintenance.remove_expired_unrenewed_connectivity_async(
+                runtime.handle(),
+                &paths,
+                &state,
+            )),
+            1,
+            "expired module evidence leaves the source set once"
+        );
+        assert!(module_record(&paths).is_none());
+        let generation_after = runtime.block_on(routing_changes.changed());
+        assert_ne!(
+            generation_after, generation_before,
+            "one route-input change"
+        );
+        assert!(
+            maintenance
+                .cadence
+                .unrenewed_connectivity_expiry_at
+                .is_none(),
+            "nothing else ages out, so no further wake is scheduled"
+        );
+        let file_after = std::fs::read(&paths.connectivity_local).unwrap();
+        assert_eq!(
+            runtime.block_on(maintenance.remove_expired_unrenewed_connectivity_async(
+                runtime.handle(),
+                &paths,
+                &state,
+            )),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            file_after
+        );
+        assert!(
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(200), routing_changes.changed())
+                        .await
+                })
+                .is_err(),
+            "after it left, nothing changes again"
+        );
+    }
+
+    #[test]
+    fn slow_but_answering_peer_is_never_recorded_as_failed() {
+        let runtime = daemon_cluster_test_runtime();
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_slow_peer_probe").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_daemon_slow_peer_probe_local").expect("local");
+        let slow = NodeId::from_legacy_named("node_daemon_slow_peer_probe_slow").expect("slow");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "slow peer probe",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&slow, "203.0.113.90:21353".to_string(), 10);
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), slow.clone(), "slow", "pk", now);
+        member.endpoints = vec![endpoint.clone()];
+        state.members.push(member);
+        // One more failure would cross the threshold.
+        let degraded = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Degraded,
+            Some(400),
+            2,
+            None,
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let entry = || sinomo_core::network::ClusterConnectivityProbeBatchEntry {
+            key: cluster_connectivity_probe_key(&state.local_node_id, &endpoint),
+            endpoint: endpoint.clone(),
+            previous: Some(degraded.clone()),
+        };
+        let daemon_paths = DaemonPaths::with_root(
+            unique_cluster_test_root("slow_peer_probe")
+                .path()
+                .join("daemon"),
+        );
+        let status = crate::DaemonStatus::new(
+            &DaemonRunOptions::default(),
+            &daemon_paths,
+            Some(DaemonClusterStatus {
+                cluster_id: cluster_id.clone(),
+                node_id: slow.clone(),
+                process: sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+                member_role: ClusterMemberRole::Voter,
+                member_state: ClusterMemberState::Voter,
+            }),
+        );
+
+        // Slower than the former two-second whole-call deadline, still answering.
+        let answered = status.clone();
+        let records = runtime.block_on(probe_connectivity_batch_with_fetch_async(
+            state.clone(),
+            vec![entry()],
+            "slow".to_string(),
+            now,
+            false,
+            Duration::from_secs(8),
+            move |_| {
+                let status = answered.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(2_500)).await;
+                    Ok(status)
+                }
+            },
+        ));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1.state, ClusterConnectivityState::Healthy);
+        assert_eq!(records[0].1.consecutive_failures, 0);
+
+        // Still answering when the maintenance budget ends: inconclusive.
+        let unfinished = status.clone();
+        let records = runtime.block_on(probe_connectivity_batch_with_fetch_async(
+            state.clone(),
+            vec![entry()],
+            "unfinished".to_string(),
+            now,
+            false,
+            Duration::from_millis(50),
+            move |_| {
+                let status = unfinished.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(status)
+                }
+            },
+        ));
+        assert!(records.is_empty(), "an unfinished probe records nothing");
+
+        // A caller's whole-call deadline is never the network's verdict.
+        assert!(
+            connectivity_record_for_daemon_status_probe(
+                &state,
+                entry(),
+                Err(sinomo_core::network::NetworkError::timeout(
+                    "status",
+                    sinomo_core::network::NetworkTimeoutPhase::Overall,
+                    Duration::from_secs(2),
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                )),
+                2_000,
+                "deadline",
+                now,
+                false,
+            )
+            .is_none()
+        );
+        // A refused connection is.
+        let refused = connectivity_record_for_daemon_status_probe(
+            &state,
+            entry(),
+            Err(sinomo_core::network::NetworkError::Io {
+                operation: "connect".to_string(),
+                detail: "connection refused".to_string(),
+            }),
+            1,
+            "refused",
+            now,
+            false,
+        )
+        .expect("refusal is a verdict");
+        assert_eq!(refused.1.state, ClusterConnectivityState::Unreachable);
+    }
+
+    fn full_connectivity_probe_batch(
+        name: &str,
+    ) -> (
+        ClusterBootstrapState,
+        Vec<sinomo_core::network::ClusterConnectivityProbeBatchEntry>,
+    ) {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named(format!("cluster_{name}")).expect("cluster");
+        let local = NodeId::from_legacy_named(format!("node_{name}_local")).expect("local");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            name,
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let entries = (0..sinomo_core::network::CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK)
+            .map(|index| {
+                let node = NodeId::from_legacy_named(format!("node_{name}_{index}")).expect("peer");
+                let endpoint = sinomo_core::network::daemon_lan_endpoint(
+                    &node,
+                    format!("203.0.113.{}:21353", index + 1),
+                    10,
+                );
+                sinomo_core::network::ClusterConnectivityProbeBatchEntry {
+                    key: cluster_connectivity_probe_key(&local, &endpoint),
+                    endpoint,
+                    previous: None,
+                }
+            })
+            .collect();
+        (state, entries)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_probe_batch_runs_as_one_wave_within_its_budget() {
+        let connect_limit = sinomo_core::network::NetworkHealthPolicy::default().connect_timeout;
+        let budget = cluster_connectivity_probe_batch_budget(None);
+        assert!(
+            connect_limit < budget,
+            "one connect limit fits one batch budget"
+        );
+        let (state, entries) = full_connectivity_probe_batch("probe_single_wave");
+        let started = tokio::time::Instant::now();
+        // Every endpoint is black-holed: each dial runs to the connect limit.
+        let records = probe_connectivity_batch_with_fetch_async(
+            state.clone(),
+            entries.clone(),
+            "black-holed".to_string(),
+            OffsetDateTime::now_utc(),
+            false,
+            budget,
+            move |endpoint| async move {
+                tokio::time::sleep(connect_limit).await;
+                Err(sinomo_core::network::NetworkError::timeout(
+                    format!("connect {}", endpoint.address),
+                    sinomo_core::network::NetworkTimeoutPhase::Connect,
+                    connect_limit,
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                ))
+            },
+        )
+        .await;
+        assert_eq!(
+            records.len(),
+            entries.len(),
+            "every black-holed endpoint of a full batch records its failure"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|(_, record)| record.consecutive_failures == 1)
+        );
+        assert!(started.elapsed() < budget);
+
+        // Connected, but the reply never progresses within the budget.
+        let records = probe_connectivity_batch_with_fetch_async(
+            state,
+            entries,
+            "silent-reply".to_string(),
+            OffsetDateTime::now_utc(),
+            false,
+            budget,
+            |_endpoint| async move {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Err(sinomo_core::network::NetworkError::Io {
+                    operation: "unreachable".to_string(),
+                    detail: "never returned".to_string(),
+                })
+            },
+        )
+        .await;
+        assert!(records.is_empty(), "an unfinished reply records nothing");
+    }
+
+    #[test]
+    fn connectivity_probe_budget_leaves_unfinished_endpoints_inconclusive() {
         let runtime = daemon_cluster_test_runtime();
         let now = OffsetDateTime::now_utc();
         let cluster_id = ClusterId::from_legacy_named("cluster_daemon_probe_endpoint_timeout")
@@ -17879,14 +19017,14 @@ mod tests {
             now,
             false,
             Duration::from_millis(25),
-            move |endpoint, _timeout| {
+            move |endpoint| {
                 let slow_node = slow_node_for_fetch.clone();
                 async move {
                     if endpoint.node_id == slow_node {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                     }
-                    Err(DaemonError::Network {
-                        address: endpoint.address,
+                    Err(sinomo_core::network::NetworkError::Io {
+                        operation: format!("connect {}", endpoint.address),
                         detail: "test probe failure".to_string(),
                     })
                 }
@@ -17897,17 +19035,15 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "one hanging endpoint must not hold the whole probe batch open"
         );
-        assert_eq!(records.len(), 2);
-        assert!(
+        assert_eq!(
             records
                 .iter()
-                .any(|(_, record)| record.target_node_id == fast_node)
+                .map(|(_, record)| record.target_node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![fast_node],
+            "the failed endpoint is evidence; the unfinished one is inconclusive and records nothing"
         );
-        assert!(
-            records
-                .iter()
-                .any(|(_, record)| record.target_node_id == slow_node)
-        );
+        let _ = slow_node;
     }
 
     #[test]
@@ -18939,8 +20075,8 @@ mod tests {
                 connectivity_record_for_daemon_status_probe(
                     &state,
                     entry,
-                    Err(DaemonError::Network {
-                        address: "synthetic-connectivity-test".to_string(),
+                    Err(sinomo_core::network::NetworkError::Io {
+                        operation: "synthetic-connectivity-test".to_string(),
                         detail: "unreachable".to_string(),
                     }),
                     0,
@@ -18948,6 +20084,7 @@ mod tests {
                     plan.now,
                     false,
                 )
+                .expect("a connection failure is a probe verdict")
             })
             .collect();
         let records = maintenance.apply_connectivity_probe_plan(plan, probed);
