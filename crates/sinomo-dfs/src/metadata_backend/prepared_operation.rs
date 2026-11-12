@@ -71,6 +71,32 @@ impl LocalSobjMetadataBackend {
         let Some(_fence) = fence else {
             return Ok(None);
         };
+        self.certified_prepared_record_at_held_cut(operation_id)
+    }
+
+    /// Read the same certified cut while borrowing the exact already-held native
+    /// writer. Reacquiring its inspection fence would wait on ourselves.
+    pub(crate) fn read_prepared_record_with_source_custody(
+        &self,
+        operation_id: &str,
+        custody: &super::source_adoption::DfsSourceAdoptionWriterCustody,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        custody.validate_scope(&self.publication_scope_for_backend(
+            custody.scope().file_system_id(), &self.shard_id,
+        )?)?;
+        if self.consistent_read_snapshot_depth != 0
+            || !self.stat_read_snapshots.is_empty()
+            || self.replica_repair_only
+        {
+            return Ok(None);
+        }
+        self.certified_prepared_record_at_held_cut(operation_id)
+    }
+
+    fn certified_prepared_record_at_held_cut(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
         let Some(prefix) = crate::metadata_journal::admission::current_owned_materialized_prefix(
             &self.root,
             &self.shard_id,

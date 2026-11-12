@@ -9,4 +9,4 @@ turn 1: When is the release shipping? Check notes/release.md.
   assistant: {"response_mode":"answer","text":"The release ships on 2026-11-02 (owner: platform team).","tool_calls":[],"background_h…
   usage
   stop: final-decision
-  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.context.assembled, agent.loop.model.completed, agent.loop.completed
+  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.tool.call.completed, agent.context.assembled, agent.loop.model.completed, agent.loop.completed

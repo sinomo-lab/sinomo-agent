@@ -289,6 +289,38 @@ impl DfsSourceAdoptionActor {
         Ok(offer)
     }
 
+    /// Borrow the original local job writer for this exact resumed namespace
+    /// request's negative genesis read. Wire offers alone supply no custody.
+    pub(crate) fn ingress_job_writer_custody(
+        &self,
+        offer: &DfsSourceAdoptionOffer,
+        command: &crate::DfsNamespaceCommand,
+        current: &DfsMetadataShardConfig,
+    ) -> Result<Option<crate::metadata_backend::DfsSourceAdoptionWriterCustody>> {
+        if offer.job_offer.job_config.file_system_id != current.file_system_id
+            || offer.job_offer.job_config.shard_id != current.shard_id
+        {
+            return Ok(None);
+        }
+        if offer.job_offer.job_config != *current {
+            return Err(error("genesis read changed the original job's current assignment"));
+        }
+        self.inspect_original_job(&offer.source_node_id, &offer.job_offer)?;
+        let session = self.original_job_session(&offer.job_offer, true)?;
+        let job = session.capture.job();
+        if command.file_system_id != job.file_system_id
+            || !job.origin.as_ref().is_some_and(|origin|
+                origin.request_id == command.request_id
+                    && origin.requester_node_id == command.requesting_node_id)
+            || session.source != offer.source_config
+            || session.target != offer.target_config
+            || session.destination != offer.destination
+        {
+            return Err(error("genesis read changed the original namespace job/request custody"));
+        }
+        Ok(Some(session.capture.writer_custody()))
+    }
+
     pub(super) fn inspect_original_job(
         &self,
         source_node: &NodeId,

@@ -1579,6 +1579,32 @@ mod tests {
         uninstall(&root, false).unwrap();
     }
 
+    #[test]
+    #[ignore = "subprocess fixture for copying removal-test executables"]
+    fn copy_removal_fixture_process() {
+        let destination = env::var_os("SINOMO_REMOVAL_COPY_DESTINATION")
+            .expect("removal fixture copy destination");
+        fs::copy(env::current_exe().unwrap(), destination).unwrap();
+    }
+
+    fn copy_removal_fixture_executable(destination: &Path) {
+        // Parallel tests spawn processes while setup runs. A writable executable
+        // opened in this parent can be inherited until another child's exec,
+        // causing ETXTBSY even after fs::copy closes the parent's handle. Keep
+        // that handle in the existing subprocess fixture model and drain it.
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "initial_setup::tests::copy_removal_fixture_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SINOMO_REMOVAL_COPY_DESTINATION", destination)
+            .output()
+            .expect("run removal fixture copy worker");
+        assert!(output.status.success(), "{output:?}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn installed_uninstaller_does_not_kill_its_own_worker_threads() {
@@ -1595,7 +1621,7 @@ mod tests {
         )
         .unwrap();
         let executable = data.join("bin/sinomo");
-        fs::copy(env::current_exe().unwrap(), &executable).unwrap();
+        copy_removal_fixture_executable(&executable);
         // The real test harness runs the removal on a worker thread. Its
         // executable name/data binding match the installed CLI, so an ownership
         // scan must distinguish that caller's threads from owned child processes.
@@ -1656,7 +1682,7 @@ mod tests {
         )
         .unwrap();
         let executable = data.join("bin").join(binary("sinomo"));
-        fs::copy(env::current_exe().unwrap(), &executable).unwrap();
+        copy_removal_fixture_executable(&executable);
         fs::create_dir_all(data.join("module/cache/native-dylib/evolved")).unwrap();
         fs::write(
             data.join("module/cache/native-dylib/evolved/module"),

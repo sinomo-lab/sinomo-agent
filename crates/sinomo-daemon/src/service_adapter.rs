@@ -2974,6 +2974,12 @@ impl DaemonServiceRegistryHost {
             address: "daemon component shutdown".into(),
             detail: error.to_string(),
         })?;
+        self.module_runtime
+            .withdraw_process_binding(&self.service_data_dir.root())
+            .map_err(|detail| DaemonError::Network {
+                address: "daemon module runtime withdrawal".into(),
+                detail,
+            })?;
         drop(reconciler);
         // Embedded hosts restart after cluster initialization in the same
         // process. A drained registry retains its old runtime and bootstrap
@@ -5220,6 +5226,8 @@ mod tests {
             );
         }
 
+        // Rebuilding replaces the owner; two live hosts cannot own the same DATA.
+        drop(host);
         let rebuilt_host = test_service_host(&root, registry);
         runtime
             .block_on(call_value_service_host_async(&rebuilt_host, {
@@ -6670,6 +6678,8 @@ mod tests {
         bootstrap
             .shutdown_components(runtime.handle(), Duration::from_secs(2))
             .unwrap();
+        assert!(sinomo_module::process_module_host(&SinomoDataDir::new(&root).root()).is_err(),
+            "a drained owner must not remain discoverable or fall back to loader state");
 
         let factory: crate::DaemonComponentFactory = Arc::new(
             sinomo_module::StaticComponentFactory::new(
@@ -6717,6 +6727,12 @@ mod tests {
             &current.component_reconciler,
             &replacement.component_reconciler
         ));
+        let current_modules = sinomo_module::process_module_host(&SinomoDataDir::new(&root).root())
+            .unwrap().expect("replacement module owner");
+        assert!(Arc::ptr_eq(
+            &current_modules.generations.active_snapshot(),
+            &replacement.module_runtime.generations.active_snapshot(),
+        ), "late cleanup must preserve the replacement module owner");
         replacement
             .shutdown_components(runtime.handle(), Duration::from_secs(2))
             .unwrap();
@@ -8407,12 +8423,19 @@ mod tests {
         let main_host =
             DaemonServiceRegistryHost::from_registry_for_paths(main_registry, &main_paths)
                 .expect("main registry host");
+        // Production main and shadow run in separate processes. Capture the
+        // main descriptors before releasing its process-local module owner.
+        let main_descriptors = authority_routes.iter().copied()
+            .chain(sinomo_build::BUILD_OBJECT_RPC_ROUTES.iter().copied())
+            .chain([DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, sinomo_sandbox::SANDBOX_STATUS_ROUTE])
+            .map(|route| (route, main_host.object_rpc_route_descriptor(route)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        drop(main_host);
         let shadow_host =
             DaemonServiceRegistryHost::from_registry_for_paths(shadow_registry, &shadow_paths)
                 .expect("shadow registry host");
         assert!(
-            main_host
-                .object_rpc_route_descriptor(DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE)
+            main_descriptors[DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE]
                 .is_none(),
             "main host must not advertise the remote shadow shutdown route"
         );
@@ -8437,7 +8460,7 @@ mod tests {
         );
         for route in &authority_routes {
             assert!(
-                main_host.object_rpc_route_descriptor(route).is_some(),
+                main_descriptors[route].is_some(),
                 "main host should advertise cluster authority route {route}"
             );
             assert!(
@@ -8447,7 +8470,7 @@ mod tests {
         }
         for route in sinomo_build::BUILD_OBJECT_RPC_ROUTES {
             assert!(
-                main_host.object_rpc_route_descriptor(route).is_some(),
+                main_descriptors[route].is_some(),
                 "main host should advertise {route}"
             );
             assert!(
@@ -8456,8 +8479,7 @@ mod tests {
             );
         }
         assert!(
-            main_host
-                .object_rpc_route_descriptor(sinomo_sandbox::SANDBOX_STATUS_ROUTE)
+            main_descriptors[sinomo_sandbox::SANDBOX_STATUS_ROUTE]
                 .is_some(),
             "main host should advertise clustered sandbox routes"
         );
@@ -8566,11 +8588,6 @@ mod tests {
             &main_paths,
         )
         .expect("main host");
-        let shadow_host = DaemonServiceRegistryHost::from_registry_for_paths(
-            daemon_service_registry(&shadow_paths, Some(runtime.handle()), &[]),
-            &shadow_paths,
-        )
-        .expect("shadow host");
         let request = || {
             ObjectRpcRequest::encode_body(
                 DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE,
@@ -8579,6 +8596,24 @@ mod tests {
             )
             .expect("remote shadow shutdown request")
         };
+        assert!(
+            runtime
+                .block_on(call_authorized_value_service_host_async(
+                    &main_host,
+                    DaemonSignerAuthority::Voter,
+                    request(),
+                ))
+                .is_err(),
+            "the same authenticated route must remain unavailable on main"
+        );
+        // Main and shadow own DATA in distinct production processes.
+        drop(main_host);
+        let shadow_host = DaemonServiceRegistryHost::from_registry_for_paths(
+            daemon_service_registry(&shadow_paths, Some(runtime.handle()), &[]),
+            &shadow_paths,
+        )
+        .expect("shadow host");
+
 
         let response = runtime
             .block_on(call_authorized_value_service_host_async(
@@ -8590,16 +8625,6 @@ mod tests {
         assert_eq!(
             response.decode_body::<String>().expect("shutdown response"),
             "sinomo shadow daemon stopping"
-        );
-        assert!(
-            runtime
-                .block_on(call_authorized_value_service_host_async(
-                    &main_host,
-                    DaemonSignerAuthority::Voter,
-                    request(),
-                ))
-                .is_err(),
-            "the same authenticated route must remain unavailable on main"
         );
         let generic_shutdown =
             ObjectRpcRequest::encode_body(DAEMON_SHUTDOWN_ROUTE, DAEMON_RPC_CATEGORY, &())

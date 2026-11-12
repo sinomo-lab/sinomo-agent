@@ -279,8 +279,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && (resolved.policy.consistency != object.policy
                 || resolved.policy.min_commit_replicas != policy.min_commit_replicas
                 || resolved.policy.desired_replicas != policy.desired_replicas
-                || resolved.policy.required_node_ids != policy.required_node_ids
-                || resolved.policy.forbidden_node_ids != policy.forbidden_node_ids
+                || !placement_node_constraints_match(&resolved.policy.required_node_ids, &policy.required_node_ids)
+                || !placement_node_constraints_match(&resolved.policy.forbidden_node_ids, &policy.forbidden_node_ids)
                 || resolved.policy.min_distinct_zones != policy.min_distinct_zones)
         {
             return Err(unavailable(
@@ -3966,4 +3966,21 @@ mod routed_patch_native_tests {
         drop(client);
         runtime.close().unwrap();
     }
+}
+
+// Managed rules retain caller ordering; replication plans normalize these same
+// constraints as sets. Their order cannot change fresh-write admission.
+fn placement_node_constraints_match(left: &[NodeId], right: &[NodeId]) -> bool {
+    left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>()
+}
+
+#[cfg(test)]
+#[test]
+fn fresh_namespace_node_constraints_compare_as_sets() {
+    let a = NodeId::from_legacy_named("constraint-a").unwrap();
+    let b = NodeId::from_legacy_named("constraint-b").unwrap();
+    let c = NodeId::from_legacy_named("constraint-c").unwrap();
+    assert!(placement_node_constraints_match(&[b.clone(), a.clone()], &[a.clone(), b.clone()]));
+    assert!(!placement_node_constraints_match(&[a.clone(), b], &[a.clone(), c]));
+    assert!(!placement_node_constraints_match(&[a], &[]));
 }

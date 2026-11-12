@@ -249,7 +249,14 @@ impl NativeImportAuthority {
             Ok::<_, sinomo_dfs::MetadataBackendError>(
                 self.cluster()?
                     .kv_request_outcome_authoritative_async(request.request_id.clone())
-                    .await,
+                    .await.inspect_err(|failure| {
+                        #[cfg(test)]
+                        self.trace_native_outcome_read_failure(
+                            "placement-outcome", &request.request_id, failure,
+                        );
+                        #[cfg(not(test))]
+                        let _ = failure;
+                    }),
             )
         })?
         .map_err(NativeEvaluationError::Native)?;

@@ -105,6 +105,22 @@ pub struct ModuleRuntimeHost {
 }
 
 impl ModuleRuntimeHost {
+    /// Withdraw this drained host without withdrawing a replacement incarnation.
+    /// Keep the stopped entry so standalone discovery cannot revive its modules.
+    pub fn withdraw_process_binding(&self, root: &std::path::Path) -> Result<(), String> {
+        let mut hosts = process_hosts()
+            .lock()
+            .map_err(|_| "module host index poisoned")?;
+        if let Some(entry) = hosts.get_mut(&host_key(root)) {
+            if entry.upgrade().is_some_and(|host| {
+                Arc::ptr_eq(&host.generations.active, &self.generations.active)
+            }) {
+                *entry = std::sync::Weak::new();
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         module_registry: Arc<ModuleRegistrySnapshot>,
         extension_registry: Arc<ExtensionRegistrySnapshot>,

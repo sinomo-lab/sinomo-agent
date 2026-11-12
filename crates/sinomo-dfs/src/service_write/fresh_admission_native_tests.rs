@@ -275,8 +275,8 @@ fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_hea
             before_calls,
         );
         let prepared_id = format!("write:{original_intent}");
-        let original_prepared = writer
-            .metadata_backend()
+        let original_prepared = runtime
+            .node_metadata(&b)
             .unwrap()
             .prepared_operation_record(&prepared_id)
             .unwrap()
@@ -287,8 +287,8 @@ fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_hea
             crate::DfsPreparedOperationStatus::Committed
         );
         assert!(original_prepared.committed_entry.is_some());
-        let original_record = writer
-            .metadata_backend()
+        let original_record = runtime
+            .node_metadata(&b)
             .unwrap()
             .get_intent(&original_object, &original_intent)
             .unwrap()
@@ -356,8 +356,8 @@ fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_hea
                 }),
             "real same-node replay RPC completes while A content remains denied"
         );
-        let after_prepared = writer
-            .metadata_backend()
+        let after_prepared = runtime
+            .node_metadata(&b)
             .unwrap()
             .prepared_operation_record(&prepared_id)
             .unwrap()
@@ -370,8 +370,8 @@ fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_hea
         );
         assert_eq!(after_prepared.status, original_prepared.status);
         assert_eq!(
-            writer
-                .metadata_backend()
+            runtime
+                .node_metadata(&b)
                 .unwrap()
                 .get_intent(&original_object, &original_intent)
                 .unwrap(),

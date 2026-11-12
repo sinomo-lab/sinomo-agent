@@ -867,8 +867,18 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
             .unwrap();
     }
     drop(control);
-    let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
-    policy.required_node_ids = required;
+    cluster
+        ._runtime
+        .wait_published_configuration_current(&cluster.writer_node)
+        .unwrap();
+    let (_, _, policy) = cluster.writer
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
+        .unwrap();
+    assert_eq!((policy.min_commit_replicas, policy.desired_replicas), (1, 2));
+    assert_eq!(
+        policy.required_node_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        required.into_iter().collect::<BTreeSet<_>>()
+    );
 
     match cluster.writer.posix_write_file(
         path,
@@ -890,22 +900,25 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
     sifs_posix_cluster_pump_until(&mut cluster, "writer observes async write", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
 
     sifs_posix_cluster_pump_until(&mut cluster, "primary async repair", |cluster| {
-        drive_repair_executor(&cluster._runtime, &mut cluster.primary);
+        cluster._runtime.maintenance_tick(
+            &cluster.primary_node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        ).unwrap().outcome.unwrap();
         cluster
             .primary
-            .posix_read_file(path)
+            .content()
+            .read_blob(&expected_hash)
             .is_ok_and(|read| read == bytes)
     });
     sifs_cluster_publish_metadata_until(
         &mut cluster,
         "writer learns repaired primary location",
         |cluster| {
-            cluster.writer.posix_stat(path).is_ok_and(|stat| {
+            cluster.writer.posix_stat_distributed(path).is_ok_and(|stat| {
                 stat.current_locations.contains(&cluster.writer_node)
                     && stat.current_locations.contains(&cluster.primary_node)
             })
@@ -917,13 +930,13 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
         .content
         .debug_remove_loose_blob(&expected_hash)
         .expect("remove writer loose blob");
-    assert!(
-        matches!(
-            cluster.writer.posix_read_file(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
-        "fault injection must remove the writer's local readable content"
-    );
+    match cluster.writer.content().read_blob(&expected_hash).unwrap_err() {
+        crate::ContentStoreError::MissingLooseBlob { hash } => assert_eq!(hash, expected_hash),
+        crate::ContentStoreError::Io { source, .. } => {
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        error => panic!("fault injection must remove the writer's local readable content: {error}"),
+    }
 
     let recovered =
         sifs_cluster_fetch_for_local_read(&mut cluster, |cluster| &mut cluster.writer, path);

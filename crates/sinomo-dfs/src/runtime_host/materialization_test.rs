@@ -47,10 +47,10 @@ pub(crate) fn observe_existing_materialization(
     else {
         return Ok(None);
     };
-    let Some(backend) = shard.try_checkout().map_err(|error| error.to_string())? else {
+    let Some((durable, materialized, prefix)) = shard.observe_open_materialization_boundary()
+        .map_err(|error| error.to_string())? else {
         return Ok(None);
     };
-    let (durable, materialized, prefix) = backend.replica_materialization_boundary_state();
     Ok(Some(DfsTestMaterializationCapture {
         physical_root: crate::default_dfs_metadata_shards_root(data_dir).join(&shard_id.0),
         file_system_id: file_system_id.clone(),
@@ -246,14 +246,13 @@ pub(super) fn capture(
         prefix: None,
         unavailable: None,
     };
-    match shard.try_checkout() {
-        Ok(Some(backend)) => {
-            let (durable, materialized, prefix) = backend.replica_materialization_boundary_state();
+    match shard.observe_open_materialization_boundary() {
+        Ok(Some((durable, materialized, prefix))) => {
             capture.durable_sequence = Some(durable);
             capture.materialized_sequence = Some(materialized);
             capture.prefix = prefix;
         }
-        Ok(None) => capture.unavailable = Some("native resident checkout is busy".into()),
+        Ok(None) => capture.unavailable = Some("native resident is busy or unopened".into()),
         Err(error) => capture.unavailable = Some(error.to_string()),
     }
     Some(PendingCapture { gate, capture })

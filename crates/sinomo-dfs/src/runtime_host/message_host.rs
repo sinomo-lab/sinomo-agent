@@ -3145,7 +3145,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     match reject_daemon_dfs_incomplete_genesis_before_effects(
-        data_dir, peer_snapshot, &command, metadata_authority_preflight.as_ref(),
+        data_dir, peer_snapshot, &command, metadata_authority_preflight.as_ref(), completed_phase.as_ref(),
     ) {
         Ok(()) => {}
         Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(stale)) => {
@@ -3879,6 +3879,7 @@ fn reject_daemon_dfs_incomplete_genesis_before_effects(
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     command: &DfsMessageCommand,
     preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+    completed_phase: Option<&crate::source_adoption::CompletedRemoteNamespacePhase>,
 ) -> Result<(), DaemonDfsAuthorityPreExecutionError> {
     let affected = daemon_dfs_genesis_ingress_scopes(peer_snapshot, command, preflight)?;
     if affected.is_empty() {
@@ -3922,8 +3923,16 @@ fn reject_daemon_dfs_incomplete_genesis_before_effects(
         }
         let handle = resident.scope_shard(&current.file_system_id, &shard)?;
         let id = crate::default_cluster::genesis::genesis_operation_id(&current);
+        let custody = match (completed_phase, &command.routed_message.message) {
+            (Some(crate::source_adoption::CompletedRemoteNamespacePhase::SourcePrepared { prepared, .. }),
+             sinomo_dfs::DfsNetworkMessage::NamespaceRequest(namespace)) => {
+                crate::source_adoption::actor_for_root(&data_dir.root())?
+                    .ingress_job_writer_custody(&prepared.offer, namespace, &current)?
+            }
+            _ => None,
+        };
         let record = handle
-            .read_prepared_operation_record_without_open(&id)?
+            .read_prepared_operation_record_with_custody_without_open(&id, custody.as_ref())?
             .ok_or_else(|| unavailable("affected resident shard is busy or unopened"))?;
         reject_known_native_genesis_record(&current, record)?;
     }

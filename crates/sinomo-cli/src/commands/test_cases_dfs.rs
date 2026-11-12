@@ -8053,7 +8053,9 @@ mod tests {
 
     #[test]
     fn dfs_acceptance_keeps_bounded_omissions_visible_without_hiding_real_debt() {
-        let legacy_reason = "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated";
+        let omission =
+            dfs::DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(1);
+        let omission_reason = omission.to_string();
         let mut status = DfsOperatorStatus {
             storage_migrations: Vec::new(),
             incomplete_reasons: Vec::new(),
@@ -8073,9 +8075,7 @@ mod tests {
             metadata_shards: Vec::new(),
             repair_attempts: Vec::new(),
         };
-        status.push_bounded_omission(
-            dfs::DfsOperatorStatusOmission::historical_routing_topology(1),
-        );
+        status.push_bounded_omission(omission);
         let unavailable_repair_targets = BTreeSet::new();
 
         let summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
@@ -8089,7 +8089,7 @@ mod tests {
 
         let completeness = assess_dfs_invariant_status_completeness(&status);
         assert!(completeness.blocking_incomplete_reasons.is_empty());
-        assert_eq!(completeness.bounded_omissions, vec![legacy_reason]);
+        assert_eq!(completeness.bounded_omissions, vec![omission_reason]);
 
         status.pending_write_count = 1;
         let debt_summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);

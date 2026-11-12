@@ -4589,11 +4589,12 @@ fn native_history_settled_peer_head(
 ) -> Option<DfsObjectMetadata> {
     // The peer node's own durable store, reopened for each observation.
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_observed = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "ordinary current metadata replication must settle before retained-only repair"
+            "ordinary current metadata replication must settle before retained-only repair; expected={current:?}; actual={last_observed:?}"
         );
         let observed = runtime
             .node_metadata(peer_node)
@@ -4603,6 +4604,7 @@ fn native_history_settled_peer_head(
         if observed.as_ref() == Some(current) {
             break;
         }
+        last_observed = observed;
         std::thread::sleep(Duration::from_millis(20));
     }
     let actual = runtime

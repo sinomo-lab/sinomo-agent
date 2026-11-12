@@ -454,11 +454,18 @@ impl NativeImportAuthority {
         if saved_only {
             // Saving the plan/request precedes the ordinary first atomic CAS.
             // No receipt is inferred from files or absent domain keys.
-            let outcome = block_native(
-                &self.runtime,
-                self.cluster()?
-                    .kv_request_outcome_authoritative_async(plan.stage_request.request_id.clone()),
-            )?;
+            let lookup = self.cluster()?
+                .kv_request_outcome_authoritative_async(plan.stage_request.request_id.clone());
+            let outcome = block_native(&self.runtime, async {
+                lookup.await.inspect_err(|failure| {
+                    #[cfg(test)]
+                    self.trace_native_outcome_read_failure(
+                        "saved-only-stage", &plan.stage_request.request_id, failure,
+                    );
+                    #[cfg(not(test))]
+                    let _ = failure;
+                })
+            })?;
             sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).map_err(error)?;
             current_authority(&outcome.authority)?;
             if !matches!(
@@ -525,7 +532,19 @@ impl NativeImportAuthority {
             request,
             &plan.expected_handoff.retiring_shard.primary_node_id,
             &plan.captured_entries,
-        )
+        ).inspect_err(|failure| {
+            #[cfg(test)]
+            eprintln!("NATIVE_IMPORT_OUTCOME_PLAN_CONTEXT {}", serde_json::json!({
+                "source_root": plan.source_cut.source_root,
+                "source_identity": plan.source_cut.source_identity,
+                "scope_shard": plan.source_cut.scope_shard,
+                "stage_request_id": plan.stage_request.request_id,
+                "activation_request_id": plan.activation_request.as_ref().map(|request| &request.request_id),
+                "failure": format!("{failure:?}"),
+            }));
+            #[cfg(not(test))]
+            let _ = failure;
+        })
     }
 
     /// Domain callers bind immutable custody and current scope separately.
@@ -551,7 +570,14 @@ impl NativeImportAuthority {
             Ok::<_, MetadataBackendError>(
                 self.cluster()?
                     .kv_request_outcome_authoritative_async(request.request_id.clone())
-                    .await,
+                    .await.inspect_err(|failure| {
+                        #[cfg(test)]
+                        self.trace_native_outcome_read_failure(
+                            "original-native-commit", &request.request_id, failure,
+                        );
+                        #[cfg(not(test))]
+                        let _ = failure;
+                    }),
             )
         })?
         .map_err(NativeEvaluationError::Native)?;

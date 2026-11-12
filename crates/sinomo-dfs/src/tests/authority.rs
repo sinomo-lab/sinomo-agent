@@ -56,10 +56,8 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
     let seed_path = format!("{prefix}/seed.bin");
     let create_path = format!("{prefix}/activation.txt");
     let read_prefix = |runtime: &DfsTestRuntime, node: &NodeId| {
-        let reader = runtime.client(node).unwrap();
+        let reader = runtime.node_metadata(node).unwrap();
         reader
-            .metadata_backend()
-            .unwrap()
             .metadata_prefix_proof(&shard_id)
             .unwrap()
             .unwrap()
@@ -89,6 +87,14 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
     );
     runtime.checkpoint_rpc_observation_window().unwrap();
     let setup_deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    // Inspect the same live shard incrementally while constructing the corpus.
+    // Reopening all shards after each write would replay the entire growing
+    // table log as fixture work. This read-only handle owns no writer authority.
+    let mut setup_inspection = LocalSobjMetadataBackend::open_for_inspection(
+        shard_id.clone(),
+        crate::local_dfs_metadata_shard_path(runtime.data_dir(&source), &shard_id),
+    )
+    .unwrap();
     writer.set_transport_operation_deadline(Some(setup_deadline));
     let mut last = None;
     let mut mutations = 0;
@@ -97,7 +103,9 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
     for index in 0..=DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT {
         assert!(
             Instant::now() < setup_deadline,
-            "bounded real journal setup expired"
+            "bounded real journal setup expired after {mutations} writes; current prefix {:?}, required > {}",
+            setup_inspection.metadata_prefix_proof().unwrap(),
+            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
         );
         last = Some(
             writer
@@ -117,12 +125,16 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
         if mutations % 4 == 0 {
             runtime.checkpoint_rpc_observation_window().unwrap();
         }
-        if read_prefix(&runtime, &source).journal_sequence
+        setup_inspection.refresh_for_inspection().unwrap();
+        if setup_inspection.metadata_prefix_proof().unwrap().journal_sequence
             > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
         {
             break;
         }
     }
+    // Do not carry any setup inspection state across the physical fault or
+    // cold-owner reopen; all subsequent proofs use freshly selected roots.
+    drop(setup_inspection);
     let last = last.unwrap();
     assert!(
         read_prefix(&runtime, &source).journal_sequence
@@ -987,12 +999,12 @@ fn committed_intent_replay_preserves_original_capture_after_replica_withdrawal()
 
 #[test]
 fn recovered_prepare_restores_the_original_resident_write_outcome() {
-    check_recovered_original_write(false);
+    check_recovered_original_write(false, false);
 }
 
 #[test]
 fn explicit_original_write_retry_recovers_its_complete_prepare() {
-    check_recovered_original_write(true);
+    check_recovered_original_write(true, false);
 }
 
 #[test]
@@ -1135,8 +1147,10 @@ fn replayed_local_receipt_finishes_exact_prepare_after_ack_failure() {
     runtime.close().unwrap();
 }
 
-fn check_recovered_original_write(explicit_retry: bool) {
-    let name = if explicit_retry {
+fn check_recovered_original_write(explicit_retry: bool, capture_filesystem: bool) {
+    let name = if capture_filesystem {
+        "native-configured-write-compound-retry"
+    } else if explicit_retry {
         "native-explicit-original-retry"
     } else {
         "native-recovered-write-outcome"
@@ -1155,6 +1169,34 @@ fn check_recovered_original_write(explicit_retry: bool) {
         .unwrap();
     drop(requester);
     let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let configuration_execution = if capture_filesystem {
+        Some(owner.acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: initial.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+            owner_epoch: shard.epoch,
+            operation_id: "native-original-partition-write".into(),
+        }).unwrap().expect("actual configured write owner"))
+    } else { None };
+    let configured = if capture_filesystem {
+        // Hold the real producer's admission while a normal settings CAS changes
+        // its configuration. No independent bootstrap may publish this delta first.
+        let mut control = runtime.configuration_publisher(&shard.primary_node_id);
+        let mut store = DfsControlPlaneStore::new(control.as_mut());
+        let expected = store.get_file_system_config(&initial.file_system_id).unwrap().unwrap();
+        let mut desired = expected.clone();
+        crate::upsert_placement_rule(&mut desired.subtree_policies,
+            crate::normalize_placement_rule("/unrelated-configured-write-policy",
+                DfsPlacementScope::Subtree,
+                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap()).unwrap());
+        assert!(store.compare_and_put_file_system_config(Some(&expected), &desired).unwrap());
+        drop(store);
+        drop(control);
+        runtime.wait_published_configuration_current(&shard.primary_node_id).unwrap();
+        let configured = DfsFileSystem::from(desired);
+        assert_ne!(owner.metadata_backend().unwrap().get_file_system(&initial.file_system_id).unwrap().as_ref(),
+            Some(&configured), "the supported producer must own a real filesystem delta");
+        Some(configured)
+    } else { None };
     let interrupted = shard.replica_node_ids[0].clone();
     runtime.stop_node(&interrupted).unwrap();
     let operation = "native-original-partition-write";
@@ -1189,10 +1231,29 @@ fn check_recovered_original_write(explicit_retry: bool) {
         initial.version
     );
     let intent = prepared.payload.prepared_intent.as_ref().unwrap().clone();
+    if let Some(configured) = &configured {
+        assert!(prepared.metadata_effects.iter().any(|effect|
+            matches!(effect, DfsPreparedMetadataEffect::PutFileSystem { file_system } if file_system == configured)),
+            "the actual configured write producer seals its admitted filesystem");
+        assert!(prepared.payload.transaction.objects.iter().any(|object|
+            object.object_id == initial.object_id && object.version == intent.target_version));
+        assert!(!prepared.payload.content_receipts.is_empty());
+        assert!(prepared.payload.content_receipts.iter().all(|receipt|
+            receipt.receipt.object_id == initial.object_id
+                && receipt.receipt.committed_version == intent.target_version
+                && receipt.content_hash == intent.content_hash));
+        assert!(owner.posix_write_file_with_operation_id(
+            path, b"changed retry bytes", options.clone(), operation,
+        ).is_err(), "the same operation cannot replace its original body");
+        assert_eq!(owner.metadata_backend().unwrap()
+            .prepared_operation_record(&prepared.digest.operation_id).unwrap().unwrap().payload,
+            prepared.payload);
+    }
+    drop(configuration_execution);
     runtime.reopen_node(interrupted).unwrap();
     if explicit_retry {
         let outcome = owner
-            .posix_write_file_with_operation_id(path, b"recovered", options, operation)
+            .posix_write_file_with_operation_id(path, b"recovered", options.clone(), operation)
             .expect("the original explicit retry must return its recovered committed outcome");
         assert_eq!(outcome.version, intent.target_version);
     } else {
@@ -1207,6 +1268,7 @@ fn check_recovered_original_write(explicit_retry: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(committed.digest, prepared.digest);
+    assert_eq!(committed.payload, prepared.payload);
     assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
     assert_eq!(
         owner
@@ -1224,6 +1286,25 @@ fn check_recovered_original_write(explicit_retry: bool) {
         if version == intent.target_version && Some(content_hash.as_str()) == intent.content_hash.as_deref()),
         "durable recovery must also finish the original resident outcome"
     );
+    if capture_filesystem {
+        let prefix = owner.metadata_backend().unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id).unwrap();
+        let mut conflicting = (*prepared.payload).clone();
+        conflicting.expected_object_versions[0].expected_version = Some(DfsVersion::generate());
+        assert!(owner.publish_prepared_operation(conflicting).is_err(),
+            "an altered read-set cannot reuse the committed original body");
+        assert_eq!(owner.metadata_backend().unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id).unwrap(), prefix);
+        let replay = owner.posix_write_file_with_operation_id(
+            path, b"recovered", options, operation,
+        ).unwrap();
+        assert_eq!(replay.version, intent.target_version);
+        assert_eq!(owner.metadata_backend().unwrap()
+            .metadata_prefix_proof(&prepared.digest.shard_id).unwrap(), prefix);
+        assert_eq!(owner.metadata_backend().unwrap()
+            .prepared_operation_record(&prepared.digest.operation_id).unwrap().unwrap().payload,
+            prepared.payload);
+    }
     drop(owner);
     runtime.close().unwrap();
 }
@@ -3192,6 +3273,7 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     runtime
         .apply_placement_policy(&old_primary, path, DfsPlacementScope::Subtree, policy)
         .unwrap();
+    runtime.wait_published_configuration_current(&old_primary).unwrap();
     deny_native_read_repair(&runtime, &old_primary, &target);
     let mut writer = runtime.client(&old_primary).unwrap();
     let (resolved, _, replication) = writer
@@ -3260,7 +3342,8 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         .get_intent(&stat.object_id, &owner_intent)
         .unwrap()
         .unwrap();
-    let mut next = runtime.client(&current_primary).unwrap();
+    let mut next = runtime.local_shard_copy_service(&current_primary, &old_config).unwrap();
+    next.hydrate_from_metadata_backend().unwrap();
     // A content hint cannot substitute for the normal authoritative lookup.
     // Synchronize the real published object before requesting its cache bytes.
     let observed = next.posix_stat_distributed(path).unwrap();
@@ -3286,8 +3369,8 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     assert_eq!(target_observed.version, stat.version);
     assert_eq!(target_observed.content_hash, stat.content_hash);
     let target_content = target_before.content().clone();
-    let target_head = target_before
-        .metadata_backend()
+    let target_head = runtime
+        .node_metadata(&target)
         .unwrap()
         .get_object(&stat.object_id)
         .unwrap()
@@ -3440,8 +3523,8 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         bytes
     );
     assert_eq!(
-        refreshed_target
-            .metadata_backend()
+        runtime
+            .node_metadata(&target)
             .unwrap()
             .get_object(&stat.object_id)
             .unwrap()
@@ -4191,12 +4274,8 @@ fn metadata_receipt_retry_recovers_original_prepare_and_receipt_identity() {
     runtime.close().unwrap();
 }
 
-fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
-    let name = if capture_filesystem {
-        "native-receipt-location-filesystem-retry"
-    } else {
-        "native-receipt-location-retry"
-    };
+fn check_compound_receipt_publication_retry() {
+    let name = "native-receipt-location-retry";
     let (mut runtime, owner, replica, service, stat, intent_id, seed_interception) =
         super::repair::native_committed_repair_backlog_with_nodes(name, true, 3);
     drop(service);
@@ -4252,16 +4331,6 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
         other => panic!("actual receiver did not retain durable bytes: {other:?}"),
     };
     assert_eq!(Some(hash.as_str()), stat.content_hash.as_deref());
-    if capture_filesystem {
-        runtime
-            .apply_placement_policy(
-                &owner,
-                &format!("/services/{name}-unrelated"),
-                DfsPlacementScope::Subtree,
-                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
-            )
-            .unwrap();
-    }
     let current_configuration = runtime
         .shared_control_plane()
         .unwrap()
@@ -4282,28 +4351,6 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
         .local_metadata_owner_shard_hint_for_object(&current)
         .unwrap()
         .unwrap();
-    let mut projection_execution = if capture_filesystem {
-        let execution = source
-            .acquire_prepared_execution(&DfsPreparedOperationScope {
-                file_system_id: stat.file_system_id.clone(),
-                shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
-                owner_epoch: shard.epoch,
-                operation_id: intent_id.clone(),
-            })
-            .unwrap()
-            .expect("actual scoped Core owner");
-        // The ordinary bootstrap's projection step uses this SAME actual
-        // native configuration. Do not bootstrap foreign roots through this
-        // services-only backend, or manufacture an authority/receipt.
-        source.clear_metadata_lookup_cache();
-        source
-            .metadata
-            .add_file_system(DfsFileSystem::from(current_configuration.clone()));
-        source.clear_metadata_lookup_cache();
-        Some(execution)
-    } else {
-        None
-    };
     let missing = shard
         .replica_node_ids
         .iter()
@@ -4331,7 +4378,6 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
     );
     // Yield the fixture's actual admission at the producer-call boundary.
     // The durable prepare and genuine reply retain recovery custody.
-    drop(projection_execution.take());
     let prepared = source.metadata_backend().unwrap().list_prepared_operations().unwrap().into_iter().find(|record|
         record.metadata_effects.iter().any(|effect| matches!(effect,
             DfsPreparedMetadataEffect::PutReceipt { receipt } if receipt.receipt.object_id == stat.object_id
@@ -4344,7 +4390,7 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
             .metadata_effects
             .iter()
             .any(|effect| matches!(effect, DfsPreparedMetadataEffect::PutFileSystem { .. })),
-        capture_filesystem,
+        false,
         "exercise the exact observed compound form"
     );
     assert!(
@@ -4533,7 +4579,6 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
         .process_routed_messages_with_options(vec![original], true)
         .unwrap();
     drop(execution);
-    drop(projection_execution);
     drop(source);
     drop(background);
     runtime.close().unwrap();
@@ -4541,7 +4586,7 @@ fn check_compound_receipt_publication_retry(capture_filesystem: bool) {
 
 #[test]
 fn compound_receipt_location_retry_preserves_original_publication() {
-    check_compound_receipt_publication_retry(false);
+    check_compound_receipt_publication_retry();
 }
 
 #[test]
@@ -5371,6 +5416,6 @@ fn exact_retry_resumes_original_intent_opening_after_restart() {
 }
 
 #[test]
-fn compound_receipt_filesystem_retry_preserves_original_publication() {
-    check_compound_receipt_publication_retry(true);
+fn configured_write_filesystem_retry_preserves_original_publication() {
+    check_recovered_original_write(true, true);
 }

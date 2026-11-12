@@ -13,4 +13,4 @@ turn 1: Mark 'write release notes' as done in TODO.md.
   context
   assistant: {"response_mode":"answer","text":"Done: 'write release notes' is checked off.","tool_calls":[],"background_handoff":null…
   stop: final-decision
-  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.completed
+  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.tool.call.completed, agent.context.assembled, agent.loop.model.completed, agent.tool.call.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.completed

@@ -22213,7 +22213,7 @@ mod tests {
 
     #[test]
     fn pushed_namespace_event_reconciles_remote_timeline_without_reopening_chat() {
-        let (_backend, mut state) = isolated_chat_state("multi-device-timeline-sync");
+        let (backend, mut state) = isolated_chat_state("multi-device-timeline-sync");
         seed_default_provider(&mut state);
         let channel_id = SessionId::generate();
         seed_backend_chat(
@@ -22238,6 +22238,10 @@ mod tests {
                     .iter()
                     .any(|message| message.text == "first device")
         });
+
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal opened local transcript observations");
 
         let store = SifsAgentChannelStore::open(&state.data_dir).expect("open second device store");
         let mut remote = store
@@ -22277,7 +22281,7 @@ mod tests {
 
     #[test]
     fn pushed_namespace_event_reconciles_backdated_message_with_unchanged_timestamp() {
-        let (_backend, mut state) = isolated_chat_state("multi-device-backdated-sync");
+        let (backend, mut state) = isolated_chat_state("multi-device-backdated-sync");
         seed_default_provider(&mut state);
         let channel_id = SessionId::generate();
         let seeded = seed_backend_chat(
@@ -22313,6 +22317,10 @@ mod tests {
             .find(|message| message.text == "original message")
             .and_then(|message| message.message_id.clone())
             .expect("durable original message id");
+
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal opened local transcript observations");
 
         let store = SifsAgentChannelStore::open(&state.data_dir).expect("open second device store");
         let mut remote = store
@@ -23072,7 +23080,7 @@ mod tests {
 
     #[test]
     fn session_rename_updates_sidebar_metadata_and_preserves_title() {
-        let (_backend, mut state) = isolated_chat_state("rename");
+        let (backend, mut state) = isolated_chat_state("rename");
         let channel_id = SessionId::generate();
         let session_id = channel_id.to_string();
         state.session_id = session_id.clone();
@@ -23087,6 +23095,10 @@ mod tests {
             &state.messages,
         );
         state.persist();
+
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal seeded session observations");
 
         state.begin_edit_current_session();
         assert_eq!(state.session_edit_id.as_deref(), Some(session_id.as_str()));
@@ -23345,13 +23357,19 @@ mod tests {
 
     #[test]
     fn channel_config_adds_selected_agent_and_updates_sidebar_count() {
-        let (_backend, mut state) = isolated_chat_state("channel-add-agent");
+        let (backend, mut state) = isolated_chat_state("channel-add-agent");
         seed_test_agents(&mut state);
         state.agents[1].tool_runtime.sandbox_node_id = Some("coding-node".to_string());
         state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
-            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
+            state.pending_session_reset.is_none()
+                && state.channel_create_rx.is_none()
+                && !state.session_list_loading
         });
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal completed channel creation observations");
+
         let channel_id = state.session_id.clone();
 
         state.set_channel_agent_idx(1);

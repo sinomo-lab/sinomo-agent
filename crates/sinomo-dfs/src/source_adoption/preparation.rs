@@ -1602,6 +1602,32 @@ mod genuine_source_first_tests {
                 source_directory.object_id
             );
             assert_eq!(prepared.offer.target_config.primary_node_id, target);
+            let actor = actor_for_root(&native.data_dir(&coordinator).root()).unwrap();
+            let origin = held.plan.job.origin.as_ref().expect("original request");
+            let mut command = crate::DfsNamespaceCommand {
+                request_id: origin.request_id.clone(),
+                file_system_id: held.plan.job.file_system_id.clone(),
+                requesting_node_id: origin.requester_node_id.clone(),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards: Vec::new(),
+                operation: crate::DfsNamespaceOperation::Rename {
+                    from: from.into(), to: to.into(),
+                },
+            };
+            assert!(actor.ingress_job_writer_custody(
+                &prepared.offer, &command, &held.plan.job_config,
+            ).unwrap().is_some());
+            command.request_id.push_str("-unrelated");
+            assert!(actor.ingress_job_writer_custody(
+                &prepared.offer, &command, &held.plan.job_config,
+            ).is_err());
+            command.request_id = origin.request_id.clone();
+            let mut wrong_epoch = held.plan.job_config.clone();
+            wrong_epoch.epoch += 1;
+            assert!(actor.ingress_job_writer_custody(
+                &prepared.offer, &command, &wrong_epoch,
+            ).is_err());
             let revoked =
                 call(&DfsSourceAdoptionRequest::RevokeSourcePreparation { token: held.token });
             assert!(
@@ -1819,8 +1845,16 @@ mod genuine_source_first_tests {
         drop(bind_pause);
         // Rebuild only restrictive guard DATA from this real replica's
         // committed Running job, through the production projection helpers.
-        let source_inspector = native.client(&nested.primary_node_id).unwrap();
         let root_shard = crate::DfsMetadataShardId::new("root");
+        let root_config = native
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|config| config.shard_id == root_shard.0)
+            .expect("root metadata assignment");
+        let source_inspector = native
+            .local_shard_copy_service(&nested.primary_node_id, &root_config)
+            .unwrap();
         let guards = source_inspector
             .replica_namespace_guard_projection(&root_shard)
             .unwrap();

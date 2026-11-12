@@ -18,4 +18,4 @@ turn 1: Which port does the server use?
   context
   assistant: {"response_mode":"answer","text":"The server listens on port 8443 (docs/config.toml).","tool_calls":[],"background_hando…
   stop: final-decision
-  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.tool.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.completed
+  events: agent.loop.started, agent.context.assembled, agent.loop.model.completed, agent.tool.call.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.tool.call.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.tool.call.completed, agent.coding.state.updated, agent.context.assembled, agent.loop.model.completed, agent.loop.completed

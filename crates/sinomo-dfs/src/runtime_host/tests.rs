@@ -7920,8 +7920,13 @@ fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
     let local = shard.primary_node_id.clone();
     let target = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    // Establish the actual acknowledged baseline and keep Main's competing
+    // planner outside this setup/publication window, as the ACK controls do.
+    let (baseline, quiet_primary) = settled_native_replication_cursor_held(&native, &shard, &target);
     let count = crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 7;
     let head = late_native_hidden_suffix(&mut service, &shard, count);
+    assert!(head.saturating_sub(baseline) > crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64,
+        "the original native suffix must exceed a batch relative to the actual acknowledged baseline");
     drop(service);
     let (peer, _) = native.peer_transports(&local).unwrap();
     let actual = crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
@@ -7981,6 +7986,7 @@ fn daemon_dfs_metadata_journal_publish_drains_bounded_batches() {
         head
     );
     drop(source);
+    drop(quiet_primary);
     native.close().unwrap();
 }
 
@@ -13001,17 +13007,17 @@ fn default_cluster_metadata_shard_transfers_after_candidate_replays_current_jour
         .expect("services");
     assert_eq!(transferred, desired);
     assert!(transferred.replica_node_ids.contains(&primary));
-    let reopened = fixture.client(&candidate).expect("actual promoted owner");
-    let target = reopened
-        .metadata_backend()
-        .expect("actual promoted backend")
+    let mut reopened = fixture.client(&candidate).expect("actual promoted owner");
+    let target = fixture
+        .node_metadata(&candidate)
+        .expect("actual promoted metadata inspection")
         .export_shard_table_snapshot(&DfsMetadataShardId::new("services"))
         .expect("actual promoted snapshot")
         .expect("services snapshot");
     assert!(target.materialized_through_sequence >= snapshot.materialized_through_sequence);
     assert!(
         reopened
-            .posix_stat("/services/transfer-replay-witness")
+            .posix_stat_distributed("/services/transfer-replay-witness")
             .is_ok(),
         "late source publication must survive real candidate replay"
     );
@@ -15891,10 +15897,9 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
             options,
         )
         .unwrap();
+    let inspection = native.node_metadata(&local).unwrap();
     let planned_object = |path: &str| {
-        source
-            .metadata_backend()
-            .unwrap()
+        inspection
             .get_object_by_path_on_shard(
                 &DfsMetadataShardId::new(root_shard.shard_id.clone()),
                 &file_system.file_system_id,
@@ -15906,6 +15911,7 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
     let first_object = planned_object("/services/daemon-write-skips-cold-hydrate.txt");
     let second_object = planned_object("/services/daemon-write-after-maintenance.txt");
     let third_object = planned_object("/services/daemon-write-after-failed-maintenance.txt");
+    drop(inspection);
     drop(source);
     assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
     let lane_opens_before_write = daemon_dfs_test_message_service_lane_open_count(&data_dir);

@@ -342,17 +342,11 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         "reopen":"not exercised: normal reopen may refuse readiness while hold is active; no SIGKILL or fresh adoption",
         "quietness":"explicit operation activity; no quiet-window/writeback proof"});
     let mut final_captures = Vec::new();
-    let mut evidence_root = None;
+    // Evidence outlives native.close(), which removes successful fixture DATA.
+    let evidence_dir = sinomo_testdir::TestDir::new("incomplete-genesis-evidence");
+    let evidence_root = Some(evidence_dir.path().to_path_buf());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let primary = native.root_shard().unwrap().primary_node_id;
-        evidence_root = Some(
-            native
-                .data_dir(&primary)
-                .root()
-                .parent()
-                .unwrap()
-                .to_owned(),
-        );
         let prefix = crate::sifs_node_path(&primary);
         let write_path = format!("{prefix}/incomplete-write.bin");
         let rename_source = "/services/incomplete-genesis-rename-source";
