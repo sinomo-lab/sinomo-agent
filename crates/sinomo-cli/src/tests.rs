@@ -10899,6 +10899,8 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
         .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
         .expect("create sandbox");
     drop(instance_store);
+    // Preserve setup RPC evidence before the complete HTTP/audit workload.
+    _native.with_native(|native, _| native.checkpoint_rpc_observation_window().unwrap());
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind http server");
     let address = listener.local_addr().expect("http server address");
@@ -10927,6 +10929,7 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
         },
     )
     .expect("fetch to file");
+    _native.with_native(|native, _| native.checkpoint_rpc_observation_window().unwrap());
 
     server.join().expect("server");
     assert_eq!(result.status, 200);
@@ -10941,6 +10944,10 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
         &result.request_id,
     )
     .expect("audit");
+    _native.with_native(|native, _| {
+        native.checkpoint_rpc_observation_window().unwrap();
+        assert_eq!(native.observation_dropped_count(), 0);
+    });
     assert_eq!(audit, result.record);
     assert_eq!(audit.url, format!("http://{address}/package"));
     assert!(!audit.url.contains("secret"));

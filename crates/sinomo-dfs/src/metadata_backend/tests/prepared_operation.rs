@@ -274,12 +274,22 @@ fn superseding_prepare_preserves_original_body_despite_changed_local_filesystem_
             .unwrap(),
         Some(changed.clone())
     );
-    // Fresh operations still carry a changed definition through the ordinary
-    // complete-body path; only immutable supersession excludes enrichment.
+    // Fresh producers select their definition from admitted configuration;
+    // a changed service-local projection alone cannot authorize that effect.
+    runtime.shared_control_plane().unwrap().with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .put_file_system_config(&crate::DfsFileSystemConfig::from(&local_view))
+            .unwrap();
+    });
+    let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation(
+        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(&config.primary_node_id)),
+        &runtime.runtime_handle(),
+    ).unwrap();
+    runtime.runtime_handle().block_on(authority.ensure_write_configuration_ready_async()).unwrap();
     let mut next = changed.clone();
     next.version = DfsVersion::generate();
     let fresh = namespace_payload(&config, &changed, next, "immutable-next-fresh");
-    let published = service.publish_prepared_operation(fresh).unwrap();
+    let published = service.publish_prepared_operation_with_file_system(fresh, Some(&local_view)).unwrap();
     assert!(published.payload.metadata_effects.iter().any(|effect| matches!(effect,
         crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } if file_system == &local_view)));
     drop(service);

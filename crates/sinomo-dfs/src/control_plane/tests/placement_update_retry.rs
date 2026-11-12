@@ -1112,15 +1112,15 @@ fn native_placement_supersession_rejects_changed_classifying_configuration() {
         drop(hook);
         drop(service);
         drop(admission);
-        // The same actual job now resumes through the normal Main owner.
-        let pass = runtime
-            .maintenance_tick(owner, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
-            .unwrap();
-        assert!(
-            pass.outcome.is_ok(),
-            "normal fresh placement owner: {:?}",
-            pass.outcome
-        );
+        // The same actual job resumes after its owner's published projection
+        // reaches the configuration restored by the controlled CAS race.
+        runtime.wait_published_configuration_current(owner).unwrap();
+        runtime
+            .with_main_maintenance_service(owner, |service| {
+                service.run_placement_reconciliation_bounded(1)
+            })
+            .unwrap()
+            .expect("normal fresh placement owner advances its bounded page");
         let retried = control.with_client(|kv| {
             let rows = kv.get_authoritative_consistent(&keys).unwrap();
             rows[0]

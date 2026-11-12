@@ -1039,6 +1039,14 @@ impl ResidentLocalMetadataShardHandle {
         &self,
         operation_id: &str,
     ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        self.read_prepared_operation_record_with_custody_without_open(operation_id, None)
+    }
+
+    pub(crate) fn read_prepared_operation_record_with_custody_without_open(
+        &self,
+        operation_id: &str,
+        custody: Option<&crate::metadata_backend::DfsSourceAdoptionWriterCustody>,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
         let backend = self.slot.checkout_with_open(&mut || {
             Err(MetadataBackendError::Serde(
                 "resident prepared-record observation requires an already-open owner".into(),
@@ -1050,7 +1058,10 @@ impl ResidentLocalMetadataShardHandle {
             slot: Arc::clone(&self.slot),
             backend: Some(backend),
         };
-        lease.read_certified_prepared_record_for_ingress(operation_id)
+        match custody {
+            Some(custody) => lease.read_prepared_record_with_source_custody(operation_id, custody),
+            None => lease.read_certified_prepared_record_for_ingress(operation_id),
+        }
     }
 
     /// Use the SAME strict primary slot to prepare storage for ingress, without
@@ -1107,6 +1118,26 @@ impl ResidentLocalMetadataShardHandle {
             slot: Arc::clone(&self.slot),
             backend: Some(backend),
         })
+    }
+
+    /// Test observation of the existing resident cut only. Unlike try_checkout,
+    /// this cannot open/replay an Unopened slot or wait for a competing owner.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn observe_open_materialization_boundary(
+        &self,
+    ) -> Result<Option<(u64, u64, Option<DfsMetadataPrefixProof>)>> {
+        let state = match self.slot.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(MetadataBackendError::Serde(format!("materialization observation lock poisoned: {error}")));
+            }
+        };
+        match &*state {
+            ResidentLocalMetadataShardState::Available(backend) =>
+                backend.observe_existing_materialization_cut(),
+            _ => Ok(None),
+        }
     }
 
     /// Attempt to check out this shard without waiting for a competing owner.
@@ -3309,6 +3340,38 @@ mod lazy_replica_slot_tests {
                 .matches_topology(&metadata_root, &shards[1..])
                 .expect("missing shard")
         );
+    }
+
+    #[test]
+    fn materialization_observation_never_opens_or_waits_for_a_resident() {
+        let root = sinomo_testdir::TestDir::new("dfs-nonopening-materialization-observer");
+        let local = node("materialization-observer-local");
+        let config = configs(&local)[0].clone();
+        let shard = DfsMetadataShardId::new(&config.shard_id);
+        let resident = LocalShardedMetadataBackend::new_with_replica_repair(
+            root.path().join("metadata"), vec![config.clone()], &local,
+        ).unwrap().into_resident();
+        let handle = resident.scope_shard(&config.file_system_id, &shard).unwrap();
+        let lease = handle.checkout().unwrap();
+        assert!(handle.observe_open_materialization_boundary().unwrap().is_none());
+        let expected = lease.observe_existing_materialization_cut().unwrap().expect("actual certified cut");
+        let physical_root = lease.shard_root().to_path_buf();
+        drop(lease);
+        let writer = crate::metadata_lock::metadata_write_lock(
+            physical_root.clone(), crate::metadata_cursor::journal_write_lock_path(&physical_root),
+        ).unwrap();
+        assert!(handle.observe_open_materialization_boundary().unwrap().is_none());
+        drop(writer);
+        assert_eq!(handle.observe_open_materialization_boundary().unwrap(), Some(expected));
+        let slot = resident.inner.shards.get(&shard).unwrap();
+        let mut state = slot.state.lock().unwrap();
+        assert!(handle.observe_open_materialization_boundary().unwrap().is_none());
+        *state = ResidentLocalMetadataShardState::Unopened;
+        drop(state);
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+        assert!(handle.observe_open_materialization_boundary().unwrap().is_none());
+        assert_eq!(crate::metadata_backend::metadata_backend_open_calls(), 0);
+        assert!(matches!(*slot.state.lock().unwrap(), ResidentLocalMetadataShardState::Unopened));
     }
 
     #[test]

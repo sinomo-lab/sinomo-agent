@@ -355,6 +355,13 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
     )
     .with_timeout(Duration::from_secs(5));
     chat.open().expect("open daemon-hosted chat session");
+    // Opening a view leaves its execution dormant. Exercise the actual command
+    // path to activate the host without starting a model request.
+    chat.command(sinomo_client::chat_contract::ChatSessionCommand::SetWorkspace {
+        session_id: String::new(),
+        workspace_root: None,
+    })
+    .expect("activate daemon-hosted chat through workspace selection");
     let ready = chat
         .events(0, 32, Duration::from_secs(3))
         .expect("poll daemon-hosted chat events");
@@ -366,14 +373,16 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
         "daemon-hosted chat did not publish readiness: {:?}",
         ready.events
     );
-    let missing_session = sinomo_runtime::events::SessionId::generate().to_string();
+    // A valid unknown ID has an observable absent/dormant state. Malformed IDs
+    // still exercise a service rejection without a transport reconnect.
+    let missing_session = "invalid-session-id".to_string();
     let rejected = chat
         .command(
             sinomo_client::chat_contract::ChatSessionCommand::ControlState {
                 session_id: missing_session,
             },
         )
-        .expect_err("an unknown runtime session rejects its control query");
+        .expect_err("a malformed runtime session rejects its control query");
     assert!(
         matches!(
             rejected,

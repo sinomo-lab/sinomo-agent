@@ -1582,7 +1582,9 @@ fn commit_version_applies_when_response_target_is_unroutable() {
             .expect("the exact native empty-path Apply job")
     };
     let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    for _ in 0..2 {
+    // Native maintenance can defer completion across turns; wait for this
+    // exact job within the original deadline rather than assuming two ticks.
+    loop {
         let current = read_apply();
         assert_eq!(current.accepted_config, accepted.accepted_config);
         assert_eq!(current.path, path);
@@ -1959,8 +1961,8 @@ fn commit_version_applies_when_response_target_is_unroutable() {
         bytes
     );
     assert_eq!(
-        actual
-            .metadata_backend()
+        runtime
+            .node_metadata(&replica)
             .unwrap()
             .get_object(&request.object_id)
             .unwrap()
@@ -2001,7 +2003,9 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
             .expect("the exact native empty-path Apply job")
     };
     let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    for _ in 0..2 {
+    // Native maintenance can defer completion across turns; wait for this
+    // exact job within the original deadline rather than assuming two ticks.
+    loop {
         let current = read_apply();
         assert_eq!(current.accepted_config, accepted.accepted_config);
         assert_eq!(current.path, path);
@@ -2368,8 +2372,8 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
         bytes
     );
     assert_eq!(
-        actual
-            .metadata_backend()
+        runtime
+            .node_metadata(&replica)
             .unwrap()
             .get_object(&request.object_id)
             .unwrap()
@@ -2903,12 +2907,37 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
     policy.required_node_ids = nodes.clone();
     let shard = DfsMetadataShardId::new("services");
-    let paused = delay_materialization.then(|| {
-        runtime
-            .pause_replica_materialization(&replica, &shard)
-            .unwrap()
-    });
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let paused = delay_materialization.then(|| {
+        // Setup publication may be materialized while its coalesced worker is
+        // still draining. Install the pause only at the real idle boundary,
+        // with producers excluded, so the next actual worker owns the hook.
+        let materializer = crate::runtime_host::daemon_dfs_metadata_materialization_lane_scheduler(
+            runtime.data_dir(&replica), &request.file_system_id, &shard,
+        ).unwrap();
+        let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(
+            runtime.data_dir(&replica),
+        ).unwrap();
+        let scope = crate::DfsMessageExecutionScope::ExactShard {
+            file_system_id: request.file_system_id.clone(), shard_id: shard.clone(),
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "setup materializer must drain inside original deadline");
+            scheduler.request_foreground_admission();
+            let admission = crate::test_runtime::executor().block_on(async {
+                tokio::time::timeout(remaining, scheduler.admit(&scope)).await
+                    .expect("original materialization pause admission deadline").unwrap()
+            });
+            if materializer.is_idle_while_producers_excluded() {
+                let pause = runtime.pause_replica_materialization(&replica, &shard).unwrap();
+                drop(admission);
+                break pause;
+            }
+            drop(admission);
+            std::thread::yield_now();
+        }
+    });
     let outcome = writer
         .write_distributed_reader_with_candidates(
             request.clone(),
@@ -3009,6 +3038,9 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     )
     .unwrap();
     if let Some(pause) = paused {
+        runtime.wait_paused_materialization(
+            &pause, deadline.saturating_duration_since(Instant::now()),
+        ).expect("actual scheduled materializer reached the installed pause");
         // Hold only the ordinary scheduled materializer, before admission.
         // Actual ingress must durably receive the original commit; no ACK,
         // current view or replacement authority is supplied by this control.
@@ -3077,17 +3109,8 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
         .read_manifest(request.object_id.as_str(), version.as_str())
         .unwrap();
     assert_eq!(manifest.content_hash, content_hash(&bytes));
-    target
-        .content()
-        .debug_remove_loose_blob(&manifest.content_hash)
-        .unwrap();
-    assert!(
-        target
-            .content()
-            .read_object_version(request.object_id.as_str(), version.as_str())
-            .is_err()
-    );
-    drop(target);
+    // Exclude repairing traffic before the destructive control; otherwise
+    // maintenance can restore the real blob before the negative Commit RPC.
     for route in [
         crate::DFS_DATA_STAGE_BLOB_ROUTE,
         crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
@@ -3102,6 +3125,17 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
             action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
         });
     }
+    target
+        .content()
+        .debug_remove_loose_blob(&manifest.content_hash)
+        .unwrap();
+    assert!(
+        target
+            .content()
+            .read_object_version(request.object_id.as_str(), version.as_str())
+            .is_err()
+    );
+    drop(target);
     let captured = Arc::new(Mutex::new(Vec::new()));
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(owner.clone()),
@@ -3122,7 +3156,8 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     assert!(
         matches!(&replies[0].message, DfsNetworkMessage::CommitVersionResponse(response)
         if response.intent_id == intent_id && response.object_id == request.object_id && response.version == version
-            && matches!(&response.result, DfsBlobTransferResult::Rejected { reason } if reason.contains("committed content bytes are missing")))
+            && matches!(&response.result, DfsBlobTransferResult::Rejected { reason } if reason.contains("committed content bytes are missing"))),
+        "actual captured CommitVersion reply: {:?}", *replies
     );
     drop(replies);
     let target = runtime.client(&replica).unwrap();

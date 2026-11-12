@@ -842,6 +842,29 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    /// Observe only an existing certified physical cut. A foreign writer,
+    /// changed table generation or absent certificate is unavailable, never an
+    /// invitation to open storage, refresh tables or replay its journal.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn observe_existing_materialization_cut(
+        &self,
+    ) -> Result<Option<(u64, u64, Option<DfsMetadataPrefixProof>)>> {
+        let Some(_fence) = crate::metadata_lock::try_metadata_inspection_lock(
+            self.root.clone(), self.journal_write_lock_path(),
+        )? else { return Ok(None); };
+        if self.table_storage_generation.as_ref()
+            != Some(&metadata_table_storage_generation(&self.root)?)
+        { return Ok(None); }
+        let Some(durable) = crate::metadata_journal::admission::current_owned_materialized_prefix(
+            &self.root, &self.shard_id,
+        )? else { return Ok(None); };
+        let Some(materialized) = self.prefix_proof.as_ref().filter(|prefix|
+            prefix.is_well_formed() && prefix.journal_sequence == self.materialized_through_sequence
+                && prefix.journal_sequence <= durable.journal_sequence)
+        else { return Ok(None); };
+        Ok(Some((durable.journal_sequence, materialized.journal_sequence, Some(materialized.clone()))))
+    }
+
     /// Read a bounded slice from the durable journal tail, including entries
     /// appended by another backend instance after this one opened.
 

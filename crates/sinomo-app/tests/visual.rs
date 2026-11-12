@@ -624,10 +624,7 @@ fn settings_narrow_click_navigates() {
 
 #[test]
 fn mobile_phone_layout_accepts_touch_navigation() {
-    use sui::{
-        Event, Point, PointerEvent, PointerEventKind, ScrollDelta, SemanticsRole, Size, Vector,
-        WindowEvent,
-    };
+    use sui::{Event, SemanticsRole, Size, WindowEvent};
 
     let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "mobile-phone");
     let runtime = build_runtime(shared.clone()).expect("build runtime");
@@ -644,45 +641,34 @@ fn mobile_phone_layout_accepts_touch_navigation() {
         .accessibility
         .nodes
         .iter()
-        .find(|node| {
-            node.role == SemanticsRole::ScrollView
-                && node.name.as_deref() == Some("Primary navigation tabs")
-        })
-        .expect("shell navigation scroll semantics");
-    let mut scroll = PointerEvent::new(
-        PointerEventKind::Scroll,
-        Point::new(
-            navigation.bounds.x() + navigation.bounds.width() / 2.0,
-            navigation.bounds.y() + navigation.bounds.height() / 2.0,
-        ),
+        .find(|node| node.role == SemanticsRole::Button && node.name.as_deref() == Some("Navigate"))
+        .expect("compact navigation button semantics");
+    touch_at(
+        &root,
+        navigation.bounds.x() + navigation.bounds.width() / 2.0,
+        navigation.bounds.y() + navigation.bounds.height() / 2.0,
     );
-    scroll.scroll_delta = Some(ScrollDelta::Pixels(Vector::new(-120.0, 0.0)));
-    root.dispatch_event_now(Event::Pointer(scroll))
-        .expect("scroll compact tabs toward Settings");
-    app.pump_frames(8).expect("pump horizontal tab scroll");
-
-    let snapshot = window
-        .snapshot_now()
-        .expect("snapshot scrolled phone shell");
-    let tab_bar = snapshot
+    app.pump_frames(8).expect("open compact navigation menu");
+    let snapshot = window.snapshot_now().expect("snapshot navigation menu");
+    let settings_tab = snapshot
         .accessibility
         .nodes
         .iter()
         .find(|node| {
-            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            node.role == SemanticsRole::MenuItem && node.name.as_deref() == Some("Settings")
         })
-        .expect("shell tab bar semantics");
+        .expect("Settings navigation item semantics");
     touch_at(
         &root,
-        tab_bar.bounds.max_x() - 22.0,
-        tab_bar.bounds.y() + tab_bar.bounds.height() / 2.0,
+        settings_tab.bounds.x() + settings_tab.bounds.width() / 2.0,
+        settings_tab.bounds.y() + settings_tab.bounds.height() / 2.0,
     );
     app.pump_frames(8).expect("pump touch tab switch");
 
     assert_eq!(
         shared.active_tab(),
         Tab::Settings,
-        "touching the compact Settings tab switches the mobile shell content"
+        "touching Settings in compact navigation switches the mobile shell content"
     );
 
     let shot = window
@@ -696,6 +682,10 @@ fn shell_tab_focus_ring_is_not_clipped_by_horizontal_scrolling() {
     use sui::{Rect, SemanticsRole};
 
     let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Cluster, "tab-focus-ring");
+    // Browser tabs represent open workspaces; pinned navigation is separate.
+    shared
+        .new_workspace_tab(sinomo_app::state::WorkspaceTabKind::Chat)
+        .expect("create a focusable workspace tab");
     let runtime = build_runtime(shared).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");

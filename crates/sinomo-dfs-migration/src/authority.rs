@@ -145,6 +145,26 @@ struct NativeImportAuthority {
         Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<staged_service::SourceTransferVerifier>>>>>,
 }
 impl NativeImportAuthority {
+    #[cfg(test)]
+    fn trace_native_outcome_read_failure(
+        &self,
+        boundary: &str,
+        request_id: &sinomo_core::kv::KvRequestId,
+        failure: &sinomo_core::service::ServiceError,
+    ) {
+        eprintln!("NATIVE_IMPORT_OUTCOME_READ_FAILED {}", serde_json::json!({
+            "boundary": boundary,
+            "data_root": self.data_root,
+            "request_id": request_id,
+            "read_only": true,
+            "authority_unavailable": matches!(failure,
+                sinomo_core::service::ServiceError::Network(
+                    sinomo_core::network::NetworkError::ClusterReadOnly { .. }
+                )),
+            "native_error": format!("{failure:?}"),
+        }));
+    }
+
     fn cluster(&self) -> Result<&Arc<dyn ClusterAccess>> {
         self.cluster.as_ref().ok_or_else(|| error("retained standalone metadata requires an explicit sealed standalone source-owner certificate"))
     }

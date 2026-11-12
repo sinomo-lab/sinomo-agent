@@ -343,6 +343,9 @@ fn native_read_fixture_observing_materialization(
     runtime
         .apply_placement_policy(&primary, &path, DfsPlacementScope::Subtree, policy)
         .unwrap();
+    // The configured writer may be on another node than the settings producer.
+    // Await its actual published configuration before resolving fixture policy.
+    runtime.wait_published_configuration_current(&owner).unwrap();
     let mut writer = runtime.client(&owner).unwrap();
     let (resolved, _, replication) = writer
         .managed_replication_policy_for_path(&path, DfsObjectPolicy::ReplicatedConfirmed, copies)

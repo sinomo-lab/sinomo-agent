@@ -183,6 +183,8 @@ pub(super) fn native_owned_repair_fixture(
             }
         }
     }
+    // Placement completion on the root owner does not publish another Main's view.
+    runtime.wait_published_configuration_current(&owner).unwrap();
     let mut core = runtime.metadata_primary_service(path).unwrap();
     let (resolved, _, policy) = core
         .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, desired)
@@ -1936,6 +1938,9 @@ fn native_write_completion_observation_waits_for_actual_response_rpc() {
         .iter()
         .find(|row| {
             row.phase == crate::test_runtime::RpcPhase::Decoded
+                && row.source == primary
+                && row.target == requester
+                && row.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
                 && row.dfs_request_id.as_deref() == Some(&response_id)
                 && row.dfs_object_id.as_ref() == Some(&request.object_id)
                 && row.dfs_version.as_ref() == Some(&request.target_version)
@@ -2177,6 +2182,9 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
         .iter()
         .find(|event| {
             event.phase == crate::test_runtime::RpcPhase::Decoded
+                && event.source == primary
+                && event.target == requester
+                && event.route == DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
                 && event.dfs_request_id.as_deref() == Some(&completed_request)
                 && event.dfs_object_id.as_ref() == Some(&request.object_id)
                 && event.dfs_version.as_ref() == Some(&request.target_version)
@@ -2215,6 +2223,9 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
                 && job.version == request.target_version
                 && job.missing_replica_node_id == replica
         })
+        .unwrap();
+    restored
+        .restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)
         .unwrap();
     assert!(
         !restored
@@ -2257,8 +2268,8 @@ fn background_local_fetch_crossing_w_preserves_deferred_repair_mode() {
         .outcome
         .unwrap();
     let mut final_primary = runtime.client(&primary).unwrap();
-    let object = final_primary
-        .metadata_backend()
+    let object = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_object(&request.object_id)
         .unwrap()

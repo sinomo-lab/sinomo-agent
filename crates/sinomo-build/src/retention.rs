@@ -66,9 +66,9 @@ fn prune_at(paths: &BuildPaths, now: SystemTime, grace: Duration) -> std::io::Re
         .read(true)
         .write(true)
         .open(paths.cache.join("retention.lock"))?;
-    if fs2::FileExt::try_lock_exclusive(&maintenance).is_err() {
+    let Ok(_maintenance) = crate::manager::BuildPathLock::try_lock_file(maintenance) else {
         return Ok(());
-    }
+    };
     let mut protected = BTreeSet::new();
     let mut source_hashes = BTreeSet::new();
     let mut terminal_jobs = Vec::new();
@@ -126,7 +126,7 @@ fn prune_at(paths: &BuildPaths, now: SystemTime, grace: Duration) -> std::io::Re
                     .read(true)
                     .write(true)
                     .open(paths.cache.join(format!("{key}.lock")))?;
-                if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+                if let Ok(_lease) = crate::manager::BuildPathLock::try_lock_file(lock) {
                     remove_owned_scratch_path(&entry.path())?;
                 }
             }
@@ -181,9 +181,9 @@ fn prune_at(paths: &BuildPaths, now: SystemTime, grace: Duration) -> std::io::Re
                 .read(true)
                 .write(true)
                 .open(path.with_extension("lock"))?;
-            if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            let Ok(_lease) = crate::manager::BuildPathLock::try_lock_file(lock) else {
                 continue;
-            }
+            };
             // A reader may have refreshed its transfer grace while this pass
             // was collecting manifests. Recheck after acquiring its lock.
             if path.join("last-used").exists() && !old(&path.join("last-used"), now, grace) {

@@ -55,9 +55,12 @@ fn required_genesis_lookup_waits_for_cache_ownership(contention: u8) {
         .unwrap()
     });
     let preflight = preflight.for_admission(&admission);
-    reject_daemon_dfs_incomplete_genesis_before_effects(&data, &peer, &command, Some(&preflight))
+    reject_daemon_dfs_incomplete_genesis_before_effects(&data, &peer, &command, Some(&preflight), None)
         .unwrap();
-    drop(daemon_dfs_bounded_status_resident(&data, &peer).unwrap());
+    // Setup borrows the resident through normal ownership below. An
+    // opportunistic status peek may legitimately be unavailable while another
+    // native fixture updates the shared cache; the controlled status assertion
+    // belongs after the specific contention has been installed.
     let slot = daemon_dfs_message_service_cache()
         .existing_root(&data.root())
         .unwrap()
@@ -115,6 +118,7 @@ fn required_genesis_lookup_waits_for_cache_ownership(contention: u8) {
             &worker_peer,
             &worker_command,
             Some(&worker_preflight),
+            None,
         )
         .map_err(|error| error.into_dfs_error().to_string());
         result_tx.send(result).unwrap();
@@ -258,11 +262,12 @@ fn genesis_preparation_and_final_fence_preserve_typed_stale_authority() {
             &peer,
             &command,
             Some(&preflight),
+            None,
         ),
         Err(DaemonDfsAuthorityPreExecutionError::AuthorityPreflightStale(_))
     ));
     assert!(matches!(
-        reject_daemon_dfs_incomplete_genesis_before_effects(&data, &peer, &command, None,),
+        reject_daemon_dfs_incomplete_genesis_before_effects(&data, &peer, &command, None, None),
         Err(DaemonDfsAuthorityPreExecutionError::Failed(_))
     ));
     drop(owner);

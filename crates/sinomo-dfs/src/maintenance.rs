@@ -2395,18 +2395,18 @@ fn dfs_repair_maintenance_observation_lines(
         return (Vec::new(), Vec::new());
     }
 
-    let routine_lines = vec![format!(
+    let mut routine_lines = vec![format!(
         "DFS repairs: scheduled={}, followups={}",
         scheduled_repairs.len(),
         repair_followups
     )];
-    let mut lines = Vec::new();
-    lines.extend(scheduled_repairs.iter().map(|job| {
+    routine_lines.extend(scheduled_repairs.iter().map(|job| {
         format!(
             "DFS repair scheduled {} {} {} -> {}",
             job.intent_id, job.object_id, job.version, job.missing_replica_node_id
         )
     }));
+    let mut lines = Vec::new();
     lines.extend(followup_events.iter().filter_map(|event| match event {
         NetworkedDfsServiceEvent::ReplicaRepaired {
             intent_id,

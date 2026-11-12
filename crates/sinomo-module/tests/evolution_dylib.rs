@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use sinomo_module::{ActiveNativeComponent, ActiveNativeComponentResponse};
 use sinomo_module_api::ServiceRequirement;
 
-const EVOLUTION_INTERFACE_ID: &str = "sinomo.evolution";
-const EVOLUTION_INTERFACE_VERSION: &str = "1.0.0";
-const EVOLUTION_CLI_OPERATION: &str = "evolution.cli.run";
+use sinomo_api::app::evolution::{
+    EVOLUTION_CLI_OPERATION, EVOLUTION_INTERFACE_ID, EVOLUTION_INTERFACE_VERSION,
+};
 
 #[derive(Clone, Debug, Serialize)]
 struct EvolutionCliRequest {

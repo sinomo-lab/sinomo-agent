@@ -640,18 +640,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         durable_shard_id,
                     )?;
                     self.restore_retained_content_intent(&intent_record)?;
-                    let retained_live = self
-                        .metadata
-                        .object(&intent_record.object_id)
-                        .map(|object| {
-                            self.committed_repair_content_is_active(object, &intent_record)
-                        })
-                        .transpose()?
-                        .unwrap_or(false);
-                    if retained_live
-                        && matches!(intent_record.status, DfsWriteIntentStatus::Committed)
-                    {
-                    }
+                    // Before W, retained staging has no published version yet.
+                    // Only committed repair owners require a live retained root;
+                    // pending owners continue through the original staging path.
+                    let retained_live = intent_record.status == DfsWriteIntentStatus::Committed
+                        && self
+                            .metadata
+                            .object(&intent_record.object_id)
+                            .map(|object| {
+                                self.committed_repair_content_is_active(object, &intent_record)
+                            })
+                            .transpose()?
+                            .unwrap_or(false);
                     if retained_live
                         || matches!(
                             intent_record.status,

@@ -392,7 +392,13 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
     let observations = dfs_maintenance_tick_observations(&report);
 
     assert_eq!(observations.metadata_replications_sent, 2);
-    assert_eq!(observations.routine_notice_lines, vec!["DFS repairs: scheduled=1, followups=1".to_string()]);
+    assert_eq!(
+        observations.routine_notice_lines,
+        vec![
+            "DFS repairs: scheduled=1, followups=1".to_string(),
+            format!("DFS repair scheduled intent-observation-repair {object_id} {version} -> {target}"),
+        ]
+    );
     assert_eq!(
         observations.notice_lines,
         vec![
@@ -409,9 +415,6 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
                 "DFS anti-entropy issue {object_id} {version} /services/dfs-observation.txt: missing local content (repaired=true)"
             ),
             format!("DFS anti-entropy {file_system_id} stopped after reaching the issue limit"),
-            format!(
-                "DFS repair scheduled intent-observation-repair {object_id} {version} -> {target}"
-            ),
             format!(
                 "DFS repair rejected intent-observation-repair {object_id} by {target}: network authorization denied"
             ),

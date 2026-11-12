@@ -164,8 +164,8 @@ fn attachment_density_benchmark() {
             0
         };
     let after_bytes = disk_bytes(&runtime.data_dir(&node).dfs_dir());
-    let object_count = dfs
-        .metadata_backend()
+    let object_count = runtime
+        .node_metadata(&node)
         .unwrap()
         .metadata_summary()
         .unwrap()
@@ -488,8 +488,8 @@ fn attachments_compact_batch_and_enforce_producer_ownership() {
         .posix_write_file("/users/source", b"source", options(&node))
         .unwrap();
     let source = source(&stat);
-    let before = dfs
-        .metadata_backend()
+    let before = runtime
+        .node_metadata(&node)
         .unwrap()
         .metadata_summary()
         .unwrap()
@@ -522,7 +522,8 @@ fn attachments_compact_batch_and_enforce_producer_ownership() {
     }
     // One catalog and a bounded number of bucket directories, not 128 files.
     assert!(
-        dfs.metadata_backend()
+        runtime
+            .node_metadata(&node)
             .unwrap()
             .metadata_summary()
             .unwrap()
@@ -697,16 +698,29 @@ fn attachment_cleanup_parks_until_committed_namespace_notification() {
     let start = crate::dfs_now_unix_nanos();
     // Establish the feed cursor and finish the initial managed-root scan.
     for step in 0..4 {
-        dfs.maintain_file_attachments_bounded_at(
-            &checkpoint,
-            &shards,
-            8,
-            start + step * 30_000_000_000,
-        )
-        .unwrap();
+        runtime
+            .with_main_maintenance_service(&node, |main| {
+                main.maintain_file_attachments_bounded_at(
+                    &checkpoint,
+                    &shards,
+                    8,
+                    start + step * 30_000_000_000,
+                )
+            })
+            .unwrap()
+            .unwrap();
     }
     let before = std::fs::read(&checkpoint).unwrap();
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 120_000_000_000)
+    runtime
+        .with_main_maintenance_service(&node, |main| {
+            main.maintain_file_attachments_bounded_at(
+                &checkpoint,
+                &shards,
+                8,
+                start + 120_000_000_000,
+            )
+        })
+        .unwrap()
         .unwrap();
     assert_eq!(
         std::fs::read(&checkpoint).unwrap(),
@@ -727,7 +741,16 @@ fn attachment_cleanup_parks_until_committed_namespace_notification() {
     drop(writer); // The committed edge outlives the response and service owner.
     assert!(tracker.take().semantic_changes);
     crate::attachment_maintenance::notify(&data_dir);
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 150_000_000_000)
+    runtime
+        .with_main_maintenance_service(&node, |main| {
+            main.maintain_file_attachments_bounded_at(
+                &checkpoint,
+                &shards,
+                8,
+                start + 150_000_000_000,
+            )
+        })
+        .unwrap()
         .unwrap();
     assert!(matches!(
         dfs.posix_stat_distributed(&catalog),
@@ -968,6 +991,7 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
     let source = source(&stat);
     let inline_slots = DFS_ATTACHMENT_INLINE_BUDGET_BYTES / DFS_ATTACHMENT_INLINE_BYTES;
     let mut last = None;
+    let mut checkpointed = 0;
     for i in 0..inline_slots + 3 {
         last = Some(stored(
             dfs.file_attachment(
@@ -982,9 +1006,11 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
             )
             .unwrap(),
         ));
+        // Preserve each completed catalog mutation before the next bounded capture window.
+        checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
     }
     let entries = dfs
-        .posix_list_dir(&dfs_attachment_catalog_directory(&source))
+        .posix_list_dir_distributed(&dfs_attachment_catalog_directory(&source))
         .unwrap();
     assert_eq!(
         entries
@@ -997,6 +1023,12 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
     assert!(
         matches!(dfs.file_attachment(DfsAttachmentRequest::Read { source, key: last.metadata.key, revision: last.revision, offset: 0, max_bytes: DFS_ATTACHMENT_MAX_RANGE_BYTES }, None).unwrap(), DfsAttachmentResponse::Data { bytes, eof: true } if bytes == vec![(inline_slots+2) as u8; DFS_ATTACHMENT_INLINE_BYTES])
     );
+    checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+    assert!(
+        checkpointed > 4096,
+        "the full spill workload spans capture windows"
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -1140,17 +1172,30 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
     let catalog = format!("{}/catalog.sobj", dfs_attachment_catalog_directory(&source));
     let start = crate::dfs_now_unix_nanos();
     for step in 0..4 {
-        dfs.maintain_file_attachments_bounded_at(
-            &checkpoint,
-            &shards,
-            8,
-            start + step * 30_000_000_000,
-        )
-        .unwrap();
+        runtime
+            .with_main_maintenance_service(&node, |main| {
+                main.maintain_file_attachments_bounded_at(
+                    &checkpoint,
+                    &shards,
+                    8,
+                    start + step * 30_000_000_000,
+                )
+            })
+            .unwrap()
+            .unwrap();
     }
     dfs.posix_unlink(&source.path).unwrap();
     crate::attachment_maintenance::notify(&data);
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 150_000_000_000)
+    runtime
+        .with_main_maintenance_service(&node, |main| {
+            main.maintain_file_attachments_bounded_at(
+                &checkpoint,
+                &shards,
+                8,
+                start + 150_000_000_000,
+            )
+        })
+        .unwrap()
         .unwrap();
     assert!(dfs.posix_stat_distributed(&catalog).is_ok());
     assert_eq!(
@@ -1169,7 +1214,16 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
     // The event is only a wake: the durable V6 revision change supplies the
     // source identity, and the maintenance task rechecks canonical lifecycle.
     crate::attachment_maintenance::notify(&data);
-    dfs.maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, start + 180_000_000_000)
+    runtime
+        .with_main_maintenance_service(&node, |main| {
+            main.maintain_file_attachments_bounded_at(
+                &checkpoint,
+                &shards,
+                8,
+                start + 180_000_000_000,
+            )
+        })
+        .unwrap()
         .unwrap();
     assert!(matches!(
         dfs.posix_stat_distributed(&catalog),

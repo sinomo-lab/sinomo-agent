@@ -3509,7 +3509,7 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
         "the original pending write must reach the actual faulted required target"
     );
     assert_eq!(
-        cluster.users_primary.posix_stat(from).unwrap().version,
+        cluster.users_primary.posix_stat_distributed(from).unwrap().version,
         original.version,
         "the genuinely incomplete W2 write cannot advance the visible head"
     );
@@ -3540,8 +3540,8 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
     );
     assert!(
         !cluster
-            .users_primary
-            .metadata_backend()
+            ._runtime
+            .node_metadata(&cluster.users_primary_node)
             .unwrap()
             .list_namespace_jobs()
             .unwrap()
@@ -3550,14 +3550,16 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
     );
     cluster._runtime.clear_faults();
     let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
-    while cluster.users_primary.posix_stat(from).unwrap().version != target {
-        cluster.users_primary.retry_pending_stages(8).unwrap();
+    cluster._runtime.checkpoint_rpc_observation_window().unwrap();
+    while cluster.users_primary.posix_stat_distributed(from).unwrap().version != target {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "actual stage completion must settle within its normal deadline");
+        // The delegated caller does not own Main's retained stage retries.
+        cluster._runtime.maintenance_tick(
+            &cluster.users_primary_node, remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+        ).unwrap().outcome.unwrap();
         cluster.users_primary.process_incoming().unwrap();
-        assert!(
-            Instant::now() < deadline,
-            "actual stage completion must settle within its normal deadline"
-        );
-        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        cluster._runtime.checkpoint_rpc_observation_window().unwrap();
     }
     cluster.users_primary.posix_rename(from, to).unwrap();
     assert_eq!(
@@ -3573,12 +3575,6 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
     let mut cluster = sifs_two_primary_cluster("native-move-with-real-repair");
     let from = "/users/repair-pending";
     let to = "/services/repair-pending";
-    // The repair queue belongs to the actual effect producer, not the routed
-    // Main requester shell held by the common fixture.
-    cluster.users_primary = cluster
-        ._runtime
-        .metadata_primary_service(from)
-        .expect("actual users Core repair producer");
     cluster
         ._runtime
         .install_fault(crate::test_runtime::FaultRule {
@@ -3590,30 +3586,33 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
             remaining_hits: 32,
             action: crate::test_runtime::FaultAction::BudgetExhausted,
         });
+    // Borrow the actual Main producer with its normal execution admission.
     let source = cluster
-        .users_primary
-        .posix_write_file(
-            from,
-            b"committed repair-pending bytes",
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                replica_candidates: vec![
-                    cluster.users_primary_node.clone(),
-                    cluster.services_primary_node.clone(),
-                ],
-                wait_for_commit: true,
-                foreground_replica_repair: false,
-            },
-        )
+        ._runtime
+        .with_main_maintenance_service(&cluster.users_primary_node, |service| {
+            let source = service
+                .posix_write_file(
+                    from,
+                    b"committed repair-pending bytes",
+                    DfsWriteOptions {
+                        policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                        replica_candidates: vec![
+                            cluster.users_primary_node.clone(),
+                            cluster.services_primary_node.clone(),
+                        ],
+                        wait_for_commit: true,
+                        foreground_replica_repair: false,
+                    },
+                )
+                .unwrap();
+            assert!(service
+                .coordinator
+                .repair_jobs()
+                .iter()
+                .any(|job| job.object_id == source.object_id));
+            source
+        })
         .unwrap();
-    assert!(
-        cluster
-            .users_primary
-            .coordinator
-            .repair_jobs()
-            .iter()
-            .any(|job| job.object_id == source.object_id)
-    );
     let moved = cluster.replica.posix_rename(from, to).unwrap();
     assert_eq!(moved.object_id, source.object_id);
     assert_eq!(moved.content_hash, source.content_hash);
@@ -3623,7 +3622,7 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
         b"committed repair-pending bytes"
     );
     assert!(matches!(
-        cluster.replica.posix_stat(from),
+        cluster.replica.posix_stat_distributed(from),
         Err(DfsPosixError::NotFound { .. })
     ));
     cluster._runtime.assert_fault_budgets().unwrap();

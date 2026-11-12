@@ -277,6 +277,7 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfs::DfsMetadataBackend;
     use dfs::test_support::{DfsTestNamespaceReadCapture, DfsTestRuntime};
 
     const ROOT: &str = "/services/cloud-files-endpoint";
@@ -384,9 +385,9 @@ mod tests {
             main.posix_write_file(DOCUMENT, b"old", options.clone())
                 .expect("original native Main write")
         };
-        let old = main
-            .metadata_backend()
-            .expect("actual client backend")
+        let old = runtime
+            .node_metadata(&local)
+            .expect("actual node metadata inspection")
             .get_object_on_shard(
                 &dfs::DfsMetadataShardId::new(shard.shard_id.clone()),
                 &old_stat.object_id,
@@ -406,9 +407,9 @@ mod tests {
         let current_stat = main
             .posix_write_file(DOCUMENT, b"current", options)
             .expect("current native Main write");
-        let current = main
-            .metadata_backend()
-            .expect("actual client backend")
+        let current = runtime
+            .node_metadata(&local)
+            .expect("actual node metadata inspection")
             .get_object_on_shard(
                 &dfs::DfsMetadataShardId::new(shard.shard_id.clone()),
                 &current_stat.object_id,
@@ -418,7 +419,7 @@ mod tests {
         assert_ne!(old.version, current.version);
         assert_eq!(current.version, current_stat.version);
         assert_eq!(
-            main.posix_read_file(DOCUMENT)
+            main.posix_read_file_distributed(DOCUMENT)
                 .expect("native content readback"),
             b"current"
         );
@@ -778,8 +779,9 @@ mod tests {
             .runtime
             .client(&fixture.local)
             .expect("actual Main client");
-        let durable = main
-            .metadata_backend()
+        let durable = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_object_on_shard(
                 &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
@@ -790,7 +792,7 @@ mod tests {
         assert_eq!(durable.version, created.version);
         assert_eq!(durable.content_hash, fixture.old.content_hash);
         assert_eq!(durable.content_size_bytes, Some(3));
-        assert_eq!(main.posix_read_file(&path).unwrap(), b"old");
+        assert_eq!(main.posix_read_file_distributed(&path).unwrap(), b"old");
         let hash = durable.content_hash.as_deref().unwrap();
         assert_eq!(main.content().read_blob(hash).unwrap(), b"old");
 
@@ -811,8 +813,9 @@ mod tests {
             )
             .expect_err("another operation cannot replace an existing path");
         assert!(matches!(conflict, dfs::DfsPosixError::AlreadyExists { .. }));
-        let after = main
-            .metadata_backend()
+        let after = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_object_on_shard(
                 &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
@@ -822,8 +825,9 @@ mod tests {
             .unwrap();
         assert_eq!(after, durable);
 
-        let history = main
-            .metadata_backend()
+        let history = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .object_write_intent_history(&created.object_id)
             .unwrap();
@@ -840,8 +844,9 @@ mod tests {
                     .map(|record| record.intent_id.clone())
             })
             .expect("actual Main retains this original operation");
-        let intent = main
-            .metadata_backend()
+        let intent = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_intent(&created.object_id, &intent_id)
             .unwrap()
@@ -906,8 +911,9 @@ mod tests {
             .runtime
             .client(&fixture.local)
             .expect("actual Main client");
-        let version = main
-            .metadata_backend()
+        let version = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_version(&identity.object_id, &identity.version)
             .unwrap()
@@ -927,8 +933,9 @@ mod tests {
         assert_eq!(grant.object.content_size_bytes, version.size_bytes);
         let hash = version.content_hash.as_deref().unwrap();
         assert_eq!(main.content().read_blob(hash).unwrap(), b"old");
-        let canonical = main
-            .metadata_backend()
+        let canonical = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_object_on_shard(
                 &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
@@ -937,7 +944,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(canonical, fixture.current);
-        assert_eq!(main.posix_read_file(DOCUMENT).unwrap(), b"current");
+        assert_eq!(
+            main.posix_read_file_distributed(DOCUMENT).unwrap(),
+            b"current"
+        );
         let replay = fixture
             .service
             .preserve_content_revision(request.clone(), &b"old"[..], options)
@@ -948,8 +958,9 @@ mod tests {
                 identity: identity.clone()
             }
         );
-        let after = main
-            .metadata_backend()
+        let after = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_object_on_shard(
                 &dfs::DfsMetadataShardId::new(fixture.shard.shard_id.clone()),
@@ -958,8 +969,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after, canonical);
-        let history = main
-            .metadata_backend()
+        let history = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .object_write_intent_history(&identity.object_id)
             .unwrap();
@@ -978,8 +990,9 @@ mod tests {
                     .map(|record| record.intent_id.clone())
             })
             .expect("actual Main retains original retained command identity");
-        let intent = main
-            .metadata_backend()
+        let intent = fixture
+            .runtime
+            .node_metadata(&fixture.local)
             .unwrap()
             .get_intent(&identity.object_id, &intent_id)
             .unwrap()

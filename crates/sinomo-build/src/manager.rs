@@ -315,6 +315,13 @@ pub(crate) struct BuildPathLock {
 }
 
 impl BuildPathLock {
+    /// Own an already-open file's nonblocking lock, including explicit unlock
+    /// before inherited file descriptions in other processes are closed.
+    pub(crate) fn try_lock_file(file: File) -> std::io::Result<Self> {
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(Self { file })
+    }
+
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let parent = path.parent().ok_or_else(|| BuildError::Io {
             path: path.display().to_string(),
@@ -705,6 +712,61 @@ fn copy_build_artifact(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture retaining an inherited lock description"]
+    fn retained_lock_description_child() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("SINOMO_BUILD_LOCK_FIXTURE").expect("lock fixture root"),
+        );
+        // stdin is the parent's duplicated locked file, retained until exit.
+        fs::write(root.join("ready"), []).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.join("release").exists() {
+            assert!(std::time::Instant::now() < deadline, "parent did not release child");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_lock_releases_before_an_inherited_child_description_closes() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = sinomo_testdir::TestDir::new("build-lock-inherited-description");
+        let path = root.join("lock");
+        let open = || OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(&path).unwrap();
+        let file = open();
+        let inherited = file.try_clone().unwrap();
+        let owner = BuildPathLock::try_lock_file(file).unwrap();
+        let mut child = ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "manager::tests::retained_lock_description_child", "--ignored"])
+            .env("SINOMO_BUILD_LOCK_FIXTURE", root.path())
+            .stdin(std::process::Stdio::from(inherited))
+            .stdout(std::process::Stdio::null())
+            .spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !root.join("ready").exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "child exited before retaining the lock");
+            assert!(std::time::Instant::now() < deadline, "child did not become ready");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(BuildPathLock::try_lock_file(open()).is_err(), "live owner must exclude another lock");
+        drop(owner);
+        let replacement = BuildPathLock::try_lock_file(open())
+            .expect("owner release must not wait for the child's inherited description");
+        assert!(child.0.try_wait().unwrap().is_none(), "child must still hold its description");
+        drop(replacement);
+        fs::write(root.join("release"), []).unwrap();
+        assert!(child.0.wait().unwrap().success());
+    }
 
     fn binary_plan(outputs: Vec<BuildOutputRequest>) -> BuildPlan {
         let source_hash = crate::build_content_hash(b"source");
