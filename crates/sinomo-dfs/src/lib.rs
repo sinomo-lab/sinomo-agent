@@ -775,11 +775,6 @@ pub use protocol::{
     DfsStableWriteReconciliationResponse, DfsStageBlobCommand, DfsStageBlobResponse,
     DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
-#[cfg(test)]
-pub use protocol::{
-    DfsSelectedLocalRecoveryFenceRpcData, DfsSelectedLocalRecoveryFenceRpcOutcome,
-    DfsSelectedLocalRecoveryFenceRpcRequest, DfsSelectedLocalRecoveryFenceRpcResponse,
-};
 pub use renewable_lease::{
     DEFAULT_DFS_RENEWABLE_LEASE_RELEASE_TIMEOUT, DfsRenewableExclusiveLease,
     DfsRenewableLeaseAnchor, DfsRenewableLeaseConfig, DfsRenewableLeaseError,

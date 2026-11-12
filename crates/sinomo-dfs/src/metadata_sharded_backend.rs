@@ -2086,25 +2086,6 @@ impl LocalShardedMetadataBackend {
         Self::open_with(root, shards, false, Some(local_node_id), true)
     }
 
-    /// Inspect the exact owner-selected original layout without initializing or
-    /// repairing it. The existing layout and per-shard checks still fence reads.
-    #[cfg(test)]
-    pub(crate) fn open_for_inspection_at_node_with_layout(
-        root: PathBuf,
-        shards: Vec<DfsMetadataShardConfig>,
-        local_node_id: &NodeId,
-        layout: Arc<crate::DfsSelectedOriginalDataLayout>,
-    ) -> Result<Self> {
-        Self::open_with_retained_shards_and_layout(
-            root,
-            shards,
-            false,
-            Some(local_node_id),
-            &BTreeSet::new(),
-            Some(layout),
-            true,
-        )
-    }
 
     /// Move this router's exact shard backend instances into a resident pool.
     ///
@@ -3762,21 +3743,6 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend(shard)?.read_native_prefix_history(shard)
     }
 
-    #[cfg(test)]
-    fn install_selected_local_recovery_fence(
-        &mut self,
-        reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
-        context: &crate::metadata_api::DfsSelectedLocalRecoveryContext,
-    ) -> Result<crate::metadata_api::DfsSelectedLocalRecoveryFenceData> {
-        self.shard_backend_mut(&DfsMetadataShardId::new(&reservation.serving_shard.shard_id))?
-            .install_selected_local_recovery_fence(reservation, context)
-    }
-    #[cfg(test)]
-    fn selected_local_recovery_fence(&self, shard: &DfsMetadataShardId)
-        -> Result<Option<crate::metadata_api::DfsSelectedLocalRecoveryFenceData>>
-    {
-        self.shard_backend(shard)?.selected_local_recovery_fence(shard)
-    }
     fn selected_original_data_layout(
         &self,
         file_system_id: &DfsFileSystemId,

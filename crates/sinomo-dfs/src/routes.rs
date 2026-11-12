@@ -175,10 +175,6 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationRequest(_) => DFS_DATA_READ_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
         DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
         DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
         DfsNetworkMessage::StableNamespaceReconciliationRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
@@ -310,11 +306,6 @@ pub fn dfs_metadata_snapshot_install_execution_scope(
 
 fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessageExecutionScope {
     match message {
-        // This conservative classification grants no generic execution path;
-        // both variants are rejected before ordinary host/service execution.
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_)
-        | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => DfsMessageExecutionScope::GlobalExclusive,
         DfsNetworkMessage::ReadRequest(_)
         | DfsNetworkMessage::BulkReadRequest(_)
         | DfsNetworkMessage::StableWriteReconciliationRequest(_)

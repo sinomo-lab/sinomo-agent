@@ -202,10 +202,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_message_label = dfs_network_message_trace_label(&message);
 
         match message {
-            #[cfg(test)]
-            DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => {
-                return Err(DfsError::Metadata { message: "selected local recovery fence requires authenticated native RPC ingress".into() });
-            }
             DfsNetworkMessage::StageBlob(command) => {
                 events.push(self.handle_stage_blob(source_node_id, command)?);
             }

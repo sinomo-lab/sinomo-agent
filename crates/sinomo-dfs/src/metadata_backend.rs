@@ -87,8 +87,6 @@ use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compacti
 use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use crate::{DfsNamespaceOperation, DfsNamespaceResult};
-#[cfg(test)]
-use sinomo_core::DfsObjectPolicy;
 use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

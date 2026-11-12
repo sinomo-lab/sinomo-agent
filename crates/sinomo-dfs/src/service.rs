@@ -833,23 +833,6 @@ impl std::fmt::Display for DfsDataPlaneHostError {
 
 impl std::error::Error for DfsDataPlaneHostError {}
 
-/// Sealed authenticated ingress for the selected local-fence test protocol.
-/// Only the real service signer/carrier join below constructs this wrapper.
-/// Decoded DTOs and arbitrary NodeIds cannot construct it or serving authority.
-#[cfg(test)]
-pub struct AuthenticatedSelectedLocalRecoveryFenceIngress {
-    command: DfsMessageCommand,
-    authenticated_source: NodeId,
-    deadline: std::time::Instant,
-}
-
-#[cfg(test)]
-impl AuthenticatedSelectedLocalRecoveryFenceIngress {
-    pub(crate) fn into_parts(self) -> (DfsMessageCommand, NodeId, std::time::Instant) {
-        (self.command, self.authenticated_source, self.deadline)
-    }
-}
-
 pub trait DfsDataPlaneHost: Send + Sync {
     /// Return an accepted observation from this active content owner only.
     /// Missing owners, samples and expired observations fail closed. This read
@@ -859,19 +842,6 @@ pub trait DfsDataPlaneHost: Send + Sync {
         _data_dir: &SinomoDataDir,
     ) -> Result<crate::DfsNodeAdvertisement, DfsDataPlaneHostError> {
         Err(DfsDataPlaneHostError::new("live DFS content owner observation unavailable"))
-    }
-
-    #[cfg(test)]
-    fn install_selected_local_recovery_fence_rpc<'a>(
-        &'a self,
-        _data_dir: Arc<SinomoDataDir>,
-        _ingress: AuthenticatedSelectedLocalRecoveryFenceIngress,
-    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
-        Box::pin(async {
-            Err(DfsDataPlaneHostError::new(
-                "host does not support selected local recovery fence RPC",
-            ))
-        })
     }
 
     fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsOperatorStatus>;
@@ -1275,10 +1245,6 @@ impl Service for DfsDataPlaneService {
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let service = self.clone();
-        // Includes decoding and every later await; never renewed by the host.
-        #[cfg(test)]
-        let selected_recovery_deadline = std::time::Instant::now()
-            + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         Box::pin(async move {
             let mut operation_metrics = crate::performance_metrics::DfsOperationMetricGuard::start(
                 request.route.as_str(),
@@ -1310,12 +1276,6 @@ impl Service for DfsDataPlaneService {
                     } else {
                         let head: crate::body_rpc::DfsAttachmentMessageCommand =
                             ctx.decode_request_body(&request).await?;
-                        #[cfg(test)]
-                        if matches!(&head.command.routed_message.message,
-                            crate::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_)
-                            | crate::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_)) {
-                            return Err(ServiceError::Service("selected local recovery fence RPC refuses attachments before collection".into()));
-                        }
                         let request_attachment = ctx.take_request_body();
                         crate::body_rpc::validate_incoming_attachment_length(
                             &head.attachment,
@@ -1358,30 +1318,6 @@ impl Service for DfsDataPlaneService {
                             "authenticated DFS message caller {authenticated_source_node_id} does not match claimed source {} for route {route}",
                             command.routed_message.source_node_id
                         )));
-                    }
-                    #[cfg(test)]
-                    match &command.routed_message.message {
-                        crate::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => {
-                            if route != crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE || attachment.is_some() {
-                                return Err(ServiceError::Service("selected local recovery fence request has a wrong route or attachment".into()));
-                            }
-                            // The signer was resolved by the real cluster context and
-                            // compared to this exact carrier immediately above.
-                            let ingress = AuthenticatedSelectedLocalRecoveryFenceIngress {
-                                command, authenticated_source: authenticated_source_node_id,
-                                deadline: selected_recovery_deadline,
-                            };
-                            let response = service.host.install_selected_local_recovery_fence_rpc(
-                                Arc::clone(&ctx.data_dir), ingress,
-                            ).await.map_err(service_error)?;
-                            ctx.respond_value(route, response)?;
-                            operation_metrics.succeed();
-                            return Ok(ServiceDisposition::Continue);
-                        }
-                        crate::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => {
-                            return Err(ServiceError::Service("selected local recovery fence reply has no inbound request authority".into()));
-                        }
-                        _ => {}
                     }
                     #[cfg(any(test, feature = "test-support"))]
                     crate::test_runtime::observe_decoded_namespace_call(&command);

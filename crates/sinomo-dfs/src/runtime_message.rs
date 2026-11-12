@@ -1131,11 +1131,6 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError> {
-    #[cfg(test)]
-    if matches!(&command.routed_message.message,
-        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_)) {
-        return Err(crate::DfsError::Metadata { message: "selected local recovery fence cannot enter a generic runtime message lane".into() });
-    }
     let completes_fetch = matches!(
         &command.routed_message.message,
         DfsNetworkMessage::FetchBlobResponse(_)
@@ -1360,10 +1355,6 @@ impl DfsRuntimeMessageServiceLane {
 
 pub(crate) fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static str {
     match message {
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => "selected-local-recovery-fence-request",
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => "selected-local-recovery-fence-response",
         DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
         DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
         DfsNetworkMessage::NamespaceRequest(_) => "namespace-request",

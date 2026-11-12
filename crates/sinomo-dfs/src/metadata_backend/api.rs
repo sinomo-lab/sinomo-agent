@@ -26,22 +26,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.read_native_prefix_history_owned()
     }
 
-    #[cfg(test)]
-    fn install_selected_local_recovery_fence(
-        &mut self,
-        reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
-        context: &crate::metadata_api::DfsSelectedLocalRecoveryContext,
-    ) -> Result<crate::metadata_api::DfsSelectedLocalRecoveryFenceData> {
-        self.install_local_recovery_fence(reservation, context)
-    }
-    #[cfg(test)]
-    fn selected_local_recovery_fence(&self, shard: &DfsMetadataShardId)
-        -> Result<Option<crate::metadata_api::DfsSelectedLocalRecoveryFenceData>>
-    {
-        if shard != &self.shard_id { return Err(MetadataBackendError::Serde("selected recovery reader names another shard".into())); }
-        let (_, layout) = self.selected_original_data_layout.as_ref().ok_or_else(|| MetadataBackendError::Serde("default metadata handle cannot read selected recovery data".into()))?;
-        crate::metadata_api::read_selected_local_recovery_fence(&self.membership_handoff_write_freeze_path(), layout)
-    }
     fn begin_stat_read_snapshot(&mut self) -> Result<()> {
         self.pin_stat_read_snapshot()
     }
@@ -1891,7 +1875,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if shard_id != &self.shard_id {
             return Ok(false);
         }
-        if self.selected_local_recovery_fence_present()? { return Ok(true); }
         let Some(freeze) = self.membership_handoff_write_freeze()? else {
             return Ok(false);
         };
@@ -2003,7 +1986,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // deliberately persist the exact journal proof before rebuildable
         // tables catch up, so this path must not force materialization.
         let _lock = self.metadata_write_lock()?;
-        self.require_no_selected_local_recovery_fence()?;
         self.next_sequence =
             self.next_sequence
                 .max(crate::metadata_journal::admission::certify_for_write(
@@ -2030,7 +2012,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // persisting that evidence must not rebuild a rotated materialized
         // table generation a second time.
         let _lock = self.metadata_write_lock()?;
-        self.require_no_selected_local_recovery_fence()?;
         self.next_sequence =
             self.next_sequence
                 .max(crate::metadata_journal::admission::certify_for_write(

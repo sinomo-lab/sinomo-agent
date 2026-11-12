@@ -3327,12 +3327,6 @@ mod native_prefix_return;
 pub use native_prefix_return::{
     NativeMetadataPrefixPhysicalOwner, OwnedNativeMetadataPrefixReturn,
 };
-#[cfg(test)]
-mod selected_recovery_fence_call;
-#[cfg(test)]
-pub(crate) use selected_recovery_fence_call::{
-    OwnedSelectedLocalRecoveryFenceReturn, call_native_selected_local_recovery_fence,
-};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod materialization_test;
 #[cfg(any(test, feature = "test-support"))]
