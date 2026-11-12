@@ -12064,9 +12064,11 @@ dependencies = [
 name = "sinomo-video"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "h264-reader",
  "image",
  "openh264",
+ "pkg-config",
  "serde",
  "serde_json",
  "sinomo-gateway",

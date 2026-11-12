@@ -6,13 +6,15 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "**/*.c", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "r2"
 
 [features]
 default = []
+# Requires system FFmpeg development libraries; never selects a software encoder.
+desktop-gpu = ["dep:cc", "dep:pkg-config"]
 native-devices = ["sinomo-runtime/native-devices"]
 
 [dependencies]
@@ -27,3 +29,7 @@ serde_json.workspace = true
 sinomo-gateway = { path = "../sinomo-gateway" }
 sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["device-client"] }
 thiserror.workspace = true
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+pkg-config = { workspace = true, optional = true }

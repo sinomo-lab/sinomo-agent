@@ -241,6 +241,22 @@ pub fn desktop_capture_body_with_transport(
     desktop_capture_body_with_options(capture, encoding, duration, cancelled, transport, None)
 }
 
+async fn reserve_frame_capacity(
+    sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    deadline: Instant,
+) -> Result<
+    Result<tokio::sync::mpsc::Permit<'_, Vec<u8>>, tokio::sync::mpsc::error::SendError<()>>,
+    tokio::time::error::Elapsed,
+> {
+    tokio::time::timeout(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50)),
+        sender.reserve(),
+    )
+    .await
+}
+
 pub fn desktop_capture_body_with_options(
     capture: impl DesktopFrameSource + 'static,
     encoding: RealtimeVideoInputConfig,
@@ -269,14 +285,23 @@ pub fn desktop_capture_body_with_options(
                 // Native capture keeps its own latest-frame slot. Pull only
                 // when we can encode/send: a provider boundary may copy a full
                 // raw frame, so polling it while backpressured wastes bandwidth.
-                if sender.capacity() == 0 {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
+                // Capacity wakes this worker immediately. The timeout only bounds
+                // consent/cancellation checks while a peer remains backpressured.
+                let permit = match tokio::runtime::Handle::current()
+                    .block_on(reserve_frame_capacity(&sender, deadline))
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                };
                 let wait = next_encode.saturating_duration_since(Instant::now());
                 if !wait.is_zero() {
                     std::thread::sleep(wait.min(Duration::from_millis(100)));
                     continue;
+                }
+                capture.check_active().map_err(|error| error.to_string())?;
+                if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    break;
                 }
                 let pull_started = Instant::now();
                 let Some(sample) = capture
@@ -286,8 +311,7 @@ pub fn desktop_capture_body_with_options(
                     continue;
                 };
                 let pull_us = pull_started.elapsed().as_micros() as u64;
-                let trace_frame =
-                    tracing::enabled!(target: "sinomo.perf", tracing::Level::TRACE);
+                let trace_frame = tracing::enabled!(target: "sinomo.perf", tracing::Level::TRACE);
                 let native_ready_us = if trace_frame { unix_micros() } else { 0 };
                 sequence = sample.sequence;
                 let encode_span = tracing::trace_span!(target: "sinomo.perf", "media.frame.encode",
@@ -406,20 +430,13 @@ pub fn desktop_capture_body_with_options(
                 metadata.tiles = capture.tiles();
                 next_encode = frame_started + encode_interval;
                 let encoded_ready_us = if trace_frame { unix_micros() } else { 0 };
-                match sender.try_send(record(&metadata, &bytes)?) {
-                    Ok(()) => {
-                        tracing::trace!(target: "sinomo.perf", stage = "media.frame.source", sequence = sample.sequence,
-                            captured_at_unix_ms = sample.captured_at_unix_ms as u64,
-                            native_ready_unix_us = native_ready_us as u64,
-                            encoded_ready_unix_us = encoded_ready_us as u64,
-                            pull_us, encode_us, payload_bytes = bytes.len(),
-                            transport = ?transport, "source frame stages");
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        return Err("video producer lost reserved queue capacity".into());
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                }
+                permit.send(record(&metadata, &bytes)?);
+                tracing::trace!(target: "sinomo.perf", stage = "media.frame.source", sequence = sample.sequence,
+                    captured_at_unix_ms = sample.captured_at_unix_ms as u64,
+                    native_ready_unix_us = native_ready_us as u64,
+                    encoded_ready_unix_us = encoded_ready_us as u64,
+                    pull_us, encode_us, payload_bytes = bytes.len(),
+                    transport = ?transport, "source frame stages");
             }
             Ok(())
         })();
@@ -551,15 +568,23 @@ impl ReceivedFrame {
     ) -> io::Result<RealtimeEncodedVideoFrameInput> {
         match self {
             Self::Image(frame) => Ok(frame),
-            Self::Pixels(frame) => sinomo_lm::encode_realtime_video_frame(
-                &frame,
-                &RealtimeVideoInputConfig {
-                    max_dimension: None,
-                    frame_format: format,
-                    ..Default::default()
-                },
-            )
-            .map_err(io::Error::other),
+            Self::Pixels(frame) => {
+                let started = Instant::now();
+                let result = sinomo_lm::encode_realtime_video_frame(
+                    &frame,
+                    &RealtimeVideoInputConfig {
+                        max_dimension: None,
+                        frame_format: format,
+                        ..Default::default()
+                    },
+                )
+                .map_err(io::Error::other);
+                tracing::trace!(target: "sinomo.perf", stage = "media.frame.reencode",
+                    sequence = frame.sequence, width = frame.width, height = frame.height,
+                    format = ?format, reencode_us = started.elapsed().as_micros() as u64,
+                    success = result.is_ok(), "receiver image conversion");
+                result
+            }
         }
     }
 }
@@ -689,6 +714,10 @@ impl VideoStreamReader {
             }
         };
         self.last_decode_us = started.elapsed().as_micros();
+        tracing::trace!(target: "sinomo.perf", stage = "media.frame.decode",
+            sequence = metadata.sequence, width = metadata.width, height = metadata.height,
+            transport = ?metadata.transport, decode_us = self.last_decode_us as u64,
+            "receiver decode including RGB conversion");
         Ok((metadata, frame))
     }
 }
@@ -789,6 +818,25 @@ impl Drop for RemoteVideoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn capacity_release_wakes_without_waiting_for_safety_timer() {
+        use std::future::Future;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.try_send(vec![1]).unwrap();
+        let mut waiting = Box::pin(reserve_frame_capacity(
+            &sender,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(receiver.try_recv().unwrap(), vec![1]);
+        let Poll::Ready(Ok(Ok(permit))) = waiting.as_mut().poll(&mut cx) else {
+            panic!("capacity release must be immediately ready without advancing a timer");
+        };
+        permit.send(vec![2]);
+        assert_eq!(receiver.try_recv().unwrap(), vec![2]);
+    }
+
     fn h264_records() -> Vec<(VideoFrameMetadata, Vec<u8>)> {
         use openh264::{
             encoder::Encoder,

@@ -1,4 +1,10 @@
 //! Cluster transport codecs. Model providers continue to receive JPEG/PNG.
+//!
+//! Desktop hardware encoding is opt-in with `sinomo-video/desktop-gpu` and
+//! requires system FFmpeg development libraries discoverable by pkg-config.
+//! Auto probes hardware once per process; explicit H264 fails if unavailable.
+//! Image remains the default. The backend uploads CPU pixels; it does not
+//! eliminate native capture readback. Android retains its host-installed codec.
 use serde::{Deserialize, Serialize};
 use sinomo_lm::RealtimeVideoFrameInput;
 use std::sync::OnceLock;
@@ -19,6 +25,28 @@ pub trait VideoEncoder {
     fn encode(&mut self, frame: &RealtimeVideoFrameInput) -> Result<Vec<u8>, String>;
 }
 pub type EncoderFactory = fn(u32, u32, u32) -> Result<Box<dyn VideoEncoder>, String>;
+#[cfg(all(
+    feature = "desktop-gpu",
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
+))]
+#[path = "desktop_gpu.rs"]
+mod desktop_gpu;
+
+fn available() -> bool {
+    if ENCODER.get().is_some() {
+        return true;
+    }
+    #[cfg(all(
+        feature = "desktop-gpu",
+        any(target_os = "linux", target_os = "windows", target_os = "macos")
+    ))]
+    {
+        return desktop_gpu::available();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 static ENCODER: OnceLock<EncoderFactory> = OnceLock::new();
 /// The Android app installs its MediaCodec adapter as part of media host startup.
 pub fn install_h264_encoder(factory: EncoderFactory) {
@@ -26,21 +54,30 @@ pub fn install_h264_encoder(factory: EncoderFactory) {
 }
 pub fn select(transport: VideoTransport, grid: bool) -> Result<VideoTransport, String> {
     match transport {
-        VideoTransport::Auto if !grid && ENCODER.get().is_some() => Ok(VideoTransport::H264),
+        VideoTransport::Auto if !grid && available() => Ok(VideoTransport::H264),
         VideoTransport::Auto => Ok(VideoTransport::Image),
         VideoTransport::H264 if grid => {
             Err("H264 transport does not support a coordinate grid; select image transport".into())
         }
-        VideoTransport::H264 if ENCODER.get().is_none() => {
+        VideoTransport::H264 if !available() => {
             Err("H264 hardware encoder is unavailable on this node".into())
         }
         value => Ok(value),
     }
 }
 pub fn encoder(width: u32, height: u32, fps: u32) -> Result<Box<dyn VideoEncoder>, String> {
-    ENCODER
-        .get()
-        .ok_or("H264 hardware encoder is unavailable")?(width, height, fps)
+    if let Some(factory) = ENCODER.get() {
+        return factory(width, height, fps);
+    }
+    #[cfg(all(
+        feature = "desktop-gpu",
+        any(target_os = "linux", target_os = "windows", target_os = "macos")
+    ))]
+    {
+        return desktop_gpu::open(width, height, fps);
+    }
+    #[allow(unreachable_code)]
+    Err("H264 hardware encoder is unavailable".into())
 }
 /// Bound decoder memory before accepting compressed data. Transport dimensions
 /// are deliberately limited to a screen preview, not arbitrary media files.
