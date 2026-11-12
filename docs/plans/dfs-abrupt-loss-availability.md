@@ -1,243 +1,330 @@
 # DFS abrupt-node-loss and reconnection availability
 
+Status: proposed. The current implementation does not meet these requirements;
+[Current behavior](#current-behavior) lists the differences.
+
 The required behavior is one safe metadata history through abrupt node loss,
-with content W kept separate from desired N and metadata authority. This plan
-specifies target protocol obligations and validation boundaries; it does not
-certify implementation or authorize deployment. Source-specific executions,
-failures, original operation identities and retained DATA belong in task receipts.
+with content W kept separate from desired N and metadata authority. When a
+metadata-shard primary goes offline, a surviving member of the shard's write set
+that can commit to cluster KV takes over automatically, without any state, freeze
+or reply from the lost primary. Reliability comes from redundancy: everything a
+successor needs is already replicated in the shard tables, on content holders or
+with the caller. This plan specifies the target protocol, its obligations and
+validation boundaries; it does not certify an implementation or authorize
+deployment.
 
-## Protocol constraints
+## Requirements
 
-The baseline journals `PrepareOperationV7` with the complete sealed operation
-and publishes using `CommitPreparedOperationV7` with its exact digest. Ordinary
-metadata publication and sync require every configured participant. Cooperative
-rotation requires the old primary's durable freeze, exact prefix, both assignment
-majorities and both primaries; it carries no repair state. That protocol
-deliberately cannot activate after abrupt loss of the source.
+1. **One history.** Each shard has exactly one ordered metadata history and one
+   serving primary per epoch. A timeout or connectivity change requests a
+   takeover attempt; it never grants one.
+2. **Write set.** A metadata change is acknowledged only after every member of
+   the shard's current write set durably holds it. A bare majority of a larger
+   set never replaces the write set. Cluster KV orders every change to the write
+   set and to the primary through its existing guarded transactions. Journals,
+   intents, receipts and effect evidence stay in DFS; no per-operation KV permit
+   or DFS ledger enters KV.
+3. **W floor.** The write set never shrinks below the filesystem's content W. A
+   shard whose live write set is below the floor keeps writes pending instead of
+   weakening durability, so metadata is never less durable than the content it
+   commits.
+4. **Automatic takeover.** When the primary is offline, a write-set member that
+   can commit to cluster KV takes over automatically.
+5. **Keeping W.** Members leave the write set when the network reports them
+   unreachable, rejoin once caught up, and are replaced by recruited members
+   when too few remain. All of this is automatic.
+6. **Metadata replicas.** Each shard keeps N metadata copies, the primary's
+   included, N being the filesystem's content N, on non-mobile metadata-capable
+   members. They need not be cluster-KV voters. Mobile members are used only
+   when too few non-mobile members exist to reach the W floor.
+7. **Desired N survives unavailability.** A W=2, N=3 eventual write may commit on
+   B and C with A unavailable once metadata authority is valid; it keeps N=3 and
+   the missing copy as repair work. When an open write's chosen targets cannot
+   reach W, reachable admitted targets replace the unreachable ones and repair
+   restores N later. Required nodes, pins, residency and confirmed-replication
+   requirements remain hard constraints and are never substituted.
+8. **Reads.** An existing exact version needs one reachable authorized valid
+   holder; it does not need W reachable copies. Missing A-only W=1 bytes affect
+   that content, not unrelated objects or metadata activation. A primary that has
+   been replaced but has not yet learned it may answer reads from its last state;
+   it can no longer commit.
+9. **Redundancy, not custody.** A successor derives all remaining work from the
+   replicated shard tables: repair, staging, commit promotion, prepared changes,
+   namespace requests and jobs. Receivers apply repeated effects idempotently,
+   and the caller owns delivery of its own result. Recovery needs no
+   survivor-durable copy of the lost primary's original requests, outbox,
+   delivery uncertainty or exact journal bytes.
+10. **Reactive.** Takeover, write-set changes and recruitment run on events:
+    delivery failures, network reachability changes, membership and
+    configuration changes, and catch-up completion. There are no heartbeats or
+    scans. Slowness is never evidence of loss: only the network layer's verdict
+    that a peer has no path counts, and DFS adds no deadline of its own.
+11. **Serving epoch and physical store are distinct.** Takeover reuses the
+    successor's existing store and indexes; the new epoch fences old writes
+    without replacing the store.
+12. **Rejoin.** Offline members keep their membership and recorded copies. A
+    returning member compares exact prefixes, transfers only the missing bounded
+    history and content, and does not become primary again automatically.
 
-1. Exactly one ordered metadata history and serving authority. A timeout or
-   connectivity change requests an attempt; it never grants promotion. Epochs,
-   vote promises/fences, prepares, exact commit evidence and unknown outcomes
-   survive process loss and reconnect.
-2. Metadata replication quorum, content W and cluster-control quorum are three
-   independent proofs. No isolated replacement of a full participant count by
-   a majority; no operation-bound KV metadata permit as a shortcut.
-3. Cluster authority orders genuine topology/epoch changes through existing
-   guarded reads and transactions. DFS journals, request bodies, intents,
-   receipts, completion evidence and delivery custody remain DFS-owned.
-4. Desired N survives temporary unavailability. A W=2,N=3 eventual write may use
-   B/C receipts with A unavailable only after metadata authority is valid. It
-   retains N=3 and durable repair obligations. Required nodes, pins, residency
-   and confirmed-replication requirements remain hard constraints.
-5. An existing exact version needs one reachable authorized valid holder for a
-   read. It does not need W reachable copies. Missing A-only W=1 bytes affect
-   that content, not unrelated objects or all metadata activation.
-6. Abrupt recovery must find complete original effect identities/bodies and
-   unresolved delivery/completion evidence on survivors before dispatch can
-   become ambiguous. No uncertain effect is recreated under another identity.
-   Advisory scheduling remains local. Activation cannot require replaying an
-   entire backlog or copying all object bytes.
-7. Serving-authority epoch and physical store generation are distinct. A checked
-   authority rebind may reuse the store and indexes while fencing old writes;
-   actual replacement retains the stronger physical-generation fence.
-8. Keep offline membership and recorded copies. Rejoin compares exact prefixes
-   and immutable identities, transfers only missing bounded history/content,
-   and does not automatically fail back to the original primary.
-9. Repair needs no original-effect custody. A replica below desired N is a need
-   in the replicated shard tables; the successor's repair executor derives it
-   from them, so takeover never depends on the retiring owner's repair work.
-   Each attempt carries its receipt-slot generation, and a late reply publishes
-   only through that generation's compare. Retry timing restarts at the
-   successor.
+## Current behavior
 
-## Protocol design obligations
+The implementation differs from these requirements:
 
-The first protocol review must specify durable state and transitions before
-changing metadata admission. Candidate design: retain a fixed three-member
-metadata assignment; durably persist epoch-bound promises on an intersecting
-metadata majority, select a survivor using existing cluster authority, recover
-the accepted history and original effect custody from those survivors, and
-activate only with an exact epoch/prefix certificate. This is a proposal, not a
-new authority path. In particular, a fresh KV epoch alone cannot certify an
-old prepare or erase an uncertain result.
+- Every metadata commit needs a durable acknowledgement from the primary and
+  every configured replica (`authorize_metadata_shard_operation`). A missing
+  member makes the commit fail and leaves the change prepared.
+- After setup, every metadata-capable service node replicates every shard, so
+  one offline node of any kind stops metadata writes on all shards.
+- A primary changes only through the cooperative membership handoff, whose
+  freeze, fence and prefix steps run on the retiring primary. With that primary
+  offline the handoff stays pending and nothing cancels it. The recovery-ballot
+  and recovery-fence code is test-only.
+- An epoch change also advances the store generation, which makes the metadata
+  service reopen.
+- Members keep no durable record of the highest epoch they have promised, and
+  acknowledgement floors are not scoped to an epoch.
+- The network layer announces route changes with a bare generation counter that
+  does not name the peer. Failed deliveries leave short-lived evidence that
+  nothing can subscribe to; otherwise unreachability waits for the periodic
+  probe.
+- A caller whose primary is unreachable fails at the first network error unless
+  the shard record already names a new primary.
+- Namespace-job resume selects jobs on every locally replicated shard rather than
+  only on shards this node is primary for. Cross-shard source-adoption sessions
+  exist only in memory.
 
-Review must resolve all of the following:
+These existing properties support the design:
 
-- How every acknowledged and possibly committed prepare/commit is preserved
-  when the old primary cannot freeze or report its tail. Prefix length alone
-  is insufficient; exact digest/slot/epoch identity and quorum intersection
-  must govern recovery, including a prepare accepted on only part of a group.
-- Which durable promise prevents a live partitioned old primary completing
-  further writes, and how prepare, commit, sync, replica ingest and restart
-  validate that promise. Every publication path must share the fence.
-- The precise commit certificate, when it is durable on an intersecting set,
-  and what a lost final reply means. Recovery must not choose a conflicting
-  value or infer commit merely from a prepare or a larger sequence number.
-- How changes between the current full-participant protocol and the new
-  protocol are capability-gated, and how metadata membership transitions keep
-  overlapping quorums. Existing cooperative handoff remains supported.
-- How original transfer bodies/identities, attempt/delivery uncertainty and
-  terminal evidence become survivor-durable before effects. Recover a bounded
-  active frontier first, retaining the backlog without gating all activation.
-- How a checked authority rebind reuses the exact store, index and matching
-  prefix while stale handles remain unable to author or dispatch effects.
+- Before a caller sees success, the complete prepared change is durable on every
+  member; only the commit record starts on the primary alone. Every member
+  therefore holds everything the primary acknowledged.
+- Prepared-change recovery at a newer epoch (`recover_one_prepared_operation`)
+  republishes the sealed body with its read set, effects and caller identity.
+- Repair work is derived from the shard tables, and receipt-slot generations
+  fence late replies.
+- Hydration on the current primary rebuilds staging for open intents and commit
+  promotions for committed intents.
+- Namespace requests, request receipts, jobs and advisory locks are rows in the
+  replicated tables.
 
-Models must be classified as implemented refinement or target hardening, mapped
-to Rust transitions, with case IDs, bounds, seeds/samples and required witnesses.
-A model pass is not real-process, transport or disk evidence.
+## Design
 
-### Target transitions and compatibility gap
+### Shard record
 
-These target obligations do not establish executable protocol acceptance:
+The cluster-KV shard record keeps its primary, replicas and epoch, and gains:
 
-| Transition | Durable obligation / rejection rule |
+| Field | Meaning |
 |---|---|
-| Reserve | Existing cluster authority orders one exact reservation, unchanged metadata assignment, nominated successor and successor serving epoch. Route failure only requests this action. |
-| Promise | Under the same participant writer/acceptance gate as old acknowledgements, persist the successor promise and capture a stable accepted-history/decision/custody cut. Synchronize before replying. Snapshot install, restart and physical replacement preserve this promise. |
-| Recover | Compare exact ancestry and accepted values/ballots, not sequence heights. Preserve every operation/result an old proof could cover. A later majority protocol must recover a chosen value when only one member of its old accept quorum intersects the new promise quorum. |
-| Decide | Bind exact operation, predecessor, slot, epoch, result and quorum evidence. Before successful new-protocol replies, the exact decision frame must be survivor-recoverable, or a reviewed deterministic construction must seal its exact identity earlier. A prepare alone is not a decision certificate. |
-| Activate | Existing cluster authority plus DFS promise/recovered-history/custody coverage authorize a successor. Checked rebind preserves physical identity while changing serving authority. No object-byte migration or backlog execution prerequisite. |
-| Rejoin | Persist active epoch/fence before old-node effects. Reuse matching exact prefixes and content identities, transfer missing bounded suffixes and retain offline membership/copy records. No automatic failback. |
+| Write set | The members a commit must reach: the primary plus the replicas currently in sync. Replicas outside it keep their copies and catch up. |
+| Generation | Advances on every write-set change. The epoch still advances only when the primary changes. |
+| Epoch start | The journal position and prefix proof at which the current primary's epoch began. |
 
-A may hold complete old proof before B/C promise the new epoch and receive its
-last old ACK afterward. Promises cannot retract issued replies or instantly
-freeze A. The successor must preserve the exact old body/result before activation
-so a delayed old completion cannot add a competing result. Old acceptance and
-promise capture must serialize durably. A fresh promise alone is also not a
-read-freshness proof; stale authoritative reads need an explicit epoch rule.
+The W floor and N come from the filesystem's replication policy; the record does
+not copy them.
 
-There is a concrete V7 compatibility gap. A commit reference includes its own
-`sequence` and `created_at`
-(`metadata_records/prepared_operation.rs::DfsPreparedOperationCommitReference`),
-and prefix identity hashes the exact encoded frame bytes
-(`metadata_records.rs::dfs_metadata_prefix_proof_v2_after_bytes`). A complete
-prepare surviving on B/C cannot reconstruct an unknown A-only commit timestamp
-or original terminal frame. Preserving its semantic result through an explicitly
-linked recovery decision is different from recovering that original frame.
-Do not invent it or claim the legacy evidence complete. Protocol admission must
-define how an exact certified old cut becomes survivor-durable before claiming
-new-protocol abrupt-loss guarantees; an already-lost legacy-only terminal frame
-remains an explicit evidence gap until authoritatively reconciled.
+### Invariant
 
-Likewise the old sealed payload/digest contains `owner_epoch`, and the current
-publication guard requires that epoch. Current cross-epoch recovery constructs a
-new body and supersedes the old preparation. A new recovery envelope must retain
-the original immutable request/body/digest and separately bind new executor
-authority, with an explicit typed authorization/version contract. Rewriting the
-epoch does not preserve the old digest.
+A member joins the write set only after it holds everything the primary has
+written, and every commit is acknowledged by the whole write set. Every
+write-set member therefore holds every acknowledged change, which is why
+write-set membership is the eligibility rule for takeover: any member can
+continue the history without the primary.
 
-Before a potentially ambiguous outbound effect, survivor-durable DFS state must
-cover the complete original command/body, request identity, source/destination,
-content identity, delivery uncertainty and completion evidence. A's local
-outbox does not provide this. Separate current executor from immutable origin; a
-successor cannot impersonate A or issue a replacement request.
-Bounded immutable cut roots, indexed pages and reservation-bound checkpoints
-provide recovery coverage; hydrate and execute the backlog incrementally after
-activation. Missing bodies or uncertain outcomes stay pending. Complete evidence
-stays in DFS; KV holds only the genuine compact authority transition/references.
+### Commit
 
-Required negative/race checks before shared protocol implementation: old ACK versus
-promise serialization; delayed complete old proof; A-only commit marker; crash
-after promise fsync/before reply; ambiguous decision persistence; concurrent
-takeovers; a second takeover whose majority intersects the old chosen quorum at
-only one holder; custody-before-dispatch; stale reads; downgrade/reopen that would
-ignore promises. Existing local acknowledgement floors contain only shard,
-sequence and prefix proof and cannot substitute for these contracts.
+The primary acknowledges a change only after every member of the write set at
+its current generation has durably stored the complete prepared body. The commit
+record may follow afterwards. A caller that does not receive success treats the
+outcome as unknown and resolves it by retrying with the same operation id. DFS
+never reports a definite failure for a change that a successor could still
+complete.
 
-### Target exact decision identity
+### Detecting loss
 
-The target admits the new regime only after a certified cooperative cut closes
-the V7 prefix and complete original-effect custody. Source loss before that cut
-leaves admission pending; it does not reconstruct missing legacy frames.
+Any of these starts an evaluation:
 
-Under the new regime, an immutable accepted proposal bundle contains the exact
-prospective prepare and terminal frames, including their sequence/timestamp
-headers. The terminal references the prepared-body digest; an outer digest may
-cover both exact frames, but neither frame embeds that outer digest. Recovery
-adopts those original bytes, response and effect identities unchanged; new
-acceptor/executor certification is separate. This resolves the identified
-timestamp reconstruction gap for newly admitted bundles only.
+- a member or caller fails to deliver a message to the primary;
+- the network layer reports a change in the primary's reachability;
+- cluster membership marks the primary offline or removed.
 
-Prospective bundles need a separate DFS-owned accepted-state log. They must not
-enter ordinary V7 replay as actionable commit markers. Reserve the bundle's
-canonical order before acceptance, and finish or recover that slot before a
-conflicting successor can be chosen. Current operations may admit durable pending
-content work without choosing its final publication bundle; missing A-only W1
-bytes must not hold all later unrelated metadata work behind a byte fetch.
-The exact storage/order and pipelining refinement remains a review/model gate.
+Only the network layer's verdict that the primary has no path counts: a connect
+failure, a disconnect or its own no-progress limit. A slow reply never counts, so
+a primary on a high-latency mobile link that still answers keeps its role. After
+a failed delivery the network layer verifies that peer at once instead of
+waiting for its next probe, and it publishes per-peer reachability changes.
+These belong to `sinomo-network`; DFS consumes them and does not duplicate
+connectivity logic. An idle shard is taken over when someone next needs it or
+when the network layer's own probing reports the primary unreachable.
 
-Each acceptance binds assignment, reserved serving epoch, slot, exact predecessor
-and full bundle bytes. A participant accepts only one value per epoch/slot and
-durably records a higher promise before acknowledging it. A promise cut contains
-every acceptance completed before that promise. Recovery selects the highest
-accepted ballot/value per slot from the promise quorum and validates exact
-ancestry, then reaccepts the same chosen bytes. One member of a previously chosen
-majority can be sufficient evidence after quorum intersection; requiring two
-matching reports would incorrectly lose that history.
+### Takeover
 
-Canonical visibility and successful replies require the exact decision evidence
-to be durably recoverable from a metadata majority. A private A-only preparation
-not reported by the promise quorum cannot later acquire an old quorum. Retain it
-as unresolved/orphan evidence on reconnect; neither merge it as committed nor
-infer absence of independent effects. A's delayed old proof may still complete
-only the value already preserved by successor recovery.
+A candidate is a write-set member that can commit to cluster KV.
 
-Latest-head and namespace reads need a fresh metadata-quorum barrier in this
-target. Cached old authority or a historical write certificate does not prove a
-current head after takeover. Fetching an already-certified exact immutable
-version remains a one-valid-holder operation and does not acquire a content-W
-availability requirement. A separate lease design is not assumed.
+1. **Corroborate.** The candidate asks the other reachable write-set members, in
+   one round, whether they still have a path to the primary and how far their
+   journal goes. Any member that still reaches the primary vetoes the attempt, so
+   one node's poor link cannot depose a healthy primary. The remaining members
+   are ranked by journal position, then non-mobile before mobile, then node id. A
+   candidate that does not rank first hands the attempt to the member that does.
+   Unreachable members are left out, so a two-member write set needs no
+   corroboration.
+2. **Confirm quorum.** The candidate reads the shard record linearizably. If it
+   cannot, it is not in quorum and stops.
+3. **Promise.** The candidate durably records that it accepts nothing more from
+   the old primary at the current epoch, serialized with its acknowledgement
+   path. From then on the old primary cannot complete a commit, because each one
+   needs this member.
+4. **Swap.** One guarded KV transaction: if the record still matches what the
+   candidate read, the candidate becomes primary, the epoch advances, the old
+   primary leaves the write set and epoch start becomes the candidate's journal
+   position. If another change won, the candidate follows it. An unknown outcome
+   is reconciled from the record before the candidate acts. The candidate
+   releases its promise only when its own takeover did not happen and the old
+   primary is still primary.
+5. **Activate.** The candidate rebinds its existing store to the new epoch and
+   republishes every prepared change it holds through prepared-change recovery,
+   so changes the old primary may already have committed complete with the same
+   effects and caller identity. A recovered change gets a new journal record; the
+   old primary's own commit record, if it exists, is discarded when that node
+   rejoins.
+6. **Align followers.** A follower whose prefix matches at epoch start drops any
+   records past it. Those records were never acknowledged, because the candidate
+   lacks them. A follower whose prefix differs installs a snapshot. Acknowledgement
+   floors from the old epoch block neither.
+7. **Resume work** from the tables, as listed below, then remove unreachable
+   members and recruit.
 
-Detached promotion and response commands need their own complete
-immutable body/identity/delivery/completion coverage before ambiguous dispatch;
-accepting the original metadata bundle alone does not cover later generated
-effects. Attachment descriptors bind exact original bytes, length/layout and
-retention custody. Missing W1 payload bytes leave the affected operation pending,
-without inventing its body or blocking unrelated metadata. The full-body versus
-attachment-retention refinement must establish the user's survivor-recovery
-requirement; a tuple or hash alone is insufficient. New executor authorization
-must not change the logical origin used for receiver idempotency or manufacture
-fresh request identities.
+Every write-set and primary change is one guarded transaction on the same record,
+so these changes are totally ordered. The winning candidate was in the write set,
+so it holds every acknowledged change. It stopped accepting the old primary's
+records before the swap, so the old primary cannot complete a commit afterwards.
+Nothing from the old primary is needed.
 
-Admission/activation requires durable coverage of an immutable history/custody
-cut, with bounded indexed pages and checkpointed continuation. It does not require
-executing or hydrating every backlog row. Repair commands are outside this
-coverage (constraint 9).
+### Keeping W
 
-Promises, accepted ballots and highest-value adoption constitute consensus.
-Existing cluster CAS orders authority reservations but does not prove this new
-DFS protocol. Review reuse of suitable existing consensus machinery, or verify
-the DFS protocol explicitly with its own DFS-owned storage. Neither choice puts
-journals/effect ledgers in cluster KV or duplicates network reachability logic.
-Explicit persistence/wire capability admission and fail-closed downgrade/reopen
-are mandatory before these semantics can replace FullShard. The target still
-requires model/refinement review and real process/transport/disk acceptance.
+- **Shrink.** When the network reports that a write-set member has no path, the
+  primary removes it with a guarded transaction, but never below the W floor. A
+  dead member that would take the set below the floor stays in it, and writes
+  wait until it returns or a recruit replaces it. Keeping it there also keeps it
+  eligible to take over.
+- **Re-add.** A returning member keeps its copy and catches up incrementally from
+  its matching prefix. Once it has acknowledged the primary's current journal
+  position, the primary adds it back and requires its acknowledgement from the
+  moment it submits that change.
+- **Recruit.** When the write set has fewer than N members and no out-of-sync
+  replica is reachable, the primary adds an eligible metadata-capable member to
+  the replicas, preferring non-mobile members. The recruit catches up by
+  snapshot and joins the write set; only then is a dead member at the floor
+  removed.
+- **Retire a substitute.** When a shard has more than N members and the
+  original member is back in the write set, the primary removes the most recent
+  recruit, which deletes its copy as any node outside a shard's placement does.
 
-## Content admission and original-effect recovery
+These steps run on write-set changes, reachability changes, membership and
+configuration changes, and catch-up completion.
 
-The [content inventory plan](dfs-content-admission-inventory.md) defines the
-coherent membership/provider/content inputs and bounded fresh-create scope.
-Historical placement grants cannot authorize a new obligation after provider
-revocation. Existing copies and offline membership remain evidence to preserve,
-not a way to widen new-target eligibility.
+### Content W for open writes
 
-The [original-effect plan](dfs-original-effect-custody.md) separates complete
-request/body custody, attempts, receiver settlement and caller delivery for the
-effects that need it; repair is not one of them. Local enrollment and cooperative
-transfer do not by themselves prove survivor durability before abrupt loss. The
-[accepted-bundle target](dfs-accepted-bundle-target.md) records the bounded
-abstract model and required Rust refinement.
+When an open write's reachable chosen targets and existing receipts cannot reach
+W, the primary replaces the unreachable targets with reachable members of the
+admitted content-target inventory described in the
+[content inventory plan](dfs-content-admission-inventory.md), using the normal
+placement ranking and constraints. The replacement is recorded in the intent, so
+a successor sees it. The write commits at W, and repair restores N against the
+updated desired placement. A target is replaced only on the network layer's
+no-path verdict, never on a single failed endpoint probe.
+
+### Old primary returns
+
+The old primary learns of its replacement from the new shard record, from a
+rejection by a write-set member or from a failed commit, and then redirects its
+callers. It follows the new primary from epoch start, dropping or replacing its
+unacknowledged tail, and rejoins the write set once caught up. It never becomes
+primary again automatically. Its late messages are harmless: anything that needs
+a metadata commit fails, and receivers apply repeats idempotently. Until it
+learns, it may answer reads from its last state.
+
+### Remaining work after takeover
+
+| Work | Successor derives it from | Why repeating it is safe |
+|---|---|---|
+| Repair toward N | The derived repair index | Receipt-slot generations fence earlier attempts. |
+| Staging for open writes | Intent and receipt rows; bytes from the writer or receipt holders | Receivers store by object, version and hash; receipts publish through slot generations. |
+| Prepared changes | The prepared bodies every write-set member holds | Replay revalidates the sealed body against the same history. |
+| Commit promotions | Committed intents and their receipts | The receiver treats an already-durable promotion as settled. |
+| Caller results | Nothing; the caller owns them | The caller retries with its operation id, and replicated intent and namespace-request receipts answer it. |
+| Namespace requests and jobs | Request and job rows | Job receipts; recovery moves only forward. |
+| Advisory locks | Lock rows | The new epoch invalidates old grants. |
+
+A content version held only by the lost node, because it is W=1 or its bytes were
+never staged elsewhere, stays unavailable until that node returns; only those
+objects are affected. A writer whose bytes never left its own node re-sends them
+on retry.
+
+### Compatibility
+
+A shard switches to the write-set protocol only after every member of its replica
+set advertises support. Until then it keeps the all-member rule and has no
+automatic takeover; old and new nodes do not share a write set. On the switch the
+primary reduces the shard to N chosen members, and removed members delete their
+copies. The cooperative handoff remains the planned-transfer path for a
+live primary.
+
+## Model
+
+Before shard authority changes, model the protocol in Quint with three or four
+members, a few journal entries and these actions: prepare, acknowledge, commit,
+shrink, add, recruit, promise, takeover swap, crash, partition, recovery and
+rejoin. Cluster KV is a linearizable compare-and-swap register. Required
+invariants:
+
+- committed histories never diverge;
+- every write-set member holds every committed entry;
+- after a takeover swap, the old primary commits nothing;
+- no acknowledged change is lost across any sequence of takeovers;
+- a shrink never takes the write set below the W floor.
+
+Liveness, storage and transport stay outside the model and are covered by native
+tests.
+
+## Implementation order
+
+1. The model above.
+2. Network: per-peer reachability change events and immediate verification
+   after a failed delivery.
+3. Shard record and member state: write set, generation and epoch start;
+   guarded transactions for shrink, add, recruit and takeover; capability gate
+   and replica-set reduction; a durable promised-epoch record that survives
+   restart and snapshot install; epoch-scoped acknowledgement floors.
+4. Commit: require the write set at the current generation instead of every
+   configured member; report a missing acknowledgement as an unknown outcome;
+   bound the wait by the caller's deadline only.
+5. Keeping W: shrink, re-add, recruitment and substitute retirement; N metadata
+   replicas from non-mobile members.
+6. Takeover: corroboration, promise, swap, store rebind without reopening,
+   prepared-change recovery and follower alignment.
+7. Callers and successor work: callers wait within their own deadline for the
+   shard record to change and retry at the new primary with the same operation
+   id; namespace-job resume only on shards this node is primary for; cross-shard
+   source adoption rebuilt from job rows.
+8. Content-target substitution for open writes.
 
 ## Acceptance matrix
 
 | Scenario | Required evidence |
 |---|---|
-| Abrupt A stop; exact committed bytes only A/C, B lacks them | Verify fixture and on-disk bindings before stop; actually stop A abruptly; read exact C version; new B/C W=2,N=3 write; retain A membership/copy facts, desired N and durable deficit. |
-| Metadata replica unavailable, primary alive | Remaining metadata majority preserves one ordered history and exact acknowledged results; no content-W substitution. |
-| Live old primary partitioned | Attempts on both sides; quorum-side activation; old side cannot publish/ack a divergent history, including restart and delayed messages. |
-| Crash/lost reply at prepare, commit and transfer | Cut each durable boundary; recover exact original IDs/bodies, unknown delivery and terminal evidence; exact replay or unresolved status, never fresh identity. |
-| Repeated reconnect | Reuse matching prefix/content; bounded missing transfer; membership/copies retained; no churn, wholesale rewrite or failback. |
-| W=1 bytes exclusively A, A unavailable | Affected content explicitly unavailable; unrelated readable/writable objects continue under valid authority. |
+| Abrupt A stop; exact committed bytes only on A and C, B lacks them | Verify fixture and on-disk bindings before the stop; actually stop A abruptly; B or C takes over without A; read the exact C version; a new B/C W=2, N=3 write commits; A's membership and copy facts, desired N and the durable deficit remain. |
+| Write-set member unavailable, primary alive | The primary removes it, writes continue at or above the W floor, and the member rejoins after catching up. |
+| Live old primary partitioned | Attempts on both sides; quorum-side takeover; the old side cannot commit, including after restart and with delayed messages; its stale reads end when it learns of the replacement. |
+| Slow but reachable primary | Replies delayed by several hundred milliseconds or more never start a takeover or a shrink. |
+| Concurrent candidates | Exactly one swap wins, the others follow it, and no promise is left blocking either the winner or a primary that kept its role. |
+| Crash or lost reply at prepare, commit and transfer | Cut each durable boundary; a retry with the same operation id returns the committed result or completes the change once; nothing is applied twice. |
+| Follower with a longer unacknowledged tail | It drops the tail past epoch start or installs a snapshot; acknowledged changes are unaffected. |
+| Write set at the W floor loses another member | Writes wait; a recruit catches up and joins; writes resume; the dead member is removed only after that. |
+| Open W=2, N=3 write with two chosen targets offline | Reachable admitted substitutes receive the bytes, the write commits and repair restores N. Required and pinned targets are never substituted. |
+| Repeated reconnect | Matching prefixes and content are reused; bounded missing transfer; membership and copies retained; no churn, wholesale rewrite or failback. |
+| W=1 bytes only on A, A unavailable | Affected content is explicitly unavailable; unrelated objects stay readable and writable under valid authority. |
+| Mobile members | A mobile member is not chosen as a metadata replica while enough non-mobile members exist. |
 
 Native and disposable process/transport/disk tests must cut the real ownership,
 persistence and reply boundaries. Preserve failed roots, exact source/artifact
