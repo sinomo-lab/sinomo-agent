@@ -398,6 +398,143 @@ fn hosted_browser_routes_file_work_without_a_private_native_metadata_image() {
     runtime.close().unwrap();
 }
 
+/// A browser write beneath an existing parent asks its authorities with
+/// batched reads and one write. It routes no recursive creation, no
+/// per-component lookups and no read of a stat its response does not carry.
+#[test]
+fn browser_write_beneath_existing_parent_routes_batched_reads_and_one_write() {
+    use crate::{DfsNamespaceOperation, DfsNetworkMessage};
+
+    const ROOT: &str = "/services/browser-write-round-trips";
+    const FIRST: &str = "/services/browser-write-round-trips/a/b/first.bin";
+    const SECOND: &str = "/services/browser-write-round-trips/a/b/second.bin";
+    let (runtime, nodes) = native_browser_runtime("native-browser-write-round-trips", 3);
+    let services = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let primary = services.primary_node_id.clone();
+    native_browser_policy(
+        &runtime.shared_control_plane().unwrap(),
+        ROOT,
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 2, 2).unwrap(),
+    );
+    let data = Arc::new(runtime.data_dir(&primary).clone());
+    let handle = runtime.runtime_handle();
+    let host = dfs_browser_component_host(&data).unwrap();
+    handle.block_on(async {
+        tokio::time::timeout(
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            host.ensure_write_configuration_ready(&data, &handle),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    let backend = DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &handle).unwrap();
+    assert!(
+        backend
+            .lock_service()
+            .unwrap()
+            .transport
+            .delegates_local_namespace_authority()
+    );
+    let write = |path: &str, bytes: &[u8]| {
+        backend
+            .write_file(DaemonDfsBrowserWriteFileRequest {
+                path: path.into(),
+                bytes: bytes.to_vec(),
+            })
+            .unwrap();
+    };
+    // The first write creates the missing parent chain.
+    write(FIRST, b"first original");
+
+    let served = |action: &dyn Fn()| {
+        let captures = nodes
+            .iter()
+            .map(|node| runtime.capture_served_work(node, 32).unwrap())
+            .collect::<Vec<_>>();
+        action();
+        let mut operations = Vec::new();
+        let mut writes = 0usize;
+        for capture in &captures {
+            for work in capture.records() {
+                match work.command.routed_message.message {
+                    DfsNetworkMessage::NamespaceRequest(command) => {
+                        operations.push(command.operation)
+                    }
+                    DfsNetworkMessage::DistributedWriteRequest(_)
+                    | DfsNetworkMessage::ExclusiveCreateRequest(_) => writes += 1,
+                    _ => {}
+                }
+            }
+        }
+        (operations, writes)
+    };
+    for (label, path, bytes) in [
+        ("overwrite", FIRST, b"first replacement".as_slice()),
+        ("create", SECOND, b"second original".as_slice()),
+    ] {
+        let (operations, writes) = served(&|| write(path, bytes));
+        assert_eq!(
+            writes, 1,
+            "{label}: one routed write, served {operations:?}"
+        );
+        let lookups = operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    DfsNamespaceOperation::LookupPath { .. }
+                        | DfsNamespaceOperation::LookupPaths { .. }
+                )
+            })
+            .count();
+        // Planning an overwrite reads the current head once, from the shard
+        // its resolved path names rather than from every shard in turn.
+        let heads = operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    DfsNamespaceOperation::MetadataQuery { query }
+                        if query.shard_id.0 == "services"
+                            && matches!(
+                                query.selection,
+                                crate::DfsMetadataSelection::CurrentObject { .. }
+                            )
+                )
+            })
+            .count();
+        assert!(heads <= 1, "{label}: one current-head read: {operations:?}");
+        assert_eq!(
+            lookups + heads,
+            operations.len(),
+            "{label}: a write beneath an existing parent routes reads only: {operations:?}"
+        );
+        // One batch for the components in the path's shard, and one exact
+        // lookup for the lone component its parent shard owns.
+        assert!(
+            lookups <= 2,
+            "{label}: components resolve in batches per shard: {operations:?}"
+        );
+        let mut stored = backend.lock_service().unwrap();
+        assert_eq!(stored.posix_read_file_distributed(path).unwrap(), bytes);
+        let stat = stored.posix_stat_distributed(path).unwrap();
+        assert_eq!(
+            stat.current_locations.len(),
+            2,
+            "{label}: the commit publishes both W receipts: {stat:?}"
+        );
+    }
+    drop(backend);
+    drop(host);
+    runtime.close().unwrap();
+}
+
 #[test]
 fn browser_parent_exact_hint_does_not_recreate_a_confirmed_deleted_parent() {
     browser_parent_hint_deletion_control(false);

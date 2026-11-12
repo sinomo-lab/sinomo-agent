@@ -729,12 +729,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(confirmed_locations.into_iter().collect())
     }
 
-    /// Publish one receipt at the slot generation its evidence was planned
-    /// against. A later withdrawal makes this a typed
-    /// [`DfsError::ReceiptGenerationSuperseded`]; the metadata writer enforces
-    /// the same compare when the publication is prepared and committed. An
-    /// already present receipt at that generation publishes nothing new.
-    pub(crate) fn put_metadata_receipt(
+    /// The object a receipt belongs to, after the admission checks every
+    /// receipt publication starts with: no conflicting receipt, the object's
+    /// actual filesystem, and a slot generation unchanged since the receipt's
+    /// evidence was planned.
+    pub(crate) fn metadata_receipt_object_at_generation(
         &mut self,
         file_system_id: &DfsFileSystemId,
         object_id: &DfsObjectId,
@@ -742,7 +741,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_id: &NodeId,
         content_hash: &str,
         generation: u64,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<DfsObjectMetadata, DfsError> {
         self.ensure_metadata_receipt_accepts(object_id, version, replica_node_id, content_hash)?;
         let object = self.current_object_for_write(object_id)?;
         if object.file_system_id != *file_system_id {
@@ -760,6 +759,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 current,
             });
         }
+        Ok(object)
+    }
+
+    /// Whether the commit this receipt makes ready publishes the receipt
+    /// itself. The commit publication seals every durable receipt at its
+    /// planned slot generation together with the visible head, so a receipt
+    /// that completes W for an open default publication needs no publication
+    /// of its own before that commit.
+    pub(crate) fn commit_publishes_completing_receipt(
+        &self,
+        intent_id: &str,
+        replica_node_id: &NodeId,
+    ) -> Result<bool, DfsError> {
+        let Some(intent) = self.coordinator.intent(intent_id) else {
+            return Ok(false);
+        };
+        if intent.state != DfsWriteIntentState::AwaitingReceipts
+            || !intent.publication.is_default_current()
+            || !self.writes.pending_writes.contains_key(intent_id)
+        {
+            return Ok(false);
+        }
+        let receipts = self.coordinator.receipts_for_intent(intent_id);
+        let already_counted = receipts
+            .iter()
+            .any(|receipt| receipt.replica_node_id == *replica_node_id);
+        if already_counted
+            || receipts.len() + 1 < intent.policy.min_commit_replicas
+            || !intent.desired_replica_nodes.contains(replica_node_id)
+        {
+            return Ok(false);
+        }
+        self.can_commit_ready_intent_batched(intent)
+    }
+
+    /// Publish one receipt at the slot generation its evidence was planned
+    /// against. A later withdrawal makes this a typed
+    /// [`DfsError::ReceiptGenerationSuperseded`]; the metadata writer enforces
+    /// the same compare when the publication is prepared and committed. An
+    /// already present receipt at that generation publishes nothing new.
+    pub(crate) fn put_metadata_receipt(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+        content_hash: &str,
+        generation: u64,
+    ) -> Result<bool, DfsError> {
+        let object = self.metadata_receipt_object_at_generation(
+            file_system_id,
+            object_id,
+            version,
+            replica_node_id,
+            content_hash,
+            generation,
+        )?;
         let existing = self.backend_receipt_for_replica(object_id, version, replica_node_id)?;
         let mut effects = Vec::new();
         let inserted = existing.is_none();

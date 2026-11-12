@@ -963,14 +963,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &response.intent_id,
                             content_hash,
                         )?;
-                        if let Err(error) = service.put_metadata_receipt(
-                            &response.file_system_id,
-                            &response.object_id,
-                            &response.version,
-                            &response.replica_node_id,
-                            content_hash,
-                            response.receipt_generation,
-                        ) {
+                        // A receipt that completes W is published by the commit
+                        // it makes ready, in the same publication as the visible
+                        // head. It passes the same admission checks here and is
+                        // published on its own below only if that commit did not
+                        // carry it.
+                        let commit_publishes_receipt = service
+                            .commit_publishes_completing_receipt(
+                                &response.intent_id,
+                                &response.replica_node_id,
+                            )?;
+                        let admitted = if commit_publishes_receipt {
+                            service
+                                .metadata_receipt_object_at_generation(
+                                    &response.file_system_id,
+                                    &response.object_id,
+                                    &response.version,
+                                    &response.replica_node_id,
+                                    content_hash,
+                                    response.receipt_generation,
+                                )
+                                .map(drop)
+                        } else {
+                            service
+                                .put_metadata_receipt(
+                                    &response.file_system_id,
+                                    &response.object_id,
+                                    &response.version,
+                                    &response.replica_node_id,
+                                    content_hash,
+                                    response.receipt_generation,
+                                )
+                                .map(drop)
+                        };
+                        if let Err(error) = admitted {
                             if !matches!(error, DfsError::ReceiptGenerationSuperseded { .. }) {
                                 return Err(error);
                             }
@@ -1016,8 +1042,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &response.replica_node_id,
                             )?;
                         } else {
-                            service
-                                .try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+                            let applied = service
+                                .try_apply_committed_intent_if_ready(&updated_intent.intent_id);
+                            if commit_publishes_receipt
+                                && service
+                                    .backend_receipt_for_replica(
+                                        &response.object_id,
+                                        &response.version,
+                                        &response.replica_node_id,
+                                    )?
+                                    .is_none()
+                            {
+                                // The commit did not publish. Keep the receipt
+                                // as durable evidence for the write's recovery,
+                                // exactly as a receipt short of W is kept. A
+                                // slot withdrawn meanwhile ends this attempt.
+                                match service.put_metadata_receipt(
+                                    &response.file_system_id,
+                                    &response.object_id,
+                                    &response.version,
+                                    &response.replica_node_id,
+                                    content_hash,
+                                    response.receipt_generation,
+                                ) {
+                                    Ok(_) => {}
+                                    Err(DfsError::ReceiptGenerationSuperseded { .. }) => {
+                                        service.coordinator.withdraw_durable_receipt(
+                                            &response.intent_id,
+                                            &response.replica_node_id,
+                                        )?;
+                                        service.record_stage_retry_scheduled(
+                                            &response.intent_id,
+                                            &response.replica_node_id,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        applied?;
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                            applied?;
                         }
                         service.send_untracked_completed_routed_write_response_if_committed(
                             &updated_intent.intent_id,

@@ -625,6 +625,82 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Fetch the components of one path walk that only their shard authority
+    /// can answer, one batched lookup per shard instead of one routed lookup
+    /// per component. Answers are retained for the active lookup-cache scope
+    /// and consumed by the exact-path lookup, which still records each
+    /// component the walk actually selects. The final component is included
+    /// even when the walk does not follow it, because its caller selects that
+    /// exact entry next. This is purely an optimization:
+    /// without a scope, with dot components, or when a batch fails, the walk
+    /// routes its components individually and reports their errors itself.
+    pub(super) fn prefetch_routed_walk_components(
+        &mut self,
+        components: &[String],
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) {
+        let Some(shards) = shard_snapshot else {
+            return;
+        };
+        if !self.metadata_lookup_cache_is_active()
+            || components
+                .iter()
+                .any(|component| matches!(component.as_str(), "." | ".."))
+        {
+            return;
+        }
+        let mut by_shard = std::collections::BTreeMap::<String, (NodeId, Vec<String>)>::new();
+        let mut candidate = "/".to_string();
+        for component in components {
+            candidate = crate::posix_path::join_posix_path(&candidate, component);
+            if self.cached_routed_lookup(&candidate).is_some() {
+                continue;
+            }
+            let Ok(Some(shard)) =
+                self.routed_namespace_shard_for_path_from_snapshot(&candidate, shards)
+            else {
+                continue;
+            };
+            if self.reads_shard_from_local_metadata(&shard) {
+                continue;
+            }
+            by_shard
+                .entry(shard.shard_id)
+                .or_insert_with(|| (shard.primary_node_id, Vec::new()))
+                .1
+                .push(candidate.clone());
+        }
+        let file_system_id = sifs_file_system_id();
+        for (_, (primary_node_id, paths)) in by_shard {
+            if paths.len() < 2 {
+                continue;
+            }
+            let Ok(objects) = self.route_namespace_lookup_paths_to_metadata_primary(
+                file_system_id.clone(),
+                primary_node_id,
+                paths.clone(),
+                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+            ) else {
+                continue;
+            };
+            // The reply also carries hardlink-target routing hints; only a
+            // record at a requested path answers that path, and a requested
+            // path without one is absent at its authority.
+            let mut found = std::collections::BTreeMap::new();
+            for object in objects {
+                if object.file_system_id == file_system_id {
+                    found
+                        .entry(crate::namespace::metadata_path(&object.path))
+                        .or_insert(object);
+                }
+            }
+            for path in paths {
+                let object = found.remove(&crate::namespace::metadata_path(&path));
+                self.remember_routed_lookup(&path, &object);
+            }
+        }
+    }
+
     /// Record only the lookup result used by the caller. A speculative local
     /// fallback does not replace the original predicate of a previous read.
     pub(super) fn record_selected_synced_path(
@@ -667,11 +743,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.lookup_sifs_path_without_shard_authority(&path);
         };
         if !self.reads_shard_from_local_metadata(&shard) {
+            // One request resolves, validates its parent and selects its
+            // target from the same authority observation instead of routing
+            // each step again. The observation remains a planning predicate:
+            // the authority re-checks it when it admits the mutation.
+            if let Some(object) = self.cached_routed_lookup(&path) {
+                return Ok(self.record_selected_synced_path(&path, object));
+            }
             let (object, _) = self.route_namespace_lookup_to_metadata_primary(
                 shard.primary_node_id.clone(),
                 &path,
                 None,
             )?;
+            self.remember_routed_lookup(&path, &object);
             return Ok(self.record_selected_synced_path(&path, object));
         }
         let local_object = self.lookup_sifs_path_speculatively(&path)?;

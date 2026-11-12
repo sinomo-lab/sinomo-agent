@@ -689,6 +689,13 @@ pub struct NetworkedDfsService<T> {
     pub(crate) metadata_lookup_cache:
         Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
     pub(crate) metadata_lookup_cache_depth: Mutex<usize>,
+    /// Exact-path answers a shard authority gave this service during the
+    /// active lookup-cache scope. It is kept apart from
+    /// `metadata_lookup_cache`, which also holds this service's own store and
+    /// planning overlay: a local row must never answer for the authority.
+    /// Both maps share one scope and are cleared together.
+    pub(crate) routed_lookup_cache:
+        Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
     /// The shard routing cut of the read in progress, so its path walk
     /// resolves every component against the same snapshot as the read.
     pub(crate) read_shard_snapshot: Option<Vec<DfsMetadataShardConfig>>,

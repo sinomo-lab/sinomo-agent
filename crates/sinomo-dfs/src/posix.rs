@@ -360,6 +360,18 @@ fn no_link_write_condition_error(error: DfsPosixError) -> DfsPosixError {
     }
 }
 
+/// What a committed write hands back before its stat is reported. A caller
+/// without a metadata store holds no committed record, so its stat is a
+/// separate read at the authorities which a caller discarding it never pays.
+enum PosixWriteCommit {
+    Stat(DfsStat),
+    AuthorityHead {
+        file_system_id: crate::DfsFileSystemId,
+        object_id: DfsObjectId,
+        path: String,
+    },
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn with_posix_commit_operation_deadline<R>(
         &mut self,
@@ -3325,6 +3337,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: Option<String>,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_write_file_bytes_checked_parent_attempts(
+            path,
+            bytes,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            replay_response_journal,
+            create_attrs,
+            exclusive_create,
+            follow_final_for_exclusive_create,
+            operation_id,
+            true,
+        )?
+        .ok_or_else(|| DfsPosixError::Conflict {
+            path: path.to_string(),
+            reason: "committed write did not report its stat".into(),
+        })
+    }
+
+    /// Commit a write whose caller discards the resulting stat. The commit,
+    /// its parent validation and its durability are those of
+    /// [`Self::posix_write_file`]; only the report is omitted, which for a
+    /// caller without a metadata store is a separate authoritative read.
+    pub(crate) fn posix_write_file_committed(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<()> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        self.posix_write_file_bytes_checked_parent_attempts(
+            path, bytes, options, true, true, true, None, false, false, None, false,
+        )
+        .map(drop)
+    }
+
+    /// Run write attempts until one commits. `report_stat` selects whether the
+    /// committed head is reported; `None` is returned exactly when it is not.
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_bytes_checked_parent_attempts(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        replay_response_journal: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        follow_final_for_exclusive_create: bool,
+        operation_id: Option<String>,
+        report_stat: bool,
+    ) -> Result<Option<DfsStat>> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
         if let Some(operation_id) = operation_id.as_deref() {
             crate::service_routed_write::validate_write_operation_id(operation_id)?;
         }
@@ -3348,7 +3414,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // within one attempt; every metadata mutation below clears the
                 // cache before later reads can observe stale state.
                 let attempt = self.with_metadata_lookup_cache_mut(|service| {
-                    service.posix_write_file_bytes_checked_parent_once_with_operation_id(
+                    let commit = service.posix_write_file_bytes_once_commit(
                         path,
                         bytes,
                         options.clone(),
@@ -3363,7 +3429,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         operation_id.as_deref(),
                         None,
                         Default::default(),
-                    )
+                    )?;
+                    if report_stat {
+                        service.posix_write_commit_stat(commit).map(Some)
+                    } else {
+                        Ok(None)
+                    }
                 });
                 match attempt {
                     Ok(stat) => return Ok(stat),
@@ -3373,6 +3444,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 && posix_error_is_concurrent_create_winner(&error)) =>
                     {
                         self.check_cancelled("POSIX blind-write serialization retry")?;
+                        // A caller's enclosing lookup scope outlives this
+                        // attempt; the retry must plan from fresh observations.
+                        self.clear_metadata_lookup_cache();
                         let now = Instant::now();
                         if now >= write_deadline {
                             return Err(error);
@@ -3454,6 +3528,64 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         opened_parent: Option<&DfsObjectMetadata>,
         publication: crate::DfsWritePublication,
     ) -> Result<DfsStat> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        let commit = self.posix_write_file_bytes_once_commit(
+            path,
+            bytes,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            replay_response_journal,
+            create_attrs,
+            exclusive_create,
+            follow_final_for_exclusive_create,
+            expected_existing,
+            resolve_links,
+            operation_id,
+            opened_parent,
+            publication,
+        )?;
+        self.posix_write_commit_stat(commit)
+    }
+
+    /// The stat a committed write reports. A caller without a metadata store
+    /// reads the committed head and its link count from the authorities.
+    fn posix_write_commit_stat(&mut self, commit: PosixWriteCommit) -> Result<DfsStat> {
+        match commit {
+            PosixWriteCommit::Stat(stat) => Ok(stat),
+            PosixWriteCommit::AuthorityHead {
+                file_system_id,
+                object_id,
+                path,
+            } => self.with_stat_deadline(|service| {
+                let authoritative = service
+                    .current_object_from_authority(&file_system_id, &object_id)?
+                    .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                service.with_stat_read_rounds(|service| {
+                    service.stat_object_from_authorities(&authoritative, &path, None)
+                })
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_bytes_once_commit(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        replay_response_journal: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        follow_final_for_exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        resolve_links: bool,
+        operation_id: Option<&str>,
+        opened_parent: Option<&DfsObjectMetadata>,
+        publication: crate::DfsWritePublication,
+    ) -> Result<PosixWriteCommit> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = if resolve_links {
@@ -3811,20 +3943,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // nothing would retire an overlay once the object changes.
                     if self.metadata_backend.is_none() {
                         self.remove_transient_object_metadata(&object.object_id);
-                        return self.with_stat_deadline(|service| {
-                            let authoritative = service
-                                .current_object_from_authority(
-                                    &object.file_system_id,
-                                    &object.object_id,
-                                )?
-                                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                            service.with_stat_read_rounds(|service| {
-                                service.stat_object_from_authorities(&authoritative, &path, None)
-                            })
+                        return Ok(PosixWriteCommit::AuthorityHead {
+                            file_system_id: object.file_system_id,
+                            object_id: object.object_id,
+                            path,
                         });
                     }
                     let authoritative = self.stat_target_for_path(&path)?;
-                    return self.stat_object_for_path(&authoritative, &path);
+                    return self
+                        .stat_object_for_path(&authoritative, &path)
+                        .map(PosixWriteCommit::Stat);
                 }
                 let mut committed_object = object.clone();
                 committed_object.version = version;
@@ -3856,11 +3984,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 if !options.foreground_replica_repair {
                     if transient_create && remote_metadata_primary {
-                        return self.committed_write_stat(&path);
+                        return self.committed_write_stat(&path).map(PosixWriteCommit::Stat);
                     }
-                    return self.stat_object_for_path(&committed_object, &path);
+                    return self
+                        .stat_object_for_path(&committed_object, &path)
+                        .map(PosixWriteCommit::Stat);
                 }
-                self.committed_write_stat(&path)
+                self.committed_write_stat(&path).map(PosixWriteCommit::Stat)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
@@ -3896,6 +4026,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 let _ = (intent_id, durable_receipts, required_receipts);
                 self.stat_object_for_path(&pending_object, &path)
+                    .map(PosixWriteCommit::Stat)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
@@ -3910,7 +4041,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         required_receipts,
                     });
                 }
-                Ok(DfsStat {
+                Ok(PosixWriteCommit::Stat(DfsStat {
                     file_system_id: object.file_system_id,
                     path,
                     object_id: object.object_id,
@@ -3930,7 +4061,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .map(|manifest| manifest.content_hash.clone()),
                     policy: object.policy,
                     current_locations: object.current_locations,
-                })
+                }))
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
