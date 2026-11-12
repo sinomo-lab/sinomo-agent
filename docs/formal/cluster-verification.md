@@ -60,8 +60,8 @@ The model inventory is split by subsystem:
     `canonical_write_eligibility`, `whole_shard`,
     `operation_authority_snapshot_reuse`, `authority_routing`,
     `read_freshness`, `routed_namespace_freshness`,
-    `metadata_primary_failover` (local failover-target selection), and
-    `no_conflict`;
+    `metadata_primary_failover` (local failover-target selection),
+    `no_conflict`, and the target `metadata_write_set_takeover`;
   - metadata journal and storage: `metadata_journal_source`,
     `metadata_journal_tail_recovery`, `metadata_stale_head_reopen`,
     `metadata_ack_floor_log`, `authored_journal_batch`,
@@ -104,6 +104,7 @@ The model inventory is split by subsystem:
   Each model has a matching `checks/dfs/<stem>_safety.qnt` invariant suite.
   `scenarios/dfs/` holds deterministic canonical-write handoff and
   historical canonical-write traces, the ten registered whole-shard scenarios,
+  write-set takeover traces and counterexamples,
   pending-read identity, advisory-lock fencing, file-sync and
   directory-generation recovery, complete-holder/quorum-repair partitions,
   cross-shard retry exhaustion, local-first file/namespace reconciliation,
@@ -582,6 +583,63 @@ The older canonical-write and union-sync slices described adjacent to this
 section retain historical target assumptions, including degraded KV coupling.
 They are not current ordinary-publication conformance evidence. This bounded
 correction does not silently relabel those older models as implemented behavior.
+
+### Shard write sets and automatic takeover
+
+The `dfs-metadata-write-set-takeover` case is **target hardening** for the
+[abrupt-loss availability plan](../plans/dfs-abrupt-loss-availability.md); no
+Rust path implements it yet. State and actions live in
+`models/dfs/metadata_write_set_takeover.qnt`, invariants and witnesses in
+`checks/dfs/metadata_write_set_takeover_safety.qnt`, and deterministic traces in
+`scenarios/dfs/metadata_write_set_takeover.qnt`.
+
+The bound is one shard, four possible members, three values, W floor 2, N 3
+and three epochs. Cluster KV is a linearizable compare-and-swap register over
+the whole shard record: primary, epoch, generation, members, write set and
+epoch start. A commit needs a current-epoch acknowledgement from every
+write-set member the primary knows of and every member it has submitted to add.
+Shrink, add, recruitment, retirement and takeover are guarded transactions on
+that record. A submitted add or swap may apply or abort later, and its
+submitter learns the outcome separately. Takeover, shrink and recruitment are
+enabled whenever their guards allow, independent of the network verdicts that
+trigger them in the design, so safety does not depend on failure detection.
+Journals, fences, promises and pending adds survive crashes. A follower that
+accepts a primary's journal replaces its own, which stands for incremental
+catch-up, dropping an unacknowledged tail and snapshot install.
+
+`safety` combines these properties:
+
+- reported successes never describe diverging histories;
+- every write-set member holds every committed entry;
+- after a takeover swap, an earlier primary's success covers only entries the
+  successor held when the swap applied, even when that success arrives later
+  from delayed acknowledgements, so epoch start bounds the old history;
+- the record's primary holds every acknowledged change;
+- a shrink never takes the write set below the W floor, and every commit was
+  made with a write set at or above it;
+- the record is well formed, and one activated primary serves each epoch.
+
+The model fixes two rules the design depends on. Catch-up evidence for an add
+is an acknowledgement under the current record generation: an older one can
+describe a copy the member has since deleted on retirement. A submitted add
+stays a required acknowledgement, durably, until the record shows it applied or
+can no longer apply.
+
+Three deterministic traces cover the design: abrupt primary loss with a
+successor completing a prepared change and the old primary rejoining after
+dropping its tail; a shrink racing a takeover, with the rejected candidate
+releasing its promise and being re-added; and a primary restart with a pending
+add, after which the added member takes over. Six counterexamples each enable
+one broken variant and must reach the violation its invariant detects: a swap
+that compares only the epoch, a candidate outside the write set, an add without
+catch-up, a commit that ignores a submitted add, a pending add lost on restart,
+and a takeover without the promise. The last loses nothing, because the
+successor still holds the records, but epoch start no longer bounds the old
+history. Replaying each counterexample under the design stops at its guarded
+step. The registered random run uses `coverageStep`, which weights replication
+and takeover actions; `step` is the unweighted transition relation for symbolic
+checks. The symbolic case is deep-tier. The model omits liveness, reads,
+content placement, storage bytes and transport.
 
 The `dfs_metadata_handoff_union_sync_safety.safety` invariant isolates the
 older, stronger exact-union sync primitive after the retiring-primary fence.

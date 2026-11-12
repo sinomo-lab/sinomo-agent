@@ -1,7 +1,8 @@
 # DFS abrupt-node-loss and reconnection availability
 
-Status: proposed. The current implementation does not meet these requirements;
-[Current behavior](#current-behavior) lists the differences.
+Status: proposed. The protocol model exists; the current implementation does not
+meet these requirements, and [Current behavior](#current-behavior) lists the
+differences.
 
 The required behavior is one safe metadata history through abrupt node loss,
 with content W kept separate from desired N and metadata authority. When a
@@ -172,15 +173,16 @@ A candidate is a write-set member that can commit to cluster KV.
    cannot, it is not in quorum and stops.
 3. **Promise.** The candidate durably records that it accepts nothing more from
    the old primary at the current epoch, serialized with its acknowledgement
-   path. From then on the old primary cannot complete a commit, because each one
-   needs this member.
+   path. From then on the old primary cannot commit anything this member does
+   not already hold, because each commit needs this member's acknowledgement.
 4. **Swap.** One guarded KV transaction: if the record still matches what the
    candidate read, the candidate becomes primary, the epoch advances, the old
    primary leaves the write set and epoch start becomes the candidate's journal
    position. If another change won, the candidate follows it. An unknown outcome
-   is reconciled from the record before the candidate acts. The candidate
-   releases its promise only when its own takeover did not happen and the old
-   primary is still primary.
+   is settled from the transaction's own outcome before the candidate acts;
+   re-reading the record cannot tell a lost swap from one that may still apply.
+   The candidate releases its promise only when its own swap was rejected and
+   the old primary is still primary.
 5. **Activate.** The candidate rebinds its existing store to the new epoch and
    republishes every prepared change it holds through prepared-change recovery,
    so changes the old primary may already have committed complete with the same
@@ -197,7 +199,8 @@ A candidate is a write-set member that can commit to cluster KV.
 Every write-set and primary change is one guarded transaction on the same record,
 so these changes are totally ordered. The winning candidate was in the write set,
 so it holds every acknowledged change. It stopped accepting the old primary's
-records before the swap, so the old primary cannot complete a commit afterwards.
+records before the swap, so anything the old primary still commits afterwards,
+from acknowledgements already sent, is in the candidate's journal at epoch start.
 Nothing from the old primary is needed.
 
 ### Keeping W
@@ -208,9 +211,12 @@ Nothing from the old primary is needed.
   wait until it returns or a recruit replaces it. Keeping it there also keeps it
   eligible to take over.
 - **Re-add.** A returning member keeps its copy and catches up incrementally from
-  its matching prefix. Once it has acknowledged the primary's current journal
-  position, the primary adds it back and requires its acknowledgement from the
-  moment it submits that change.
+  its matching prefix. Once it has acknowledged the primary's whole journal
+  under the current record generation, the primary adds it back; an older
+  acknowledgement can describe a copy the member has since deleted. From the
+  moment the primary submits that change, it durably requires the member's
+  acknowledgement until the record shows the change applied or no longer able
+  to apply.
 - **Recruit.** When the write set has fewer than N members and no out-of-sync
   replica is reachable, the primary adds an eligible metadata-capable member to
   the replicas, preferring non-mobile members. The recruit catches up by
@@ -272,20 +278,24 @@ live primary.
 
 ## Model
 
-Before shard authority changes, model the protocol in Quint with three or four
-members, a few journal entries and these actions: prepare, acknowledge, commit,
-shrink, add, recruit, promise, takeover swap, crash, partition, recovery and
-rejoin. Cluster KV is a linearizable compare-and-swap register. Required
-invariants:
+The protocol is modeled in Quint before shard authority changes, with four
+possible members, a few journal entries and these actions: prepare,
+acknowledge, commit, shrink, add, recruit, retire, promise, takeover swap,
+crash, partition, recovery and rejoin. Cluster KV is a linearizable
+compare-and-swap register. Required invariants:
 
 - committed histories never diverge;
 - every write-set member holds every committed entry;
-- after a takeover swap, the old primary commits nothing;
+- after a takeover swap, the old primary commits nothing the successor did not
+  hold when the swap applied, even from delayed acknowledgements;
 - no acknowledged change is lost across any sequence of takeovers;
 - a shrink never takes the write set below the W floor.
 
-Liveness, storage and transport stay outside the model and are covered by native
-tests.
+Without the promise nothing is lost, because the successor still holds what it
+accepts, but epoch start no longer bounds the old primary's history. Liveness,
+storage and transport stay outside the model and are covered by native tests.
+The [formal verification reference](../formal/cluster-verification.md#shard-write-sets-and-automatic-takeover)
+describes the model, its deterministic traces and its counterexamples.
 
 ## Implementation order
 
