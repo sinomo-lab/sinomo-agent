@@ -4151,6 +4151,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<(DfsNamespaceCommand, PendingRoutedNamespaceOp), DfsError> {
+        // A routed request other than a read can change what its authority
+        // answers, on a request shell that cannot reach this caller's
+        // lookup-cache scope. Drop earlier observations before dispatch.
+        if !matches!(
+            operation,
+            DfsNamespaceOperation::LookupPath { .. }
+                | DfsNamespaceOperation::LookupPaths { .. }
+                | DfsNamespaceOperation::MetadataQuery { .. }
+                | DfsNamespaceOperation::PollNamespaceChanges { .. }
+        ) {
+            self.clear_metadata_lookup_cache();
+        }
         // A caller sharing Main's store cannot ingest a mutation reply, even
         // when another node owns this shard. Main owns all physical persistence;
         // returned objects and typed results still travel on the original call.

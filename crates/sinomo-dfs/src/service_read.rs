@@ -440,6 +440,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 None => None,
             },
         };
+        // A service holding no record of the object may have just resolved its
+        // path at an authority. That path names the shard to ask first; the
+        // record itself is still read from the authority.
+        let local = local.or_else(|| self.routed_lookup_path_of_object(object_id));
         let file_system_id = match (&local, file_system_hint) {
             (Some((file_system_id, _)), _) => file_system_id.clone(),
             (None, Some(file_system_id)) => file_system_id.clone(),

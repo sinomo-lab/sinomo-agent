@@ -295,6 +295,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
+    /// Whether `path` resolves to a directory at its metadata authority. This
+    /// is a read-only hint for deciding whether recursive creation is needed:
+    /// a failed or unanswered read is `false`, and the mutation that follows
+    /// is still validated by the authority that admits it.
+    pub(crate) fn posix_directory_observed_at_authority(&mut self, path: &str) -> bool {
+        self.with_metadata_lookup_cache_mut(|service| {
+            service.resolve_posix_path_distributed_with_terminal_object(path)
+        })
+        .is_ok_and(|(_, object)| {
+            object.is_some_and(|object| object.kind == DfsObjectKind::Directory)
+        })
+    }
+
     /// Policy of the object a write to `path` would replace, or `None` when
     /// nothing exists there yet. A node whose durable store replicates the
     /// path's shard uses that view; any other asks the shard's authority, since

@@ -61,6 +61,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             metadata_backend: None,
             metadata_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
             metadata_lookup_cache_depth: std::sync::Mutex::new(0),
+            routed_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
             read_shard_snapshot: None,
             passive_fetch_started_at: BTreeMap::new(),
             pending_routed_namespace_ops: BTreeMap::new(),
@@ -139,6 +140,64 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn clear_metadata_lookup_cache(&self) {
         if let Ok(mut cache) = self.metadata_lookup_cache.lock() {
             cache.clear();
+        }
+        if let Ok(mut cache) = self.routed_lookup_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    /// The authority's answer for an exact path already routed in the active
+    /// lookup-cache scope: `Some(None)` is an observed absence.
+    pub(crate) fn cached_routed_lookup(
+        &self,
+        path: &str,
+    ) -> Option<Option<crate::DfsObjectMetadata>> {
+        if !self.metadata_lookup_cache_is_active() {
+            return None;
+        }
+        let key = (
+            crate::sifs_file_system_id(),
+            crate::namespace::metadata_path(path),
+        );
+        self.routed_lookup_cache.lock().ok()?.get(&key).cloned()
+    }
+
+    /// The filesystem and path at which an authority showed `object_id`
+    /// during the active lookup-cache scope. It is a routing hint only.
+    pub(crate) fn routed_lookup_path_of_object(
+        &self,
+        object_id: &crate::DfsObjectId,
+    ) -> Option<(crate::DfsFileSystemId, String)> {
+        if !self.metadata_lookup_cache_is_active() {
+            return None;
+        }
+        self.routed_lookup_cache
+            .lock()
+            .ok()?
+            .values()
+            .flatten()
+            .find(|object| object.object_id == *object_id)
+            .map(|object| (object.file_system_id.clone(), object.path.clone()))
+    }
+
+    /// Retain an authority's exact-path answer for the active scope. Outside
+    /// a scope every lookup routes, so nothing is retained.
+    pub(crate) fn remember_routed_lookup(
+        &self,
+        path: &str,
+        object: &Option<crate::DfsObjectMetadata>,
+    ) {
+        if !self.metadata_lookup_cache_is_active() {
+            return;
+        }
+        if let Ok(mut cache) = self.routed_lookup_cache.lock() {
+            cache.insert(
+                (
+                    crate::sifs_file_system_id(),
+                    crate::namespace::metadata_path(path),
+                ),
+                object.clone(),
+            );
         }
     }
 

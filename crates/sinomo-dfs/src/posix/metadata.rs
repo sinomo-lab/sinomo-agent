@@ -488,6 +488,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .filter(|component| !component.is_empty())
                 .map(str::to_string)
                 .collect::<Vec<_>>();
+            self.prefetch_routed_walk_components(&components, target_shard_snapshot.as_deref());
             let mut resolved = "/".to_string();
             let mut known_live_ancestors = false;
             let mut observed = capture_components.then(|| Vec::with_capacity(components.len()));

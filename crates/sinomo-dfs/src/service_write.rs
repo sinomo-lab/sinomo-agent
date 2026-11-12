@@ -2653,6 +2653,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsDistributedWriteCommand,
         attachment_bytes: Option<bytes::Bytes>,
     ) -> Result<(NetworkedDfsWriteOutcome, PreviousRoutedWriteState), DfsError> {
+        // The authority may publish this write before any reply arrives, so
+        // earlier lookup observations no longer describe its namespace.
+        self.clear_metadata_lookup_cache();
         self.prune_retained_routed_writes();
         let earlier_unresolved = self
             .writes

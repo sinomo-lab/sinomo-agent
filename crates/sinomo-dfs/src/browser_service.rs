@@ -1413,27 +1413,35 @@ impl DfsBrowserBackend {
                 return Ok(DfsBrowserWriteAttempt::ConfigurationPending(request));
             }
         };
-        prepare_sifs_browser_write_parent(&mut service, &path)
-            .map_err(dfs_browser_service_error)?;
-        let mkdir_us = phase_elapsed();
-        let replica_candidates = match configuration.as_deref() {
-            Some(configuration) => configuration
-                .content_replica_candidates()
-                .map_err(dfs_browser_service_error)?,
-            None => self.content_replica_candidates()?,
-        };
-        let candidates_us = phase_elapsed();
-        let options = sifs_browser_write_options_with_configuration(
-            &mut service,
-            &path,
-            &replica_candidates,
-            configuration.as_deref(),
-        )?;
-        let options_us = phase_elapsed();
-        service
-            .posix_write_file(&path, &request.bytes, options)
-            .map_err(dfs_browser_service_error)?;
-        let write_us = phase_elapsed();
+        // Parent preparation, policy selection and the write resolve the same
+        // path. One lookup scope lets them share each authority observation;
+        // any routed mutation among them discards the earlier observations.
+        let (mkdir_us, candidates_us, options_us, write_us) = service
+            .with_metadata_lookup_cache_mut(|service| -> Result<_, ServiceError> {
+                prepare_sifs_browser_write_parent(service, &path)
+                    .map_err(dfs_browser_service_error)?;
+                let mkdir_us = phase_elapsed();
+                let replica_candidates = match configuration.as_deref() {
+                    Some(configuration) => configuration
+                        .content_replica_candidates()
+                        .map_err(dfs_browser_service_error)?,
+                    None => self.content_replica_candidates()?,
+                };
+                let candidates_us = phase_elapsed();
+                let options = sifs_browser_write_options_with_configuration(
+                    service,
+                    &path,
+                    &replica_candidates,
+                    configuration.as_deref(),
+                )?;
+                let options_us = phase_elapsed();
+                // The response carries no metadata, so the committed stat is
+                // not read back.
+                service
+                    .posix_write_file_committed(&path, &request.bytes, options)
+                    .map_err(dfs_browser_service_error)?;
+                Ok((mkdir_us, candidates_us, options_us, phase_elapsed()))
+            })?;
         self.flush_after_mutation(&mut service)?;
         let flush_us = phase_elapsed();
         if let Some(started) = trace_started {
@@ -3466,6 +3474,13 @@ pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
             .posix_object_metadata_hint(&parent)
             .is_ok_and(|object| object.kind == DfsObjectKind::Directory)
     {
+        return Ok(());
+    }
+    // A caller delegating to its Main has no local view and retains no row
+    // for a parent it merely wrote beneath. Its parent's authority answers
+    // the same question with a read; only a parent that authority does not
+    // show as a directory needs the routed recursive creation.
+    if service.posix_directory_observed_at_authority(&parent) {
         return Ok(());
     }
     service.posix_mkdir_all(&parent)
