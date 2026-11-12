@@ -3833,7 +3833,8 @@ impl ClusterNetworkMaintenance {
 
     /// Evidence no regular probe renews has aged out: remove it from the source
     /// set once, so the source's publication withdraws the committed copy, then
-    /// schedule the next such expiry. Returns how many records left.
+    /// schedule the next such expiry. A failed removal is retried under the
+    /// due-class failure backoff. Returns how many records left.
     async fn remove_expired_unrenewed_connectivity_async(
         &mut self,
         runtime: &tokio::runtime::Handle,
@@ -3852,10 +3853,15 @@ impl ClusterNetworkMaintenance {
                     target: "sinomo.daemon.cluster_network_maintenance",
                     removed, "expired unrenewed connectivity evidence left the source set"
                 );
+                self.cadence.record_unrenewed_removal_success();
                 removed
             }
             Err(error) => {
-                tracing::warn!("sinomo daemon could not remove expired connectivity evidence: {error}");
+                self.cadence.record_unrenewed_removal_failure(Instant::now());
+                tracing::warn!(
+                    failure_streak = self.cadence.unrenewed_removal_failure_streak,
+                    "sinomo daemon could not remove expired connectivity evidence: {error}"
+                );
                 0
             }
         };
@@ -8949,6 +8955,8 @@ mod tests {
                     connectivity_overdue_claimed: false,
                     peer_verification: Default::default(),
                     unrenewed_connectivity_expiry_at: None,
+                    unrenewed_removal_failure_streak: 0,
+                    unrenewed_removal_retry_at: None,
                     $($cadence)*
                 },
                 resource_mode: sinomo_device::NodeResourceMode::Normal,
@@ -18726,6 +18734,129 @@ mod tests {
                 .is_err(),
             "after it left, nothing changes again"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_expiry_removal_is_retried_under_backoff_until_it_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("module_evidence_removal_backoff");
+        let peer = NodeId::from_legacy_named("module_evidence_removal_backoff_peer").expect("peer");
+        let module = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::Id::derived(
+                "test.module.endpoint",
+                "module_evidence_removal_backoff",
+            ),
+            node_id: peer.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://moduleevidenceremovalbackoffkey".to_string(),
+            source: sinomo_core::base::ClusterEndpointSource::Rendezvous,
+            privacy: sinomo_core::base::ClusterEndpointPrivacy::InternetDirect,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            peer,
+            "peer",
+            "pk-peer",
+            OffsetDateTime::now_utc(),
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![module.clone()];
+        state.members.push(member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &[sinomo_core::network::cluster_connectivity_record(
+                &state,
+                &module,
+                ClusterConnectivityState::Healthy,
+                Some(3),
+                0,
+                None,
+                None,
+                OffsetDateTime::now_utc(),
+                1,
+            )],
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(1_200));
+
+        // A store that can be read but not written, as on a disk remounted
+        // read-only.
+        let directory = paths
+            .connectivity_local
+            .parent()
+            .expect("connectivity store directory")
+            .to_path_buf();
+        struct RestoreOnDrop(std::path::PathBuf, std::fs::Permissions);
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        let read_only = RestoreOnDrop(
+            directory.clone(),
+            std::fs::metadata(&directory).unwrap().permissions(),
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(directory.join("write-probe"), b"").is_ok() {
+            let _ = std::fs::remove_file(directory.join("write-probe"));
+            eprintln!("skipped: permissions do not block writes for this user");
+            return;
+        }
+
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        for streak in 1..=3_u32 {
+            let before = Instant::now();
+            assert_eq!(
+                runtime.block_on(maintenance.remove_expired_unrenewed_connectivity_async(
+                    runtime.handle(),
+                    &paths,
+                    &state,
+                )),
+                0
+            );
+            assert_eq!(maintenance.cadence.unrenewed_removal_failure_streak, streak);
+            let backoff = sinomo_core::cluster::cluster_network_due_class_failure_backoff(streak);
+            let wake = maintenance
+                .cadence
+                .unrenewed_connectivity_expiry_at
+                .expect("the expired record still needs removal");
+            assert!(
+                wake >= before + backoff,
+                "failure {streak} retries after its backoff, not at once"
+            );
+            // Observing the same expiry again, as a publication does, never
+            // pulls the attempt earlier.
+            maintenance.observe_unrenewed_connectivity_expiries(&paths, &state);
+            assert!(
+                maintenance
+                    .cadence
+                    .unrenewed_connectivity_expiry_at
+                    .is_some_and(|observed| observed >= wake)
+            );
+        }
+
+        drop(read_only);
+        assert_eq!(
+            runtime.block_on(maintenance.remove_expired_unrenewed_connectivity_async(
+                runtime.handle(),
+                &paths,
+                &state,
+            )),
+            1,
+            "once the store is writable the expired record leaves"
+        );
+        assert_eq!(maintenance.cadence.unrenewed_removal_failure_streak, 0);
+        assert!(maintenance.cadence.unrenewed_removal_retry_at.is_none());
+        assert!(maintenance.cadence.unrenewed_connectivity_expiry_at.is_none());
     }
 
     #[test]

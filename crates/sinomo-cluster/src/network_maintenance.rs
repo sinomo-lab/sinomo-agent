@@ -281,6 +281,11 @@ pub struct ClusterNetworkMaintenanceCadence {
     /// wake at that moment lets the owner remove it from its source set once.
     /// It is not a renewal and never claims a due class.
     pub unrenewed_connectivity_expiry_at: Option<Instant>,
+    /// Consecutive failed removals of expired unrenewed evidence.
+    pub unrenewed_removal_failure_streak: u32,
+    /// After a failed removal, the earliest next attempt. The removal wake
+    /// never lands before it, however often expiries are observed again.
+    pub unrenewed_removal_retry_at: Option<Instant>,
 }
 
 impl ClusterNetworkMaintenanceCadence {
@@ -323,6 +328,8 @@ impl ClusterNetworkMaintenanceCadence {
             active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             peer_verification: ClusterPeerVerificationCadence::default(),
             unrenewed_connectivity_expiry_at: None,
+            unrenewed_removal_failure_streak: 0,
+            unrenewed_removal_retry_at: None,
         }
     }
 
@@ -413,17 +420,36 @@ impl ClusterNetworkMaintenanceCadence {
 
     /// Schedules the one wake for the earliest of `expiries`, accepted records
     /// that no regular probe renews. The wake lands just after the expiry so
-    /// the record has left every view when the owner removes it.
+    /// the record has left every view when the owner removes it, and never
+    /// before a pending removal retry.
     pub fn observe_unrenewed_connectivity_expiries(
         &mut self,
         expiries: impl IntoIterator<Item = OffsetDateTime>,
         wall_now: OffsetDateTime,
         now: Instant,
     ) {
+        let retry_at = self.unrenewed_removal_retry_at;
         self.unrenewed_connectivity_expiry_at = expiries.into_iter().min().map(|expiry| {
             let remaining = Duration::try_from(expiry - wall_now).unwrap_or(Duration::ZERO);
-            now + remaining + CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE
+            let wake = now + remaining + CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE;
+            retry_at.map_or(wake, |retry_at| wake.max(retry_at))
         });
+    }
+
+    /// A removal of expired unrenewed evidence failed: hold the next attempt
+    /// under the due-class failure backoff instead of retrying at the
+    /// already-passed expiry.
+    pub fn record_unrenewed_removal_failure(&mut self, now: Instant) {
+        self.unrenewed_removal_failure_streak =
+            self.unrenewed_removal_failure_streak.saturating_add(1);
+        self.unrenewed_removal_retry_at = now.checked_add(cluster_network_due_class_failure_backoff(
+            self.unrenewed_removal_failure_streak,
+        ));
+    }
+
+    pub fn record_unrenewed_removal_success(&mut self) {
+        self.unrenewed_removal_failure_streak = 0;
+        self.unrenewed_removal_retry_at = None;
     }
 
     /// Consumes the unrenewed-expiry wake when it is due.
@@ -1194,6 +1220,54 @@ mod tests {
         ));
         cadence.observe_unrenewed_connectivity_expiries(None, wall, start);
         assert!(cadence.unrenewed_connectivity_expiry_at.is_none());
+    }
+
+    #[test]
+    fn failed_unrenewed_removal_backs_off_until_it_succeeds() {
+        let start = Instant::now();
+        let wall = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let expired = [wall - time::Duration::seconds(5)];
+        let mut cadence =
+            ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Workstation);
+        cadence.connectivity_converged = true;
+        cadence.last_publish = start;
+        cadence.last_discovery = start;
+        cadence.last_probe = start;
+
+        let mut now = start;
+        for streak in 1..=12_u32 {
+            let backoff = cluster_network_due_class_failure_backoff(streak);
+            cadence.record_unrenewed_removal_failure(now);
+            cadence.observe_unrenewed_connectivity_expiries(expired, wall, now);
+            assert_eq!(cadence.unrenewed_removal_failure_streak, streak);
+            assert_eq!(
+                cadence.unrenewed_connectivity_expiry_at,
+                Some(now + backoff),
+                "failure {streak} waits for its backoff, not the passed expiry"
+            );
+            // A commit or publication observing the same expiry again does
+            // not pull the attempt earlier.
+            cadence.observe_unrenewed_connectivity_expiries(expired, wall, now);
+            assert_eq!(cadence.unrenewed_connectivity_expiry_at, Some(now + backoff));
+            assert!(!cadence.take_unrenewed_connectivity_expiry(now));
+            now += backoff;
+            assert!(cadence.take_unrenewed_connectivity_expiry(now));
+        }
+        assert_eq!(
+            cluster_network_due_class_failure_backoff(12),
+            CLUSTER_NETWORK_MAINTENANCE_FAILURE_BACKOFF,
+            "the retry spacing is capped"
+        );
+
+        cadence.record_unrenewed_removal_success();
+        assert_eq!(cadence.unrenewed_removal_failure_streak, 0);
+        assert!(cadence.unrenewed_removal_retry_at.is_none());
+        cadence.observe_unrenewed_connectivity_expiries(expired, wall, now);
+        assert_eq!(
+            cadence.unrenewed_connectivity_expiry_at,
+            Some(now + CLUSTER_UNRENEWED_CONNECTIVITY_EXPIRY_GRACE),
+            "after a success the next expiry is due at once again"
+        );
     }
 
     fn renewal_cadence(now: Instant) -> ClusterNetworkMaintenanceCadence {
