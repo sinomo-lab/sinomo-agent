@@ -467,6 +467,8 @@ pub struct DfsMetadataReplicaIngestPermit {
     source_node_id: NodeId,
     source_epoch: u64,
     pending_primary_handoff_id: Option<String>,
+    /// Switch epoch of a write-set shard; `None` under the all-member rule.
+    floor_epoch_scope: Option<u64>,
 }
 
 /// Verify the immutable original preparation independently of the current cut.
@@ -590,6 +592,7 @@ impl DfsMetadataReplicaIngestPermit {
             source_node_id,
             source_epoch,
             pending_primary_handoff_id: None,
+            floor_epoch_scope: None,
         }
     }
 
@@ -610,6 +613,51 @@ impl DfsMetadataReplicaIngestPermit {
             source_node_id,
             source_epoch,
             pending_primary_handoff_id: Some(handoff_id),
+            floor_epoch_scope: None,
+        }
+    }
+
+    /// Scope acknowledgement floors to epochs for a write-set shard. The
+    /// value is the switch epoch from the same validated shard record.
+    pub(crate) fn with_floor_epoch_scope(mut self, scope: Option<u64>) -> Self {
+        self.floor_epoch_scope = scope;
+        self
+    }
+
+    pub(crate) fn floor_epoch_scope(&self) -> Option<u64> {
+        self.floor_epoch_scope
+    }
+
+    /// Epoch to record in a floor acknowledged under this permit: the source
+    /// epoch on a write-set shard, `None` under the all-member rule.
+    pub(crate) fn floor_authority_epoch(&self) -> Option<u64> {
+        self.floor_epoch_scope.map(|_| self.source_epoch)
+    }
+
+    /// Keep `floor` when it binds this ingest, drop it when it belongs to an
+    /// earlier epoch, and refuse the ingest when it belongs to a later one.
+    pub(crate) fn binding_ack_floor<T>(
+        &self,
+        floor: Option<T>,
+        floor_epoch: impl Fn(&T) -> Option<u64>,
+    ) -> Result<Option<T>> {
+        let Some(floor) = floor else {
+            return Ok(None);
+        };
+        match crate::metadata_records::dfs_metadata_ack_floor_relation(
+            self.floor_epoch_scope,
+            floor_epoch(&floor),
+            self.source_epoch,
+        ) {
+            crate::metadata_records::DfsMetadataAckFloorRelation::Binds => Ok(Some(floor)),
+            crate::metadata_records::DfsMetadataAckFloorRelation::EarlierEpoch => Ok(None),
+            crate::metadata_records::DfsMetadataAckFloorRelation::LaterEpoch => {
+                Err(MetadataBackendError::SourceEpochFenced {
+                    shard_id: self.shard_id.clone(),
+                    source_epoch: self.source_epoch,
+                    fenced_epoch: floor_epoch(&floor).or(self.floor_epoch_scope).unwrap_or_default(),
+                })
+            }
         }
     }
 
@@ -641,6 +689,10 @@ impl DfsMetadataReplicaIngestPermit {
                 && self.pending_primary_handoff_id() == Some(freeze.handoff_id.as_str())
                 && self.source_epoch == freeze.retiring_epoch)
     }
+}
+
+fn write_set_member_state_unsupported() -> MetadataBackendError {
+    MetadataBackendError::Serde("metadata backend has no write-set member state".into())
 }
 
 /// One object's slice of the global `(object, version)` scan, read through
@@ -2744,6 +2796,64 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         floor: &DfsMetadataAuthorityAckFloor,
     ) -> Result<()>;
+
+    /// Durable member-local state of a write-set shard, if any.
+    fn write_set_member_state(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataWriteSetMemberState>> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// Durably promise to accept nothing more at `cut`'s epoch and return the
+    /// exact epoch start, under the shard's writer lock.
+    fn promise_metadata_takeover(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _cut: &crate::DfsMetadataShardRecordCut,
+        _swap_request_id: &sinomo_core::kv::KvRequestId,
+    ) -> Result<crate::DfsMetadataPrefixProof> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// End a settled takeover promise.
+    fn settle_metadata_takeover_promise(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _swap_request_id: &sinomo_core::kv::KvRequestId,
+        _end: crate::DfsMetadataTakeoverPromiseEnd,
+    ) -> Result<()> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// Drop the acceptance fence once the member's record view has reached it.
+    fn retire_write_set_member_fence(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _observed_epoch: u64,
+    ) -> Result<()> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// Durably require a member's acknowledgement before its add is submitted.
+    fn record_pending_write_set_add(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _cut: &crate::DfsMetadataShardRecordCut,
+        _node_id: &NodeId,
+        _evidence: &crate::DfsMetadataMemberAckView,
+    ) -> Result<()> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// Drop pending adds whose record is no longer `current`.
+    fn release_pending_write_set_adds(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _current: &crate::DfsMetadataShardRecordCut,
+    ) -> Result<Vec<NodeId>> {
+        Err(write_set_member_state_unsupported())
+    }
 
     /// Return the durable replay cursor for journal entries originating from
     /// `source_shard_id`. Local durable backends require this to match their

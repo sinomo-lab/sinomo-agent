@@ -1821,6 +1821,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                         journal_sequence: current.journal_sequence,
                         state_fingerprint: String::new(),
                         durable_prefix_proof: current.clone(),
+                        authority_epoch: None,
                     },
                     current.journal_sequence,
                     &self.shard_id,
@@ -1986,6 +1987,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // deliberately persist the exact journal proof before rebuildable
         // tables catch up, so this path must not force materialization.
         let _lock = self.metadata_write_lock()?;
+        self.require_source_epoch_accepted(floor.authority_epoch)?;
         self.next_sequence =
             self.next_sequence
                 .max(crate::metadata_journal::admission::certify_for_write(
@@ -2012,6 +2014,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // persisting that evidence must not rebuild a rotated materialized
         // table generation a second time.
         let _lock = self.metadata_write_lock()?;
+        self.require_source_epoch_accepted(floor.authority_epoch)?;
         self.next_sequence =
             self.next_sequence
                 .max(crate::metadata_journal::admission::certify_for_write(
@@ -2020,6 +2023,63 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 )?);
 
         metadata_cursor::put_metadata_authority_ack_floor(&self.root, floor)
+    }
+
+    fn write_set_member_state(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataWriteSetMemberState>> {
+        self.require_replication_source_shard(shard_id)?;
+        self.read_write_set_member_state()
+    }
+
+    fn promise_metadata_takeover(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cut: &crate::DfsMetadataShardRecordCut,
+        swap_request_id: &sinomo_core::kv::KvRequestId,
+    ) -> Result<DfsMetadataPrefixProof> {
+        self.require_replication_source_shard(shard_id)?;
+        self.promise_metadata_takeover_owned(cut, swap_request_id)
+    }
+
+    fn settle_metadata_takeover_promise(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        swap_request_id: &sinomo_core::kv::KvRequestId,
+        end: crate::DfsMetadataTakeoverPromiseEnd,
+    ) -> Result<()> {
+        self.require_replication_source_shard(shard_id)?;
+        self.settle_metadata_takeover_promise_owned(swap_request_id, end)
+    }
+
+    fn retire_write_set_member_fence(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        observed_epoch: u64,
+    ) -> Result<()> {
+        self.require_replication_source_shard(shard_id)?;
+        self.retire_write_set_member_fence_owned(observed_epoch)
+    }
+
+    fn record_pending_write_set_add(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cut: &crate::DfsMetadataShardRecordCut,
+        node_id: &NodeId,
+        evidence: &crate::DfsMetadataMemberAckView,
+    ) -> Result<()> {
+        self.require_replication_source_shard(shard_id)?;
+        self.record_pending_write_set_add_owned(cut, node_id, evidence)
+    }
+
+    fn release_pending_write_set_adds(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        current: &crate::DfsMetadataShardRecordCut,
+    ) -> Result<Vec<NodeId>> {
+        self.require_replication_source_shard(shard_id)?;
+        self.release_pending_write_set_adds_owned(current)
     }
 
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {

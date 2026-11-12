@@ -7113,6 +7113,7 @@ mod tests {
                     verified_prefix_only: command.verify_prefix_only,
                     verified_authority_probe_id: None,
                     result: crate::DfsMetadataJournalBatchResult::Applied,
+                    member_view: None,
                 },
             )
             .map(ObjectRpcResult::value)
@@ -7280,6 +7281,7 @@ mod tests {
                 verified_prefix_only: false,
                 verified_authority_probe_id: None,
                 result: crate::DfsMetadataJournalBatchResult::Applied,
+                member_view: None,
             }
         }
 

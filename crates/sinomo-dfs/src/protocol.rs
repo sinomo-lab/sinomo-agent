@@ -1510,6 +1510,18 @@ pub enum DfsCanonicalAuthorization {
     },
 }
 
+/// A write-set member's view when it acknowledged: the epoch and write-set
+/// generation of its shard record and the exact durable prefix it holds. A
+/// primary accepts it as catch-up evidence for an add only when the epoch and
+/// generation equal the current record and the prefix is its whole journal.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataMemberAckView {
+    pub epoch: u64,
+    pub write_set_generation: u64,
+    pub durable_prefix: crate::DfsMetadataPrefixProof,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataJournalBatchResponse {
     pub request_id: String,
@@ -1524,6 +1536,11 @@ pub struct DfsMetadataJournalBatchResponse {
     #[serde(deserialize_with = "required_optional")]
     pub verified_authority_probe_id: Option<String>,
     pub result: DfsMetadataJournalBatchResult,
+    /// Sent only by a member of a write-set shard, with a durable
+    /// acknowledgement. Omitted otherwise, so other shards' replies keep
+    /// their existing encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_view: Option<DfsMetadataMemberAckView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

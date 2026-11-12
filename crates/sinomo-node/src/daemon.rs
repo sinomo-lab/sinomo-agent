@@ -25,6 +25,17 @@ pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reco
 /// nodes must upgrade before participating in a shard.
 pub const DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY: &str =
     "dfs.metadata.prepared-operation.v7";
+/// Supports shard metadata write sets: the write-set record beside the shard
+/// configuration, the durable member epoch fence, epoch-scoped
+/// acknowledgement floors and acknowledgement views. A shard switches to the
+/// write-set protocol only when every configured member advertises this in
+/// its own member record.
+///
+/// [`main_daemon_capabilities`] does not advertise it. A node advertises it
+/// only once it implements the whole member-side contract of a write-set
+/// shard, including commit by write set and follower alignment after a
+/// takeover.
+pub const DFS_METADATA_WRITE_SET_V1_CAPABILITY: &str = "dfs.metadata.write-set.v1";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 

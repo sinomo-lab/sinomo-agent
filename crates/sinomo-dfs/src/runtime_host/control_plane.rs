@@ -1023,6 +1023,41 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
             Some(crate::DfsNativeTxnCommit { request, result }),
         ))
     }
+
+    fn txn_request(
+        &mut self,
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> Result<KvTxnResponse, KvError> {
+        let notify_handoff =
+            daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &request.txn);
+        let cluster = self.cluster_access()?;
+        let result =
+            block_on_dfs_cluster_future(&self.runtime, cluster.kv_commit_compact_async(request))?;
+        let response = result.txn_response.ok_or_else(|| KvError::Serialization {
+            detail: "component cluster commit returned no transaction response".into(),
+        })?;
+        if response.succeeded
+            && notify_handoff
+            && let Some(root) = self.cluster_paths.root.parent()
+        {
+            notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
+        }
+        self.observe_revision(response.revision);
+        Ok(response)
+    }
+
+    fn request_outcome(
+        &mut self,
+        request_id: &sinomo_core::kv::KvRequestId,
+    ) -> Result<sinomo_core::kv::KvRequestOutcome, KvError> {
+        let cluster = self.cluster_access()?;
+        let read = block_on_dfs_cluster_future(
+            &self.runtime,
+            cluster.kv_request_outcome_authoritative_async(request_id.clone()),
+        )?;
+        sinomo_core::kv::validate_cluster_kv_request_outcome_read(&read)?;
+        Ok(read.outcome)
+    }
 }
 
 impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
@@ -1170,6 +1205,47 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
             }
             self.observe_revision(response.revision);
             Ok(response)
+        })
+    }
+
+    fn txn_request_async<'a>(
+        &'a mut self,
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, KvTxnResponse> {
+        Box::pin(async move {
+            let notify_handoff =
+                daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &request.txn);
+            let result = self
+                .cluster_access()?
+                .kv_commit_compact_async(request)
+                .await
+                .map_err(dfs_cluster_service_error)?;
+            let response = result.txn_response.ok_or_else(|| KvError::Serialization {
+                detail: "component cluster commit returned no transaction response".to_string(),
+            })?;
+            if response.succeeded
+                && notify_handoff
+                && let Some(root) = self.cluster_paths.root.parent()
+            {
+                notify_daemon_dfs_maintenance_work(&SinomoDataDir::new(root));
+            }
+            self.observe_revision(response.revision);
+            Ok(response)
+        })
+    }
+
+    fn request_outcome_async<'a>(
+        &'a mut self,
+        request_id: sinomo_core::kv::KvRequestId,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, sinomo_core::kv::KvRequestOutcome> {
+        Box::pin(async move {
+            let read = self
+                .cluster_access()?
+                .kv_request_outcome_authoritative_async(request_id)
+                .await
+                .map_err(dfs_cluster_service_error)?;
+            sinomo_core::kv::validate_cluster_kv_request_outcome_read(&read)?;
+            Ok(read.outcome)
         })
     }
 }

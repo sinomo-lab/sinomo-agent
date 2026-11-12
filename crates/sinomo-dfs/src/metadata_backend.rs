@@ -920,6 +920,7 @@ impl LocalSobjMetadataBackend {
         drop(candidate);
         let _lock = self.begin_metadata_replica_ingest(permit, &source_shard_id)?;
         let archived = self.replace_with_replicated_snapshot_unlocked(
+            permit,
             source_shard_id,
             replayed_through_sequence,
             snapshot,
@@ -999,7 +1000,9 @@ impl LocalSobjMetadataBackend {
                 handoff_id: freeze.handoff_id,
             });
         }
+        backend.require_source_epoch_accepted(Some(permit.source_epoch()))?;
         let archived_existing = backend.replace_with_replicated_snapshot_unlocked(
+            permit,
             source_shard_id,
             replayed_through_sequence,
             snapshot,
@@ -1013,6 +1016,7 @@ impl LocalSobjMetadataBackend {
 
     fn replace_with_replicated_snapshot_unlocked(
         &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
         source_shard_id: DfsMetadataShardId,
         replayed_through_sequence: u64,
         snapshot: crate::DfsMetadataSnapshotImage,
@@ -1032,10 +1036,18 @@ impl LocalSobjMetadataBackend {
                 "replicated current snapshot prefix invalid".into(),
             ));
         }
-        let acknowledged_floor =
+        let stored_acknowledged_floor =
             metadata_cursor::metadata_prefix_ack_floor(&self.root, &source_shard_id)?;
-        let authority_floor =
+        let stored_authority_floor =
             metadata_cursor::metadata_authority_ack_floor(&self.root, &source_shard_id)?;
+        let stored = (stored_acknowledged_floor.is_some(), stored_authority_floor.is_some());
+        let acknowledged_floor =
+            permit.binding_ack_floor(stored_acknowledged_floor, |floor| floor.authority_epoch)?;
+        let authority_floor =
+            permit.binding_ack_floor(stored_authority_floor, |floor| floor.authority_epoch)?;
+        // A stored floor that does not bind belongs to an earlier epoch.
+        let earlier_epoch_floor = (stored.0 && acknowledged_floor.is_none())
+            || (stored.1 && authority_floor.is_none());
         if let Some(floor) = authority_floor.as_ref() {
             if replayed_through_sequence < floor.journal_sequence {
                 return Err(MetadataBackendError::Serde(format!(
@@ -1081,6 +1093,33 @@ impl LocalSobjMetadataBackend {
         }
         let tables = snapshot.state()?.tables.clone();
         require_version_pin_table_invariants(&tables)?;
+        if earlier_epoch_floor {
+            // Replace an earlier epoch's floors before the state they describe
+            // is archived, so a restart in between never compares the new
+            // state with them. Epoch-major merge lets the new floors replace
+            // a higher sequence. An authority floor cannot name sequence zero.
+            metadata_cursor::put_metadata_prefix_ack_floor(
+                &self.root,
+                &DfsMetadataPrefixAckFloor {
+                    shard_id: source_shard_id.clone(),
+                    journal_sequence: replayed_through_sequence,
+                    state_fingerprint: String::new(),
+                    durable_prefix_proof: replacement_prefix_proof.clone(),
+                    authority_epoch: Some(permit.source_epoch()),
+                },
+            )?;
+            if replayed_through_sequence > 0 {
+                metadata_cursor::put_metadata_authority_ack_floor(
+                    &self.root,
+                    &crate::DfsMetadataAuthorityAckFloor {
+                        shard_id: source_shard_id.clone(),
+                        journal_sequence: replayed_through_sequence,
+                        durable_prefix_proof: replacement_prefix_proof.clone(),
+                        authority_epoch: Some(permit.source_epoch()),
+                    },
+                )?;
+            }
+        }
         // An identical snapshot is already installed when this held writer
         // still owns a fully materialized certificate for the exact physical
         // generation. Replacing it would unnecessarily retire journal bytes
@@ -2099,6 +2138,9 @@ impl LocalSobjMetadataBackend {
                 handoff_id: freeze.handoff_id,
             });
         }
+        // A member fenced at a later epoch, by its own takeover promise,
+        // ingests nothing more from this source.
+        self.require_source_epoch_accepted(Some(permit.source_epoch()))?;
         self.refresh_after_metadata_write_lock()?;
         Ok(lock)
     }
@@ -2136,6 +2178,9 @@ impl LocalSobjMetadataBackend {
                 handoff_id: freeze.handoff_id,
             });
         }
+        // A member fenced at a later epoch, by its own takeover promise,
+        // ingests nothing more from this source.
+        self.require_source_epoch_accepted(Some(permit.source_epoch()))?;
         self.next_sequence =
             self.next_sequence
                 .max(crate::metadata_journal::admission::certify_for_write(
@@ -3248,6 +3293,12 @@ mod replay;
 mod handoff;
 #[cfg(test)]
 pub(crate) mod native_prefix_history;
+
+mod write_set_member_state;
+pub use write_set_member_state::{
+    DFS_METADATA_WRITE_SET_MEMBER_STATE_FORMAT, DfsMetadataPendingWriteSetAdd,
+    DfsMetadataTakeoverPromise, DfsMetadataTakeoverPromiseEnd, DfsMetadataWriteSetMemberState,
+};
 
 mod source_adoption;
 pub(crate) use source_adoption::DfsSourceAdoptionWriterCustody;

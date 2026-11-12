@@ -480,9 +480,39 @@ pub struct DfsMetadataReplicaShardContext {
     pub local_node_id: NodeId,
     pub shard: DfsMetadataShardConfig,
     pub pending_membership_handoff: Option<DfsMetadataShardMembershipHandoff>,
+    /// The shard's current write set when it is on the write-set protocol.
+    pub write_set: Option<crate::DfsMetadataShardWriteSet>,
 }
 
 impl DfsMetadataReplicaShardContext {
+    /// Epoch scope of this member's acknowledgement floors: the switch epoch
+    /// of a write-set shard, `None` for a shard on the all-member rule.
+    pub fn floor_epoch_scope(&self) -> Option<u64> {
+        self.write_set
+            .as_ref()
+            .map(|write_set| write_set.switched_at_epoch)
+    }
+
+    /// Epoch to record in an acknowledgement floor written for this shard.
+    /// Floors of a shard on the all-member rule keep their existing format.
+    pub fn floor_authority_epoch(&self) -> Option<u64> {
+        self.write_set.as_ref().map(|_| self.shard.epoch)
+    }
+
+    /// This member's view for an acknowledgement of `durable_prefix`, sent
+    /// only for a write-set shard.
+    pub fn member_ack_view(
+        &self,
+        durable_prefix: Option<&crate::DfsMetadataPrefixProof>,
+    ) -> Option<crate::DfsMetadataMemberAckView> {
+        let write_set = self.write_set.as_ref()?;
+        Some(crate::DfsMetadataMemberAckView {
+            epoch: self.shard.epoch,
+            write_set_generation: write_set.generation,
+            durable_prefix: durable_prefix?.clone(),
+        })
+    }
+
     /// Whether the local node holds a copy of this shard.
     pub fn local_node_holds_copy(&self) -> bool {
         node_holds_metadata_shard_copy(
@@ -5529,6 +5559,7 @@ mod concurrent_target_publish_tests {
                     verified_prefix_only: command.verify_prefix_only,
                     verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
+                    member_view: None,
                 })
             })
         };
@@ -5641,6 +5672,7 @@ mod concurrent_target_publish_tests {
                             verified_prefix_only: command.verify_prefix_only,
                             verified_authority_probe_id: None,
                             result: DfsMetadataJournalBatchResult::Applied,
+                            member_view: None,
                         })
                     })
                 })
@@ -5754,6 +5786,7 @@ mod concurrent_target_publish_tests {
                             verified_prefix_only: command.verify_prefix_only,
                             verified_authority_probe_id: None,
                             result: DfsMetadataJournalBatchResult::Applied,
+                            member_view: None,
                         })
                     })
                 })
@@ -6247,6 +6280,7 @@ fn bind_pending_primary_handoff_snapshot_for_target(
         local_node_id: target_node_id.clone(),
         shard: sender_context.shard.clone(),
         pending_membership_handoff: Some(handoff.clone()),
+        write_set: sender_context.write_set.clone(),
     };
     if !matches!(
         validated_pending_primary_handoff_snapshot_id(&receiver_context, command),
@@ -6658,10 +6692,23 @@ mod durable_metadata_journal_frame_validation_tests {
     }
 }
 
+/// The member view for a verified prefix probe, from the floor the probe
+/// just made durable. Only a write-set shard's member sends one.
+fn member_ack_view_from_prefix_floor(
+    backend: &dyn DfsMetadataBackend,
+    context: &DfsMetadataReplicaShardContext,
+    shard_id: &DfsMetadataShardId,
+) -> Option<crate::DfsMetadataMemberAckView> {
+    context.write_set.as_ref()?;
+    let floor = backend.metadata_prefix_ack_floor(shard_id).ok().flatten()?;
+    context.member_ack_view(Some(&floor.durable_prefix_proof))
+}
+
 pub(crate) fn persist_durable_metadata_replication_ack(
     backend: &mut dyn DfsMetadataBackend,
     command: &DfsMetadataJournalBatchCommand,
     apply_report: &DfsMetadataReplicaApplyReport,
+    authority_epoch: Option<u64>,
 ) -> Result<Option<String>, String> {
     let Some(replication) = command.durable_replication.as_ref() else {
         return Ok(None);
@@ -6684,6 +6731,7 @@ pub(crate) fn persist_durable_metadata_replication_ack(
             journal_sequence: command.batch.next_after_sequence,
             state_fingerprint: String::new(),
             durable_prefix_proof: durable_prefix,
+            authority_epoch,
         })
         .map_err(|error| {
             format!(
@@ -6734,6 +6782,7 @@ fn process_dfs_metadata_journal_batch_inner(
                 backend, context, source_node_id, &command,
             ) {
                 Ok(verified_primary_handoff_id) => DfsMetadataJournalBatchResponse {
+                    member_view: member_ack_view_from_prefix_floor(&*backend, context, &shard_id),
                     request_id: command.request_id,
                     shard_id,
                     next_after_sequence,
@@ -6750,6 +6799,7 @@ fn process_dfs_metadata_journal_batch_inner(
                     verified_prefix_only: false,
                     verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::from_rejection(reason),
+                    member_view: None,
                 },
             };
         #[cfg(any(test, feature = "test-support"))]
@@ -6805,6 +6855,7 @@ fn process_dfs_metadata_journal_batch_inner(
             shard_id: shard_id.clone(),
             journal_sequence: next_after_sequence,
             durable_prefix_proof: probe.prepared_prefix.clone(),
+            authority_epoch: context.floor_authority_epoch(),
         };
         if let Err(error) = backend.put_metadata_authority_ack_floor(&floor) {
             return dfs_metadata_journal_rejection_response(&command, error.to_string());
@@ -6817,6 +6868,7 @@ fn process_dfs_metadata_journal_batch_inner(
             verified_prefix_only: false,
             verified_authority_probe_id: Some(confirmation),
             result: DfsMetadataJournalBatchResult::Applied,
+            member_view: context.member_ack_view(Some(&floor.durable_prefix_proof)),
         };
     }
     let context = context.expect("validated metadata replica ingest has a shard context");
@@ -6825,7 +6877,8 @@ fn process_dfs_metadata_journal_batch_inner(
         shard_id.clone(),
         context.shard.primary_node_id.clone(),
         context.shard.epoch,
-    );
+    )
+    .with_floor_epoch_scope(context.floor_epoch_scope());
     #[cfg(any(test, feature = "test-support"))]
     let mut native_trace = crate::native_shard_trace::current_boundary_interest();
     #[cfg(any(test, feature = "test-support"))]
@@ -6873,7 +6926,12 @@ fn process_dfs_metadata_journal_batch_inner(
             }
 
             let verified_durable_replication_id =
-                match persist_durable_metadata_replication_ack(backend, &command, &apply_report) {
+                match persist_durable_metadata_replication_ack(
+                    backend,
+                    &command,
+                    &apply_report,
+                    permit.floor_authority_epoch(),
+                ) {
                     Ok(confirmation_id) => confirmation_id,
                     Err(reason) => {
                         return dfs_metadata_journal_rejection_response(&command, reason);
@@ -6909,6 +6967,7 @@ fn process_dfs_metadata_journal_batch_inner(
                         shard_id: command.batch.shard_id.clone(),
                         journal_sequence: command.batch.next_after_sequence,
                         durable_prefix_proof,
+                        authority_epoch: permit.floor_authority_epoch(),
                     })
                 {
                     return dfs_metadata_journal_rejection_response(
@@ -6931,6 +6990,9 @@ fn process_dfs_metadata_journal_batch_inner(
                 verified_prefix_only: false,
                 // Echo the prefix-bound confirmation only after the exact
                 // hidden operation and complete primary history are durable.
+                member_view: verified_authority_probe_id
+                    .as_ref()
+                    .and_then(|_| context.member_ack_view(apply_report.durable_prefix_proof())),
                 verified_authority_probe_id,
                 result: DfsMetadataJournalBatchResult::Applied,
             };
@@ -6966,6 +7028,7 @@ fn process_dfs_metadata_journal_batch_inner(
                 verified_prefix_only: false,
                 verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::from_rejection(error),
+                member_view: None,
             }
         }
     }
@@ -7099,6 +7162,7 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
             journal_sequence: probe.journal_sequence,
             state_fingerprint: probe.state_fingerprint.clone(),
             durable_prefix_proof,
+            authority_epoch: context.floor_authority_epoch(),
         })
         .map_err(|error| {
             format!(
@@ -7161,6 +7225,8 @@ fn cluster_dfs_metadata_resident_shard_context_for_outbound_handoff(
         .transpose()?;
     Ok(shard.map(|shard| DfsMetadataReplicaShardContext {
         local_node_id: state.local_node_id,
+        // An outbound handoff hint carries no write-set authority.
+        write_set: None,
         pending_membership_handoff: pending_membership_handoff.filter(|handoff| {
             handoff.retiring_shard == shard
                 && handoff.desired_shard.file_system_id == shard.file_system_id
@@ -7335,6 +7401,7 @@ pub(crate) fn metadata_snapshot_install_permit(
     command: &DfsMetadataSnapshotInstallCommand,
 ) -> std::result::Result<DfsMetadataReplicaIngestPermit, String> {
     let handoff_id = validated_pending_primary_handoff_snapshot_id(context, command)?;
+    let scope = context.floor_epoch_scope();
     Ok(if let Some(handoff_id) = handoff_id {
         DfsMetadataReplicaIngestPermit::new_validated_pending_primary_handoff(
             context.shard.file_system_id.clone(),
@@ -7343,6 +7410,7 @@ pub(crate) fn metadata_snapshot_install_permit(
             context.shard.epoch,
             handoff_id,
         )
+        .with_floor_epoch_scope(scope)
     } else {
         DfsMetadataReplicaIngestPermit::new_validated(
             context.shard.file_system_id.clone(),
@@ -7350,6 +7418,7 @@ pub(crate) fn metadata_snapshot_install_permit(
             context.shard.primary_node_id.clone(),
             context.shard.epoch,
         )
+        .with_floor_epoch_scope(scope)
     })
 }
 
@@ -7364,7 +7433,11 @@ pub fn process_dfs_metadata_snapshot_install(
     let request_id = command.request_id.clone();
     let shard_id = command.shard_id.clone();
     let next_after_sequence = command.next_after_sequence;
-    match validate_dfs_metadata_snapshot_install_state(backend, &command) {
+    match validate_dfs_metadata_snapshot_install_state(
+        backend,
+        &command,
+        context.and_then(DfsMetadataReplicaShardContext::floor_epoch_scope),
+    ) {
         Ok(Some(reason)) => {
             return DfsMetadataSnapshotInstallResponse {
                 request_id,
@@ -7452,7 +7525,31 @@ pub fn process_dfs_metadata_snapshot_install(
 pub(crate) fn validate_dfs_metadata_snapshot_install_state(
     backend: &dyn DfsMetadataBackend,
     command: &DfsMetadataSnapshotInstallCommand,
+    floor_epoch_scope: Option<u64>,
 ) -> Result<Option<String>, DfsError> {
+    // On a write-set shard a floor binds only at its own epoch; the install
+    // re-checks the same rule under the writer lock.
+    let relation = |floor_epoch: Option<u64>| {
+        command.authority_epoch.map_or(
+            crate::metadata_records::DfsMetadataAckFloorRelation::Binds,
+            |source_epoch| {
+                crate::metadata_records::dfs_metadata_ack_floor_relation(
+                    floor_epoch_scope,
+                    floor_epoch,
+                    source_epoch,
+                )
+            },
+        )
+    };
+    let stale = |floor_epoch: Option<u64>| {
+        (relation(floor_epoch) == crate::metadata_records::DfsMetadataAckFloorRelation::LaterEpoch)
+            .then(|| {
+                format!(
+                    "metadata snapshot from epoch {:?} is older than shard {}'s acknowledged epoch",
+                    command.authority_epoch, command.shard_id.0
+                )
+            })
+    };
     if command.snapshot.materialized_through_sequence != command.next_after_sequence {
         return Ok(Some(format!(
             "metadata snapshot embedded sequence {:?} does not match install sequence {} for shard {}",
@@ -7476,6 +7573,14 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
         }
     }
     if let Some(authority_floor) = backend.metadata_authority_ack_floor(&command.shard_id)? {
+        if let Some(reason) = stale(authority_floor.authority_epoch) {
+            return Ok(Some(reason));
+        }
+    }
+    if let Some(authority_floor) = backend
+        .metadata_authority_ack_floor(&command.shard_id)?
+        .filter(|floor| relation(floor.authority_epoch) == crate::metadata_records::DfsMetadataAckFloorRelation::Binds)
+    {
         if command.next_after_sequence < authority_floor.journal_sequence {
             return Ok(Some(format!(
                 "metadata snapshot sequence {} would replace shard {} behind locally acknowledged authority operation {}",
@@ -7494,6 +7599,12 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
     let Some(floor) = backend.metadata_prefix_ack_floor(&command.shard_id)? else {
         return Ok(None);
     };
+    if let Some(reason) = stale(floor.authority_epoch) {
+        return Ok(Some(reason));
+    }
+    if relation(floor.authority_epoch) != crate::metadata_records::DfsMetadataAckFloorRelation::Binds {
+        return Ok(None);
+    }
     if command.next_after_sequence < floor.journal_sequence {
         return Ok(Some(format!(
             "metadata snapshot sequence {} would roll shard {} behind locally acknowledged checkpoint {}",
@@ -7937,6 +8048,7 @@ fn dfs_metadata_journal_rejection_response(
         verified_prefix_only: false,
         verified_authority_probe_id: None,
         result: DfsMetadataJournalBatchResult::from_rejection(reason),
+        member_view: None,
     }
 }
 

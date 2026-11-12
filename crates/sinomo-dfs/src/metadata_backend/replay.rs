@@ -171,10 +171,17 @@ impl LocalSobjMetadataBackend {
             > MAX_DEFERRED_REPLICA_ENTRIES;
 
         let prefix_started = Instant::now();
-        let authority_floor =
-            metadata_cursor::metadata_authority_ack_floor(&self.root, &batch.shard_id)?;
-        let prefix_ack_floor =
-            metadata_cursor::metadata_prefix_ack_floor(&self.root, &batch.shard_id)?;
+        // On a write-set shard a floor binds only at its own epoch: an
+        // earlier epoch's floor blocks neither alignment nor a new primary,
+        // and a later epoch's floor refuses this stale source.
+        let authority_floor = permit.binding_ack_floor(
+            metadata_cursor::metadata_authority_ack_floor(&self.root, &batch.shard_id)?,
+            |floor| floor.authority_epoch,
+        )?;
+        let prefix_ack_floor = permit.binding_ack_floor(
+            metadata_cursor::metadata_prefix_ack_floor(&self.root, &batch.shard_id)?,
+            |floor| floor.authority_epoch,
+        )?;
         if let Some(floor) = authority_floor.as_ref()
             && floor.journal_sequence > target_sequence
         {

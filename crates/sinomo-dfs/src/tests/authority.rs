@@ -2318,6 +2318,7 @@ fn clustered_metadata_journal_batch_requires_exact_authority_identity() {
     let context = DfsMetadataReplicaShardContext {
         local_node_id: replica.clone(),
         pending_membership_handoff: None,
+        write_set: None,
         shard: DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "root".to_string(),
@@ -3090,6 +3091,7 @@ fn metadata_authority_empty_probe_confirms_only_exact_snapshot_covered_prepare()
             shard_id: shard_id.clone(),
             journal_sequence: later.prepare_sequence,
             durable_prefix_proof: prepared_prefix,
+            authority_epoch: None,
         })
     );
     drop(call);
@@ -3135,6 +3137,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
     };
     let context = DfsMetadataReplicaShardContext {
         local_node_id: desired_replica,
+        write_set: None,
         shard: retiring_shard.clone(),
         pending_membership_handoff: Some(DfsMetadataShardMembershipHandoff {
             cause: crate::DfsMetadataShardHandoffCause::Membership,

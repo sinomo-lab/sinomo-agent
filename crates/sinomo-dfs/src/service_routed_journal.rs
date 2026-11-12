@@ -412,6 +412,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsMetadataRejectionCode::ReplicaDiverged,
                     reason,
                 ),
+                member_view: None,
             }),
         )?;
         Ok(())

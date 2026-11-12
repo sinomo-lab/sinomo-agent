@@ -1504,7 +1504,8 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
     > {
         self.compact_commit_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
-            crate::test_runtime::observe_native_kv_request(&self.local_data_dir.root(), &request)?;
+            let root = self.local_data_dir.root();
+            crate::test_runtime::observe_native_kv_request(&root, &request)?;
             let options =
                 sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
                     .kv_txn_quorum_options(true);
@@ -1514,11 +1515,15 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
                 peers: self.peers.clone(),
                 object_rpc: self.object_rpc.clone(),
             };
-            sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
+            let submitted = request.clone();
+            let committed = sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
                 &runtime, &paths, request, options, &mut host,
             )
             .await
-            .map_err(sinomo_core::service::ServiceError::Network)
+            .map_err(sinomo_core::service::ServiceError::Network)?;
+            // A reply hook can lose the reply of a request that committed.
+            crate::test_runtime::observe_native_kv_reply(&root, &submitted)?;
+            Ok(committed)
         })
     }
 }

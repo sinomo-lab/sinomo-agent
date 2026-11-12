@@ -523,7 +523,7 @@ pub fn placement_rule_matches(rule: &DfsSubtreePolicy, path: &str) -> bool {
     }
 }
 
-fn path_is_within(path: &str, root: &str) -> bool {
+pub(crate) fn path_is_within(path: &str, root: &str) -> bool {
     root == "/"
         || path == root
         || path
@@ -542,7 +542,7 @@ fn placement_scope_rank(scope: DfsPlacementScope) -> u8 {
     }
 }
 
-fn default_placement_policy(
+pub(crate) fn default_placement_policy(
     policy: DfsObjectPolicy,
     desired_replicas: usize,
 ) -> Result<DfsPlacementPolicy, DfsDistributedError> {

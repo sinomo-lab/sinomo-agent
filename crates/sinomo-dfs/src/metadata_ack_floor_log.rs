@@ -436,6 +436,7 @@ mod tests {
                 journal_sequence: sequence,
                 digest: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
             },
+            authority_epoch: None,
         }
     }
 
@@ -576,6 +577,7 @@ mod tests {
                 journal_sequence: 3,
                 state_fingerprint: "exact-fingerprint".into(),
                 durable_prefix_proof: floor(3).durable_prefix_proof,
+                authority_epoch: None,
             },
         );
         assert!(put(&path, &floor(3)).is_err());
@@ -665,6 +667,7 @@ mod tests {
                     journal_sequence: sequence,
                     state_fingerprint: String::new(),
                     durable_prefix_proof: floor(sequence).durable_prefix_proof,
+                    authority_epoch: None,
                 },
             )
             .unwrap();

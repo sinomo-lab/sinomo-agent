@@ -152,6 +152,59 @@ Ordinary writes do not store per-file state in cluster KV or perform an uncondit
 
 Shard membership changes retain the current primary and do not immediately activate a replacement authority. The quorum side first records a bounded pending handoff; this is not itself a write fence because the isolated retiring primary may not have observed it. After reconnecting, the retiring primary takes its publication guard, installs a durable local backend freeze, and acknowledges its exact journal head and fingerprint. That exact prefix must then reach and be acknowledged by the union of the retiring and desired assignments before the desired assignment activates. The local marker then advances to the activated epoch instead of disappearing: only the backend instance explicitly rebound after observing that exact control-plane generation may resume authoritative mutations, while independently opened stale instances remain fenced. Pending markers reject authoritative metadata mutations, and both pending and activated markers still permit replay and handoff transfer. This carries writes completed after the pending decision without putting healthy DFS operations through Raft.
 
+#### Shard write sets
+
+A shard on the write-set protocol keeps its configuration at
+`metadata-shards/<shard>` and adds `metadata-write-sets/<shard>` under the same
+filesystem prefix. The write-set record holds the write set, its generation,
+the epoch start as an exact prefix proof, the epoch at which the shard switched,
+the substitutes recruited for unavailable members and the change that produced
+it. It names the configuration's epoch and primary; a record that does not
+match them, or cannot be decoded, grants nothing and the shard keeps the
+all-member rule. The shard configuration's format is unchanged, the shard scan
+decodes only `metadata-shards/` keys, and a write-set change is an authority
+change that does not reopen metadata stores.
+
+Every switch, shrink, add, recruit, removal and takeover swap is one guarded
+transaction built from one exact-key-set read. It compares the exact bytes of
+both keys, the pending handoff, the filesystem configuration when its guard
+uses W or N, and the member and capability-policy records of each member it
+admits. Each change advances the generation, so a transaction built from an
+earlier record can never apply. Transactions carry a stable request id: a
+takeover candidate settles an unknown swap by resubmitting the identical
+request, which returns the committed reply or commits once, and the resulting
+record names that request. A cooperative handoff compares the write-set key;
+on a switched shard it admits only a primary rotation, and its completion moves
+the write set to the new primary with the frozen prefix as epoch start.
+
+The W floor and N of a shard are the highest content W and N among the rules
+that can apply to its paths (`metadata_shard_replication_bounds`). A commit also
+needs at least its own intent's W (`metadata_commit_write_set_floor`), because
+object and per-write policies are not derivable from configuration.
+
+A member admits the write-set capability only when its own member record
+advertises it and its capability policy, if present, allows it. Main daemons
+do not advertise it until they implement the whole member-side contract.
+
+Each member's durable state for a write-set shard is
+`coordination/write-set-member-state.sobj` in the shard directory: the
+acceptance fence, a takeover candidate's promise and a primary's pending adds.
+Snapshot install never archives `coordination/`; leaving the shard's placement
+deletes it with the copy. Under the shard writer lock, journal ingest, snapshot
+install and both acknowledgement-floor writers refuse a source epoch below the
+fence. A promise captures the materialized journal head as epoch start and
+raises the fence to the next epoch in one writer-lock section. A pending add is
+written in one section with the evidence check and stays required while the
+record equals the add's read.
+
+On a write-set shard an acknowledgement floor records its authority epoch and
+binds only at that epoch; a floor without one belongs to the switch epoch.
+Floors merge by epoch, then sequence. A snapshot from a later epoch replaces an
+earlier epoch's floors before it replaces the state they describe. A member's
+durable acknowledgement carries `member_view`: its epoch, write-set generation
+and exact durable prefix. Other shards write floors and replies in their
+existing encoding.
+
 Normal quorum-backed DFS operation must not create conflict records. Base-version races and stale writers are serialized at the owner or metadata-shard primary and must retry, reject, remain pending, or fail fast; a conflict record in this path is a correctness bug. Conflict records are reserved for future split-cluster or disconnected-authority recovery and need an explicit reconciliation algorithm before that mode can be enabled.
 
 Replica-side commands are authorized against object ownership, metadata-shard primary state when available, desired replica membership, persisted intent records, and content hashes. Rejected replica commands do not create replica metadata.

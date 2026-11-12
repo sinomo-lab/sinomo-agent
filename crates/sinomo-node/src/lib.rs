@@ -279,6 +279,14 @@ mod tests {
                     .any(|candidate| candidate.as_str() == capability)
             );
         }
+        // The write-set protocol is not advertised until nodes implement
+        // its whole member-side contract.
+        assert!(
+            voter_capabilities
+                .iter()
+                .chain(&learner_capabilities)
+                .all(|capability| capability.as_str() != DFS_METADATA_WRITE_SET_V1_CAPABILITY)
+        );
         assert!(
             voter_capabilities
                 .iter()

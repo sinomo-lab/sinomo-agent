@@ -6008,6 +6008,146 @@ impl DfsTestRuntime {
     }
 }
 
+impl DfsTestRuntime {
+    /// The test-support switch for the dormant write-set capability: commit
+    /// `node`'s actual cluster member record with the capability advertised,
+    /// and its derived capability policy record with it, as the cluster
+    /// member store does when a node's binary advertises a capability.
+    pub fn advertise_metadata_write_set_capability(&self, node: &NodeId) -> Result<(), String> {
+        let member_key = sinomo_core::node::cluster_member_key(node);
+        let policy_key = sinomo_core::node::cluster_capability_policy_key(node);
+        let error = |error: sinomo_core::kv::KvError| error.to_string();
+        let mut client = self.configuration_publisher(node);
+        for _ in 0..8 {
+            let entries = client
+                .get_authoritative_consistent(&[member_key.clone(), policy_key.clone()])
+                .map_err(error)?;
+            let member_entry = entries[0]
+                .clone()
+                .ok_or("native fixture node has no member record")?;
+            let mut member = member_entry
+                .decode::<sinomo_core::ClusterMemberRecord>()
+                .map_err(error)?;
+            let capability = sinomo_core::CapabilityName::new(
+                sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY,
+            )
+            .map_err(|error| error.to_string())?;
+            if !member.capabilities.contains(&capability) {
+                member.capabilities.push(capability.clone());
+            }
+            if !member.allowed_capabilities.contains(&capability) {
+                member.allowed_capabilities.push(capability);
+            }
+            let policy = sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member);
+            let policy_compare = match entries[1].clone() {
+                Some(entry) => sinomo_core::kv::KvCompare::ValueEquals {
+                    key: policy_key.clone(),
+                    value: entry.value,
+                },
+                None => sinomo_core::kv::KvCompare::Missing {
+                    key: policy_key.clone(),
+                },
+            };
+            let response = client
+                .txn(sinomo_core::kv::KvTxn {
+                    compares: vec![
+                        sinomo_core::kv::KvCompare::ValueEquals {
+                            key: member_key.clone(),
+                            value: member_entry.value,
+                        },
+                        policy_compare,
+                    ],
+                    success: vec![
+                        sinomo_core::kv::KvOp::put_serde(member_key.clone(), &member, None)
+                            .map_err(error)?,
+                        sinomo_core::kv::KvOp::put_serde(policy_key.clone(), &policy, None)
+                            .map_err(error)?,
+                    ],
+                    failure: Vec::new(),
+                })
+                .map_err(error)?;
+            if response.succeeded {
+                return Ok(());
+            }
+        }
+        Err("member record kept changing while advertising the capability".into())
+    }
+}
+
+// Post-commit reply loss at the native KV boundary. The request has already
+// committed through the actual Raft implementation when the callback runs; an
+// error it returns replaces only the reply the caller sees.
+type NativeKvReplyHook =
+    dyn Fn(&sinomo_core::kv::KvTxnRequest) -> Result<(), ServiceError> + Send + Sync;
+struct NativeKvReplyHookEntry {
+    root: std::path::PathBuf,
+    id: u64,
+    callback: Arc<NativeKvReplyHook>,
+}
+static NATIVE_KV_REPLY_HOOKS: OnceLock<
+    Mutex<BTreeMap<std::path::PathBuf, std::sync::Weak<NativeKvReplyHookEntry>>>,
+> = OnceLock::new();
+pub struct DfsTestNativeKvReplyHookRegistration(Arc<NativeKvReplyHookEntry>);
+impl Drop for DfsTestNativeKvReplyHookRegistration {
+    fn drop(&mut self) {
+        if let Some(registry) = NATIVE_KV_REPLY_HOOKS.get() {
+            let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+            if registry
+                .get(&self.0.root)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|entry| entry.id == self.0.id)
+            {
+                registry.remove(&self.0.root);
+            }
+        }
+    }
+}
+pub(crate) fn observe_native_kv_reply(
+    root: &std::path::Path,
+    request: &sinomo_core::kv::KvTxnRequest,
+) -> Result<(), ServiceError> {
+    let callback = NATIVE_KV_REPLY_HOOKS.get().and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(root)
+            .and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(entry) = callback {
+        (entry.callback)(request)?;
+    }
+    Ok(())
+}
+
+impl DfsTestRuntime {
+    /// Lose the reply of an actual native KV request after it committed.
+    /// The callback decides per request; `Ok` delivers the reply unchanged.
+    pub fn native_kv_reply_hook(
+        &self,
+        node: &NodeId,
+        callback: impl Fn(&sinomo_core::kv::KvTxnRequest) -> Result<(), ServiceError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<DfsTestNativeKvReplyHookRegistration, String> {
+        let owned = self.nodes.get(node).ok_or("unknown native fixture node")?;
+        let root = owned.data_dir.root();
+        let registry = NATIVE_KV_REPLY_HOOKS.get_or_init(Default::default);
+        let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+        registry.retain(|_, value| value.strong_count() != 0);
+        if registry.contains_key(&root) {
+            return Err("native reply hook already owned for this root".into());
+        }
+        let entry = Arc::new(NativeKvReplyHookEntry {
+            root: root.clone(),
+            id: NEXT_NATIVE_KV_HOOK.fetch_add(1, Ordering::Relaxed),
+            callback: Arc::new(callback),
+        });
+        registry.insert(root, Arc::downgrade(&entry));
+        Ok(DfsTestNativeKvReplyHookRegistration(entry))
+    }
+}
+
 // Shared negative-only configuration faults, rooted in the existing native KV hook.
 struct NativeConfigurationFault {
     authority: std::sync::Weak<crate::DfsMetadataAuthorityRuntime>,

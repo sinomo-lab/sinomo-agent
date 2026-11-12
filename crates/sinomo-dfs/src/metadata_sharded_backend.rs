@@ -6501,6 +6501,62 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .put_metadata_authority_ack_floor(floor)
     }
 
+    fn write_set_member_state(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<crate::DfsMetadataWriteSetMemberState>> {
+        self.shard_backend(shard_id)?.write_set_member_state(shard_id)
+    }
+
+    fn promise_metadata_takeover(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cut: &crate::DfsMetadataShardRecordCut,
+        swap_request_id: &sinomo_core::kv::KvRequestId,
+    ) -> Result<crate::DfsMetadataPrefixProof> {
+        self.shard_backend_mut(shard_id)?
+            .promise_metadata_takeover(shard_id, cut, swap_request_id)
+    }
+
+    fn settle_metadata_takeover_promise(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        swap_request_id: &sinomo_core::kv::KvRequestId,
+        end: crate::DfsMetadataTakeoverPromiseEnd,
+    ) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .settle_metadata_takeover_promise(shard_id, swap_request_id, end)
+    }
+
+    fn retire_write_set_member_fence(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        observed_epoch: u64,
+    ) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .retire_write_set_member_fence(shard_id, observed_epoch)
+    }
+
+    fn record_pending_write_set_add(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cut: &crate::DfsMetadataShardRecordCut,
+        node_id: &NodeId,
+        evidence: &crate::DfsMetadataMemberAckView,
+    ) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .record_pending_write_set_add(shard_id, cut, node_id, evidence)
+    }
+
+    fn release_pending_write_set_adds(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        current: &crate::DfsMetadataShardRecordCut,
+    ) -> Result<Vec<NodeId>> {
+        self.shard_backend_mut(shard_id)?
+            .release_pending_write_set_adds(shard_id, current)
+    }
+
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
         self.shard_backend(source_shard_id)?
             .metadata_replay_cursor(source_shard_id)

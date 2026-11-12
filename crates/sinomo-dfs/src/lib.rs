@@ -375,6 +375,18 @@ pub use control_plane::{
     placement_reconciliations_prefix,
     select_metadata_shard_config_for_path_strict_default_sifs_split,
 };
+pub use control_plane::{
+    DFS_METADATA_SHARD_WRITE_SET_FORMAT, DfsMetadataMemberCapabilityCut, DfsMetadataShardBounds,
+    DfsMetadataShardRecordCut, DfsMetadataShardSubstitute, DfsMetadataShardWriteSet,
+    DfsMetadataShardWriteSetChange, DfsMetadataShardWriteSetChangeKind,
+    DfsMetadataShardWriteSetState, DfsMetadataTakeoverSettlement, DfsMetadataWriteSetCandidate,
+    DfsMetadataWriteSetChangeRequest, DfsMetadataWriteSetEvent, DfsMetadataWriteSetTxnOutcome,
+    build_metadata_takeover_swap, build_metadata_write_set_add, build_metadata_write_set_recruit,
+    build_metadata_write_set_remove, build_metadata_write_set_shrink,
+    build_metadata_write_set_switch, dfs_metadata_shard_write_set_key_is_exact,
+    metadata_commit_write_set_floor, metadata_shard_replication_bounds,
+    metadata_shard_write_set_key, metadata_shard_write_set_state, select_metadata_shard_members,
+};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use default_cluster::test_establish_default_cluster_dfs_replica_progress_subscription;
@@ -526,6 +538,8 @@ pub use metadata_api::{
     DfsSelectedOriginalDataLayout, DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{
+    DFS_METADATA_WRITE_SET_MEMBER_STATE_FORMAT, DfsMetadataPendingWriteSetAdd,
+    DfsMetadataTakeoverPromise, DfsMetadataTakeoverPromiseEnd, DfsMetadataWriteSetMemberState,
     DfsSourceAdoptionCapture, DfsSourceAdoptionJobCapture, DfsSourceAdoptionSourceCapture,
     LocalSobjMetadataBackend,
 };
@@ -761,6 +775,7 @@ pub use protocol::{
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof, DfsMessageCommand, DfsMessageResponse,
     DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataDurableReplication,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataMemberAckView,
     DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
     DfsMkdirAtNoLinksWithAttrs, DfsNamespaceChangePollRequest, DfsNamespaceChangePollResponse,

@@ -33,6 +33,7 @@ pub fn dfs_metadata_authority_key_is_exact(key: &str) -> bool {
             Some(file_system_id),
             Some(
                 "metadata-shards"
+                    | "metadata-write-sets"
                     | "metadata-head-watermarks"
                     | "metadata-membership-handoffs"
                     | "metadata-membership-handoff-proofs"
@@ -394,10 +395,20 @@ pub fn metadata_replica_context_from_authority_entries(
                 && handoff.desired_shard.shard_id == shard.shard_id
                 && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
         });
+    let write_set_key = crate::metadata_shard_write_set_key(file_system_id, &shard_id.0);
+    // A write-set record that is stale or unreadable grants nothing: the
+    // shard keeps the all-member rule for this member.
+    let write_set = crate::metadata_shard_write_set_state(
+        &shard,
+        entry(&write_set_key).map(|entry| entry.value.as_slice()),
+    )
+    .switched()
+    .cloned();
     Ok(Some(DfsMetadataReplicaShardContext {
         local_node_id: local_node_id.clone(),
         shard,
         pending_membership_handoff,
+        write_set,
     }))
 }
 

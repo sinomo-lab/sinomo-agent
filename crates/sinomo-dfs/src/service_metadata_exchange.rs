@@ -1138,6 +1138,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     local_node_id: self.node_id.clone(),
                     shard: shard.clone(),
                     pending_membership_handoff,
+                    write_set: retained_context
+                        .as_ref()
+                        .and_then(|context| context.write_set.clone()),
                 };
                 match crate::metadata_replication::validated_pending_primary_handoff_snapshot_id(
                     &context, &command,
@@ -1150,17 +1153,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 source_node_id.clone(),
                                 shard.epoch,
                                 handoff_id,
-                            ),
+                            )
+                            .with_floor_epoch_scope(context.floor_epoch_scope()),
                         ),
                         None,
                     ),
                     Ok(None) => (
-                        Some(DfsMetadataReplicaIngestPermit::new_validated(
-                            shard.file_system_id.clone(),
-                            shard_id.clone(),
-                            source_node_id.clone(),
-                            shard.epoch,
-                        )),
+                        Some(
+                            DfsMetadataReplicaIngestPermit::new_validated(
+                                shard.file_system_id.clone(),
+                                shard_id.clone(),
+                                source_node_id.clone(),
+                                shard.epoch,
+                            )
+                            .with_floor_epoch_scope(context.floor_epoch_scope()),
+                        ),
                         None,
                     ),
                     Err(reason) => (None, Some(reason.into())),
@@ -1169,7 +1176,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(reason) => (None, Some(reason)),
         };
         let rejection = if rejection.is_none() {
-            self.validate_metadata_snapshot_against_local_state(&command)?
+            self.validate_metadata_snapshot_against_local_state(
+                &command,
+                permit
+                    .as_ref()
+                    .and_then(DfsMetadataReplicaIngestPermit::floor_epoch_scope),
+            )?
                 .map(DfsMetadataRejection::from)
         } else {
             rejection
@@ -1256,11 +1268,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn validate_metadata_snapshot_against_local_state(
         &mut self,
         command: &DfsMetadataSnapshotInstallCommand,
+        floor_epoch_scope: Option<u64>,
     ) -> Result<Option<String>, DfsError> {
         if let Some(backend) = self.metadata_backend.as_deref()
             && let Some(reason) =
                 crate::metadata_replication::validate_dfs_metadata_snapshot_install_state(
-                    backend, command,
+                    backend,
+                    command,
+                    floor_epoch_scope,
                 )?
         {
             return Ok(Some(reason));
@@ -1470,6 +1485,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // in addition to the verified prefix.
                     verified_authority_probe_id: verified_primary_handoff_id,
                     result: DfsMetadataJournalBatchResult::Applied,
+                    member_view: None,
                 }),
             )?;
             return Ok(NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
@@ -1527,6 +1543,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         backend.as_mut(),
                         &command,
                         &apply_report,
+                        validated_source.permit.floor_authority_epoch(),
                     ) {
                         Ok(confirmation_id) => confirmation_id,
                         Err(reason) => {
@@ -1570,6 +1587,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         shard_id: shard_id.clone(),
                                         journal_sequence: next_after_sequence,
                                         durable_prefix_proof,
+                                        authority_epoch: validated_source
+                                            .permit
+                                            .floor_authority_epoch(),
                                     },
                                 )
                                 .map_err(DfsError::from)
@@ -1609,6 +1629,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             verified_prefix_only: false,
                             verified_authority_probe_id,
                             result: DfsMetadataJournalBatchResult::Applied,
+                            member_view: None,
                         },
                     ),
                 )?;
@@ -1710,6 +1731,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 verified_prefix_only: false,
                 verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::from_rejection(reason),
+                member_view: None,
             }),
         )?;
         Ok(())
@@ -1801,6 +1823,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let shard = context.shard;
         let pending_membership_handoff = context.pending_membership_handoff;
+        let write_set = context.write_set;
         if ordinary_applied_batch
             && (command.file_system_id.as_ref() != Some(&shard.file_system_id)
                 || command.authority_epoch != Some(shard.epoch))
@@ -1884,11 +1907,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 batch.shard_id.clone(),
                 source_node_id.clone(),
                 shard.epoch,
+            )
+            .with_floor_epoch_scope(
+                write_set
+                    .as_ref()
+                    .map(|write_set| write_set.switched_at_epoch),
             ),
             replica_context: DfsMetadataReplicaShardContext {
                 local_node_id: self.node_id.clone(),
                 shard,
                 pending_membership_handoff,
+                write_set,
             },
         }))
     }
@@ -2001,6 +2030,7 @@ mod response_bookkeeping_tests {
             verified_prefix_only,
             verified_authority_probe_id: confirmation_id.map(str::to_string),
             result: DfsMetadataJournalBatchResult::Applied,
+            member_view: None,
         }
     }
 

@@ -359,6 +359,9 @@ impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataPrefixAckFloor {
         Ok(())
     }
     fn merge(current: &Self, floor: &Self) -> Result<Self> {
+        if let Some(epoch_major) = merge_floor_epochs(current.authority_epoch, floor.authority_epoch) {
+            return Ok(if epoch_major { floor.clone() } else { current.clone() });
+        }
         if floor.journal_sequence < current.journal_sequence {
             return Ok(current.clone());
         }
@@ -387,6 +390,7 @@ impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataPrefixAckFloor {
                     floor.state_fingerprint.clone()
                 },
                 durable_prefix_proof: floor.durable_prefix_proof.clone(),
+                authority_epoch: floor.authority_epoch,
             };
             if &merged == current {
                 return Ok(current.clone());
@@ -394,6 +398,21 @@ impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataPrefixAckFloor {
             return Ok(merged);
         }
         Ok(floor.clone())
+    }
+}
+
+/// Floors are ordered by authority epoch first, then by sequence. A floor
+/// written without an epoch orders before every epoch: such floors exist only
+/// for a shard on the all-member rule, or from before a write-set switch, and
+/// a write-set shard's first epoch floor never has a lower sequence than its
+/// last epoch-less floor. Returns `Some(true)` when the incoming floor
+/// replaces the current one by epoch, `Some(false)` when it is older, and
+/// `None` when both share an epoch and sequence decides.
+fn merge_floor_epochs(current: Option<u64>, incoming: Option<u64>) -> Option<bool> {
+    match incoming.unwrap_or(0).cmp(&current.unwrap_or(0)) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(true),
+        std::cmp::Ordering::Less => Some(false),
     }
 }
 
@@ -440,6 +459,9 @@ impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataAuthorityAckFloor {
         Ok(())
     }
     fn merge(current: &Self, floor: &Self) -> Result<Self> {
+        if let Some(epoch_major) = merge_floor_epochs(current.authority_epoch, floor.authority_epoch) {
+            return Ok(if epoch_major { floor.clone() } else { current.clone() });
+        }
         if floor.journal_sequence < current.journal_sequence {
             return Ok(current.clone());
         }
@@ -532,6 +554,7 @@ mod tests {
             journal_sequence: 10,
             state_fingerprint: "blake3:first".into(),
             durable_prefix_proof: exact(10, 'a'),
+            authority_epoch: None,
         };
         put_metadata_prefix_ack_floor(&root, &first).unwrap();
         let stale = DfsMetadataPrefixAckFloor {
@@ -682,6 +705,7 @@ mod tests {
             shard_id: shard_id.clone(),
             journal_sequence: 10,
             durable_prefix_proof: exact(10, 'a'),
+            authority_epoch: None,
         };
         put_metadata_authority_ack_floor(&root, &first).unwrap();
         let stale = DfsMetadataAuthorityAckFloor {

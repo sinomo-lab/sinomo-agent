@@ -25,19 +25,22 @@ deployment.
    set and to the primary through its existing guarded transactions. Journals,
    intents, receipts and effect evidence stay in DFS; no per-operation KV permit
    or DFS ledger enters KV.
-3. **W floor.** The write set never shrinks below the filesystem's content W. A
-   shard whose live write set is below the floor keeps writes pending instead of
-   weakening durability, so metadata is never less durable than the content it
-   commits.
+3. **W floor.** The write set never shrinks below the shard's W floor: the
+   highest content W among the rules that can apply to the shard's paths. A
+   commit whose own content W, from its object or write policy, is higher needs
+   a write set at least that large. A shard whose live write set is below what a
+   commit needs keeps that write pending instead of weakening durability, so
+   metadata is never less durable than the content it commits.
 4. **Automatic takeover.** When the primary is offline, a write-set member that
    can commit to cluster KV takes over automatically.
 5. **Keeping W.** Members leave the write set when the network reports them
    unreachable, rejoin once caught up, and are replaced by recruited members
    when too few remain. All of this is automatic.
 6. **Metadata replicas.** Each shard keeps N metadata copies, the primary's
-   included, N being the filesystem's content N, on non-mobile metadata-capable
-   members. They need not be cluster-KV voters. Mobile members are used only
-   when too few non-mobile members exist to reach the W floor.
+   included, N being the highest content N among the rules that can apply to
+   the shard's paths, on non-mobile metadata-capable members. They need not be
+   cluster-KV voters. Mobile members are used only when too few non-mobile
+   members exist to reach the W floor.
 7. **Desired N survives unavailability.** A W=2, N=3 eventual write may commit on
    B and C with A unavailable once metadata authority is valid; it keeps N=3 and
    the missing copy as repair work. When an open write's chosen targets cannot
@@ -78,12 +81,9 @@ The implementation differs from these requirements:
   one offline node of any kind stops metadata writes on all shards.
 - A primary changes only through the cooperative membership handoff, whose
   freeze, fence and prefix steps run on the retiring primary. With that primary
-  offline the handoff stays pending and nothing cancels it. The recovery-ballot
-  and recovery-fence code is test-only.
+  offline the handoff stays pending and nothing cancels it.
 - An epoch change also advances the store generation, which makes the metadata
   service reopen.
-- Members keep no durable record of the highest epoch they have promised, and
-  acknowledgement floors are not scoped to an epoch.
 - A caller whose primary is unreachable fails at the first network error unless
   the shard record already names a new primary.
 - Namespace-job resume selects jobs on every locally replicated shard rather than
@@ -108,7 +108,10 @@ These existing properties support the design:
 
 ### Shard record
 
-The cluster-KV shard record keeps its primary, replicas and epoch, and gains:
+The shard record is two cluster-KV keys: the shard configuration, which keeps
+its primary, replicas and epoch, and a write-set key beside it. Every write-set
+and primary change compares the exact bytes of both keys in one transaction, so
+together they behave as one record. The write-set key holds:
 
 | Field | Meaning |
 |---|---|
@@ -116,8 +119,18 @@ The cluster-KV shard record keeps its primary, replicas and epoch, and gains:
 | Generation | Advances on every write-set change. The epoch still advances only when the primary changes. |
 | Epoch start | The journal position and prefix proof at which the current primary's epoch began. |
 
-The W floor and N come from the filesystem's replication policy; the record does
-not copy them.
+The shard configuration keeps its format, so every node keeps decoding it and
+routing by primary and epoch, including nodes that predate write sets; they
+never read the write-set key. A write-set record not bound to the
+configuration's epoch and primary grants nothing, and the shard keeps the
+all-member rule.
+
+The W floor and N are the highest content W and N among the rules that can
+apply to the shard's paths; the record does not copy them. A prefix-assigned
+shard takes the deepest rule at or above its assignment root, or the default
+policy when there is none, and every rule inside its subtree that is not inside
+another shard's nested assignment. Any path can land on a hash-range shard, so
+every rule applies to it.
 
 ### Invariant
 
@@ -266,11 +279,14 @@ on retry.
 ### Compatibility
 
 A shard switches to the write-set protocol only after every member of its replica
-set advertises support. Until then it keeps the all-member rule and has no
-automatic takeover; old and new nodes do not share a write set. On the switch the
-primary reduces the shard to N chosen members, and removed members delete their
-copies. The cooperative handoff remains the planned-transfer path for a
-live primary.
+set advertises support. A node advertises it only when it implements the whole
+member-side contract of a write-set shard. Until then the shard keeps the
+all-member rule and has no automatic takeover; old and new nodes do not share a
+write set. On the switch the primary reduces the shard to N chosen members, and
+removed members delete their copies. The cooperative handoff remains the
+planned-transfer path for a live primary. A switched shard does not switch back:
+rolling a member of a switched shard back to a build without write-set support is
+unsupported.
 
 ## Model
 

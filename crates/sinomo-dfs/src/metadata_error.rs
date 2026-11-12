@@ -60,6 +60,16 @@ pub enum MetadataBackendError {
         shard_id: DfsMetadataShardId,
         handoff_id: String,
     },
+    /// This member promised, or acknowledged under, a later epoch than the
+    /// source's: it ingests and acknowledges nothing more from that epoch.
+    #[error(
+        "metadata shard {shard_id:?} accepts nothing from source epoch {source_epoch}; it is fenced at epoch {fenced_epoch}"
+    )]
+    SourceEpochFenced {
+        shard_id: DfsMetadataShardId,
+        source_epoch: u64,
+        fenced_epoch: u64,
+    },
     /// The receipt slot advanced past the generation its publisher planned
     /// against: a later withdrawal superseded that attempt.
     #[error(

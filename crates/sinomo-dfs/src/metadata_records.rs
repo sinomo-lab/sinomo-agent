@@ -73,6 +73,11 @@ pub struct DfsMetadataPrefixAckFloor {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state_fingerprint: String,
     pub durable_prefix_proof: DfsMetadataPrefixProof,
+    /// Authority epoch the floor was acknowledged under, recorded only for a
+    /// write-set shard. A floor binds only at its own epoch; see
+    /// [`dfs_metadata_ack_floor_relation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<u64>,
 }
 
 /// Replica-local durable floor established before acknowledging one exact
@@ -89,6 +94,46 @@ pub struct DfsMetadataAuthorityAckFloor {
     pub journal_sequence: u64,
     /// Exact durable journal prefix acknowledged by the actual receiver.
     pub durable_prefix_proof: DfsMetadataPrefixProof,
+    /// Authority epoch the floor was acknowledged under, recorded only for a
+    /// write-set shard. A floor binds only at its own epoch; see
+    /// [`dfs_metadata_ack_floor_relation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<u64>,
+}
+
+/// How an acknowledgement floor relates to an ingest at `source_epoch`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DfsMetadataAckFloorRelation {
+    /// The floor binds the ingest, as on a shard under the all-member rule.
+    Binds,
+    /// The floor belongs to an earlier epoch. Records past a new epoch's
+    /// start were never acknowledged to a caller, so the floor blocks neither
+    /// alignment nor a new primary.
+    EarlierEpoch,
+    /// The floor belongs to a later epoch: the ingest is from a stale source.
+    LaterEpoch,
+}
+
+/// Relate a floor written at `floor_epoch` to an ingest at `source_epoch`.
+///
+/// `scope` is the switch epoch of a write-set shard, or `None` for a shard on
+/// the all-member rule, where every floor binds as before. On a write-set
+/// shard a floor written without an epoch belongs to the switch epoch: it was
+/// written at or before it, and cooperative handoffs preserve exact prefixes.
+pub fn dfs_metadata_ack_floor_relation(
+    scope: Option<u64>,
+    floor_epoch: Option<u64>,
+    source_epoch: u64,
+) -> DfsMetadataAckFloorRelation {
+    let Some(switched_at_epoch) = scope else {
+        return DfsMetadataAckFloorRelation::Binds;
+    };
+    let floor_epoch = floor_epoch.unwrap_or(switched_at_epoch);
+    match floor_epoch.cmp(&source_epoch) {
+        std::cmp::Ordering::Equal => DfsMetadataAckFloorRelation::Binds,
+        std::cmp::Ordering::Less => DfsMetadataAckFloorRelation::EarlierEpoch,
+        std::cmp::Ordering::Greater => DfsMetadataAckFloorRelation::LaterEpoch,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd)]

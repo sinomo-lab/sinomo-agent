@@ -420,6 +420,25 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             return Ok(());
         }
         if let Some(current) = current.as_ref() {
+            // A write-set shard changes its members only through recruit and
+            // remove; default setup never expands it through a handoff.
+            let write_set = self
+                .control_plane
+                .get_async(&crate::metadata_shard_write_set_key(
+                    &current.file_system_id,
+                    &current.shard_id,
+                ))
+                .await?;
+            if !matches!(
+                crate::metadata_shard_write_set_state(
+                    current,
+                    write_set.as_ref().map(|entry| entry.value.as_slice()),
+                ),
+                crate::DfsMetadataShardWriteSetState::Unswitched
+                    | crate::DfsMetadataShardWriteSetState::Stale { .. }
+            ) {
+                return Ok(());
+            }
             let pending = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
                 .begin_metadata_shard_membership_handoff(current, desired)
                 .await?;

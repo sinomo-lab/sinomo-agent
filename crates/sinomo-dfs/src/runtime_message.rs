@@ -643,6 +643,7 @@ pub(crate) fn dfs_metadata_journal_rejection_for(
         verified_prefix_only: false,
         verified_authority_probe_id: None,
         result: crate::DfsMetadataJournalBatchResult::from_rejection(reason),
+        member_view: None,
     }
 }
 

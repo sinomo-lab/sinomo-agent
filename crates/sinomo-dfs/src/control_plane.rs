@@ -19,7 +19,8 @@ use crate::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT;
 use sinomo_core::kv::{
-    InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
+    InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRequestId, KvRequestOutcome, KvRevision,
+    KvTxn, KvTxnRequest, KvTxnResponse,
 };
 use sinomo_core::node::{
     ClusterCapabilityPolicyRecord, DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY, NodeId,
@@ -31,6 +32,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+
+mod write_set;
+pub use write_set::*;
 
 const DFS_KV_PREFIX: &str = "/dfs";
 const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
@@ -1385,6 +1389,28 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
         Ok((self.txn(txn)?, None))
     }
 
+    /// Commit one transaction under the caller's stable request identity.
+    /// Resubmitting the identical request returns its committed response or
+    /// commits it once, which settles an outcome the caller did not learn.
+    /// Clients without a native stable-identity commit path fail closed.
+    fn txn_request(&mut self, request: KvTxnRequest) -> Result<KvTxnResponse, KvError> {
+        Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "control-plane client cannot commit stable request {:?}",
+                request.request_id
+            ),
+        })
+    }
+
+    /// The authoritative retained outcome of one stable request identity.
+    /// This never executes the request. Clients without a native outcome
+    /// reader fail closed.
+    fn request_outcome(&mut self, request_id: &KvRequestId) -> Result<KvRequestOutcome, KvError> {
+        Err(KvError::AuthorityUnavailable {
+            detail: format!("control-plane client cannot read the outcome of {request_id:?}"),
+        })
+    }
+
     /// Compare a control-plane value through the client's linearizable write
     /// path. The fresh barrier write is intentional: a compare-only or
     /// same-value transaction can be answered by the cluster's semantic
@@ -1466,6 +1492,33 @@ pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
     ) -> DfsControlPlaneKvFuture<'a, KvRevision>;
 
     fn txn_async<'a>(&'a mut self, txn: KvTxn) -> DfsControlPlaneKvFuture<'a, KvTxnResponse>;
+
+    /// Async counterpart of [`DfsControlPlaneKvClient::txn_request`].
+    fn txn_request_async<'a>(
+        &'a mut self,
+        request: KvTxnRequest,
+    ) -> DfsControlPlaneKvFuture<'a, KvTxnResponse> {
+        Box::pin(async move {
+            Err(KvError::AuthorityUnavailable {
+                detail: format!(
+                    "control-plane client cannot commit stable request {:?}",
+                    request.request_id
+                ),
+            })
+        })
+    }
+
+    /// Async counterpart of [`DfsControlPlaneKvClient::request_outcome`].
+    fn request_outcome_async<'a>(
+        &'a mut self,
+        request_id: KvRequestId,
+    ) -> DfsControlPlaneKvFuture<'a, KvRequestOutcome> {
+        Box::pin(async move {
+            Err(KvError::AuthorityUnavailable {
+                detail: format!("control-plane client cannot read the outcome of {request_id:?}"),
+            })
+        })
+    }
 
     fn linearizable_compare_value_async<'a>(
         &'a mut self,
@@ -1657,6 +1710,24 @@ where
                 detail: "control-plane KV client lock poisoned".into(),
             })?
             .txn_with_native_authority(txn)
+    }
+
+    fn txn_request(&mut self, request: KvTxnRequest) -> Result<KvTxnResponse, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".into(),
+            })?
+            .txn_request(request)
+    }
+
+    fn request_outcome(&mut self, request_id: &KvRequestId) -> Result<KvRequestOutcome, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".into(),
+            })?
+            .request_outcome(request_id)
     }
 }
 
@@ -3441,6 +3512,17 @@ impl<'a> DfsControlPlaneStore<'a> {
                     && handoff.cause == cause)
                     .then_some(handoff));
             }
+            let write_set_entry = self.kv.get(&metadata_shard_write_set_key(
+                &retiring.file_system_id,
+                &retiring.shard_id,
+            ))?;
+            let (write_set_compare, _) = metadata_handoff_write_set_ops(
+                retiring,
+                desired,
+                &cause,
+                write_set_entry.as_ref(),
+                None,
+            )?;
 
             let floor_entry = self.kv.get(&floor_key)?;
             let floor_sequence = match floor_entry.as_ref() {
@@ -3518,6 +3600,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 KvCompare::Missing {
                     key: handoff_key.clone(),
                 },
+                write_set_compare,
             ];
             compares.extend(metadata_prepared_operation_admission_compares(
                 self.kv, desired,
@@ -3618,6 +3701,23 @@ impl<'a> DfsControlPlaneStore<'a> {
         if let Some(existing) = handoff.retiring_primary_fence.as_ref() {
             return Ok((existing == fence).then_some(handoff));
         }
+        // A write-set shard admits only a primary rotation; the retiring
+        // primary never fences any other handoff, so it cannot activate.
+        let write_set_entry = self.kv.get(&metadata_shard_write_set_key(
+            &retiring.file_system_id,
+            &retiring.shard_id,
+        ))?;
+        if metadata_handoff_write_set_ops(
+            retiring,
+            &handoff.desired_shard,
+            &handoff.cause,
+            write_set_entry.as_ref(),
+            None,
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
 
         let floor_entry = self.kv.get(&floor_key)?;
         let current_floor = floor_entry
@@ -3711,6 +3811,10 @@ impl<'a> DfsControlPlaneStore<'a> {
         if handoff.retiring_shard != *retiring || handoff.desired_shard != *desired {
             return Ok(false);
         }
+        let write_set_entry = self.kv.get(&metadata_shard_write_set_key(
+            &retiring.file_system_id,
+            &retiring.shard_id,
+        ))?;
         let floor_entry = self.kv.get(&floor_key)?;
         let current_floor = floor_entry
             .as_ref()
@@ -3723,6 +3827,13 @@ impl<'a> DfsControlPlaneStore<'a> {
         )?;
         let activated_watermark =
             metadata_shard_membership_handoff_activated_watermark(&handoff, &proof)?;
+        let (write_set_compare, write_set_put) = metadata_handoff_write_set_ops(
+            retiring,
+            desired,
+            &handoff.cause,
+            write_set_entry.as_ref(),
+            Some(&proof),
+        )?;
         let watermark_entry = self.kv.get(&watermark_key)?;
         if !metadata_shard_membership_handoff_watermark_is_exact(
             &handoff,
@@ -3757,6 +3868,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             },
             floor_compare,
             watermark_compare,
+            write_set_compare,
         ];
         compares.extend(metadata_prepared_operation_admission_compares(
             self.kv, desired,
@@ -3770,7 +3882,10 @@ impl<'a> DfsControlPlaneStore<'a> {
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
                     KvOp::put_serde(proof_key, &proof, None)?,
                     KvOp::Delete { key: handoff_key },
-                ],
+                ]
+                .into_iter()
+                .chain(write_set_put)
+                .collect(),
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -4742,6 +4857,20 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     && handoff.cause == cause)
                     .then_some(handoff));
             }
+            let write_set_entry = self
+                .kv
+                .get_async(&metadata_shard_write_set_key(
+                    &retiring.file_system_id,
+                    &retiring.shard_id,
+                ))
+                .await?;
+            let (write_set_compare, _) = metadata_handoff_write_set_ops(
+                retiring,
+                desired,
+                &cause,
+                write_set_entry.as_ref(),
+                None,
+            )?;
 
             let floor_entry = self.kv.get_async(&floor_key).await?;
             let floor_sequence = match floor_entry.as_ref() {
@@ -4819,6 +4948,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 KvCompare::Missing {
                     key: handoff_key.clone(),
                 },
+                write_set_compare,
             ];
             compares.extend(
                 metadata_prepared_operation_admission_compares_async(self.kv, desired).await?,
@@ -4867,6 +4997,24 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         }
         if let Some(existing) = handoff.retiring_primary_fence.as_ref() {
             return Ok((existing == fence).then_some(handoff));
+        }
+        let write_set_entry = self
+            .kv
+            .get_async(&metadata_shard_write_set_key(
+                &retiring.file_system_id,
+                &retiring.shard_id,
+            ))
+            .await?;
+        if metadata_handoff_write_set_ops(
+            retiring,
+            &handoff.desired_shard,
+            &handoff.cause,
+            write_set_entry.as_ref(),
+            None,
+        )
+        .is_err()
+        {
+            return Ok(None);
         }
 
         let floor_entry = self.kv.get_async(&floor_key).await?;
@@ -4959,6 +5107,13 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         if handoff.retiring_shard != *retiring || handoff.desired_shard != *desired {
             return Ok(false);
         }
+        let write_set_entry = self
+            .kv
+            .get_async(&metadata_shard_write_set_key(
+                &retiring.file_system_id,
+                &retiring.shard_id,
+            ))
+            .await?;
         let floor_entry = self.kv.get_async(&floor_key).await?;
         let current_floor = floor_entry
             .as_ref()
@@ -4971,6 +5126,13 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         )?;
         let activated_watermark =
             metadata_shard_membership_handoff_activated_watermark(&handoff, &proof)?;
+        let (write_set_compare, write_set_put) = metadata_handoff_write_set_ops(
+            retiring,
+            desired,
+            &handoff.cause,
+            write_set_entry.as_ref(),
+            Some(&proof),
+        )?;
         let watermark_entry = self.kv.get_async(&watermark_key).await?;
         if !metadata_shard_membership_handoff_watermark_is_exact(
             &handoff,
@@ -5005,6 +5167,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             },
             floor_compare,
             watermark_compare,
+            write_set_compare,
         ];
         compares
             .extend(metadata_prepared_operation_admission_compares_async(self.kv, desired).await?);
@@ -5017,7 +5180,10 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
                     KvOp::put_serde(proof_key, &proof, None)?,
                     KvOp::Delete { key: handoff_key },
-                ],
+                ]
+                .into_iter()
+                .chain(write_set_put)
+                .collect(),
                 failure: Vec::new(),
             })
             .await?
