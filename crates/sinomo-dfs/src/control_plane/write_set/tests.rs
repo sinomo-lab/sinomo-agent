@@ -753,6 +753,7 @@ fn selection_keeps_the_primary_prefers_non_mobile_members_and_uses_mobile_only_f
         mobile,
         in_write_set: true,
         reachable: true,
+        kind: DfsMetadataWriteSetCandidateKind::Original,
     };
     let candidates = vec![
         candidate("node_ws_a", false),

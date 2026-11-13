@@ -20,9 +20,18 @@ use super::*;
 use sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY;
 
 mod bounds;
+mod keeping;
 pub use bounds::{
-    DfsMetadataShardBounds, DfsMetadataWriteSetCandidate, metadata_commit_write_set_floor,
+    DfsMetadataShardBounds, DfsMetadataWriteSetCandidate, DfsMetadataWriteSetCandidateKind,
+    metadata_commit_write_set_floor,
     metadata_shard_effective_n, metadata_shard_replication_bounds, select_metadata_shard_members,
+};
+
+pub(crate) use keeping::{
+    DfsWriteSetKeepingPlan, DfsWriteSetKeepingTxn, DfsWriteSetKeepingView, DfsWriteSetMemberFacts,
+    DfsWriteSetMemberReach, DfsWriteSetRemoveCause, DfsWriteSetShrinkCause,
+    metadata_write_set_desired_members, metadata_write_set_reduction,
+    plan_metadata_write_set_keeping,
 };
 
 #[cfg(test)]
