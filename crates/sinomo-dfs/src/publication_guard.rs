@@ -1778,12 +1778,24 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                     write_set,
                     pending_adds,
                     floor,
+                    intent_w,
                 } = self.metadata_commit_requirement(&current, &payload)?
                 else {
                     return Err(crate::DfsError::Metadata {
                         message: "a switched shard lost its write-set requirement".into(),
                     });
                 };
+                // The accepted W only grows, so this holds whenever it held at
+                // authorization; it is checked under the lock all the same.
+                if intent_w > write_set.accepted_w() {
+                    return Err(crate::DfsError::Metadata {
+                        message: format!(
+                            "metadata shard {} accepts content W {}, not the commit's {intent_w}",
+                            digest.shard_id.0,
+                            write_set.accepted_w()
+                        ),
+                    });
+                }
                 let acknowledged = acknowledged_node_ids.into_iter().collect::<BTreeSet<_>>();
                 let required = write_set
                     .write_set

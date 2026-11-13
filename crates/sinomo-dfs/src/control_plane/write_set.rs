@@ -22,7 +22,7 @@ use sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY;
 mod bounds;
 pub use bounds::{
     DfsMetadataShardBounds, DfsMetadataWriteSetCandidate, metadata_commit_write_set_floor,
-    metadata_shard_replication_bounds, select_metadata_shard_members,
+    metadata_shard_effective_n, metadata_shard_replication_bounds, select_metadata_shard_members,
 };
 
 #[cfg(test)]
@@ -100,6 +100,14 @@ pub struct DfsMetadataShardWriteSet {
     /// Members recruited to replace unavailable ones, most recent last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub substitutes: Vec<DfsMetadataShardSubstitute>,
+    /// The largest content W this shard has accepted for commit. The shard's
+    /// effective N never falls below it (see [`metadata_shard_effective_n`]),
+    /// so metadata keeps at least as many copies as the content it committed.
+    /// It only grows: the switch starts it from the content the shard already
+    /// holds, every change carries it forward, and only
+    /// [`build_metadata_write_set_raise_n`] raises it. `None` is W = 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raised_n: Option<u64>,
     /// The change that produced this value.
     pub last_change: DfsMetadataShardWriteSetChange,
 }
@@ -129,6 +137,7 @@ pub enum DfsMetadataShardWriteSetChangeKind {
     Add { node_id: NodeId },
     Recruit { node_id: NodeId },
     Remove { node_ids: Vec<NodeId> },
+    RaiseN { n: u64 },
     Takeover { previous_primary_node_id: NodeId },
     Handoff { handoff_id: String },
 }
@@ -136,6 +145,13 @@ pub enum DfsMetadataShardWriteSetChangeKind {
 impl DfsMetadataShardWriteSet {
     pub fn contains(&self, node_id: &NodeId) -> bool {
         self.write_set.binary_search(node_id).is_ok()
+    }
+
+    /// The largest content W accepted for commit, at least one.
+    pub fn accepted_w(&self) -> usize {
+        self.raised_n
+            .map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX))
+            .max(1)
     }
 
     /// Check the record's own shape and its binding to `shard`. A record
@@ -155,6 +171,9 @@ impl DfsMetadataShardWriteSet {
         }
         if self.generation == 0 || self.switched_at_epoch > self.epoch {
             return Err("write-set generation or switch epoch is out of range".into());
+        }
+        if self.raised_n == Some(0) {
+            return Err("write-set raised N must be at least one".into());
         }
         if !self.write_set.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err("write set is not sorted and unique".into());
@@ -612,6 +631,21 @@ pub fn build_metadata_write_set_switch(
     cut: &DfsMetadataShardRecordCut,
     initial_write_set: &BTreeSet<NodeId>,
 ) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+    build_metadata_write_set_switch_with_raised_n(cut, initial_write_set, None)
+}
+
+/// [`build_metadata_write_set_switch`] with the record's initial raised N:
+/// the largest content W among the versions the shard already holds, since
+/// that content was committed under the all-member rule and never compared
+/// with the shard's N.
+pub fn build_metadata_write_set_switch_with_raised_n(
+    cut: &DfsMetadataShardRecordCut,
+    initial_write_set: &BTreeSet<NodeId>,
+    raised_n: Option<u64>,
+) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+    if raised_n == Some(0) {
+        return Err(refuse(cut, "the initial raised N must be at least one"));
+    }
     let previous_generation = match cut.write_set_state() {
         DfsMetadataShardWriteSetState::Unswitched => 0,
         DfsMetadataShardWriteSetState::Stale { .. } => cut
@@ -679,6 +713,7 @@ pub fn build_metadata_write_set_switch(
         epoch_start: None,
         switched_at_epoch: cut.shard.epoch,
         substitutes: Vec::new(),
+        raised_n,
         last_change: DfsMetadataShardWriteSetChange {
             kind: DfsMetadataShardWriteSetChangeKind::Switch,
             change_id: change_id(&request_id),
@@ -786,22 +821,22 @@ pub fn build_metadata_write_set_recruit(
             format!("{node_id} is already a configured member"),
         ));
     }
+    let n = metadata_shard_effective_n(bounds, Some(&current));
     match admission {
-        DfsMetadataShardRecruit::BelowN if current.write_set.len() >= bounds.n => {
+        DfsMetadataShardRecruit::BelowN if current.write_set.len() >= n => {
             return Err(refuse(
                 cut,
-                format!("the write set already has N = {} members", bounds.n),
+                format!("the write set already has N = {n} members"),
             ));
         }
         DfsMetadataShardRecruit::Replacement
-            if configured.len() > bounds.n
+            if configured.len() > n
                 || configured.iter().any(|member| !current.contains(member)) =>
         {
             return Err(refuse(
                 cut,
                 format!(
-                    "a replacement recruit needs every configured member in the write set and at most N = {} of them",
-                    bounds.n
+                    "a replacement recruit needs every configured member in the write set and at most N = {n} of them"
                 ),
             ));
         }
@@ -826,6 +861,34 @@ pub fn build_metadata_write_set_recruit(
     let mut shard = cut.shard.clone();
     shard.replica_node_ids.push(node_id.clone());
     change_request(cut, request_id, compares, next, Some(shard), Vec::new())
+}
+
+/// Raise the shard's accepted content W to `w`, so its effective N is at
+/// least `w`: a commit whose content W exceeds the record's waits for this.
+/// The value only grows; a request not above the current one is refused.
+pub fn build_metadata_write_set_raise_n(
+    cut: &DfsMetadataShardRecordCut,
+    w: usize,
+) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+    let current = switched_write_set(cut)?;
+    if w <= current.accepted_w() {
+        return Err(refuse(
+            cut,
+            format!(
+                "the shard already accepts content W {}, not below {w}",
+                current.accepted_w()
+            ),
+        ));
+    }
+    let n = u64::try_from(w).map_err(|_| refuse(cut, "content W is out of range"))?;
+    let request_id = KvRequestId::generate();
+    let mut next = current.next(
+        DfsMetadataShardWriteSetChangeKind::RaiseN { n },
+        change_id(&request_id),
+    )?;
+    next.raised_n = Some(n);
+    let compares = vec![handoff_missing(cut)?];
+    change_request(cut, request_id, compares, next, None, Vec::new())
 }
 
 /// Remove `node_ids` from the configured members, and from the write set when
@@ -1238,6 +1301,7 @@ impl DfsMetadataWriteSetEvent {
     pub const ADDED: &'static str = "dfs.metadata.write_set.added";
     pub const RECRUITED: &'static str = "dfs.metadata.write_set.recruited";
     pub const RETIRED: &'static str = "dfs.metadata.write_set.retired";
+    pub const N_RAISED: &'static str = "dfs.metadata.write_set.n_raised";
     pub const PROMISED: &'static str = "dfs.metadata.takeover.promised";
     pub const SWAPPED: &'static str = "dfs.metadata.takeover.swapped";
     pub const PROMISE_RELEASED: &'static str = "dfs.metadata.takeover.promise_released";
@@ -1264,6 +1328,7 @@ impl DfsMetadataWriteSetEvent {
             DfsMetadataShardWriteSetChangeKind::Remove { node_ids } => {
                 (Self::RETIRED, node_ids.clone())
             }
+            DfsMetadataShardWriteSetChangeKind::RaiseN { .. } => (Self::N_RAISED, Vec::new()),
             DfsMetadataShardWriteSetChangeKind::Takeover {
                 previous_primary_node_id,
             } => (

@@ -1832,6 +1832,10 @@ mod commit_outcome_unknown_wire_tests {
         for cause in [
             cause(),
             crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch: 5 },
+            crate::DfsCommitOutcomeUnknownCause::ReplicationBelowIntent {
+                accepted: 1,
+                intent_w: 3,
+            },
             crate::DfsCommitOutcomeUnknownCause::Deadline,
             crate::DfsCommitOutcomeUnknownCause::Cancelled,
             crate::DfsCommitOutcomeUnknownCause::Interrupted {

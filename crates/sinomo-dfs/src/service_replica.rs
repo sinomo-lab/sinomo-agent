@@ -167,6 +167,8 @@ pub(crate) enum DfsMetadataCommitRequirement {
         write_set: crate::DfsMetadataShardWriteSet,
         pending_adds: BTreeSet<NodeId>,
         floor: usize,
+        /// The commit's own content W; the record must already accept it.
+        intent_w: usize,
     },
 }
 
@@ -361,10 +363,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(DfsMetadataCommitRequirement::AllMembers);
         };
         let bounds = self.retained_metadata_shard_bounds(&context.shard)?;
-        let floor = crate::metadata_commit_write_set_floor(
-            &bounds,
-            prepared_payload_commit_intent_w(payload),
-        );
+        let intent_w = prepared_payload_commit_intent_w(payload);
+        let floor = crate::metadata_commit_write_set_floor(&bounds, intent_w);
         let shard_id = DfsMetadataShardId::new(context.shard.shard_id.clone());
         let pending_adds = self
             .metadata_backend
@@ -392,6 +392,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             write_set,
             pending_adds,
             floor,
+            intent_w,
         })
     }
 
@@ -513,7 +514,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 trace_started.elapsed().as_millis()
             ));
             let DfsMetadataCommitRequirement::WriteSet {
-                write_set, floor, ..
+                write_set,
+                floor,
+                intent_w,
+                ..
             } = requirement
             else {
                 return Ok(DfsCanonicalAuthorization::FullShard {
@@ -523,6 +527,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepare_sequence: prepared_batch.next_after_sequence,
                 });
             };
+            // Content committed at W needs metadata kept at N >= W, which the
+            // record must order before the commit: the write stays pending
+            // until the keeper raises the shard's N.
+            if *intent_w > write_set.accepted_w() {
+                let DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } =
+                    operation;
+                crate::write_set_keeping_signals::post_commit_demand(
+                    &self.node_id,
+                    &shard.file_system_id,
+                    &DfsMetadataShardId::new(shard.shard_id.clone()),
+                    crate::write_set_keeping_signals::DfsWriteSetCommitDemand::RaiseN(*intent_w),
+                );
+                return Err(DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard.shard_id.clone(),
+                    epoch: shard.epoch,
+                    operation_id: operation_id.clone(),
+                    cause: crate::DfsCommitOutcomeUnknownCause::ReplicationBelowIntent {
+                        accepted: write_set.accepted_w(),
+                        intent_w: *intent_w,
+                    },
+                    current_primary_node_id: None,
+                });
+            }
             // Below its floor the live write set durably holds the change but
             // cannot commit it: the write stays pending.
             if write_set.write_set.len() < *floor {

@@ -82,6 +82,12 @@ pub(super) fn switched(name: &str, rule: Option<(usize, usize)>) -> (DfsTestRunt
     (runtime, config)
 }
 
+pub(super) fn raise_n(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, w: usize) {
+    let change = build_metadata_write_set_raise_n(&cut(runtime, config), w).unwrap();
+    submit(runtime, config, &change);
+    assert_eq!(write_set_of(runtime, config).accepted_w(), w);
+}
+
 pub(super) fn shrink(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
@@ -668,10 +674,11 @@ fn content_write(
         )
 }
 
-/// C2 and C9: a write whose own content W exceeds the live write set stays
-/// prepared while W meets the shard floor; a recovery pass still commits an
-/// ordinary body beside it; once the write set grows, the same operation
-/// commits.
+/// C2 and C9: a write whose own content W exceeds the W the record accepts
+/// stays prepared until the shard's N rises to it; a write whose W exceeds
+/// the live write set stays prepared while W meets the shard floor; a recovery
+/// pass still commits an ordinary body beside it; once the write set grows,
+/// the same operation commits.
 #[test]
 fn native_write_set_intent_w_above_the_write_set_waits_for_it() {
     let (runtime, config) = switched("native-write-set-intent-w", None);
@@ -680,7 +687,22 @@ fn native_write_set_intent_w_above_the_write_set_waits_for_it() {
     let mut service = primary(&runtime);
     directory(&mut service, "/services/intent-w");
     drop(service);
-    // W = 2 fits the write set {P, B}.
+    // W = 2 fits the write set {P, B}, but the record accepts only W = 1:
+    // the shard's N must first rise to 2, which the keeper orders in KV.
+    match content_write(
+        &runtime,
+        &config,
+        "/services/intent-w/two.bin",
+        2,
+        "intent-w-two",
+    ) {
+        Err(crate::DfsPosixError::Dfs(crate::DfsError::MetadataCommitOutcomeUnknown {
+            cause: crate::DfsCommitOutcomeUnknownCause::ReplicationBelowIntent { accepted, intent_w },
+            ..
+        })) => assert_eq!((accepted, intent_w), (1, 2)),
+        other => panic!("a write above the accepted W stays pending: {other:?}"),
+    }
+    raise_n(&runtime, &config, 2);
     content_write(
         &runtime,
         &config,
@@ -688,8 +710,11 @@ fn native_write_set_intent_w_above_the_write_set_waits_for_it() {
         2,
         "intent-w-two",
     )
-    .expect("a write whose W the write set meets commits");
-    // W = 3 does not: the change stays prepared, durable on {P, B}.
+    .expect("once the record accepts W = 2 the same operation commits");
+    assert!(build_metadata_write_set_raise_n(&cut(&runtime, &config), 2).is_err());
+    raise_n(&runtime, &config, 3);
+    // W = 3 is accepted but does not fit the write set {P, B}: the change stays
+    // prepared, durable on {P, B}.
     match content_write(
         &runtime,
         &config,

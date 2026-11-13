@@ -164,6 +164,20 @@ pub fn metadata_commit_write_set_floor(
     bounds.w_floor.max(intent_min_commit_replicas)
 }
 
+/// A switched shard's effective N: the rule-derived N, its W floor, and the
+/// largest content W it has accepted for commit. The last part only grows, so
+/// the effective N never falls below the W of content committed under the
+/// write-set protocol.
+pub fn metadata_shard_effective_n(
+    bounds: &DfsMetadataShardBounds,
+    write_set: Option<&super::DfsMetadataShardWriteSet>,
+) -> usize {
+    bounds
+        .n
+        .max(bounds.w_floor)
+        .max(write_set.map_or(1, super::DfsMetadataShardWriteSet::accepted_w))
+}
+
 /// One member considered for a shard's metadata copies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataWriteSetCandidate {

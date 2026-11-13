@@ -859,3 +859,57 @@ fn a_replacement_recruit_adds_one_member_beyond_n_only_while_all_are_in_the_writ
         .is_err()
     );
 }
+
+/// The switch can start the record's raised N from the content the shard
+/// already holds; the raise then only grows from there.
+#[test]
+fn a_switch_starts_raised_n_from_the_content_it_finds() {
+    let mut fixture = Fixture::new();
+    let cut = fixture.cut();
+    let initial = fixture.nodes[..3].iter().cloned().collect();
+    assert!(build_metadata_write_set_switch_with_raised_n(&cut, &initial, Some(0)).is_err());
+    let change = build_metadata_write_set_switch_with_raised_n(&cut, &initial, Some(3)).unwrap();
+    assert!(fixture.apply(&change));
+    let switched = fixture.cut().write_set_state().switched().cloned().unwrap();
+    assert_eq!(switched.raised_n, Some(3));
+    assert_eq!(switched.accepted_w(), 3);
+    assert_eq!(metadata_shard_effective_n(&bounds(1, 2), Some(&switched)), 3);
+    assert!(build_metadata_write_set_raise_n(&fixture.cut(), 3).is_err());
+}
+
+#[test]
+fn raise_n_only_grows_and_lifts_the_effective_n() {
+    let mut fixture = Fixture::new();
+    let switched = fixture.switch_all();
+    assert_eq!(switched.raised_n, None);
+    assert_eq!(switched.accepted_w(), 1);
+    assert_eq!(metadata_shard_effective_n(&bounds(1, 2), Some(&switched)), 2);
+    let cut = fixture.cut();
+    assert!(build_metadata_write_set_raise_n(&cut, 1).is_err());
+    let raise = build_metadata_write_set_raise_n(&cut, 4).unwrap();
+    assert!(fixture.apply(&raise));
+    let raised = fixture.cut().write_set_state().switched().cloned().unwrap();
+    assert_eq!(raised.raised_n, Some(4));
+    assert_eq!(raised.generation, switched.generation + 1);
+    assert_eq!(
+        raised.last_change.kind,
+        DfsMetadataShardWriteSetChangeKind::RaiseN { n: 4 }
+    );
+    assert_eq!(metadata_shard_effective_n(&bounds(1, 2), Some(&raised)), 4);
+    assert!(build_metadata_write_set_raise_n(&fixture.cut(), 3).is_err());
+    // Every other change carries the raise forward.
+    let shrink =
+        build_metadata_write_set_shrink(&fixture.cut(), &fixture.nodes[2], &bounds(1, 2)).unwrap();
+    assert!(fixture.apply(&shrink));
+    let shrunk = fixture.cut().write_set_state().switched().cloned().unwrap();
+    assert_eq!(shrunk.raised_n, Some(4));
+    // With effective N 4 the write set {a, b} may recruit although the rules
+    // say N = 2.
+    let recruit = build_metadata_write_set_recruit(
+        &fixture.cut(),
+        &fixture.nodes[3],
+        &bounds(1, 2),
+        DfsMetadataShardRecruit::BelowN,
+    );
+    assert!(recruit.is_ok());
+}

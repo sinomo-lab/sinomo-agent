@@ -215,6 +215,7 @@ mod transfer;
 mod write_configuration_inputs;
 mod write_configuration_projection;
 mod write_precondition;
+mod write_set_keeping_signals;
 mod write_set_member_evidence;
 
 pub use advisory_lock::{
@@ -378,14 +379,16 @@ pub use control_plane::{
 };
 pub use control_plane::{
     DFS_METADATA_SHARD_WRITE_SET_FORMAT, DfsMetadataMemberCapabilityCut, DfsMetadataShardBounds,
-    DfsMetadataShardRecordCut, DfsMetadataShardSubstitute, DfsMetadataShardWriteSet,
+    DfsMetadataShardRecordCut, DfsMetadataShardRecruit, DfsMetadataShardSubstitute,
+    DfsMetadataShardWriteSet,
     DfsMetadataShardWriteSetChange, DfsMetadataShardWriteSetChangeKind,
     DfsMetadataShardWriteSetState, DfsMetadataTakeoverSettlement, DfsMetadataWriteSetCandidate,
     DfsMetadataWriteSetChangeRequest, DfsMetadataWriteSetEvent, DfsMetadataWriteSetTxnOutcome,
     build_metadata_takeover_swap, build_metadata_write_set_add, build_metadata_write_set_recruit,
-    build_metadata_write_set_remove, build_metadata_write_set_shrink,
-    build_metadata_write_set_switch, dfs_metadata_shard_write_set_key_is_exact,
-    metadata_commit_write_set_floor, metadata_pending_write_set_add_superseded,
+    build_metadata_write_set_raise_n, build_metadata_write_set_remove,
+    build_metadata_write_set_shrink, build_metadata_write_set_switch,
+    build_metadata_write_set_switch_with_raised_n, dfs_metadata_shard_write_set_key_is_exact, metadata_commit_write_set_floor,
+    metadata_pending_write_set_add_superseded, metadata_shard_effective_n,
     metadata_shard_replication_bounds, metadata_shard_write_set_key,
     metadata_shard_write_set_state, select_metadata_shard_members,
 };

@@ -43,6 +43,7 @@ fn cut(epoch: u64, generation: u64) -> DfsMetadataShardRecordCut {
         epoch_start: None,
         switched_at_epoch: epoch,
         substitutes: Vec::new(),
+        raised_n: None,
         last_change: DfsMetadataShardWriteSetChange {
             kind: DfsMetadataShardWriteSetChangeKind::Switch,
             change_id: "switch".into(),
