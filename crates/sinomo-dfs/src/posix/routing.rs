@@ -847,7 +847,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     true,
                 ) {
                 Ok(result) => result,
-                Err(error @ DfsError::Network { .. }) => {
+                // A stable request id makes a retry after a possibly applied
+                // dispatch safe: the primary answers it from durable admission.
+                Err(
+                    error @ (DfsError::Network { .. }
+                    | DfsError::NetworkDelivery {
+                        delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                        ..
+                    }),
+                ) => {
                     let recovery = self.refresh_routed_namespace_primary_after_network_error(
                         Some(&operation_id),
                         &operation,
@@ -991,6 +999,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     operation.clone(),
                 ) {
                 Ok(result) => result,
+                // Each attempt here has a new request id, so only an error
+                // before dispatch is retried. A possibly applied dispatch is
+                // returned unchanged, never repeated under a new id.
                 Err(error @ DfsError::Network { .. }) => {
                     match self.refresh_routed_namespace_primary_after_network_error(
                         None,

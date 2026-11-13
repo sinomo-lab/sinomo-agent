@@ -1535,6 +1535,9 @@ mod wire_tests {
             DaemonDfsBrowserReplaceFileIfVersionOutcome::Rejected {
                 detail: "not writable".to_string(),
             },
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::Unknown {
+                detail: "commit unconfirmed".to_string(),
+            },
         ] {
             let encoded = serde_json::to_vec(&outcome).expect("encode typed outcome");
             let decoded: DaemonDfsBrowserReplaceFileIfVersionOutcome =

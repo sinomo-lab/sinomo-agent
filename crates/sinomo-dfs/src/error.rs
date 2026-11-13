@@ -5,6 +5,7 @@ use crate::{
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::KvError;
 use sinomo_core::network::NetworkDeliveryState;
+use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use thiserror::Error;
 
@@ -48,16 +49,24 @@ pub enum DfsError {
     },
     #[error("conditional write unsupported at {path}: {reason}")]
     UnsupportedWritePrecondition { path: String, reason: String },
-    /// Raft votes and content receipts cannot substitute for an exact durable
-    /// metadata-prepare recovery quorum.
+    /// The operation's complete body is durable on the shard primary but did
+    /// not commit in this attempt. It can still commit through a retry with
+    /// the same operation id or through prepared-change recovery on this or a
+    /// successor primary, so it is neither a success nor a failure. Callers
+    /// must not report it as a failure and must not retry it under a new
+    /// operation id.
     #[error(
-        "metadata shard {shard_id} recovery quorum unavailable: verified {verified}, required {required}"
+        "metadata shard {shard_id} epoch {epoch}: outcome of operation {operation_id} is unknown ({cause}); retry with the same operation id"
     )]
-    MetadataRecoveryQuorumUnavailable {
+    MetadataCommitOutcomeUnknown {
         file_system_id: DfsFileSystemId,
         shard_id: String,
-        required: usize,
-        verified: usize,
+        epoch: u64,
+        /// The prepared operation id.
+        operation_id: String,
+        cause: DfsCommitOutcomeUnknownCause,
+        /// Set when the shard record names another primary.
+        current_primary_node_id: Option<NodeId>,
     },
     #[error(
         "DFS write operation {operation_id} for object {object_id} was already bound to a different payload"
@@ -175,7 +184,72 @@ pub enum DfsError {
     Cancelled { operation: &'static str },
 }
 
+/// Why a durably prepared metadata change did not commit in one attempt.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DfsCommitOutcomeUnknownCause {
+    /// Members the commit requires had not durably acknowledged the prepare
+    /// when the wait ended.
+    AcknowledgementsMissing {
+        required: usize,
+        acknowledged: usize,
+        missing: Vec<NodeId>,
+    },
+    /// The shard's live write set is smaller than this commit needs.
+    BelowWriteSetFloor { write_set: usize, floor: usize },
+    /// The shard record moved to another epoch or primary.
+    RecordChanged { epoch: u64 },
+    /// The caller's deadline ended the wait.
+    Deadline,
+    /// The caller or the host cancelled the attempt.
+    Cancelled,
+    /// Any other failure after the prepare was durable.
+    Interrupted { detail: String },
+}
+
+impl std::fmt::Display for DfsCommitOutcomeUnknownCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AcknowledgementsMissing {
+                required,
+                acknowledged,
+                missing,
+            } => write!(
+                f,
+                "{acknowledged} of {required} required acknowledgements, missing {missing:?}"
+            ),
+            Self::BelowWriteSetFloor { write_set, floor } => {
+                write!(f, "write set of {write_set} is below the commit floor {floor}")
+            }
+            Self::RecordChanged { epoch } => write!(f, "shard record moved to epoch {epoch}"),
+            Self::Deadline => f.write_str("caller deadline reached"),
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Interrupted { detail } => write!(f, "interrupted: {detail}"),
+        }
+    }
+}
+
 impl DfsError {
+    /// Whether this error reports a durably prepared change whose outcome is
+    /// not yet known.
+    pub fn is_commit_outcome_unknown(&self) -> bool {
+        matches!(self, Self::MetadataCommitOutcomeUnknown { .. })
+    }
+
+    /// Whether the caller's cancellation ended this work, including a commit
+    /// wait whose durably prepared change is left with an unknown outcome.
+    /// Cancellation stops the caller's pass; it is not an outcome to move past.
+    pub fn is_cancellation(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled { .. }
+                | Self::MetadataCommitOutcomeUnknown {
+                    cause: crate::DfsCommitOutcomeUnknownCause::Cancelled,
+                    ..
+                }
+        )
+    }
+
     pub(crate) fn metadata_rejection_code(&self) -> crate::DfsMetadataRejectionCode {
         match self {
             Self::MetadataRejection { code, .. } => *code,

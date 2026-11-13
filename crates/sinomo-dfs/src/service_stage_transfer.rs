@@ -1044,7 +1044,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         } else {
                             let applied = service
                                 .try_apply_committed_intent_if_ready(&updated_intent.intent_id);
+                            // A commit whose outcome is unknown leaves its
+                            // durable prepare active. That body already seals
+                            // this receipt, and a second publication over its
+                            // rows would be refused as overlapping.
+                            let outcome_unknown = applied
+                                .as_ref()
+                                .is_err_and(DfsError::is_commit_outcome_unknown);
                             if commit_publishes_receipt
+                                && !outcome_unknown
                                 && service
                                     .backend_receipt_for_replica(
                                         &response.object_id,
@@ -1082,7 +1090,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     }
                                 }
                             }
-                            applied?;
+                            service.settle_receipt_commit_attempt(
+                                &updated_intent.intent_id,
+                                applied,
+                            )?;
                         }
                         service.send_untracked_completed_routed_write_response_if_committed(
                             &updated_intent.intent_id,

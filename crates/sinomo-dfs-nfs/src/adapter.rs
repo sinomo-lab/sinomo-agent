@@ -962,6 +962,9 @@ fn map_posix_error(error: DfsPosixError) -> nfsstat3 {
         | DfsPosixError::SymlinkContentPending { .. }
         | DfsPosixError::PartialBulkCommit { .. } => nfsstat3::NFS3ERR_JUKEBOX,
         DfsPosixError::Conflict { .. } => nfsstat3::NFS3ERR_NOT_SYNC,
+        // Durable but not yet committed: the client retries later, as for a
+        // pending write.
+        DfsPosixError::Dfs(error) if error.is_commit_outcome_unknown() => nfsstat3::NFS3ERR_JUKEBOX,
         DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) => nfsstat3::NFS3ERR_IO,
     }
 }
@@ -974,6 +977,25 @@ mod tests {
 
     fn filename(value: &str) -> filename3<'static> {
         filename3::from(value.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn an_unknown_commit_outcome_asks_the_client_to_retry_later() {
+        let unknown = DfsPosixError::Dfs(dfs::DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id: dfs::sifs_file_system_id(),
+            shard_id: "root".into(),
+            epoch: 1,
+            operation_id: "write:dfs_write_op_1".into(),
+            cause: dfs::DfsCommitOutcomeUnknownCause::Deadline,
+            current_primary_node_id: None,
+        });
+        assert_eq!(map_posix_error(unknown), nfsstat3::NFS3ERR_JUKEBOX);
+        assert_eq!(
+            map_posix_error(DfsPosixError::Dfs(dfs::DfsError::Network {
+                message: "unreachable".into(),
+            })),
+            nfsstat3::NFS3ERR_IO
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

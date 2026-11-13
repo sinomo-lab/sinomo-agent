@@ -215,8 +215,12 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
     let denied = primary_client.add_file_system(file_system.clone());
     assert!(
         matches!(&denied,
-        Err(crate::DfsError::MetadataRecoveryQuorumUnavailable {
-            file_system_id, shard_id: denied_shard, required: 3, verified: 2,
+        Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id, shard_id: denied_shard,
+            cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                required: 3, acknowledged: 2, ..
+            },
+            ..
         }) if file_system_id == &shard.file_system_id && denied_shard == &shard.shard_id),
         "a stopped assigned receiver cannot be replaced by a permit or majority: {denied:?}"
     );

@@ -402,6 +402,20 @@ pub enum DfsDistributedWriteResult {
         path: String,
         reason: String,
     },
+    /// The write's metadata body is durable on the primary but did not commit
+    /// in this attempt. The requester resolves it by retrying the same
+    /// request id; it is never a failure.
+    CommitOutcomeUnknown {
+        intent_id: String,
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+        /// The prepared operation id on the primary.
+        operation_id: String,
+        cause: crate::DfsCommitOutcomeUnknownCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_primary_node_id: Option<NodeId>,
+    },
     Rejected {
         reason: String,
         /// Set when the addressed node is not the current metadata-shard
@@ -1199,6 +1213,16 @@ pub enum DfsNamespacePosixError {
     Busy {
         path: String,
     },
+    /// Not a failure: the operation's metadata body is durable on the primary
+    /// but did not commit in this attempt. The requester retries the same
+    /// request id.
+    CommitOutcomeUnknown {
+        file_system_id: DfsFileSystemId,
+        shard_id: String,
+        epoch: u64,
+        operation_id: String,
+        cause: crate::DfsCommitOutcomeUnknownCause,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1738,6 +1762,95 @@ impl DfsMetadataSnapshotInstallResult {
             Self::Rejected { code, .. } => Some(*code),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_outcome_unknown_wire_tests {
+    use super::*;
+
+    fn cause() -> crate::DfsCommitOutcomeUnknownCause {
+        crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+            required: 3,
+            acknowledged: 2,
+            missing: vec![NodeId::from_legacy_named("node_c").unwrap()],
+        }
+    }
+
+    #[test]
+    fn unknown_outcome_round_trips_on_routed_write_and_namespace_replies() {
+        let write = DfsDistributedWriteResult::CommitOutcomeUnknown {
+            intent_id: "dfs_write_op_1".into(),
+            file_system_id: DfsFileSystemId::generate(),
+            shard_id: "root".into(),
+            epoch: 4,
+            operation_id: "write:dfs_write_op_1".into(),
+            cause: cause(),
+            current_primary_node_id: None,
+        };
+        let encoded = serde_json::to_vec(&write).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DfsDistributedWriteResult>(&encoded).unwrap(),
+            write
+        );
+        let namespace = DfsNamespacePosixError::CommitOutcomeUnknown {
+            file_system_id: DfsFileSystemId::generate(),
+            shard_id: "root".into(),
+            epoch: 4,
+            operation_id: "namespace-request:op".into(),
+            cause: crate::DfsCommitOutcomeUnknownCause::BelowWriteSetFloor {
+                write_set: 1,
+                floor: 2,
+            },
+        };
+        let encoded = serde_json::to_vec(&namespace).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DfsNamespacePosixError>(&encoded).unwrap(),
+            namespace
+        );
+        for cause in [
+            cause(),
+            crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch: 5 },
+            crate::DfsCommitOutcomeUnknownCause::Deadline,
+            crate::DfsCommitOutcomeUnknownCause::Cancelled,
+            crate::DfsCommitOutcomeUnknownCause::Interrupted {
+                detail: "detail".into(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&cause).unwrap();
+            assert!(encoded.get("kind").is_some(), "{encoded}");
+            assert_eq!(
+                serde_json::from_value::<crate::DfsCommitOutcomeUnknownCause>(encoded).unwrap(),
+                cause
+            );
+        }
+    }
+
+    /// A decoder that predates the unknown outcome fails closed on it rather
+    /// than reading it as another result.
+    #[test]
+    fn a_decoder_without_the_variant_rejects_it() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        #[allow(dead_code)]
+        enum PreChangeResult {
+            Outcome { outcome: serde_json::Value },
+            ReconciliationRequired { operation_id: String, reason: String },
+            PreconditionFailed { failure: serde_json::Value },
+            UnsupportedPrecondition { path: String, reason: String },
+            Rejected { reason: String },
+        }
+        let encoded = serde_json::to_vec(&DfsDistributedWriteResult::CommitOutcomeUnknown {
+            intent_id: "dfs_write_op_1".into(),
+            file_system_id: DfsFileSystemId::generate(),
+            shard_id: "root".into(),
+            epoch: 1,
+            operation_id: "write:dfs_write_op_1".into(),
+            cause: cause(),
+            current_primary_node_id: None,
+        })
+        .unwrap();
+        assert!(serde_json::from_slice::<PreChangeResult>(&encoded).is_err());
     }
 }
 

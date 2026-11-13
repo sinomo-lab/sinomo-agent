@@ -155,8 +155,12 @@ fn native_pending_rename_batch_recovers_before_next_bounded_plan() {
         "actual_carriers_debug":format!("{:#?}",runtime.rpc_observations()),
     })).unwrap()).unwrap();
     assert!(
-        matches!(&first, Err(DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
-        shard_id, required: 3, verified: 2, ..
+        matches!(&first, Err(DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+        shard_id,
+        cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+            required: 3, acknowledged: 2, ..
+        },
+        ..
     })) if shard_id == &shard.shard_id),
         "the actual named ACK fault must reach the normal native3/2 gate: {first:?}"
     );

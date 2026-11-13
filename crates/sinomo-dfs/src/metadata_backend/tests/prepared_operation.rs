@@ -5,6 +5,7 @@ mod checkpoint_cache;
 mod owned_namespace_plan;
 mod quiet_open;
 mod local_cursor;
+mod commit_outcome;
 use super::*;
 use crate::DfsControlPlaneStore;
 use crate::test_support::{DfsTestRuntime, current_native_metadata_service};
@@ -2717,4 +2718,98 @@ fn native_replay_validation_keeps_mutable_record_checks_and_releases_body_custod
             "a decoded-body observation cannot keep an evicted body alive"
         );
     });
+}
+
+/// A failure after the body is durable is decided from the durable record:
+/// a prepared body is an unknown outcome, a committed one is the success it
+/// already is, and a typed kernel rejection or an absent body stays definite.
+#[test]
+fn failed_commit_outcome_is_decided_from_the_durable_record() {
+    let (mut runtime, mut service, config) = native_case("v7-native-commit-outcome", 3);
+    let current = directory(&mut service, "/services/v7-native-commit-outcome");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o640;
+    let payload = namespace_payload(&config, &current, changed, "commit-outcome-original");
+    let digest = service
+        .metadata_backend_mut()
+        .unwrap()
+        .prepare_operation(payload, None)
+        .unwrap();
+
+    let network = crate::DfsError::Network {
+        message: "acknowledgement path failed".into(),
+    };
+    match service.settle_failed_prepared_commit(&digest, network.clone()) {
+        Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id,
+            shard_id,
+            epoch,
+            operation_id,
+            cause: crate::DfsCommitOutcomeUnknownCause::Interrupted { .. },
+            current_primary_node_id: None,
+        }) => {
+            assert_eq!(file_system_id, config.file_system_id);
+            assert_eq!(shard_id, config.shard_id);
+            assert_eq!(epoch, config.epoch);
+            assert_eq!(operation_id, digest.operation_id);
+        }
+        other => panic!(
+            "a prepared body is an unknown outcome: {:?}",
+            other.map(|publication| publication.published)
+        ),
+    }
+    let other_primary = config
+        .replica_node_ids
+        .first()
+        .cloned()
+        .expect("a replica");
+    let stale = crate::DfsError::StaleOwnerEpoch {
+        file_system_id: config.file_system_id.clone(),
+        local_node_id: config.primary_node_id.clone(),
+        primary_node_id: other_primary.clone(),
+        epoch: config.epoch + 1,
+    };
+    match service.settle_failed_prepared_commit(&digest, stale) {
+        Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+            cause: crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch },
+            current_primary_node_id: Some(primary),
+            ..
+        }) => {
+            assert_eq!(epoch, config.epoch + 1);
+            assert_eq!(primary, other_primary);
+        }
+        other => panic!(
+            "a moved record leaves the outcome unknown: {:?}",
+            other.map(|publication| publication.published)
+        ),
+    }
+    let rejection = crate::DfsError::AlreadyExists {
+        path: current.path.clone(),
+    };
+    assert_eq!(
+        service
+            .settle_failed_prepared_commit(&digest, rejection.clone())
+            .err(),
+        Some(rejection),
+        "a typed kernel rejection stays definite"
+    );
+    let mut absent = digest.clone();
+    absent.operation_id = "commit-outcome-never-prepared".into();
+    assert_eq!(
+        service
+            .settle_failed_prepared_commit(&absent, network.clone())
+            .err(),
+        Some(network.clone()),
+        "nothing durable names an absent body"
+    );
+
+    let committed = service.commit_stored_prepared_operation(&digest).unwrap();
+    assert!(committed.published);
+    let settled = service
+        .settle_failed_prepared_commit(&digest, network)
+        .expect("a committed body is a success");
+    assert!(!settled.published);
+    drop(service);
+    runtime.close().unwrap();
 }

@@ -233,7 +233,8 @@ pub use browser_service::{
     DfsBrowserMutationAttempt, DfsBrowserServiceHost, HostedDfsBrowserService,
     HostedDfsPlacementAuthorityAdminService,
     authorize_dfs_core_component_access, dfs_browser_component_host,
-    dfs_core_component_requirement, normalize_sifs_browser_path, register_dfs_browser_services,
+    dfs_core_component_requirement, normalize_sifs_browser_path, posix_error_outcome_is_unknown,
+    register_dfs_browser_services,
     run_blocking_browser_task, run_blocking_browser_task_unqueued, run_blocking_service_task, run_configured_browser_task,
 };
 pub use default_projection::*;
@@ -426,7 +427,7 @@ pub use distributed::{
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
     DistributedWriteIntent, explain_replicas, plan_replicas, validate_replication_plan,
 };
-pub use error::DfsError;
+pub use error::{DfsCommitOutcomeUnknownCause, DfsError};
 pub(crate) use error::{
     dfs_rejection_is_commit_content_repair_pending, dfs_rejection_is_replica_not_desired,
     dfs_replica_not_desired_reason, distributed_write_rejection_current_primary,

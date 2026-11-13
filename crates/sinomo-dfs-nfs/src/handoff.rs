@@ -310,6 +310,9 @@ fn nfs_error_code(error: &dfs::DfsPosixError) -> &'static str {
         dfs::DfsPosixError::Conflict { .. } => "nfs-dfs-conflict",
         dfs::DfsPosixError::DirectoryNotEmpty { .. } => "nfs-dfs-directory-not-empty",
         dfs::DfsPosixError::PartialBulkCommit { .. } => "nfs-dfs-partial-bulk-commit",
+        dfs::DfsPosixError::Dfs(error) if error.is_commit_outcome_unknown() => {
+            "nfs-dfs-commit-outcome-unknown"
+        }
         dfs::DfsPosixError::Dfs(_) => "nfs-dfs-error",
         dfs::DfsPosixError::Metadata(_) => "nfs-metadata-error",
     }

@@ -10301,6 +10301,9 @@ fn save_sifs_text_document(
         SifsReplaceFileIfVersionOutcome::Rejected { detail } => Err(format!(
             "SIFS policy rejected the conditional save. Your edits are still available and were not written. {detail}"
         )),
+        SifsReplaceFileIfVersionOutcome::Unknown { detail } => Err(format!(
+            "The SIFS save may or may not have been applied. Your edits are still open; reload to see the current version before saving again. {detail}"
+        )),
     }
 }
 

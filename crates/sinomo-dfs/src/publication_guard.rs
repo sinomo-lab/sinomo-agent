@@ -1298,7 +1298,117 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
     }
 
     /// Exact retry names the captured durable body; it introduces no new effect.
+    ///
+    /// Once the body is durable, every result except success is decided from
+    /// the durable record, not from the error: a body that is still prepared
+    /// can commit through a retry with the same operation id or through
+    /// prepared-change recovery, so its outcome is reported as unknown.
     pub(crate) fn commit_stored_prepared_operation(
+        &mut self,
+        digest: &DfsPreparedOperationDigest,
+    ) -> std::result::Result<DfsPreparedPublication, crate::DfsError> {
+        match self.commit_stored_prepared_operation_once(digest) {
+            Ok(publication) => Ok(publication),
+            Err(error) => self.settle_failed_prepared_commit(digest, error),
+        }
+    }
+
+    pub(crate) fn settle_failed_prepared_commit(
+        &mut self,
+        digest: &DfsPreparedOperationDigest,
+        error: crate::DfsError,
+    ) -> std::result::Result<DfsPreparedPublication, crate::DfsError> {
+        // The kernel's typed predicate rejections are deterministic for the
+        // body; overlapping prepares are recovered before a new one is made.
+        if matches!(
+            error,
+            crate::DfsError::WritePreconditionFailed { .. }
+                | crate::DfsError::AlreadyExists { .. }
+                | crate::DfsError::DirectoryNotEmpty { .. }
+                | crate::DfsError::StaleDirectoryVersion { .. }
+        ) {
+            return Err(error);
+        }
+        let current_primary_node_id = match &error {
+            crate::DfsError::StaleOwnerEpoch {
+                primary_node_id, ..
+            } if primary_node_id != &self.node_id => Some(primary_node_id.clone()),
+            crate::DfsError::MetadataCommitOutcomeUnknown {
+                current_primary_node_id,
+                ..
+            } => current_primary_node_id.clone(),
+            _ => None,
+        };
+        let unknown = |cause| {
+            let current_primary_node_id = current_primary_node_id.clone();
+            crate::DfsError::MetadataCommitOutcomeUnknown {
+                file_system_id: digest.file_system_id.clone(),
+                shard_id: digest.shard_id.0.clone(),
+                epoch: digest.owner_epoch,
+                operation_id: digest.operation_id.clone(),
+                cause,
+                current_primary_node_id,
+            }
+        };
+        let record = match self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.prepared_operation_record(&digest.operation_id))
+            .transpose()
+        {
+            Ok(record) => record.flatten(),
+            Err(read_error) => {
+                return Err(unknown(crate::DfsCommitOutcomeUnknownCause::Interrupted {
+                    detail: format!("{error}; reading the durable prepare: {read_error}"),
+                }));
+            }
+        };
+        let Some(record) = record.filter(|record| record.digest == *digest) else {
+            // Nothing durable names this body: the failure is definite.
+            return Err(error);
+        };
+        match record.status {
+            crate::DfsPreparedOperationStatus::Committed => {
+                // Another attempt committed it, or only the reply path failed.
+                let payload = Arc::clone(&record.payload);
+                self.refresh_recorded_prepared_rows(&payload)?;
+                Ok(DfsPreparedPublication {
+                    payload,
+                    published: false,
+                })
+            }
+            crate::DfsPreparedOperationStatus::Aborted => Err(error),
+            crate::DfsPreparedOperationStatus::Prepared
+            | crate::DfsPreparedOperationStatus::Superseded => {
+                let cause = match &error {
+                    crate::DfsError::MetadataCommitOutcomeUnknown { cause, .. } => cause.clone(),
+                    crate::DfsError::StaleOwnerEpoch { epoch, .. } => {
+                        crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch: *epoch }
+                    }
+                    crate::DfsError::Cancelled { .. } => {
+                        crate::DfsCommitOutcomeUnknownCause::Cancelled
+                    }
+                    other => crate::DfsCommitOutcomeUnknownCause::Interrupted {
+                        detail: other.to_string(),
+                    },
+                };
+                let unknown = unknown(cause);
+                tracing::info!(
+                    target: "sinomo.dfs.metadata",
+                    event = "dfs.metadata.commit.outcome_unknown",
+                    file_system_id = %digest.file_system_id,
+                    shard_id = %digest.shard_id.0,
+                    epoch = digest.owner_epoch,
+                    operation_id = %digest.operation_id,
+                    detail = %unknown,
+                    "metadata commit outcome unknown"
+                );
+                Err(unknown)
+            }
+        }
+    }
+
+    fn commit_stored_prepared_operation_once(
         &mut self,
         digest: &DfsPreparedOperationDigest,
     ) -> std::result::Result<DfsPreparedPublication, crate::DfsError> {

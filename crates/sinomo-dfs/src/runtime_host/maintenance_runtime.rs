@@ -1043,7 +1043,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         )
         .await;
         match result {
-            Err(crate::DfsError::Cancelled { .. }) if _foreground_preemption.is_requested() => {
+            Err(error) if error.is_cancellation() && _foreground_preemption.is_requested() => {
                 // The synchronous metadata wait observed the SAME generation
                 // before Tokio could poll the outer biased select again.
                 // Existing progress/queue owners retain the unfinished turn.

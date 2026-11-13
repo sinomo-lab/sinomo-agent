@@ -668,9 +668,12 @@ mod tests {
         assert!(
             matches!(
                 error,
-                DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
-                    required: 3,
-                    verified: 2,
+                DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+                    cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                        required: 3,
+                        acknowledged: 2,
+                        ..
+                    },
                     ..
                 })
             ),

@@ -2813,9 +2813,12 @@ mod filesystem_preparation_recovery_tests {
         assert!(
             matches!(
                 error,
-                crate::DfsError::MetadataRecoveryQuorumUnavailable {
-                    required: 3,
-                    verified: 2,
+                crate::DfsError::MetadataCommitOutcomeUnknown {
+                    cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                        required: 3,
+                        acknowledged: 2,
+                        ..
+                    },
                     ..
                 }
             ),
@@ -2995,9 +2998,12 @@ mod filesystem_preparation_recovery_tests {
             );
             assert!(matches!(
                 result,
-                Err(DfsError::MetadataRecoveryQuorumUnavailable {
-                    required: 3,
-                    verified: 2,
+                Err(DfsError::MetadataCommitOutcomeUnknown {
+                    cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                        required: 3,
+                        acknowledged: 2,
+                        ..
+                    },
                     ..
                 })
             ));
@@ -3122,9 +3128,12 @@ mod filesystem_preparation_recovery_tests {
         let first = requester.add_file_system(requested.clone());
         assert!(matches!(
             first,
-            Err(DfsError::MetadataRecoveryQuorumUnavailable {
-                required: 3,
-                verified: 2,
+            Err(DfsError::MetadataCommitOutcomeUnknown {
+                cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                    required: 3,
+                    acknowledged: 2,
+                    ..
+                },
                 ..
             })
         ));
@@ -3176,9 +3185,12 @@ mod filesystem_preparation_recovery_tests {
         );
         assert!(matches!(
             second,
-            Err(DfsError::MetadataRecoveryQuorumUnavailable {
-                required: 3,
-                verified: 2,
+            Err(DfsError::MetadataCommitOutcomeUnknown {
+                cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                    required: 3,
+                    acknowledged: 2,
+                    ..
+                },
                 ..
             })
         ));

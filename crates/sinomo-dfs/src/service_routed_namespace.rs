@@ -863,8 +863,25 @@ fn namespace_execution_error_is_retriable(error: &posix_model::DfsPosixError) ->
                     | DfsError::ContentStore { .. }
                     | DfsError::Busy { .. }
                     | DfsError::Cancelled { .. }
+                    // A durably prepared change that may still commit.
+                    | DfsError::MetadataCommitOutcomeUnknown { .. }
             )
     )
+}
+
+/// The wire form of a request whose durable prepare has not committed yet.
+fn namespace_prepare_outcome_unknown(
+    prepare: &crate::DfsPreparedOperationRecord,
+) -> crate::DfsNamespacePosixError {
+    crate::DfsNamespacePosixError::CommitOutcomeUnknown {
+        file_system_id: prepare.digest.file_system_id.clone(),
+        shard_id: prepare.digest.shard_id.0.clone(),
+        epoch: prepare.digest.owner_epoch,
+        operation_id: prepare.digest.operation_id.clone(),
+        cause: crate::DfsCommitOutcomeUnknownCause::Interrupted {
+            detail: "the durable prepare is awaiting recovery".into(),
+        },
+    }
 }
 
 fn namespace_execution_must_remain_pending(
@@ -1685,7 +1702,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 "namespace request {}/{} has a durable hidden prepare awaiting recovery",
                                 requester_node_id, command.request_id
                             ),
-                            posix_error: None,
+                            posix_error: prepared
+                                .as_ref()
+                                .map(namespace_prepare_outcome_unknown),
                         });
                     }
                 }
@@ -1750,7 +1769,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "namespace request {}/{} has a durable hidden prepare awaiting recovery",
                     requester_node_id, command.request_id
                 ),
-                posix_error: None,
+                posix_error: Some(namespace_prepare_outcome_unknown(&prepare)),
             });
         }
         if history_expired {
@@ -2404,12 +2423,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     phase = "before-durable-admission",
                                     "namespace request prologue"
                                 );
-                                let admission = self.admit_durable_namespace_request(
+                                let admission = match self.admit_durable_namespace_request(
                                     &requester_node_id,
                                     &mut command,
                                     shard_id,
                                     recovering,
-                                )?;
+                                ) {
+                                    // The request row's own commit can be left
+                                    // unknown. That is the requester's answer:
+                                    // it retries the same id, and admission
+                                    // answers from the row once it commits.
+                                    Err(error) if error.is_commit_outcome_unknown() => {
+                                        let error = posix_model::DfsPosixError::from(error);
+                                        DurableNamespaceRequestAdmission::Reject {
+                                            reason: error.to_string(),
+                                            posix_error: posix_model::namespace_posix_error_for(
+                                                &error,
+                                            ),
+                                        }
+                                    }
+                                    admission => admission?,
+                                };
                                 tracing::trace!(
                                     target: "sinomo.dfs.perf",
                                     node = %self.node_id,
@@ -4128,10 +4162,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
         else {
-            return Err(DfsError::Network {
+            // The request was dispatched; it may have applied.
+            return Err(DfsError::NetworkDelivery {
                 message: format!(
                     "routed namespace operation {request_id} timed out before response settle"
                 ),
+                delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
             });
         };
         self.pending_routed_namespace_ops
@@ -4274,10 +4310,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
                 self.pending_routed_namespace_ops.remove(request_id);
-                return Err(DfsError::Network {
+                // The request was dispatched; it may have applied, so a
+                // retry must reuse the same request id.
+                return Err(DfsError::NetworkDelivery {
                     message: format!(
                         "routed namespace operation {request_id} timed out waiting for the metadata primary"
                     ),
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
                 });
             }
             if events.is_empty() {
@@ -4496,6 +4535,20 @@ where
 mod admission_tests {
     use super::*;
     use crate::protocol::DfsNamespaceObjectPrecondition;
+
+    #[test]
+    fn an_unknown_commit_outcome_keeps_the_request_pending() {
+        let unknown = posix_model::DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".into(),
+            epoch: 1,
+            operation_id: "namespace-request:op".into(),
+            cause: crate::DfsCommitOutcomeUnknownCause::Cancelled,
+            current_primary_node_id: None,
+        });
+        assert!(namespace_execution_error_is_retriable(&unknown));
+        assert!(namespace_execution_must_remain_pending(&unknown, false, false));
+    }
 
     #[test]
     fn caller_operation_ids_are_bounded_and_reconciliation_is_structured() {

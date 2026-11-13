@@ -5192,8 +5192,12 @@ fn normal_main_abort_publication_failure_retains_pending_until_actual_recovery()
         )
         .unwrap_err();
     assert!(
-        matches!(&rejected, DfsError::MetadataRecoveryQuorumUnavailable {
-        file_system_id, shard_id, required, verified,
+        matches!(&rejected, DfsError::MetadataCommitOutcomeUnknown {
+        file_system_id, shard_id,
+        cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+            required, acknowledged: verified, ..
+        },
+        ..
     } if file_system_id == &case.request.file_system_id && shard_id == &case.shard.0
         && *required == participants.len() && *verified + 1 == *required),
         "{rejected:?}"

@@ -2728,9 +2728,12 @@ mod provider_lifecycle_tests {
             assert!(
                 matches!(
                     result,
-                    Err(sinomo_dfs::DfsError::MetadataRecoveryQuorumUnavailable {
-                        required: 2,
-                        verified: 1,
+                    Err(sinomo_dfs::DfsError::MetadataCommitOutcomeUnknown {
+                        cause: sinomo_dfs::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                            required: 2,
+                            acknowledged: 1,
+                            ..
+                        },
                         ..
                     })
                 ),

@@ -10,6 +10,15 @@ use time::OffsetDateTime;
 
 use crate::*;
 
+/// Result of one pass over durable prepares.
+pub(crate) struct DfsPreparedRecoveryPass {
+    /// False when cancellation stopped the pass or a body's commit outcome
+    /// stayed unknown, so the pass must run again.
+    pub(crate) completed: bool,
+    /// The first body whose commit outcome stayed unknown.
+    pub(crate) first_unknown: Option<DfsError>,
+}
+
 fn sort_prepared_operations(prepares: &mut [DfsPreparedOperationRecord]) {
     prepares.sort_by(|left, right| left.digest.operation_id.cmp(&right.digest.operation_id));
 }
@@ -43,20 +52,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool, DfsError> {
+        Ok(self
+            .recover_durable_namespace_prepares_pass(should_cancel)?
+            .completed)
+    }
+
+    /// One recovery pass over every durable prepare. A body whose commit
+    /// outcome stays unknown, for example because a member it needs has not
+    /// acknowledged or it is below its own commit floor, stays prepared and
+    /// does not stop the pass: each body has its own requirements.
+    pub(crate) fn recover_durable_namespace_prepares_pass(
+        &mut self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DfsPreparedRecoveryPass, DfsError> {
+        let mut pass = DfsPreparedRecoveryPass {
+            completed: true,
+            first_unknown: None,
+        };
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(true);
+            return Ok(pass);
         };
         let mut records = backend.list_prepared_operations()?;
         sort_prepared_operations(&mut records);
         for record in records {
             if should_cancel() {
-                return Ok(false);
+                pass.completed = false;
+                return Ok(pass);
             }
             // Current complete bodies already seal W receipts and terminal
             // intent, so content and namespace use the same recovery decision.
-            self.recover_one_prepared_operation(record)?;
+            match self.recover_one_prepared_operation(record) {
+                Ok(_) => {}
+                Err(error) if error.is_commit_outcome_unknown() => {
+                    // The other bodies are still attempted, but the pass is
+                    // not complete: its owner runs recovery again.
+                    let cancelled = error.is_cancellation();
+                    pass.first_unknown.get_or_insert(error);
+                    if cancelled {
+                        pass.completed = false;
+                        return Ok(pass);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(!should_cancel())
+        pass.completed = pass.first_unknown.is_none() && !should_cancel();
+        Ok(pass)
     }
 
     pub(crate) fn recover_durable_namespace_prepares_for_requests(
@@ -76,7 +117,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         sort_prepared_operations(&mut records);
         let mut recovered = 0;
         for record in records.into_iter().take(max_prepares) {
-            recovered += usize::from(self.recover_one_prepared_operation(record)?);
+            // An unknown outcome leaves the request pending; its admission
+            // answers the caller with that unknown outcome. Cancellation
+            // still stops this caller, which keeps the unfinished turn.
+            match self.recover_one_prepared_operation(record) {
+                Ok(done) => recovered += usize::from(done),
+                Err(error) if error.is_commit_outcome_unknown() && !error.is_cancellation() => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(recovered)
     }

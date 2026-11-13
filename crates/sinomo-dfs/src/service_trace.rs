@@ -175,6 +175,7 @@ pub(crate) fn dfs_distributed_write_result_trace_label(
         DfsDistributedWriteResult::PreconditionFailed { .. } => "precondition-failed",
         DfsDistributedWriteResult::UnsupportedPrecondition { .. } => "unsupported-precondition",
         DfsDistributedWriteResult::ReconciliationRequired { .. } => "reconciliation-required",
+        DfsDistributedWriteResult::CommitOutcomeUnknown { .. } => "commit-outcome-unknown",
         DfsDistributedWriteResult::Outcome { outcome } => match outcome {
             NetworkedDfsWriteOutcome::Pending { .. } => "pending",
             NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => {

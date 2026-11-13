@@ -3471,7 +3471,7 @@ fn native_whole_shard_partial_metadata_probe_uses_actual_operation_bound_native_
     assert!(
         rejected
             .to_string()
-            .contains("recovery quorum unavailable: verified 2, required 3"),
+            .contains("2 of 3 required acknowledgements"),
         "actual native metadata rejection: {rejected}"
     );
     let shard = DfsMetadataShardId::new("root");

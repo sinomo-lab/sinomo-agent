@@ -758,7 +758,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // A previous completion can have persisted this receipt and then
             // failed to authorize its exact prepared publication. Deduplicate
             // the receipt, but keep that original commit/response obligation.
-            service.try_apply_committed_intent_if_ready(intent_id)?;
+            let applied = service.try_apply_committed_intent_if_ready(intent_id);
+            service.settle_receipt_commit_attempt(intent_id, applied)?;
             service.send_untracked_completed_routed_write_response_if_committed(
                 intent_id, object_id,
             )?;

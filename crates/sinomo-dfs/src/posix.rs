@@ -452,6 +452,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             outcome = match self.take_write_outcome(&intent_id) {
                 Ok(outcome) => outcome,
+                // An unknown outcome keeps the compact identity that
+                // `take_write_outcome` retained for a late response.
+                Err(error) if error.is_commit_outcome_unknown() => return Err(error),
                 Err(error) => {
                     self.abandon_pending_routed_write(&intent_id);
                     return Err(error);

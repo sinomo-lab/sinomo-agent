@@ -423,9 +423,12 @@ fn hidden_original_mkdir_reserves_its_path_and_recovers_the_same_creation_body()
     );
     assert!(matches!(
         native_attempt,
-        Err(DfsError::MetadataRecoveryQuorumUnavailable {
-            required: 3,
-            verified: 2,
+        Err(DfsError::MetadataCommitOutcomeUnknown {
+            cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                required: 3,
+                acknowledged: 2,
+                ..
+            },
             ..
         })
     ));

@@ -432,6 +432,20 @@ pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsName
         DfsPosixError::Dfs(DfsError::Busy { path }) => {
             Some(DfsNamespacePosixError::Busy { path: path.clone() })
         }
+        DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id,
+            shard_id,
+            epoch,
+            operation_id,
+            cause,
+            ..
+        }) => Some(DfsNamespacePosixError::CommitOutcomeUnknown {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            epoch: *epoch,
+            operation_id: operation_id.clone(),
+            cause: cause.clone(),
+        }),
         DfsPosixError::Dfs(_)
         | DfsPosixError::Metadata(_)
         | DfsPosixError::PendingWrite { .. }
@@ -471,6 +485,46 @@ pub(crate) fn posix_error_for_namespace_rejection(
             detail,
         },
         Some(DfsNamespacePosixError::Busy { path }) => DfsPosixError::Dfs(DfsError::Busy { path }),
+        Some(DfsNamespacePosixError::CommitOutcomeUnknown {
+            file_system_id,
+            shard_id,
+            epoch,
+            operation_id,
+            cause,
+        }) => DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id,
+            shard_id,
+            epoch,
+            operation_id,
+            cause,
+            current_primary_node_id: None,
+        }),
         None => DfsPosixError::Dfs(DfsError::Distributed { message: reason }),
+    }
+}
+
+#[cfg(test)]
+mod commit_outcome_unknown_tests {
+    use super::*;
+
+    #[test]
+    fn routed_namespace_rejection_keeps_an_unknown_outcome_typed() {
+        let unknown = DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id: crate::DfsFileSystemId::generate(),
+            shard_id: "root".into(),
+            epoch: 3,
+            operation_id: "namespace-request:op".into(),
+            cause: crate::DfsCommitOutcomeUnknownCause::Deadline,
+            current_primary_node_id: None,
+        });
+        let wire = namespace_posix_error_for(&unknown).expect("typed on the wire");
+        assert!(matches!(
+            wire,
+            DfsNamespacePosixError::CommitOutcomeUnknown { .. }
+        ));
+        assert_eq!(
+            posix_error_for_namespace_rejection(unknown.to_string(), Some(wire)).to_string(),
+            unknown.to_string()
+        );
     }
 }

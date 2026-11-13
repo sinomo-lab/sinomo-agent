@@ -153,11 +153,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // cursor. Recover those exact native bodies before observing the
             // next children, then reload the job from the recovered generation.
             let cancellation = self.cancellation.clone();
-            if !self.recover_durable_namespace_prepares_until_cancelled(&|| {
+            let pass = self.recover_durable_namespace_prepares_pass(&|| {
                 cancellation
                     .as_ref()
                     .is_some_and(crate::DfsCancellationFlag::is_cancelled)
-            })? {
+            })?;
+            // A sealed move that has not committed must not be planned over;
+            // the job stays running and resumes once it commits.
+            if let Some(unknown) = pass.first_unknown {
+                return Err(unknown.into());
+            }
+            if !pass.completed {
                 return Err(crate::DfsError::Cancelled {
                     operation: "namespace job resume",
                 }
@@ -293,11 +299,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 report.completed_job_count =
                                     report.completed_job_count.saturating_add(1);
                             }
+                            // A durably prepared step whose commit outcome is
+                            // unknown may still commit; the job keeps running.
                             DfsNamespaceJobStatus::Running
                                 if namespace_job_kind_is_cross_shard(&latest.kind)
                                     || matches!(
                                         &error,
-                                        DfsPosixError::Dfs(crate::DfsError::Cancelled { .. })
+                                        DfsPosixError::Dfs(
+                                            crate::DfsError::Cancelled { .. }
+                                                | crate::DfsError::MetadataCommitOutcomeUnknown { .. }
+                                        )
                                     ) =>
                             {
                                 report.remaining_running_job_count =

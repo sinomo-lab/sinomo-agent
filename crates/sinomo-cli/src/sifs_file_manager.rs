@@ -5018,6 +5018,9 @@ fn sifs_conditional_write_error(
         DfsPosixError::NotFound { path } => Outcome::NotFound {
             detail: format!("not found: {path}"),
         },
+        error if sinomo_runtime::dfs::posix_error_outcome_is_unknown(&error) => Outcome::Unknown {
+            detail: error.to_string(),
+        },
         error => Outcome::Rejected {
             detail: error.to_string(),
         },
@@ -6450,6 +6453,20 @@ mod tests {
                 path: "/notes.txt".to_string(),
             }),
             sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome::Rejected { .. }
+        ));
+        // A durable body whose commit is unconfirmed may have applied.
+        assert!(matches!(
+            sifs_conditional_write_error(DfsPosixError::Dfs(
+                sinomo_runtime::dfs::DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
+                    shard_id: "root".to_string(),
+                    epoch: 1,
+                    operation_id: "write:dfs_write_op_1".to_string(),
+                    cause: sinomo_runtime::dfs::DfsCommitOutcomeUnknownCause::Deadline,
+                    current_primary_node_id: None,
+                }
+            )),
+            sinomo_runtime::api::DaemonDfsBrowserReplaceFileIfVersionOutcome::Unknown { .. }
         ));
     }
 

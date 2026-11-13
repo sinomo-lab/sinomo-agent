@@ -1967,9 +1967,12 @@ fn native_new_write_recovers_current_epoch_receipt_preparation() {
     assert!(
         matches!(
             error,
-            DfsError::MetadataRecoveryQuorumUnavailable {
-                required: 3,
-                verified: 2,
+            DfsError::MetadataCommitOutcomeUnknown {
+                cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                    required: 3,
+                    acknowledged: 2,
+                    ..
+                },
                 ..
             }
         ),
@@ -2106,8 +2109,12 @@ fn posix_create_cleans_transient_metadata_when_publication_authorization_is_unav
         .posix_write_file_with_operation_id(path, payload, options.clone(), &operation_id)
         .expect_err("unavailable operation-bound metadata quorum must reject the create");
     assert!(
-        matches!(&error, DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable {
-        file_system_id, shard_id, required, verified: 1,
+        matches!(&error, DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+        file_system_id, shard_id,
+        cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+            required, acknowledged: 1, ..
+        },
+        ..
     }) if file_system_id == &shard.file_system_id && shard_id == &shard.shard_id
         && *required == shard.replica_node_ids.len() + 1),
         "unexpected authorization error: {error}"
@@ -4593,7 +4600,7 @@ fn compound_receipt_location_retry_preserves_original_publication() {
 }
 
 #[test]
-fn routed_create_cleanup_preserves_the_original_unpublished_opening() {
+fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_replay() {
     let name = "native-routed-create-opening-cleanup";
     let path = "/native-routed-create-opening-cleanup";
     let operation = "native-routed-create-opening-cleanup-original";
@@ -4782,8 +4789,11 @@ fn routed_create_cleanup_preserves_the_original_unpublished_opening() {
         );
     }
     assert!(
-        first.is_err(),
-        "the actual opening quorum must encounter the negative boundary"
+        matches!(
+            &first,
+            Err(DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown { .. }))
+        ),
+        "the opening quorum's negative boundary leaves the outcome unknown: {first:?}"
     );
     assert_eq!(
         openings.len(),
@@ -4810,79 +4820,33 @@ fn routed_create_cleanup_preserves_the_original_unpublished_opening() {
         "replay must not allocate another original intent"
     );
     let terminal = records[0];
-    assert_eq!(terminal.status, DfsWriteIntentStatus::Aborted);
+    // The opening's commit outcome was unknown, so nothing aborted it: the
+    // replay with the same operation id continued the original body.
+    assert_ne!(terminal.status, DfsWriteIntentStatus::Aborted);
+    assert_eq!(terminal.intent_id, original.intent_id);
     assert_eq!(terminal.created_at, original.created_at);
-    let initial_terminal = before
-        .tables
-        .intents
-        .iter()
-        .find(|record| record.intent_id == original.intent_id)
-        .expect("cleanup must publish its exact terminal before the first return");
-    assert_eq!(
-        initial_terminal, terminal,
-        "replay cannot replace the initial terminal"
-    );
-    let mut expected = original.clone();
-    expected.status = DfsWriteIntentStatus::Aborted;
-    expected.updated_at = terminal.updated_at;
-    assert_eq!(
-        terminal, &expected,
-        "only the original intent's terminal state may change"
-    );
-    assert_eq!(
-        after
-            .tables
-            .prepared_operations_v7
-            .iter()
-            .find(|record| record.digest.operation_id == opening.digest.operation_id)
-            .expect("the original opening remains recorded"),
-        opening,
-        "replay must preserve the original opening and its resolution"
-    );
+    let aborts_original = |prepared: &crate::DfsPreparedOperationRecord| {
+        prepared.payload.metadata_effects.iter().any(|effect| {
+            matches!(effect, DfsPreparedMetadataEffect::PutIntent { intent }
+                if intent.intent_id == original.intent_id
+                    && intent.status == DfsWriteIntentStatus::Aborted)
+        })
+    };
     assert!(
-        after.tables.prepared_operations_v7.iter().all(|prepared| {
-            prepared.status != DfsPreparedOperationStatus::Prepared
-                || crate::service_routed_write::prepared_intent_for_write(
-                    prepared,
-                    &original.object_id,
-                    &original.intent_id,
-                )
-                .is_none()
-        }),
-        "a terminal abort cannot leave an unresolved original preparation"
+        !before.tables.prepared_operations_v7.iter().any(aborts_original)
+            && !after.tables.prepared_operations_v7.iter().any(aborts_original),
+        "an unknown outcome never prepares an abort of the original opening"
     );
-    assert_eq!(
-        after
-            .tables
-            .prepared_operations_v7
-            .iter()
-            .filter(|prepared| {
-                prepared.status == DfsPreparedOperationStatus::Committed
-                    && prepared.payload.metadata_effects.iter().any(|effect| {
-                        matches!(effect, DfsPreparedMetadataEffect::PutIntent { intent }
-                            if intent.intent_id == original.intent_id
-                                && intent.status == DfsWriteIntentStatus::Aborted)
-                    })
-            })
-            .count(),
-        1,
-        "one actual terminal publication closes the original opening"
-    );
+    // The replay continues the original body: it commits, or is still
+    // pending its content receipts. It is never a definite failure.
+    let replay = replay.unwrap();
     assert!(
-        replay.unwrap().is_err(),
-        "a durably aborted create cannot reopen"
+        matches!(&replay, Ok(_) | Err(DfsPosixError::PendingWrite { .. })),
+        "the same operation continues its original body: {replay:?}"
     );
     assert!(
         changed.unwrap().is_err(),
         "the original identity rejects changed bytes"
-    );
-    assert!(
-        after
-            .tables
-            .objects
-            .iter()
-            .all(|object| object.path != path),
-        "a rejected create cannot publish a namespace object"
     );
 }
 
@@ -5025,9 +4989,12 @@ fn check_retained_intent_opening(
         );
         match outcome {
             Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired { .. }) => {}
-            Err(DfsError::MetadataRecoveryQuorumUnavailable {
-                required: 3,
-                verified: 2,
+            Err(DfsError::MetadataCommitOutcomeUnknown {
+                cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                    required: 3,
+                    acknowledged: 2,
+                    ..
+                },
                 ..
             }) => {}
             other => panic!(

@@ -400,13 +400,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .difference(&acknowledged_node_ids)
                 .collect::<Vec<_>>(),
         ));
-        Err(DfsError::MetadataRecoveryQuorumUnavailable {
+        let DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } = operation;
+        Err(DfsError::MetadataCommitOutcomeUnknown {
             file_system_id: shard.file_system_id.clone(),
             shard_id: shard.shard_id.clone(),
-            required: required_node_ids.len(),
-            verified: acknowledged_node_ids
-                .intersection(&required_node_ids)
-                .count(),
+            epoch: shard.epoch,
+            operation_id: operation_id.clone(),
+            cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                required: required_node_ids.len(),
+                acknowledged: acknowledged_node_ids
+                    .intersection(&required_node_ids)
+                    .count(),
+                missing: required_node_ids
+                    .difference(&acknowledged_node_ids)
+                    .cloned()
+                    .collect(),
+            },
+            current_primary_node_id: None,
         })
     }
 

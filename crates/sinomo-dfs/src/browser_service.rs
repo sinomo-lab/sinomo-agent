@@ -3865,10 +3865,30 @@ pub fn daemon_dfs_browser_conditional_write_error(
         crate::DfsPosixError::NotFound { path } => Outcome::NotFound {
             detail: format!("not found: {path}"),
         },
+        error if posix_error_outcome_is_unknown(&error) => Outcome::Unknown {
+            detail: error.to_string(),
+        },
         error => Outcome::Rejected {
             detail: error.to_string(),
         },
     }
+}
+
+/// Whether a failed mutation may still have applied, so it must not be
+/// reported as rejected: a durable body whose commit is unconfirmed, a write
+/// still pending, or a request that was dispatched but not answered.
+pub fn posix_error_outcome_is_unknown(error: &crate::DfsPosixError) -> bool {
+    matches!(
+        error,
+        crate::DfsPosixError::PendingWrite { .. }
+            | crate::DfsPosixError::Dfs(
+                crate::DfsError::MetadataCommitOutcomeUnknown { .. }
+                    | crate::DfsError::NetworkDelivery {
+                        delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                        ..
+                    }
+            )
+    )
 }
 
 pub fn normalize_sifs_browser_path(path: &str) -> Result<String, ServiceError> {
@@ -3916,6 +3936,44 @@ fn parent_sifs_browser_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_replace_reports_a_possibly_applied_save_as_unknown() {
+        use crate::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
+        for error in [
+            crate::DfsPosixError::Dfs(crate::DfsError::MetadataCommitOutcomeUnknown {
+                file_system_id: crate::sifs_file_system_id(),
+                shard_id: "root".into(),
+                epoch: 1,
+                operation_id: "write:dfs_write_op_1".into(),
+                cause: crate::DfsCommitOutcomeUnknownCause::Deadline,
+                current_primary_node_id: None,
+            }),
+            crate::DfsPosixError::PendingWrite {
+                intent_id: "dfs_write_op_1".into(),
+                durable_receipts: 1,
+                required_receipts: 2,
+            },
+            crate::DfsPosixError::Dfs(crate::DfsError::NetworkDelivery {
+                message: "reply lost".into(),
+                delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+            }),
+        ] {
+            assert!(matches!(
+                daemon_dfs_browser_conditional_write_error(error),
+                Outcome::Unknown { .. }
+            ));
+        }
+        assert!(matches!(
+            daemon_dfs_browser_conditional_write_error(crate::DfsPosixError::Dfs(
+                crate::DfsError::NetworkDelivery {
+                    message: "route unavailable".into(),
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                }
+            )),
+            Outcome::Rejected { .. }
+        ));
+    }
 
     #[test]
     fn placement_apply_diagnostics_distinguish_rejection_from_unknown_outcomes() {

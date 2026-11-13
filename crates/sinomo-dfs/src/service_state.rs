@@ -1080,6 +1080,10 @@ pub(crate) struct PendingRemoteWriteResponse {
     pub(crate) created_object_path: Option<String>,
     pub(crate) foreground_replica_repair: bool,
     pub(crate) created_at: Instant,
+    /// A receipt-driven commit attempt that left the durable body with an
+    /// unknown outcome; the requester is answered with it while the intent
+    /// is still pending.
+    pub(crate) commit_outcome_unknown: Option<DfsError>,
 }
 
 #[derive(Clone, Debug)]

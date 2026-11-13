@@ -625,6 +625,12 @@ pub enum DaemonDfsBrowserReplaceFileIfVersionOutcome {
     Rejected {
         detail: String,
     },
+    /// The replacement may or may not have committed: its metadata body is
+    /// durable but its commit was not confirmed. It is not a failure; reload
+    /// the file to see which version is current.
+    Unknown {
+        detail: String,
+    },
 }
 
 impl DaemonDfsBrowserReplaceFileIfVersionOutcome {

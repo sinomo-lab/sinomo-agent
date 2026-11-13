@@ -362,6 +362,9 @@ impl From<DfsPosixError> for FuseMountedMutationError {
             DfsPosixError::DirectoryNotEmpty { .. } => "dfs-posix-directory-not-empty",
             DfsPosixError::PendingWrite { .. } => "dfs-posix-pending-write",
             DfsPosixError::PartialBulkCommit { .. } => "dfs-posix-partial-bulk-commit",
+            DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown { .. }) => {
+                "dfs-posix-commit-outcome-unknown"
+            }
             DfsPosixError::Dfs(_) => "dfs-posix-dfs-error",
             DfsPosixError::Metadata(_) => "dfs-posix-metadata-error",
         };
@@ -5151,6 +5154,9 @@ fn errno_for_posix_error(error: DfsPosixError) -> libc::c_int {
         // In-flight cross-shard moves reject mutations transiently; tell the
         // application to retry rather than reporting an I/O failure.
         DfsPosixError::Dfs(DfsError::Busy { .. }) => libc::EAGAIN,
+        // Durable but not yet committed: like a pending write, it may still
+        // become visible, so it is not reported as an I/O failure.
+        DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown { .. }) => libc::EAGAIN,
         DfsPosixError::PartialBulkCommit { .. }
         | DfsPosixError::Dfs(_)
         | DfsPosixError::Metadata(_) => libc::EIO,
@@ -5620,6 +5626,24 @@ mod errno_tests {
             outcome,
             committed_work,
         }
+    }
+
+    #[test]
+    fn an_unknown_commit_outcome_is_retriable_not_an_io_error() {
+        let unknown = || {
+            DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+                file_system_id: dfs::sifs_file_system_id(),
+                shard_id: "root".into(),
+                epoch: 1,
+                operation_id: "write:dfs_write_op_1".into(),
+                cause: dfs::DfsCommitOutcomeUnknownCause::Deadline,
+                current_primary_node_id: None,
+            })
+        };
+        let error = FuseMountedMutationError::from(unknown());
+        assert_eq!(error.errno, libc::EAGAIN);
+        assert_eq!(error.error_code, "dfs-posix-commit-outcome-unknown");
+        assert_eq!(errno_for_posix_error(unknown()), libc::EAGAIN);
     }
 
     #[test]

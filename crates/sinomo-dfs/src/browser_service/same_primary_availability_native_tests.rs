@@ -359,7 +359,7 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
         Ok(DfsBrowserMutationAttempt::Complete((_, Ok(_)))) => "native-create-returned-success",
         Ok(DfsBrowserMutationAttempt::Complete((
             _,
-            Err(DfsPosixError::Dfs(DfsError::MetadataRecoveryQuorumUnavailable { .. })),
+            Err(DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown { .. })),
         ))) => "native-metadata-authority-full-assigned",
         Ok(DfsBrowserMutationAttempt::Complete((_, Err(_)))) => {
             "native-create-returned-error-see-exact-original-result"

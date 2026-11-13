@@ -1525,6 +1525,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     operation_id,
                     reason,
                 }),
+                Err(DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id,
+                    shard_id,
+                    epoch,
+                    operation_id,
+                    cause,
+                    current_primary_node_id,
+                }) => Some(DfsDistributedWriteResult::CommitOutcomeUnknown {
+                    intent_id: stable_write_intent_id(&requester_node_id, &object_id, &request_id),
+                    file_system_id,
+                    shard_id,
+                    epoch,
+                    operation_id,
+                    cause,
+                    current_primary_node_id,
+                }),
                 Err(error) => return Err(error),
             }
         {
@@ -1836,6 +1852,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         outcome: response_outcome,
                     }
                 }
+                Err(DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id: unknown_file_system_id,
+                    shard_id,
+                    epoch,
+                    operation_id,
+                    cause,
+                    current_primary_node_id,
+                }) => {
+                    // The body is durable and can still commit; a cleanup or
+                    // abort here would contradict it. The requester retries
+                    // the same request id.
+                    DfsDistributedWriteResult::CommitOutcomeUnknown {
+                        intent_id: stable_write_intent_id(
+                            &requester_node_id,
+                            &object_id,
+                            &request_id,
+                        ),
+                        file_system_id: unknown_file_system_id,
+                        shard_id,
+                        epoch,
+                        operation_id,
+                        cause,
+                        current_primary_node_id,
+                    }
+                }
                 Err(error) => {
                     let failed_intent = self
                         .coordinator
@@ -2132,8 +2173,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 created_object_path,
                 foreground_replica_repair,
                 created_at: Instant::now(),
+                commit_outcome_unknown: None,
             },
         );
+    }
+
+    /// Settle a commit attempt made when a content receipt arrived. An
+    /// unknown outcome for a tracked served write is its requester's answer,
+    /// not a failure of the receipt: the durable prepare carries the receipt
+    /// and the requester retries the same operation id. Cancellation, every
+    /// other error, and an unknown with no tracked served write still end the
+    /// receipt's handling.
+    pub(crate) fn settle_receipt_commit_attempt(
+        &mut self,
+        intent_id: &str,
+        attempt: Result<(), DfsError>,
+    ) -> Result<(), DfsError> {
+        match attempt {
+            Err(error) if error.is_commit_outcome_unknown() && !error.is_cancellation() => {
+                match self
+                    .writes
+                    .pending_remote_write_responses
+                    .get_mut(intent_id)
+                {
+                    Some(pending) => {
+                        pending.commit_outcome_unknown = Some(error);
+                        Ok(())
+                    }
+                    None => Err(error),
+                }
+            }
+            attempt => attempt,
+        }
     }
 
     fn rebase_routed_path_write_if_current(
@@ -2462,8 +2533,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let result = self.write_outcome(intent_id);
-        if !matches!(result, Ok(NetworkedDfsWriteOutcome::Pending { .. })) {
-            self.abandon_pending_routed_write(intent_id);
+        match &result {
+            Ok(NetworkedDfsWriteOutcome::Pending { .. }) => {}
+            // The primary still holds the durable body; keep enough identity
+            // to admit a late authoritative response.
+            Err(error) if error.is_commit_outcome_unknown() => {
+                self.compact_pending_routed_write(intent_id);
+            }
+            _ => self.abandon_pending_routed_write(intent_id),
         }
         result
     }
@@ -2850,6 +2927,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                 );
             }
+            DfsDistributedWriteResult::CommitOutcomeUnknown {
+                file_system_id,
+                shard_id,
+                epoch,
+                operation_id,
+                cause,
+                current_primary_node_id,
+                ..
+            } => {
+                self.complete_pending_routed_write(
+                    &canonical_request_id,
+                    Err(DfsError::MetadataCommitOutcomeUnknown {
+                        file_system_id: file_system_id.clone(),
+                        shard_id: shard_id.clone(),
+                        epoch: *epoch,
+                        operation_id: operation_id.clone(),
+                        cause: cause.clone(),
+                        current_primary_node_id: current_primary_node_id.clone(),
+                    }),
+                );
+            }
             DfsDistributedWriteResult::PreconditionFailed { failure } => {
                 failure.validate().map_err(|message| DfsError::Serialization { message })?;
                 let matches_original = self.writes.pending_routed_writes.get(&canonical_request_id)
@@ -3044,9 +3142,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect::<Vec<_>>();
         for intent_id in intent_ids {
             self.refresh_committed_write_projection(&intent_id)?;
+            let recorded_unknown = self
+                .writes
+                .pending_remote_write_responses
+                .get(&intent_id)
+                .and_then(|pending| pending.commit_outcome_unknown.clone());
             let result = match self.write_outcome(&intent_id) {
-                Ok(NetworkedDfsWriteOutcome::Pending { .. }) => continue,
+                Ok(NetworkedDfsWriteOutcome::Pending { .. }) => match recorded_unknown {
+                    Some(unknown) => distributed_write_commit_outcome_unknown(&intent_id, unknown)?,
+                    None => continue,
+                },
                 Ok(outcome) => DfsDistributedWriteResult::Outcome { outcome },
+                Err(error) if error.is_commit_outcome_unknown() => {
+                    distributed_write_commit_outcome_unknown(&intent_id, error)?
+                }
                 Err(error) => {
                     let current_primary_node_id =
                         distributed_write_rejection_current_primary(&error);
@@ -3323,6 +3432,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .remove(&path);
             self.touch_routed_create_parent_directory(&path);
         }
+    }
+}
+
+/// The routed write reply for a durable body whose commit outcome is unknown.
+fn distributed_write_commit_outcome_unknown(
+    intent_id: &str,
+    error: DfsError,
+) -> Result<DfsDistributedWriteResult, DfsError> {
+    match error {
+        DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id,
+            shard_id,
+            epoch,
+            operation_id,
+            cause,
+            current_primary_node_id,
+        } => Ok(DfsDistributedWriteResult::CommitOutcomeUnknown {
+            intent_id: intent_id.to_string(),
+            file_system_id,
+            shard_id,
+            epoch,
+            operation_id,
+            cause,
+            current_primary_node_id,
+        }),
+        error => Err(error),
     }
 }
 

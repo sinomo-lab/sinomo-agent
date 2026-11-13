@@ -11031,7 +11031,7 @@ mod tests {
             drop(capture);
             let error = created.unwrap_err();
             assert!(
-                error.to_string().contains("recovery quorum unavailable"),
+                error.to_string().contains("required acknowledgements"),
                 "{error}"
             );
             assert_eq!(
