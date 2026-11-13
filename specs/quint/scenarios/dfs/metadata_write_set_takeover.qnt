@@ -109,6 +109,38 @@ module dfs_write_set_pending_add_crash_scenario {
   def terminalWitness: bool = all { phase == 23, W::s.kv.primary == W::M4, W::s.kv.writeSet == Set(W::M2, W::M4), C::witnessSuccessorCommits, W::s.commits.exists(c => c.epoch == 2 and c.entries.length() == 2) }
 }
 
+/// The W floor equals N (3). M3 stops answering: removing it would take the
+/// write set below the floor, so it stays and writes wait. M1 recruits M4 as
+/// a replacement beyond N, which every configured member being in the write
+/// set admits; M4 catches up and joins, only then is M3 removed, and M1
+/// commits at the floor with M4.
+module dfs_write_set_replacement_recruit_scenario {
+  import common.* from "../../lib/common"
+  import dfs_metadata_write_set_takeover as W from "../../models/dfs/metadata_write_set_takeover"
+  import dfs_metadata_write_set_takeover_safety as C from "../../checks/dfs/metadata_write_set_takeover_safety"
+  var phase: int
+  action init = all { W::initWithBounds(W::Design, 3, 3), phase' = 0 }
+  action step = any {
+    all { phase == 0, W::s.kv.writeSet.size() - 1 < W::s.wFloor, W::s' = W::s, phase' = 1 },
+    all { phase == 1, W::recruit(W::M1, W::M4), phase' = 2 },
+    all { phase == 2, W::observe(W::M4), phase' = 3 },
+    all { phase == 3, W::accept(W::M4, W::M1), phase' = 4 },
+    all { phase == 4, W::submitAdd(W::M1, W::M4), phase' = 5 },
+    all { phase == 5, W::resolveAnyAdd(true), phase' = 6 },
+    all { phase == 6, W::observe(W::M1), phase' = 7 },
+    all { phase == 7, W::shrink(W::M1, W::M3), phase' = 8 },
+    all { phase == 8, W::prepare(W::M1, 1), phase' = 9 },
+    all { phase == 9, W::observe(W::M2), phase' = 10 },
+    all { phase == 10, W::accept(W::M2, W::M1), phase' = 11 },
+    all { phase == 11, W::observe(W::M4), phase' = 12 },
+    all { phase == 12, W::accept(W::M4, W::M1), phase' = 13 },
+    all { phase == 13, W::commit(W::M1, 1), phase' = 14 },
+    all { phase == 14, W::s' = W::s, phase' = phase },
+  }
+  def safety: bool = C::safety
+  def terminalWitness: bool = all { phase == 14, W::s.kv.writeSet == Set(W::M1, W::M2, W::M4), W::s.kv.members == Set(W::M1, W::M2, W::M3, W::M4), C::witnessReplacementRecruitJoins }
+}
+
 /// Counterexample: if the pending add were lost on restart, M1 would commit
 /// without M4 and the add would then put M4 in the write set without the
 /// committed change.

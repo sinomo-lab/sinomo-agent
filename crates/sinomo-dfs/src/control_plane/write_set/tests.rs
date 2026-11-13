@@ -449,13 +449,13 @@ fn recruit_and_remove_keep_n_and_the_floor_and_record_substitutes() {
     fixture.switch_all();
     let cut = fixture.cut();
     assert!(
-        build_metadata_write_set_recruit(&cut, &fixture.nodes[3], &bounds(2, 3)).is_err(),
+        build_metadata_write_set_recruit(&cut, &fixture.nodes[3], &bounds(2, 3), DfsMetadataShardRecruit::BelowN).is_err(),
         "write set already has N"
     );
     let shrink = build_metadata_write_set_shrink(&cut, &fixture.nodes[2], &bounds(2, 3)).unwrap();
     assert!(fixture.apply(&shrink));
     let cut = fixture.cut();
-    let recruit = build_metadata_write_set_recruit(&cut, &fixture.nodes[3], &bounds(2, 3)).unwrap();
+    let recruit = build_metadata_write_set_recruit(&cut, &fixture.nodes[3], &bounds(2, 3), DfsMetadataShardRecruit::BelowN).unwrap();
     assert!(fixture.apply(&recruit));
     let cut = fixture.cut();
     assert!(cut.shard.replica_node_ids.contains(&fixture.nodes[3]));
@@ -802,4 +802,60 @@ fn write_set_record_round_trips_and_rejects_an_unknown_format() {
         metadata_shard_write_set_state(&fixture.cut().shard, Some(&bytes)),
         DfsMetadataShardWriteSetState::Unreadable { .. }
     ));
+}
+
+#[test]
+fn a_replacement_recruit_adds_one_member_beyond_n_only_while_all_are_in_the_write_set() {
+    let mut fixture = Fixture::new();
+    fixture.switch_all();
+    let cut = fixture.cut();
+    // W = N = 3 with every configured member in the write set, as when a dead
+    // member is held at a W = N floor: only the replacement form admits it.
+    assert!(
+        build_metadata_write_set_recruit(
+            &cut,
+            &fixture.nodes[3],
+            &bounds(3, 3),
+            DfsMetadataShardRecruit::BelowN
+        )
+        .is_err()
+    );
+    // More configured members than N: no replacement either.
+    assert!(
+        build_metadata_write_set_recruit(
+            &cut,
+            &fixture.nodes[3],
+            &bounds(2, 2),
+            DfsMetadataShardRecruit::Replacement
+        )
+        .is_err()
+    );
+    let recruit = build_metadata_write_set_recruit(
+        &cut,
+        &fixture.nodes[3],
+        &bounds(3, 3),
+        DfsMetadataShardRecruit::Replacement,
+    )
+    .unwrap();
+    assert!(fixture.apply(&recruit));
+    let cut = fixture.cut();
+    assert_eq!(cut.shard.replica_node_ids.len(), 3);
+    let write_set = cut.write_set_state().switched().cloned().unwrap();
+    assert_eq!(write_set.substitutes[0].node_id, fixture.nodes[3]);
+    // While the recruit is outside the write set, no second one is admitted.
+    let mut other = cut.clone();
+    other.members.push(DfsMetadataMemberCapabilityCut {
+        node_id: node("node_ws_e"),
+        member_value: None,
+        policy_value: None,
+    });
+    assert!(
+        build_metadata_write_set_recruit(
+            &other,
+            &node("node_ws_e"),
+            &bounds(3, 3),
+            DfsMetadataShardRecruit::Replacement
+        )
+        .is_err()
+    );
 }

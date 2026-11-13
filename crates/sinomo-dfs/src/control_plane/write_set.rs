@@ -755,25 +755,57 @@ pub fn build_metadata_write_set_add(
     change_request(cut, request_id, compares, next, None, Vec::new())
 }
 
-/// Add an eligible member to the configured replicas while the write set has
-/// fewer than N members. It joins the write set later through an add.
+/// Why a recruit is admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DfsMetadataShardRecruit {
+    /// The write set has fewer than N members.
+    BelowN,
+    /// Every configured member is in the write set and there are at most N of
+    /// them. One member beyond N then replaces a dead member held at the W
+    /// floor, which cannot leave the write set, or a mobile member; the
+    /// surplus is retired once the replacement has joined. While the recruit
+    /// is outside the write set the condition fails, so at most one member
+    /// beyond N is ever added this way.
+    Replacement,
+}
+
+/// Add an eligible member to the configured replicas: while the write set has
+/// fewer than N members, or as a replacement (see [`DfsMetadataShardRecruit`]).
+/// It joins the write set later through an add.
 pub fn build_metadata_write_set_recruit(
     cut: &DfsMetadataShardRecordCut,
     node_id: &NodeId,
     bounds: &DfsMetadataShardBounds,
+    admission: DfsMetadataShardRecruit,
 ) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
     let current = switched_write_set(cut)?;
-    if metadata_shard_configured_node_ids(&cut.shard).contains(node_id) {
+    let configured = metadata_shard_configured_node_ids(&cut.shard);
+    if configured.contains(node_id) {
         return Err(refuse(
             cut,
             format!("{node_id} is already a configured member"),
         ));
     }
-    if current.write_set.len() >= bounds.n {
-        return Err(refuse(
-            cut,
-            format!("the write set already has N = {} members", bounds.n),
-        ));
+    match admission {
+        DfsMetadataShardRecruit::BelowN if current.write_set.len() >= bounds.n => {
+            return Err(refuse(
+                cut,
+                format!("the write set already has N = {} members", bounds.n),
+            ));
+        }
+        DfsMetadataShardRecruit::Replacement
+            if configured.len() > bounds.n
+                || configured.iter().any(|member| !current.contains(member)) =>
+        {
+            return Err(refuse(
+                cut,
+                format!(
+                    "a replacement recruit needs every configured member in the write set and at most N = {} of them",
+                    bounds.n
+                ),
+            ));
+        }
+        _ => {}
     }
     let mut compares = vec![handoff_missing(cut)?, cut.file_system_config_compare()];
     compares.extend(metadata_write_set_member_capability_compares(
