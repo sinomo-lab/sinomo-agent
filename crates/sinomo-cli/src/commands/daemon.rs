@@ -472,7 +472,11 @@ pub fn audio_component_factory() -> Result<sinomo_runtime::daemon::DaemonCompone
                 sinomo_audio::service::register_services(
                     sinomo_runtime::service::ServiceRegistry::builder(),
                 )
-                .register(sinomo_video::service::CameraService)
+                .register(sinomo_video::service::VideoService::with_screens(
+                    std::sync::Arc::new(
+                        sinomo_actions::desktop::provider::DesktopScreenVideoProvider,
+                    ),
+                ))
                 .register(sinomo_runtime::device::sensors::SensorService)
                 .build(),
             );
@@ -1532,7 +1536,12 @@ mod tests {
         use sinomo_runtime::daemon::DaemonSignerAuthority;
         use sinomo_runtime::service::Service;
         let mut routes = sinomo_audio::service::MediaAudioService::new().route_categories();
-        routes.extend(sinomo_video::service::CameraService.route_categories());
+        routes.extend(
+            sinomo_video::service::VideoService::with_screens(std::sync::Arc::new(
+                sinomo_actions::desktop::provider::DesktopScreenVideoProvider,
+            ))
+            .route_categories(),
+        );
         routes.extend(sinomo_runtime::device::sensors::SensorService.route_categories());
         for route in routes {
             let scope = route.auth_scope.as_deref().expect("media scope");

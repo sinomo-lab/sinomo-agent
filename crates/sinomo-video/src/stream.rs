@@ -19,6 +19,17 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
+#[path = "stream_ceiling.rs"]
+mod ceiling;
+use ceiling::FrameRateCeiling;
+
+/// Apply the consumer ceiling once, at a native producer that can enforce it.
+pub fn effective_capture_fps(capture_fps: u32, consumer_fps: Option<u32>) -> u32 {
+    consumer_fps
+        .filter(|rate| *rate > 0)
+        .map_or(capture_fps, |rate| capture_fps.min(rate))
+}
+
 fn unix_micros() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -28,14 +39,89 @@ fn unix_micros() -> u128 {
 
 pub const VIDEO_STREAM_VERSION: u32 = 1;
 pub const H264_STREAM_VERSION: u32 = 2;
+/// Screen/App Use consumers must understand source geometry and content bounds.
+pub const GEOMETRY_STREAM_VERSION: u32 = 3;
 use crate::codec::VideoTransport;
 pub const MAX_ENCODED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 4096;
+
+/// A source can resize while keeping the negotiated video surface and codec
+/// alive. Content bounds locate its letterboxed pixels in the delivered frame.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub content_bounds: Option<[u32; 4]>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum VideoNotification {
+    #[serde(rename = "media.video.geometry.changed")]
+    GeometryChanged {
+        geometry: VideoGeometry,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<VideoGeometryOrigin>,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoGeometryOrigin {
+    pub sequence: u64,
+    pub captured_at_unix_ms: u64,
+}
+fn update_geometry(metadata: &mut VideoFrameMetadata, previous: &mut Option<VideoGeometry>) {
+    metadata.notifications.clear();
+    let projection = matches!(&metadata.identity, Some(DesktopCaptureIdentity::Target {
+        target: sinomo_runtime::device::desktop::DesktopTarget::Monitor { device_name }, ..
+    }) if device_name.starts_with("android:display:0:"));
+    metadata.content_bounds = projection.then(|| {
+        let scale = (f64::from(metadata.width) / f64::from(metadata.source_width))
+            .min(f64::from(metadata.height) / f64::from(metadata.source_height));
+        let width = ((f64::from(metadata.source_width) * scale) as u32)
+            .max(1)
+            .min(metadata.width);
+        let height = ((f64::from(metadata.source_height) * scale) as u32)
+            .max(1)
+            .min(metadata.height);
+        let left = (metadata.width - width) / 2;
+        let top = (metadata.height - height) / 2;
+        [left, top, left + width, top + height]
+    });
+    let geometry = VideoGeometry {
+        width: metadata.width,
+        height: metadata.height,
+        source_width: metadata.source_width,
+        source_height: metadata.source_height,
+        content_bounds: metadata.content_bounds,
+    };
+    if previous.as_ref() != Some(&geometry) {
+        metadata
+            .notifications
+            .push(VideoNotification::GeometryChanged {
+                geometry: geometry.clone(),
+                origin: u64::try_from(metadata.captured_at_unix_ms).ok().map(
+                    |captured_at_unix_ms| VideoGeometryOrigin {
+                        sequence: metadata.sequence,
+                        captured_at_unix_ms,
+                    },
+                ),
+            });
+        *previous = Some(geometry);
+    }
+}
 
 /// A record is u32 LE metadata length, JSON metadata, u32 LE image length,
 /// encoded image. The outer object RPC owns routing, authorization and framing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoFrameMetadata {
+    /// Logical producer identity, distinct from a shared native frame sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bounds: Option<[u32; 4]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notifications: Vec<VideoNotification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<DesktopCaptureIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -106,6 +192,9 @@ pub fn encode_sample(
         return Err("encoded video frame exceeds limit".into());
     }
     let metadata = VideoFrameMetadata {
+        stream_id: None,
+        content_bounds: None,
+        notifications: Vec::new(),
         identity: None,
         tiles: Vec::new(),
         sequence: sample.sequence,
@@ -270,12 +359,25 @@ pub fn desktop_capture_body_with_options(
     let terminal = failure.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + duration;
+        let stream_id = sinomo_runtime::core::Id::generate().to_string();
         let mut sequence = 0;
         let mut packet_sequence = 0;
         let mut hardware = None;
         let mut output_size = None;
-        let mut next_encode = Instant::now();
+        let mut previous_geometry = None;
         let encode_interval = encoding.model_frame_interval().unwrap_or(Duration::ZERO);
+        let delegated = capture.frame_rate_ceiling().is_some_and(|rate| {
+            encoding
+                .max_frame_rate_hz
+                .filter(|rate| *rate > 0)
+                .is_none_or(|limit| rate <= limit)
+        });
+        let mut ceiling = FrameRateCeiling::new(if delegated {
+            None
+        } else {
+            encoding.max_frame_rate_hz
+        });
+        let mut pending: Option<NativeVideoSample> = None;
         let result = (|| -> Result<(), String> {
             while Instant::now() < deadline
                 && !cancelled.load(Ordering::Acquire)
@@ -294,28 +396,44 @@ pub fn desktop_capture_body_with_options(
                     Ok(Err(_)) => break,
                     Err(_) => continue,
                 };
-                let wait = next_encode.saturating_duration_since(Instant::now());
-                if !wait.is_zero() {
-                    std::thread::sleep(wait.min(Duration::from_millis(100)));
+                let delay = ceiling.delay(Instant::now());
+                let encoded_pending = pending
+                    .as_ref()
+                    .is_some_and(|sample| sample.format == NativeVideoSampleFormat::H264);
+                if encoded_pending && !delay.is_zero() {
+                    // Opaque encoded sources cannot discard a reference frame.
+                    // Wait only for an exhausted ceiling, never an idle cadence.
+                    std::thread::park_timeout(delay.min(Duration::from_millis(50)));
+                    continue;
+                }
+                let pull_started = Instant::now();
+                if !encoded_pending {
+                    let timeout = if pending.is_some() {
+                        delay.min(Duration::from_millis(100))
+                    } else {
+                        Duration::from_millis(100)
+                    };
+                    if let Some(sample) =
+                        capture.next(sequence, timeout).map_err(|e| e.to_string())?
+                    {
+                        sequence = sample.sequence;
+                        pending = Some(sample);
+                    }
+                }
+                let pull_us = pull_started.elapsed().as_micros() as u64;
+                if pending.is_none() || !ceiling.delay(Instant::now()).is_zero() {
                     continue;
                 }
                 capture.check_active().map_err(|error| error.to_string())?;
                 if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                     break;
                 }
-                let pull_started = Instant::now();
-                let Some(sample) = capture
-                    .next(sequence, Duration::from_millis(100))
-                    .map_err(|e| e.to_string())?
-                else {
-                    continue;
-                };
-                let pull_us = pull_started.elapsed().as_micros() as u64;
+                let sample = pending.take().expect("pending frame checked");
+                ceiling.admit(Instant::now());
                 let trace_frame = tracing::enabled!(target: "sinomo.perf", tracing::Level::TRACE);
                 let native_ready_us = if trace_frame { unix_micros() } else { 0 };
-                sequence = sample.sequence;
                 let encode_span = tracing::trace_span!(target: "sinomo.perf", "media.frame.encode",
-                    stage = "media.frame.encode", sequence = sample.sequence,
+                    stage = "media.frame.encode", stream_id = %stream_id, sequence = sample.sequence,
                     captured_at_unix_ms = sample.captured_at_unix_ms as u64,
                     outcome = tracing::field::Empty);
                 let encode_guard = encode_span.enter();
@@ -350,6 +468,9 @@ pub fn desktop_capture_body_with_options(
                     )?;
                     (
                         VideoFrameMetadata {
+                            stream_id: None,
+                            content_bounds: None,
+                            notifications: Vec::new(),
                             identity: None,
                             tiles: Vec::new(),
                             sequence: sample.sequence,
@@ -395,6 +516,9 @@ pub fn desktop_capture_body_with_options(
                     let bytes = hardware.as_mut().unwrap().encode(&frame)?;
                     (
                         VideoFrameMetadata {
+                            stream_id: None,
+                            content_bounds: None,
+                            notifications: Vec::new(),
                             identity: None,
                             tiles: Vec::new(),
                             sequence: sample.sequence,
@@ -426,12 +550,13 @@ pub fn desktop_capture_body_with_options(
                     break;
                 }
                 packet_sequence += 1;
+                metadata.stream_id = Some(stream_id.clone());
                 metadata.identity = capture.identity();
                 metadata.tiles = capture.tiles();
-                next_encode = frame_started + encode_interval;
+                update_geometry(&mut metadata, &mut previous_geometry);
                 let encoded_ready_us = if trace_frame { unix_micros() } else { 0 };
                 permit.send(record(&metadata, &bytes)?);
-                tracing::trace!(target: "sinomo.perf", stage = "media.frame.source", sequence = sample.sequence,
+                tracing::trace!(target: "sinomo.perf", stage = "media.frame.source", stream_id = %stream_id, sequence = sample.sequence,
                     captured_at_unix_ms = sample.captured_at_unix_ms as u64,
                     native_ready_unix_us = native_ready_us as u64,
                     encoded_ready_unix_us = encoded_ready_us as u64,
@@ -527,9 +652,37 @@ async fn read_packet<R: AsyncRead + Unpin>(
     }
     if metadata.width == 0
         || metadata.height == 0
+        || metadata.source_width == 0
+        || metadata.source_height == 0
         || u64::from(metadata.width) * u64::from(metadata.height) > 32 * 1024 * 1024
     {
         return Err(io::Error::other("invalid video dimensions"));
+    }
+    if metadata
+        .content_bounds
+        .is_some_and(|[left, top, right, bottom]| {
+            left >= right || top >= bottom || right > metadata.width || bottom > metadata.height
+        })
+    {
+        return Err(io::Error::other(
+            "video content bounds exceed frame geometry",
+        ));
+    }
+    for notification in &metadata.notifications {
+        let VideoNotification::GeometryChanged { geometry, origin } = notification;
+        if geometry.width != metadata.width
+            || geometry.height != metadata.height
+            || geometry.source_width != metadata.source_width
+            || geometry.source_height != metadata.source_height
+            || geometry.content_bounds != metadata.content_bounds
+            || origin
+                .as_ref()
+                .is_some_and(|origin| origin.sequence > metadata.sequence)
+        {
+            return Err(io::Error::other(
+                "geometry notification does not match its video frame",
+            ));
+        }
     }
     let mut image = vec![0; length];
     reader.read_exact(&mut image).await?;
@@ -593,6 +746,7 @@ impl ReceivedFrame {
 /// a latest image; dropping compressed P frames would corrupt later frames.
 #[derive(Default)]
 pub struct VideoStreamReader {
+    stream_identity: Option<Option<String>>,
     decoder: Option<openh264::decoder::Decoder>,
     previous: Option<u64>,
     geometry: Option<(u32, u32)>,
@@ -640,6 +794,16 @@ impl VideoStreamReader {
         metadata: VideoFrameMetadata,
         frame: RealtimeEncodedVideoFrameInput,
     ) -> io::Result<(VideoFrameMetadata, ReceivedFrame)> {
+        if self
+            .stream_identity
+            .as_ref()
+            .is_some_and(|previous| previous != &metadata.stream_id)
+        {
+            return Err(io::Error::other(
+                "video producer identity changed within a stream",
+            ));
+        }
+        self.stream_identity = Some(metadata.stream_id.clone());
         self.last_wire_bytes = frame.image.len();
         let started = Instant::now();
         if self
@@ -754,7 +918,7 @@ pub struct RemoteVideoSource {
 }
 impl RemoteVideoSource {
     pub fn from_body(body: sinomo_runtime::network::ObjectRpcIncomingBody) -> Self {
-        let latest = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<DecodedVideoFrame>>> = Arc::new(Mutex::new(None));
         let failure = Arc::new(Mutex::new(None));
         let output = latest.clone();
         let terminal = failure.clone();
@@ -764,11 +928,27 @@ impl RemoteVideoSource {
             let mut decoder = VideoStreamReader::default();
             loop {
                 match decoder.read_decoded(&mut body).await {
-                    Ok(Some(frame))
+                    Ok(Some(mut frame))
                         if previous.is_none_or(|sequence| frame.0.sequence > sequence) =>
                     {
                         previous = Some(frame.0.sequence);
-                        *output.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
+                        let mut latest = output.lock().unwrap_or_else(|e| e.into_inner());
+                        // A slow preview may drop pixels, but must still see the
+                        // latest pending geometry change and its source evidence.
+                        if frame.0.notifications.is_empty()
+                            && let Some((old, _)) = latest.as_ref()
+                        {
+                            if old.identity == frame.0.identity
+                                && old.width == frame.0.width
+                                && old.height == frame.0.height
+                                && old.source_width == frame.0.source_width
+                                && old.source_height == frame.0.source_height
+                                && old.content_bounds == frame.0.content_bounds
+                            {
+                                frame.0.notifications = old.notifications.clone();
+                            }
+                        }
+                        *latest = Some(frame);
                     }
                     Ok(None) => break,
                     result => {
@@ -837,6 +1017,119 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), vec![2]);
     }
 
+    #[tokio::test]
+    async fn projection_resize_notifies_without_resetting_h264_references() {
+        let records = h264_records();
+        let mut previous = None;
+        let mut reader = VideoStreamReader::default();
+        for (index, (mut metadata, bytes)) in records.into_iter().enumerate() {
+            metadata.identity = Some(DesktopCaptureIdentity::Target {
+                target: sinomo_runtime::device::desktop::DesktopTarget::Monitor {
+                    device_name: "android:display:0:test-share".into(),
+                },
+                application: None,
+            });
+            metadata.source_width = if index < 2 { 1080 } else { 2280 };
+            metadata.source_height = if index < 2 { 2280 } else { 1080 };
+            update_geometry(&mut metadata, &mut previous);
+            assert_eq!(
+                metadata.notifications.len(),
+                usize::from(index == 0 || index == 2)
+            );
+            let bounds = metadata.content_bounds.unwrap();
+            if index < 2 {
+                assert!(bounds[0] > 0);
+            } else {
+                assert!(bounds[1] > 0);
+            }
+            let wire = record(&metadata, &bytes).unwrap();
+            let (received, frame) = reader
+                .read_decoded(&mut wire.as_slice())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, metadata);
+            assert!(matches!(frame, ReceivedFrame::Pixels(_)));
+        }
+    }
+    #[tokio::test]
+    async fn latest_preview_retains_pending_geometry_with_original_evidence() {
+        let mut previous = None;
+        let mut wire = Vec::new();
+        let mut changed_at = 0;
+        for (index, (mut metadata, bytes)) in h264_records().into_iter().enumerate() {
+            metadata.source_width = if index == 0 { 1080 } else { 2280 };
+            metadata.source_height = if index == 0 { 2280 } else { 1080 };
+            update_geometry(&mut metadata, &mut previous);
+            if index == 1 {
+                changed_at = metadata.sequence;
+            }
+            wire.extend(record(&metadata, &bytes).unwrap());
+        }
+        let source = RemoteVideoSource::from_body(
+            sinomo_runtime::network::ObjectRpcIncomingBody::bytes(wire),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !source.worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (metadata, _) = source.take_latest().unwrap().unwrap();
+        assert_eq!(metadata.sequence, 7);
+        let [
+            VideoNotification::GeometryChanged {
+                geometry,
+                origin: Some(origin),
+            },
+        ] = metadata.notifications.as_slice()
+        else {
+            panic!("pending geometry notification was lost");
+        };
+        assert_eq!(geometry.source_width, 2280);
+        assert_eq!(origin.sequence, changed_at);
+        assert!(origin.sequence < metadata.sequence);
+    }
+
+    #[tokio::test]
+    async fn receiver_rejects_interleaved_logical_producers() {
+        let frames = h264_records();
+        let mut reader = VideoStreamReader::default();
+        for (index, (mut metadata, bytes)) in frames.into_iter().take(2).enumerate() {
+            metadata.stream_id = Some(format!("producer-{index}"));
+            let wire = record(&metadata, &bytes).unwrap();
+            let result = reader.read_decoded(&mut wire.as_slice()).await;
+            if index == 0 {
+                assert!(result.unwrap().is_some());
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("producer identity changed")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_rejects_content_coordinates_outside_frame() {
+        let (mut metadata, bytes) = h264_records().remove(0);
+        metadata.content_bounds = Some([0, 0, metadata.width + 1, metadata.height]);
+        let wire = record(&metadata, &bytes).unwrap();
+        assert!(
+            VideoStreamReader::default()
+                .read_decoded(&mut wire.as_slice())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("content bounds")
+        );
+    }
+
     fn h264_records() -> Vec<(VideoFrameMetadata, Vec<u8>)> {
         use openh264::{
             encoder::Encoder,
@@ -850,6 +1143,9 @@ mod tests {
                 let bytes = encoder.encode(&yuv).unwrap().to_vec();
                 (
                     VideoFrameMetadata {
+                        stream_id: None,
+                        content_bounds: None,
+                        notifications: Vec::new(),
                         capture_format: None,
                         identity: None,
                         tiles: Vec::new(),
@@ -919,7 +1215,7 @@ mod tests {
         let (body, worker) = desktop_capture_body_with_transport(
             Source(Mutex::new(samples), cancelled.clone()),
             RealtimeVideoInputConfig {
-                max_frame_rate_hz: None,
+                max_frame_rate_hz: Some(2),
                 ..Default::default()
             },
             Duration::from_secs(5),
@@ -1120,6 +1416,85 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn ceiling_coalesces_to_final_static_frame_without_spacing_the_initial_burst() {
+        struct Source {
+            frames: Mutex<std::collections::VecDeque<NativeVideoSample>>,
+            pulled: Arc<Mutex<Vec<Instant>>>,
+        }
+        impl DesktopFrameSource for Source {
+            fn check_active(&self) -> sinomo_runtime::device::desktop::DesktopResult<()> {
+                Ok(())
+            }
+            fn next(
+                &self,
+                _: u64,
+                timeout: Duration,
+            ) -> sinomo_runtime::device::desktop::DesktopResult<Option<NativeVideoSample>>
+            {
+                let sample = self.frames.lock().unwrap().pop_front();
+                if sample.is_some() {
+                    self.pulled.lock().unwrap().push(Instant::now());
+                } else {
+                    std::thread::park_timeout(timeout);
+                }
+                Ok(sample)
+            }
+        }
+        let frames = (1..=4)
+            .map(|sequence| NativeVideoSample {
+                native_dimensions: None,
+                sequence,
+                format: NativeVideoSampleFormat::Bgra8,
+                width: 1,
+                height: 1,
+                timestamp_ns: sequence,
+                duration_ns: 1,
+                captured_at_unix_ms: 1,
+                data: Arc::from([0, 0, 0, 255]),
+                planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+                    offset: 0,
+                    len: 4,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                }]),
+            })
+            .collect();
+        let pulled = Arc::new(Mutex::new(Vec::new()));
+        let (body, worker) = desktop_capture_body(
+            Source {
+                frames: Mutex::new(frames),
+                pulled: pulled.clone(),
+            },
+            RealtimeVideoInputConfig {
+                frame_format: RealtimeVideoFrameFormat::Png,
+                max_frame_rate_hz: Some(2),
+                ..Default::default()
+            },
+            Duration::from_millis(1300),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let bytes = body.collect_to_vec(1024 * 1024).await.unwrap();
+        worker.await.unwrap();
+        let times = pulled.lock().unwrap();
+        assert_eq!(times.len(), 4);
+        assert!(
+            times[3].duration_since(times[0]) < Duration::from_millis(400),
+            "available frames must not be paced at 500 ms"
+        );
+        let mut reader = bytes.as_slice();
+        let mut sequences = Vec::new();
+        while let Some((metadata, _)) = read_frame(&mut reader).await.unwrap() {
+            sequences.push(metadata.sequence);
+        }
+        assert_eq!(
+            sequences,
+            [1, 2, 4],
+            "keep the latest update even when the source becomes static"
+        );
+    }
+
+    #[tokio::test]
     async fn backpressure_does_not_fetch_frames_or_delay_revocation() {
         use std::sync::atomic::AtomicUsize;
         struct Source(Arc<AtomicUsize>, Arc<AtomicBool>);
@@ -1234,6 +1609,9 @@ mod tests {
     #[tokio::test]
     async fn continuous_records_preserve_sequence_and_reject_truncation() {
         let metadata = VideoFrameMetadata {
+            stream_id: None,
+            content_bounds: None,
+            notifications: Vec::new(),
             capture_format: None,
             identity: None,
             tiles: Vec::new(),

@@ -111,9 +111,10 @@ API references: [MediaCodec input/output surfaces](https://developer.android.com
 ## Integrated cross-node comparison
 
 App Use `/app-use/capture` and camera `/media/video/capture` requests accept
-`transport: "image" | "h264" | "auto"`. Omitted transport preserves image
-stream version 1. H.264 uses version 2 and a stream-local Android MediaCodec
-encoder; explicit H.264 requests fail if that backend is unavailable. Auto
+`transport: "image" | "h264" | "auto"`. Camera image/H.264 streams retain
+versions 1/2. Screen and App Use streams use version 3, including geometry change
+notifications and content bounds. H.264 uses a stream-local hardware encoder;
+explicit H.264 requests fail if that backend is unavailable. Auto
 selects the installed hardware adapter except for coordinate-grid images.
 Check the capture response's selected version, not just the default image
 version in the session descriptor. HEVC remains a standalone experiment.
@@ -124,8 +125,9 @@ and decodes every reference frame before a consumer may replace its latest
 frame. `VideoStreamReader::read_decoded` returns pixels directly for preview;
 model consumers convert only their selected frames to JPEG/PNG. The Android
 adapter uploads existing native pixels to an encoder surface for GPU scaling;
-this still includes the capture interface's CPU readback and native-module
-transfer. It is not a zero-copy MediaProjection path.
+the pixel path includes CPU readback and native-module transfer. Android screen
+sharing can instead supply direct encoder surfaces through the generic media
+screen source. Accessibility screenshots are a separate, rate-limited source.
 
 For a comparison, build the app and its native provider with `android-debug`,
 activate the provider through the normal module interface, and join a second
@@ -176,10 +178,12 @@ its percentiles must not be subtracted from frame-age percentiles.
 
 Enable an Observe capture with `sinomo.perf=trace` around a bounded streaming
 workload. `media.frame.encode` spans measure encoding; `media.frame.source`
-events carry the source sequence, acquisition timestamp, native handoff time,
-encoded-ready time and pull duration. The consumer's `wire_received_unix_us`
+events carry the logical `stream_id`, source sequence, acquisition timestamp,
+native handoff time, encoded-ready time and pull duration. The consumer's `wire_received_unix_us`
 marks complete record arrival before decoder scheduling. Join frames by source
-sequence and acquisition timestamp, and reject missing or ambiguous matches.
+stream ID, source sequence and acquisition timestamp, and reject missing or
+ambiguous matches. Native Android diagnostics do not carry the logical stream ID;
+ambiguous native-stage matches are reported as unavailable instead of overwritten.
 
 For Android's internal handoff, save the existing value of
 `adb shell getprop log.tag.SinomoMediaStage`, then enable

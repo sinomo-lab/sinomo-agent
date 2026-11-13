@@ -73,7 +73,7 @@ fn unsupported(detail: &str) -> DesktopError {
 }
 
 pub fn capabilities() -> DesktopCapabilities {
-    let mut caps = DesktopCapabilities { capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8],
+    let mut caps = DesktopCapabilities { frame_rate_ceiling: false, accessibility: false, capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8],
         platform: "linux".into(), capture: false, keyboard_mouse: false, background_window_input: false,
         gamepad: "unsupported".into(), limitations: vec![
             "Wayland uses explicit raw mode through RemoteDesktop/ScreenCast portals; background window messages and gamepads are unavailable".into(),
@@ -100,6 +100,32 @@ pub fn capabilities() -> DesktopCapabilities {
             .push("Wayland portal capability probe failed".into()),
     }
     caps
+}
+/// Generic video discovery observes an approved portal session; it never
+/// launches the chooser while a caller is only listing camera/screen sources.
+pub fn video_targets(
+    permissions: &LocalNodePermissionStore,
+) -> DesktopResult<Vec<DesktopTargetInfo>> {
+    authorize_host(permissions)?;
+    let slot = owner().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(current) = slot.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if current.shared.stopped.load(Ordering::Acquire) {
+        return Ok(Vec::new());
+    }
+    if current.shared.permissions.path() != permissions.path() {
+        return Err(DesktopError::PermissionDenied(
+            "portal session belongs to a different node-local permission store".into(),
+        ));
+    }
+    current
+        .shared
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .map(|target| target.map(|target| vec![target.info]).unwrap_or_default())
 }
 pub fn targets(
     permissions: &LocalNodePermissionStore,

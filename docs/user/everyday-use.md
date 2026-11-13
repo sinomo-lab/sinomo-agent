@@ -60,9 +60,10 @@ revoke Android's permission for local calls. Sensor capture depends on a platfor
 adapter; Android supplies motion, rotation, magnetic field, light, and pressure
 readings where the hardware is available.
 
-On Android, **Set up App Use** opens the local display-sharing and accessibility
-controls. App Use also requires its packaged OS provider and exact-share consent;
-see [App Use setup](computer-and-app-use.md#installation-and-local-consent).
+On Android, **Set up App Use** opens persistent Accessibility observation/control
+and separate screen-sharing settings. App Use requires its packaged OS provider
+and local resource grants; semantic observation does not require screen sharing.
+See [App Use setup](computer-and-app-use.md#installation-and-local-consent).
 
 ## Models and Providers
 

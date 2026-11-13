@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 pub const APP_USE_OS_MODULE_ID: &str = "module.app-use.os";
 pub const APP_USE_OS_INTERFACE: &str = "sinomo.app-use.os";
-pub const APP_USE_OS_VERSION: &str = "2.0.0";
+pub const APP_USE_OS_VERSION: &str = "3.0.0";
 pub const APP_USE_OS_OPERATION: &str = "app-use.os";
 pub const APP_USE_OS_SERVICE: &str = "app-use-os";
 pub const APP_USE_OS_CACHE_KEY: &str = "module/desktop/app-use";
@@ -24,6 +24,20 @@ pub struct DesktopProviderRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopProviderCommand {
+    AccessibilityObserve {
+        target: DesktopTarget,
+        max_nodes: u32,
+    },
+    AccessibilityAct {
+        target: DesktopTarget,
+        snapshot_id: String,
+        node_id: String,
+        operation: super::accessibility::AccessibilityAction,
+    },
+    VideoTargets,
+    StopVideo {
+        target: DesktopTarget,
+    },
     SurfaceCapabilities,
     Applications,
     OpenApplication {
@@ -96,6 +110,9 @@ pub enum DesktopProviderCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DesktopProviderResponse {
+    AccessibilityObserved {
+        snapshot: super::accessibility::AccessibilitySnapshot,
+    },
     SurfaceCapabilities {
         capabilities: DesktopSurfaceCapabilities,
     },

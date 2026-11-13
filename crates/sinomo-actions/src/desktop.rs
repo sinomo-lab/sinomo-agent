@@ -74,6 +74,22 @@ impl DesktopModule {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopControlRequest {
+    VideoSources,
+    StopVideo {
+        source: sinomo_video::service::VideoSource,
+    },
+    /// Prefer this semantic observation on platforms advertising accessibility.
+    Observe {
+        target: DesktopTarget,
+        #[serde(default = "default_max_nodes")]
+        max_nodes: u32,
+    },
+    Act {
+        target: DesktopTarget,
+        snapshot_id: String,
+        node_id: String,
+        operation: accessibility::AccessibilityAction,
+    },
     Capabilities,
     Applications,
     OpenApplication {
@@ -149,6 +165,9 @@ pub enum DesktopControlRequest {
         session_id: String,
     },
 }
+fn default_max_nodes() -> u32 {
+    64
+}
 fn default_overview_windows() -> usize {
     4
 }
@@ -166,6 +185,14 @@ pub struct DesktopStreamDescriptor {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DesktopControlResponse {
+    VideoSources {
+        devices: Vec<sinomo_video::service::VideoDevice>,
+        capture_route: String,
+        control_route: String,
+    },
+    Observed {
+        snapshot: accessibility::AccessibilitySnapshot,
+    },
     Capabilities {
         capabilities: DesktopCapabilities,
         #[serde(default)]
@@ -319,6 +346,75 @@ impl Runtime {
             authorize_host(&permissions)?;
         }
         match request {
+            DesktopControlRequest::VideoSources => Ok(DesktopControlResponse::VideoSources {
+                devices: sinomo_video::service::video_sources(
+                    &self.root,
+                    Some(&provider::DesktopScreenVideoProvider),
+                )?,
+                capture_route: sinomo_video::service::CAMERA_CAPTURE.into(),
+                control_route: sinomo_video::service::VIDEO_CONTROL.into(),
+            }),
+            DesktopControlRequest::StopVideo { source } => {
+                sinomo_video::service::stop_video_source(
+                    &self.root,
+                    &provider::DesktopScreenVideoProvider,
+                    source,
+                )?;
+                Ok(DesktopControlResponse::Closed)
+            }
+            DesktopControlRequest::Observe { target, max_nodes } => {
+                authorize(&permissions, &target, "capture")?;
+                match self.provider()?.invoke(
+                    protocol::DesktopProviderCommand::AccessibilityObserve { target, max_nodes },
+                )? {
+                    protocol::DesktopProviderResponse::AccessibilityObserved { snapshot } => {
+                        Ok(DesktopControlResponse::Observed { snapshot })
+                    }
+                    _ => Err(DesktopError::Platform(
+                        "invalid accessibility observation response".into(),
+                    )),
+                }
+            }
+            DesktopControlRequest::Act {
+                target,
+                snapshot_id,
+                node_id,
+                operation,
+            } => {
+                authorize(&permissions, &target, "input")?;
+                // Keep another actor's raw input lease exclusive through this
+                // bounded semantic effect. The same actor may deliberately mix.
+                let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                if sessions.values().any(|session| {
+                    session.input.is_some()
+                        && session.owner != owner
+                        && session.expires > Instant::now()
+                        && (session.target == target || session.mode == DesktopControlMode::Raw)
+                }) {
+                    return Err(DesktopError::Invalid(
+                        "input target already has another owner".into(),
+                    ));
+                }
+                match self.provider()?.invoke(
+                    protocol::DesktopProviderCommand::AccessibilityAct {
+                        target,
+                        snapshot_id,
+                        node_id,
+                        operation,
+                    },
+                )? {
+                    protocol::DesktopProviderResponse::Applied { events } => {
+                        Ok(DesktopControlResponse::InputApplied {
+                            events,
+                            delivery: "accessibility action accepted; observe to verify its effect"
+                                .into(),
+                        })
+                    }
+                    _ => Err(DesktopError::Platform(
+                        "invalid accessibility action response".into(),
+                    )),
+                }
+            }
             DesktopControlRequest::Capabilities => Ok(DesktopControlResponse::Capabilities {
                 capabilities: self.provider()?.capabilities()?,
                 surfaces: self
@@ -411,7 +507,7 @@ impl Runtime {
                         route: kind.capture_route().into(),
                         category: MEDIA_CATEGORY.into(),
                         session_id: session_id.clone(),
-                        version: sinomo_video::stream::VIDEO_STREAM_VERSION,
+                        version: sinomo_video::stream::GEOMETRY_STREAM_VERSION,
                     }),
                     session_id,
                 })
@@ -549,6 +645,10 @@ impl Service for DesktopService {
                     .decode_request_body_bounded(&request, 128 * 1024)
                     .await?;
                 let action = match &command {
+                    DesktopControlRequest::VideoSources => "video_sources",
+                    DesktopControlRequest::StopVideo { .. } => "stop_video",
+                    DesktopControlRequest::Observe { .. } => "observe",
+                    DesktopControlRequest::Act { .. } => "act",
                     DesktopControlRequest::Capabilities => "capabilities",
                     DesktopControlRequest::Targets { .. } => "targets",
                     DesktopControlRequest::Children { .. } => "children",
@@ -567,7 +667,12 @@ impl Service for DesktopService {
                     DesktopControlRequest::InvokeMenuItem { .. } => "invoke_menu_item",
                 };
                 let subject = match &command {
-                    DesktopControlRequest::Open { target, .. }
+                    DesktopControlRequest::StopVideo {
+                        source: sinomo_video::service::VideoSource::Screen { target },
+                    }
+                    | DesktopControlRequest::Observe { target, .. }
+                    | DesktopControlRequest::Act { target, .. }
+                    | DesktopControlRequest::Open { target, .. }
                     | DesktopControlRequest::Children { target } => Some(target.resource_id()),
                     DesktopControlRequest::Input { session_id, .. }
                     | DesktopControlRequest::Close { session_id }
@@ -625,11 +730,7 @@ impl Service for DesktopService {
                     capture_request.encoding.coordinate_grid,
                 )
                 .map_err(service_error)?;
-                let version = if transport == sinomo_video::codec::VideoTransport::H264 {
-                    sinomo_video::stream::H264_STREAM_VERSION
-                } else {
-                    sinomo_video::stream::VIDEO_STREAM_VERSION
-                };
+                let version = sinomo_video::stream::GEOMETRY_STREAM_VERSION;
                 let state = self.state.clone();
                 let mut capture_options = capture_request.clone();
                 capture_options.transport = transport;
@@ -669,7 +770,7 @@ impl Service for DesktopService {
                     let _ = worker.await;
                     return Err(service_error("module unloaded while capture opened"));
                 }
-                self.publish_operation(&request, &owner, "capture", true, serde_json::json!({"session_id":capture_request.session_id, "stream_version":sinomo_video::stream::VIDEO_STREAM_VERSION}))
+                self.publish_operation(&request, &owner, "capture", true, serde_json::json!({"session_id":capture_request.session_id, "stream_version":sinomo_video::stream::GEOMETRY_STREAM_VERSION}))
                     .await?;
                 ctx.respond_with_body(ObjectRpcResponse::encode_body(self.kind.capture_route(), &serde_json::json!({ "version": version, "transport":transport, "session_id": capture_request.session_id, "content_type": "application/vnd.sinomo.video-stream", "max_duration_ms": duration.as_millis() }))?, body)?;
             }
@@ -823,6 +924,23 @@ fn control_request_schema(_kind: DesktopModule) -> serde_json::Value {
             &["action", "target"],
         ));
     }
+    actions.push(object(json!({"action":{"type":"string","enum":["observe"]},"target":target,"max_nodes":{"type":"integer","minimum":1,"maximum":128,"default":64}}), &["action","target"]));
+    actions.push(object(
+        json!({"action":{"type":"string","enum":["video_sources"]}}),
+        &["action"],
+    ));
+    actions.push(object(json!({"action":{"type":"string","enum":["stop_video"]},"source":{"type":"object","properties":{"kind":{"type":"string","enum":["screen"]},"target":target},"required":["kind","target"],"additionalProperties":false}}), &["action","source"]));
+    let semantic_operations = vec![
+        object(
+            json!({"kind":{"type":"string","enum":["click","long_click","focus","scroll_forward","scroll_backward"]}}),
+            &["kind"],
+        ),
+        object(
+            json!({"kind":{"type":"string","enum":["set_text"]},"text":{"type":"string","maxLength":4096}}),
+            &["kind", "text"],
+        ),
+    ];
+    actions.push(object(json!({"action":{"type":"string","enum":["act"]},"target":target,"snapshot_id":{"type":"string"},"node_id":{"type":"string"},"operation":{"oneOf":semantic_operations}}), &["action","target","snapshot_id","node_id","operation"]));
     let text = json!({"type":"string"});
     let lease = json!({"type":"integer","minimum":1000,"maximum":300000});
     let app = object(
@@ -840,7 +958,7 @@ fn control_request_schema(_kind: DesktopModule) -> serde_json::Value {
         object(json!({"action":{"type":"string","enum":["menu_items"]},"application_session_id":text,"surface_id":text}), &["action","application_session_id","surface_id"]),
         object(json!({"action":{"type":"string","enum":["invoke_menu_item"]},"application_session_id":text,"surface_id":text,"item_id":text,"allow_desktop_interaction":{"type":"boolean","default":false}}), &["action","application_session_id","surface_id","item_id"]),
     ]);
-    json!({"oneOf":actions,"description":"Unified App Use control request. Background window messages are preferred; raw desktop input requires an explicit raw session. For background video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels in background mode and virtual-desktop pixels in raw mode, except Wayland portal targets use portal-advertised stream-local bounds: scale video pixels to those target bounds. On Wayland, raw target discovery starts a local chooser; repeat discovery after user approval. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
+    json!({"oneOf":actions,"description":"Unified App Use control request. Prefer observe/act when accessibility is advertised; choose or combine semantic observations, screenshots and generic media video explicitly. Background window messages are preferred; raw desktop input requires an explicit raw session. For background video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels in background mode and virtual-desktop pixels in raw mode, except Wayland portal targets use portal-advertised stream-local bounds: scale video pixels to those target bounds. On Wayland, raw target discovery starts a local chooser; repeat discovery after user approval. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
 }
 
 pub fn module_registration(kind: DesktopModule) -> ModuleRegistration {
@@ -1037,6 +1155,50 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn semantic_observation_and_input_require_separate_local_grants() {
+        let root = sinomo_testdir::TestDir::new("semantic-consent");
+        let permissions = LocalNodePermissionStore::new(root.path());
+        permissions
+            .mutate(|p| Ok(p.set_remote_management_enabled(true)))
+            .unwrap();
+        let target = DesktopTarget::Monitor {
+            device_name: accessibility::ANDROID_ACCESSIBILITY_TARGET.into(),
+        };
+        let runtime = Runtime {
+            root: root.path().into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            runtime.control(
+                DesktopModule::AppUse,
+                permissions.clone(),
+                "test".into(),
+                DesktopControlRequest::Observe {
+                    target: target.clone(),
+                    max_nodes: 64
+                }
+            ),
+            Err(DesktopError::PermissionDenied(_))
+        ));
+        permissions
+            .mutate(|p| p.expose_resource_operation(&target.resource_id(), "capture"))
+            .unwrap();
+        assert!(matches!(
+            runtime.control(
+                DesktopModule::AppUse,
+                permissions,
+                "test".into(),
+                DesktopControlRequest::Act {
+                    target,
+                    snapshot_id: "untrusted".into(),
+                    node_id: "1".into(),
+                    operation: accessibility::AccessibilityAction::Click
+                }
+            ),
+            Err(DesktopError::PermissionDenied(_))
+        ));
+    }
     #[test]
     fn application_input_rejects_a_different_surface_before_any_effect() {
         let root = sinomo_testdir::TestDir::new("app-input-surface-binding");

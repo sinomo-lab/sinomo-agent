@@ -437,10 +437,17 @@ transports live in `sinomo-dfs`; module persistence stays in `sinomo-module`.
 Computer Use and App Use are independently enabled components hosted by standard
 main/embedded products. Their device layer owns driver-free native capture and
 input, rechecking node-local consent and exact resource exposure at each effect.
-App input uses window messages without claiming the user's focus or pointer.
+Background window input does not claim the user's focus or pointer.
 Capture produces bounded native video samples; encoding and streaming reuse the
-video/realtime and routed object-RPC media paths. Component leases own held input,
-capture workers and cancellation. See [Computer Use and App Use](user/computer-and-app-use.md).
+video/realtime and routed object-RPC media paths. The agent selects and may combine
+semantic Accessibility observations, screenshots and video; available semantic
+observation is preferred for app control. Camera and screen video share the media
+service contract. Component leases own held input and individual stream workers;
+an explicitly approved Android projection has a separate lifetime that survives
+consumer disconnects and app switches. Geometry changes notify consumers without
+ending that projection. Only explicit stop, OS interruption or fatal capture
+failure ends sharing. Persistent Accessibility consent remains independently
+revocable. See [Computer Use and App Use](user/computer-and-app-use.md).
 
 Frontend module changes go through daemon RPC. `sinomo-module-api` remains the
 small native ABI package and owns the data-only metric exporter vocabulary in

@@ -1,4 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_use_accessibility_description">Allows Sinomo App Use to perform touch gestures and edit the focused text field when you grant input access to the shared display. It can affect the app you are using. Screen capture requires a separate screen-sharing grant. Disable this service here to revoke input access.</string>
+    <string name="app_use_accessibility_description">Allows Sinomo App Use to observe accessible UI, take screenshots, and perform actions when you grant access locally in Sinomo. It can affect the app you are using. This access does not require screen sharing. Disable this service here to revoke Accessibility access; separate screen video continues until stopped.</string>
 </resources>

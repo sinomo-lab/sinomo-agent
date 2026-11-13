@@ -41,11 +41,13 @@ public final class FixtureActivity extends Activity {
         column.addView(button);
         EditText editor = new EditText(this); editor.setSingleLine(true); editor.setHint("Native input test editor");
         editor.setShowSoftInputOnFocus(false);
+        if(getIntent().getBooleanExtra("password",false))editor.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         editor.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             public void onTextChanged(CharSequence s, int start, int before, int count) { text = s.toString(); persist(); }
             public void afterTextChanged(Editable e) {}
         });
+        if(getIntent().getBooleanExtra("password",false))editor.setText("fixture-password");
         column.addView(editor);
         View surface = new View(this) {
             final Paint paint = new Paint();

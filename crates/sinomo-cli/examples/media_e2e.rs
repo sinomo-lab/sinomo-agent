@@ -32,7 +32,8 @@ fn request(
         "/app-use/capture" => typed!(sinomo_actions::desktop::DesktopStreamRequest),
         "/media/audio/devices" => typed!(sinomo_audio::service::MediaAudioDevicesRequest),
         "/media/audio/capture" => typed!(sinomo_audio::service::MediaAudioCaptureRequest),
-        "/media/video/capture" => typed!(sinomo_video::service::CameraCaptureRequest),
+        "/media/video/capture" => typed!(sinomo_video::service::VideoCaptureRequest),
+        "/media/video/control" => typed!(sinomo_video::service::VideoControlRequest),
         "/media/video/devices" | "/media/sensors/read" => {
             ObjectRpcRequest::encode_body(route, category, &())?
         }
@@ -230,6 +231,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .object_rpc_call_to_target_async(&node, call, Duration::from_secs(10), true)
         .await?;
     result.response.error_detail()?;
+    if matches!(mode, "video" | "video-latency") {
+        let header: Value = result.response.decode_body()?;
+        let version = header
+            .as_u64()
+            .or_else(|| header.get("version").and_then(Value::as_u64));
+        if !matches!(version, Some(1 | 2 | 3)) {
+            return Err("unsupported video stream version".into());
+        }
+        if input["request"]["source"]["kind"] == "screen" && version != Some(3) {
+            return Err("screen video requires the geometry-aware stream contract".into());
+        }
+    }
     let connected_ms = started.elapsed().as_secs_f64() * 1000.0;
     if mode == "rpc" {
         let response: Value = result.decode_body().await?;
@@ -249,6 +262,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::timeout(Duration::from_secs(5), decoder.read_decoded(&mut body))
                     .await??
                     .ok_or("video ended before requested samples")?;
+            if input["request"]["source"]["kind"] == "screen" {
+                let expected: sinomo_runtime::device::desktop::DesktopTarget =
+                    serde_json::from_value(input["request"]["source"]["target"].clone())?;
+                if !matches!(&metadata.identity, Some(sinomo_runtime::device::desktop::surfaces::DesktopCaptureIdentity::Target { target, .. }) if target == &expected)
+                {
+                    return Err("video source identity does not match requested screen".into());
+                }
+            }
             let received = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
             let decode_image = Instant::now();
             let (width, height, saved, pixels) = match image {

@@ -8,7 +8,7 @@ use sinomo_runtime::module::*;
 use sinomo_runtime::node::LocalNodePermissionStore;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -36,6 +36,21 @@ impl DesktopProviderClient {
                     "App Use OS provider is not installed; install modules/desktop/app-use".into(),
                 )
             })?;
+        // App Use sessions and generic video share one legacy ABI callback
+        // owner per node. Weak entries do not extend its module/worker lifetime.
+        static CLIENTS: OnceLock<
+            Mutex<std::collections::BTreeMap<PathBuf, Weak<DesktopProviderClient>>>,
+        > = OnceLock::new();
+        let key = std::fs::canonicalize(root).map_err(error)?;
+        let mut clients = CLIENTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clients.retain(|_, client| client.strong_count() > 0);
+        if let Some(client) = clients.get(&key).and_then(Weak::upgrade) {
+            client.check_current()?;
+            return Ok(client);
+        }
         let requirement = ServiceRequirement::new(APP_USE_OS_INTERFACE, APP_USE_OS_VERSION)
             .from_service(APP_USE_OS_SERVICE)
             .with_operation(APP_USE_OS_OPERATION);
@@ -51,6 +66,7 @@ impl DesktopProviderClient {
             invocation: Mutex::new(()),
         });
         client.check_current()?;
+        clients.insert(key, Arc::downgrade(&client));
         Ok(client)
     }
     pub fn check_current(&self) -> DesktopResult<()> {
@@ -162,11 +178,16 @@ impl DesktopProviderClient {
             target: config.target.clone(),
             application: None,
         };
+        let frame_rate_ceiling = self
+            .capabilities()?
+            .frame_rate_ceiling
+            .then_some(config.frames_per_second);
         match self.invoke(DesktopProviderCommand::OpenCapture { config })? {
             DesktopProviderResponse::Opened { id } => Ok(NativeDesktopCapture {
                 provider: self.clone(),
                 id,
                 identity,
+                frame_rate_ceiling,
             }),
             _ => Err(error("invalid capture open response")),
         }
@@ -301,6 +322,11 @@ impl NativeApplication {
         config: DesktopCaptureConfig,
     ) -> DesktopResult<NativeDesktopCapture> {
         let binding = self.binding(surface_id)?;
+        let frame_rate_ceiling = self
+            .provider
+            .capabilities()?
+            .frame_rate_ceiling
+            .then_some(config.frames_per_second);
         let identity = DesktopCaptureIdentity::Target {
             target: config.target.clone(),
             application: Some(binding.clone()),
@@ -313,6 +339,7 @@ impl NativeApplication {
                 provider: self.provider.clone(),
                 id,
                 identity,
+                frame_rate_ceiling,
             }),
             _ => Err(error("invalid application capture response")),
         }
@@ -424,11 +451,15 @@ impl Drop for NativeDesktopInput {
     }
 }
 pub struct NativeDesktopCapture {
+    frame_rate_ceiling: Option<u32>,
     provider: Arc<DesktopProviderClient>,
     id: String,
     identity: DesktopCaptureIdentity,
 }
 impl DesktopFrameSource for NativeDesktopCapture {
+    fn frame_rate_ceiling(&self) -> Option<u32> {
+        self.frame_rate_ceiling
+    }
     fn identity(&self) -> Option<DesktopCaptureIdentity> {
         Some(self.identity.clone())
     }
@@ -545,5 +576,89 @@ fn measure_native_frame_callback_latency() {
             "iteration":iteration,"warmup":iteration<5,"elapsed_us":elapsed_us,
             "encoded_bytes":bytes.len(),"verified":true})
         );
+    }
+}
+
+/// Reuses the App Use OS binding without making media depend on App Use sessions.
+pub struct DesktopScreenVideoProvider;
+impl sinomo_video::service::ScreenVideoProvider for DesktopScreenVideoProvider {
+    fn targets(&self, root: &Path) -> DesktopResult<Vec<DesktopTargetInfo>> {
+        let provider = DesktopProviderClient::resolve(root)?;
+        match provider.invoke(DesktopProviderCommand::VideoTargets)? {
+            DesktopProviderResponse::Targets { targets } => Ok(targets),
+            _ => Err(error("invalid screen targets response")),
+        }
+    }
+    fn capture(
+        &self,
+        root: &Path,
+        config: DesktopCaptureConfig,
+    ) -> DesktopResult<Box<dyn DesktopFrameSource>> {
+        self.capture_with_ceiling(root, config, None)
+    }
+    fn capture_with_ceiling(
+        &self,
+        root: &Path,
+        mut config: DesktopCaptureConfig,
+        consumer_fps: Option<u32>,
+    ) -> DesktopResult<Box<dyn DesktopFrameSource>> {
+        let provider = DesktopProviderClient::resolve(root)?;
+        let targets = match provider.invoke(DesktopProviderCommand::VideoTargets)? {
+            DesktopProviderResponse::Targets { targets } => targets,
+            _ => return Err(error("invalid screen targets response")),
+        };
+        if !targets.iter().any(|target| target.target == config.target) {
+            return Err(DesktopError::TargetUnavailable("screen video source is unavailable; use Accessibility observation for semantic targets".into()));
+        }
+        let capabilities = provider.capabilities()?;
+        if capabilities.frame_rate_ceiling {
+            config.frames_per_second =
+                sinomo_video::stream::effective_capture_fps(config.frames_per_second, consumer_fps);
+        }
+        // Native surface encoding is optional. Desktop pixels use the shared
+        // media encoder, preserving the explicitly selected wire transport.
+        if config.pixel_format == Some(sinomo_runtime::device::NativeVideoSampleFormat::H264)
+            && !capabilities
+                .capture_formats
+                .contains(&sinomo_runtime::device::NativeVideoSampleFormat::H264)
+        {
+            config.pixel_format = None;
+        }
+        let target = config.target.clone();
+        Ok(Box::new(AuthorizedScreenCapture {
+            capture: provider.capture(config)?,
+            target,
+            permissions: LocalNodePermissionStore::new(root),
+        }))
+    }
+    fn stop(&self, root: &Path, target: DesktopTarget) -> DesktopResult<()> {
+        match DesktopProviderClient::resolve(root)?
+            .invoke(DesktopProviderCommand::StopVideo { target })?
+        {
+            DesktopProviderResponse::Closed => Ok(()),
+            _ => Err(error("invalid screen stop response")),
+        }
+    }
+}
+
+struct AuthorizedScreenCapture {
+    capture: NativeDesktopCapture,
+    target: DesktopTarget,
+    permissions: LocalNodePermissionStore,
+}
+impl DesktopFrameSource for AuthorizedScreenCapture {
+    fn frame_rate_ceiling(&self) -> Option<u32> {
+        self.capture.frame_rate_ceiling()
+    }
+    fn check_active(&self) -> DesktopResult<()> {
+        self.capture.provider.check_current()?;
+        authorize(&self.permissions, &self.target, "capture")
+    }
+    fn identity(&self) -> Option<DesktopCaptureIdentity> {
+        self.capture.identity()
+    }
+    fn next(&self, after: u64, timeout: Duration) -> DesktopResult<Option<NativeVideoSample>> {
+        self.check_active()?;
+        self.capture.next(after, timeout)
     }
 }

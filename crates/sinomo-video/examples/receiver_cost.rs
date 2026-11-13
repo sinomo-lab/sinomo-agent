@@ -75,6 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let encode_us = started.elapsed().as_micros();
         let metadata = VideoFrameMetadata {
+            stream_id: None,
+            content_bounds: None,
+            notifications: Vec::new(),
             identity: None,
             tiles: vec![],
             sequence: sequence as u64,
