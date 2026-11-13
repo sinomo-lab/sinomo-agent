@@ -208,3 +208,44 @@ Preserve raw process metadata: if an embedded app omits its trace node ID, recor
 that limitation and independently verify its node/PID using daemon status. Do
 not rewrite missing identity fields or report the strict collector's rejection
 as a successful capture.
+
+
+## Android receiver verification
+
+The Android application installs a MediaCodec decoder adapter. On Android 10 or
+newer it prefers a decoder positively identified as hardware accelerated, with
+flexible YUV output at the negotiated dimensions. Unsupported hardware or a
+failure before the first decoded frame falls back to OpenH264. After a successful
+frame, decoder failures terminate the stream; switching an uninitialized decoder
+onto dependent frames would lose reference state. Older Android versions and
+hosts without the application adapter retain OpenH264. The selected backend is
+available through `VideoStreamReader::decoder_backend` and decode trace records.
+
+Decoded output remains RGB pixels for existing consumers. Image plane cropping,
+row/pixel strides and BT.601/BT.709 full/limited range conversion are honored.
+Hardware decoding does not eliminate that pixel conversion or provide a direct
+video display surface.
+
+The JNI probe compiles the production application adapter and calls the
+production stream reader. It decodes identical predictive H.264 frames through
+software and hardware, checks RGB output against a generated color fixture, and
+records decode/conversion and total reader timing. It requires an API 29+ device
+with a compatible hardware encoder and decoder. No screen-sharing or camera
+permission is requested; its temporary device directory is removed on completion.
+With `ANDROID_HOME`, `ANDROID_NDK_HOME`, and the Android Cargo linker/compiler
+variables configured as for the app's native builds, run from the repository root:
+
+```sh
+cargo build -p sinomo-video --features native-devices --example android_decoder_probe \
+  --profile android-debug --target aarch64-linux-android --target-dir target/android-host
+python3 scripts/verification/android-video-codecs/run_decoder_probe.py \
+  --library target/android-host/aarch64-linux-android/android-debug/examples/libandroid_decoder_probe.so \
+  --output target/android-decoder-probe/results
+```
+
+Five warmup frames precede 100 measured frames. This is a local receiver test,
+excluding capture, network delivery, presentation and model image encoding.
+Compare the two backends within the same run; do not treat its simple color
+fixture as an end-to-end streaming latency result. The standalone command-line
+media probe does not install the application's Java adapter and therefore cannot
+verify hardware receiver selection by itself.

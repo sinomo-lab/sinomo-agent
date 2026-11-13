@@ -747,7 +747,7 @@ impl ReceivedFrame {
 #[derive(Default)]
 pub struct VideoStreamReader {
     stream_identity: Option<Option<String>>,
-    decoder: Option<openh264::decoder::Decoder>,
+    decoder: Option<crate::decoder::H264Decoder>,
     previous: Option<u64>,
     geometry: Option<(u32, u32)>,
     transport: Option<VideoTransport>,
@@ -758,6 +758,11 @@ pub struct VideoStreamReader {
     pub last_received_unix_us: u128,
 }
 impl VideoStreamReader {
+    /// Selected H264 decoder, if initialized.
+    pub fn decoder_backend(&self) -> Option<&'static str> {
+        self.decoder.as_ref().map(|decoder| decoder.backend())
+    }
+
     pub async fn read<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
@@ -845,26 +850,17 @@ impl VideoStreamReader {
                 .map_err(io::Error::other)?;
                 self.next_packet += 1;
                 if self.decoder.is_none() {
-                    self.decoder =
-                        Some(openh264::decoder::Decoder::new().map_err(io::Error::other)?);
+                    self.decoder = Some(
+                        crate::decoder::H264Decoder::new(metadata.width, metadata.height)
+                            .map_err(io::Error::other)?,
+                    );
                 }
-                use openh264::formats::YUVSource;
-                let decoded = self
+                let rgb = self
                     .decoder
                     .as_mut()
                     .unwrap()
                     .decode(&frame.image)
-                    .map_err(io::Error::other)?
-                    .ok_or_else(|| {
-                        io::Error::other("H264 access unit did not produce one frame")
-                    })?;
-                if decoded.dimensions() != (metadata.width as usize, metadata.height as usize) {
-                    return Err(io::Error::other(
-                        "H264 decoded dimensions do not match metadata",
-                    ));
-                }
-                let mut rgb = vec![0; metadata.width as usize * metadata.height as usize * 3];
-                decoded.write_rgb8(&mut rgb);
+                    .map_err(io::Error::other)?;
                 let mut input = RealtimeVideoFrameInput::new(
                     rgb.into(),
                     RealtimeVideoPixelFormat::Rgb8,
@@ -880,7 +876,7 @@ impl VideoStreamReader {
         self.last_decode_us = started.elapsed().as_micros();
         tracing::trace!(target: "sinomo.perf", stage = "media.frame.decode",
             sequence = metadata.sequence, width = metadata.width, height = metadata.height,
-            transport = ?metadata.transport, decode_us = self.last_decode_us as u64,
+            transport = ?metadata.transport, backend = self.decoder.as_ref().map(|d| d.backend()).unwrap_or("image"), decode_us = self.last_decode_us as u64,
             "receiver decode including RGB conversion");
         Ok((metadata, frame))
     }

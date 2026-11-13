@@ -12,6 +12,7 @@ pub(crate) fn install(vm: jni::JavaVM, callback: Global<JObject<'static>>) {
     let _ = BRIDGE.set((vm, callback));
     sinomo_runtime::device::install_android_camera(open_camera);
     sinomo_video::codec::install_h264_encoder(open_video_encoder);
+    sinomo_video::decoder::install_h264_decoder(open_video_decoder);
     sinomo_runtime::device::sensors::install_sensor_reader(read_sensors);
 }
 
@@ -265,6 +266,109 @@ impl Drop for VideoEncoder {
             let _ = vm.attach_current_thread(|env| {
                 env.call_method(&self.object, jni_str!("close"), jni_sig!("()V"), &[])
                     .map(|_| ())
+            });
+        }
+    }
+}
+
+fn open_video_decoder(
+    width: u32,
+    height: u32,
+) -> Result<Box<dyn sinomo_video::decoder::VideoDecoder>, String> {
+    let (vm, callback) = BRIDGE.get().ok_or("Android media host unavailable")?;
+    let object = vm
+        .attach_current_thread(|env| -> jni::errors::Result<_> {
+            let result = env.call_method(
+                callback,
+                jni_str!("openVideoDecoder"),
+                jni_sig!("(II)Lnet/sinomo/app/runtime/SinomoVideoDecoder;"),
+                &[(width as i32).into(), (height as i32).into()],
+            );
+            // Fallback must leave this worker usable for subsequent JNI calls.
+            if result.is_err() && env.exception_check() {
+                env.exception_clear();
+            }
+            env.new_global_ref(result?.l()?)
+        })
+        .map_err(|e| format!("Android hardware decoder unavailable: {e}"))?;
+    Ok(Box::new(VideoDecoder {
+        object,
+        width,
+        height,
+    }))
+}
+struct VideoDecoder {
+    object: Global<JObject<'static>>,
+    width: u32,
+    height: u32,
+}
+impl sinomo_video::decoder::VideoDecoder for VideoDecoder {
+    fn backend(&self) -> &'static str {
+        "android-mediacodec"
+    }
+    fn decode(&mut self, access: &[u8]) -> Result<Vec<u8>, String> {
+        let (vm, _) = BRIDGE.get().ok_or("Android media host unavailable")?;
+        vm.attach_current_thread(|env| -> jni::errors::Result<Result<Vec<u8>, String>> {
+            // Java reads access synchronously; its allocation outlives this call.
+            let input = unsafe { env.new_direct_byte_buffer(access.as_ptr() as *mut u8, access.len())? };
+            let decode_started = std::time::Instant::now();
+            let result = env.call_method(&self.object, jni_str!("decode"),
+                jni_sig!("(Ljava/nio/ByteBuffer;)Lnet/sinomo/app/runtime/SinomoVideoDecoder$DecodedFrame;"), &[(&input).into()]);
+            if result.is_err() && env.exception_check() { env.exception_clear(); }
+            let frame = result?.l()?;
+            let codec_us = decode_started.elapsed().as_micros() as u64;
+            let planes_started = std::time::Instant::now();
+            let converted = (|| -> jni::errors::Result<Result<Vec<u8>, String>> {
+                let layout = env.call_method(&frame, jni_str!("layout"), jni_sig!("()[I"), &[])?.l()?;
+                let layout = jni::objects::JIntArray::cast_local(env, layout)?;
+                if layout.len(env)? != 14 { return Ok(Err("invalid Android image layout".into())); }
+                let mut values = [0i32; 14]; layout.get_region(env, 0, &mut values)?;
+                let mut buffers = Vec::with_capacity(3);
+                for index in 0..3i32 {
+                    let buffer = env.call_method(&frame, jni_str!("plane"), jni_sig!("(I)Ljava/nio/ByteBuffer;"), &[index.into()])?.l()?;
+                    buffers.push(jni::objects::JByteBuffer::cast_local(env, buffer)?);
+                }
+                let mut planes = Vec::with_capacity(3);
+                for (index, buffer) in buffers.iter().enumerate() {
+                    let v = &values[index*4..index*4+4];
+                    if v.iter().any(|value| *value < 0) { return Ok(Err("negative Android plane layout".into())); }
+                    let capacity = env.get_direct_buffer_capacity(buffer)?;
+                    if v[3] as usize > capacity { return Ok(Err("Android plane limit exceeds allocation".into())); }
+                    let pointer = env.get_direct_buffer_address(buffer)?;
+                    if pointer.is_null() { return Ok(Err("null Android image plane".into())); }
+                    // The DecodedFrame retains its Image and codec output buffer.
+                    // We read only the validated ByteBuffer limit, and close it
+                    // after conversion; no borrowed plane escapes this closure.
+                    let data = unsafe { std::slice::from_raw_parts(pointer, v[3] as usize) };
+                    planes.push(sinomo_video::decoder::AndroidYuvPlane {data,offset:v[0] as usize,row_stride:v[1] as usize,pixel_stride:v[2] as usize});
+                }
+                let planes: [_;3] = planes.try_into().map_err(|_| jni::errors::Error::NullPtr("image planes"))?;
+                let plane_access_us = planes_started.elapsed().as_micros() as u64;
+                let convert_started = std::time::Instant::now();
+                let rgb = sinomo_video::decoder::android_yuv420_rgb(&planes,self.width,self.height,values[12],values[13]);
+                tracing::trace!(target: "sinomo.perf", stage="media.frame.hardware_decode", codec_us, plane_access_us,
+                    convert_us=convert_started.elapsed().as_micros() as u64, width=self.width,height=self.height,
+                    "Android hardware decode stages");
+                Ok(rgb)
+            })();
+            if converted.is_err() && env.exception_check() { env.exception_clear(); }
+            // Return the codec buffer even when plane validation/conversion fails.
+            let closed = env.call_method(&frame, jni_str!("close"), jni_sig!("()V"), &[]);
+            if closed.is_err() && env.exception_check() { env.exception_clear(); }
+            closed?;
+            converted
+        }).map_err(|e| format!("Android hardware decode failed: {e}"))?
+    }
+}
+impl Drop for VideoDecoder {
+    fn drop(&mut self) {
+        if let Some((vm, _)) = BRIDGE.get() {
+            let _ = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+                let result = env.call_method(&self.object, jni_str!("close"), jni_sig!("()V"), &[]);
+                if result.is_err() && env.exception_check() {
+                    env.exception_clear();
+                }
+                result.map(|_| ())
             });
         }
     }
