@@ -45,6 +45,7 @@ mod android {
             }
             let metadata = json!({"capture_id":delivery.capture_id,"sequence":f.sequence,
                 "width":f.width,"height":f.height,"stride":f.stride,
+                "native_width":f.native_width,"native_height":f.native_height,"format":f.pixel_format,
                 "timestamp_ns":f.timestamp_ns,"bytes":f.pixels.len(),"checksum":format!("{checksum:016x}")});
             if host.save {
                 std::fs::write(

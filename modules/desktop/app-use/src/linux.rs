@@ -20,6 +20,15 @@ pub fn capabilities() -> DesktopCapabilities {
         x11::capabilities()
     }
 }
+pub fn video_targets(
+    permissions: &LocalNodePermissionStore,
+) -> DesktopResult<Vec<DesktopTargetInfo>> {
+    if is_wayland() {
+        wayland::video_targets(permissions)
+    } else {
+        x11::enumerate_targets(false)
+    }
+}
 pub fn enumerate_targets(
     permissions: &LocalNodePermissionStore,
     windows: bool,

@@ -12,7 +12,7 @@ ring = "r1"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.app-use.os"
-interface-version = "sinomo.app-use.os.v2"
+interface-version = "sinomo.app-use.os.v3"
 cache-key = "module/desktop/app-use"
 source = "rollout:modules/desktop/app-use"
 

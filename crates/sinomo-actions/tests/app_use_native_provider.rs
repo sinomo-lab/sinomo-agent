@@ -47,6 +47,25 @@ fn native_provider_authority_removal_and_reload() {
         store.save(&grants).unwrap();
 
         let provider = DesktopProviderClient::resolve(&root).unwrap();
+        let video_client = DesktopProviderClient::resolve(&root).unwrap();
+        assert!(
+            Arc::ptr_eq(&provider, &video_client),
+            "App Use and video must share the callback owner"
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let client = video_client.clone();
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        assert_eq!(
+                            client.capabilities().unwrap().platform,
+                            std::env::consts::OS
+                        );
+                    }
+                });
+            }
+        });
+        drop(video_client);
         let capabilities = provider.capabilities().unwrap();
         assert_eq!(capabilities.platform, std::env::consts::OS);
         assert!(matches!(

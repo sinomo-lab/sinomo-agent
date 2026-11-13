@@ -3038,7 +3038,11 @@ impl ObjectRpcResult {
         // value while proxying it through another owned RPC.
         Ok(ObjectRpcOutgoingResponse {
             response: self.response,
-            body: ObjectRpcBodySource::from_incoming_body(self.body),
+            // The outgoing response is now the sole upstream-body owner. If
+            // downstream cancels, do not drain an abandoned subscription until
+            // its lease expires. Ordinary finite readers still drain/validate
+            // their outer body; natural EOF disarms this upstream cancellation.
+            body: ObjectRpcBodySource::from_incoming_body(self.body.cancel_on_drop()),
         })
     }
 }

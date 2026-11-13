@@ -149,9 +149,10 @@ impl Runtime {
         };
         let guard = CaptureActive(active);
         let provider = self.provider()?;
-        let surface_available = request.transport == sinomo_video::codec::VideoTransport::H264
-            && provider
-                .capabilities()?
+        let capabilities = provider.capabilities()?;
+        let surface_available = !matches!(&target, DesktopTarget::Monitor { device_name } if device_name == accessibility::ANDROID_ACCESSIBILITY_TARGET)
+            && request.transport == sinomo_video::codec::VideoTransport::H264
+            && capabilities
                 .capture_formats
                 .contains(&sinomo_runtime::device::NativeVideoSampleFormat::H264);
         if request.capture_path == CapturePath::Surface && !surface_available {
@@ -183,7 +184,14 @@ impl Runtime {
             pixel_format: (surface_available && request.capture_path != CapturePath::Pixels)
                 .then_some(sinomo_runtime::device::NativeVideoSampleFormat::H264),
             target,
-            frames_per_second: request.frames_per_second,
+            frames_per_second: if capabilities.frame_rate_ceiling {
+                sinomo_video::stream::effective_capture_fps(
+                    request.frames_per_second,
+                    request.encoding.max_frame_rate_hz,
+                )
+            } else {
+                request.frames_per_second
+            },
             include_cursor: request.include_cursor,
             lease_ms: duration.as_millis().min(MAX_LEASE_MS as u128) as u64,
         };
@@ -379,7 +387,7 @@ impl Runtime {
                         route: kind.capture_route().into(),
                         category: MEDIA_CATEGORY.into(),
                         session_id,
-                        version: sinomo_video::stream::VIDEO_STREAM_VERSION,
+                        version: sinomo_video::stream::GEOMETRY_STREAM_VERSION,
                     }),
                 })
             }
@@ -442,7 +450,7 @@ impl Runtime {
                         route: kind.capture_route().into(),
                         category: MEDIA_CATEGORY.into(),
                         session_id,
-                        version: sinomo_video::stream::VIDEO_STREAM_VERSION,
+                        version: sinomo_video::stream::GEOMETRY_STREAM_VERSION,
                     }),
                 })
             }

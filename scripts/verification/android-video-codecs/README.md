@@ -111,9 +111,10 @@ API references: [MediaCodec input/output surfaces](https://developer.android.com
 ## Integrated cross-node comparison
 
 App Use `/app-use/capture` and camera `/media/video/capture` requests accept
-`transport: "image" | "h264" | "auto"`. Omitted transport preserves image
-stream version 1. H.264 uses version 2 and a stream-local Android MediaCodec
-encoder; explicit H.264 requests fail if that backend is unavailable. Auto
+`transport: "image" | "h264" | "auto"`. Camera image/H.264 streams retain
+versions 1/2. Screen and App Use streams use version 3, including geometry change
+notifications and content bounds. H.264 uses a stream-local hardware encoder;
+explicit H.264 requests fail if that backend is unavailable. Auto
 selects the installed hardware adapter except for coordinate-grid images.
 Check the capture response's selected version, not just the default image
 version in the session descriptor. HEVC remains a standalone experiment.
@@ -124,8 +125,9 @@ and decodes every reference frame before a consumer may replace its latest
 frame. `VideoStreamReader::read_decoded` returns pixels directly for preview;
 model consumers convert only their selected frames to JPEG/PNG. The Android
 adapter uploads existing native pixels to an encoder surface for GPU scaling;
-this still includes the capture interface's CPU readback and native-module
-transfer. It is not a zero-copy MediaProjection path.
+the pixel path includes CPU readback and native-module transfer. Android screen
+sharing can instead supply direct encoder surfaces through the generic media
+screen source. Accessibility screenshots are a separate, rate-limited source.
 
 For a comparison, build the app and its native provider with `android-debug`,
 activate the provider through the normal module interface, and join a second
@@ -176,10 +178,12 @@ its percentiles must not be subtracted from frame-age percentiles.
 
 Enable an Observe capture with `sinomo.perf=trace` around a bounded streaming
 workload. `media.frame.encode` spans measure encoding; `media.frame.source`
-events carry the source sequence, acquisition timestamp, native handoff time,
-encoded-ready time and pull duration. The consumer's `wire_received_unix_us`
+events carry the logical `stream_id`, source sequence, acquisition timestamp,
+native handoff time, encoded-ready time and pull duration. The consumer's `wire_received_unix_us`
 marks complete record arrival before decoder scheduling. Join frames by source
-sequence and acquisition timestamp, and reject missing or ambiguous matches.
+stream ID, source sequence and acquisition timestamp, and reject missing or
+ambiguous matches. Native Android diagnostics do not carry the logical stream ID;
+ambiguous native-stage matches are reported as unavailable instead of overwritten.
 
 For Android's internal handoff, save the existing value of
 `adb shell getprop log.tag.SinomoMediaStage`, then enable
@@ -204,3 +208,55 @@ Preserve raw process metadata: if an embedded app omits its trace node ID, recor
 that limitation and independently verify its node/PID using daemon status. Do
 not rewrite missing identity fields or report the strict collector's rejection
 as a successful capture.
+
+
+## Android receiver verification
+
+The Android application installs a MediaCodec decoder adapter. On Android 10 or
+newer it prefers a decoder positively identified as hardware accelerated, with
+flexible YUV output at the negotiated dimensions. Unsupported hardware or a
+failure before the first decoded frame falls back to OpenH264. After a successful
+frame, decoder failures terminate the stream; switching an uninitialized decoder
+onto dependent frames would lose reference state. Older Android versions and
+hosts without the application adapter retain OpenH264. The selected backend is
+available through `VideoStreamReader::decoder_backend` and decode trace records.
+
+Decoded output remains YUV until a consumer requests RGB or an encoded image.
+Hardware and software decoders copy bounded planes into immutable shared I420
+storage, then release the codec output immediately. Retaining or cloning a frame
+therefore cannot hold a MediaCodec output buffer or block subsequent decoding.
+Cropping and row/pixel strides are normalized during the copy; color matrix and
+range remain attached to the frame. `ReceivedFrame::into_pixels` explicitly
+materializes RGB. Model JPEG/PNG encoding converts only the selected frame;
+latest-frame consumers discard replaced YUV frames without RGB conversion.
+
+This path does not provide a GPU display surface or direct YUV-to-JPEG encoding.
+Those require a compatible rendering or image-encoding consumer. The H.264 wire
+contract and reference-frame ordering are unchanged.
+
+The JNI probe compiles the production application adapter and calls the
+production stream reader. It decodes identical predictive H.264 frames through
+software and hardware, checks RGB output against a generated color fixture, and
+records native decode/copy, explicit RGB conversion and total reader timing.
+It also retains an old frame through later decodes and decoder shutdown, then
+checks that its pixels remain unchanged. A native-consumer mode requests RGB
+only for the first and last frame; all intervening frames remain YUV. It requires an API 29+ device
+with a compatible hardware encoder and decoder. No screen-sharing or camera
+permission is requested; its temporary device directory is removed on completion.
+With `ANDROID_HOME`, `ANDROID_NDK_HOME`, and the Android Cargo linker/compiler
+variables configured as for the app's native builds, run from the repository root:
+
+```sh
+cargo build -p sinomo-video --features native-devices --example android_decoder_probe \
+  --profile android-debug --target aarch64-linux-android --target-dir target/android-host
+python3 scripts/verification/android-video-codecs/run_decoder_probe.py \
+  --library target/android-host/aarch64-linux-android/android-debug/examples/libandroid_decoder_probe.so \
+  --output target/android-decoder-probe/results
+```
+
+Five warmup frames precede 100 measured frames. This is a local receiver test,
+excluding capture, network delivery, presentation and model image encoding.
+Compare the two backends within the same run; do not treat its simple color
+fixture as an end-to-end streaming latency result. The standalone command-line
+media probe does not install the application's Java adapter and therefore cannot
+verify hardware receiver selection by itself.

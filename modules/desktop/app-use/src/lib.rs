@@ -66,7 +66,7 @@ pub fn descriptor() -> NativeModuleDescriptor {
         owner: "sinomo-app-use-module".into(),
         native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
         backend: NativeModuleBackend::NativeDylib,
-        interface_version: "sinomo.app-use.os.v2".into(),
+        interface_version: "sinomo.app-use.os.v3".into(),
         platform_triple: format!(
             "{}-{}-{}",
             std::env::consts::ARCH,
@@ -135,6 +135,29 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
     use DesktopProviderCommand as C;
     use DesktopProviderResponse as R;
     match request.command {
+        C::AccessibilityObserve { target, max_nodes } => {
+            drop(state);
+            Ok(R::AccessibilityObserved {
+                snapshot: device::accessibility_observe(&permissions, &target, max_nodes)?,
+            })
+        }
+        C::AccessibilityAct {
+            target,
+            snapshot_id,
+            node_id,
+            operation,
+        } => {
+            drop(state);
+            device::accessibility_act(&permissions, &target, &snapshot_id, &node_id, &operation)?;
+            Ok(R::Applied { events: 1 })
+        }
+        C::VideoTargets => Ok(R::Targets {
+            targets: device::video_targets(&permissions)?,
+        }),
+        C::StopVideo { target } => {
+            device::stop_video(&permissions, &target)?;
+            Ok(R::Closed)
+        }
         C::SurfaceCapabilities => Ok(R::SurfaceCapabilities {
             capabilities: device::surface_capabilities(),
         }),
@@ -397,11 +420,15 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             drop(state);
             #[cfg(target_os = "android")]
             let started = Instant::now();
-            let sample = capture.next(after_sequence, Duration::from_millis(timeout_ms.min(100)))?;
+            let sample =
+                capture.next(after_sequence, Duration::from_millis(timeout_ms.min(100)))?;
             #[cfg(target_os = "android")]
             let next_us = started.elapsed().as_micros();
             #[cfg(target_os = "android")]
-            let returned_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
+            let returned_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros();
             let frame = sample.map(DesktopRawFrame::from_sample).transpose()?;
             #[cfg(target_os = "android")]
             let prepare_us = started.elapsed().as_micros() - next_us;

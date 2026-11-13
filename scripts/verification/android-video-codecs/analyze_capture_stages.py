@@ -22,7 +22,7 @@ def lines(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.startswith('{')]
 
 def key(row):
-    return row['sequence'], row['captured_at_unix_ms']
+    return row.get('stream_id'), row['sequence'], row['captured_at_unix_ms']
 
 brackets = []
 for path in [args.clock_before, args.clock_after]:
@@ -45,9 +45,9 @@ native = {}
 if args.native_log:
     for row in lines(args.native_log):
         if 'sequence' in row and 'captured_at_unix_ms' in row:
-            native[row.get('kind', 'java'), key(row)] = row
+            native.setdefault((row.get('kind', 'java'), row['sequence'], row['captured_at_unix_ms']), []).append(row)
 frames = [row for row in lines(args.frames) if 'sample' in row and not row['warmup']]
-values, missing = {}, []
+values, missing, ambiguous_native = {}, [], []
 for frame in frames:
     identity = key(frame['metadata'])
     if identity not in source:
@@ -55,21 +55,24 @@ for frame in frames:
         continue
     row = source[identity]
     stage = {
-        'acquisition_to_native_us': row['native_ready_unix_us'] - identity[1] * 1000,
+        'acquisition_to_native_us': row['native_ready_unix_us'] - frame['metadata']['captured_at_unix_ms'] * 1000,
         'pull_us': row['pull_us'],
         'encode_us': row['encode_us'],
-        'acquisition_to_encoded_us': row['encoded_ready_unix_us'] - identity[1] * 1000,
+        'acquisition_to_encoded_us': row['encoded_ready_unix_us'] - frame['metadata']['captured_at_unix_ms'] * 1000,
         'post_encode_delivery_us': frame['wire_received_unix_us'] - offset - row['encoded_ready_unix_us'],
         'receiver_work_us': frame['ready_unix_us'] - frame['wire_received_unix_us'],
-        'acquisition_to_pixels_us': frame['ready_unix_us'] - offset - identity[1] * 1000,
+        'acquisition_to_pixels_us': frame['ready_unix_us'] - offset - frame['metadata']['captured_at_unix_ms'] * 1000,
     }
     for kind, fields in {
         'java': ['copy_us', 'java_queue_us', 'socket_write_us'],
         'capture': ['read_us', 'normalize_us', 'publish_us'],
         'module': ['call_next_us', 'prepare_us', 'serialize_us', 'host_callback_us'],
     }.items():
-        if (kind, identity) in native:
-            stage.update({kind + '.' + field: native[kind, identity][field] for field in fields})
+        candidates = native.get((kind, frame['metadata']['sequence'], frame['metadata']['captured_at_unix_ms']), [])
+        if len(candidates) == 1:
+            stage.update({kind + '.' + field: candidates[0][field] for field in fields})
+        elif len(candidates) > 1:
+            ambiguous_native.append({'kind': kind, 'frame': identity, 'records': len(candidates)})
     for name, value in stage.items():
         values.setdefault(name, []).append(value)
 summary = {name: reporter.latency_summary(samples) for name, samples in values.items()}
@@ -80,7 +83,7 @@ result = {
               'frame_timestamp_quantization_us': 1000,
               'assumption': 'Offset stays inside the before/after RPC brackets; no clock step.'},
     'coverage': {'expected_measured_frames': len(frames), 'matched': len(frames) - len(missing),
-                 'missing_source_frames': missing, 'source_trace_process': trace['process'],
+                 'missing_source_frames': missing, 'ambiguous_native_frames': ambiguous_native, 'source_trace_process': trace['process'],
                  'dropped_records': trace.get('dropped_records'), 'truncated': trace.get('truncated')},
     'stages': summary,
     'notes': ['Stages overlap; do not sum their percentiles.',

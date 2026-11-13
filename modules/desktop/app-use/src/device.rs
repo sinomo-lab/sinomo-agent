@@ -500,3 +500,58 @@ impl Drop for DesktopCapture {
 
 #[cfg(target_os = "android")]
 pub(super) use platform::{frame_trace_enabled, trace_frame};
+
+/// Semantic observations and projection controls use the same native authority
+/// boundary as capture/input; unsupported platforms never silently fall back.
+pub fn accessibility_observe(
+    store: &LocalNodePermissionStore,
+    target: &DesktopTarget,
+    max_nodes: u32,
+) -> DesktopResult<accessibility::AccessibilitySnapshot> {
+    authorize(store, target, "capture")?;
+    if !(1..=128).contains(&max_nodes) {
+        return Err(DesktopError::Invalid("max_nodes must be 1..128".into()));
+    }
+    #[cfg(target_os = "android")]
+    return platform::accessibility_observe(target, max_nodes);
+    #[cfg(not(target_os = "android"))]
+    Err(DesktopError::Unsupported(
+        "semantic accessibility observation is unavailable on this platform".into(),
+    ))
+}
+pub fn accessibility_act(
+    store: &LocalNodePermissionStore,
+    target: &DesktopTarget,
+    snapshot_id: &str,
+    node_id: &str,
+    action: &accessibility::AccessibilityAction,
+) -> DesktopResult<()> {
+    authorize(store, target, "input")?;
+    #[cfg(target_os = "android")]
+    return platform::accessibility_act(target, snapshot_id, node_id, action);
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (snapshot_id, node_id, action);
+        Err(DesktopError::Unsupported(
+            "semantic accessibility actions are unavailable on this platform".into(),
+        ))
+    }
+}
+pub fn video_targets(store: &LocalNodePermissionStore) -> DesktopResult<Vec<DesktopTargetInfo>> {
+    authorize_host(store)?;
+    #[cfg(target_os = "android")]
+    return platform::video_targets();
+    #[cfg(target_os = "linux")]
+    return platform::video_targets(store);
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    enumerate_targets(store, false)
+}
+pub fn stop_video(store: &LocalNodePermissionStore, target: &DesktopTarget) -> DesktopResult<()> {
+    authorize(store, target, "stop")?;
+    #[cfg(target_os = "android")]
+    return platform::stop_video(target);
+    #[cfg(not(target_os = "android"))]
+    Err(DesktopError::Unsupported(
+        "this platform has no persistent projection to stop".into(),
+    ))
+}
