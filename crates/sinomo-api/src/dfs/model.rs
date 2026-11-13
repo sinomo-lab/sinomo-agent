@@ -52,6 +52,7 @@ impl TryFrom<DfsFileSystemWire> for DfsFileSystem {
 
 /// Policy override that applies to objects below a path prefix.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(from = "DfsSubtreePolicyFields")]
 pub struct DfsSubtreePolicy {
     pub path_prefix: String,
     pub policy: DfsObjectPolicy,
@@ -77,13 +78,49 @@ pub enum DfsPlacementScope {
     Subtree,
 }
 
+/// The decoded fields of a [`DfsSubtreePolicy`], before normalization.
+#[derive(Deserialize)]
+struct DfsSubtreePolicyFields {
+    path_prefix: String,
+    policy: DfsObjectPolicy,
+    scope: DfsPlacementScope,
+    min_commit_replicas: usize,
+    desired_replicas: usize,
+    #[serde(default)]
+    required_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    forbidden_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    min_distinct_zones: usize,
+}
+
+impl From<DfsSubtreePolicyFields> for DfsSubtreePolicy {
+    fn from(fields: DfsSubtreePolicyFields) -> Self {
+        let (min_commit_replicas, desired_replicas) =
+            crate::dfs::normalized_replica_counts(fields.min_commit_replicas, fields.desired_replicas);
+        Self {
+            path_prefix: fields.path_prefix,
+            policy: fields.policy,
+            scope: fields.scope,
+            min_commit_replicas,
+            desired_replicas,
+            required_node_ids: fields.required_node_ids,
+            forbidden_node_ids: fields.forbidden_node_ids,
+            min_distinct_zones: fields.min_distinct_zones,
+        }
+    }
+}
+
 impl DfsSubtreePolicy {
+    /// A subtree rule; N is raised to W when it states less.
     pub fn new(
         path_prefix: impl Into<String>,
         policy: DfsObjectPolicy,
         min_commit_replicas: usize,
         desired_replicas: usize,
     ) -> Self {
+        let (min_commit_replicas, desired_replicas) =
+            crate::dfs::normalized_replica_counts(min_commit_replicas, desired_replicas);
         Self {
             path_prefix: path_prefix.into(),
             policy,

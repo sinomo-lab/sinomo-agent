@@ -21,6 +21,7 @@ pub const PLACEMENT_RECONCILIATION_SUPERSEDED_ADAPTIVE_PREFIX: &str =
     "superseded by newer adaptive observation ";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(from = "DfsPlacementPolicyFields")]
 pub struct DfsPlacementPolicy {
     pub consistency: DfsObjectPolicy,
     pub min_commit_replicas: usize,
@@ -33,12 +34,44 @@ pub struct DfsPlacementPolicy {
     pub min_distinct_zones: usize,
 }
 
+/// The decoded fields of a [`DfsPlacementPolicy`], before normalization.
+#[derive(Deserialize)]
+struct DfsPlacementPolicyFields {
+    consistency: DfsObjectPolicy,
+    min_commit_replicas: usize,
+    desired_replicas: usize,
+    #[serde(default)]
+    required_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    forbidden_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    min_distinct_zones: usize,
+}
+
+impl From<DfsPlacementPolicyFields> for DfsPlacementPolicy {
+    fn from(fields: DfsPlacementPolicyFields) -> Self {
+        let (min_commit_replicas, desired_replicas) =
+            crate::dfs::normalized_replica_counts(fields.min_commit_replicas, fields.desired_replicas);
+        Self {
+            consistency: fields.consistency,
+            min_commit_replicas,
+            desired_replicas,
+            required_node_ids: fields.required_node_ids,
+            forbidden_node_ids: fields.forbidden_node_ids,
+            min_distinct_zones: fields.min_distinct_zones,
+        }
+    }
+}
+
 impl DfsPlacementPolicy {
+    /// A placement policy; N is raised to W when it states less.
     pub fn new(
         consistency: DfsObjectPolicy,
         min_commit_replicas: usize,
         desired_replicas: usize,
     ) -> Result<Self, DfsDistributedError> {
+        let (min_commit_replicas, desired_replicas) =
+            crate::dfs::normalized_replica_counts(min_commit_replicas, desired_replicas);
         let policy = Self {
             consistency,
             min_commit_replicas,
@@ -52,6 +85,13 @@ impl DfsPlacementPolicy {
     }
 
     pub fn validate(&self) -> Result<(), DfsDistributedError> {
+        // Unreachable through construction and decoding, which normalize.
+        if self.min_commit_replicas > self.desired_replicas {
+            return Err(DfsDistributedError::InvalidPolicy {
+                reason: "min_commit_replicas exceeds desired_replicas in a policy that was not normalized"
+                    .to_string(),
+            });
+        }
         if matches!(
             self.consistency,
             DfsObjectPolicy::LocalOwned | DfsObjectPolicy::EphemeralLocal

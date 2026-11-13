@@ -7,7 +7,24 @@ use sinomo_core::node::NodeId;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// The one rule for W and N: W never exceeds N. A policy that states more
+/// required copies (W) than desired copies (N) desires W copies; W is never
+/// lowered. Every replication, placement and subtree policy applies this when
+/// it is constructed or decoded, so no policy is refused, weakened or left
+/// pending because it stated W > N.
+pub const fn normalized_replica_counts(
+    min_commit_replicas: usize,
+    desired_replicas: usize,
+) -> (usize, usize) {
+    if desired_replicas < min_commit_replicas {
+        (min_commit_replicas, min_commit_replicas)
+    } else {
+        (min_commit_replicas, desired_replicas)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(from = "DfsReplicationPolicyFields")]
 pub struct DfsReplicationPolicy {
     pub min_commit_replicas: usize,
     pub desired_replicas: usize,
@@ -31,11 +48,45 @@ fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
+/// The decoded fields of a [`DfsReplicationPolicy`], before normalization.
+#[derive(Deserialize)]
+struct DfsReplicationPolicyFields {
+    min_commit_replicas: usize,
+    desired_replicas: usize,
+    #[serde(default)]
+    required_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    forbidden_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    min_distinct_zones: usize,
+    #[serde(default)]
+    node_zones: BTreeMap<NodeId, String>,
+}
+
+impl From<DfsReplicationPolicyFields> for DfsReplicationPolicy {
+    fn from(fields: DfsReplicationPolicyFields) -> Self {
+        let (min_commit_replicas, desired_replicas) =
+            normalized_replica_counts(fields.min_commit_replicas, fields.desired_replicas);
+        Self {
+            min_commit_replicas,
+            desired_replicas,
+            required_node_ids: fields.required_node_ids,
+            forbidden_node_ids: fields.forbidden_node_ids,
+            min_distinct_zones: fields.min_distinct_zones,
+            node_zones: fields.node_zones,
+        }
+    }
+}
+
 impl DfsReplicationPolicy {
+    /// A policy with `min_commit_replicas` required and `desired_replicas`
+    /// desired copies; N is raised to W when it states less.
     pub fn new(
         min_commit_replicas: usize,
         desired_replicas: usize,
     ) -> Result<Self, DfsDistributedError> {
+        let (min_commit_replicas, desired_replicas) =
+            normalized_replica_counts(min_commit_replicas, desired_replicas);
         let policy = Self {
             min_commit_replicas,
             desired_replicas,
@@ -75,12 +126,15 @@ impl DfsReplicationPolicy {
         Ok(self)
     }
 
-    /// Change W/N while retaining node and zone constraints.
+    /// Change W/N while retaining node and zone constraints; N is raised to W
+    /// when it states less.
     pub fn with_counts(
         &self,
         min_commit_replicas: usize,
         desired_replicas: usize,
     ) -> Result<Self, DfsDistributedError> {
+        let (min_commit_replicas, desired_replicas) =
+            normalized_replica_counts(min_commit_replicas, desired_replicas);
         let mut policy = self.clone();
         policy.min_commit_replicas = min_commit_replicas;
         policy.desired_replicas = desired_replicas;
@@ -101,9 +155,11 @@ impl DfsReplicationPolicy {
             });
         }
 
+        // Unreachable through construction and decoding, which normalize.
         if self.min_commit_replicas > self.desired_replicas {
             return Err(DfsDistributedError::InvalidPolicy {
-                reason: "min_commit_replicas cannot exceed desired_replicas".to_string(),
+                reason: "min_commit_replicas exceeds desired_replicas in a policy that was not normalized"
+                    .to_string(),
             });
         }
 
@@ -254,4 +310,69 @@ pub enum DfsDistributedError {
         intent_id: String,
         state: DfsWriteIntentState,
     },
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    #[test]
+    fn a_policy_stating_w_above_n_desires_w_copies_and_keeps_its_w() {
+        assert_eq!(normalized_replica_counts(3, 2), (3, 3));
+        assert_eq!(normalized_replica_counts(1, 2), (1, 2));
+        assert_eq!(normalized_replica_counts(2, 2), (2, 2));
+        let policy = DfsReplicationPolicy::new(3, 2).unwrap();
+        assert_eq!((policy.min_commit_replicas, policy.desired_replicas), (3, 3));
+        let changed = policy.with_counts(4, 1).unwrap();
+        assert_eq!((changed.min_commit_replicas, changed.desired_replicas), (4, 4));
+        let decoded: DfsReplicationPolicy = serde_json::from_value(serde_json::json!({
+            "min_commit_replicas": 3,
+            "desired_replicas": 1,
+        }))
+        .unwrap();
+        assert_eq!((decoded.min_commit_replicas, decoded.desired_replicas), (3, 3));
+        // An already consistent policy keeps its exact encoding.
+        let plain = DfsReplicationPolicy::new(1, 2).unwrap();
+        let encoded = serde_json::to_vec(&plain).unwrap();
+        let again: DfsReplicationPolicy = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(again, plain);
+        assert_eq!(serde_json::to_vec(&again).unwrap(), encoded);
+        // W = 0 is still refused: only W > N is normalized.
+        assert!(DfsReplicationPolicy::new(0, 2).is_err());
+    }
+
+    #[test]
+    fn placement_and_subtree_policies_normalize_on_construction_and_decode() {
+        let confirmed = crate::dfs::DfsPlacementPolicy::new(
+            sinomo_core::DfsObjectPolicy::ReplicatedConfirmed,
+            3,
+            2,
+        )
+        .unwrap();
+        assert_eq!((confirmed.min_commit_replicas, confirmed.desired_replicas), (3, 3));
+        let decoded: crate::dfs::DfsPlacementPolicy = serde_json::from_value(serde_json::json!({
+            "consistency": "replicated-eventual",
+            "min_commit_replicas": 2,
+            "desired_replicas": 1,
+        }))
+        .unwrap();
+        assert_eq!((decoded.min_commit_replicas, decoded.desired_replicas), (2, 2));
+        decoded.validate().unwrap();
+        let rule = crate::dfs::DfsSubtreePolicy::new(
+            "/team",
+            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            3,
+            1,
+        );
+        assert_eq!((rule.min_commit_replicas, rule.desired_replicas), (3, 3));
+        let decoded: crate::dfs::DfsSubtreePolicy = serde_json::from_value(serde_json::json!({
+            "path_prefix": "/team",
+            "policy": "replicated-eventual",
+            "scope": "subtree",
+            "min_commit_replicas": 2,
+            "desired_replicas": 1,
+        }))
+        .unwrap();
+        assert_eq!((decoded.min_commit_replicas, decoded.desired_replicas), (2, 2));
+    }
 }

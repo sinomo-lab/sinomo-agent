@@ -518,13 +518,15 @@ impl PlacementEditorPolicyDraft {
     }
 
     fn normalize(&mut self) {
+        // W never exceeds N: a W above N raises N, as every placement policy does.
+        self.min_commit_replicas = self.min_commit_replicas.max(1);
         self.desired_replicas = self
             .desired_replicas
             .max(1)
             .max(self.required_node_ids.len())
-            .max(self.min_distinct_zones);
+            .max(self.min_distinct_zones)
+            .max(self.min_commit_replicas);
         self.min_distinct_zones = self.min_distinct_zones.min(self.desired_replicas);
-        self.min_commit_replicas = self.min_commit_replicas.clamp(1, self.desired_replicas);
         if self.consistency == PlacementEditorConsistency::Confirmed {
             self.min_commit_replicas = self.desired_replicas;
         }
@@ -27691,6 +27693,25 @@ mod tests {
         assert_eq!(
             draft.policy_and_scope().expect("inherited draft"),
             (None, SifsPlacementScope::Subtree)
+        );
+    }
+
+    #[test]
+    fn placement_editor_draft_raises_desired_replicas_to_a_higher_commit_count() {
+        let mut draft = PlacementEditorDraft::for_details(None, true);
+        draft.scope = SifsPlacementScope::Subtree;
+        let policy = draft.active_policy_mut().expect("active policy");
+        policy.consistency = PlacementEditorConsistency::Eventual;
+        policy.desired_replicas = 2;
+        policy.min_commit_replicas = 3;
+        draft.normalize();
+
+        let (policy, _) = draft.policy_and_scope().expect("valid draft");
+        let policy = policy.expect("explicit policy");
+        assert_eq!(
+            (policy.min_commit_replicas, policy.desired_replicas),
+            (3, 3),
+            "a commit count above the desired count raises the desired count"
         );
     }
 

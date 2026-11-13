@@ -6750,13 +6750,14 @@ mod tests {
         let candidate = crate::DfsNodeAdvertisement::content(owner.clone());
         let snapshot = crate::DfsPlacementSnapshot::empty(owner.clone());
         let budget = crate::DfsAdaptivePlacementBudget::default();
+        // A rule stating W > N desires W copies; only W = 0 stays invalid.
         for (w, n, valid) in [
             (1, 1, true),
             (1, 3, true),
             (2, 2, true),
-            (2, 1, false),
+            (2, 1, true),
             (0, 1, false),
-            (1, 0, false),
+            (1, 0, true),
         ] {
             let config = DfsFileSystemConfig {
                 file_system_id: DfsFileSystemId::generate(),
