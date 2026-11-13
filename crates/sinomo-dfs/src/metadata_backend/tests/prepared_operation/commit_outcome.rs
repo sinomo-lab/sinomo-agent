@@ -290,3 +290,56 @@ fn native_lost_write_reply_after_commit_is_possibly_applied_and_commits_once() {
     drop(requester);
     runtime.close().unwrap();
 }
+
+/// C7(b): on a shard with the all-member rule a stopped replica ends the
+/// commit on the network's verdict as missing acknowledgements. No DFS
+/// deadline exists to end it otherwise: the caller set none, and a deadline
+/// would report `deadline`. Once the replica is back the same body commits
+/// exactly once.
+#[test]
+fn native_stopped_replica_ends_the_commit_on_the_network_verdict() {
+    let (mut runtime, mut service, config) = native_case("native-stopped-replica-unknown", 3);
+    let c = config.replica_node_ids[1].clone();
+    let current = directory(&mut service, "/services/stopped-replica");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o640;
+    let payload = namespace_payload(&config, &current, changed, "stopped-replica-commit");
+    drop(service);
+    runtime.stop_node(&c).unwrap();
+    let mut service = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(service.transport.operation_deadline(), None);
+    match service.publish_prepared_operation(payload.clone()) {
+        Err(DfsError::MetadataCommitOutcomeUnknown {
+            cause: DfsCommitOutcomeUnknownCause::AcknowledgementsMissing { missing, .. },
+            operation_id,
+            ..
+        }) => {
+            assert_eq!(missing, vec![c.clone()]);
+            assert_eq!(operation_id, "stopped-replica-commit");
+        }
+        other => panic!(
+            "a stopped replica leaves the outcome unknown on the network verdict: {:?}",
+            other.map(|publication| publication.published)
+        ),
+    }
+    let digest = service
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record("stopped-replica-commit")
+        .unwrap()
+        .expect("the durable body")
+        .digest;
+    drop(service);
+    runtime.reopen_node(c.clone()).unwrap();
+    let mut service = runtime.metadata_primary_service("/services").unwrap();
+    let committed = service
+        .publish_prepared_operation(payload.clone())
+        .expect("the same body commits once C answers again");
+    assert!(committed.published);
+    let again = service.publish_prepared_operation(payload).unwrap();
+    assert!(!again.published, "a committed body answers its retry");
+    drop(service);
+    assert_eq!(commit_records(&runtime, &config, &digest), 1);
+    runtime.close().unwrap();
+}

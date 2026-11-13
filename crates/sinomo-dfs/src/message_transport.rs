@@ -149,7 +149,7 @@ pub(crate) trait DfsMetadataAuthorityFanoutWorkers: Send {
     fn start_routed(
         &mut self,
         message: DfsRoutedMessage,
-        deadline: Instant,
+        deadline: Option<Instant>,
         events: &Sender<DfsMetadataAuthorityFanoutSignal>,
     ) -> Result<(), DfsRoutedMessage>;
 
@@ -159,12 +159,12 @@ pub(crate) trait DfsMetadataAuthorityFanoutWorkers: Send {
 
 /// The metadata authority calls in flight for one prepare round.
 ///
-/// Every call carries the same network deadline and reports exactly one
-/// event. Calls run until they finish or that deadline expires; the owner's
-/// decision to hedge never cancels them. Dropping the fan-out abandons every
-/// call still in flight.
+/// Every call carries the caller's deadline, if it set one, and reports
+/// exactly one event. Calls run until they finish, the network layer gives a
+/// verdict, or that deadline expires; the owner's decision to hedge never
+/// cancels them. Dropping the fan-out abandons every call still in flight.
 pub struct DfsMetadataAuthorityFanout {
-    deadline: Instant,
+    deadline: Option<Instant>,
     direct_calls: BTreeMap<NodeId, ObjectRpcBodyProgress>,
     in_flight: usize,
     events_tx: Sender<DfsMetadataAuthorityFanoutSignal>,
@@ -176,7 +176,7 @@ impl DfsMetadataAuthorityFanout {
     /// `direct_calls` names the direct calls already started with senders
     /// cloned from `events_tx`, each with the progress of its request upload.
     pub(crate) fn new(
-        deadline: Instant,
+        deadline: Option<Instant>,
         direct_calls: BTreeMap<NodeId, ObjectRpcBodyProgress>,
         events_tx: Sender<DfsMetadataAuthorityFanoutSignal>,
         events: Receiver<DfsMetadataAuthorityFanoutSignal>,
@@ -192,8 +192,8 @@ impl DfsMetadataAuthorityFanout {
         }
     }
 
-    /// The network deadline shared by every call on this fan-out.
-    pub fn deadline(&self) -> Instant {
+    /// The caller's deadline shared by every call on this fan-out, if any.
+    pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
@@ -234,12 +234,21 @@ impl DfsMetadataAuthorityFanout {
     }
 
     /// Wait for the next completion. Returns `None` at `until`, when no call
-    /// remains in flight, or when a [`Self::waker`] fires.
-    pub fn next_event(&mut self, until: Instant) -> Option<DfsMetadataAuthorityFanoutEvent> {
+    /// remains in flight, or when a [`Self::waker`] fires. Without `until` the
+    /// wait ends only on a completion or a wake.
+    pub fn next_event(
+        &mut self,
+        until: Option<Instant>,
+    ) -> Option<DfsMetadataAuthorityFanoutEvent> {
         if self.in_flight == 0 {
             return None;
         }
-        let timeout = until.saturating_duration_since(Instant::now());
+        let receive = |events: &Receiver<DfsMetadataAuthorityFanoutSignal>| match until {
+            Some(until) => events
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .ok(),
+            None => events.recv().ok(),
+        };
         let received = match tokio::runtime::Handle::try_current() {
             Ok(runtime)
                 if matches!(
@@ -247,11 +256,11 @@ impl DfsMetadataAuthorityFanout {
                     tokio::runtime::RuntimeFlavor::MultiThread
                 ) =>
             {
-                tokio::task::block_in_place(|| self.events.recv_timeout(timeout))
+                tokio::task::block_in_place(|| receive(&self.events))
             }
-            _ => self.events.recv_timeout(timeout),
+            _ => receive(&self.events),
         };
-        let event = received.ok()??;
+        let event = received??;
         self.in_flight -= 1;
         Some(event)
     }
@@ -521,7 +530,7 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
     fn start_metadata_authority_fanout(
         &mut self,
         _groups: &[DfsMetadataJournalBatchDirectGroup],
-        _deadline: Instant,
+        _deadline: Option<Instant>,
     ) -> Result<Option<DfsMetadataAuthorityFanout>, NetworkError> {
         Ok(None)
     }

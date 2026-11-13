@@ -2725,7 +2725,7 @@ fn native_replay_validation_keeps_mutable_record_checks_and_releases_body_custod
 /// already is, and a typed kernel rejection or an absent body stays definite.
 #[test]
 fn failed_commit_outcome_is_decided_from_the_durable_record() {
-    let (mut runtime, mut service, config) = native_case("v7-native-commit-outcome", 3);
+    let (runtime, mut service, config) = native_case("v7-native-commit-outcome", 3);
     let current = directory(&mut service, "/services/v7-native-commit-outcome");
     let mut changed = current.clone();
     changed.version = DfsVersion::generate();
@@ -2810,6 +2810,129 @@ fn failed_commit_outcome_is_decided_from_the_durable_record() {
         .settle_failed_prepared_commit(&digest, network)
         .expect("a committed body is a success");
     assert!(!settled.published);
+    drop(service);
+    runtime.close().unwrap();
+}
+
+fn hold_member_replies(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    member: &sinomo_core::node::NodeId,
+) -> std::sync::Arc<tokio::sync::Semaphore> {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    // The member executes every prepare and confirmation; only its answers
+    // are held, as on a slow link that still delivers them.
+    for (source, target, route) in [
+        (
+            config.primary_node_id.clone(),
+            member.clone(),
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        ),
+        (
+            config.primary_node_id.clone(),
+            member.clone(),
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        ),
+        (
+            member.clone(),
+            config.primary_node_id.clone(),
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
+        ),
+    ] {
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(source),
+            target: Some(target),
+            route: Some(route.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::PauseAfterDispatch(std::sync::Arc::clone(
+                &gate,
+            )),
+        });
+    }
+    gate
+}
+
+fn release_after(gate: std::sync::Arc<tokio::sync::Semaphore>, delay: std::time::Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    });
+}
+
+/// With no caller deadline nothing in DFS ends the wait: a member that still
+/// answers, however late, completes the commit. The former 5 s cap and 1 s
+/// floor would have failed it.
+#[test]
+fn a_slow_answering_member_never_fails_a_commit_without_a_caller_deadline() {
+    let (runtime, mut service, config) = native_case("v7-native-slow-member", 3);
+    let current = directory(&mut service, "/services/v7-native-slow-member");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o640;
+    let payload = namespace_payload(&config, &current, changed, "slow-member-commit");
+    assert_eq!(service.transport.operation_deadline(), None);
+    let slow = config.replica_node_ids[0].clone();
+    let gate = hold_member_replies(&runtime, &config, &slow);
+    let held = std::time::Duration::from_secs(7);
+    release_after(gate, held);
+    let started = std::time::Instant::now();
+    let committed = service
+        .publish_prepared_operation(payload)
+        .expect("a member that answers late still acknowledges");
+    assert!(committed.published);
+    assert!(
+        started.elapsed() >= held - std::time::Duration::from_millis(500),
+        "the commit waited for the held member: {:?}",
+        started.elapsed()
+    );
+    runtime.clear_faults();
+    drop(service);
+    runtime.close().unwrap();
+}
+
+/// The caller's deadline is the only bound: it ends the wait as an unknown
+/// outcome, and the same body commits once the member's answers arrive.
+#[test]
+fn the_caller_deadline_ends_the_wait_as_unknown_and_a_retry_commits() {
+    let (runtime, mut service, config) = native_case("v7-native-caller-deadline", 3);
+    let current = directory(&mut service, "/services/v7-native-caller-deadline");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o640;
+    let payload = namespace_payload(&config, &current, changed, "caller-deadline-commit");
+    let slow = config.replica_node_ids[0].clone();
+    let gate = hold_member_replies(&runtime, &config, &slow);
+    let deadline = std::time::Duration::from_secs(2);
+    service
+        .transport
+        .set_operation_deadline(Some(std::time::Instant::now() + deadline));
+    let started = std::time::Instant::now();
+    let outcome = service.publish_prepared_operation(payload.clone());
+    let elapsed = started.elapsed();
+    service.transport.set_operation_deadline(None);
+    match outcome {
+        Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+            cause: crate::DfsCommitOutcomeUnknownCause::Deadline,
+            operation_id,
+            ..
+        }) => assert_eq!(operation_id, "caller-deadline-commit"),
+        other => panic!(
+            "the caller deadline leaves the outcome unknown: {:?}",
+            other.map(|publication| publication.published)
+        ),
+    }
+    assert!(
+        elapsed < deadline + std::time::Duration::from_secs(3),
+        "{elapsed:?}"
+    );
+    gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    runtime.clear_faults();
+    let retried = service
+        .publish_prepared_operation(payload)
+        .expect("the same body commits on retry");
+    assert!(retried.published);
     drop(service);
     runtime.close().unwrap();
 }

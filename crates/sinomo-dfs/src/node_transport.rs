@@ -4792,10 +4792,13 @@ fn spawn_metadata_authority_fanout_thread(task: impl FnOnce() + Send + 'static) 
 impl DfsNodeMetadataAuthorityFanoutWorkers {
     /// Start one direct call. Returns `false` when no blocking worker slot is
     /// free, leaving that target without a direct route for this round.
+    /// Start one direct call. With a caller deadline the call's whole network
+    /// time is bounded by it; without one only the network layer's own
+    /// connect and no-progress limits apply.
     fn start_direct(
         &mut self,
         mut prepared: DfsPreparedMetadataJournalBatchRpc,
-        deadline: Instant,
+        deadline: Option<Instant>,
         events: &std::sync::mpsc::Sender<DfsMetadataAuthorityFanoutSignal>,
     ) -> bool {
         let target_node_id = prepared.target_node_id.clone();
@@ -4817,25 +4820,32 @@ impl DfsNodeMetadataAuthorityFanoutWorkers {
                             let _slot = direct_slots.acquire_owned().await.map_err(|_| {
                                 metadata_authority_fanout_deadline_error(&prepared.target_node_id)
                             })?;
-                            let remaining = deadline
-                                .checked_duration_since(Instant::now())
-                                .filter(|remaining| !remaining.is_zero())
-                                .ok_or_else(|| {
-                                    metadata_authority_fanout_deadline_error(
-                                        &prepared.target_node_id,
-                                    )
-                                })?;
-                            prepared.options.overall_timeout = Some(remaining);
+                            if let Some(deadline) = deadline {
+                                let remaining = deadline
+                                    .checked_duration_since(Instant::now())
+                                    .filter(|remaining| !remaining.is_zero())
+                                    .ok_or_else(|| {
+                                        metadata_authority_fanout_deadline_error(
+                                            &prepared.target_node_id,
+                                        )
+                                    })?;
+                                prepared.options.overall_timeout = Some(remaining);
+                            }
                             call_direct_metadata_journal_rpc_async(peer_transport, prepared).await
                         };
-                        let result =
-                            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
-                                .await
-                                .unwrap_or_else(|_| {
-                                    Err(metadata_authority_fanout_deadline_error(
-                                        &completion.target_node_id,
-                                    ))
-                                });
+                        let result = match deadline {
+                            Some(deadline) => tokio::time::timeout_at(
+                                tokio::time::Instant::from_std(deadline),
+                                call,
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(metadata_authority_fanout_deadline_error(
+                                    &completion.target_node_id,
+                                ))
+                            }),
+                            None => call.await,
+                        };
                         completion.direct(result.map(|(_, response)| response));
                     }
                     .in_current_span(),
@@ -4863,17 +4873,22 @@ impl DfsNodeMetadataAuthorityFanoutWorkers {
                 let peer_transport = Arc::clone(peer_transport);
                 spawn_metadata_authority_fanout_thread(move || {
                     let _worker_slot = worker_slot;
-                    let result = match deadline
-                        .checked_duration_since(Instant::now())
-                        .filter(|remaining| !remaining.is_zero())
-                    {
-                        Some(remaining) => {
+                    let remaining = deadline.map(|deadline| {
+                        deadline
+                            .checked_duration_since(Instant::now())
+                            .filter(|remaining| !remaining.is_zero())
+                    });
+                    let result = match remaining {
+                        Some(None) => Err(metadata_authority_fanout_deadline_error(
+                            &prepared.target_node_id,
+                        )),
+                        Some(Some(remaining)) => {
                             prepared.options.overall_timeout = Some(remaining);
                             call_direct_metadata_journal_rpc_blocking(&*peer_transport, prepared)
                         }
-                        None => Err(metadata_authority_fanout_deadline_error(
-                            &prepared.target_node_id,
-                        )),
+                        None => {
+                            call_direct_metadata_journal_rpc_blocking(&*peer_transport, prepared)
+                        }
                     };
                     completion.direct(result.map(|(_, response)| response));
                 });
@@ -4887,7 +4902,7 @@ impl DfsMetadataAuthorityFanoutWorkers for DfsNodeMetadataAuthorityFanoutWorkers
     fn start_routed(
         &mut self,
         message: DfsRoutedMessage,
-        deadline: Instant,
+        deadline: Option<Instant>,
         events: &std::sync::mpsc::Sender<DfsMetadataAuthorityFanoutSignal>,
     ) -> Result<(), DfsRoutedMessage> {
         let target_node_id = message.target_node_id.clone();
@@ -4910,9 +4925,7 @@ impl DfsMetadataAuthorityFanoutWorkers for DfsNodeMetadataAuthorityFanoutWorkers
                         let call = async {
                             let options =
                                 DfsNodeTransport::clamp_send_options_to_operation_deadline(
-                                    options,
-                                    Some(deadline),
-                                    operation,
+                                    options, deadline, operation,
                                 )?;
                             send_dfs_routed_message_to_peer_async(
                                 sender,
@@ -4922,14 +4935,19 @@ impl DfsMetadataAuthorityFanoutWorkers for DfsNodeMetadataAuthorityFanoutWorkers
                             )
                             .await
                         };
-                        let result =
-                            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
-                                .await
-                                .unwrap_or_else(|_| {
-                                    Err(metadata_authority_fanout_deadline_error(
-                                        &completion.target_node_id,
-                                    ))
-                                });
+                        let result = match deadline {
+                            Some(deadline) => tokio::time::timeout_at(
+                                tokio::time::Instant::from_std(deadline),
+                                call,
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(metadata_authority_fanout_deadline_error(
+                                    &completion.target_node_id,
+                                ))
+                            }),
+                            None => call.await,
+                        };
                         completion.routed(result);
                     }
                     .in_current_span(),
@@ -4967,9 +4985,7 @@ impl DfsMetadataAuthorityFanoutWorkers for DfsNodeMetadataAuthorityFanoutWorkers
                     let _native_context =
                         crate::native_shard_trace::enter_rpc_attempt_context(native_context);
                     let result = DfsNodeTransport::clamp_send_options_to_operation_deadline(
-                        options,
-                        Some(deadline),
-                        operation,
+                        options, deadline, operation,
                     )
                     .and_then(|options| {
                         send_dfs_routed_message_to_peer(
@@ -5296,12 +5312,13 @@ impl DfsNodeTransport {
     }
 
     /// Validate every target and encode each group once. Returns `None` when
-    /// `deadline` expires before every call is prepared.
+    /// `deadline`, if any, expires before every call is prepared.
     fn prepare_metadata_journal_batch_rpcs(
         &self,
         groups: &[DfsBorrowedMetadataJournalBatchDirectGroup<'_>],
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<Option<Vec<DfsPreparedMetadataJournalBatchRpc>>, NetworkError> {
+        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
         let request_count = groups
             .iter()
             .map(|group| group.target_node_ids.len())
@@ -5325,7 +5342,7 @@ impl DfsNodeTransport {
                         node_id: (*target_node_id).clone(),
                     });
                 }
-                if Instant::now() >= deadline {
+                if expired() {
                     return Ok(None);
                 }
             }
@@ -5336,7 +5353,7 @@ impl DfsNodeTransport {
                     std::thread::sleep(delay);
                 }
             }
-            if Instant::now() >= deadline {
+            if expired() {
                 return Ok(None);
             }
             let replayable_call = Arc::new(dfs_metadata_journal_batch_replayable_rpc_call(
@@ -5352,7 +5369,7 @@ impl DfsNodeTransport {
             encoded_value_bytes =
                 encoded_value_bytes.saturating_add(replayable_call.encoded_value_bytes());
             for target_node_id in &group.target_node_ids {
-                if Instant::now() >= deadline {
+                if expired() {
                     return Ok(None);
                 }
                 let options = self.current_send_options(format!(
@@ -5423,7 +5440,8 @@ impl DfsNodeTransport {
         let deadline = self
             .operation_deadline
             .map_or(fanout_deadline, |deadline| deadline.min(fanout_deadline));
-        let Some(mut prepared) = self.prepare_metadata_journal_batch_rpcs(groups, deadline)? else {
+        let Some(mut prepared) = self.prepare_metadata_journal_batch_rpcs(groups, Some(deadline))?
+        else {
             return Ok(Some(Vec::new()));
         };
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -5472,7 +5490,7 @@ impl DfsNodeTransport {
     fn start_metadata_authority_fanout_inner(
         &mut self,
         groups: &[DfsMetadataJournalBatchDirectGroup],
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<Option<DfsMetadataAuthorityFanout>, NetworkError> {
         let mode = match (
             self.async_peer_transport.as_ref(),
@@ -5841,7 +5859,7 @@ impl DfsMessageTransport for DfsNodeTransport {
     fn start_metadata_authority_fanout(
         &mut self,
         groups: &[DfsMetadataJournalBatchDirectGroup],
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<Option<DfsMetadataAuthorityFanout>, NetworkError> {
         self.start_metadata_authority_fanout_inner(groups, deadline)
     }
@@ -7466,7 +7484,7 @@ mod tests {
         let mut fanout = transport
             .start_metadata_authority_fanout(
                 &authority_fanout_groups(&local, &[fast.clone(), slow.clone()]),
-                deadline,
+                Some(deadline),
             )
             .expect("authority fan-out")
             .expect("blocking peer retained");
@@ -7500,7 +7518,7 @@ mod tests {
         let mut fanout = transport
             .start_metadata_authority_fanout(
                 &authority_fanout_groups(&local, &[fast.clone(), slow.clone()]),
-                deadline,
+                Some(deadline),
             )
             .expect("authority fan-out")
             .expect("async peer retained");
@@ -7529,7 +7547,7 @@ mod tests {
         let mut fanout = transport
             .start_metadata_authority_fanout(
                 &authority_fanout_groups(&local, std::slice::from_ref(&target)),
-                operation_deadline,
+                Some(operation_deadline),
             )
             .expect("authority fan-out")
             .expect("blocking peer retained");
@@ -7574,11 +7592,11 @@ mod tests {
         let mut fanout = transport
             .start_metadata_authority_fanout(
                 &authority_fanout_groups(&local, std::slice::from_ref(&target)),
-                deadline,
+                Some(deadline),
             )
             .expect("authority fan-out")
             .expect("async peer retained");
-        let event = fanout.next_event(deadline + Duration::from_secs(2));
+        let event = fanout.next_event(Some(deadline + Duration::from_secs(2)));
 
         assert!(
             matches!(
@@ -7619,7 +7637,7 @@ mod tests {
         let fanout = transport
             .start_metadata_authority_fanout(
                 &authority_fanout_groups(&local, std::slice::from_ref(&target)),
-                deadline,
+                Some(deadline),
             )
             .expect("authority fan-out")
             .expect("async peer retained");
@@ -7658,7 +7676,7 @@ mod tests {
         transport.set_operation_deadline(Some(deadline));
         let groups = authority_fanout_groups(&local, std::slice::from_ref(&target));
         let mut fanout = transport
-            .start_metadata_authority_fanout(&groups, deadline)
+            .start_metadata_authority_fanout(&groups, Some(deadline))
             .expect("authority fan-out")
             .expect("blocking peer retained");
         let mut command = groups[0].command.clone();
@@ -7682,7 +7700,7 @@ mod tests {
         let Some(DfsMetadataAuthorityFanoutEvent::Routed {
             target_node_id,
             result,
-        }) = fanout.next_event(deadline)
+        }) = fanout.next_event(Some(deadline))
         else {
             panic!("the routed reply arrives before the slow direct reply");
         };
@@ -7699,7 +7717,7 @@ mod tests {
             "{delivered:?}"
         );
         assert!(matches!(
-            fanout.next_event(deadline),
+            fanout.next_event(Some(deadline)),
             Some(DfsMetadataAuthorityFanoutEvent::Direct { result: Ok(_), .. })
         ));
         assert_eq!(*peer.routed_targets.lock().unwrap(), vec![target]);
@@ -7779,7 +7797,7 @@ mod tests {
             })
             .collect();
         let mut fanout = transport
-            .start_metadata_authority_fanout(&groups, deadline)
+            .start_metadata_authority_fanout(&groups, Some(deadline))
             .expect("authority fan-out")
             .expect("async peer retained");
 
@@ -7795,7 +7813,7 @@ mod tests {
             "a slow but progressing upload advances between hedges: {earlier} -> {later}"
         );
         assert!(matches!(
-            fanout.next_event(deadline),
+            fanout.next_event(Some(deadline)),
             Some(DfsMetadataAuthorityFanoutEvent::Direct { result: Ok(_), .. })
         ));
         assert!(fanout.direct_upload_bytes(&target).unwrap() >= 256 * 1024);
@@ -7822,7 +7840,7 @@ mod tests {
         let groups = authority_fanout_groups(&local, std::slice::from_ref(&target));
 
         let mut fanout = transport
-            .start_metadata_authority_fanout(&groups, deadline)
+            .start_metadata_authority_fanout(&groups, Some(deadline))
             .expect("authority fan-out")
             .expect("blocking peer retained");
         let message = DfsRoutedMessage {
