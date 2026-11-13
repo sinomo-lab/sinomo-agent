@@ -593,13 +593,15 @@ Rust path implements it yet. State and actions live in
 `checks/dfs/metadata_write_set_takeover_safety.qnt`, and deterministic traces in
 `scenarios/dfs/metadata_write_set_takeover.qnt`.
 
-The bound is one shard, four possible members, three values, W floor 2, N 3
-and three epochs. Cluster KV is a linearizable compare-and-swap register over
-the whole shard record: primary, epoch, generation, members, write set and
-epoch start. A commit needs a current-epoch acknowledgement from every
-write-set member the primary knows of and every member it has submitted to add.
-Shrink, add, recruitment, retirement and takeover are guarded transactions on
-that record. A submitted add or swap may apply or abort later, and its
+The bound is one shard, four possible members, three values and three epochs.
+The W floor and N are state parameters, 2 and 3 unless a trace starts with
+others. Cluster KV is a linearizable compare-and-swap register over the whole
+shard record: primary, epoch, generation, members, write set and epoch start.
+A commit needs a current-epoch acknowledgement from every write-set member the
+primary knows of and every member it has submitted to add. Shrink, add,
+recruitment, retirement and takeover are guarded transactions on that record.
+A recruit is admitted while the write set has fewer than N members, or, one
+at a time, beyond N while every configured member is in the write set. A submitted add or swap may apply or abort later, and its
 submitter learns the outcome separately. Takeover, shrink and recruitment are
 enabled whenever their guards allow, independent of the network verdicts that
 trigger them in the design, so safety does not depend on failure detection.
@@ -625,11 +627,13 @@ describe a copy the member has since deleted on retirement. A submitted add
 stays a required acknowledgement, durably, until the record shows it applied or
 can no longer apply.
 
-Three deterministic traces cover the design: abrupt primary loss with a
+Four deterministic traces cover the design: abrupt primary loss with a
 successor completing a prepared change and the old primary rejoining after
 dropping its tail; a shrink racing a takeover, with the rejected candidate
-releasing its promise and being re-added; and a primary restart with a pending
-add, after which the added member takes over. Six counterexamples each enable
+releasing its promise and being re-added; a primary restart with a pending
+add, after which the added member takes over; and, with the W floor equal to
+N, a dead member held at the floor replaced by a recruit beyond N, which joins
+before the dead member leaves and then commits with the primary at the floor. Six counterexamples each enable
 one broken variant and must reach the violation its invariant detects: a swap
 that compares only the epoch, a candidate outside the write set, an add without
 catch-up, a commit that ignores a submitted add, a pending add lost on restart,
