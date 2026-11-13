@@ -812,6 +812,24 @@ enum DfsPublicationAuthority {
         expected: crate::DfsMetadataShardConfig,
         acknowledged: BTreeSet<sinomo_core::node::NodeId>,
     },
+    /// A write-set shard: every member of the write set at the generation the
+    /// fence checked, and every pending add, acknowledged the prepare.
+    WriteSet {
+        expected: crate::DfsMetadataShardConfig,
+        write_set: crate::DfsMetadataShardWriteSet,
+        required: BTreeSet<sinomo_core::node::NodeId>,
+        floor: usize,
+        acknowledged: BTreeSet<sinomo_core::node::NodeId>,
+    },
+}
+
+impl DfsPublicationAuthority {
+    fn expected_shard(&self) -> Option<&crate::DfsMetadataShardConfig> {
+        match self {
+            Self::Local { .. } => None,
+            Self::FullShard { expected, .. } | Self::WriteSet { expected, .. } => Some(expected),
+        }
+    }
 }
 
 pub struct DfsPublicationGuard {
@@ -845,7 +863,7 @@ impl DfsPublicationCommitGuard {
         else {
             return Ok(());
         };
-        let DfsPublicationAuthority::FullShard { expected, .. } = &self._guard.authority else {
+        let Some(expected) = self._guard.authority.expected_shard() else {
             return Err(MetadataBackendError::Serde(
                 "native source terminal requires its full assigned author proof".into(),
             ));
@@ -1480,7 +1498,31 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         } else {
             record
         };
-        let guard = self.authorize_prepared_publication_from_record(digest, record)?;
+        // The fence answers `None` when the shard record moved past what this
+        // round acknowledged; another round runs against the new record,
+        // bounded by the caller's deadline alone.
+        let guard = loop {
+            if let Some(guard) =
+                self.authorize_prepared_publication_from_record(digest, record.clone())?
+            {
+                break guard;
+            }
+            self.check_cancelled("metadata commit fence")?;
+            if self
+                .transport
+                .operation_deadline()
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id: digest.file_system_id.clone(),
+                    shard_id: digest.shard_id.0.clone(),
+                    epoch: digest.owner_epoch,
+                    operation_id: digest.operation_id.clone(),
+                    cause: crate::DfsCommitOutcomeUnknownCause::Deadline,
+                    current_primary_node_id: None,
+                });
+            }
+        };
         #[cfg(test)]
         if let Some(after_authorization) =
             AFTER_PREPARED_AUTHORIZATION.with(|hook| hook.borrow_mut().take())
@@ -1525,7 +1567,10 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "publication names no exact durable prepare".into(),
             })?;
-        self.authorize_prepared_publication_from_record(digest, record)
+        self.authorize_prepared_publication_from_record(digest, record)?
+            .ok_or_else(|| crate::DfsError::Metadata {
+                message: "the shard record moved past this round's acknowledgements".into(),
+            })
     }
 
     // Both callers obtained this immutable body from the durable backend.
@@ -1535,7 +1580,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         &mut self,
         digest: &DfsPreparedOperationDigest,
         record: crate::DfsPreparedOperationRecord,
-    ) -> std::result::Result<DfsPublicationGuard, crate::DfsError> {
+    ) -> std::result::Result<Option<DfsPublicationGuard>, crate::DfsError> {
         let backend = self.metadata_backend.as_ref().expect("prepared backend");
         record.validate()?;
         if record.digest != *digest {
@@ -1582,12 +1627,13 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             payload_digest: digest.payload_digest.clone(),
         };
         let authorization = if self.control_plane.is_some() {
-            let shard = self
+            let context = self
                 .retained_metadata_replica_context(&digest.file_system_id, &digest.shard_id)?
                 .ok_or_else(|| crate::DfsError::Metadata {
                     message: "publication requires the host's coherent shard configuration".into(),
-                })?
-                .shard;
+                })?;
+            let requirement = self.metadata_commit_requirement(&context, &payload)?;
+            let shard = context.shard;
             let batch = self
                 .metadata_backend
                 .as_ref()
@@ -1601,7 +1647,12 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 .ok_or_else(|| crate::DfsError::Metadata {
                     message: "publication prepare frame is unavailable".into(),
                 })?;
-            Some(self.authorize_metadata_shard_operation(&shard, &operation, &batch)?)
+            Some(self.authorize_metadata_shard_operation(
+                &shard,
+                &requirement,
+                &operation,
+                &batch,
+            )?)
         } else {
             None
         };
@@ -1618,10 +1669,14 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             Arc::new(shard_fence_guard(&scope))
         };
         let provider = self.publication_provider.current();
-        let clustered = authorization.as_ref().map(|authorization| {
-            let crate::DfsCanonicalAuthorization::FullShard { expected_shard, .. } = authorization;
-            expected_shard
-        });
+        let clustered = authorization
+            .as_ref()
+            .map(|authorization| match authorization {
+                crate::DfsCanonicalAuthorization::FullShard { expected_shard, .. }
+                | crate::DfsCanonicalAuthorization::WriteSet { expected_shard, .. } => {
+                    expected_shard
+                }
+            });
         let writer = self
             .metadata_backend
             .as_mut()
@@ -1671,6 +1726,89 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 DfsPublicationAuthority::FullShard {
                     expected: expected_shard,
                     acknowledged: acknowledged_node_ids.into_iter().collect(),
+                }
+            }
+            Some(crate::DfsCanonicalAuthorization::WriteSet {
+                operation_digest,
+                expected_shard,
+                acknowledged_node_ids,
+                prepare_sequence,
+                ..
+            }) => {
+                if operation_digest != digest.payload_digest
+                    || prepare_sequence != digest.prepare_sequence
+                {
+                    return Err(crate::DfsError::StaleOwnerEpoch {
+                        file_system_id: digest.file_system_id.clone(),
+                        local_node_id: self.node_id.clone(),
+                        primary_node_id: expected_shard.primary_node_id,
+                        epoch: expected_shard.epoch,
+                    });
+                }
+                // The fence: under the writer lock this session holds, the
+                // requirement is evaluated again against the retained record,
+                // so the commit is checked against the generation it lands on.
+                let current = {
+                    #[cfg(any(test, feature = "test-support"))]
+                    let _native_configuration_scope = native_trace
+                        .as_ref()
+                        .map(|trace| trace.enter_retained_configuration());
+                    self.retained_metadata_replica_context(
+                        &digest.file_system_id,
+                        &digest.shard_id,
+                    )?
+                }
+                .ok_or_else(|| crate::DfsError::Metadata {
+                    message: "publication lost the host's coherent shard configuration".into(),
+                })?;
+                if current.shard.epoch != expected_shard.epoch
+                    || current.shard.primary_node_id != expected_shard.primary_node_id
+                    || current.write_set.is_none()
+                {
+                    // Another epoch or an unreadable record: the change stays
+                    // prepared for whichever primary the record names.
+                    return Err(crate::DfsError::StaleOwnerEpoch {
+                        file_system_id: digest.file_system_id.clone(),
+                        local_node_id: self.node_id.clone(),
+                        primary_node_id: current.shard.primary_node_id,
+                        epoch: current.shard.epoch,
+                    });
+                }
+                let crate::service_replica::DfsMetadataCommitRequirement::WriteSet {
+                    write_set,
+                    pending_adds,
+                    floor,
+                } = self.metadata_commit_requirement(&current, &payload)?
+                else {
+                    return Err(crate::DfsError::Metadata {
+                        message: "a switched shard lost its write-set requirement".into(),
+                    });
+                };
+                let acknowledged = acknowledged_node_ids.into_iter().collect::<BTreeSet<_>>();
+                let required = write_set
+                    .write_set
+                    .iter()
+                    .chain(&pending_adds)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if write_set.write_set.len() < floor || !required.is_subset(&acknowledged) {
+                    return Ok(None);
+                }
+                self.metadata_backend
+                    .as_mut()
+                    .expect("checked durable backend")
+                    .release_superseded_pending_write_set_adds_held(
+                        &digest.shard_id,
+                        &current.shard,
+                        Some(&write_set),
+                        &writer,
+                    )?;
+                DfsPublicationAuthority::WriteSet {
+                    expected: current.shard,
+                    write_set,
+                    required,
+                    floor,
+                    acknowledged,
                 }
             }
             None => {
@@ -1745,6 +1883,19 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                     expected: expected.clone(),
                     authenticated_acknowledged_node_ids: acknowledged.iter().cloned().collect(),
                 },
+                DfsPublicationAuthority::WriteSet {
+                    expected,
+                    write_set,
+                    required,
+                    floor,
+                    acknowledged,
+                } => NativeGuardAuthorityV1::WriteSet {
+                    expected: expected.clone(),
+                    write_set_generation: write_set.generation,
+                    required_node_ids: required.iter().cloned().collect(),
+                    floor: *floor,
+                    authenticated_acknowledged_node_ids: acknowledged.iter().cloned().collect(),
+                },
             };
             let execution = guard.execution.as_ref().map(|owners| {
                 let scheduler = owners
@@ -1793,7 +1944,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             guard._native_trace = native_trace;
             guard
         };
-        Ok(guard)
+        Ok(Some(guard))
     }
 }
 impl std::fmt::Debug for DfsPublicationGuard {
@@ -1837,6 +1988,26 @@ impl DfsPublicationGuard {
                     && expected.shard_id == digest.shard_id.0
                     && expected.epoch == digest.owner_epoch
                     && &required == acknowledged
+            }
+            DfsPublicationAuthority::WriteSet {
+                expected,
+                write_set,
+                required,
+                floor,
+                acknowledged,
+            } => {
+                expected.file_system_id == digest.file_system_id
+                    && expected.shard_id == digest.shard_id.0
+                    && expected.epoch == digest.owner_epoch
+                    && write_set.validate_against(expected).is_ok()
+                    && *floor >= 1
+                    && write_set.write_set.len() >= *floor
+                    && write_set
+                        .write_set
+                        .iter()
+                        .all(|node| required.contains(node))
+                    && required.is_subset(acknowledged)
+                    && acknowledged.contains(&expected.primary_node_id)
             }
         };
         if !valid_authority {

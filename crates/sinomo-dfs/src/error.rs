@@ -2,10 +2,10 @@ use crate::{
     ContentStoreError, DfsDistributedError, DfsFileSystemId, DfsObjectId, DfsVersion,
     MetadataBackendError,
 };
+use serde::{Deserialize, Serialize};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::KvError;
 use sinomo_core::network::NetworkDeliveryState;
-use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use thiserror::Error;
 
@@ -219,7 +219,10 @@ impl std::fmt::Display for DfsCommitOutcomeUnknownCause {
                 "{acknowledged} of {required} required acknowledgements, missing {missing:?}"
             ),
             Self::BelowWriteSetFloor { write_set, floor } => {
-                write!(f, "write set of {write_set} is below the commit floor {floor}")
+                write!(
+                    f,
+                    "write set of {write_set} is below the commit floor {floor}"
+                )
             }
             Self::RecordChanged { epoch } => write!(f, "shard record moved to epoch {epoch}"),
             Self::Deadline => f.write_str("caller deadline reached"),

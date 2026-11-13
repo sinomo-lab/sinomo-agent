@@ -231,11 +231,10 @@ pub use browser_service::{
     DFS_CORE_BROWSER_ROUTES, DFS_CORE_COMPONENT_ACCESS_OPERATION, DFS_CORE_COMPONENT_ACCESS_ROUTE,
     DFS_CORE_COMPONENT_INTERFACE, DFS_CORE_COMPONENT_INTERFACE_VERSION, DfsBrowserBackend,
     DfsBrowserMutationAttempt, DfsBrowserServiceHost, HostedDfsBrowserService,
-    HostedDfsPlacementAuthorityAdminService,
-    authorize_dfs_core_component_access, dfs_browser_component_host,
-    dfs_core_component_requirement, normalize_sifs_browser_path, posix_error_outcome_is_unknown,
-    register_dfs_browser_services,
-    run_blocking_browser_task, run_blocking_browser_task_unqueued, run_blocking_service_task, run_configured_browser_task,
+    HostedDfsPlacementAuthorityAdminService, authorize_dfs_core_component_access,
+    dfs_browser_component_host, dfs_core_component_requirement, normalize_sifs_browser_path,
+    posix_error_outcome_is_unknown, register_dfs_browser_services, run_blocking_browser_task,
+    run_blocking_browser_task_unqueued, run_blocking_service_task, run_configured_browser_task,
 };
 pub use default_projection::*;
 #[cfg(feature = "test-support")]
@@ -385,8 +384,9 @@ pub use control_plane::{
     build_metadata_takeover_swap, build_metadata_write_set_add, build_metadata_write_set_recruit,
     build_metadata_write_set_remove, build_metadata_write_set_shrink,
     build_metadata_write_set_switch, dfs_metadata_shard_write_set_key_is_exact,
-    metadata_commit_write_set_floor, metadata_shard_replication_bounds,
-    metadata_shard_write_set_key, metadata_shard_write_set_state, select_metadata_shard_members,
+    metadata_commit_write_set_floor, metadata_pending_write_set_add_superseded,
+    metadata_shard_replication_bounds, metadata_shard_write_set_key,
+    metadata_shard_write_set_state, select_metadata_shard_members,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

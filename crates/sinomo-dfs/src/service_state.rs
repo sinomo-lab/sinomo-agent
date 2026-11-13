@@ -1025,6 +1025,9 @@ pub(crate) struct PendingMetadataAuthorityProbe {
     pub(crate) confirmation_id: String,
     pub(crate) expected_shard: DfsMetadataShardConfig,
     pub(crate) expected_next_after_sequence: u64,
+    /// The exact prefix the probe challenges; a member view in the reply
+    /// must name it.
+    pub(crate) expected_prefix: crate::DfsMetadataPrefixProof,
 }
 
 #[derive(Clone, Debug)]

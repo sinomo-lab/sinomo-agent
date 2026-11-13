@@ -1526,9 +1526,23 @@ pub enum DfsMetadataAuthorityOperation {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum DfsCanonicalAuthorization {
+    /// Every configured member acknowledged: a shard on the all-member rule.
     FullShard {
         operation_digest: String,
         expected_shard: DfsMetadataShardConfig,
+        acknowledged_node_ids: Vec<NodeId>,
+        prepare_sequence: u64,
+    },
+    /// A shard on the write-set protocol: the write set at
+    /// `expected_write_set`'s generation and the pending adds acknowledged,
+    /// and the write set meets the commit floor. The publication fence checks
+    /// the requirement again against the record it commits under.
+    WriteSet {
+        operation_digest: String,
+        expected_shard: DfsMetadataShardConfig,
+        expected_write_set: crate::DfsMetadataShardWriteSet,
+        required_node_ids: Vec<NodeId>,
+        commit_floor: usize,
         acknowledged_node_ids: Vec<NodeId>,
         prepare_sequence: u64,
     },
@@ -1834,11 +1848,23 @@ mod commit_outcome_unknown_wire_tests {
         #[serde(rename_all = "kebab-case")]
         #[allow(dead_code)]
         enum PreChangeResult {
-            Outcome { outcome: serde_json::Value },
-            ReconciliationRequired { operation_id: String, reason: String },
-            PreconditionFailed { failure: serde_json::Value },
-            UnsupportedPrecondition { path: String, reason: String },
-            Rejected { reason: String },
+            Outcome {
+                outcome: serde_json::Value,
+            },
+            ReconciliationRequired {
+                operation_id: String,
+                reason: String,
+            },
+            PreconditionFailed {
+                failure: serde_json::Value,
+            },
+            UnsupportedPrecondition {
+                path: String,
+                reason: String,
+            },
+            Rejected {
+                reason: String,
+            },
         }
         let encoded = serde_json::to_vec(&DfsDistributedWriteResult::CommitOutcomeUnknown {
             intent_id: "dfs_write_op_1".into(),

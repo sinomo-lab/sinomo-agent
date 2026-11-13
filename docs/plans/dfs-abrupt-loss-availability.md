@@ -74,9 +74,11 @@ deployment.
 
 The implementation differs from these requirements:
 
-- Every metadata commit needs a durable acknowledgement from the primary and
-  every configured replica (`authorize_metadata_shard_operation`). A missing
-  member makes the commit fail and leaves the change prepared.
+- Every metadata commit on a shard that has not switched to the write-set
+  protocol, which is every shard while no node advertises it, needs a durable
+  acknowledgement from the primary and every configured replica
+  (`authorize_metadata_shard_operation`). A missing member leaves the change
+  prepared and the caller receives an unknown outcome, not a failure.
 - After setup, every metadata-capable service node replicates every shard, so
   one offline node of any kind stops metadata writes on all shards.
 - A primary changes only through the cooperative membership handoff, whose
@@ -84,8 +86,9 @@ The implementation differs from these requirements:
   offline the handoff stays pending and nothing cancels it.
 - An epoch change also advances the store generation, which makes the metadata
   service reopen.
-- A caller whose primary is unreachable fails at the first network error unless
-  the shard record already names a new primary.
+- A caller whose primary is unreachable gets an unknown outcome or a not-sent
+  error at the first network error. It does not yet wait for the shard record
+  to name a new primary.
 - Namespace-job resume selects jobs on every locally replicated shard rather than
   only on shards this node is primary for. Cross-shard source-adoption sessions
   exist only in memory.
@@ -143,11 +146,25 @@ continue the history without the primary.
 ### Commit
 
 The primary acknowledges a change only after every member of the write set at
-its current generation has durably stored the complete prepared body. The commit
-record may follow afterwards. A caller that does not receive success treats the
+its current generation, and every member it has submitted to add, has durably
+stored the complete prepared body, and only while that write set meets the
+commit's floor: the shard's W floor, raised to the content W of what the change
+makes visible. Below the floor the change stays prepared. The commit record may
+follow afterwards. A shard that has not switched treats every configured member
+as its write set.
+
+Once the body is durable, any result other than success is an unknown outcome:
+the change can still commit through a retry or through a successor, so it is
+never reported as a failure. A caller that does not receive success treats the
 outcome as unknown and resolves it by retrying with the same operation id. DFS
 never reports a definite failure for a change that a successor could still
 complete.
+
+DFS sets no deadline of its own on the acknowledgement wait. It ends when the
+required members have acknowledged, at the caller's deadline, on cancellation,
+when the network layer reports no path to a required member, on a definite
+rejection, or when the shard record moves to another epoch. A member that still
+answers, however slowly, is waited for.
 
 ### Detecting loss
 
@@ -327,7 +344,9 @@ describes the model, its deterministic traces and its counterexamples.
    prepared-change recovery and follower alignment.
 7. Callers and successor work: callers wait within their own deadline for the
    shard record to change and retry at the new primary with the same operation
-   id; namespace-job resume only on shards this node is primary for; cross-shard
+   id; the requester's remaining budget reaches the primary serving its
+   request, so a served commit's wait ends when its requester stops waiting;
+   namespace-job resume only on shards this node is primary for; cross-shard
    source adoption rebuilt from job rows.
 8. Content-target substitution for open writes.
 

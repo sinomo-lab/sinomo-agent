@@ -4791,7 +4791,9 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
     assert!(
         matches!(
             &first,
-            Err(DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown { .. }))
+            Err(DfsPosixError::Dfs(
+                DfsError::MetadataCommitOutcomeUnknown { .. }
+            ))
         ),
         "the opening quorum's negative boundary leaves the outcome unknown: {first:?}"
     );
@@ -4833,8 +4835,16 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
         })
     };
     assert!(
-        !before.tables.prepared_operations_v7.iter().any(aborts_original)
-            && !after.tables.prepared_operations_v7.iter().any(aborts_original),
+        !before
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .any(aborts_original)
+            && !after
+                .tables
+                .prepared_operations_v7
+                .iter()
+                .any(aborts_original),
         "an unknown outcome never prepares an abort of the original opening"
     );
     // The replay continues the original body: it commits, or is still
@@ -4990,11 +5000,12 @@ fn check_retained_intent_opening(
         match outcome {
             Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired { .. }) => {}
             Err(DfsError::MetadataCommitOutcomeUnknown {
-                cause: crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
-                    required: 3,
-                    acknowledged: 2,
-                    ..
-                },
+                cause:
+                    crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
+                        required: 3,
+                        acknowledged: 2,
+                        ..
+                    },
                 ..
             }) => {}
             other => panic!(

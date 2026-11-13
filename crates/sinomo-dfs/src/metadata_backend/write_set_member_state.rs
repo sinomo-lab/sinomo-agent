@@ -286,19 +286,46 @@ impl LocalSobjMetadataBackend {
         self.write_write_set_member_state(&state)
     }
 
-    /// Drop every pending add whose record is no longer `current`: it either
+    /// Drop every pending add the record `current` has moved past: it either
     /// applied, and the record now requires the member, or it can never apply.
+    /// A record equal to or older than an add's cut keeps the add.
     pub(crate) fn release_pending_write_set_adds_owned(
         &mut self,
         current: &DfsMetadataShardRecordCut,
     ) -> Result<Vec<NodeId>> {
         let _lock = self.metadata_write_lock()?;
+        let write_set = current.write_set_state().switched().cloned();
+        self.release_superseded_pending_write_set_adds_locked(&current.shard, write_set.as_ref())
+    }
+
+    /// The same release for a caller that already holds the shard writer
+    /// lock, such as the commit fence; `writer` is that proof.
+    pub(crate) fn release_superseded_pending_write_set_adds_held_owned(
+        &mut self,
+        shard: &crate::DfsMetadataShardConfig,
+        write_set: Option<&crate::DfsMetadataShardWriteSet>,
+        writer: &crate::publication_guard::DfsPublicationWriterSession,
+    ) -> Result<Vec<NodeId>> {
+        if writer.owner_scope().shard_id() != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "pending-add release names another shard's writer".into(),
+            ));
+        }
+        self.release_superseded_pending_write_set_adds_locked(shard, write_set)
+    }
+
+    fn release_superseded_pending_write_set_adds_locked(
+        &mut self,
+        shard: &crate::DfsMetadataShardConfig,
+        write_set: Option<&crate::DfsMetadataShardWriteSet>,
+    ) -> Result<Vec<NodeId>> {
         let Some(mut state) = self.read_write_set_member_state()? else {
             return Ok(Vec::new());
         };
         let mut released = Vec::new();
         state.pending_adds.retain(|pending| {
-            let keep = pending.cut.same_record(current);
+            let keep =
+                !crate::metadata_pending_write_set_add_superseded(&pending.cut, shard, write_set);
             if !keep {
                 released.push(pending.node_id.clone());
             }

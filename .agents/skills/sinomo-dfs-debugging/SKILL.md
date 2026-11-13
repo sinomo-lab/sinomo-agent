@@ -50,8 +50,9 @@ At the current V7 boundary, distinguish four facts:
 | Outcome is known | Exact prepared/committed/terminal operation record | A new operation may replace an uncertain one |
 | Transport delivered or may have delivered | Request/response identity and `NetworkDeliveryState` | The semantic write committed or failed |
 
-`MetadataRecoveryQuorumUnavailable { verified, required }` names a failed proof;
-it does not identify the subsystem that stalled. At the reviewed revision,
+`MetadataCommitOutcomeUnknown` with cause `acknowledgements-missing { required,
+acknowledged, missing }` names a missing proof for a durable prepare; it does
+not identify the subsystem that stalled. At the reviewed revision,
 publication requires every assigned metadata participant and has no ordinary
 Raft-permit fallback. This describes the existing rejection path, including its
 availability defect. Verify the working revision; do not turn this description

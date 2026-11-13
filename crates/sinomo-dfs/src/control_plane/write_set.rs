@@ -26,6 +26,8 @@ pub use bounds::{
 };
 
 #[cfg(test)]
+mod commit_native_tests;
+#[cfg(test)]
 mod native_tests;
 #[cfg(test)]
 mod tests;
@@ -254,6 +256,28 @@ pub fn metadata_shard_write_set_state(
         Ok(()) => DfsMetadataShardWriteSetState::Switched(write_set),
         Err(reason) => DfsMetadataShardWriteSetState::Stale { reason },
     }
+}
+
+/// Whether the record has moved past a pending add's cut, so the add either
+/// applied (its member is then in the write set) or can never apply.
+///
+/// The comparison is by order, not by equality: a retained view can lag the
+/// authoritative read that produced the cut, and a view equal to or older than
+/// the cut must keep the member required. Generation advances with every
+/// change to the record, and the epoch only grows.
+pub fn metadata_pending_write_set_add_superseded(
+    cut: &DfsMetadataShardRecordCut,
+    shard: &DfsMetadataShardConfig,
+    write_set: Option<&DfsMetadataShardWriteSet>,
+) -> bool {
+    if shard.epoch != cut.shard.epoch {
+        return shard.epoch > cut.shard.epoch;
+    }
+    let Some(cut_write_set) = cut.write_set_state().switched().cloned() else {
+        // An add is only ever built from a switched record.
+        return true;
+    };
+    write_set.is_some_and(|current| current.generation > cut_write_set.generation)
 }
 
 /// Exact bytes of one member's capability evidence.

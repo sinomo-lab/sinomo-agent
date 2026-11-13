@@ -5440,7 +5440,8 @@ impl DfsNodeTransport {
         let deadline = self
             .operation_deadline
             .map_or(fanout_deadline, |deadline| deadline.min(fanout_deadline));
-        let Some(mut prepared) = self.prepare_metadata_journal_batch_rpcs(groups, Some(deadline))?
+        let Some(mut prepared) =
+            self.prepare_metadata_journal_batch_rpcs(groups, Some(deadline))?
         else {
             return Ok(Some(Vec::new()));
         };

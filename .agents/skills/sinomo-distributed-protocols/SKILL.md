@@ -47,8 +47,9 @@ restart paths; a success response alone does not identify the commit boundary.
 - Content receipt threshold `W` is distinct from metadata publication authority.
   Current DFS publication requires the complete configured metadata participant
   proof. Missing participants leave it pending/unavailable; there is no ordinary
-  per-operation Raft permit, KV floor or watermark fallback. The error name
-  `MetadataRecoveryQuorumUnavailable` does not imply majority admission.
+  per-operation Raft permit, KV floor or watermark fallback. The resulting
+  `MetadataCommitOutcomeUnknown` is an unknown outcome of a durable prepare,
+  not a failure, and does not imply majority admission.
   This is a known implementation mismatch with the user's original outage/W/N
   requirement, not a product constraint to preserve indefinitely. Restore that
   behavior with a safe protocol; do not merely lower a count, revive a removed

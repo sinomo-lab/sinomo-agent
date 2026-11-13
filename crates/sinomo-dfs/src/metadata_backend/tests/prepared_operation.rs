@@ -2759,11 +2759,7 @@ fn failed_commit_outcome_is_decided_from_the_durable_record() {
             other.map(|publication| publication.published)
         ),
     }
-    let other_primary = config
-        .replica_node_ids
-        .first()
-        .cloned()
-        .expect("a replica");
+    let other_primary = config.replica_node_ids.first().cloned().expect("a replica");
     let stale = crate::DfsError::StaleOwnerEpoch {
         file_system_id: config.file_system_id.clone(),
         local_node_id: config.primary_node_id.clone(),

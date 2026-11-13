@@ -2846,11 +2846,23 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Err(write_set_member_state_unsupported())
     }
 
-    /// Drop pending adds whose record is no longer `current`.
+    /// Drop pending adds the record `current` has moved past.
     fn release_pending_write_set_adds(
         &mut self,
         _shard_id: &DfsMetadataShardId,
         _current: &crate::DfsMetadataShardRecordCut,
+    ) -> Result<Vec<NodeId>> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// The same release for a caller that already holds the shard writer
+    /// lock through `writer`, such as the publication fence.
+    fn release_superseded_pending_write_set_adds_held(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _shard: &crate::DfsMetadataShardConfig,
+        _write_set: Option<&crate::DfsMetadataShardWriteSet>,
+        _writer: &crate::publication_guard::DfsPublicationWriterSession,
     ) -> Result<Vec<NodeId>> {
         Err(write_set_member_state_unsupported())
     }

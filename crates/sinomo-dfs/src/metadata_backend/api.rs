@@ -2082,6 +2082,17 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.release_pending_write_set_adds_owned(current)
     }
 
+    fn release_superseded_pending_write_set_adds_held(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        shard: &crate::DfsMetadataShardConfig,
+        write_set: Option<&crate::DfsMetadataShardWriteSet>,
+        writer: &crate::publication_guard::DfsPublicationWriterSession,
+    ) -> Result<Vec<NodeId>> {
+        self.require_replication_source_shard(shard_id)?;
+        self.release_superseded_pending_write_set_adds_held_owned(shard, write_set, writer)
+    }
+
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
         self.require_replication_source_shard(source_shard_id)?;
         let checkpoint =

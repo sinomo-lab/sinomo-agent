@@ -1702,9 +1702,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 "namespace request {}/{} has a durable hidden prepare awaiting recovery",
                                 requester_node_id, command.request_id
                             ),
-                            posix_error: prepared
-                                .as_ref()
-                                .map(namespace_prepare_outcome_unknown),
+                            posix_error: prepared.as_ref().map(namespace_prepare_outcome_unknown),
                         });
                     }
                 }
@@ -4547,7 +4545,9 @@ mod admission_tests {
             current_primary_node_id: None,
         });
         assert!(namespace_execution_error_is_retriable(&unknown));
-        assert!(namespace_execution_must_remain_pending(&unknown, false, false));
+        assert!(namespace_execution_must_remain_pending(
+            &unknown, false, false
+        ));
     }
 
     #[test]

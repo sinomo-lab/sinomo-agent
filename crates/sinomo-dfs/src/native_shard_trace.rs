@@ -656,6 +656,13 @@ pub(crate) enum NativeGuardAuthorityV1 {
         expected: crate::DfsMetadataShardConfig,
         authenticated_acknowledged_node_ids: Vec<sinomo_core::node::NodeId>,
     },
+    WriteSet {
+        expected: crate::DfsMetadataShardConfig,
+        write_set_generation: u64,
+        required_node_ids: Vec<sinomo_core::node::NodeId>,
+        floor: usize,
+        authenticated_acknowledged_node_ids: Vec<sinomo_core::node::NodeId>,
+    },
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct NativeGuardScopeV1 {

@@ -148,9 +148,26 @@ In the JSONL output, `desired_replicas` is N and `write_quorum` is W. `network_b
 
 Distributed writes are coordinated by the responsible metadata-shard primary. A node that receives a write for a shard it does not currently primary routes the request to that primary instead of creating a local intent. The primary creates the persisted intent, stages content to desired replicas, records durable receipts, commits the visible version after the policy threshold, and keeps repair jobs until the desired replica set converges.
 
-Ordinary writes do not store per-file state in cluster KV or perform an unconditional Raft round. Before visible publication, the primary journals a hidden, operation-bound prepare in DFS metadata: the pending intent and exact `W` receipt set for content writes, plus the namespace transaction for first publication or namespace-only mutations. Every configured metadata-shard replica must durably apply and verify that exact prepare before acknowledging it. If the complete shard cannot acknowledge, the primary falls back to an operation-bound certificate for the exact DFS configuration through cluster quorum. Cluster KV therefore retains only DFS configuration and the bounded fallback barrier; content durability remains governed independently by `W`.
+Ordinary writes do not store per-file state in cluster KV or perform an unconditional Raft round. Before visible publication, the primary journals a hidden, operation-bound prepare in DFS metadata: the pending intent and exact `W` receipt set for content writes, plus the namespace transaction for first publication or namespace-only mutations. Each required member must durably apply and verify that exact prepare before acknowledging it: every configured member of a shard on the all-member rule, or the write set and pending adds of a shard on the write-set protocol (below). Missing acknowledgements leave the prepare durable and the outcome unknown; there is no cluster-quorum fallback. Cluster KV therefore retains only DFS configuration; content durability remains governed independently by `W`.
+
+The acknowledgement wait has no DFS deadline. It ends when every required member has acknowledged, at the caller's operation deadline if the caller set one, on cancellation, when every attempt to a required member has ended with a network delivery failure, on a definite rejection, or when the retained shard record changes epoch. Complete evidence is used even when the caller's deadline has passed. A required member that is behind by more than one bounded batch, or rejects the prepare, is caught up through the ordinary durability barrier: within the caller's deadline, or, without one, for as long as each catch-up slice advances the member's acknowledged cursor. A target reached only over the routed path gets its empty confirmation re-sent on a timer that backs off to the network's liveness interval; the timer re-sends and never ends the wait. A caller's deadline does not cross the wire, so a served request's wait is bounded only by these events.
 
 Shard membership changes retain the current primary and do not immediately activate a replacement authority. The quorum side first records a bounded pending handoff; this is not itself a write fence because the isolated retiring primary may not have observed it. After reconnecting, the retiring primary takes its publication guard, installs a durable local backend freeze, and acknowledges its exact journal head and fingerprint. That exact prefix must then reach and be acknowledged by the union of the retiring and desired assignments before the desired assignment activates. The local marker then advances to the activated epoch instead of disappearing: only the backend instance explicitly rebound after observing that exact control-plane generation may resume authoritative mutations, while independently opened stale instances remain fenced. Pending markers reject authoritative metadata mutations, and both pending and activated markers still permit replay and handoff transfer. This carries writes completed after the pending decision without putting healthy DFS operations through Raft.
+
+#### Unknown commit outcomes
+
+Once a prepare is durable, the outcome of any failed commit attempt is decided from the durable record, not from the error: a `Committed` record is the success it already is, an `Aborted` or absent record keeps the original error, and a `Prepared` record is `DfsError::MetadataCommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`. Typed kernel rejections (precondition failure, existing path, non-empty directory, stale directory version) stay definite. `cause` is a `DfsCommitOutcomeUnknownCause`: `acknowledgements-missing { required, acknowledged, missing }`, `below-write-set-floor { write_set, floor }`, `record-changed { epoch }`, `deadline`, `cancelled` or `interrupted { detail }`.
+
+An unknown outcome is neither success nor failure. The caller retries the same operation id; the primary answers that retry from the durable prepare and commits it at most once. Its forms on each surface:
+
+| Surface | Form |
+|---|---|
+| Routed write reply | `DfsDistributedWriteResult::CommitOutcomeUnknown { intent_id, file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`; the requester keeps the compact pending write instead of abandoning it. A commit attempted when a completing content receipt arrives answers a pending served write the same way; the receipt stays in the durable prepare that carries it |
+| Routed namespace reply | `Rejected` carrying `DfsNamespacePosixError::CommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause }`; the request record stays `Pending`, and admission of a request whose prepare awaits recovery answers the same way. An admission whose own request-row commit is left unknown answers the same way; the same-id retry answers from that row once it commits |
+| Routed namespace timeout after dispatch | `NetworkDelivery { PossiblyApplied }`; the stable-id wrapper retries the same id, and the per-attempt-id wrapper returns instead of retrying under a new id |
+| FUSE / NFS | `EAGAIN` / `NFS3ERR_JUKEBOX`, as for a pending write |
+| Browser conditional replace | `DaemonDfsBrowserReplaceFileIfVersionOutcome::Unknown { detail }`, also used for a pending write and a possibly applied dispatch |
+| Same-shard namespace jobs and prepared-change recovery | the job stays `Running`; a recovery pass attempts every other body and reports itself incomplete so it runs again; an unknown caused by cancellation stops the pass, and `DfsError::is_cancellation` treats it as the cancellation it is |
 
 #### Shard write sets
 
@@ -180,7 +197,29 @@ the write set to the new primary with the frozen prefix as epoch start.
 The W floor and N of a shard are the highest content W and N among the rules
 that can apply to its paths (`metadata_shard_replication_bounds`). A commit also
 needs at least its own intent's W (`metadata_commit_write_set_floor`), because
-object and per-write policies are not derivable from configuration.
+object and per-write policies are not derivable from configuration. The intent
+is the one the commit makes visible: its terminal intent, or else the intent it
+prepares; metadata-only publications carry none.
+
+A commit on a switched shard needs acknowledgements from the write set at the
+retained generation plus every durable pending add the record has not moved
+past. A pending add is dropped from that set only when the retained record is
+at a later epoch or a later generation than the add's read, never merely when
+it differs, because the retained view can lag that read. The prepare goes only
+to those members; others receive the journal through ordinary replication. A
+write set smaller than the commit floor still collects acknowledgements, so the
+change is durable on the live write set, and then reports
+`below-write-set-floor`. The authorization (`DfsCanonicalAuthorization::WriteSet`)
+names the generation it was evaluated at. Under the shard writer lock the
+publication fence evaluates the requirement again from the retained record and
+the member-state file: another epoch leaves the outcome unknown, a moved
+generation or replica list that the acknowledgements still cover commits under
+the new generation, and anything else runs another round. The fence also drops
+superseded pending adds. An acknowledgement carrying `member_view` counts only
+when the view names the probe's epoch and exact prefix; the generation is not
+compared, and the primary keeps each member's latest view as add evidence. The
+prepared body seals no member set: retries and prepared-change recovery are
+evaluated against the record current when they run.
 
 A member admits the write-set capability only when its own member record
 advertises it and its capability policy, if present, allows it. Main daemons
@@ -194,8 +233,8 @@ deletes it with the copy. Under the shard writer lock, journal ingest, snapshot
 install and both acknowledgement-floor writers refuse a source epoch below the
 fence. A promise captures the materialized journal head as epoch start and
 raises the fence to the next epoch in one writer-lock section. A pending add is
-written in one section with the evidence check and stays required while the
-record equals the add's read.
+written in one section with the evidence check and stays required until the
+record moves past the add's read.
 
 On a write-set shard an acknowledgement floor records its authority epoch and
 binds only at that epoch; a floor without one belongs to the switch epoch.

@@ -6557,6 +6557,17 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .release_pending_write_set_adds(shard_id, current)
     }
 
+    fn release_superseded_pending_write_set_adds_held(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        shard: &crate::DfsMetadataShardConfig,
+        write_set: Option<&crate::DfsMetadataShardWriteSet>,
+        writer: &crate::publication_guard::DfsPublicationWriterSession,
+    ) -> Result<Vec<NodeId>> {
+        self.shard_backend_mut(shard_id)?
+            .release_superseded_pending_write_set_adds_held(shard_id, shard, write_set, writer)
+    }
+
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
         self.shard_backend(source_shard_id)?
             .metadata_replay_cursor(source_shard_id)

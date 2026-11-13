@@ -777,6 +777,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
             }
+            let source_node_id_for_view = source_node_id.clone();
             // Surface only the exact correlated rejection to the existing
             // caller. It may run ordinary catch-up under its original budget;
             // this event does not authorize snapshot repair or count as proof.
@@ -796,6 +797,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.replication
                 .pending_metadata_authority_probes
                 .remove(&response.request_id);
+            if accepted && let Some(view) = response.member_view.clone() {
+                self.replication
+                    .metadata_member_views
+                    .insert((source_node_id_for_view, response.shard_id.clone()), view);
+            }
             self.replication
                 .metadata_authority_probe_results
                 .insert(response.request_id, accepted);
@@ -1763,6 +1769,51 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// The shard's W floor and N from the same retained projection that holds
+    /// its record: the filesystem's rules and every shard of the filesystem.
+    /// No KV read.
+    pub(crate) fn retained_metadata_shard_bounds(
+        &self,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<crate::DfsMetadataShardBounds, DfsError> {
+        let unavailable = || DfsError::Metadata {
+            message: "write-set commit bounds require the retained write configuration".into(),
+        };
+        let control = self.control_plane.as_ref().ok_or_else(unavailable)?;
+        let projection = control
+            .write_configuration_projection()?
+            .ok_or_else(unavailable)?;
+        let entries = projection
+            .entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
+            .ok_or_else(unavailable)?;
+        let config_key = crate::file_system_config_key(&shard.file_system_id);
+        let config = entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(&config_key))
+            .ok()
+            .map(|index| entries[index].decode::<crate::DfsFileSystemConfig>())
+            .transpose()?
+            .ok_or_else(|| DfsError::Metadata {
+                message: format!(
+                    "retained configuration has no filesystem {} rules",
+                    shard.file_system_id
+                ),
+            })?;
+        let shards =
+            crate::metadata_authority_projection::metadata_shard_index_from_authority_entries(
+                entries,
+            )
+            .remove(&shard.file_system_id.to_string())
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .map_err(|message| DfsError::Metadata { message })?;
+        crate::metadata_shard_replication_bounds(
+            &config,
+            shard,
+            &shards,
+            shard.replica_node_ids.len() + 1,
+        )
+        .map_err(DfsError::from)
+    }
+
     fn validate_metadata_journal_batch_source(
         &mut self,
         source_node_id: &NodeId,
@@ -1974,7 +2025,12 @@ impl PendingMetadataAuthorityProbe {
                 if response.verified_authority_probe_id.as_deref()
                     == Some(self.confirmation_id.as_str()) =>
             {
-                Some(true)
+                // A member view must name this probe's epoch and prefix; a
+                // member that has not observed the switch sends none.
+                Some(response.member_view.as_ref().is_none_or(|view| {
+                    view.epoch == self.expected_shard.epoch
+                        && view.durable_prefix == self.expected_prefix
+                }))
             }
             DfsMetadataJournalBatchResult::Rejected { .. }
                 if response.verified_authority_probe_id.is_none() =>
@@ -2104,6 +2160,11 @@ mod response_bookkeeping_tests {
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             expected_next_after_sequence: 23,
+            expected_prefix: crate::DfsMetadataPrefixProof::from_digest(
+                23,
+                format!("dfs-metadata-prefix-v2:blake3:{}", "7".repeat(64)),
+            )
+            .unwrap(),
         };
         let exact = applied_journal_response(
             "authority-response-request",
