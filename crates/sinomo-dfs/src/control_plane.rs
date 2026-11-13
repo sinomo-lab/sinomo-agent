@@ -3958,6 +3958,21 @@ impl<'a> DfsControlPlaneStore<'a> {
         ))
     }
 
+    /// sinomo:kv-configuration: Read the shard's write-set record through the existing retained configuration projection.
+    pub fn get_metadata_shard_write_set_state(
+        &self,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<DfsMetadataShardWriteSetState, KvError> {
+        let entry = self.kv.get(&metadata_shard_write_set_key(
+            &shard.file_system_id,
+            &shard.shard_id,
+        ))?;
+        Ok(metadata_shard_write_set_state(
+            shard,
+            entry.as_ref().map(|entry| entry.value.as_slice()),
+        ))
+    }
+
     /// sinomo:kv-configuration: Read the assigned shard through the existing retained configuration projection.
     pub fn get_metadata_shard(
         &self,
@@ -5861,7 +5876,7 @@ fn metadata_prepared_operation_member_compares(
     ])
 }
 
-fn metadata_shard_configured_node_ids(shard: &DfsMetadataShardConfig) -> BTreeSet<NodeId> {
+pub(crate) fn metadata_shard_configured_node_ids(shard: &DfsMetadataShardConfig) -> BTreeSet<NodeId> {
     std::iter::once(shard.primary_node_id.clone())
         .chain(shard.replica_node_ids.iter().cloned())
         .collect()

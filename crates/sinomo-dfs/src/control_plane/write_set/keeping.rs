@@ -60,6 +60,9 @@ pub(crate) enum DfsWriteSetRemoveCause {
     SwitchReduction,
     SubstituteSurplus,
     MobileSurplus,
+    /// Members beyond the desired set that are neither substitutes nor all
+    /// mobile, after the shard's N came down.
+    AboveN,
     MemberDeparted,
 }
 
@@ -320,14 +323,19 @@ pub(crate) fn plan_metadata_write_set_keeping(
             let mobile = surplus
                 .iter()
                 .all(|node| facts(node).is_some_and(|facts| facts.mobile));
+            let substitutes = surplus
+                .iter()
+                .all(|node| write_set.substitutes.iter().any(|s| &s.node_id == node));
             plan.txn = Some(DfsWriteSetKeepingTxn::Remove {
                 retire_only: surplus.iter().all(|node| !write_set.contains(node)),
                 members: surplus,
                 retain_at_least: desired.len(),
                 cause: if mobile {
                     DfsWriteSetRemoveCause::MobileSurplus
-                } else {
+                } else if substitutes {
                     DfsWriteSetRemoveCause::SubstituteSurplus
+                } else {
+                    DfsWriteSetRemoveCause::AboveN
                 },
             });
         }
@@ -349,7 +357,7 @@ pub(crate) fn metadata_write_set_reduction(
         .into_iter()
         .filter(|node| !desired.contains(node))
         .collect::<BTreeSet<_>>();
-    (!remove.is_empty()).then(|| DfsWriteSetKeepingTxn::Remove {
+    (!remove.is_empty()).then_some(DfsWriteSetKeepingTxn::Remove {
         retire_only: false,
         members: remove,
         retain_at_least: desired.len(),

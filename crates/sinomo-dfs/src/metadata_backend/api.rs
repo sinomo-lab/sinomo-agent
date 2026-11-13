@@ -906,6 +906,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         ))
     }
 
+    fn version_records_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsObjectVersionScanPage>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        self.version_records_page(after, max_entries).map(Some)
+    }
+
     fn receipt_records_page(
         &self,
         after: Option<&DfsReplicaReceiptScanCursor>,

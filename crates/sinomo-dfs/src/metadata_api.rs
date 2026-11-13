@@ -2065,6 +2065,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsObjectVersionScanPage>;
 
+    /// Return one cursor-bounded page of every object-version record one
+    /// physical shard store holds, listed or not, visible or not. `None` when
+    /// this backend does not hold `shard_id`.
+    fn version_records_on_shard_page(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _after: Option<&DfsObjectVersionScanCursor>,
+        _max_entries: usize,
+    ) -> Result<Option<DfsObjectVersionScanPage>> {
+        Ok(None)
+    }
+
     /// Return one cursor-bounded global page of replica receipts.
     fn receipt_records_page(
         &self,

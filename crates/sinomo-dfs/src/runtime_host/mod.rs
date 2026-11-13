@@ -3408,6 +3408,17 @@ pub(crate) use maintenance_runtime::{
     run_daemon_dfs_maintenance_tick_in_blocking_task,
     run_daemon_dfs_repair_executor_turn_in_blocking_task,
 };
+mod write_set_keeping;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use write_set_keeping::{
+    keeping_events_for_test, keeping_failures_for_test, keeping_reachability_interest_for_test,
+    set_test_peer_verdict,
+    set_write_set_keeping_suspended,
+    suspend_write_set_keeping_unless_enabled, test_verification_requests,
+};
+pub(crate) use write_set_keeping::{
+    DFS_WRITE_SET_EVENT_KINDS, dfs_write_set_event_publication, run_dfs_write_set_keeping,
+};
 mod publish_host;
 #[cfg(test)]
 use publish_host::{

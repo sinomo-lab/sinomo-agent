@@ -3583,6 +3583,7 @@ impl DfsTestRuntime {
             return Err("duplicate live DFS test node".into());
         }
         let data_dir = self.nodes[node].data_dir.clone();
+        crate::runtime_host::suspend_write_set_keeping_unless_enabled(data_dir.root());
         let host_generation = Arc::new(());
         let carrier = Arc::new(Carrier {
             host_identity: Some(NativeHostIdentity {
@@ -6009,6 +6010,94 @@ impl DfsTestRuntime {
 }
 
 impl DfsTestRuntime {
+    /// Resume the write-set keeper of `node`, which the test runtime mounts
+    /// suspended so that tests driving write-set transactions by hand keep
+    /// that control. It stays resumed across the node's restarts.
+    pub fn enable_write_set_keeping(&self, node: &NodeId) {
+        crate::runtime_host::set_write_set_keeping_suspended(self.data_dir(node).root(), false);
+    }
+
+    /// Set the network verdict `observer`'s keeper sees for `peer`. Once a
+    /// test sets one, that keeper reads only verdicts the test sets.
+    pub fn set_peer_verdict(
+        &self,
+        observer: &NodeId,
+        peer: &NodeId,
+        verdict: sinomo_core::network::PeerPathVerdict,
+        verifying: bool,
+    ) {
+        crate::runtime_host::set_test_peer_verdict(
+            self.data_dir(observer).root(),
+            peer.clone(),
+            verdict,
+            verifying,
+        );
+    }
+
+    /// Peers `observer`'s keeper asked the network to verify.
+    pub fn peer_verification_requests(&self, observer: &NodeId) -> Vec<NodeId> {
+        crate::runtime_host::test_verification_requests(&self.data_dir(observer).root())
+    }
+
+    /// Write-set events `node`'s keeper published, with their names.
+    pub fn write_set_keeping_events(
+        &self,
+        node: &NodeId,
+    ) -> Vec<(String, crate::DfsMetadataWriteSetEvent)> {
+        crate::runtime_host::keeping_events_for_test(&self.data_dir(node).root())
+    }
+
+    /// Whether `node`'s keeper held a network reachability subscription at
+    /// its last evaluation; `None` before it first evaluated.
+    pub fn write_set_keeping_holds_reachability(&self, node: &NodeId) -> Option<bool> {
+        crate::runtime_host::keeping_reachability_interest_for_test(&self.data_dir(node).root())
+    }
+
+    /// Steps `node`'s keeper could not complete, for diagnostics.
+    pub fn write_set_keeping_failures(&self, node: &NodeId) -> Vec<String> {
+        crate::runtime_host::keeping_failures_for_test(&self.data_dir(node).root())
+    }
+
+    /// Commit `node`'s member record with `role`, as the cluster member store
+    /// does when the node's role changes.
+    pub fn set_member_node_role(
+        &self,
+        node: &NodeId,
+        role: sinomo_core::ClusterNodeRole,
+    ) -> Result<(), String> {
+        let member_key = sinomo_core::node::cluster_member_key(node);
+        let error = |error: sinomo_core::kv::KvError| error.to_string();
+        let mut client = self.configuration_publisher(node);
+        for _ in 0..8 {
+            let entry = client
+                .get_authoritative_consistent(std::slice::from_ref(&member_key))
+                .map_err(error)?
+                .remove(0)
+                .ok_or("native fixture node has no member record")?;
+            let mut member = entry
+                .decode::<sinomo_core::ClusterMemberRecord>()
+                .map_err(error)?;
+            member.node_role = role.clone();
+            let response = client
+                .txn(sinomo_core::kv::KvTxn {
+                    compares: vec![sinomo_core::kv::KvCompare::ValueEquals {
+                        key: member_key.clone(),
+                        value: entry.value,
+                    }],
+                    success: vec![
+                        sinomo_core::kv::KvOp::put_serde(member_key.clone(), &member, None)
+                            .map_err(error)?,
+                    ],
+                    failure: Vec::new(),
+                })
+                .map_err(error)?;
+            if response.succeeded {
+                return Ok(());
+            }
+        }
+        Err("member record kept changing while setting the role".into())
+    }
+
     /// The test-support switch for the dormant write-set capability: commit
     /// `node`'s actual cluster member record with the capability advertised,
     /// and its derived capability policy record with it, as the cluster

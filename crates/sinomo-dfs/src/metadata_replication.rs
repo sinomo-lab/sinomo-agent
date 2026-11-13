@@ -8161,6 +8161,27 @@ pub(crate) fn dfs_metadata_write_set_member_probe_command(
     command
 }
 
+/// A plain prefix probe at `prefix`: the member acknowledges only when it
+/// holds exactly that journal head.
+pub(crate) fn dfs_metadata_caught_up_probe_command_for(
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    authority_epoch: u64,
+    prefix: &crate::DfsMetadataPrefixProof,
+) -> DfsMetadataJournalBatchCommand {
+    dfs_metadata_caught_up_probe_command(
+        local_node_id,
+        target_node_id,
+        file_system_id,
+        shard_id,
+        authority_epoch,
+        prefix.journal_sequence,
+        prefix.digest.clone(),
+    )
+}
+
 fn dfs_metadata_caught_up_probe_command(
     local_node_id: &NodeId,
     target_node_id: &NodeId,

@@ -261,6 +261,29 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     pending: Option<&DfsMetadataShardMembershipHandoff>,
     proof: Option<&DfsMetadataShardMembershipHandoffProof>,
 ) -> Result<bool, DfsError> {
+    rebind_completed_metadata_shard_membership_handoff_for(
+        backend,
+        local_node_id,
+        active,
+        pending,
+        proof,
+        false,
+    )
+}
+
+/// The same rebind for a shard on the write-set protocol, or not. A write-set
+/// shard changes its configured members within one epoch through guarded
+/// write-set transactions (recruit and remove), so its completed handoff still
+/// activated the current epoch when the replica list differs from the one the
+/// proof names; every other field of the proof's successor must still match.
+pub(crate) fn rebind_completed_metadata_shard_membership_handoff_for(
+    backend: &mut dyn DfsMetadataBackend,
+    local_node_id: &NodeId,
+    active: &DfsMetadataShardConfig,
+    pending: Option<&DfsMetadataShardMembershipHandoff>,
+    proof: Option<&DfsMetadataShardMembershipHandoffProof>,
+    write_set_shard: bool,
+) -> Result<bool, DfsError> {
     // Another already-bound writer can append after the read-side lineage
     // check and before the backend acquires its write gate. Retry only that
     // typed comparison failure, re-reading the marker and revalidating the
@@ -273,6 +296,7 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
             active,
             pending,
             proof,
+            write_set_shard,
         ) {
             Err(DfsError::MetadataRejection {
                 code: crate::DfsMetadataRejectionCode::PrefixMismatch,
@@ -291,6 +315,7 @@ fn rebind_completed_metadata_shard_membership_handoff_once(
     active: &DfsMetadataShardConfig,
     pending: Option<&DfsMetadataShardMembershipHandoff>,
     proof: Option<&DfsMetadataShardMembershipHandoffProof>,
+    write_set_shard: bool,
 ) -> Result<bool, DfsError> {
     let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
     if backend.metadata_shard_write_freeze(&shard_id)?.is_none() {
@@ -331,7 +356,12 @@ fn rebind_completed_metadata_shard_membership_handoff_once(
         && proof.retiring_shard.file_system_id == active.file_system_id
         && proof.retiring_shard.shard_id == active.shard_id
         && proof.retiring_shard.epoch == freeze.retiring_epoch
-        && proof.desired_shard == *active
+        && (proof.desired_shard == *active
+            || (write_set_shard && {
+                let mut desired = proof.desired_shard.clone();
+                desired.replica_node_ids.clone_from(&active.replica_node_ids);
+                desired == *active
+            }))
         && proof.journal_sequence == freeze.journal_sequence
         && proof_matches_target
         && proof.acknowledged_node_ids.contains(local_node_id);
@@ -470,7 +500,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(false);
         };
-        let (pending, proof) = {
+        let (pending, proof, write_set_shard) = {
             let store = DfsControlPlaneStore::new(control_plane.as_mut());
             if store
                 .get_metadata_shard(&expected.file_system_id, &expected.shard_id)?
@@ -488,6 +518,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &expected.file_system_id,
                     &expected.shard_id,
                 )?,
+                store
+                    .get_metadata_shard_write_set_state(expected)?
+                    .switched()
+                    .is_some(),
             )
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -517,12 +551,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .metadata_backend
                 .as_deref_mut()
                 .expect("frozen backend checked");
-            rebind_completed_metadata_shard_membership_handoff(
+            rebind_completed_metadata_shard_membership_handoff_for(
                 backend,
                 &self.node_id,
                 expected,
                 pending.as_ref(),
                 proof.as_ref(),
+                write_set_shard,
             )?
         };
         Ok(rebound)
@@ -614,7 +649,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &active.file_system_id,
                         &active.shard_id,
                     )?;
-                    Ok((active, pending, proof))
+                    let write_set_shard = store
+                        .get_metadata_shard_write_set_state(&active)?
+                        .switched()
+                        .is_some();
+                    Ok((active, pending, proof, write_set_shard))
                 })
                 .collect::<Result<Vec<_>, sinomo_core::kv::KvError>>()?
         };
@@ -625,7 +664,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(0);
         };
         let mut rebound = 0usize;
-        for (active, pending, proof) in observed {
+        for (active, pending, proof, write_set_shard) in observed {
             #[cfg(test)]
             if pending.is_none()
                 && proof.is_some()
@@ -646,12 +685,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &DfsMetadataShardId::new(active.shard_id.clone()),
                 )
             });
-            if rebind_completed_metadata_shard_membership_handoff(
+            if rebind_completed_metadata_shard_membership_handoff_for(
                 backend,
                 &self.node_id,
                 &active,
                 pending.as_ref(),
                 proof.as_ref(),
+                write_set_shard,
             )? {
                 rebound = rebound.saturating_add(1);
             }
@@ -2958,16 +2998,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "ordinary metadata sync has no retained qualified shard context"
                         .into(),
                 })?;
+            let configured =
+                normalized_replica_node_ids(&self.node_id, context.shard.replica_node_ids.clone());
+            // A write-set shard certifies exactly the members a target names:
+            // keeping W and POSIX sync need the write set, not a majority of
+            // every configured member.
+            let named_members = target.replica_node_ids == configured
+                || (context.write_set.is_some()
+                    && !target.replica_node_ids.is_empty()
+                    && target
+                        .replica_node_ids
+                        .iter()
+                        .all(|member| configured.contains(member)));
             if context.pending_membership_handoff.is_some()
                 || target.expected_shard.as_ref() != Some(&context.shard)
                 || context.shard.epoch != epoch
                 || context.shard.primary_node_id != self.node_id
                 || target.primary_node_id != self.node_id
-                || target.replica_node_ids
-                    != normalized_replica_node_ids(
-                        &self.node_id,
-                        context.shard.replica_node_ids.clone(),
-                    )
+                || !named_members
             {
                 return Err(DfsError::StaleOwnerEpoch {
                     file_system_id: target.file_system_id.clone(),

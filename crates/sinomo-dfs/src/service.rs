@@ -408,6 +408,27 @@ fn component_factory_with_selected_layout(
             .publish_event(crate::runtime_host::dfs_namespace_event_publication())
             .publish_event(crate::runtime_host::dfs_placement_event_publication())
             .publish_event(crate::runtime_host::dfs_configuration_event_publication())
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[0],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[1],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[2],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[3],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[4],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[5],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[6],
+            ))
             .subscribe_event(crate::runtime_host::host_cluster_control_subscription())
             .subscribe_event(crate::runtime_host::host_connectivity_subscription());
     let caller = descriptor.clone();
@@ -595,6 +616,27 @@ fn component_factory_with_selected_layout(
                                 scope.shutdown_receiver(),
                             )),
                         );
+                        // Keeping write sets is the shard primary's, on Main.
+                        // The test runtime hosts its nodes as embedded Main
+                        // stand-ins.
+                        let keeps_write_sets = context.host_role()
+                            == sinomo_module::ComponentHostRole::Main
+                            || (cfg!(any(test, feature = "test-support"))
+                                && context.host_role()
+                                    == sinomo_module::ComponentHostRole::Embedded);
+                        if keeps_write_sets {
+                            scope.own_task(
+                                "DFS metadata write-set keeping",
+                                runtime.spawn(crate::runtime_host::run_dfs_write_set_keeping(
+                                    data_dir.clone(),
+                                    Arc::clone(authority),
+                                    events.clone(),
+                                    (*state).clone(),
+                                    runtime.clone(),
+                                    scope.shutdown_receiver(),
+                                )),
+                            );
+                        }
                     }
                 }
                 let browser: Arc<dyn crate::DfsBrowserServiceHost> =
@@ -1671,7 +1713,18 @@ mod tests {
                 "feature route remains core-owned {route}"
             );
         }
-        assert_eq!(factory.descriptor().event_publications.len(), 3);
+        // Three DFS events and the write-set keeper's typed events.
+        let publications = &factory.descriptor().event_publications;
+        assert_eq!(
+            publications.len(),
+            3 + crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS.len()
+        );
+        for kind in crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS {
+            assert!(
+                publications.iter().any(|publication| publication.kind == kind),
+                "missing write-set event publication {kind}"
+            );
+        }
         assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
         drop(registry);
         runtime

@@ -5377,6 +5377,20 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .write_intents_on_shard_page(shard_id, after, max_entries)
     }
 
+    fn version_records_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsObjectVersionScanPage>> {
+        let Some(backend) = self.shards.get(shard_id) else {
+            return Ok(None);
+        };
+        backend
+            .backend()?
+            .version_records_on_shard_page(shard_id, after, max_entries)
+    }
+
     fn query_file_history_on_shard(
         &self,
         query: &crate::DfsMetadataShardQuery,

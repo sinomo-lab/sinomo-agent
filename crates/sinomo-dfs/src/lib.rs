@@ -210,6 +210,8 @@ mod service_state;
 mod service_sync;
 mod service_trace;
 mod service_write;
+mod service_write_set_keeping;
+pub(crate) use service_write_set_keeping::DfsWriteSetJoin;
 mod smoke;
 mod transfer;
 mod write_configuration_inputs;
@@ -922,6 +924,11 @@ mod test_runtime;
 mod tests;
 
 pub use control_plane::select_metadata_shard_config_for_path;
+pub(crate) use control_plane::{
+    DfsWriteSetKeepingTxn, DfsWriteSetKeepingView, DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
+    DfsWriteSetRemoveCause, DfsWriteSetShrinkCause, metadata_shard_configured_node_ids,
+    metadata_write_set_reduction, plan_metadata_write_set_keeping,
+};
 pub use intent::{
     stable_create_object_id, stable_operation_order_token, stable_write_target_version,
 };

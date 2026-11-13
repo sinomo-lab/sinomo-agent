@@ -28,9 +28,8 @@ pub use bounds::{
 };
 
 pub(crate) use keeping::{
-    DfsWriteSetKeepingPlan, DfsWriteSetKeepingTxn, DfsWriteSetKeepingView, DfsWriteSetMemberFacts,
-    DfsWriteSetMemberReach, DfsWriteSetRemoveCause, DfsWriteSetShrinkCause,
-    metadata_write_set_desired_members, metadata_write_set_reduction,
+    DfsWriteSetKeepingTxn, DfsWriteSetKeepingView, DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
+    DfsWriteSetRemoveCause, DfsWriteSetShrinkCause, metadata_write_set_reduction,
     plan_metadata_write_set_keeping,
 };
 
