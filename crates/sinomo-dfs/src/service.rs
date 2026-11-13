@@ -880,6 +880,26 @@ pub trait DfsDataPlaneHost: Send + Sync {
         None
     }
 
+    /// Wait until this host's own published record view of a write-set shard
+    /// reaches `generation` at `epoch`, moves to a later epoch, or no longer
+    /// lists the local node. A write-set catch-up probe names the generation
+    /// the primary's record is at; answering only once the member observed it
+    /// makes its `member_view` describe the copy the write set would hold.
+    /// The wait holds no lock, lane or admission and has no deadline: it ends
+    /// when the publication advances, when the caller drops the call, or at
+    /// host shutdown. `None` means the host cannot wait, and the receiver
+    /// rejects a probe its view has not reached.
+    fn await_metadata_write_set_generation<'a>(
+        &'a self,
+        _data_dir: Arc<SinomoDataDir>,
+        _file_system_id: DfsFileSystemId,
+        _shard_id: DfsMetadataShardId,
+        _epoch: u64,
+        _generation: u64,
+    ) -> Option<DfsDataPlaneHostFuture<'a, ()>> {
+        None
+    }
+
     /// Persist an already-authorized replica journal command through the
     /// process-resident exact shard backend. The service boundary supplies the
     /// committed authority context so the host must not repeat a remote KV
@@ -1082,6 +1102,25 @@ impl Service for DfsService {
                     let may_have_deferred_materialization =
                         command.durable_replication.is_some() || command.authority_probe.is_some();
                     let materialize_shard_id = command.batch.shard_id.clone();
+                    // A write-set catch-up probe is answered under the record
+                    // generation it names (see the probe field).
+                    if let (Some(host), Some(file_system_id), Some(epoch), Some(generation)) = (
+                        host.as_deref(),
+                        command.file_system_id.clone(),
+                        command.authority_epoch,
+                        command
+                            .prefix_probe
+                            .as_ref()
+                            .and_then(|probe| probe.write_set_generation),
+                    ) && let Some(wait) = host.await_metadata_write_set_generation(
+                        Arc::clone(&ctx.data_dir),
+                        file_system_id,
+                        command.batch.shard_id.clone(),
+                        epoch,
+                        generation,
+                    ) {
+                        wait.await.map_err(service_error)?;
+                    }
                     let context = authoritative_metadata_replica_shard_context(
                         host.as_deref(),
                         ctx.cluster.clone(),

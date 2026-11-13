@@ -1331,6 +1331,7 @@ impl NativeImportAuthority {
             journal_sequence: sequence,
             state_fingerprint: fingerprint,
             primary_handoff_id: id.clone(),
+            write_set_generation: None,
         };
         let barrier = probe.barrier_id.clone();
         let response = if *node == self.local_node()? {

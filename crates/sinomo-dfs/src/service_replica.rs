@@ -202,6 +202,27 @@ pub(crate) fn prepared_payload_commit_intent_w(
         .map_or(0, |intent| intent.policy.min_commit_replicas)
 }
 
+/// Whether an authority probe names the assignment a follower serves.
+///
+/// A follower of a write-set shard compares the filesystem, shard, epoch and
+/// primary: configured-member changes at one epoch (recruit and remove) do not
+/// change who may commit, and the primary's own fence evaluates the required
+/// members against its record. This is the model's `accept` guard. A shard on
+/// the all-member rule keeps comparing the whole assignment.
+pub(crate) fn metadata_authority_probe_names_follower_assignment(
+    expected: &DfsMetadataShardConfig,
+    current: &DfsMetadataShardConfig,
+    write_set_shard: bool,
+) -> bool {
+    if !write_set_shard {
+        return expected == current;
+    }
+    expected.file_system_id == current.file_system_id
+        && expected.shard_id == current.shard_id
+        && expected.epoch == current.epoch
+        && expected.primary_node_id == current.primary_node_id
+}
+
 /// Whether a member's acknowledgement view agrees with the challenge it
 /// answers. A member without a view has not yet observed the switch; its
 /// confirmation id alone proves the durable prefix.
@@ -1321,12 +1342,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         });
                         match reply {
                             Ok((MetadataAuthorityDirectReply::Acknowledged, response)) => {
-                                if let Some(view) = response.member_view.clone() {
-                                    self.replication.metadata_member_views.insert(
-                                        (target_node_id.clone(), prepared_batch.shard_id.clone()),
-                                        view,
-                                    );
-                                }
+                                crate::write_set_member_evidence::record_metadata_member_view(
+                                    &self.node_id,
+                                    &prepared_batch.shard_id,
+                                    &target_node_id,
+                                    response.member_view.as_ref(),
+                                );
                                 #[cfg(any(test, feature = "test-support"))]
                                 if let Some(mut trace) =
                                     crate::native_shard_trace::current_boundary_interest()
@@ -2264,6 +2285,38 @@ pub(crate) fn verify_persisted_metadata_authority_operation(
 #[cfg(test)]
 mod authority_cursor_tests {
     use super::*;
+
+    #[test]
+    fn write_set_followers_compare_epoch_and_primary_but_not_replicas() {
+        let node = |name: &str| NodeId::from_legacy_named(name).unwrap();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "follower-assignment".into(),
+            primary_node_id: node("assignment-primary"),
+            replica_node_ids: vec![node("assignment-b")],
+            epoch: 4,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut recruited = shard.clone();
+        recruited.replica_node_ids.push(node("assignment-recruit"));
+        assert!(metadata_authority_probe_names_follower_assignment(
+            &recruited, &shard, true
+        ));
+        assert!(!metadata_authority_probe_names_follower_assignment(
+            &recruited, &shard, false
+        ));
+        let mut later = shard.clone();
+        later.epoch += 1;
+        assert!(!metadata_authority_probe_names_follower_assignment(
+            &later, &shard, true
+        ));
+        let mut moved = shard.clone();
+        moved.primary_node_id = node("assignment-b");
+        assert!(!metadata_authority_probe_names_follower_assignment(
+            &moved, &shard, true
+        ));
+    }
 
     #[test]
     fn re_sends_back_off_to_the_network_liveness_interval_and_no_deadline_never_passes() {

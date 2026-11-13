@@ -215,6 +215,7 @@ mod transfer;
 mod write_configuration_inputs;
 mod write_configuration_projection;
 mod write_precondition;
+mod write_set_member_evidence;
 
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockCommand, DfsAdvisoryLockConflict,

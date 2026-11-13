@@ -1490,6 +1490,13 @@ pub struct DfsMetadataPrefixProbe {
     /// durably installs the matching local freeze marker.
     #[serde(deserialize_with = "required_optional")]
     pub primary_handoff_id: Option<String>,
+    /// Write-set generation the primary's record names, sent only to members
+    /// of a write-set shard collecting catch-up evidence. The receiver answers
+    /// once its own record view has reached this generation at the probe's
+    /// epoch, so the `member_view` it returns describes the copy the write set
+    /// would hold. Omitted otherwise, so other probes keep their encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_set_generation: Option<u64>,
 }
 
 /// Fresh request identity bound to the complete captured current source cut.

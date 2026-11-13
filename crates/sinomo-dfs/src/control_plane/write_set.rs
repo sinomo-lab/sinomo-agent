@@ -28,6 +28,8 @@ pub use bounds::{
 #[cfg(test)]
 mod commit_native_tests;
 #[cfg(test)]
+mod keeping_native_tests;
+#[cfg(test)]
 mod native_tests;
 #[cfg(test)]
 mod tests;

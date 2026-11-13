@@ -67,6 +67,9 @@ pub enum DfsMetadataRejectionCode {
     ReplicaUnreadable,
     PrefixMismatch,
     PrimaryMismatch,
+    /// A write-set catch-up probe named a record generation this member's
+    /// own view has not reached. Nothing is repaired; the primary asks again.
+    WriteSetViewBehind,
     /// Explicitly non-repairable here. Unknown future codes fail closed and
     /// never fall back to interpreting the accompanying diagnostic text.
     #[serde(other)]

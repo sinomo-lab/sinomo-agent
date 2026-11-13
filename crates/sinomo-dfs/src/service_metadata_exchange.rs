@@ -797,10 +797,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.replication
                 .pending_metadata_authority_probes
                 .remove(&response.request_id);
-            if accepted && let Some(view) = response.member_view.clone() {
-                self.replication
-                    .metadata_member_views
-                    .insert((source_node_id_for_view, response.shard_id.clone()), view);
+            if accepted {
+                crate::write_set_member_evidence::record_metadata_member_view(
+                    &self.node_id,
+                    &response.shard_id,
+                    &source_node_id_for_view,
+                    response.member_view.as_ref(),
+                );
             }
             self.replication
                 .metadata_authority_probe_results
@@ -829,6 +832,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
+        if matches!(&response.result, DfsMetadataJournalBatchResult::Applied) {
+            // Ordinary replication and the sync barrier's prefix probes carry
+            // the member's view with their durable acknowledgement.
+            crate::write_set_member_evidence::record_metadata_member_view(
+                &self.node_id,
+                &response.shard_id,
+                &source_node_id,
+                response.member_view.as_ref(),
+            );
+        }
         if matches!(&response.result, DfsMetadataJournalBatchResult::Applied)
             && !pending.verify_prefix_only
         {
@@ -1899,7 +1912,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 || command.prefix_probe.is_some()
                 || !has_authority_payload
                 || probe.probe_id.is_empty()
-                || probe.expected_shard != shard
+                || !crate::service_replica::metadata_authority_probe_names_follower_assignment(
+                    &probe.expected_shard,
+                    &shard,
+                    write_set.is_some(),
+                )
                 || !crate::service_replica::metadata_authority_operation_is_well_formed_for_shard(
                     &probe.operation,
                     &shard,
@@ -1934,6 +1951,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 shard.shard_id, shard.epoch
             ))
             .into()));
+        }
+        // A lane cannot wait for this node's view to reach the generation a
+        // write-set catch-up probe names; it refuses, and the primary asks
+        // again over the direct route, which waits.
+        if let Some(generation) = command
+            .prefix_probe
+            .as_ref()
+            .and_then(|probe| probe.write_set_generation)
+            && write_set
+                .as_ref()
+                .is_none_or(|write_set| write_set.generation < generation)
+        {
+            return Ok(Err(DfsMetadataRejection::new(
+                DfsMetadataRejectionCode::WriteSetViewBehind,
+                format!(
+                    "metadata shard {} write-set view has not reached generation {generation}",
+                    shard.shard_id
+                ),
+            )));
         }
         if shard.primary_node_id == self.node_id {
             return Ok(Err(

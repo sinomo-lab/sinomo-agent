@@ -11,15 +11,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-type NativeService = crate::NetworkedDfsService<crate::DfsNodeTransport>;
+pub(super) type NativeService = crate::NetworkedDfsService<crate::DfsNodeTransport>;
 
-fn members(config: &DfsMetadataShardConfig) -> Vec<NodeId> {
+pub(super) fn members(config: &DfsMetadataShardConfig) -> Vec<NodeId> {
     metadata_shard_configured_node_ids(config)
         .into_iter()
         .collect()
 }
 
-fn cut(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig) -> DfsMetadataShardRecordCut {
+pub(super) fn cut(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig) -> DfsMetadataShardRecordCut {
     let mut client = runtime.configuration_publisher(&config.primary_node_id);
     DfsControlPlaneStore::new(client.as_mut())
         .read_metadata_shard_record_cut(&config.file_system_id, &config.shard_id, &members(config))
@@ -27,7 +27,7 @@ fn cut(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig) -> DfsMetadata
         .expect("the shard exists")
 }
 
-fn submit(
+pub(super) fn submit(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     change: &DfsMetadataWriteSetChangeRequest,
@@ -42,7 +42,7 @@ fn submit(
     }
 }
 
-fn write_set_of(
+pub(super) fn write_set_of(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
 ) -> DfsMetadataShardWriteSet {
@@ -55,7 +55,7 @@ fn write_set_of(
 
 /// A three-member shard on the write-set protocol, optionally under a
 /// subtree rule that sets its W floor.
-fn switched(name: &str, rule: Option<(usize, usize)>) -> (DfsTestRuntime, DfsMetadataShardConfig) {
+pub(super) fn switched(name: &str, rule: Option<(usize, usize)>) -> (DfsTestRuntime, DfsMetadataShardConfig) {
     let (runtime, service, config) = current_native_metadata_service(name, 3, "/services").unwrap();
     drop(service);
     if let Some((w, n)) = rule {
@@ -82,7 +82,7 @@ fn switched(name: &str, rule: Option<(usize, usize)>) -> (DfsTestRuntime, DfsMet
     (runtime, config)
 }
 
-fn shrink(
+pub(super) fn shrink(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     member: &NodeId,
@@ -97,7 +97,7 @@ fn shrink(
     submit(runtime, config, &change);
 }
 
-fn primary(runtime: &DfsTestRuntime) -> NativeService {
+pub(super) fn primary(runtime: &DfsTestRuntime) -> NativeService {
     runtime.metadata_primary_service("/services").unwrap()
 }
 
@@ -153,7 +153,7 @@ fn mode_change(
     .unwrap()
 }
 
-fn fail_journal_calls(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, member: &NodeId) {
+pub(super) fn fail_journal_calls(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, member: &NodeId) {
     for route in [
         crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
         crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
@@ -210,7 +210,7 @@ fn release(gate: &tokio::sync::Semaphore) {
     gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
 }
 
-fn shard_root(
+pub(super) fn shard_root(
     runtime: &DfsTestRuntime,
     node: &NodeId,
     config: &DfsMetadataShardConfig,
@@ -219,7 +219,7 @@ fn shard_root(
         .join(crate::metadata_keys::key_segment(&config.shard_id))
 }
 
-fn durable_prefix(
+pub(super) fn durable_prefix(
     runtime: &DfsTestRuntime,
     node: &NodeId,
     config: &DfsMetadataShardConfig,
@@ -235,7 +235,7 @@ fn durable_prefix(
 
 /// Replicate the primary's whole journal to `member` through the ordinary
 /// durability barrier; the member then holds exactly the primary's head.
-fn catch_up(
+pub(super) fn catch_up(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     member: &NodeId,

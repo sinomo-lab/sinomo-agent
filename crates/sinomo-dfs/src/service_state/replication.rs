@@ -18,10 +18,6 @@ pub(crate) struct DfsReplicationState {
     pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pub(crate) pending_metadata_authority_probes: BTreeMap<String, PendingMetadataAuthorityProbe>,
     pub(crate) metadata_authority_probe_results: BTreeMap<String, bool>,
-    /// The latest acknowledgement view of each write-set shard member, the
-    /// catch-up evidence a later add needs.
-    pub(crate) metadata_member_views:
-        BTreeMap<(NodeId, DfsMetadataShardId), crate::DfsMetadataMemberAckView>,
 }
 
 impl DfsReplicationState {
@@ -30,7 +26,6 @@ impl DfsReplicationState {
     pub(crate) fn into_lazy(self) -> Self {
         Self {
             metadata_replication_cursors: self.metadata_replication_cursors,
-            metadata_member_views: self.metadata_member_views,
             ..Self::default()
         }
     }

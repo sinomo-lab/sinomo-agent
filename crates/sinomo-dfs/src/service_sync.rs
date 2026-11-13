@@ -2434,6 +2434,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             journal_sequence: target.journal_sequence,
             state_fingerprint: target.state_fingerprint.clone(),
             primary_handoff_id: None,
+            write_set_generation: None,
         };
         let probe = crate::DfsMetadataJournalFrameBatch {
             shard_id: target.shard_id.clone(),
