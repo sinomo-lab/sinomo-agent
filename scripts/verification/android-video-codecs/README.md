@@ -221,15 +221,26 @@ onto dependent frames would lose reference state. Older Android versions and
 hosts without the application adapter retain OpenH264. The selected backend is
 available through `VideoStreamReader::decoder_backend` and decode trace records.
 
-Decoded output remains RGB pixels for existing consumers. Image plane cropping,
-row/pixel strides and BT.601/BT.709 full/limited range conversion are honored.
-Hardware decoding does not eliminate that pixel conversion or provide a direct
-video display surface.
+Decoded output remains YUV until a consumer requests RGB or an encoded image.
+Hardware and software decoders copy bounded planes into immutable shared I420
+storage, then release the codec output immediately. Retaining or cloning a frame
+therefore cannot hold a MediaCodec output buffer or block subsequent decoding.
+Cropping and row/pixel strides are normalized during the copy; color matrix and
+range remain attached to the frame. `ReceivedFrame::into_pixels` explicitly
+materializes RGB. Model JPEG/PNG encoding converts only the selected frame;
+latest-frame consumers discard replaced YUV frames without RGB conversion.
+
+This path does not provide a GPU display surface or direct YUV-to-JPEG encoding.
+Those require a compatible rendering or image-encoding consumer. The H.264 wire
+contract and reference-frame ordering are unchanged.
 
 The JNI probe compiles the production application adapter and calls the
 production stream reader. It decodes identical predictive H.264 frames through
 software and hardware, checks RGB output against a generated color fixture, and
-records decode/conversion and total reader timing. It requires an API 29+ device
+records native decode/copy, explicit RGB conversion and total reader timing.
+It also retains an old frame through later decodes and decoder shutdown, then
+checks that its pixels remain unchanged. A native-consumer mode requests RGB
+only for the first and last frame; all intervening frames remain YUV. It requires an API 29+ device
 with a compatible hardware encoder and decoder. No screen-sharing or camera
 permission is requested; its temporary device directory is removed on completion.
 With `ANDROID_HOME`, `ANDROID_NDK_HOME`, and the Android Cargo linker/compiler

@@ -1,5 +1,6 @@
 //! Video and screen perception event producer skeleton.
 
+pub mod decoded_frame;
 pub mod decoder;
 pub mod codec;
 pub mod stream;

@@ -47,7 +47,7 @@ try:
     result = subprocess.run(['adb', 'shell', shlex.join(command)], capture_output=True, text=True, timeout=120)
     (a.output / 'stdout.log').write_text(result.stdout)
     (a.output / 'stderr.log').write_text(result.stderr)
-    for name in ['SOFTWARE', 'FALLBACK', 'HARDWARE']:
+    for name in ['SOFTWARE', 'FALLBACK', 'HARDWARE', 'NATIVE']:
         rows = [line[len(name)+1:] for line in result.stdout.splitlines() if line.startswith(name + ' ')]
         if len(rows) == 1:
             (a.output / (name.lower() + '.json')).write_text(json.dumps(json.loads(rows[0]), indent=2))

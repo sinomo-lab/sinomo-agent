@@ -306,9 +306,12 @@ impl sinomo_video::decoder::VideoDecoder for VideoDecoder {
     fn backend(&self) -> &'static str {
         "android-mediacodec"
     }
-    fn decode(&mut self, access: &[u8]) -> Result<Vec<u8>, String> {
+    fn decode(
+        &mut self,
+        access: &[u8],
+    ) -> Result<sinomo_video::decoded_frame::DecodedYuvFrame, String> {
         let (vm, _) = BRIDGE.get().ok_or("Android media host unavailable")?;
-        vm.attach_current_thread(|env| -> jni::errors::Result<Result<Vec<u8>, String>> {
+        vm.attach_current_thread(|env| -> jni::errors::Result<Result<sinomo_video::decoded_frame::DecodedYuvFrame, String>> {
             // Java reads access synchronously; its allocation outlives this call.
             let input = unsafe { env.new_direct_byte_buffer(access.as_ptr() as *mut u8, access.len())? };
             let decode_started = std::time::Instant::now();
@@ -318,7 +321,7 @@ impl sinomo_video::decoder::VideoDecoder for VideoDecoder {
             let frame = result?.l()?;
             let codec_us = decode_started.elapsed().as_micros() as u64;
             let planes_started = std::time::Instant::now();
-            let converted = (|| -> jni::errors::Result<Result<Vec<u8>, String>> {
+            let converted = (|| -> jni::errors::Result<Result<sinomo_video::decoded_frame::DecodedYuvFrame, String>> {
                 let layout = env.call_method(&frame, jni_str!("layout"), jni_sig!("()[I"), &[])?.l()?;
                 let layout = jni::objects::JIntArray::cast_local(env, layout)?;
                 if layout.len(env)? != 14 { return Ok(Err("invalid Android image layout".into())); }
@@ -338,21 +341,21 @@ impl sinomo_video::decoder::VideoDecoder for VideoDecoder {
                     if pointer.is_null() { return Ok(Err("null Android image plane".into())); }
                     // The DecodedFrame retains its Image and codec output buffer.
                     // We read only the validated ByteBuffer limit, and close it
-                    // after conversion; no borrowed plane escapes this closure.
+                    // after the bounded plane copy; no borrowed plane escapes this closure.
                     let data = unsafe { std::slice::from_raw_parts(pointer, v[3] as usize) };
                     planes.push(sinomo_video::decoder::AndroidYuvPlane {data,offset:v[0] as usize,row_stride:v[1] as usize,pixel_stride:v[2] as usize});
                 }
                 let planes: [_;3] = planes.try_into().map_err(|_| jni::errors::Error::NullPtr("image planes"))?;
                 let plane_access_us = planes_started.elapsed().as_micros() as u64;
-                let convert_started = std::time::Instant::now();
-                let rgb = sinomo_video::decoder::android_yuv420_rgb(&planes,self.width,self.height,values[12],values[13]);
+                let copy_started = std::time::Instant::now();
+                let native = sinomo_video::decoded_frame::YuvColorSpace::from_android(values[12],values[13]).and_then(|color| sinomo_video::decoded_frame::DecodedYuvFrame::copy_from_planes(&planes,self.width,self.height,color));
                 tracing::trace!(target: "sinomo.perf", stage="media.frame.hardware_decode", codec_us, plane_access_us,
-                    convert_us=convert_started.elapsed().as_micros() as u64, width=self.width,height=self.height,
+                    copy_us=copy_started.elapsed().as_micros() as u64, width=self.width,height=self.height,
                     "Android hardware decode stages");
-                Ok(rgb)
+                Ok(native)
             })();
             if converted.is_err() && env.exception_check() { env.exception_clear(); }
-            // Return the codec buffer even when plane validation/conversion fails.
+            // Return the codec buffer even when plane validation/copy fails.
             let closed = env.call_method(&frame, jni_str!("close"), jni_sig!("()V"), &[]);
             if closed.is_err() && env.exception_check() { env.exception_clear(); }
             closed?;

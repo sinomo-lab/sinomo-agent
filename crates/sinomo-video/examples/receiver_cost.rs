@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reads.push(read_us);
             jpegs.push(jpeg_us);
             pngs.push(png_us);
-            rows.push(serde_json::json!({"sequence":sequence,"encode_us":encode_us,"decode_rgb_us":decoder.last_decode_us,
+            rows.push(serde_json::json!({"sequence":sequence,"encode_us":encode_us,"decode_native_us":decoder.last_decode_us,
                 "read_wall_us":read_us,"jpeg_us":jpeg_us,"png_us":png_us,"h264_bytes":bytes.len(),
                 "jpeg_bytes":jpeg.image.len(),"png_bytes":png.image.len()}));
         }
@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "width":width,"height":height,"frames":count,"warmup_frames":10,"gpu":gpu,
-            "encode_including_conversion_upload":stats(&encodes),"decode_including_rgb":stats(&decodes),
+            "encode_including_conversion_upload":stats(&encodes),"decode_native":stats(&decodes),
             "read_including_worker_scheduling":stats(&reads),"jpeg":stats(&jpegs),"png":stats(&pngs),"samples":rows
         }))?
     );

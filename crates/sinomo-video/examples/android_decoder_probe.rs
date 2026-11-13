@@ -55,13 +55,22 @@ fn check_conversion() -> Result<(), String> {
                 if vector != scalar {
                     return Err("SIMD/scalar conversion mismatch".into());
                 }
+                let owned = sinomo_video::decoded_frame::DecodedYuvFrame::copy_from_planes(
+                    &planes,
+                    width as u32,
+                    height as u32,
+                    sinomo_video::decoded_frame::YuvColorSpace::from_android(standard, range)?,
+                )?;
+                if owned.to_rgb()? != scalar {
+                    return Err("owned plane copy mismatch".into());
+                }
             }
         }
     }
     Ok(())
 }
 
-fn run(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn run(path: &str, rgb_every_frame: bool) -> Result<String, Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()
         .json()
         .with_max_level(tracing::Level::TRACE)
@@ -73,6 +82,8 @@ fn run(path: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut reader = VideoStreamReader::default();
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let mut rows = Vec::new();
+    let mut retained = None;
+    let mut retained_rgb = None;
     let mut sequence = 0u64;
     while !bytes.is_empty() {
         if bytes.len() < 4 {
@@ -99,9 +110,23 @@ fn run(path: &str) -> Result<String, Box<dyn std::error::Error>> {
             .block_on(reader.read_decoded(&mut wire.as_slice()))?
             .ok_or("no output")?;
         let wall_us = start.elapsed().as_micros();
-        let ReceivedFrame::Pixels(frame) = frame else {
-            return Err("not pixels".into());
-        };
+        if !matches!(frame, ReceivedFrame::Yuv { .. }) {
+            return Err("decoder did not preserve YUV".into());
+        }
+        if sequence == 0 {
+            retained = Some(frame.clone());
+        }
+        if !rgb_every_frame && sequence != 0 && sequence != 104 {
+            rows.push(serde_json::json!({"frame":sequence,"warmup":sequence<5,"decode_yuv_us":reader.last_decode_us,"rgb_us":null,"wall_us":wall_us,"rgb_mae":null}));
+            sequence += 1;
+            continue;
+        }
+        let conversion_started = Instant::now();
+        let frame = frame.into_pixels()?;
+        let rgb_us = conversion_started.elapsed().as_micros();
+        if sequence == 0 {
+            retained_rgb = Some(frame.pixels.clone());
+        }
         // Match the fixture's RGB quadrants, excluding chroma boundaries.
         let mut error = 0u64;
         let mut count = 0u64;
@@ -125,14 +150,19 @@ fn run(path: &str) -> Result<String, Box<dyn std::error::Error>> {
         if mae > 12.0 {
             return Err(format!("RGB/crop mismatch at {sequence}: MAE {mae}").into());
         }
-        rows.push(serde_json::json!({"frame":sequence,"warmup":sequence<5,"decode_rgb_us":reader.last_decode_us,"wall_us":wall_us,"rgb_mae":mae}));
+        rows.push(serde_json::json!({"frame":sequence,"warmup":sequence<5,"decode_yuv_us":reader.last_decode_us,"rgb_us":rgb_us,"wall_us":wall_us,"rgb_mae":mae}));
         sequence += 1;
     }
     if sequence != 105 {
         return Err("expected 105 reference-dependent frames".into());
     }
+    let backend = reader.decoder_backend();
+    drop(reader);
+    if retained.unwrap().into_pixels()?.pixels != retained_rgb.unwrap() {
+        return Err("retained frame changed after decoder teardown".into());
+    }
     Ok(
-        serde_json::json!({"backend":reader.decoder_backend(),"frames":sequence,"samples":rows})
+        serde_json::json!({"backend":backend,"frames":sequence,"retained_after_close":true,"rgb_every_frame":rgb_every_frame,"samples":rows})
             .to_string(),
     )
 }
@@ -144,6 +174,7 @@ pub extern "system" fn Java_net_sinomo_probe_DecoderProbe_run<'local>(
     callback: JObject<'local>,
     path: JString<'local>,
     hardware: bool,
+    rgb_every_frame: bool,
 ) -> jni::sys::jstring {
     env.with_env(|env| -> jni::errors::Result<_> {
         if hardware {
@@ -151,7 +182,7 @@ pub extern "system" fn Java_net_sinomo_probe_DecoderProbe_run<'local>(
             let callback = env.new_global_ref(callback)?;
             android_media::install(vm, callback);
         }
-        let result = run(&path.try_to_string(env)?)
+        let result = run(&path.try_to_string(env)?, rgb_every_frame)
             .unwrap_or_else(|e| serde_json::json!({"error":e.to_string()}).to_string());
         Ok(env.new_string(result)?.into_raw())
     })

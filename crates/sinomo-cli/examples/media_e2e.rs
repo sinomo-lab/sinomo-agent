@@ -277,7 +277,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let decoded = image::load_from_memory(&image.image)?;
                     (decoded.width(), decoded.height(), Some(image.image), None)
                 }
-                sinomo_video::stream::ReceivedFrame::Pixels(frame) => {
+                native => {
+                    let frame = native.into_pixels()?;
                     (frame.width, frame.height, None, Some(frame))
                 }
             };

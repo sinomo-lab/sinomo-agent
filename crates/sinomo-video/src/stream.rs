@@ -707,21 +707,52 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     Ok(frame)
 }
 
-/// A received frame stays in pixels after video decoding. Image conversion is
-/// deferred until a model actually consumes it, not performed for dropped previews.
+/// Native YUV is retained after decoding. RGB and image encoding are deferred
+/// until a consumer requests them, not performed for discarded previews.
 #[derive(Clone)]
 pub enum ReceivedFrame {
     Image(RealtimeEncodedVideoFrameInput),
     Pixels(RealtimeVideoFrameInput),
+    Yuv {
+        frame: crate::decoded_frame::DecodedYuvFrame,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+    },
 }
 impl ReceivedFrame {
+    /// Materialize RGB only at a consumer boundary, never for a discarded preview.
+    pub fn into_pixels(self) -> io::Result<RealtimeVideoFrameInput> {
+        match self {
+            Self::Pixels(frame) => Ok(frame),
+            Self::Yuv {
+                frame,
+                sequence,
+                timestamp_ms,
+            } => {
+                let started = Instant::now();
+                let mut pixels = RealtimeVideoFrameInput::new(
+                    frame.to_rgb().map_err(io::Error::other)?.into(),
+                    RealtimeVideoPixelFormat::Rgb8,
+                    frame.width(),
+                    frame.height(),
+                    frame.width() as usize * 3,
+                    sequence,
+                );
+                pixels.timestamp_ms = timestamp_ms;
+                tracing::trace!(target:"sinomo.perf",stage="media.frame.rgb",sequence,convert_us=started.elapsed().as_micros() as u64,"deferred receiver RGB conversion");
+                Ok(pixels)
+            }
+            Self::Image(_) => Err(io::Error::other("encoded image requires an image decoder")),
+        }
+    }
     pub fn into_model_image(
         self,
         format: RealtimeVideoFrameFormat,
     ) -> io::Result<RealtimeEncodedVideoFrameInput> {
         match self {
             Self::Image(frame) => Ok(frame),
-            Self::Pixels(frame) => {
+            native => {
+                let frame = native.into_pixels()?;
                 let started = Instant::now();
                 let result = sinomo_lm::encode_realtime_video_frame(
                     &frame,
@@ -855,29 +886,24 @@ impl VideoStreamReader {
                             .map_err(io::Error::other)?,
                     );
                 }
-                let rgb = self
+                let native = self
                     .decoder
                     .as_mut()
                     .unwrap()
                     .decode(&frame.image)
                     .map_err(io::Error::other)?;
-                let mut input = RealtimeVideoFrameInput::new(
-                    rgb.into(),
-                    RealtimeVideoPixelFormat::Rgb8,
-                    metadata.width,
-                    metadata.height,
-                    metadata.width as usize * 3,
-                    metadata.sequence,
-                );
-                input.timestamp_ms = frame.timestamp_ms;
-                ReceivedFrame::Pixels(input)
+                ReceivedFrame::Yuv {
+                    frame: native,
+                    sequence: metadata.sequence,
+                    timestamp_ms: frame.timestamp_ms,
+                }
             }
         };
         self.last_decode_us = started.elapsed().as_micros();
         tracing::trace!(target: "sinomo.perf", stage = "media.frame.decode",
             sequence = metadata.sequence, width = metadata.width, height = metadata.height,
             transport = ?metadata.transport, backend = self.decoder.as_ref().map(|d| d.backend()).unwrap_or("image"), decode_us = self.last_decode_us as u64,
-            "receiver decode including RGB conversion");
+            "receiver decode to native frame");
         Ok((metadata, frame))
     }
 }
@@ -1014,6 +1040,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_frames_remain_yuv_until_the_selected_consumer_requests_pixels() {
+        let mut decoder = VideoStreamReader::default();
+        let mut retained = None;
+        for (metadata, bytes) in h264_records() {
+            let record = record(&metadata, &bytes).unwrap();
+            let (received, frame) = decoder
+                .read_decoded(&mut record.as_slice())
+                .await
+                .unwrap()
+                .unwrap();
+            let ReceivedFrame::Yuv {
+                frame: native,
+                sequence,
+                timestamp_ms,
+            } = &frame
+            else {
+                panic!("eager RGB output");
+            };
+            assert_eq!(
+                native.storage_len(),
+                (received.width * received.height * 3 / 2) as usize
+            );
+            assert_eq!(*sequence, received.sequence);
+            assert_eq!(*timestamp_ms, Some(received.timestamp_ns / 1_000_000));
+            if retained.is_none() {
+                retained = Some(frame);
+            }
+        }
+        drop(decoder);
+        let retained = retained.unwrap();
+        let pixels = retained.clone().into_pixels().unwrap();
+        let image = retained
+            .into_model_image(RealtimeVideoFrameFormat::Png)
+            .unwrap();
+        assert_eq!(image.sequence, pixels.sequence);
+        assert_eq!(
+            image::load_from_memory(&image.image)
+                .unwrap()
+                .to_rgb8()
+                .as_raw(),
+            pixels.pixels.as_ref()
+        );
+    }
+
+    #[tokio::test]
     async fn projection_resize_notifies_without_resetting_h264_references() {
         let records = h264_records();
         let mut previous = None;
@@ -1045,7 +1116,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(received, metadata);
-            assert!(matches!(frame, ReceivedFrame::Pixels(_)));
+            assert!(matches!(frame, ReceivedFrame::Yuv { .. }));
         }
     }
     #[tokio::test]
@@ -1230,7 +1301,7 @@ mod tests {
                 (metadata.source_width, metadata.source_height),
                 (1080, 2280)
             );
-            assert!(matches!(frame, ReceivedFrame::Pixels(_)));
+            assert!(matches!(frame, ReceivedFrame::Yuv { .. }));
         }
         assert!(decoder.read_decoded(&mut reader).await.unwrap().is_none());
     }

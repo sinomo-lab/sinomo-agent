@@ -1,9 +1,10 @@
 //! Stream-local decoder selection. Fallback is safe only before the first output.
+use crate::decoded_frame::{DecodedYuvFrame, YuvColorSpace};
 use std::sync::OnceLock;
 
 pub trait VideoDecoder: Send {
-    /// Decode one validated access unit into tightly packed RGB8 pixels.
-    fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<u8>, String>;
+    /// Decode one validated access unit into owned native YUV planes.
+    fn decode(&mut self, access_unit: &[u8]) -> Result<DecodedYuvFrame, String>;
     fn backend(&self) -> &'static str;
 }
 pub type DecoderFactory = fn(u32, u32) -> Result<Box<dyn VideoDecoder>, String>;
@@ -52,29 +53,29 @@ impl H264Decoder {
     pub(crate) fn backend(&self) -> &'static str {
         self.active.backend()
     }
-    pub(crate) fn decode(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn decode(&mut self, bytes: &[u8]) -> Result<DecodedYuvFrame, String> {
         let result = self
             .active
             .decode(bytes)
-            .and_then(|rgb| self.check_pixels(rgb));
+            .and_then(|frame| self.check_frame(frame));
         let result = match result {
             Err(error) if self.fallback_allowed => {
                 tracing::warn!(%error, "hardware decoder rejected first frame; using OpenH264");
                 self.active = software(self.dimensions.0, self.dimensions.1)?;
                 self.active
                     .decode(bytes)
-                    .and_then(|rgb| self.check_pixels(rgb))
+                    .and_then(|frame| self.check_frame(frame))
             }
             result => result,
         };
         self.fallback_allowed = false;
         result
     }
-    fn check_pixels(&self, rgb: Vec<u8>) -> Result<Vec<u8>, String> {
-        if rgb.len() != self.dimensions.0 as usize * self.dimensions.1 as usize * 3 {
-            return Err("decoder RGB length does not match stream geometry".into());
+    fn check_frame(&self, frame: DecodedYuvFrame) -> Result<DecodedYuvFrame, String> {
+        if (frame.width(), frame.height()) != self.dimensions {
+            return Err("decoder frame does not match stream geometry".into());
         }
-        Ok(rgb)
+        Ok(frame)
     }
 }
 struct Software {
@@ -93,7 +94,7 @@ impl VideoDecoder for Software {
     fn backend(&self) -> &'static str {
         "openh264"
     }
-    fn decode(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    fn decode(&mut self, bytes: &[u8]) -> Result<DecodedYuvFrame, String> {
         use openh264::formats::YUVSource;
         let decoded = self
             .decoder
@@ -103,9 +104,34 @@ impl VideoDecoder for Software {
         if decoded.dimensions() != (self.width as usize, self.height as usize) {
             return Err("H264 decoded dimensions do not match metadata".into());
         }
-        let mut rgb = vec![0; self.width as usize * self.height as usize * 3];
-        decoded.write_rgb8(&mut rgb);
-        Ok(rgb)
+        let (ys, us, vs) = decoded.strides();
+        let planes = [
+            AndroidYuvPlane {
+                data: decoded.y(),
+                offset: 0,
+                row_stride: ys,
+                pixel_stride: 1,
+            },
+            AndroidYuvPlane {
+                data: decoded.u(),
+                offset: 0,
+                row_stride: us,
+                pixel_stride: 1,
+            },
+            AndroidYuvPlane {
+                data: decoded.v(),
+                offset: 0,
+                row_stride: vs,
+                pixel_stride: 1,
+            },
+        ];
+        // Preserve the existing OpenH264 RGB adapter's BT.601 full-range interpretation.
+        DecodedYuvFrame::copy_from_planes(
+            &planes,
+            self.width,
+            self.height,
+            YuvColorSpace::from_android(4, 1)?,
+        )
     }
 }
 
@@ -116,19 +142,12 @@ pub struct AndroidYuvPlane<'a> {
     pub row_stride: usize,
     pub pixel_stride: usize,
 }
-/// Android color-standard 1/2/4 is BT.709/BT.601 PAL/BT.601 NTSC;
-/// color-range 1/2 is full/limited. Convert directly without packing/copying YUV.
-pub fn android_yuv420_rgb(
+pub(crate) fn validate_yuv_planes(
     planes: &[AndroidYuvPlane<'_>; 3],
     width: u32,
     height: u32,
-    standard: i32,
-    range: i32,
-) -> Result<Vec<u8>, String> {
+) -> Result<(), String> {
     crate::codec::dimensions(width, height)?;
-    if !matches!(standard, 1 | 2 | 4) || !matches!(range, 1 | 2) {
-        return Err("unsupported Android YUV color space".into());
-    }
     for (index, plane) in planes.iter().enumerate() {
         let shift = usize::from(index > 0);
         let w = (width as usize) >> shift;
@@ -149,6 +168,19 @@ pub fn android_yuv420_rgb(
             return Err("invalid Android YUV plane bounds".into());
         }
     }
+    Ok(())
+}
+/// Android color-standard 1/2/4 is BT.709/BT.601 PAL/BT.601 NTSC;
+/// color-range 1/2 is full/limited. Convert directly without packing/copying YUV.
+pub fn android_yuv420_rgb(
+    planes: &[AndroidYuvPlane<'_>; 3],
+    width: u32,
+    height: u32,
+    standard: i32,
+    range: i32,
+) -> Result<Vec<u8>, String> {
+    validate_yuv_planes(planes, width, height)?;
+    YuvColorSpace::from_android(standard, range)?;
     let (rv, gu, gv, bu) = match (standard, range) {
         (1, 1) => (403, -48, -120, 475),
         (1, 2) => (459, -55, -136, 541),
@@ -345,12 +377,12 @@ mod tests {
         fn backend(&self) -> &'static str {
             "test-hardware"
         }
-        fn decode(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+        fn decode(&mut self, _: &[u8]) -> Result<DecodedYuvFrame, String> {
             self.calls += 1;
             if self.reject_first || self.calls > 1 {
                 Err("device failure".into())
             } else {
-                Ok(vec![90; 16 * 16 * 3])
+                software(16, 16)?.decode(&access_unit())
             }
         }
     }
@@ -367,7 +399,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(decoder.decode(&access_unit()).unwrap().len(), 16 * 16 * 3);
+        assert_eq!(
+            decoder.decode(&access_unit()).unwrap().storage_len(),
+            16 * 16 * 3 / 2
+        );
         assert_eq!(decoder.backend(), "test-hardware");
         assert!(
             decoder
@@ -389,7 +424,10 @@ mod tests {
             }) as DecoderFactory,
         ] {
             let mut decoder = H264Decoder::with_factory(16, 16, Some(factory)).unwrap();
-            assert_eq!(decoder.decode(&access_unit()).unwrap().len(), 16 * 16 * 3);
+            assert_eq!(
+                decoder.decode(&access_unit()).unwrap().storage_len(),
+                16 * 16 * 3 / 2
+            );
             assert_eq!(decoder.backend(), "openh264");
         }
     }

@@ -6,7 +6,7 @@ import net.sinomo.app.runtime.SinomoVideoDecoder;
 
 /** Standalone app_process fixture: no capture, networking, permissions or app data. */
 public final class DecoderProbe {
-    private static native String run(Object callback, String path, boolean hardware);
+    private static native String run(Object callback, String path, boolean hardware, boolean rgbEveryFrame);
     private boolean unsupported;
     public SinomoVideoDecoder openVideoDecoder(int width,int height) throws Exception {
         if (unsupported) throw new IOException("Test hardware unavailable");
@@ -26,11 +26,14 @@ public final class DecoderProbe {
             }
         }
         DecoderProbe callback=new DecoderProbe();
-        String software=run(callback,file.getAbsolutePath(),false);
+        String software=run(callback,file.getAbsolutePath(),false,true);
         callback.unsupported=true;
-        String fallback=run(callback,file.getAbsolutePath(),true);
+        String fallback=run(callback,file.getAbsolutePath(),true,true);
         callback.unsupported=false;
-        String hardware=run(callback,file.getAbsolutePath(),true);
+        String hardware=run(callback,file.getAbsolutePath(),true,true);
+        String nativeFrames=run(callback,file.getAbsolutePath(),true,false);
+        System.out.println("NATIVE "+nativeFrames);
+        if(nativeFrames.contains("\"error\"")||!nativeFrames.contains("\"rgb_every_frame\":false"))throw new IOException("Native consumer verification failed");
         System.out.println("SOFTWARE "+software);
         System.out.println("FALLBACK "+fallback);
         System.out.println("HARDWARE "+hardware);
