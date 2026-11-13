@@ -5644,6 +5644,16 @@ mod errno_tests {
         assert_eq!(error.errno, libc::EAGAIN);
         assert_eq!(error.error_code, "dfs-posix-commit-outcome-unknown");
         assert_eq!(errno_for_posix_error(unknown()), libc::EAGAIN);
+        // A sync the write set holds but cannot yet certify, as a directory
+        // sync below the shard's W floor reports it, is retriable too.
+        assert_eq!(
+            errno_for_posix_error(DfsPosixError::PendingWrite {
+                intent_id: "directory-sync:dir@v1".into(),
+                durable_receipts: 1,
+                required_receipts: 2,
+            }),
+            libc::EAGAIN
+        );
     }
 
     #[test]

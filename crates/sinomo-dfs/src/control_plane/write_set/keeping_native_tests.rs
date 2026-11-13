@@ -1,7 +1,9 @@
 //! Keeping W on the native test runtime: real Raft-backed cluster KV, real
 //! shard stores and the real member acknowledgement path.
 
-use super::commit_native_tests::{catch_up, cut, switched, write_set_of};
+use super::commit_native_tests::{
+    catch_up, cut, fail_journal_calls, primary, shrink, switched, write_set_of,
+};
 use super::*;
 use crate::DfsMetadataShardId;
 use std::sync::Arc;
@@ -774,4 +776,69 @@ fn native_keeper_acts_on_a_commit_that_could_not_reach_a_member() {
             .ok();
         committed.is_some()
     });
+}
+
+/// K16: file and directory sync on a write-set shard certify against the
+/// write set, so out-of-set members B and C, both unreachable, are not needed
+/// although a configured majority would need one of them. Below the W floor
+/// nothing is certified.
+#[test]
+fn native_write_set_sync_certifies_against_the_write_set() {
+    let (runtime, config) = switched("native-write-set-sync", Some((1, 3)));
+    let local = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    shrink(&runtime, &config, &c, 1);
+    shrink(&runtime, &config, &b, 1);
+    fail_journal_calls(&runtime, &config, &b);
+    fail_journal_calls(&runtime, &config, &c);
+    let mut service = primary(&runtime);
+    service
+        .posix_write_file(
+            "/services/write-set-sync.txt",
+            b"synced",
+            crate::DfsWriteOptions::replicated_eventual(vec![local.clone()]),
+        )
+        .unwrap();
+    let file = service
+        .posix_capture_file_sync_target("/services/write-set-sync.txt", crate::DfsPosixSyncKind::File)
+        .unwrap();
+    let certificate = service
+        .posix_sync_file_local(&file, Duration::from_secs(30))
+        .expect("the write set {P} certifies the file");
+    assert_eq!(certificate.metadata_certificate.acknowledged_node_ids, vec![local.clone()]);
+    let directory = service.posix_capture_directory_sync_target("/services").unwrap();
+    let certificate = service
+        .posix_sync_directory_local(&directory, Duration::from_secs(30))
+        .expect("the write set {P} certifies the directory");
+    assert_eq!(certificate.metadata_certificate.acknowledged_node_ids, vec![local.clone()]);
+    drop(service);
+
+    // The rule's floor rises to 2 above the write set of 1.
+    let policy =
+        crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 2, 3)
+            .unwrap();
+    runtime
+        .apply_placement_policy(&local, "/services", crate::DfsPlacementScope::Subtree, policy)
+        .unwrap();
+    runtime.wait_published_configuration_current(&local).unwrap();
+    let mut service = primary(&runtime);
+    match service.posix_sync_file_local(&file, Duration::from_secs(30)) {
+        Err(crate::DfsPosixError::PendingWrite {
+            durable_receipts: 1,
+            required_receipts: 2,
+            ..
+        }) => {}
+        other => panic!("file sync below the floor is a pending write: {other:?}"),
+    }
+    // Below the floor a directory sync is retriable (EAGAIN, NFS JUKEBOX),
+    // like the file, never a definite failure.
+    match service.posix_sync_directory_local(&directory, Duration::from_secs(30)) {
+        Err(error @ crate::DfsPosixError::PendingWrite {
+            durable_receipts: 1,
+            required_receipts: 2,
+            ..
+        }) => assert!(crate::posix_error_outcome_is_unknown(&error)),
+        other => panic!("directory sync below the floor is pending: {other:?}"),
+    }
 }

@@ -243,6 +243,16 @@ pub struct DfsMetadataQuorumSyncCertificate {
     pub acknowledged_node_ids: Vec<NodeId>,
 }
 
+/// How a sync on a write-set shard ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DfsWriteSetSync {
+    /// Every write-set member and pending add durably holds the prefix.
+    Certified(DfsMetadataQuorumSyncCertificate),
+    /// The write set is below the shard's W floor: nothing is certified until
+    /// it grows.
+    BelowFloor { write_set: usize, floor: usize },
+}
+
 /// Majority size for one primary plus `replica_count` configured replicas.
 pub const fn dfs_metadata_replica_quorum_size(replica_count: usize) -> usize {
     replica_count.div_ceil(2) + 1
@@ -1500,6 +1510,114 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             MetadataQuorumSyncPurpose::ExactPrefixFullAssignment,
             timeout,
         )
+    }
+
+    /// On a write-set shard, certify `target` against the write set and the
+    /// pending adds at the retained generation: each of them durably holds
+    /// the frozen prefix. Only write-set members can take over, so a majority
+    /// of a larger configured set never replaces them. Below the shard's W
+    /// floor nothing is certified. `None` for a shard on the all-member rule,
+    /// whose certificate stays a configured majority.
+    pub(crate) fn sync_metadata_shard_to_write_set(
+        &mut self,
+        target: &DfsMetadataQuorumSyncTarget,
+        timeout: Duration,
+    ) -> Result<Option<DfsWriteSetSync>, DfsError> {
+        if target.authority_epoch.is_none() {
+            return Ok(None);
+        }
+        let Some(context) =
+            self.retained_metadata_replica_context(&target.file_system_id, &target.shard_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(write_set) = context.write_set.clone() else {
+            return Ok(None);
+        };
+        if Some(context.shard.epoch) != target.authority_epoch
+            || context.shard.primary_node_id != self.node_id
+        {
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: target.file_system_id.clone(),
+                local_node_id: self.node_id.clone(),
+                primary_node_id: context.shard.primary_node_id,
+                epoch: context.shard.epoch,
+            });
+        }
+        let bounds = self.retained_metadata_shard_bounds(&context.shard)?;
+        if write_set.write_set.len() < bounds.w_floor {
+            return Ok(Some(DfsWriteSetSync::BelowFloor {
+                write_set: write_set.write_set.len(),
+                floor: bounds.w_floor,
+            }));
+        }
+        let pending = self
+            .metadata_backend
+            .as_deref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "write-set sync requires the shard's durable backend".into(),
+            })?
+            .write_set_member_state(&target.shard_id)?
+            .map(|state| {
+                state
+                    .pending_adds
+                    .into_iter()
+                    .filter(|add| {
+                        !crate::metadata_pending_write_set_add_superseded(
+                            &add.cut,
+                            &context.shard,
+                            Some(&write_set),
+                        )
+                    })
+                    .map(|add| add.node_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let required = write_set
+            .write_set
+            .iter()
+            .chain(&pending)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        // One barrier per member, each naming only that member, within what
+        // remains of the caller's own sync timeout. A member that already
+        // holds the prefix answers at once, so a zero timeout still certifies
+        // a write set that is caught up.
+        let deadline = Instant::now().checked_add(timeout);
+        let local = self.node_id.clone();
+        for member in required.iter().filter(|member| **member != local) {
+            let remaining = deadline.map_or(timeout, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            let member_target = DfsMetadataQuorumSyncTarget {
+                replica_node_ids: vec![member.clone()],
+                expected_shard: Some(context.shard.clone()),
+                barrier_id: sinomo_core::Id::generate().to_string(),
+                checkpoint_snapshot: None,
+                ..target.clone()
+            };
+            match self.sync_metadata_shard_to_quorum_intersecting(
+                &member_target,
+                std::slice::from_ref(member),
+                remaining,
+            ) {
+                Ok(_) => {}
+                Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => {
+                    return Err(DfsError::Distributed {
+                        message: format!(
+                            "write-set member {member} did not acknowledge metadata shard {} prefix {} within the sync timeout",
+                            target.shard_id.0, target.journal_sequence
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(DfsWriteSetSync::Certified(DfsMetadataQuorumSyncCertificate {
+            target: target.clone(),
+            quorum_size: required.len(),
+            acknowledged_node_ids: required.into_iter().collect(),
+        })))
     }
 
     /// Replicate a frozen metadata prefix to quorum while also requiring at
