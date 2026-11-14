@@ -11,6 +11,13 @@ use android_build::{DebugInfo, Dexer, JavaBuild};
 const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/logo.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        winresource::WindowsResource::new()
+            .set_icon("assets/logo.ico")
+            .compile()
+            .expect("compile Sinomo executable icon");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN/lib");
     }
