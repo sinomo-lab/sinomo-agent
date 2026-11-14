@@ -76,6 +76,42 @@ impl DaemonDfsDataPlaneHost {
 
 /// This comparison permits only a pre-execution retry, never execution under
 /// the earlier unfenced receiver observation.
+/// Whether `local`'s published record view of a write-set shard is at or past
+/// (`epoch`, `generation`), or no longer names `local` as a member. A view
+/// that is not ready yet keeps the caller waiting; a shard that disappeared
+/// or cannot be read ends the wait so ordinary validation answers.
+pub(super) fn daemon_dfs_write_set_view_reached(
+    snapshot: &crate::DfsConfigurationSnapshot,
+    local: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    epoch: u64,
+    generation: u64,
+) -> bool {
+    let Some(entries) =
+        snapshot.entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
+    else {
+        return false;
+    };
+    match crate::metadata_replica_context_from_authority_entries(
+        entries,
+        local,
+        file_system_id,
+        shard_id,
+    ) {
+        Ok(Some(context)) => {
+            context.shard.epoch > epoch
+                || !context.local_node_holds_copy()
+                || (context.shard.epoch == epoch
+                    && context
+                        .write_set
+                        .as_ref()
+                        .is_some_and(|write_set| write_set.generation >= generation))
+        }
+        Ok(None) | Err(_) => true,
+    }
+}
+
 pub(super) fn replica_context_can_reselect_committed_fence(
     previous: &sinomo_dfs::DfsMetadataReplicaShardContext,
     current: &sinomo_dfs::DfsMetadataReplicaShardContext,
@@ -904,6 +940,52 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 &shard_id,
             )
             .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))
+        }))
+    }
+
+    fn await_metadata_write_set_generation<'a>(
+        &'a self,
+        data_dir: Arc<SinomoDataDir>,
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        epoch: u64,
+        generation: u64,
+    ) -> Option<DfsDataPlaneHostFuture<'a, ()>> {
+        let data_owner = self.require_data_owner();
+        let validation = self.validate_data_dir(data_dir.as_ref());
+        let runtime = self.runtime.clone();
+        Some(Box::pin(async move {
+            let _data_owner = data_owner?;
+            validation?;
+            let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+            let state =
+                sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)
+                    .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
+            let authority = daemon_dfs_metadata_authority_generation_for_identity(
+                &cluster_paths,
+                &state.cluster_id,
+                &state.local_node_id,
+                Some(&runtime),
+            )
+            .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
+            let mut published = authority.subscribe_configuration_snapshot();
+            loop {
+                let snapshot = Arc::clone(&published.borrow_and_update());
+                if daemon_dfs_write_set_view_reached(
+                    &snapshot,
+                    &state.local_node_id,
+                    &file_system_id,
+                    &shard_id,
+                    epoch,
+                    generation,
+                ) {
+                    return Ok(());
+                }
+                if published.changed().await.is_err() {
+                    // The host is shutting down; validation answers the probe.
+                    return Ok(());
+                }
+            }
         }))
     }
 

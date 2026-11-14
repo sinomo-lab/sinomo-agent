@@ -555,7 +555,8 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
 /// Run `operation` on this node's resident Main maintenance service, which
 /// holds every shard copy on the node, under the global exclusive admission,
 /// DATA owner and publication provider an ordinary maintenance tick holds.
-#[cfg(any(test, feature = "test-support"))]
+/// The write-set keeper's joins and switch evidence run here, so no prepare
+/// or commit record is appended while they compare a member with the head.
 pub(crate) fn with_daemon_dfs_main_maintenance_service<R>(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,

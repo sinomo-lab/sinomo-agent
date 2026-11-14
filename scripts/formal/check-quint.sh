@@ -344,6 +344,7 @@ run_write_set_takeover_scenarios() {
     abrupt_takeover_scenario:21 \
     shrink_race_scenario:13 \
     pending_add_crash_scenario:23 \
+    replacement_recruit_scenario:14 \
     volatile_pending_add_counterexample:11 \
     epoch_only_compare_counterexample:8 \
     out_of_sync_candidate_counterexample:8 \

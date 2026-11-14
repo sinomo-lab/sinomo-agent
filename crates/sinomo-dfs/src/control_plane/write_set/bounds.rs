@@ -164,6 +164,31 @@ pub fn metadata_commit_write_set_floor(
     bounds.w_floor.max(intent_min_commit_replicas)
 }
 
+/// A switched shard's effective N: the rule-derived N, its W floor, and the
+/// largest content W it has accepted for commit. The last part only grows, so
+/// the effective N never falls below the W of content committed under the
+/// write-set protocol.
+pub fn metadata_shard_effective_n(
+    bounds: &DfsMetadataShardBounds,
+    write_set: Option<&super::DfsMetadataShardWriteSet>,
+) -> usize {
+    bounds
+        .n
+        .max(bounds.w_floor)
+        .max(write_set.map_or(1, super::DfsMetadataShardWriteSet::accepted_w))
+}
+
+/// How a member considered for a shard's copies relates to the shard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum DfsMetadataWriteSetCandidateKind {
+    /// A configured member that was not recruited as a substitute.
+    Original,
+    /// A configured member recruited to replace another, at this generation.
+    Substitute { recruited_at_generation: u64 },
+    /// An eligible member that is not configured.
+    Candidate,
+}
+
 /// One member considered for a shard's metadata copies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataWriteSetCandidate {
@@ -171,14 +196,18 @@ pub struct DfsMetadataWriteSetCandidate {
     pub mobile: bool,
     /// In the current write set, so it holds every committed change.
     pub in_write_set: bool,
-    /// The network layer reports a path. A ranking input only.
+    /// The network layer reports a settled path. A ranking input only.
     pub reachable: bool,
+    pub kind: DfsMetadataWriteSetCandidateKind,
 }
 
 /// Choose the members that keep a shard's metadata copies, the primary first.
 ///
 /// The primary is always kept. Non-mobile members are taken up to N, ranked
-/// by write-set membership, reachability, a per-shard rendezvous hash that
+/// by reachability (a lost member must not keep its place, or nothing names
+/// its replacement), then originals before substitutes and older substitutes
+/// before newer ones (the most recent recruit is the one an original's return
+/// makes surplus), then write-set membership, a per-shard rendezvous hash that
 /// spreads copies across shards, and node id. Mobile members are added only
 /// while the non-mobile members, the primary included, are fewer than the W
 /// floor, and then only up to the floor.
@@ -198,8 +227,9 @@ pub fn select_metadata_shard_members(
             .update(candidate.node_id.as_str().as_bytes())
             .finalize();
         (
-            !candidate.in_write_set,
             !candidate.reachable,
+            candidate.kind,
+            !candidate.in_write_set,
             *hash.as_bytes(),
             candidate.node_id.clone(),
         )

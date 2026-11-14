@@ -1788,6 +1788,7 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
                 journal_sequence: 0,
                 state_fingerprint: "blake3:prefix-probe-state".to_string(),
                 primary_handoff_id: None,
+                write_set_generation: None,
             }),
             authority_probe: None,
             durable_replication: None,
@@ -5497,7 +5498,7 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
     let response = sender(
         &replica,
         &snapshot_command,
-        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
     )
     .unwrap();
     assert!(
@@ -8151,7 +8152,7 @@ fn daemon_dfs_metadata_journal_publish_repairs_sequence_conflict_with_snapshot()
     let (peer, _) = native.peer_transports(&local).unwrap();
     let sender =
         crate::metadata_replication::dfs_metadata_snapshot_install_sender_from_peer_transport(peer);
-    let installed = sender(&target, &command, Duration::from_secs(5)).unwrap();
+    let installed = sender(&target, &command, Some(Duration::from_secs(5))).unwrap();
     assert!(matches!(
         installed.result,
         DfsMetadataSnapshotInstallResult::Installed { .. }
@@ -8175,7 +8176,7 @@ fn daemon_dfs_metadata_journal_publish_repairs_sequence_conflict_with_snapshot()
     drop(file);
     assert!(LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &root).is_err());
     native.reopen_node(target.clone()).unwrap();
-    let repaired = sender(&target, &command, Duration::from_secs(5)).unwrap();
+    let repaired = sender(&target, &command, Some(Duration::from_secs(5))).unwrap();
     assert!(matches!(
         repaired.result,
         DfsMetadataSnapshotInstallResult::Installed {

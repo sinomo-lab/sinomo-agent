@@ -40,7 +40,9 @@ deployment.
    included, N being the highest content N among the rules that can apply to
    the shard's paths, on non-mobile metadata-capable members. They need not be
    cluster-KV voters. Mobile members are used only when too few non-mobile
-   members exist to reach the W floor.
+   members exist to reach the W floor. W is never above N: a policy or rule
+   that states a W above its N has its N raised to W, and a shard's N is raised
+   to the content W of any change it commits.
 7. **Desired N survives unavailability.** A W=2, N=3 eventual write may commit on
    B and C with A unavailable once metadata authority is valid; it keeps N=3 and
    the missing copy as repair work. When an open write's chosen targets cannot
@@ -79,8 +81,10 @@ The implementation differs from these requirements:
   acknowledgement from the primary and every configured replica
   (`authorize_metadata_shard_operation`). A missing member leaves the change
   prepared and the caller receives an unknown outcome, not a failure.
-- After setup, every metadata-capable service node replicates every shard, so
-  one offline node of any kind stops metadata writes on all shards.
+- A shard that has not switched keeps every metadata-capable service node as a
+  replica, as set up, so one offline node of any kind stops metadata writes on
+  every such shard. Only a switched shard is reduced to N members and keeps its
+  write set.
 - A primary changes only through the cooperative membership handoff, whose
   freeze, fence and prefix steps run on the retiring primary. With that primary
   offline the handoff stays pending and nothing cancels it.
@@ -121,6 +125,7 @@ together they behave as one record. The write-set key holds:
 | Write set | The members a commit must reach: the primary plus the replicas currently in sync. Replicas outside it keep their copies and catch up. |
 | Generation | Advances on every write-set change. The epoch still advances only when the primary changes. |
 | Epoch start | The journal position and prefix proof at which the current primary's epoch began. |
+| Raised N | The highest content W the shard holds or a commit needed above the N its rules give, starting from the content the shard held when it switched. It only grows. |
 
 The shard configuration keeps its format, so every node keeps decoding it and
 routing by primary and epoch, including nodes that predate write sets; they
@@ -129,7 +134,8 @@ configuration's epoch and primary grants nothing, and the shard keeps the
 all-member rule.
 
 The W floor and N are the highest content W and N among the rules that can
-apply to the shard's paths; the record does not copy them. A prefix-assigned
+apply to the shard's paths; the record does not copy them. The shard's N is
+never below its W floor or the record's raised N. A prefix-assigned
 shard takes the deepest rule at or above its assignment root, or the default
 policy when there is none, and every rule inside its subtree that is not inside
 another shard's nested assignment. Any path can land on a hash-range shard, so
@@ -149,9 +155,12 @@ The primary acknowledges a change only after every member of the write set at
 its current generation, and every member it has submitted to add, has durably
 stored the complete prepared body, and only while that write set meets the
 commit's floor: the shard's W floor, raised to the content W of what the change
-makes visible. Below the floor the change stays prepared. The commit record may
-follow afterwards. A shard that has not switched treats every configured member
-as its write set.
+makes visible. Below the floor the change stays prepared, and so does a change
+whose content W is above the shard's N until that N is raised. The commit
+record may follow afterwards. A shard that has not switched treats every
+configured member as its write set. File and directory sync certify the same
+set: every write-set member and every submitted add holds the synced prefix,
+and below the W floor sync certifies nothing.
 
 Once the body is durable, any result other than success is an unknown outcome:
 the change can still commit through a retry or through a successor, so it is
@@ -231,11 +240,11 @@ Nothing from the old primary is needed.
 
 ### Keeping W
 
-- **Shrink.** When the network reports that a write-set member has no path, the
-  primary removes it with a guarded transaction, but never below the W floor. A
-  dead member that would take the set below the floor stays in it, and writes
-  wait until it returns or a recruit replaces it. Keeping it there also keeps it
-  eligible to take over.
+- **Shrink.** When the network reports that a write-set member has no path, or
+  the cluster no longer authorizes it as a member, the primary removes it with a
+  guarded transaction, but never below the W floor. A dead member that would
+  take the set below the floor stays in it, and writes wait until it returns or
+  a recruit replaces it. Keeping it there also keeps it eligible to take over.
 - **Re-add.** A returning member keeps its copy and catches up incrementally from
   its matching prefix. Once it has acknowledged the primary's whole journal
   under the current record generation, the primary adds it back; an older
@@ -245,15 +254,26 @@ Nothing from the old primary is needed.
   to apply.
 - **Recruit.** When the write set has fewer than N members and no out-of-sync
   replica is reachable, the primary adds an eligible metadata-capable member to
-  the replicas, preferring non-mobile members. The recruit catches up by
-  snapshot and joins the write set; only then is a dead member at the floor
-  removed.
+  the replicas, preferring non-mobile members. When every configured member is
+  in the write set but one of them should be replaced, a dead member held at a
+  floor equal to N or a mobile member a non-mobile one can replace, one recruit
+  beyond N is admitted; another waits until it has joined. The recruit catches
+  up by snapshot and joins the write set; only then is a dead member at the
+  floor removed.
+- **Raise N.** A change whose content W is above the shard's N stays prepared,
+  and the primary raises the shard's N to that W with a guarded transaction on
+  the record, so the raise is durable, ordered with write-set changes and seen
+  by a successor. The primary then recruits up to the new N and the prepared
+  change commits. A raised N never comes down, because content committed at
+  that W can exist until its version is collected.
 - **Retire a substitute.** When a shard has more than N members and the
   original member is back in the write set, the primary removes the most recent
   recruit, which deletes its copy as any node outside a shard's placement does.
+  Removal never takes the shard below N.
 
 These steps run on write-set changes, reachability changes, membership and
-configuration changes, and catch-up completion.
+configuration changes, catch-up completion and changes that need the record to
+change first.
 
 ### Content W for open writes
 
@@ -299,8 +319,11 @@ A shard switches to the write-set protocol only after every member of its replic
 set advertises support. A node advertises it only when it implements the whole
 member-side contract of a write-set shard. Until then the shard keeps the
 all-member rule and has no automatic takeover; old and new nodes do not share a
-write set. On the switch the primary reduces the shard to N chosen members, and
-removed members delete their copies. The cooperative handoff remains the
+write set. On the switch the primary reads the content versions its own copy
+of the shard holds and starts the raised N at their highest content W. If any
+content version does not record its W, the switch keeps every member. The
+primary then reduces the shard to N chosen members, and removed members delete
+their copies. The cooperative handoff remains the
 planned-transfer path for a live primary. A switched shard does not switch back:
 rolling a member of a switched shard back to a build without write-set support is
 unsupported.

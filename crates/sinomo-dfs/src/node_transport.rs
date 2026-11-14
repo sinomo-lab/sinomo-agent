@@ -5087,6 +5087,7 @@ impl DfsNodeTransport {
                         journal_sequence: target.journal_sequence,
                         state_fingerprint: target.state_fingerprint.clone(),
                         primary_handoff_id: None,
+                        write_set_generation: None,
                     }),
                     authority_probe: None,
                     durable_replication: None,

@@ -197,6 +197,9 @@ pub enum DfsCommitOutcomeUnknownCause {
     },
     /// The shard's live write set is smaller than this commit needs.
     BelowWriteSetFloor { write_set: usize, floor: usize },
+    /// The commit's content W exceeds the W the shard record has accepted
+    /// (`accepted`), so the shard's N must first rise to `intent_w`.
+    ReplicationBelowIntent { accepted: usize, intent_w: usize },
     /// The shard record moved to another epoch or primary.
     RecordChanged { epoch: u64 },
     /// The caller's deadline ended the wait.
@@ -224,6 +227,10 @@ impl std::fmt::Display for DfsCommitOutcomeUnknownCause {
                     "write set of {write_set} is below the commit floor {floor}"
                 )
             }
+            Self::ReplicationBelowIntent { accepted, intent_w } => write!(
+                f,
+                "the shard accepts content W {accepted}; its N must rise to {intent_w} first"
+            ),
             Self::RecordChanged { epoch } => write!(f, "shard record moved to epoch {epoch}"),
             Self::Deadline => f.write_str("caller deadline reached"),
             Self::Cancelled => f.write_str("cancelled"),

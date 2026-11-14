@@ -1,6 +1,7 @@
 /// Target hardening: shard metadata write sets with automatic takeover.
 ///
-/// One metadata shard with four possible members, W floor 2 and N 3. Cluster
+/// One metadata shard with four possible members, by default W floor 2 and
+/// N 3; a run may instead start with the floor equal to N. Cluster
 /// KV is a linearizable compare-and-swap register holding the shard record:
 /// primary, epoch, generation, members, write set and epoch start. A commit
 /// needs a current-epoch acknowledgement from every write-set member the
@@ -31,8 +32,8 @@ module dfs_metadata_write_set_takeover {
   type Member = M1 | M2 | M3 | M4
   pure val Members: Set[Member] = Set(M1, M2, M3, M4)
   pure val Values: Set[int] = Set(1, 2, 3)
-  pure val WFloor: int = 2
-  pure val NCopies: int = 3
+  pure val DefaultWFloor: int = 2
+  pure val DefaultNCopies: int = 3
   pure val MaxEpoch: int = 3
 
   type Mode =
@@ -82,6 +83,9 @@ module dfs_metadata_write_set_takeover {
     prepared: Set[int],
     swapLogs: int -> List[Entry],
     droppedTail: bool,
+    // The shard's W floor and N copies, fixed for a run.
+    wFloor: int,
+    nCopies: int,
     mode: Mode,
     last: Event,
   }
@@ -93,7 +97,9 @@ module dfs_metadata_write_set_takeover {
     members: Set(M1, M2, M3), writeSet: Set(M1, M2, M3), epochStart: 0,
   }
 
-  pure def initialState(mode: Mode): State = {
+  pure def initialState(mode: Mode): State = initialStateWithBounds(mode, DefaultWFloor, DefaultNCopies)
+
+  pure def initialStateWithBounds(mode: Mode, wFloor: int, nCopies: int): State = {
     kv: initialRecord,
     view: Members.mapBy(_ => initialRecord),
     log: Members.mapBy(_ => List()),
@@ -110,6 +116,8 @@ module dfs_metadata_write_set_takeover {
     prepared: Set(),
     swapLogs: Map(),
     droppedTail: false,
+    wFloor: wFloor,
+    nCopies: nCopies,
     mode: mode,
     last: Initialized,
   }
@@ -155,6 +163,9 @@ module dfs_metadata_write_set_takeover {
 
   action initWith(mode: Mode): bool = s' = initialState(mode)
 
+  action initWithBounds(mode: Mode, wFloor: int, nCopies: int): bool =
+    s' = initialStateWithBounds(mode, wFloor, nCopies)
+
   action init = initWith(Design)
 
   action prepare(p: Member, v: int): bool = all {
@@ -191,7 +202,7 @@ module dfs_metadata_write_set_takeover {
     val entries = s.log.get(p)
     all {
       isActivePrimary(p),
-      s.view.get(p).writeSet.size() >= WFloor,
+      s.view.get(p).writeSet.size() >= s.wFloor,
       k >= 1,
       k <= entries.length(),
       requiredAcks(p).forall(m => ackedAtLeast(m, e, k)),
@@ -299,7 +310,7 @@ module dfs_metadata_write_set_takeover {
       ownsCurrentRecord(p),
       r.writeSet.contains(m),
       m != p,
-      r.writeSet.size() - 1 >= WFloor,
+      r.writeSet.size() - 1 >= s.wFloor,
       s' = s.with("kv", updated)
         .with("view", s.view.set(p, updated))
         .with("pendingAdd", s.pendingAdd.set(p, Set()))
@@ -341,13 +352,19 @@ module dfs_metadata_write_set_takeover {
     }
   }
 
+  /// A recruit joins the configured members while the write set has fewer
+  /// than N members, or as a replacement: when every configured member is in
+  /// the write set and there are at most N of them, one member beyond N may
+  /// be recruited, for a dead member held at a floor equal to N or a mobile
+  /// member. The surplus member is retired once the replacement has joined.
   action recruit(p: Member, m: Member): bool = {
     val r = s.kv
     val updated = r.with("members", r.members.union(Set(m))).with("gen", r.gen + 1)
+    val replacement = r.members == r.writeSet and r.members.size() <= s.nCopies
     all {
       ownsCurrentRecord(p),
       not(r.members.contains(m)),
-      r.writeSet.size() < NCopies,
+      r.writeSet.size() < s.nCopies or replacement,
       s' = s.with("kv", updated)
         .with("view", s.view.set(p, updated))
         .with("pendingAdd", s.pendingAdd.set(p, Set()))
@@ -363,7 +380,7 @@ module dfs_metadata_write_set_takeover {
       ownsCurrentRecord(p),
       r.members.contains(m),
       not(r.writeSet.contains(m)),
-      r.members.size() > NCopies,
+      r.members.size() > s.nCopies,
       s' = s.with("kv", updated)
         .with("view", s.view.set(p, updated))
         .with("log", s.log.set(m, List()))

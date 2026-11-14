@@ -167,6 +167,8 @@ pub(crate) enum DfsMetadataCommitRequirement {
         write_set: crate::DfsMetadataShardWriteSet,
         pending_adds: BTreeSet<NodeId>,
         floor: usize,
+        /// The commit's own content W; the record must already accept it.
+        intent_w: usize,
     },
 }
 
@@ -200,6 +202,27 @@ pub(crate) fn prepared_payload_commit_intent_w(
         .as_ref()
         .or(payload.prepared_intent.as_ref())
         .map_or(0, |intent| intent.policy.min_commit_replicas)
+}
+
+/// Whether an authority probe names the assignment a follower serves.
+///
+/// A follower of a write-set shard compares the filesystem, shard, epoch and
+/// primary: configured-member changes at one epoch (recruit and remove) do not
+/// change who may commit, and the primary's own fence evaluates the required
+/// members against its record. This is the model's `accept` guard. A shard on
+/// the all-member rule keeps comparing the whole assignment.
+pub(crate) fn metadata_authority_probe_names_follower_assignment(
+    expected: &DfsMetadataShardConfig,
+    current: &DfsMetadataShardConfig,
+    write_set_shard: bool,
+) -> bool {
+    if !write_set_shard {
+        return expected == current;
+    }
+    expected.file_system_id == current.file_system_id
+        && expected.shard_id == current.shard_id
+        && expected.epoch == current.epoch
+        && expected.primary_node_id == current.primary_node_id
 }
 
 /// Whether a member's acknowledgement view agrees with the challenge it
@@ -340,10 +363,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(DfsMetadataCommitRequirement::AllMembers);
         };
         let bounds = self.retained_metadata_shard_bounds(&context.shard)?;
-        let floor = crate::metadata_commit_write_set_floor(
-            &bounds,
-            prepared_payload_commit_intent_w(payload),
-        );
+        let intent_w = prepared_payload_commit_intent_w(payload);
+        let floor = crate::metadata_commit_write_set_floor(&bounds, intent_w);
         let shard_id = DfsMetadataShardId::new(context.shard.shard_id.clone());
         let pending_adds = self
             .metadata_backend
@@ -371,6 +392,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             write_set,
             pending_adds,
             floor,
+            intent_w,
         })
     }
 
@@ -492,7 +514,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 trace_started.elapsed().as_millis()
             ));
             let DfsMetadataCommitRequirement::WriteSet {
-                write_set, floor, ..
+                write_set,
+                floor,
+                intent_w,
+                ..
             } = requirement
             else {
                 return Ok(DfsCanonicalAuthorization::FullShard {
@@ -502,6 +527,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepare_sequence: prepared_batch.next_after_sequence,
                 });
             };
+            // Content committed at W needs metadata kept at N >= W, which the
+            // record must order before the commit: the write stays pending
+            // until the keeper raises the shard's N.
+            if *intent_w > write_set.accepted_w() {
+                let DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } =
+                    operation;
+                crate::write_set_keeping_signals::post_commit_demand(
+                    &self.node_id,
+                    &shard.file_system_id,
+                    &DfsMetadataShardId::new(shard.shard_id.clone()),
+                    crate::write_set_keeping_signals::DfsWriteSetCommitDemand::RaiseN(*intent_w),
+                );
+                return Err(DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: shard.shard_id.clone(),
+                    epoch: shard.epoch,
+                    operation_id: operation_id.clone(),
+                    cause: crate::DfsCommitOutcomeUnknownCause::ReplicationBelowIntent {
+                        accepted: write_set.accepted_w(),
+                        intent_w: *intent_w,
+                    },
+                    current_primary_node_id: None,
+                });
+            }
             // Below its floor the live write set durably holds the change but
             // cannot commit it: the write stays pending.
             if write_set.write_set.len() < *floor {
@@ -540,7 +589,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ));
         let DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } = operation;
         // The caller's deadline is the only time that ends this wait.
-        let cause = if metadata_authority_deadline_passed(self.transport.operation_deadline()) {
+        let deadline_passed = metadata_authority_deadline_passed(self.transport.operation_deadline());
+        if !deadline_passed && matches!(requirement, DfsMetadataCommitRequirement::WriteSet { .. }) {
+            // Every attempt to these members ended without an acknowledgement:
+            // the shard primary's keeper asks the network to verify them and
+            // acts on the settled verdict.
+            crate::write_set_keeping_signals::post_commit_demand(
+                &self.node_id,
+                &shard.file_system_id,
+                &DfsMetadataShardId::new(shard.shard_id.clone()),
+                crate::write_set_keeping_signals::DfsWriteSetCommitDemand::Unreachable(
+                    required_node_ids
+                        .difference(&acknowledged_node_ids)
+                        .cloned()
+                        .collect(),
+                ),
+            );
+        }
+        let cause = if deadline_passed {
             crate::DfsCommitOutcomeUnknownCause::Deadline
         } else {
             crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing {
@@ -707,6 +773,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         member: &NodeId,
         deadline: Option<Instant>,
     ) -> Result<bool, DfsError> {
+        self.catch_up_metadata_shard_member(
+            shard,
+            &prepared_batch.shard_id,
+            prefix,
+            member,
+            deadline,
+            false,
+        )
+    }
+
+    /// Catch one member of `shard` up to `prefix` through the existing
+    /// durability barrier and report whether it got there.
+    ///
+    /// A caller deadline bounds the catch-up. Without one it runs in slices of
+    /// the network layer's liveness interval and continues for as long as the
+    /// member's acknowledged cursor advances, so elapsed time alone never ends
+    /// a catch-up that is making progress.
+    ///
+    /// With `only_member` on a write-set shard, the barrier names only
+    /// `member`, so it certifies that member alone rather than a majority of
+    /// every configured member as well.
+    pub(crate) fn catch_up_metadata_shard_member(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+        shard_id: &DfsMetadataShardId,
+        prefix: &crate::DfsMetadataPrefixProof,
+        member: &NodeId,
+        deadline: Option<Instant>,
+        only_member: bool,
+    ) -> Result<bool, DfsError> {
         loop {
             let slice = match deadline {
                 Some(deadline) => match deadline
@@ -718,23 +814,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 None => DFS_METADATA_AUTHORITY_RESEND_MAX,
             };
-            let before = self.metadata_authority_replicated_through_sequence_for_target(
-                member,
-                prepared_batch,
-            )?;
+            let before = self.metadata_replicated_through_sequence_for_target(member, shard_id)?;
             // The barrier names the shard's whole replica set, as its
             // authority check requires, and must include this member.
-            let mut replica_node_ids = shard
-                .replica_node_ids
-                .iter()
-                .filter(|node_id| **node_id != shard.primary_node_id)
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut replica_node_ids = if only_member {
+                vec![member.clone()]
+            } else {
+                shard
+                    .replica_node_ids
+                    .iter()
+                    .filter(|node_id| **node_id != shard.primary_node_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
             replica_node_ids.sort();
             replica_node_ids.dedup();
             let target = DfsMetadataQuorumSyncTarget {
                 file_system_id: shard.file_system_id.clone(),
-                shard_id: prepared_batch.shard_id.clone(),
+                shard_id: shard_id.clone(),
                 primary_node_id: self.node_id.clone(),
                 authority_epoch: Some(shard.epoch),
                 replica_node_ids,
@@ -755,10 +852,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ) {
                 Ok(_) => return Ok(true),
                 Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => {
-                    let after = self.metadata_authority_replicated_through_sequence_for_target(
-                        member,
-                        prepared_batch,
-                    )?;
+                    let after = self.metadata_replicated_through_sequence_for_target(member, shard_id)?;
                     if deadline.is_none() && after > before {
                         continue;
                     }
@@ -1321,12 +1415,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         });
                         match reply {
                             Ok((MetadataAuthorityDirectReply::Acknowledged, response)) => {
-                                if let Some(view) = response.member_view.clone() {
-                                    self.replication.metadata_member_views.insert(
-                                        (target_node_id.clone(), prepared_batch.shard_id.clone()),
-                                        view,
-                                    );
-                                }
+                                crate::write_set_member_evidence::record_metadata_member_view(
+                                    &self.node_id,
+                                    &prepared_batch.shard_id,
+                                    &target_node_id,
+                                    response.member_view.as_ref(),
+                                );
                                 #[cfg(any(test, feature = "test-support"))]
                                 if let Some(mut trace) =
                                     crate::native_shard_trace::current_boundary_interest()
@@ -1490,17 +1584,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         prepared_batch: &DfsMetadataJournalBatch,
     ) -> Result<u64, DfsError> {
+        self.metadata_replicated_through_sequence_for_target(target_node_id, &prepared_batch.shard_id)
+    }
+
+    fn metadata_replicated_through_sequence_for_target(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<u64, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Err(DfsError::Metadata {
                 message: "metadata authority probe has no durable metadata backend".to_string(),
             });
         };
         let durable_replicated_through_sequence =
-            backend.metadata_replication_cursor(target_node_id, &prepared_batch.shard_id)?;
+            backend.metadata_replication_cursor(target_node_id, shard_id)?;
         let replicated_through_sequence = self
             .replication
             .metadata_replication_cursors
-            .get(&(target_node_id.clone(), prepared_batch.shard_id.clone()))
+            .get(&(target_node_id.clone(), shard_id.clone()))
             .copied()
             .unwrap_or(0)
             .max(durable_replicated_through_sequence);
@@ -2264,6 +2366,38 @@ pub(crate) fn verify_persisted_metadata_authority_operation(
 #[cfg(test)]
 mod authority_cursor_tests {
     use super::*;
+
+    #[test]
+    fn write_set_followers_compare_epoch_and_primary_but_not_replicas() {
+        let node = |name: &str| NodeId::from_legacy_named(name).unwrap();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "follower-assignment".into(),
+            primary_node_id: node("assignment-primary"),
+            replica_node_ids: vec![node("assignment-b")],
+            epoch: 4,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut recruited = shard.clone();
+        recruited.replica_node_ids.push(node("assignment-recruit"));
+        assert!(metadata_authority_probe_names_follower_assignment(
+            &recruited, &shard, true
+        ));
+        assert!(!metadata_authority_probe_names_follower_assignment(
+            &recruited, &shard, false
+        ));
+        let mut later = shard.clone();
+        later.epoch += 1;
+        assert!(!metadata_authority_probe_names_follower_assignment(
+            &later, &shard, true
+        ));
+        let mut moved = shard.clone();
+        moved.primary_node_id = node("assignment-b");
+        assert!(!metadata_authority_probe_names_follower_assignment(
+            &moved, &shard, true
+        ));
+    }
 
     #[test]
     fn re_sends_back_off_to_the_network_liveness_interval_and_no_deadline_never_passes() {

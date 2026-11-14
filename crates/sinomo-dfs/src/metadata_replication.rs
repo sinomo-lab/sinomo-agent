@@ -552,6 +552,11 @@ pub struct DfsMetadataJournalReplicationOptions {
     /// Only asynchronous publishers opt in. Synchronous barriers keep the
     /// default foreground priority to break cross-node admission dependencies.
     pub background_publication: bool,
+    /// No DFS attempt or target deadline: each call is bounded only by the
+    /// network's connect and no-progress limits, so a transfer that keeps
+    /// making progress, such as a write-set member's catch-up over a slow link,
+    /// is never cut. `attempt_timeout` and `target_timeout` are then unused.
+    pub network_limited_attempts: bool,
 }
 
 impl Default for DfsMetadataJournalReplicationOptions {
@@ -564,21 +569,27 @@ impl Default for DfsMetadataJournalReplicationOptions {
             target_timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             probe_caught_up_replicas: false,
             background_publication: false,
+            network_limited_attempts: false,
         }
     }
 }
 
+/// The deadline of the next replication call to one target: `None` when the
+/// target's budget is spent, `Some(None)` when the options are network-limited.
 fn dfs_metadata_replication_attempt_timeout(
     options: DfsMetadataJournalReplicationOptions,
     target_started_at: Instant,
-) -> Option<Duration> {
+) -> Option<Option<Duration>> {
+    if options.network_limited_attempts {
+        return Some(None);
+    }
     let remaining = options
         .target_timeout
         .checked_sub(target_started_at.elapsed())?;
     if remaining.is_zero() {
         return None;
     }
-    Some(options.attempt_timeout.min(remaining))
+    Some(Some(options.attempt_timeout.min(remaining)))
 }
 
 #[cfg(test)]
@@ -609,6 +620,7 @@ mod replication_budget_tests {
         };
 
         let fresh = dfs_metadata_replication_attempt_timeout(options, Instant::now())
+            .flatten()
             .expect("fresh attempt budget");
         assert!(fresh > Duration::from_secs(9));
         assert!(fresh <= Duration::from_secs(10));
@@ -617,6 +629,7 @@ mod replication_budget_tests {
             options,
             Instant::now() - Duration::from_secs(9),
         )
+        .flatten()
         .expect("remaining target budget");
         assert!(partly_spent > Duration::from_secs(5));
         assert!(partly_spent <= Duration::from_secs(6));
@@ -627,6 +640,18 @@ mod replication_budget_tests {
                 Instant::now() - Duration::from_secs(15),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn network_limited_replication_has_no_dfs_deadline() {
+        let options = DfsMetadataJournalReplicationOptions {
+            network_limited_attempts: true,
+            ..DfsMetadataJournalReplicationOptions::default()
+        };
+        assert_eq!(
+            dfs_metadata_replication_attempt_timeout(options, Instant::now() - Duration::from_secs(3600)),
+            Some(None)
         );
     }
 }
@@ -2213,14 +2238,14 @@ pub trait DfsMetadataJournalReplicationTransport: Send {
         &mut self,
         target_node_id: &NodeId,
         command: &DfsMetadataJournalBatchCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>;
 
     fn send_metadata_snapshot_install(
         &mut self,
         target_node_id: &NodeId,
         command: &DfsMetadataSnapshotInstallCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>;
 }
 
@@ -2234,7 +2259,7 @@ pub trait AsyncDfsMetadataJournalReplicationTransport: Send + Sync {
         &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataJournalBatchCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> DfsMetadataJournalReplicationTransportFuture<
         'a,
         Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
@@ -2244,7 +2269,7 @@ pub trait AsyncDfsMetadataJournalReplicationTransport: Send + Sync {
         &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataSnapshotInstallCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> DfsMetadataJournalReplicationTransportFuture<
         'a,
         Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
@@ -2278,7 +2303,7 @@ pub type DfsMetadataJournalBatchSender = Arc<
     dyn Fn(
             &NodeId,
             &DfsMetadataJournalBatchCommand,
-            Duration,
+            Option<Duration>,
         ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>
         + Send
         + Sync,
@@ -2288,7 +2313,7 @@ pub type DfsMetadataSnapshotInstallSender = Arc<
     dyn Fn(
             &NodeId,
             &DfsMetadataSnapshotInstallCommand,
-            Duration,
+            Option<Duration>,
         ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>
         + Send
         + Sync,
@@ -2420,7 +2445,7 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataNodeTransport {
         &mut self,
         target_node_id: &NodeId,
         command: &DfsMetadataJournalBatchCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
         if !self.has_peer_node(target_node_id) {
             return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
@@ -2443,7 +2468,7 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataNodeTransport {
         &mut self,
         target_node_id: &NodeId,
         command: &DfsMetadataSnapshotInstallCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
     {
         if !self.has_peer_node(target_node_id) {
@@ -2507,7 +2532,7 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataNodeTranspo
         &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataJournalBatchCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> DfsMetadataJournalReplicationTransportFuture<
         'a,
         Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
@@ -2539,7 +2564,7 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataNodeTranspo
         &'a self,
         target_node_id: &'a NodeId,
         command: &'a DfsMetadataSnapshotInstallCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> DfsMetadataJournalReplicationTransportFuture<
         'a,
         Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
@@ -5186,6 +5211,12 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                     completed_plan = false;
                     break;
                 }
+                crate::write_set_member_evidence::record_metadata_member_view(
+                    local_node_id,
+                    &shard_id,
+                    &target_node_id,
+                    response.member_view.as_ref(),
+                );
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(context) =
                     crate::native_shard_trace::direct_journal_attempt_context(data_dir, &command)
@@ -6002,6 +6033,12 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     completed_plan = false;
                     break;
                 }
+                crate::write_set_member_evidence::record_metadata_member_view(
+                    local_node_id,
+                    &shard_id,
+                    &target_node_id,
+                    response.member_view.as_ref(),
+                );
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(context) =
                     crate::native_shard_trace::direct_journal_attempt_context(data_dir, &command)
@@ -7759,7 +7796,11 @@ pub fn validate_dfs_metadata_journal_batch_source(
         if command.verify_prefix_only
             || command.prefix_probe.is_some()
             || probe.probe_id.is_empty()
-            || probe.expected_shard != context.shard
+            || !crate::service_replica::metadata_authority_probe_names_follower_assignment(
+                &probe.expected_shard,
+                &context.shard,
+                context.write_set.is_some(),
+            )
             || !crate::service_replica::metadata_authority_operation_is_well_formed_for_shard(
                 &probe.operation,
                 &context.shard,
@@ -7792,6 +7833,9 @@ pub fn validate_dfs_metadata_journal_batch_source(
                 context.shard.shard_id, context.shard.epoch
             ),
         ));
+    }
+    if let Some(rejection) = write_set_probe_generation_rejection(command, context) {
+        return Some(dfs_metadata_journal_rejection_response(command, rejection));
     }
     let Some(source_node_id) = command.source_node_id.as_ref() else {
         return Some(dfs_metadata_journal_rejection_response(
@@ -7839,6 +7883,31 @@ pub fn validate_dfs_metadata_journal_batch_source(
         ));
     }
     None
+}
+
+/// A write-set catch-up probe names the primary's record generation. A member
+/// whose own view has not reached it refuses, so its acknowledgement never
+/// carries an older generation than the one asked about.
+pub(crate) fn write_set_probe_generation_rejection(
+    command: &DfsMetadataJournalBatchCommand,
+    context: &DfsMetadataReplicaShardContext,
+) -> Option<DfsMetadataRejection> {
+    let generation = command
+        .prefix_probe
+        .as_ref()
+        .and_then(|probe| probe.write_set_generation)?;
+    let observed = context.write_set.as_ref().map(|write_set| write_set.generation);
+    observed
+        .is_none_or(|observed| observed < generation)
+        .then(|| {
+            DfsMetadataRejection::new(
+                DfsMetadataRejectionCode::WriteSetViewBehind,
+                format!(
+                    "metadata shard {} write-set view is at generation {observed:?}, not yet {generation}",
+                    context.shard.shard_id
+                ),
+            )
+        })
 }
 
 fn any_handoff_catch_up_command(
@@ -8064,6 +8133,55 @@ enum DfsMetadataJournalReplicationStep {
     Terminal,
 }
 
+/// A prefix probe asking a write-set member for catch-up evidence: it names
+/// the record generation `write_set_generation`, so the member answers with
+/// a `member_view` only once its own view has reached it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dfs_metadata_write_set_member_probe_command(
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    authority_epoch: u64,
+    prefix: &crate::DfsMetadataPrefixProof,
+    write_set_generation: u64,
+) -> DfsMetadataJournalBatchCommand {
+    let mut command = dfs_metadata_caught_up_probe_command(
+        local_node_id,
+        target_node_id,
+        file_system_id,
+        shard_id,
+        authority_epoch,
+        prefix.journal_sequence,
+        prefix.digest.clone(),
+    );
+    if let Some(probe) = command.prefix_probe.as_mut() {
+        probe.write_set_generation = Some(write_set_generation);
+    }
+    command
+}
+
+/// A plain prefix probe at `prefix`: the member acknowledges only when it
+/// holds exactly that journal head.
+pub(crate) fn dfs_metadata_caught_up_probe_command_for(
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    authority_epoch: u64,
+    prefix: &crate::DfsMetadataPrefixProof,
+) -> DfsMetadataJournalBatchCommand {
+    dfs_metadata_caught_up_probe_command(
+        local_node_id,
+        target_node_id,
+        file_system_id,
+        shard_id,
+        authority_epoch,
+        prefix.journal_sequence,
+        prefix.digest.clone(),
+    )
+}
+
 fn dfs_metadata_caught_up_probe_command(
     local_node_id: &NodeId,
     target_node_id: &NodeId,
@@ -8091,6 +8209,7 @@ fn dfs_metadata_caught_up_probe_command(
             journal_sequence,
             state_fingerprint,
             primary_handoff_id: None,
+            write_set_generation: None,
         }),
         authority_probe: None,
         durable_replication: None,
@@ -8540,7 +8659,7 @@ pub type AsyncDfsMetadataJournalBatchSender = Arc<
     dyn for<'a> Fn(
             &'a NodeId,
             &'a DfsMetadataJournalBatchCommand,
-            Duration,
+            Option<Duration>,
         ) -> DfsPeerTransportFuture<
             'a,
             Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>,
@@ -8552,7 +8671,7 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
     dyn for<'a> Fn(
             &'a NodeId,
             &'a DfsMetadataSnapshotInstallCommand,
-            Duration,
+            Option<Duration>,
         ) -> DfsPeerTransportFuture<
             'a,
             Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>,
@@ -8596,7 +8715,10 @@ pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
                 .call_object_rpc_async(
                     target_node_id,
                     call,
-                    DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
+                    DfsObjectRpcSendOptions {
+                        overall_timeout: operation_timeout,
+                        ..DfsObjectRpcSendOptions::default()
+                    },
                 )
                 .await
                 .map_err(|source| {
@@ -8641,7 +8763,10 @@ pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
                 .call_object_rpc_async(
                     target_node_id,
                     call,
-                    DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
+                    DfsObjectRpcSendOptions {
+                        overall_timeout: operation_timeout,
+                        ..DfsObjectRpcSendOptions::default()
+                    },
                 )
                 .await
                 .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
@@ -8676,7 +8801,10 @@ pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
             .call_object_rpc(
                 target_node_id,
                 call,
-                DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
+                DfsObjectRpcSendOptions {
+                        overall_timeout: operation_timeout,
+                        ..DfsObjectRpcSendOptions::default()
+                    },
             )
             .map_err(|source| {
                 #[cfg(any(test, feature = "test-support"))]
@@ -8722,7 +8850,10 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
             .call_object_rpc(
                 target_node_id,
                 call,
-                DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
+                DfsObjectRpcSendOptions {
+                        overall_timeout: operation_timeout,
+                        ..DfsObjectRpcSendOptions::default()
+                    },
             )
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         let response = dfs_metadata_value_response(response)?;
@@ -8828,7 +8959,7 @@ mod cursor_update_tests {
                         "original cursor test snapshot deadline elapsed",
                     )
                 })?;
-            actual_snapshot(node, command, budget.min(remaining))
+            actual_snapshot(node, command, Some(budget.map_or(remaining, |budget| budget.min(remaining))))
         });
         let sender: DfsMetadataJournalBatchSender = Arc::new(move |node, command, budget| {
             let remaining = deadline
@@ -8839,7 +8970,7 @@ mod cursor_update_tests {
                         "original cursor test publication deadline elapsed",
                     )
                 })?;
-            let response = actual(node, command, budget.min(remaining))?;
+            let response = actual(node, command, Some(budget.map_or(remaining, |budget| budget.min(remaining))))?;
             if node == &selected && command.batch.shard_id == selected_shard {
                 validate_dfs_metadata_journal_replication_response(
                     command,
@@ -9307,7 +9438,7 @@ mod cursor_update_tests {
         drop(primary_view);
         let (peer, _) = runtime.peer_transports(&primary).unwrap();
         let sender = dfs_metadata_snapshot_install_sender_from_peer_transport(peer);
-        let installed = sender(&receiver, &command, Duration::from_secs(5)).unwrap();
+        let installed = sender(&receiver, &command, Some(Duration::from_secs(5))).unwrap();
         assert!(
             matches!(
                 installed.result,
@@ -9331,7 +9462,7 @@ mod cursor_update_tests {
             .reopen_node_with_startup_action(
                 receiver.clone(),
                 Box::new(|remaining| {
-                    let installed = sender(&receiver, &command, remaining)
+                    let installed = sender(&receiver, &command, Some(remaining))
                         .map_err(|error| error.to_string())?;
                     if !matches!(
                         installed.result,
@@ -9495,7 +9626,7 @@ mod cursor_update_tests {
             expected.prefix_proof.digest.clone(),
         );
         let confirmed = transport
-            .send_metadata_journal_batch(&receiver, &probe, remaining)
+            .send_metadata_journal_batch(&receiver, &probe, Some(remaining))
             .unwrap();
         assert!(
             matches!(confirmed.result, DfsMetadataJournalBatchResult::Applied),
@@ -9536,7 +9667,7 @@ mod cursor_update_tests {
         );
         assert_eq!(floor.durable_prefix_proof, expected.prefix_proof);
         drop(before);
-        let rejected = sender(&receiver, &stale, Duration::from_secs(5)).unwrap();
+        let rejected = sender(&receiver, &stale, Some(Duration::from_secs(5))).unwrap();
         assert!(
             matches!(
                 rejected.result,
@@ -9580,7 +9711,7 @@ mod cursor_update_tests {
                 receiver.clone(),
                 Box::new(|remaining| {
                     let began = Instant::now();
-                    let rejection = sender(&receiver, &stale, remaining);
+                    let rejection = sender(&receiver, &stale, Some(remaining));
                     let reason = match rejection {
                         Ok(response) => match response.result {
                             DfsMetadataSnapshotInstallResult::Rejected { reason, .. } => reason,
@@ -9659,7 +9790,7 @@ mod cursor_update_tests {
                         !remaining.is_zero(),
                         "negative and actual recovery share the original budget"
                     );
-                    let installed = sender(&receiver, &current_snapshot, remaining)
+                    let installed = sender(&receiver, &current_snapshot, Some(remaining))
                         .map_err(|error| error.to_string())?;
                     assert!(
                         matches!(

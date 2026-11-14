@@ -156,7 +156,7 @@ Shard membership changes retain the current primary and do not immediately activ
 
 #### Unknown commit outcomes
 
-Once a prepare is durable, the outcome of any failed commit attempt is decided from the durable record, not from the error: a `Committed` record is the success it already is, an `Aborted` or absent record keeps the original error, and a `Prepared` record is `DfsError::MetadataCommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`. Typed kernel rejections (precondition failure, existing path, non-empty directory, stale directory version) stay definite. `cause` is a `DfsCommitOutcomeUnknownCause`: `acknowledgements-missing { required, acknowledged, missing }`, `below-write-set-floor { write_set, floor }`, `record-changed { epoch }`, `deadline`, `cancelled` or `interrupted { detail }`.
+Once a prepare is durable, the outcome of any failed commit attempt is decided from the durable record, not from the error: a `Committed` record is the success it already is, an `Aborted` or absent record keeps the original error, and a `Prepared` record is `DfsError::MetadataCommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`. Typed kernel rejections (precondition failure, existing path, non-empty directory, stale directory version) stay definite. `cause` is a `DfsCommitOutcomeUnknownCause`: `acknowledgements-missing { required, acknowledged, missing }`, `below-write-set-floor { write_set, floor }`, `replication-below-intent { accepted, intent_w }`, `record-changed { epoch }`, `deadline`, `cancelled` or `interrupted { detail }`.
 
 An unknown outcome is neither success nor failure. The caller retries the same operation id; the primary answers that retry from the durable prepare and commits it at most once. Its forms on each surface:
 
@@ -175,15 +175,15 @@ A shard on the write-set protocol keeps its configuration at
 `metadata-shards/<shard>` and adds `metadata-write-sets/<shard>` under the same
 filesystem prefix. The write-set record holds the write set, its generation,
 the epoch start as an exact prefix proof, the epoch at which the shard switched,
-the substitutes recruited for unavailable members and the change that produced
-it. It names the configuration's epoch and primary; a record that does not
+the substitutes recruited for unavailable members, the raised N and the change
+that produced it. It names the configuration's epoch and primary; a record that does not
 match them, or cannot be decoded, grants nothing and the shard keeps the
 all-member rule. The shard configuration's format is unchanged, the shard scan
 decodes only `metadata-shards/` keys, and a write-set change is an authority
 change that does not reopen metadata stores.
 
-Every switch, shrink, add, recruit, removal and takeover swap is one guarded
-transaction built from one exact-key-set read. It compares the exact bytes of
+Every switch, shrink, add, recruit, N raise, removal and takeover swap is one
+guarded transaction built from one exact-key-set read. It compares the exact bytes of
 both keys, the pending handoff, the filesystem configuration when its guard
 uses W or N, and the member and capability-policy records of each member it
 admits. Each change advances the generation, so a transaction built from an
@@ -192,14 +192,22 @@ takeover candidate settles an unknown swap by resubmitting the identical
 request, which returns the committed reply or commits once, and the resulting
 record names that request. A cooperative handoff compares the write-set key;
 on a switched shard it admits only a primary rotation, and its completion moves
-the write set to the new primary with the frozen prefix as epoch start.
+the write set to the new primary with the frozen prefix as epoch start. Recruit
+and removal change the replica list within an epoch, so a lane rebinds a
+completed handoff's activated marker on a switched shard when the proof's
+successor matches the current assignment in everything but its replica list.
 
 The W floor and N of a shard are the highest content W and N among the rules
 that can apply to its paths (`metadata_shard_replication_bounds`). A commit also
 needs at least its own intent's W (`metadata_commit_write_set_floor`), because
 object and per-write policies are not derivable from configuration. The intent
 is the one the commit makes visible: its terminal intent, or else the intent it
-prepares; metadata-only publications carry none.
+prepares; metadata-only publications carry none. A switched shard's effective N
+(`metadata_shard_effective_n`) is the largest of its rules' N, its W floor and
+the record's `raised_n`; the record accepts content up to that W
+(`accepted_w`). A commit whose intent W is above it collects acknowledgements,
+reports `replication-below-intent` and asks the keeper to raise N
+(`build_metadata_write_set_raise_n`), which only grows it.
 
 A commit on a switched shard needs acknowledgements from the write set at the
 retained generation plus every durable pending add the record has not moved
@@ -217,13 +225,73 @@ generation or replica list that the acknowledgements still cover commits under
 the new generation, and anything else runs another round. The fence also drops
 superseded pending adds. An acknowledgement carrying `member_view` counts only
 when the view names the probe's epoch and exact prefix; the generation is not
-compared, and the primary keeps each member's latest view as add evidence. The
-prepared body seals no member set: retries and prepared-change recovery are
-evaluated against the record current when they run.
+compared, and the primary keeps each member's latest view, from any reply, as
+add evidence. A catch-up probe can name a record generation
+(`write_set_generation`): the member answers it only once its own published
+view of the record reaches that generation, waiting on the publication rather
+than a timer, and a routed reply that cannot wait rejects with
+`write-set-view-behind`. The prepared body seals no member set: retries and
+prepared-change recovery are evaluated against the record current when they
+run.
+
+On a switched shard, file and directory sync certify the write set and pending
+adds at the retained generation instead of a configured majority: each member is
+brought to the synced prefix within the caller's sync timeout. Below the W floor
+nothing is certified, and file and directory sync both return a pending write
+(`EAGAIN` / `NFS3ERR_JUKEBOX`), never a definite failure.
 
 A member admits the write-set capability only when its own member record
 advertises it and its capability policy, if present, allows it. Main daemons
 do not advertise it until they implement the whole member-side contract.
+
+#### Keeping the write set
+
+On a Main daemon, the primary of each shard runs one keeper task
+(`run_dfs_write_set_keeping`) that changes the record; nothing else does. It
+acts only on events: configuration publications (the record, cluster members,
+service providers and rules), the network layer's per-peer reachability
+verdicts, member views arriving with replies, and demands left by commits. An
+idle shard whose record already matches its plan sends nothing, and a verdict
+the network is still verifying starts nothing. The keeper holds a network
+reachability subscription only while its node is primary of a switched shard.
+For each shard it plans one step
+from the record and those facts (`plan_metadata_write_set_keeping`):
+
+- switch a shard whose configured members all advertise the protocol, then
+  reduce it to the N members it should keep, ranked reachable first, then
+  original before substitute before new candidate, then in the write set, then
+  by a per-shard hash. The switch evidence includes one pass over every version
+  record the primary's own shard store holds (`version_records_on_shard_page`),
+  current or retained, visible or not: the record's initial `raised_n` is the
+  highest `content_durability.policy.min_commit_replicas` among them, and a
+  version with content but no recorded policy keeps every configured member
+  (`raised_n` at least their number; the switch event's cause says so). The
+  pass and the switch submission hold the maintenance admission, so no version
+  commits in between;
+- shrink a member with a settled no-path verdict, or one the cluster no longer
+  authorizes, never below the W floor;
+- re-add a returning member: it is caught up through the ordinary durability
+  barrier, confirms the head under the record's generation, and its pending add
+  is recorded under the shard writer lock before the add is submitted, all while
+  the keeper holds the maintenance admission so no change is appended between;
+- recruit an eligible member, preferring non-mobile ones, when the write set is
+  below the effective N, or one replacement beyond N when every configured member is in
+  the write set (`DfsMetadataShardRecruit`);
+- raise N for a commit demand;
+- remove surplus members beyond the desired set, never below it, and members
+  the cluster no longer authorizes that are outside the write set.
+
+A commit that could not reach a required member asks the network to verify
+that peer; once the verdict settles, either the member leaves or the prepared
+change is recovered. Each applied change publishes a typed
+`dfs.metadata.write_set.*` event (`switched`, `shrunk`, `add_submitted`,
+`added`, `recruited`, `retired`, `n_raised`) naming the change id, generation,
+members and cause, and a shrink or N raise wakes prepared-change recovery. An
+unknown transaction outcome is settled from the record before the keeper acts
+again. Members are eligible when the cluster authorizes them, they provide
+`dfs.metadata.replicate` and advertise the prepared-operation and write-set
+capabilities; they need not be KV voters. Until a cluster publication carries the member and service scopes
+the keeper judges no member.
 
 Each member's durable state for a write-set shard is
 `coordination/write-set-member-state.sobj` in the shard directory: the
@@ -271,6 +339,11 @@ retries. DFS does not expose transport chunk indexes, windows, or resume routes.
 `LocalContentStore` can enforce blob, logical-object, manifest, and staging-byte quotas and reports content footprint through operational metrics.
 
 ## Policies
+
+A policy never has `min_commit_replicas` above `desired_replicas`: constructing
+or decoding one that states a higher W raises N to W
+(`normalized_replica_counts`), for replication, placement and subtree policies
+and rules alike. Such a policy is never refused or lowered for it.
 
 The main object policies currently used by the crate are:
 

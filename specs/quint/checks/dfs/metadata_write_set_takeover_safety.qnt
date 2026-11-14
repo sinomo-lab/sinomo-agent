@@ -23,10 +23,10 @@ module dfs_metadata_write_set_takeover_safety {
     s.commits.forall(c => isPrefix(c.entries, s.log.get(s.kv.primary)))
 
   def shrinkNeverGoesBelowFloor: bool =
-    s.last == Shrunk implies s.kv.writeSet.size() >= WFloor
+    s.last == Shrunk implies s.kv.writeSet.size() >= s.wFloor
 
   def commitsMeetTheFloor: bool =
-    s.commits.forall(c => c.writeSetSize >= WFloor)
+    s.commits.forall(c => c.writeSetSize >= s.wFloor)
 
   def recordIsWellFormed: bool = all {
     s.kv.writeSet.contains(s.kv.primary),
@@ -60,9 +60,17 @@ module dfs_metadata_write_set_takeover_safety {
     }))
 
   def witnessSecondTakeover: bool = s.kv.epoch == MaxEpoch and s.commits.exists(c => c.epoch == MaxEpoch)
-  def witnessCommitAtFloor: bool = s.commits.exists(c => c.writeSetSize == WFloor)
+  def witnessCommitAtFloor: bool = s.commits.exists(c => c.writeSetSize == s.wFloor)
   def witnessPromiseReleased: bool = s.last == PromiseReleased
   def witnessRecruitJoinsWriteSet: bool = s.kv.writeSet.contains(M4)
+  /// With the floor equal to N, a recruit beyond N replaced a member held at
+  /// the floor, joined the write set, and the shard committed at the floor
+  /// with it.
+  def witnessReplacementRecruitJoins: bool = all {
+    s.wFloor == s.nCopies,
+    s.kv.writeSet.contains(M4),
+    s.commits.exists(c => c.writeSetSize == s.wFloor and c.entries.length() >= 1),
+  }
   def witnessOldPrimaryRejoins: bool = s.kv.primary != M1 and s.kv.writeSet.contains(M1)
   def witnessDeposedPrimaryLateCommit: bool = s.commits.exists(c => c.deposed)
   def witnessFollowerDropsTail: bool = s.droppedTail

@@ -478,13 +478,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object = self.current_object_for_file_sync_target(target)?;
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let metadata_certificate = self
-            .sync_metadata_shard_to_quorum_intersecting(
-                &metadata_target,
-                &content_evidence.receipt_node_ids,
-                remaining,
-            )
-            .map_err(DfsPosixError::from)?;
+        let metadata_certificate = match self
+            .sync_metadata_shard_to_write_set(&metadata_target, remaining)
+            .map_err(DfsPosixError::from)?
+        {
+            Some(crate::service_sync::DfsWriteSetSync::Certified(certificate)) => certificate,
+            // Too few members hold the shard for the policy: like content
+            // short of its receipts, the write is not durable yet.
+            Some(crate::service_sync::DfsWriteSetSync::BelowFloor { write_set, floor }) => {
+                return Err(DfsPosixError::PendingWrite {
+                    intent_id: content_evidence.intent_id.clone(),
+                    durable_receipts: write_set,
+                    required_receipts: floor,
+                });
+            }
+            None => self
+                .sync_metadata_shard_to_quorum_intersecting(
+                    &metadata_target,
+                    &content_evidence.receipt_node_ids,
+                    remaining,
+                )
+                .map_err(DfsPosixError::from)?,
+        };
 
         if !content_evidence
             .receipt_node_ids
@@ -534,9 +549,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self.current_object_for_directory_sync_target(target)?;
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
-        let metadata_certificate = self
-            .sync_metadata_shard_to_quorum(&metadata_target, timeout)
-            .map_err(DfsPosixError::from)?;
+        let metadata_certificate = match self
+            .sync_metadata_shard_to_write_set(&metadata_target, timeout)
+            .map_err(DfsPosixError::from)?
+        {
+            Some(crate::service_sync::DfsWriteSetSync::Certified(certificate)) => certificate,
+            // The write set durably holds the directory generation but is
+            // too small to certify it: retriable, as a file short of its
+            // receipts, never a definite failure. A directory sync has no
+            // write intent, so the pending item names the generation.
+            Some(crate::service_sync::DfsWriteSetSync::BelowFloor { write_set, floor }) => {
+                return Err(DfsPosixError::PendingWrite {
+                    intent_id: format!("directory-sync:{}@{}", target.object_id, target.version),
+                    durable_receipts: write_set,
+                    required_receipts: floor,
+                });
+            }
+            None => self
+                .sync_metadata_shard_to_quorum(&metadata_target, timeout)
+                .map_err(DfsPosixError::from)?,
+        };
         Ok(DfsPosixDirectorySyncCertificate {
             target: target.clone(),
             metadata_certificate,

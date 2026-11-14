@@ -996,6 +996,16 @@ mod tests {
             })),
             nfsstat3::NFS3ERR_IO
         );
+        // A sync the write set holds but cannot yet certify, as a directory
+        // sync below the shard's W floor reports it, is retried later too.
+        assert_eq!(
+            map_posix_error(DfsPosixError::PendingWrite {
+                intent_id: "directory-sync:dir@v1".into(),
+                durable_receipts: 1,
+                required_receipts: 2,
+            }),
+            nfsstat3::NFS3ERR_JUKEBOX
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

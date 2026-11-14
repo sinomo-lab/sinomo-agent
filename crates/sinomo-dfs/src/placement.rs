@@ -504,10 +504,12 @@ fn resolve_placement_policy_for_scope(
 pub(crate) fn placement_policy_from_rule(
     rule: &DfsSubtreePolicy,
 ) -> Result<DfsPlacementPolicy, DfsDistributedError> {
+    let (min_commit_replicas, desired_replicas) =
+        sinomo_api::dfs::normalized_replica_counts(rule.min_commit_replicas, rule.desired_replicas);
     let policy = DfsPlacementPolicy {
         consistency: rule.policy.clone(),
-        min_commit_replicas: rule.min_commit_replicas,
-        desired_replicas: rule.desired_replicas,
+        min_commit_replicas,
+        desired_replicas,
         required_node_ids: rule.required_node_ids.clone(),
         forbidden_node_ids: rule.forbidden_node_ids.clone(),
         min_distinct_zones: rule.min_distinct_zones,
@@ -6710,7 +6712,7 @@ mod tests {
         let config = placement_config(node("node-a"));
         let invalid = DfsPlacementPolicy {
             consistency: DfsObjectPolicy::ReplicatedEventual,
-            min_commit_replicas: 2,
+            min_commit_replicas: 0,
             desired_replicas: 1,
             required_node_ids: Vec::new(),
             forbidden_node_ids: Vec::new(),
@@ -6719,6 +6721,20 @@ mod tests {
         let error = preview_with(&config, invalid, vec![advertisement("node-a", "east")])
             .expect_err("invalid policy");
         assert!(matches!(error, DfsDistributedError::InvalidPolicy { .. }));
+        // A decoded policy stating W > N previews with N raised to W.
+        let stated: DfsPlacementPolicy = serde_json::from_value(serde_json::json!({
+            "consistency": "replicated-eventual",
+            "min_commit_replicas": 2,
+            "desired_replicas": 1,
+        }))
+        .unwrap();
+        assert_eq!((stated.min_commit_replicas, stated.desired_replicas), (2, 2));
+        preview_with(
+            &config,
+            stated,
+            vec![advertisement("node-a", "east"), advertisement("node-b", "west")],
+        )
+        .expect("a policy stating W > N is normalized, not refused");
     }
 
     #[test]
@@ -7509,11 +7525,16 @@ mod tests {
             explicit.desired_replicas = 1;
             assert_eq!(placement_policy_from_rule(&explicit).unwrap(), resolved);
 
+            // A rule stating N = 0 below W = 1 desires W copies.
+            let mut understated = current.clone();
+            understated.desired_replicas = 0;
+            assert_eq!(placement_policy_from_rule(&understated).unwrap(), resolved);
+
             let mut invalid = Vec::new();
+            let mut rule = current.clone();
+            rule.desired_replicas = 2;
+            invalid.push(rule);
             for count in [0, 2] {
-                let mut rule = current.clone();
-                rule.desired_replicas = count;
-                invalid.push(rule);
                 let mut rule = current.clone();
                 rule.min_commit_replicas = count;
                 invalid.push(rule);
@@ -7561,7 +7582,7 @@ mod tests {
             path_prefix: "/services/team".to_string(),
             policy: DfsObjectPolicy::ReplicatedEventual,
             scope: DfsPlacementScope::Subtree,
-            min_commit_replicas: 2,
+            min_commit_replicas: 0,
             desired_replicas: 1,
             required_node_ids: Vec::new(),
             forbidden_node_ids: Vec::new(),

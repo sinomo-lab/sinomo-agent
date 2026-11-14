@@ -408,6 +408,27 @@ fn component_factory_with_selected_layout(
             .publish_event(crate::runtime_host::dfs_namespace_event_publication())
             .publish_event(crate::runtime_host::dfs_placement_event_publication())
             .publish_event(crate::runtime_host::dfs_configuration_event_publication())
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[0],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[1],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[2],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[3],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[4],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[5],
+            ))
+            .publish_event(crate::runtime_host::dfs_write_set_event_publication(
+                crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[6],
+            ))
             .subscribe_event(crate::runtime_host::host_cluster_control_subscription())
             .subscribe_event(crate::runtime_host::host_connectivity_subscription());
     let caller = descriptor.clone();
@@ -595,6 +616,27 @@ fn component_factory_with_selected_layout(
                                 scope.shutdown_receiver(),
                             )),
                         );
+                        // Keeping write sets is the shard primary's, on Main.
+                        // The test runtime hosts its nodes as embedded Main
+                        // stand-ins.
+                        let keeps_write_sets = context.host_role()
+                            == sinomo_module::ComponentHostRole::Main
+                            || (cfg!(any(test, feature = "test-support"))
+                                && context.host_role()
+                                    == sinomo_module::ComponentHostRole::Embedded);
+                        if keeps_write_sets {
+                            scope.own_task(
+                                "DFS metadata write-set keeping",
+                                runtime.spawn(crate::runtime_host::run_dfs_write_set_keeping(
+                                    data_dir.clone(),
+                                    Arc::clone(authority),
+                                    events.clone(),
+                                    (*state).clone(),
+                                    runtime.clone(),
+                                    scope.shutdown_receiver(),
+                                )),
+                            );
+                        }
                     }
                 }
                 let browser: Arc<dyn crate::DfsBrowserServiceHost> =
@@ -880,6 +922,26 @@ pub trait DfsDataPlaneHost: Send + Sync {
         None
     }
 
+    /// Wait until this host's own published record view of a write-set shard
+    /// reaches `generation` at `epoch`, moves to a later epoch, or no longer
+    /// lists the local node. A write-set catch-up probe names the generation
+    /// the primary's record is at; answering only once the member observed it
+    /// makes its `member_view` describe the copy the write set would hold.
+    /// The wait holds no lock, lane or admission and has no deadline: it ends
+    /// when the publication advances, when the caller drops the call, or at
+    /// host shutdown. `None` means the host cannot wait, and the receiver
+    /// rejects a probe its view has not reached.
+    fn await_metadata_write_set_generation<'a>(
+        &'a self,
+        _data_dir: Arc<SinomoDataDir>,
+        _file_system_id: DfsFileSystemId,
+        _shard_id: DfsMetadataShardId,
+        _epoch: u64,
+        _generation: u64,
+    ) -> Option<DfsDataPlaneHostFuture<'a, ()>> {
+        None
+    }
+
     /// Persist an already-authorized replica journal command through the
     /// process-resident exact shard backend. The service boundary supplies the
     /// committed authority context so the host must not repeat a remote KV
@@ -1082,6 +1144,25 @@ impl Service for DfsService {
                     let may_have_deferred_materialization =
                         command.durable_replication.is_some() || command.authority_probe.is_some();
                     let materialize_shard_id = command.batch.shard_id.clone();
+                    // A write-set catch-up probe is answered under the record
+                    // generation it names (see the probe field).
+                    if let (Some(host), Some(file_system_id), Some(epoch), Some(generation)) = (
+                        host.as_deref(),
+                        command.file_system_id.clone(),
+                        command.authority_epoch,
+                        command
+                            .prefix_probe
+                            .as_ref()
+                            .and_then(|probe| probe.write_set_generation),
+                    ) && let Some(wait) = host.await_metadata_write_set_generation(
+                        Arc::clone(&ctx.data_dir),
+                        file_system_id,
+                        command.batch.shard_id.clone(),
+                        epoch,
+                        generation,
+                    ) {
+                        wait.await.map_err(service_error)?;
+                    }
                     let context = authoritative_metadata_replica_shard_context(
                         host.as_deref(),
                         ctx.cluster.clone(),
@@ -1632,7 +1713,18 @@ mod tests {
                 "feature route remains core-owned {route}"
             );
         }
-        assert_eq!(factory.descriptor().event_publications.len(), 3);
+        // Three DFS events and the write-set keeper's typed events.
+        let publications = &factory.descriptor().event_publications;
+        assert_eq!(
+            publications.len(),
+            3 + crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS.len()
+        );
+        for kind in crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS {
+            assert!(
+                publications.iter().any(|publication| publication.kind == kind),
+                "missing write-set event publication {kind}"
+            );
+        }
         assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
         drop(registry);
         runtime
