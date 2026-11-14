@@ -26,6 +26,8 @@ sinomo-device.workspace = true
 sinomo-module-api.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+serde_json.workspace = true
 x11rb.workspace = true
 zbus.workspace = true
 pipewire.workspace = true

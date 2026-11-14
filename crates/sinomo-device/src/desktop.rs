@@ -1,6 +1,8 @@
 //! Platform-neutral app-use contracts. Native OS integration lives in the
 //! independently loaded modules/desktop/app-use provider.
 pub mod accessibility;
+mod frame_rate;
+pub use frame_rate::FrameRateCeiling;
 
 use crate::NativeVideoSample;
 use serde::{Deserialize, Serialize};
@@ -530,4 +532,4 @@ mod tests {
 }
 
 mod capture;
-pub use capture::{CaptureResolution, fit_capture_sample};
+pub use capture::{CaptureResolution, fit_capture_sample, resize_capture_pixels};

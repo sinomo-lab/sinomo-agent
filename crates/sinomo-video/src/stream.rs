@@ -19,9 +19,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
-#[path = "stream_ceiling.rs"]
-mod ceiling;
-use ceiling::FrameRateCeiling;
+use sinomo_runtime::device::desktop::FrameRateCeiling;
 
 /// Apply the consumer ceiling once, at a native producer that can enforce it.
 pub fn effective_capture_fps(capture_fps: u32, consumer_fps: Option<u32>) -> u32 {

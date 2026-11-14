@@ -6,8 +6,8 @@ the typed `sinomo.app-use.os` service interface version `2.0.0`.
 
 The module owns native target enumeration, identity checks, capture and input.
 Windows uses WGC/D3D11, background window messages, SendInput and conditional
-gamepad injection. Linux uses local X11 with XRes, Composite, Damage, XFixes and
-XTest, or Wayland portals with PipeWire capture and approved raw input. Android
+gamepad injection. Linux uses local X11 with XRes, Composite, Damage, XFixes,
+XInput2 cursor notifications and XTest, or Wayland portals with PipeWire capture and approved raw input. Android
 uses a same-UID local OS adapter with MediaProjection and a
 user-enabled AccessibilityService. Other platforms report unsupported capabilities.
 It does not own an encoder, network stack, agent runtime or alternate toolset.
@@ -127,6 +127,32 @@ map; the provider never rewrites that map. Raw Set-1 keys assume Xorg's evdev
 keycode mapping. Gamepads and remote X servers are unsupported. Wayland sessions,
 including those with an Xwayland `DISPLAY`, select the portal backend below.
 
+X11 capture wakes on Damage, geometry and cursor notifications. Its FPS setting
+is an admission ceiling in a rolling second, not a periodic frame clock. Pending
+changes coalesce until budget becomes available, including the final update of a
+screen that becomes static. Cursor capture requires XInput2 and XFixes; core
+motion/crossing notifications on the target and its descendants cover pointer
+warps, while raw motion covers ordinary movement and grabs. Descendant watches
+are bounded and removed when windows leave the captured subtree. An idle cursor
+does not cause repeated screenshots. Socket waits wake directly for frame events and cancellation; timeouts only
+bound authority and lease checks.
+
+Local servers supporting MIT-SHM 1.2 can provide an FD-backed image buffer owned
+by the capture lease. Each readback completes before normalization/resizing;
+returned frames own their storage and never retain that shared mapping. Buffers
+are reused, replaced on growth and detached on teardown. Servers without usable
+shared-memory readback retain the ordinary GetImage path. Common XRGB buffers
+are normalized in place, then resized directly into final shared output storage.
+The shared bilinear resampler precomputes fixed-point weights and preserves
+channel order and native geometry; rounding differs from floating-point
+interpolation by at most one channel value.
+
+`SINOMO_MEDIA_STAGE_TRACE=1` enables opt-in JSON stage diagnostics on stderr for
+X11 readback, normalization, cursor overlay, resizing and module handoff.
+Capture timestamps mark the start of acquisition, before image readback. For
+interaction latency, also measure the screen change through to the received
+frame; timestamps alone do not include time before capture is admitted.
+
 ```sh
 cargo build -p sinomo-app-use-module
 sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v3 --cache-key module/desktop/app-use target/debug/libsinomo_app_use_module.so
@@ -134,8 +160,21 @@ cargo test -p sinomo-actions --test app_use_native_provider -- --ignored
 xvfb-run cargo test -p sinomo-app-use-module x11_background_pixels_input_revocation_and_cleanup -- --ignored
 ```
 
-Use an isolated X server for the native test. It creates and destroys its own
-window, checks pixels and input delivery, and checks revocation and cleanup.
+Use an isolated X server for the native tests. They create and destroy their own
+windows and check pixels, input delivery, cursor motion/shape/warps, child-window
+changes, idle behavior, FPS ceilings, revocation and cleanup. Run the same tests
+with MIT-SHM disabled to exercise the readback fallback:
+
+```sh
+xvfb-run -s '-screen 0 1280x720x24 -nolisten tcp' cargo test -p sinomo-app-use-module --profile android-debug x11_ -- --ignored --test-threads=1
+xvfb-run -s '-screen 0 1280x720x24 -nolisten tcp -extension MIT-SHM' cargo test -p sinomo-app-use-module --profile android-debug x11_ -- --ignored --test-threads=1
+```
+
+`x11_capture_change_latency` accepts `SINOMO_X11_CAPTURE_RESULTS` for its JSON
+samples; `capture_resize_cost` accepts `SINOMO_X11_RESIZE_RESULTS` to compare
+floating-point reference and fixed-point resampling at the same optimization
+level. The Android debug profile optimizes both the provider and device helper;
+keep build profiles explicit when interpreting measurements.
 
 ## Linux Wayland
 

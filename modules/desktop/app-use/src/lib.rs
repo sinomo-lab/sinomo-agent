@@ -418,35 +418,35 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             same_owner(&entry.owner, &owner)?;
             let capture = entry.capture.clone();
             drop(state);
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             let started = Instant::now();
             let sample =
                 capture.next(after_sequence, Duration::from_millis(timeout_ms.min(100)))?;
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             let next_us = started.elapsed().as_micros();
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             let returned_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_micros();
             let frame = sample.map(DesktopRawFrame::from_sample).transpose()?;
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             let prepare_us = started.elapsed().as_micros() - next_us;
             let available = frame.is_some();
             if let Some(frame) = frame {
                 // The stable output callback carries a single SOBJ byte blob.
                 // Nesting a 4K frame inside InvocationResponse.payload_sobj
                 // makes the generic envelope serialize millions of integers.
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 let identity = (frame.sequence, frame.captured_at_unix_ms);
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 let serialize_started = Instant::now();
                 let bytes = encode_sobj(&DesktopFrameDelivery {
                     capture_id: id,
                     frame,
                 })
                 .map_err(|e| DesktopError::Platform(e.to_string()))?;
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 let serialize_us = serialize_started.elapsed().as_micros();
                 let host = HOST
                     .lock()
@@ -457,11 +457,11 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
                 let output = host.0.output_chunk.ok_or_else(|| {
                     DesktopError::Closed("capture output callback unavailable".into())
                 })?;
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 let callback_started = Instant::now();
                 let status =
                     unsafe { output(host.0.user_data, SinomoModuleByteSlice::from_slice(&bytes)) };
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "linux"))]
                 if device::frame_trace_enabled() {
                     device::trace_frame(serde_json::json!({"kind":"module", "sequence":identity.0,
                         "captured_at_unix_ms":identity.1, "call_next_us":next_us,

@@ -4,20 +4,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) struct FrameRateCeiling {
+pub struct FrameRateCeiling {
     limit: Option<usize>,
     admitted: VecDeque<Instant>,
 }
 impl FrameRateCeiling {
-    pub(super) fn new(limit: Option<u32>) -> Self {
+    pub fn new(limit: Option<u32>) -> Self {
         Self {
-            limit: limit
-                .filter(|rate| *rate > 0)
-                .map(|rate| rate as usize),
+            limit: limit.filter(|rate| *rate > 0).map(|rate| rate as usize),
             admitted: VecDeque::new(),
         }
     }
-    pub(super) fn delay(&mut self, now: Instant) -> Duration {
+    pub fn delay(&mut self, now: Instant) -> Duration {
         while self
             .admitted
             .front()
@@ -32,7 +30,7 @@ impl FrameRateCeiling {
             _ => Duration::ZERO,
         }
     }
-    pub(super) fn admit(&mut self, now: Instant) {
+    pub fn admit(&mut self, now: Instant) {
         debug_assert!(self.delay(now).is_zero());
         if self.limit.is_some() {
             self.admitted.push_back(now);
