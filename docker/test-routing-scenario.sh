@@ -636,12 +636,89 @@ run_large_routed_dfs() {
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
+# Prints "<file-system-id> <primary> <epoch> <comma-separated sorted replicas>"
+# for one metadata shard as $node's retained configuration describes it.
+dfs_shard_layout() {
+  local node="$1" shard="$2"
+  compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" "$node" sinomo dfs status --json 2>/dev/null \
+    | python3 -c '
+import json, sys
+text = sys.stdin.read()
+status = json.loads(text[text.index("{"):])
+for shard in status.get("metadata_shards", []):
+    if shard["shard_id"] == sys.argv[1]:
+        print(shard["file_system_id"], shard["primary_node_id"], shard["epoch"],
+              ",".join(sorted(shard.get("replica_node_ids", []))) or "-")
+        break
+else:
+    sys.exit(1)
+' "$shard"
+}
+
+# Shard expansion runs once, with whichever members are voting metadata
+# providers at that moment, so which of node2 and node3 replicate a shard
+# depends on join timing. Pin the services shard to the nodes that stay
+# online, so the offline-node case below tests that an absent non-replica
+# never blocks writes, independent of that timing.
+pin_services_shard_to_online_nodes() {
+  local stopped_id="$1" online_a="$2" online_b="$3"
+  local layout fs primary epoch replicas desired now_epoch now_replicas node deadline settled
+  if ! layout="$(dfs_shard_layout node1 services)"; then
+    log "  could not read the services shard layout"
+    return 1
+  fi
+  read -r fs primary epoch replicas <<<"$layout"
+  if [ "$primary" = "$stopped_id" ]; then
+    log "  services shard primary is the node about to stop; cannot pin its replicas"
+    return 1
+  fi
+  desired="$(printf '%s\n' "$online_a" "$online_b" | grep -vx "$primary" | sort | paste -sd, -)"
+  if [ "$replicas" = "$desired" ]; then
+    log "  services shard already replicated only on the online nodes (epoch $epoch)"
+    return 0
+  fi
+  log "  pinning services shard replicas to the online nodes (was $replicas at epoch $epoch)"
+  if ! compose_exec_timeout "$READINESS_COMMAND_TIMEOUT" node1 sinomo dfs metadata shard set-replicas \
+      --filesystem "$fs" --shard services --expected-epoch "$epoch" --json \
+      $(printf -- '--replica %s ' ${desired//,/ }) \
+      >"$ARTIFACTS/pin-services-shard.json" 2>"$ARTIFACTS/pin-services-shard.stderr.log"; then
+    log "  services shard replica assignment was refused"
+    sed 's/^/[routing-scenario]   /' "$ARTIFACTS/pin-services-shard.json" "$ARTIFACTS/pin-services-shard.stderr.log"
+    return 1
+  fi
+  deadline=$(( $(date +%s) + EXPECT_TIMEOUT ))
+  while :; do
+    settled=1
+    for node in node1 node2; do
+      if ! layout="$(dfs_shard_layout "$node" services)"; then
+        settled=0
+        continue
+      fi
+      read -r _ _ now_epoch now_replicas <<<"$layout"
+      if [ "$now_replicas" != "$desired" ] || [ "$now_epoch" -le "$epoch" ]; then
+        settled=0
+      fi
+    done
+    if [ "$settled" = 1 ]; then
+      log "  services shard pinned to the online nodes"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "  services shard pin did not activate within ${EXPECT_TIMEOUT}s"
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 run_two_online_one_offline_dfs_probe() {
-  local node1_id node2_id path_a path_b payload_a payload_b
+  local node1_id node2_id node3_id path_a path_b payload_a payload_b
 
   log "checking DFS quorum with node3 offline"
   node1_id="$(cluster_local_node_id node1)"
   node2_id="$(cluster_local_node_id node2)"
+  node3_id="$(cluster_local_node_id node3)"
+  pin_services_shard_to_online_nodes "$node3_id" "$node1_id" "$node2_id" || return 1
   compose stop node3 >/dev/null
 
   run_probe node1 cluster.network.ping-benchmark \
