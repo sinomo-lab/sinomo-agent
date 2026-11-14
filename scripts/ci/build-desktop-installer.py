@@ -6,12 +6,10 @@ import json
 import os
 from pathlib import Path
 import shutil
-import struct
 import subprocess
 import sys
 import tarfile
 import tomllib
-import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGER_VERSION = "0.11.8"
@@ -22,20 +20,8 @@ def run(*args, **kwargs):
 
 
 def write_icon(path):
-    """A small code-authored S glyph; no image build dependency is needed in CI."""
-    rows = []
-    glyph = ("11111", "10000", "10000", "11111", "00001", "00001", "11111")
-    for y in range(256):
-        row = bytearray(b"\0")
-        for x in range(256):
-            gx, gy = (x - 48) // 32, (y - 16) // 32
-            on = 0 <= gx < 5 and 0 <= gy < 7 and glyph[gy][gx] == "1"
-            row.extend((235, 244, 255, 255) if on else (28, 71, 120, 255))
-        rows.append(row)
-    def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 256, 256, 8, 6, 0, 0, 0))
-                     + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
+    """Stage the Sinomo logo without requiring image conversion tools in CI."""
+    shutil.copyfile(ROOT / "crates/sinomo-app/assets/logo.png", path)
 
 
 def configuration(stage, output, target, version):
@@ -56,7 +42,8 @@ def configuration(stage, output, target, version):
                                {"src": str(ROOT / "crates/sinomo-installer/src/initial_setup/windows-integration.ps1"),
                                 "target": "windows-integration.ps1"},
                                {"src": str(stage / "initial-payload.tar"), "target": "initial-payload.tar"}]
-        config["nsis"] = {"installMode": "currentUser", "template": str(ROOT / "packaging/windows/installer.nsi")}
+        config["nsis"] = {"installMode": "currentUser", "template": str(ROOT / "packaging/windows/installer.nsi"),
+                          "installerIcon": str(ROOT / "crates/sinomo-app/assets/logo.ico")}
     else:
         # linuxdeploy patches ELF RPATHs. Preserve the verified originals in an opaque archive,
         # while the loose binary copies let linuxdeploy discover all runtime dependencies.

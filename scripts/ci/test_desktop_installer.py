@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import struct
 import unittest
 
 spec = importlib.util.spec_from_file_location("installer", Path(__file__).with_name("build-desktop-installer.py"))
@@ -19,17 +20,19 @@ class PayloadContract(unittest.TestCase):
             if "windows" in target:
                 self.assertIn("desktop-release.json", [r["target"] for r in config["resources"]])
                 self.assertEqual(config["nsis"]["installMode"], "currentUser")
+                self.assertTrue(Path(config["nsis"]["installerIcon"]).is_file())
             else:
                 self.assertEqual(config["appimage"]["files"][str(Path("stage/sinomo-payload.tar"))],
                                  "usr/bin/sinomo-payload.tar")
 
-    def test_generated_icon_is_a_square_rgba_png(self):
+    def test_staged_icon_is_the_sinomo_logo(self):
         with tempfile.TemporaryDirectory() as directory:
             icon = Path(directory) / "icon.png"
             installer.write_icon(icon)
             data = icon.read_bytes()
             self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
-            self.assertEqual(installer.struct.unpack(">II", data[16:24]), (256, 256))
+            self.assertEqual(struct.unpack(">II", data[16:24]), (256, 256))
+            self.assertEqual(data, (installer.ROOT / "crates/sinomo-app/assets/logo.png").read_bytes())
 
 
 if __name__ == "__main__":
