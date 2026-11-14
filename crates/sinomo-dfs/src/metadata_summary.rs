@@ -622,6 +622,7 @@ mod tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -636,6 +637,7 @@ mod tests {
             object_id: object_id(),
             file_system_id: file_system_id(),
             path: "/docs/readme.md".to_string(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: node("node_owner"),

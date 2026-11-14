@@ -3271,6 +3271,7 @@ mod causal_time_tests {
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         };
         let file_system = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id,

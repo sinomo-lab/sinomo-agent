@@ -508,6 +508,7 @@ fn current_adoption_job_with_routing(
                 old_path: source_path.clone(),
             },
             DfsNamespaceJobFrame::CrossShardAdopt {
+                promotion_alias: None,
                 moved_object: moved,
                 old_path: source_path,
                 destination_primary_node_id: destination,
@@ -1447,6 +1448,7 @@ mod tests {
             file_system_id: fs.clone(),
             path: "/right/moved".into(),
             kind: DfsObjectKind::Directory,
+            namespace_link_count: None,
             tombstone_provenance: None,
             owner_node_id: NodeId::from_legacy_named("actual-source-owner").unwrap(),
             current_locations: Vec::new(),

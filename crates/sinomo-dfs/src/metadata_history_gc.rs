@@ -2374,6 +2374,7 @@ mod tests {
             object_id: object_id.clone(),
             file_system_id: file_system_id(),
             path: format!("/{}", object_id.as_str()),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: node("node_owner"),

@@ -1747,6 +1747,7 @@ mod tests {
                 .is_none()
         );
         let cut = MetadataSourceCut {
+            namespace_count_cohort: None,
             source_root: source_root.clone(),
             source_identity,
             scope_shard: shard.clone(),

@@ -454,6 +454,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         self.write_outcome(intent_id)
     }
+    /// Wait for the existing transport inbox only. This neither retries a
+    /// write nor runs maintenance; callers retain their original deadline.
+    pub fn test_wait_for_incoming(&mut self, timeout: std::time::Duration) -> Result<(), DfsError> {
+        self.transport.wait_for_incoming(timeout).map(|_| ()).map_err(DfsError::from_network)
+    }
     pub fn test_write_distributed_bytes_with_base(
         &mut self,
         request: DfsWriteRequest,

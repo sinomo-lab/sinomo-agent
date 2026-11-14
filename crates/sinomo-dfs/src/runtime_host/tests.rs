@@ -3946,6 +3946,7 @@ fn test_dfs_write_routed_message(
         object_id: object_id.clone(),
         file_system_id: sinomo_dfs::sifs_file_system_id(),
         path: path.to_string(),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         owner_node_id: target_node_id.clone(),
         current_locations: vec![source_node_id.clone()],
@@ -4064,6 +4065,7 @@ fn install_test_metadata_replica_shard(
 
 fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        namespace_count_activation: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),

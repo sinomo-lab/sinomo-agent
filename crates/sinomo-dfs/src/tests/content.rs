@@ -56,6 +56,7 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let file_system = DfsFileSystemConfig {
+        namespace_count_activation: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),

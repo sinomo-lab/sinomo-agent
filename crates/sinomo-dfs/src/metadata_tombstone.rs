@@ -242,6 +242,7 @@ mod tests {
             object_id: object_id(),
             file_system_id: file_system_id(),
             path: "/docs/deleted.md".to_string(),
+            namespace_link_count: (DfsObjectKind::Tombstone).initial_namespace_link_count(),
             kind: DfsObjectKind::Tombstone,
             tombstone_provenance: None,
             owner_node_id: node("node_owner"),

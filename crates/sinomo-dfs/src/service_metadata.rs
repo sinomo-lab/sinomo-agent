@@ -1098,17 +1098,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(NamespaceTransactionApplyError::from)
     }
 
-    pub fn add_file_system(&mut self, file_system: DfsFileSystem) -> Result<(), DfsError> {
+    pub fn add_file_system(&mut self, mut file_system: DfsFileSystem) -> Result<(), DfsError> {
         let mut scopes = Vec::new();
         if let Some(kv) = self.control_plane.as_mut() {
             let mut store = DfsControlPlaneStore::new(kv.as_mut());
+            let current = store.get_file_system_config(&file_system.file_system_id)?;
+            let activation = current.as_ref().and_then(|config| config.namespace_count_activation.clone());
+            if file_system.namespace_count_activation.as_ref().is_some_and(|claimed| Some(claimed) != activation.as_ref()) {
+                return Err(DfsError::Metadata { message: "ordinary filesystem publication cannot author namespace-count activation".into() });
+            }
+            file_system.namespace_count_activation = activation;
             let config = DfsFileSystemConfig::from(&file_system);
-            if store
-                .get_file_system_config(&file_system.file_system_id)?
-                .as_ref()
-                .is_none_or(|current| {
-                    !crate::placement::dfs_file_system_config_semantically_eq(current, &config)
-                })
+            if current.as_ref().is_none_or(|current| {
+                !crate::placement::dfs_file_system_config_semantically_eq(current, &config)
+            })
             {
                 store.put_file_system_config(&config)?;
             }
@@ -1123,6 +1126,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         } else {
+            let activation = self.metadata.filesystems.get(&file_system.file_system_id)
+                .and_then(|current| current.namespace_count_activation.clone());
+            if file_system.namespace_count_activation.as_ref().is_some_and(|claimed| Some(claimed) != activation.as_ref()) {
+                return Err(DfsError::Metadata { message: "ordinary filesystem publication cannot author namespace-count activation".into() });
+            }
+            file_system.namespace_count_activation = activation;
             scopes.push(DfsPreparedOperationScope {
                 file_system_id: file_system.file_system_id.clone(),
                 shard_id: self.local_prepared_operation_shard()?,

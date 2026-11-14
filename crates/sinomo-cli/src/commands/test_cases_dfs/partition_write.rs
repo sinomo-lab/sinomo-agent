@@ -470,6 +470,7 @@ mod original_pending_guard_tests {
             object_id: DfsObjectId::from_legacy_named("partition-predicate-object").unwrap(),
             file_system_id: dfs::sifs_file_system_id(),
             path: "/services/cluster-tests/runs/predicate/value.txt".into(),
+            namespace_link_count: (dfs::DfsObjectKind::File).initial_namespace_link_count(),
             kind: dfs::DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: owner.clone(),

@@ -828,6 +828,7 @@ fn namespace_transaction_proves_operation_completed(
         | DfsNamespaceOperation::MetadataQuery { .. }
         | DfsNamespaceOperation::PollNamespaceChanges { .. }
         | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+        | DfsNamespaceOperation::ParentCountParticipant { .. }
         | DfsNamespaceOperation::RenameDirectoryBounded { .. }
         | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
         | DfsNamespaceOperation::ClearDirRecursive { .. }

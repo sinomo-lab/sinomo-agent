@@ -1135,6 +1135,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     None
                 };
                 let context = crate::metadata_replication::DfsMetadataReplicaShardContext {
+                    namespace_catalog: retained_context.as_ref().and_then(|context| context.namespace_catalog.clone()),
                     local_node_id: self.node_id.clone(),
                     shard: shard.clone(),
                     pending_membership_handoff,
@@ -1142,34 +1143,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .as_ref()
                         .and_then(|context| context.write_set.clone()),
                 };
-                match crate::metadata_replication::validated_pending_primary_handoff_snapshot_id(
-                    &context, &command,
-                ) {
-                    Ok(Some(handoff_id)) => (
-                        Some(
-                            DfsMetadataReplicaIngestPermit::new_validated_pending_primary_handoff(
-                                shard.file_system_id.clone(),
-                                shard_id.clone(),
-                                source_node_id.clone(),
-                                shard.epoch,
-                                handoff_id,
-                            )
-                            .with_floor_epoch_scope(context.floor_epoch_scope()),
-                        ),
-                        None,
-                    ),
-                    Ok(None) => (
-                        Some(
-                            DfsMetadataReplicaIngestPermit::new_validated(
-                                shard.file_system_id.clone(),
-                                shard_id.clone(),
-                                source_node_id.clone(),
-                                shard.epoch,
-                            )
-                            .with_floor_epoch_scope(context.floor_epoch_scope()),
-                        ),
-                        None,
-                    ),
+                match crate::metadata_replication::metadata_snapshot_install_permit(&context, &command) {
+                    Ok(permit) => (Some(permit), None),
                     Err(reason) => (None, Some(reason.into())),
                 }
             }
@@ -1755,8 +1730,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsError::Metadata {
                 message: "retained write configuration omits metadata authority".into(),
             })?;
-        crate::metadata_authority_projection::metadata_replica_context_from_authority_entries(
-            entries,
+        let complete = crate::DfsAuthoritativePrefixProjection::complete(
+            crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX,
+            entries.to_vec(), projection.revision(),
+        )?;
+        crate::metadata_authority_projection::metadata_replica_context_from_authority_projection(
+            &complete,
             &self.node_id,
             file_system_id,
             shard_id,
@@ -1914,6 +1893,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(|write_set| write_set.switched_at_epoch),
             ),
             replica_context: DfsMetadataReplicaShardContext {
+                namespace_catalog: None, // Journal source tuple, not a snapshot catalog.
                 local_node_id: self.node_id.clone(),
                 shard,
                 pending_membership_handoff,

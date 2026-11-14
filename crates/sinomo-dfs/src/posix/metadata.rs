@@ -254,6 +254,24 @@ pub(super) fn symlink_target_from_distributed_read_outcome(
     }
 }
 
+/// Checked successor of an authoritative canonical namespace count. Unknown
+/// legacy rows require explicit conversion; mutation never infers a count.
+pub(crate) fn updated_namespace_link_count(
+    object: &DfsObjectMetadata,
+    delta: i64,
+) -> std::result::Result<u64, DfsError> {
+    let invalid = || DfsError::Metadata {
+        message: format!("canonical namespace link count unavailable or invalid for {} at {}", object.object_id, object.path),
+    };
+    if object.kind == DfsObjectKind::Hardlink { return Err(invalid()); }
+    if object.kind == DfsObjectKind::Tombstone {
+        return if delta == 0 { Ok(0) } else { Err(invalid()) };
+    }
+    let minimum = if object.kind == DfsObjectKind::Directory { 2 } else { 1 };
+    let count = object.namespace_link_count.filter(|count| *count >= minimum).ok_or_else(invalid)?;
+    count.checked_add_signed(delta).filter(|count| *count >= minimum).ok_or_else(invalid)
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn lookup_sifs_path(&self, path: &str) -> Result<Option<DfsObjectMetadata>> {
         self.lookup_metadata_path(&sifs_file_system_id(), path)
@@ -1279,17 +1297,69 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .count())
     }
 
+    /// Mutation-only alias selection. A maintained canonical count can name
+    /// links outside this node's replica set, so local tables cannot prove
+    /// there is no surviving alias. The selected id/version is rechecked by
+    /// the existing destination mutation predicate; this is not a global stat.
     pub(super) fn first_hardlink_to_object(
-        &self,
+        &mut self,
         target_object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectMetadata>> {
-        let result = self.first_hardlink_to_object_unobserved(target_object_id)?;
+        let result = if self.control_plane.is_none() {
+            self.first_hardlink_to_object_unobserved(target_object_id)?
+        } else {
+            let target = self.object_by_id(target_object_id)?.ok_or_else(|| DfsPosixError::Dfs(DfsError::UnknownObject {
+                object_id: target_object_id.clone(),
+            }))?;
+            self.with_stat_deadline(|service| {
+                let catalog = service.metadata_shard_authorities(&target.file_system_id)?;
+                let mut pages_left = crate::file_history_query::HISTORY_PAGE_LIMIT;
+                for shard in &catalog {
+                    let mut request = crate::DfsStatProjectionRequest {
+                        object_id: target.object_id.clone(), object_path: target.path.clone(),
+                        object_kind: target.kind.clone(), object_version: target.version.clone(),
+                        limit: 1, after: None, expected_prefix: None, fence_only: false,
+                    };
+                    loop {
+                        service.check_cancelled("namespace alias discovery")?;
+                        if pages_left == 0 || service.transport.operation_deadline().is_some_and(|deadline|
+                            std::time::Instant::now() >= deadline) {
+                            return Err(DfsError::Metadata { message: "namespace alias discovery exhausted its existing read budget".into() }.into());
+                        }
+                        pages_left -= 1;
+                        let reply = service.query_metadata_authority_from_snapshot(
+                            shard, DfsMetadataSelection::StatProjectionV1 { request: Box::new(request.clone()) }, Some(&catalog),
+                        )?;
+                        let DfsMetadataQueryResult::StatProjectionV1 { page } = reply else {
+                            return Err(DfsError::Metadata { message: "alias authority omitted its bounded projection".into() }.into());
+                        };
+                        if page.request != request || !page.prefix.is_well_formed()
+                            || request.expected_prefix.as_ref().is_some_and(|prefix| prefix != &page.prefix)
+                            || page.entries.len() > 1 || page.complete != page.after.is_none()
+                            || page.after.as_ref().is_some_and(|after| page.entries.is_empty() || Some(after) == request.after.as_ref()) {
+                            return Err(DfsError::Metadata { message: "alias authority returned an invalid bounded page".into() }.into());
+                        }
+                        for alias in &page.entries {
+                            if alias.file_system_id != target.file_system_id || alias.kind != DfsObjectKind::Hardlink
+                                || alias.tombstone_provenance.is_some() || alias.link_target_object_id.as_ref() != Some(target_object_id)
+                                || normalize_posix_path(&alias.path)? != alias.path {
+                                return Err(DfsError::Metadata { message: "alias authority returned another namespace identity".into() }.into());
+                            }
+                            let owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                                &target.file_system_id, &catalog, &alias.path,
+                            ).map_err(DfsError::from)?;
+                            if owner.as_ref() == Some(shard) { return Ok(Some(alias.clone())); }
+                        }
+                        let Some(after) = page.after.clone() else { break; };
+                        request.after = Some(after);
+                        request.expected_prefix.get_or_insert(page.prefix.clone());
+                    }
+                }
+                Ok(None)
+            })?
+        };
         if let Some(object) = result.as_ref() {
-            self.namespace_execution.observe_path(
-                &object.file_system_id,
-                &object.path,
-                Some(object),
-            );
+            self.namespace_execution.observe_path(&object.file_system_id, &object.path, Some(object));
         }
         Ok(result)
     }
@@ -1387,18 +1457,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.kind != DfsObjectKind::Hardlink || self.control_plane.is_none() {
             return self.resolve_hardlink_target(object);
         }
-        if self.metadata_backend.is_some() || !self.transport.delegates_local_namespace_authority()
-        {
-            // A target in a shard this node replicates reads locally; any
-            // other target is read from its authority.
-            return resolve_hardlink_target_with(object, |target_id| {
-                match self.current_read_object_metadata_distributed(target_id) {
-                    Ok(target) => Ok(Some(target)),
-                    Err(DfsError::UnknownObject { .. }) => Ok(None),
-                    Err(error) => Err(error.into()),
-                }
-            });
-        }
         let owned_catalog;
         let catalog = match captured_catalog {
             Some(catalog) => catalog,
@@ -1409,10 +1467,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         resolve_hardlink_target_with(object, |target_id| {
             for shard in catalog {
-                let DfsMetadataQueryResult::CurrentObject { object: target } = self
+                let DfsMetadataQueryResult::StatObjectV1 { object: target, prefix } = self
                     .query_metadata_authority_from_snapshot(
                         shard,
-                        DfsMetadataSelection::CurrentObject {
+                        DfsMetadataSelection::StatObjectV1 {
                             object_id: target_id.clone(),
                         },
                         Some(catalog),
@@ -1423,6 +1481,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     .into());
                 };
+                if !prefix.is_well_formed() {
+                    return Err(DfsError::Metadata {
+                        message: "hardlink authority returned an invalid metadata prefix".into(),
+                    }.into());
+                }
                 if let Some(target) = target {
                     if target.file_system_id != object.file_system_id
                         || &target.object_id != target_id
@@ -1432,6 +1495,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             message: "hardlink authority returned a foreign target".into(),
                         }
                         .into());
+                    }
+                    // An ancestor can retain a physical copy after a split.
+                    // Only the current path owner in this operation's routing
+                    // catalog can supply the canonical inode generation.
+                    if crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &object.file_system_id, catalog, &target.path,
+                    ).map_err(DfsError::from)?.as_ref() != Some(shard) {
+                        continue;
                     }
                     if !self.transient_metadata_object_ids.contains(target_id) {
                         self.namespace_execution.observe_path(
@@ -1491,7 +1562,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let object = self.stat_target_from_authority(path)?;
         self.with_stat_deadline(|service| {
-            service.with_stat_read_rounds(|service| {
+            service.with_stat_read(|service| {
                 service.stat_object_from_authorities(&object, path, shard_snapshot.as_deref())
             })
         })
@@ -1692,15 +1763,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let object = self.resolve_hardlink_target(object)?;
         let size_bytes = self.object_content_size_hint(&object)?;
-        let link_count = match link_count_hint {
-            Some(count)
-                if object.kind != DfsObjectKind::Directory
-                    && object.kind != DfsObjectKind::Hardlink =>
-            {
-                count
-            }
-            _ => self.link_count_for_object(&object)?,
-        };
+        // A caller's earlier enumeration cannot override the canonical count.
+        let _ = link_count_hint;
+        let link_count = self.link_count_for_object(&object)?;
         Ok(DfsStat {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -1727,13 +1792,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let target = self.resolve_hardlink_target(object)?;
             return self.link_count_for_object(&target);
         }
-        if object.kind != DfsObjectKind::Directory {
-            let count = self.hardlink_count_to_object(&object.object_id)?;
-            return Ok(1u64.saturating_add(count as u64));
-        }
-        let path = normalize_posix_path(&object.path)?;
-        let child_directory_count = self.child_directory_count_for_sifs_dir(&path)?;
-        Ok(2u64.saturating_add(child_directory_count))
+        updated_namespace_link_count(object, 0).map_err(Into::into)
     }
 
     pub(super) fn first_hardlink_alias_outside_prefix(

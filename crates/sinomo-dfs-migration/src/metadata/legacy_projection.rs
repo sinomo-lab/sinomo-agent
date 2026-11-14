@@ -2080,6 +2080,7 @@ mod tests {
             file_system_id: fs().file_system_id,
             path: "/docs/file".into(),
             kind: DfsObjectKind::File,
+            namespace_link_count: None,
             tombstone_provenance: None,
             owner_node_id: NodeId::from_legacy_named("projection-owner").unwrap(),
             current_locations: Vec::new(),

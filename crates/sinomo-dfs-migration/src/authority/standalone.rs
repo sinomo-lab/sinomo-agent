@@ -650,6 +650,9 @@ pub fn storage_preparation_provider(
     let metadata_root = dfs_root.join("metadata");
     Ok(Arc::new(move |root, scope, budget| {
         let _owner = &owner;
+        if matches!(scope, DfsStoragePreparationScope::MetadataCountCohort { .. }) {
+            return Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records: 0 });
+        }
         if matches!(scope, DfsStoragePreparationScope::MetadataRouting) {
             if root != metadata_root {
                 return Err(error("standalone routing state changes actual owner root"));
@@ -667,6 +670,7 @@ pub fn storage_preparation_provider(
             return Ok(local);
         }
         match scope {
+            DfsStoragePreparationScope::MetadataCountCohort { .. } => unreachable!("native cohort requires native activation authority"),
             DfsStoragePreparationScope::Metadata(shard) => {
                 let preparation = content.prepare(&dfs_root.join("content"), budget)?;
                 if matches!(

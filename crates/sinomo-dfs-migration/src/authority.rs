@@ -28,6 +28,7 @@ mod configuration;
 pub(crate) mod content_work;
 mod handoff;
 mod namespace_work;
+mod namespace_counts;
 pub(crate) mod placement_job_source;
 mod placement_work;
 mod plan_file;
@@ -434,6 +435,16 @@ impl NativeImportAuthority {
 }
 
 impl MetadataImportAuthority for NativeImportAuthority {
+    fn namespace_count_cohort_ready(&self, source: &MetadataSourceCut) -> Result<bool> {
+        self.count_cohort_ready(source)
+    }
+    fn namespace_count_initializations_ready(
+        &self,
+        shard: &sinomo_dfs::DfsMetadataShardId,
+        obligations: &std::collections::BTreeSet<(sinomo_dfs::DfsFileSystemId, String)>,
+    ) -> Result<bool> {
+        self.count_initializations_ready(shard, obligations)
+    }
     fn queue_original_topology_after_install(
         &self,
         source: &MetadataSourceCut,
@@ -1804,6 +1815,87 @@ fn shared_runtime(
     Ok(value)
 }
 
+/// Explicit maintenance owner retaining the SAME converter/source locks as the
+/// registered storage provider. Callers must drain namespace writers before
+/// capture, collect every retiring owner's source, and enroll that complete set.
+/// Dropping this handle grants no completion or permission to resume writers.
+pub struct NamespaceCountMaintenance {
+    runtime: Arc<MigrationRuntime>,
+}
+impl NamespaceCountMaintenance {
+    pub fn open(
+        context: &sinomo_module::ComponentContext,
+        lifecycle: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<Self, sinomo_module::ComponentError> {
+        Ok(Self { runtime: shared_runtime(context, lifecycle)? })
+    }
+    pub fn capture(
+        &self, shard: &sinomo_dfs::DfsMetadataShardId,
+        catalog: &[DfsMetadataShardConfig], budget: usize,
+    ) -> Result<Option<crate::namespace_counts::NamespaceCountMaintenanceSource>> {
+        self.require_live(catalog)?;
+        self.runtime.metadata.capture_namespace_count_source(
+            &self.runtime.metadata_root.join(&shard.0), shard, catalog, budget,
+        )
+    }
+    pub fn enroll(
+        &self, shard: &sinomo_dfs::DfsMetadataShardId,
+        sources: &[crate::namespace_counts::NamespaceCountMaintenanceSource],
+        catalog: &[DfsMetadataShardConfig], at: time::OffsetDateTime,
+        limits: crate::namespace_counts::NamespaceCountMaintenanceLimits,
+    ) -> Result<crate::namespace_count_cohort::NamespaceCountCohortSeal> {
+        self.require_live(catalog)?;
+        self.runtime.metadata.enroll_namespace_count_source(
+            &self.runtime.metadata_root.join(&shard.0), shard, sources, catalog, at, limits,
+        )
+    }
+    /// Recover the existing invocation identity before resuming enrollment.
+    /// This is DATA only; all activation and Ready gates remain native checks.
+    pub fn retained_cohort(&self, shard: &sinomo_dfs::DfsMetadataShardId)
+        -> Result<Option<crate::namespace_count_cohort::NamespaceCountCohortSeal>> {
+        let path = Path::new(&shard.0);
+        if shard.0.contains(['\\', ':', '\0']) || path.components().count() != 1
+            || !matches!(path.components().next(), Some(std::path::Component::Normal(_))) {
+            return Err(error("count maintenance requires a safe physical scope"));
+        }
+        let root = crate::metadata::namespace_count_plan_root(&self.runtime.metadata_root.join(&shard.0), shard)?;
+        let path = root.parent().ok_or_else(|| error("count stage has no parent"))?.join("namespace-count-source-cut.json");
+        if !path.exists() { return Ok(None); }
+        let cut: MetadataSourceCut = serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?;
+        let seal = cut.namespace_count_cohort.as_deref().ok_or_else(|| error("retained count cut omitted its seal"))?;
+        seal.validate_bound_cut(&cut)?;
+        if cut.scope_shard != *shard { return Err(error("retained count seal changed physical scope")); }
+        Ok(Some(seal.clone()))
+    }
+    pub fn advance(
+        &self, shard: &sinomo_dfs::DfsMetadataShardId, budget: usize,
+    ) -> Result<sinomo_dfs::DfsStoragePreparation> {
+        if *self.runtime.lifecycle.borrow() || self.runtime.lifecycle.has_changed().is_err() {
+            return Err(error("count maintenance owner lifecycle closed"));
+        }
+        let path = Path::new(&shard.0);
+        if shard.0.contains(['\\', ':', '\0']) || path.components().count() != 1
+            || !matches!(path.components().next(), Some(std::path::Component::Normal(_))) {
+            return Err(error("count maintenance requires a safe physical scope"));
+        }
+        let destination = self.runtime.metadata_root.join(&shard.0);
+        let plan_root = crate::metadata::namespace_count_plan_root(&destination, shard)?;
+        let enrolled = plan_root.parent().ok_or_else(|| error("count maintenance stage has no parent"))?
+            .join("namespace-count-source-cut.json");
+        if !enrolled.is_file() {
+            return Err(error("count maintenance cannot advance a source before complete-set enrollment"));
+        }
+        self.runtime.metadata.prepare_with_source(&destination, &destination, shard, budget)
+    }
+    fn require_live(&self, catalog: &[DfsMetadataShardConfig]) -> Result<()> {
+        if *self.runtime.lifecycle.borrow() || self.runtime.lifecycle.has_changed().is_err() {
+            return Err(error("count maintenance owner lifecycle closed"));
+        }
+        crate::namespace_count_cohort::validate_catalog(catalog)?;
+        self.runtime.authority.require_count_capabilities(catalog)
+    }
+}
+
 /// Mount after the normal DFS component has acquired its real storage lease.
 /// The service exposes only hidden native candidates, never normal DFS routes.
 pub fn staged_import_component_factory()
@@ -1826,6 +1918,7 @@ pub fn storage_preparation_provider(
                 return Err(error("read-only storage provider lifecycle closed"));
             }
             let current = match scope {
+                DfsStoragePreparationScope::MetadataCountCohort { .. } => false,
                 DfsStoragePreparationScope::Metadata(_) => crate::metadata::current_root(root)?,
                 DfsStoragePreparationScope::MetadataRouting => routing_cache::current(root)?,
                 DfsStoragePreparationScope::Content => crate::content::current(root)?,
@@ -1850,6 +1943,17 @@ pub fn storage_preparation_provider(
     Ok(Arc::new(move |root, scope, budget| {
         if *runtime.lifecycle.borrow() || runtime.lifecycle.has_changed().is_err() {
             return Err(error("storage provider component lifecycle closed"));
+        }
+        if let DfsStoragePreparationScope::MetadataCountCohort { shard, obligations } = scope {
+            // This callback runs with the resident backend slot held. It must
+            // not enter converter/local-state preparation or reopen the root.
+            let expected = runtime.metadata_root.join(&shard.0);
+            if root != expected { return Err(error("count admission changed its actual metadata owner root")); }
+            return Ok(if runtime.authority.count_initializations_ready(shard, obligations)? {
+                sinomo_dfs::DfsStoragePreparation::Ready
+            } else {
+                sinomo_dfs::DfsStoragePreparation::Pending { processed_records: 0 }
+            });
         }
         if matches!(scope, DfsStoragePreparationScope::LocalState) {
             // Preparation supplies the physical root, while the original
@@ -1988,6 +2092,9 @@ pub fn storage_preparation_provider(
             return Ok(local);
         }
         match scope {
+            DfsStoragePreparationScope::MetadataCountCohort { .. } => {
+                unreachable!("handled by read-only native activation admission")
+            }
             DfsStoragePreparationScope::Metadata(shard) => {
                 let content = runtime.content.prepare(&dfs_root.join("content"), budget)?;
                 if matches!(content, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {

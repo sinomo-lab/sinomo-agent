@@ -4,6 +4,8 @@
 //! table maps, secondary indexes, and rollback bookkeeping used while
 //! materializing journal entries.
 
+mod parent_counts;
+
 use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
@@ -98,6 +100,8 @@ pub(crate) struct DfsMetadataTables {
     /// Derived from active request-owned prepares and rebuilt on snapshot load.
     pub(crate) namespace_prepare_request_owners: BTreeMap<(NodeId, String), BTreeSet<String>>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
+    /// Nonserialized active parent-write lookup, derived only from durable jobs.
+    parent_count_reservations: BTreeMap<(DfsFileSystemId, DfsObjectId), BTreeSet<String>>,
     pub(crate) namespace_job_receipts: BTreeMap<String, DfsNamespaceJobReceipt>,
     pub(crate) namespace_requests: BTreeMap<(NodeId, String), DfsNamespaceRequestRecord>,
     pub(crate) namespace_request_receipts: BTreeMap<(NodeId, String), DfsNamespaceRequestReceipt>,
@@ -1130,6 +1134,18 @@ impl DfsMetadataTables {
     }
     pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
         match op {
+            DfsMetadataTableOp::PutNamespaceJob { job } if job.kind == crate::DfsNamespaceJobKind::ParentCountParticipant => {
+                let (participant, state) = job.parent_count_participant().ok_or_else(|| MetadataBackendError::Serde("parent participant job lost its declaration".into()))?;
+                participant.validate()?;
+                if !participant.matches_job(job, state) { return Err(MetadataBackendError::Serde("parent participant job changes its declared identity".into())); }
+                Ok(())
+            }
+            DfsMetadataTableOp::PutNamespaceJobReceipt { receipt } if receipt.kind == crate::DfsNamespaceJobKind::ParentCountParticipant => {
+                if receipt.status != DfsNamespaceJobStatus::Completed || !receipt.parent_count.as_ref().is_some_and(|terminal| terminal.participant_id == receipt.job_id && terminal.state != crate::DfsParentCountState::Reserved) {
+                    return Err(MetadataBackendError::Serde("parent participant receipt has no exact terminal decision".into()));
+                }
+                Ok(())
+            }
             DfsMetadataTableOp::PutReceipt { receipt } => {
                 self.validate_receipt_publication(receipt)
             }
@@ -1364,7 +1380,9 @@ impl DfsMetadataTables {
                 Ok(())
             }
             op @ (DfsMetadataTableOp::PutReceipt { .. }
-            | DfsMetadataTableOp::WithdrawReceipt { .. }) => {
+            | DfsMetadataTableOp::WithdrawReceipt { .. }
+            | DfsMetadataTableOp::PutNamespaceJob { .. }
+            | DfsMetadataTableOp::PutNamespaceJobReceipt { .. }) => {
                 self.validate_checked(&op)?;
                 self.apply_with_rollback(op, rollback);
                 Ok(())
@@ -2447,10 +2465,14 @@ impl DfsMetadataTables {
             }
 
             DfsMetadataTableOp::PutNamespaceJob { job } => {
+                self.remove_parent_count_index(&job.job_id);
                 self.namespace_job_receipts.remove(&job.job_id);
-                self.namespace_jobs.insert(job.job_id.clone(), job);
+                let job_id = job.job_id.clone();
+                self.namespace_jobs.insert(job_id.clone(), job);
+                self.insert_parent_count_index(&job_id);
             }
             DfsMetadataTableOp::PutNamespaceJobReceipt { receipt } => {
+                self.remove_parent_count_index(&receipt.job_id);
                 self.namespace_jobs.remove(&receipt.job_id);
                 self.namespace_job_receipts
                     .insert(receipt.job_id.clone(), receipt);
@@ -3206,6 +3228,7 @@ impl DfsMetadataTableRollback {
         tables.rebuild_namespace_prepare_footprint_indexes();
         tables.rebuild_namespace_prepare_request_index();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
+        tables.rebuild_parent_count_index();
         rollback_map(
             &mut tables.namespace_job_receipts,
             self.namespace_job_receipts,

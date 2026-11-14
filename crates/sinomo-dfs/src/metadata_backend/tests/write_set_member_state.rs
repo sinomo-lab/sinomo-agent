@@ -9,6 +9,9 @@ use crate::{
 };
 use sinomo_core::kv::KvRequestId;
 
+#[path = "write_set_member_state/native_snapshots.rs"]
+mod native_snapshots;
+
 fn node(name: &str) -> NodeId {
     NodeId::from_legacy_named(name).unwrap()
 }
@@ -227,44 +230,39 @@ fn an_applied_swap_or_a_later_epoch_keeps_the_fence_until_the_record_reaches_it(
 
 #[test]
 fn the_member_state_survives_snapshot_install_and_fences_an_old_epoch_snapshot() {
+    let native = native_snapshots::NativeSnapshots::new("native-member-state-snapshot");
     let root = sinomo_testdir::TestDir::new("write-set-promise-snapshot");
-    let source_root = sinomo_testdir::TestDir::new("write-set-promise-snapshot-source");
-    let image = || {
-        LocalSobjMetadataBackend::new(shard_id(), source_root.path())
-            .unwrap()
-            .export_snapshot_image()
-            .unwrap()
-    };
     let mut backend = backend(&root);
+    // Backend/owner validation with real native captured epochs, original cut,
+    // source image and complete catalog; not a general takeover availability test.
     backend
-        .promise_metadata_takeover_owned(&cut(3, 1), &KvRequestId::generate())
+        .promise_metadata_takeover_owned(&native.before_cut, &KvRequestId::generate())
         .unwrap();
-    let image_for_old_epoch = image();
-    let sequence = image_for_old_epoch
-        .descriptor()
-        .materialized_through_sequence;
+    let old_permit = native.permit(&native.before_context, &native.before_image);
     assert!(matches!(
         backend.replace_with_replicated_snapshot_with_replica_permit(
-            &permit(3, Some(3)),
+            &old_permit,
             shard_id(),
-            sequence,
-            image_for_old_epoch,
+            native.before_image.materialized_through_sequence,
+            native.before_image.clone()
         ),
         Err(MetadataBackendError::SourceEpochFenced { .. })
     ));
+    let current_permit = native.permit(&native.current_context, &native.current_image);
     backend
         .replace_with_replicated_snapshot_with_replica_permit(
-            &permit(4, Some(3)),
+            &current_permit,
             shard_id(),
-            sequence,
-            image(),
+            native.current_image.materialized_through_sequence,
+            native.current_image.clone(),
         )
         .unwrap();
     assert!(backend.write_set_member_state_path().exists());
-    assert!(fenced(backend.begin_metadata_replica_ingest(
-        &permit(3, Some(3)),
-        &shard_id()
-    )));
+    assert!(fenced(
+        backend.begin_metadata_replica_ingest(&old_permit, &shard_id())
+    ));
+    drop(backend);
+    native.runtime.close().unwrap();
 }
 
 #[test]
@@ -363,65 +361,66 @@ fn floors_bind_only_at_their_own_epoch_on_a_write_set_shard() {
 
 #[test]
 fn an_earlier_epoch_floor_does_not_block_a_new_epochs_snapshot_and_is_replaced_before_it() {
-    let source_root = sinomo_testdir::TestDir::new("write-set-floor-snapshot-source");
-    let image = || {
-        LocalSobjMetadataBackend::new(shard_id(), source_root.path())
-            .unwrap()
-            .export_snapshot_image()
-            .unwrap()
-    };
-    let sequence = image().descriptor().materialized_through_sequence;
+    let native = native_snapshots::NativeSnapshots::new("native-member-floor-snapshot");
+    let sequence = native.current_image.materialized_through_sequence;
+    // Deliberately high stale floor DATA is the negative component input. Its
+    // epoch is captured from a real earlier assignment; current snapshot
+    // permission and image come from the real later native owner.
     let stale_floor = DfsMetadataPrefixAckFloor {
         shard_id: shard_id(),
         journal_sequence: sequence + 5,
         state_fingerprint: String::new(),
         durable_prefix_proof: proof(sequence + 5, 'b'),
-        authority_epoch: Some(3),
+        authority_epoch: Some(native.before_context.shard.epoch),
     };
-    // Under the all-member rule the floor still binds.
     let legacy_root = sinomo_testdir::TestDir::new("write-set-floor-snapshot-legacy");
     let mut legacy = backend(&legacy_root);
     metadata_cursor::put_metadata_prefix_ack_floor(legacy_root.path(), &stale_floor).unwrap();
+    let legacy_permit = native.permit(&native.legacy_context, &native.before_image);
     assert!(
         legacy
             .replace_with_replicated_snapshot_with_replica_permit(
-                &permit(4, None),
+                &legacy_permit,
                 shard_id(),
-                sequence,
-                image()
+                native.before_image.materialized_through_sequence,
+                native.before_image.clone()
             )
             .is_err()
     );
-    // On a write-set shard an epoch-3 floor does not bind an epoch-4 source,
-    // and an epoch-2 source is refused as stale.
     let root = sinomo_testdir::TestDir::new("write-set-floor-snapshot");
     let mut backend = backend(&root);
     metadata_cursor::put_metadata_prefix_ack_floor(root.path(), &stale_floor).unwrap();
+    let oldest_permit = native.permit(&native.oldest_context, &native.before_image);
     assert!(matches!(
         backend.replace_with_replicated_snapshot_with_replica_permit(
-            &permit(2, Some(2)),
+            &oldest_permit,
             shard_id(),
-            sequence,
-            image()
+            native.before_image.materialized_through_sequence,
+            native.before_image.clone()
         ),
         Err(MetadataBackendError::SourceEpochFenced { .. })
     ));
+    let current_permit = native.permit(&native.current_context, &native.current_image);
     backend
         .replace_with_replicated_snapshot_with_replica_permit(
-            &permit(4, Some(3)),
+            &current_permit,
             shard_id(),
             sequence,
-            image(),
+            native.current_image.clone(),
         )
         .unwrap();
     let floor = metadata_cursor::metadata_prefix_ack_floor(root.path(), &shard_id())
         .unwrap()
         .unwrap();
-    assert_eq!(floor.authority_epoch, Some(4));
+    assert_eq!(
+        floor.authority_epoch,
+        Some(native.current_context.shard.epoch)
+    );
     assert_eq!(floor.journal_sequence, sequence);
-    // A restart finds floors consistent with the installed state.
     drop(backend);
     self::backend(&root);
+    drop(legacy);
+    native.runtime.close().unwrap();
 }
 
 #[test]

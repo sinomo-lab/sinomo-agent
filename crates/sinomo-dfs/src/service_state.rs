@@ -353,6 +353,28 @@ impl DfsCrossShardNamespaceLockRegistry {
             .len()
     }
 
+    /// Existing reservation identities overlapping an admitted mutation path.
+    /// Callers must verify any exemption against the original durable job;
+    /// this query grants neither a writer nor a generic guard bypass.
+    pub(crate) fn overlapping_job_ids(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Vec<String> {
+        self.locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|(_, lock)| {
+                lock.file_system_id == *file_system_id && lock.paths.iter().any(|locked| {
+                    crate::posix_path::posix_path_is_at_or_under_prefix(path, locked)
+                        || crate::posix_path::posix_path_is_at_or_under_prefix(locked, path)
+                })
+            })
+            .map(|(job_id, _)| job_id.clone())
+            .collect()
+    }
+
     pub(crate) fn blocks(&self, file_system_id: &DfsFileSystemId, path: &str) -> bool {
         self.blocks_except_verified_job(file_system_id, path, None)
     }

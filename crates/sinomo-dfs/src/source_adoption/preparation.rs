@@ -854,6 +854,12 @@ impl DfsSourceAdoptionActor {
                 &family.source_object.path,
                 &family,
                 transfer,
+                if family.source_object.kind == crate::DfsObjectKind::Directory
+                    && completed.original_job.kind == crate::DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                    && crate::namespace::metadata_path(&completed.original_job.root_path)
+                        == crate::namespace::metadata_path(&family.source_object.path) {
+                    completed.original_job.directory_move_counts()?.map_or(0, |plan| plan.source_effect_delta(&family.source_object.path))
+                } else { 0 },
             )
             .map_err(error)?;
         Ok(())

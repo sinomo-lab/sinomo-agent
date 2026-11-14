@@ -2316,6 +2316,7 @@ fn clustered_metadata_journal_batch_requires_exact_authority_identity() {
     let replica = NodeId::from_legacy_named("node_meta_identity_replica").expect("replica node id");
     let file_system = file_system(primary.clone());
     let context = DfsMetadataReplicaShardContext {
+        namespace_catalog: None,
         local_node_id: replica.clone(),
         pending_membership_handoff: None,
         write_set: None,
@@ -3136,6 +3137,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let context = DfsMetadataReplicaShardContext {
+        namespace_catalog: None,
         local_node_id: desired_replica,
         write_set: None,
         shard: retiring_shard.clone(),

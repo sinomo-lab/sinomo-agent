@@ -1,4 +1,4 @@
-//! Read-only inspection of original native generation-8 and generation-9 images.
+//! Read-only inspection of original native generation-8, generation-9 and generation-10 images.
 //! Its hashes describe retained DATA; native recovery separately replays the
 //! exact saved plan and committed activation request. DFS never opens this image.
 use super::{Result, error, source_proof};
@@ -38,6 +38,9 @@ enum Record {
     },
     Prepared {
         record: Value,
+    },
+    ReceiptWithdrawal {
+        record: DfsReplicaReceiptWithdrawalRecord,
     },
     Eviction {
         record: DfsPreparedOperationEviction,
@@ -168,6 +171,7 @@ struct Tables<'a> {
     current_data: &'a DfsMetadataTableSnapshotTables,
     jobs: &'a [Value],
     prepares: &'a [Value],
+    generation: u16,
 }
 impl Serialize for Tables<'_> {
     fn serialize<S: serde::Serializer>(
@@ -201,6 +205,9 @@ impl Serialize for Tables<'_> {
         rows!(version_pins);
         rows!(cross_shard_pin_transfers);
         rows!(receipts);
+        if self.generation >= 10 {
+            rows!(receipt_withdrawals);
+        }
         rows!(intents);
         rows!(intent_receipts);
         if t.intent_receipt_retention != DfsWriteIntentReceiptRetentionState::default() {
@@ -208,10 +215,13 @@ impl Serialize for Tables<'_> {
         }
         rows!(advisory_lock_states);
         rows!(namespace_transaction_receipts);
-        if !self.prepares.is_empty() {
+        if self.generation >= 10 {
+            rows!(prepared_operations_v7);
+            rows!(namespace_jobs);
+        } else if !self.prepares.is_empty() {
             map.serialize_entry("prepared_operations_v7", &Prepares(self.prepares))?;
         }
-        if !self.jobs.is_empty() {
+        if self.generation < 10 && !self.jobs.is_empty() {
             map.serialize_entry("namespace_jobs", &Jobs(self.jobs))?;
         }
         rows!(namespace_job_receipts);
@@ -230,13 +240,18 @@ impl Serialize for Tables<'_> {
 }
 
 pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
+    Ok(read_snapshot(root)?.0)
+}
+pub(super) fn read_snapshot(
+    root: &Path,
+) -> Result<(DfsMetadataCandidateIdentity, DfsMetadataTableSnapshot)> {
     let path = root.join("records/tables/snapshot.sobj");
     let mut file = File::open(&path).map_err(error)?;
     let mut reader =
         MigrationStreamReader::from_file(file.try_clone().map_err(error)?).map_err(error)?;
     let header: Header = serde_ext::from_bytes(&reader.header).map_err(error)?;
     let generation = header.format_version;
-    if !matches!(generation, 8 | 9) {
+    if !matches!(generation, 8 | 9 | 10) {
         return Err(error("unknown original native image generation"));
     }
     native_document(&reader.header, generation)?;
@@ -323,7 +338,7 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
             }
             Record::Prepared { record } => {
                 let id = validate_prepare(&record)?;
-                if generation == 9 {
+                if generation >= 9 {
                     let original: DfsPreparedOperationRecord =
                         serde_json::from_value(record.clone()).map_err(error)?;
                     original.validate()?;
@@ -335,6 +350,14 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
                 if prepares.insert(id, record).is_some() {
                     return Err(error("prior native image repeats a preparation identity"));
                 }
+            }
+            Record::ReceiptWithdrawal { record } => {
+                if generation != 10 {
+                    return Err(error(
+                        "receipt withdrawals require original native generation 10",
+                    ));
+                }
+                tables.receipt_withdrawals.push(record);
             }
             Record::Eviction { record } => {
                 record.validate()?;
@@ -363,7 +386,7 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
         tables: T,
     }
     let mut semantic = blake3::Hasher::new();
-    if generation == 8 {
+    if generation == 8 || generation == 10 {
         serde_json::to_writer(
             &mut semantic,
             &Semantic {
@@ -373,6 +396,7 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
                     current_data: &tables,
                     jobs: &jobs,
                     prepares: &prepares,
+                    generation,
                 },
             },
         )
@@ -404,11 +428,21 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
         }
         digest.update(&buffer[..count]);
     }
-    Ok(DfsMetadataCandidateIdentity {
-        state_fingerprint: fingerprint,
-        file_fingerprint: format!("blake3:{}", digest.finalize().to_hex()),
-        prefix_proof: header.prefix_proof,
-    })
+    let snapshot = DfsMetadataTableSnapshot {
+        format_version: generation,
+        materialized_through_sequence: header.materialized_through_sequence,
+        semantic_state_fingerprint: fingerprint.clone(),
+        tables: Box::new(tables),
+        prefix_proof: header.prefix_proof.clone(),
+    };
+    Ok((
+        DfsMetadataCandidateIdentity {
+            state_fingerprint: fingerprint,
+            file_fingerprint: format!("blake3:{}", digest.finalize().to_hex()),
+            prefix_proof: header.prefix_proof,
+        },
+        snapshot,
+    ))
 }
 
 /// Historic desired topology is retained DATA under the new source cut. A9
@@ -759,5 +793,114 @@ mod tests {
             "actual R125 normal producer must retain copy state without the new stage"
         );
         inventory.verify(dir.path()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod count_native10_tests {
+    use super::*;
+    use sinomo_core::object::LengthMode;
+    use sinomo_core::storage::migration::stream::{MigrationStreamWriter, StreamCursor};
+
+    #[test]
+    fn native10_count_unknown_snapshot_is_verified_without_rewriting_source() {
+        let temp = sinomo_testdir::TestDir::new("count-original-native10-codec");
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("old-count-root").unwrap(),
+            file_system_id: sifs_file_system_id(),
+            path: "/".into(),
+            kind: DfsObjectKind::Directory,
+            namespace_link_count: None,
+            tombstone_provenance: None,
+            owner_node_id: sinomo_core::node::NodeId::from_legacy_named("old-count-owner").unwrap(),
+            current_locations: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: DfsVersion::from_legacy_named("old-count-version").unwrap(),
+            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let mut state = DfsMetadataCandidateState::new(Default::default()).unwrap();
+        state
+            .apply(DfsPreparedMetadataEffect::PutObject { object })
+            .unwrap();
+        let tables = state.snapshot();
+        let proof =
+            source_proof::conversion_base(0, "original-native10-codec", "original-unknown-count");
+        let current_root = temp.join("current-data");
+        let writer = DfsMetadataCandidateWriter::open(&current_root).unwrap();
+        writer.write(tables.clone(), proof.clone()).unwrap();
+        drop(writer);
+        #[derive(Serialize)]
+        struct Semantic<T: Serialize> {
+            format_version: u16,
+            materialized_through_sequence: u64,
+            tables: T,
+        }
+        let mut hash = blake3::Hasher::new();
+        serde_json::to_writer(
+            &mut hash,
+            &Semantic {
+                format_version: 10,
+                materialized_through_sequence: 0,
+                tables: Tables {
+                    current_data: &tables,
+                    jobs: &[],
+                    prepares: &[],
+                    generation: 10,
+                },
+            },
+        )
+        .unwrap();
+        let fingerprint = format!("blake3:{}", hash.finalize().to_hex());
+        let header = serde_json::json!({"format_version":10,"materialized_through_sequence":0,
+            "prefix_proof":proof,"semantic_state_fingerprint":fingerprint});
+        let source = temp.join("original-native10");
+        std::fs::create_dir_all(source.join("records/tables")).unwrap();
+        let path = source.join("records/tables/snapshot.sobj");
+        let mut output = MigrationStreamWriter::resume(
+            &path,
+            &serde_ext::to_bytes(&header, 10, LengthMode::U32).unwrap(),
+            &StreamCursor::default(),
+        )
+        .unwrap();
+        let mut input =
+            MigrationStreamReader::open(&current_root.join("records/tables/snapshot.sobj"))
+                .unwrap();
+        while let Some(bytes) = input.next_record(MAX_RECORD_BYTES as usize).unwrap() {
+            let record: Value = serde_ext::from_bytes(&bytes).unwrap();
+            output
+                .append(&serde_ext::to_bytes(&record, 10, LengthMode::U32).unwrap())
+                .unwrap();
+        }
+        output.finish().unwrap();
+        drop(output);
+        let original_bytes = std::fs::read(&path).unwrap();
+        let (identity, captured) = read_snapshot(&source).unwrap();
+        assert_eq!(identity.prefix_proof, proof);
+        assert_eq!(identity.state_fingerprint, fingerprint);
+        assert_eq!(*captured.tables, tables);
+        assert!(
+            captured
+                .tables
+                .objects
+                .iter()
+                .all(|row| row.namespace_link_count.is_none())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        let mut changed = original_bytes.clone();
+        let index = changed.len() / 2;
+        changed[index] ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert!(read_snapshot(&source).is_err());
     }
 }

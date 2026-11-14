@@ -1169,6 +1169,155 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Complete a bootstrap cohort without recounting or overwriting live
+    /// parents. New parents already carry the cohort's full initial count.
+    pub(crate) fn publish_missing_bootstrap_objects(
+        &mut self,
+        objects: Vec<DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        let mut still_missing = Vec::new();
+        for object in objects {
+            let backend = self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata {
+                message: "bootstrap cohort requires its actual metadata owner".into(),
+            })?;
+            let occupant = backend.get_object_by_path(&object.file_system_id, &object.path)?;
+            if occupant.is_some() { continue; }
+            let current = backend.get_object(&object.object_id)?;
+            if current.is_some() {
+                return Err(DfsError::Metadata { message: format!("bootstrap identity {} requires qualified repair rather than pathname recreation", object.object_id) });
+            }
+            still_missing.push(object);
+        }
+        let mut groups = std::collections::BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
+        for object in still_missing {
+            let scope = self.metadata_effect_scope_for_object(&object, "bootstrap-cohort-scope".into())?;
+            groups.entry(scope.shard_id).or_default().push(object);
+        }
+        let mut authored_parents = BTreeSet::new();
+        for (shard_id, candidates) in groups {
+            let _namespace_plan = self.namespace_execution.begin_independent_planning();
+            let mut objects = Vec::new();
+            for object in candidates {
+                let backend = self.metadata_backend.as_ref().expect("validated bootstrap owner");
+                if backend.get_object_by_path(&object.file_system_id, &object.path)?.is_some() { continue; }
+                if backend.get_object(&object.object_id)?.is_some() {
+                    return Err(DfsError::Metadata { message: "bootstrap identity changed before its owning transaction".into() });
+                }
+                self.namespace_execution.observe_path(&object.file_system_id, &object.path, None);
+                self.namespace_execution.observe_object(&object.file_system_id, &object.object_id, None);
+                objects.push(object);
+            }
+            let fresh_paths = objects.iter().map(|object| object.path.clone()).collect::<BTreeSet<_>>();
+            let mut parents = std::collections::BTreeMap::<String, DfsObjectMetadata>::new();
+            for object in &objects {
+                if object.kind != DfsObjectKind::Directory { continue; }
+                let Some(parent_path) = parent_posix_path(&object.path) else { continue; };
+                if fresh_paths.contains(&parent_path) || authored_parents.contains(&parent_path) { continue; }
+                if let Some(parent) = parents.get_mut(&parent_path) {
+                    parent.namespace_link_count = Some(crate::posix::updated_namespace_link_count(parent, 1)?);
+                    continue;
+                }
+                let parent_shards = self.namespace_shards_for_exact_paths(&object.file_system_id, [parent_path.as_str()])?;
+                if parent_shards.iter().any(|parent| parent.shard_id != shard_id.0 || parent.primary_node_id != self.node_id) {
+                    return Err(DfsError::Metadata { message: format!("retained bootstrap anchor {} requires qualified original-genesis repair across its parent shard", object.path) });
+                }
+                let parent = self.parent_directory_touch_metadata_for_create(object)?.ok_or_else(|| DfsError::Metadata {
+                    message: "bootstrap directory has no parent successor".into(),
+                })?;
+                parents.insert(parent_path, parent);
+            }
+            objects.extend(parents.into_values());
+            if objects.is_empty() { continue; }
+            let file_system_id = objects[0].file_system_id.clone();
+            let versions = objects.iter().map(|object| object_version_record(object, object.content_size_bytes)).collect::<Vec<_>>();
+            self.apply_namespace_transaction(DfsNamespaceTransaction {
+                content_reference_identity: None, contribution_digest: None,
+                extension_expectations: Vec::new(), file_version_pins: None,
+                transaction_id: namespace_transaction_id_for_batch("bootstrap-missing-cohort", &file_system_id, &objects, &versions),
+                file_system_id, objects, versions, advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::now_utc(),
+            })?;
+            authored_parents.extend(fresh_paths);
+        }
+        Ok(())
+    }
+
+    fn publish_namespace_membership_change(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<bool, DfsError> {
+        let _namespace_plan = self.namespace_execution.begin_planning();
+        let Some(backend) = self.metadata_backend.as_ref() else { return Ok(false); };
+        let current = backend.get_object(&object.object_id)?;
+        let occupant = backend.get_object_by_path(&object.file_system_id, &object.path)?;
+        let old_occupant = match current.as_ref() {
+            Some(current) if current.path != object.path => backend.get_object_by_path(&current.file_system_id, &current.path)?,
+            _ => occupant.clone(),
+        };
+        self.namespace_execution.observe_object(&object.file_system_id, &object.object_id, current.as_ref());
+        self.namespace_execution.observe_path(&object.file_system_id, &object.path, occupant.as_ref());
+        if let Some(current) = current.as_ref().filter(|current| current.path != object.path) {
+            self.namespace_execution.observe_path(&current.file_system_id, &current.path, old_occupant.as_ref());
+        }
+        let mut deltas = std::collections::BTreeMap::<String, i64>::new();
+        let mut change = |row: &DfsObjectMetadata, delta| {
+            if row.kind == DfsObjectKind::Directory && row.tombstone_provenance.is_none()
+                && let Some(parent) = parent_posix_path(&row.path)
+            { *deltas.entry(parent).or_default() += delta; }
+        };
+        if let Some(current) = current.as_ref().filter(|current| old_occupant.as_ref().is_some_and(|old| old.object_id == current.object_id)) { change(current, -1); }
+        if let Some(occupant) = occupant.as_ref().filter(|old| old.object_id != object.object_id) { change(occupant, -1); }
+        change(object, 1);
+        deltas.retain(|_, delta| *delta != 0);
+        let canonical_unlink = object.kind == DfsObjectKind::Tombstone
+            && object.tombstone_provenance.is_none()
+            && current.as_ref().is_some_and(|current| !matches!(current.kind,
+                DfsObjectKind::Directory | DfsObjectKind::Hardlink | DfsObjectKind::Tombstone)
+                && current.path == object.path
+                && old_occupant.as_ref().is_some_and(|occupant| occupant.object_id == current.object_id));
+        if canonical_unlink {
+            let current = current.as_ref().expect("validated original canonical row");
+            if crate::posix::updated_namespace_link_count(current, 0)? != 1 {
+                return Err(DfsError::Metadata { message: "canonical deletion with surviving links requires the owning unlink/promotion operation".into() });
+            }
+            if let Some(parent) = parent_posix_path(&object.path) { deltas.entry(parent).or_insert(0); }
+        }
+        if deltas.is_empty() { return Ok(false); }
+        let mut paths = vec![object.path.as_str()];
+        paths.extend(deltas.keys().map(String::as_str));
+        if let Some(current) = current.as_ref() { paths.push(&current.path); }
+        let shards = self.namespace_shards_for_exact_paths(&object.file_system_id, paths)?;
+        if shards.len() > 1 || shards.first().is_some_and(|shard| shard.primary_node_id != self.node_id) {
+            return Err(DfsError::Metadata { message: "directory membership change requires its owning namespace transaction or existing cross-shard adoption job".into() });
+        }
+        let mut objects = vec![object.clone()];
+        for (path, delta) in deltas {
+            let mut parent = self.metadata_backend.as_ref().unwrap()
+                .get_object_by_path(&object.file_system_id, &path)?
+                .ok_or_else(|| DfsError::Metadata { message: format!("directory membership parent {path} is absent") })?;
+            if parent.kind != DfsObjectKind::Directory {
+                return Err(DfsError::Metadata { message: format!("directory membership parent {path} is not a directory") });
+            }
+            self.namespace_execution.observe_object(&parent.file_system_id, &parent.object_id, Some(&parent));
+            self.namespace_execution.observe_path(&parent.file_system_id, &parent.path, Some(&parent));
+            parent.namespace_link_count = Some(crate::posix::updated_namespace_link_count(&parent, delta)?);
+            let touch = dfs_now_unix_nanos().max(parent.modified_at_unix_nanos.saturating_add(1)).max(parent.changed_at_unix_nanos.saturating_add(1));
+            parent.modified_at_unix_nanos = touch;
+            parent.changed_at_unix_nanos = touch;
+            parent.version = namespace::next_version(&parent.version);
+            objects.push(parent);
+        }
+        let versions = objects.iter().map(|object| object_version_record(object, object.content_size_bytes)).collect::<Vec<_>>();
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None, contribution_digest: None,
+            extension_expectations: Vec::new(), file_version_pins: None,
+            transaction_id: namespace_transaction_id_for_batch("directory-membership", &object.file_system_id, &objects, &versions),
+            file_system_id: object.file_system_id.clone(), objects, versions,
+            advisory_lock_states: Vec::new(), created_at: OffsetDateTime::now_utc(),
+        })?;
+        Ok(true)
+    }
+
     pub(crate) fn put_visible_object_and_version_in_metadata_backend(
         &mut self,
         object: &DfsObjectMetadata,
@@ -1176,6 +1325,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         let mut object = object.clone();
         normalize_current_locations(&mut object.current_locations);
+        if self.publish_namespace_membership_change(&object)? { return Ok(()); }
         let mut version = object_version_record(
             &object,
             size_bytes.or(self.object_content_size_hint(&object)?),
@@ -1307,6 +1457,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
+        self.namespace_execution.observe_object(&parent.file_system_id, &parent.object_id, Some(&parent));
+        self.namespace_execution.observe_path(&parent.file_system_id, &parent.path, Some(&parent));
         let mut touched_parent = parent;
         let touch_time = dfs_now_unix_nanos()
             .max(touched_parent.modified_at_unix_nanos.saturating_add(1))
@@ -1315,6 +1467,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touched_parent.changed_at_unix_nanos = touch_time;
         touched_parent.version = namespace::next_version(&touched_parent.version);
         touched_parent.last_modified_by_event_id = Some(EventId::generate());
+        if child.kind == DfsObjectKind::Directory {
+            touched_parent.namespace_link_count = Some(crate::posix::updated_namespace_link_count(&touched_parent, 1)?);
+        }
         Ok(Some(touched_parent))
     }
 
@@ -2551,6 +2706,7 @@ mod atomic_create_parent_touch_tests {
 
     fn path_object(object_id: DfsObjectId, kind: DfsObjectKind) -> DfsObjectMetadata {
         DfsObjectMetadata {
+            namespace_link_count: kind.initial_namespace_link_count(),
             object_id,
             file_system_id: sifs_file_system_id(),
             path: "/services/fenced-create.txt".to_string(),

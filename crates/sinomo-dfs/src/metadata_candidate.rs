@@ -460,6 +460,15 @@ impl DfsMetadataCandidateState {
             tables: crate::metadata_table_store::metadata_tables_from_snapshot(tables)?,
         })
     }
+    /// Reconstruct one exact native source event as DATA. The caller retains
+    /// source custody and validates the contiguous original prefix separately.
+    /// This shares ordinary replay (including Prepare receipts), never author
+    /// admission or normalization of historical payloads/digests.
+    pub fn replay_native_journal_entry(&mut self, entry: &crate::DfsMetadataJournalEntry) -> Result<()> {
+        let op = crate::metadata_replay::table_op_for_native_journal_entry(entry)?;
+        self.tables.apply_checked(op)
+    }
+
     pub fn apply(&mut self, effect: crate::DfsPreparedMetadataEffect) -> Result<()> {
         if let crate::DfsPreparedMetadataEffect::PutObject { object } = &effect {
             let transaction = crate::DfsNamespaceTransaction {
@@ -591,3 +600,6 @@ impl DfsMetadataCandidateState {
         self.tables.rebuild_prepared_operation_reservations()
     }
 }
+
+#[path = "metadata_candidate/namespace_counts.rs"]
+mod namespace_counts;

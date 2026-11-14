@@ -728,7 +728,7 @@ impl DfsSourceAdoptionContextSlot {
             previous: Some(previous),
         }
     }
-    fn offer(&self) -> Option<crate::DfsSourceAdoptionOffer> {
+    pub(crate) fn offer(&self) -> Option<crate::DfsSourceAdoptionOffer> {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())

@@ -16,6 +16,7 @@ pub const SIFS_SERVICES_PATH: &str = "/services";
 pub fn distributed_sifs(owner_node_id: NodeId) -> DfsFileSystem {
     let node_files_path = sifs_node_files_path(&owner_node_id);
     DfsFileSystem {
+        namespace_count_activation: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: sifs_file_system_id(),
@@ -33,7 +34,7 @@ pub fn distributed_sifs(owner_node_id: NodeId) -> DfsFileSystem {
 pub fn distributed_sifs_bootstrap_objects(owner_node_id: NodeId) -> Vec<DfsObjectMetadata> {
     let node_path = sifs_node_path(&owner_node_id);
     let node_files_path = sifs_node_files_path(&owner_node_id);
-    [
+    let mut objects = [
         SIFS_ROOT_PATH.to_string(),
         SIFS_SINOMO_PATH.to_string(),
         SIFS_NODES_PATH.to_string(),
@@ -51,7 +52,24 @@ pub fn distributed_sifs_bootstrap_objects(owner_node_id: NodeId) -> Vec<DfsObjec
         };
         directory_object_with_policy(&path, owner_node_id.clone(), policy)
     })
-    .collect()
+    .collect::<Vec<_>>();
+    initialize_bootstrap_counts(&mut objects);
+    objects
+}
+
+/// Genesis knows the complete fresh namespace before distributing its shards.
+/// This is never used to infer counts from retained or partial metadata.
+fn initialize_bootstrap_counts(objects: &mut [DfsObjectMetadata]) {
+    let mut children = std::collections::BTreeMap::<String, u64>::new();
+    for object in objects.iter() {
+        if object.kind == DfsObjectKind::Directory
+            && let Some(parent) = crate::posix_path::parent_posix_path(&object.path) {
+            *children.entry(parent).or_default() += 1;
+        }
+    }
+    for object in objects {
+        object.namespace_link_count = Some(2 + children.get(&object.path).copied().unwrap_or(0));
+    }
 }
 
 pub fn distributed_sifs_bootstrap_objects_for_nodes(
@@ -71,6 +89,7 @@ pub fn distributed_sifs_bootstrap_objects_for_nodes(
             }
         }
     }
+    initialize_bootstrap_counts(&mut objects);
     objects
 }
 
@@ -87,6 +106,7 @@ pub fn directory_object_with_policy(
         object_id: object_id_for_path(path),
         file_system_id: sifs_file_system_id(),
         path: normalize_sifs_path(path),
+        namespace_link_count: (DfsObjectKind::Directory).initial_namespace_link_count(),
         kind: DfsObjectKind::Directory,
         tombstone_provenance: None,
         owner_node_id: owner_node_id.clone(),

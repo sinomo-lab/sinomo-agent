@@ -10,6 +10,9 @@ pub const DFS_FILE_HISTORY_RANGE_LIMIT: u32 = 64 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsMetadataSelection {
+    /// One current path owner's metadata, including its maintained namespace count.
+    /// No alias enumeration, cross-shard snapshot, or generation revalidation.
+    StatAtPathV2 { path: String },
     StatAtPathV1 {
         request: Box<DfsStatPathRequest>,
     },
@@ -99,6 +102,10 @@ pub struct DfsMetadataShardQuery {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DfsMetadataQueryResult {
+    StatAtPathV2 {
+        #[serde(deserialize_with = "crate::protocol::required_optional")]
+        object: Option<Box<DfsObjectMetadata>>,
+    },
     StatAtPathV1 {
         view: Box<DfsStatPathView>,
     },
@@ -172,6 +179,19 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
     query: &DfsMetadataShardQuery,
 ) -> Result<DfsMetadataQueryResult, MetadataBackendError> {
     match &query.selection {
+        DfsMetadataSelection::StatAtPathV2 { path } => {
+            let normalized = crate::posix_path::normalize_posix_path(path)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+            if normalized != *path {
+                return Err(MetadataBackendError::Serde("stat path is not canonical".into()));
+            }
+            let mut object = backend.get_object_by_path_on_shard(
+                &query.shard_id, &query.file_system_id, path,
+            )?.filter(|row| row.file_system_id == query.file_system_id
+                && row.tombstone_provenance.is_none() && row.kind != DfsObjectKind::Tombstone);
+            crate::stat_projection::enrich_stat_object(backend, &mut object)?;
+            Ok(DfsMetadataQueryResult::StatAtPathV2 { object: object.map(Box::new) })
+        }
         DfsMetadataSelection::StatAtPathV1 { .. } => Err(MetadataBackendError::Serde(
             "stat path requires its authenticated owning service and complete catalog".into(),
         )),
@@ -182,9 +202,10 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
                 .ok_or_else(|| {
                     MetadataBackendError::Serde("stat object has no exact prefix".into())
                 })?;
-            let object = backend.get_object(object_id)?.filter(|row| {
+            let mut object = backend.get_object(object_id)?.filter(|row| {
                 row.file_system_id == query.file_system_id && row.tombstone_provenance.is_none()
             });
+            crate::stat_projection::enrich_stat_object(backend, &mut object)?;
             Ok(DfsMetadataQueryResult::StatObjectV1 {
                 object: object.map(Box::new),
                 prefix,
@@ -573,6 +594,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ));
             }
         }
+        // Native admission (or the actual local owner) already captured the
+        // operation's complete routing projection. Reuse that view to exclude
+        // ancestor-shard copies rather than fetching the catalog again per read.
+        // The normal response boundary separately revalidates shard authority.
+        let inode_catalog = if matches!(query.selection,
+            DfsMetadataSelection::StatAtPathV2 { .. } | DfsMetadataSelection::StatObjectV1 { .. }) {
+            Some(self.namespace_execution.context()
+                .filter(|context| context.file_system_id == query.file_system_id)
+                .ok_or_else(|| error("stat requires its admitted routing projection"))?
+                .shards.clone())
+        } else { None };
+        if let DfsMetadataSelection::StatAtPathV2 { path } = &query.selection {
+            self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
+            if !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &query.file_system_id, inode_catalog.as_deref().expect("stat catalog"), path,
+            )?.is_some_and(|shard| shard.shard_id == query.shard_id.0 && shard.epoch == query.epoch) {
+                return Err(error("stat path does not belong to the queried authority"));
+            }
+        }
         if let DfsMetadataSelection::DirectoryPage { path, .. } = &query.selection {
             self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
         }
@@ -805,7 +845,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let exact_stat_scope =
             matches!(
                 query.selection,
-                DfsMetadataSelection::StatProjectionV1 { .. }
+                DfsMetadataSelection::StatAtPathV2 { .. }
+                    | DfsMetadataSelection::StatProjectionV1 { .. }
                     | DfsMetadataSelection::StatObjectV1 { .. }
             ) || matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. })
                 && !complete_stat_scope;
@@ -901,7 +942,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             result
         };
-        let result = result?;
+        let mut result = result?;
+        if let DfsMetadataQueryResult::StatObjectV1 { object, .. } = &mut result {
+            if let Some(row) = object.as_ref()
+                && !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &query.file_system_id, inode_catalog.as_deref().expect("stat catalog"), &row.path,
+                )?.is_some_and(|owner| owner.shard_id == query.shard_id.0
+                    && owner.epoch == query.epoch && owner.primary_node_id == self.node_id) {
+                *object = None;
+            }
+        }
+        if let DfsMetadataSelection::StatAtPathV2 { path } = &query.selection {
+            ensure_read(&query.file_system_id, path)?;
+        }
         match &result {
             DfsMetadataQueryResult::StatAtPathV1 { view } => {
                 if let Some(object) = view.object.as_deref() {
@@ -918,7 +971,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ensure_read(&object.file_system_id, &object.path)?;
                 }
             }
-            DfsMetadataQueryResult::CurrentObject {
+            DfsMetadataQueryResult::StatAtPathV2 { object: Some(object) }
+            | DfsMetadataQueryResult::CurrentObject {
                 object: Some(object),
             }
             | DfsMetadataQueryResult::StatObjectV1 {

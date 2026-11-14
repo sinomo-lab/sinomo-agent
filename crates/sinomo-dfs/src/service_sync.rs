@@ -285,16 +285,18 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     }
 }
 
-fn rebind_completed_metadata_shard_membership_handoff_once(
+/// Read-only qualification of the existing certified handoff marker and its
+/// exact current descendant. It grants no writer or publication permission.
+pub(crate) fn completed_metadata_handoff_evidence(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     active: &DfsMetadataShardConfig,
     pending: Option<&DfsMetadataShardMembershipHandoff>,
     proof: Option<&DfsMetadataShardMembershipHandoffProof>,
-) -> Result<bool, DfsError> {
+) -> Result<Option<(crate::DfsMetadataShardWriteFreeze, DfsMetadataPrefixProof)>, DfsError> {
     let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
     if backend.metadata_shard_write_freeze(&shard_id)?.is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     // The completion proof and marker are durable, but this lane may have
     // opened before canonical replication caught up a different backend
@@ -302,13 +304,13 @@ fn rebind_completed_metadata_shard_membership_handoff_once(
     // exact completion prefix.
     backend.refresh_metadata_shard_durable_view_if_changed(&shard_id)?;
     let Some(freeze) = backend.metadata_shard_write_freeze(&shard_id)? else {
-        return Ok(false);
+        return Ok(None);
     };
     if pending.is_some_and(|pending| pending.handoff_id == freeze.handoff_id) {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(proof) = proof else {
-        return Ok(false);
+        return Ok(None);
     };
     let exact_successor_epoch = freeze.retiring_epoch.checked_add(1);
     let marker_matches_active_epoch = freeze
@@ -339,7 +341,7 @@ fn rebind_completed_metadata_shard_membership_handoff_once(
         || !marker_matches_active_epoch
         || !proof_matches_marker_and_active
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(checked_prefix) = metadata_shard_prefix_matches_or_extends_marker(
         backend,
@@ -349,8 +351,23 @@ fn rebind_completed_metadata_shard_membership_handoff_once(
         &freeze.rebind_prefix_proof,
     )?
     else {
-        return Ok(false);
+        return Ok(None);
     };
+    Ok(Some((freeze, checked_prefix)))
+}
+
+fn rebind_completed_metadata_shard_membership_handoff_once(
+    backend: &mut dyn DfsMetadataBackend,
+    local_node_id: &NodeId,
+    active: &DfsMetadataShardConfig,
+    pending: Option<&DfsMetadataShardMembershipHandoff>,
+    proof: Option<&DfsMetadataShardMembershipHandoffProof>,
+) -> Result<bool, DfsError> {
+    let Some((freeze, checked_prefix)) = completed_metadata_handoff_evidence(
+        backend, local_node_id, active, pending, proof,
+    )? else { return Ok(false); };
+    let proof = proof.expect("qualified handoff evidence includes its proof");
+    let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
     #[cfg(any(test, feature = "test-support"))]
     let mut native_boundary = crate::native_shard_trace::current_boundary_interest();
     #[cfg(any(test, feature = "test-support"))]
@@ -447,6 +464,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(rebound)
+    }
+
+    /// Existing activated membership proof and exact canonical descendant;
+    /// observation only, never an independent author certificate.
+    pub(crate) fn activated_metadata_handoff_for_current_owner(
+        &mut self, active: &DfsMetadataShardConfig,
+    ) -> Result<Option<(crate::DfsMetadataShardWriteFreeze, DfsMetadataPrefixProof)>, DfsError> {
+        if active.primary_node_id != self.node_id { return Ok(None); }
+        self.refresh_control_plane_latest()?;
+        let Some(control_plane) = self.control_plane.as_mut() else { return Ok(None); };
+        let (pending, proof) = {
+            let store = DfsControlPlaneStore::new(control_plane.as_mut());
+            if store.get_metadata_shard(&active.file_system_id, &active.shard_id)?.as_ref() != Some(active) { return Ok(None); }
+            (store.get_metadata_shard_membership_handoff(&active.file_system_id, &active.shard_id)?,
+             store.get_metadata_shard_membership_handoff_proof(&active.file_system_id, &active.shard_id)?)
+        };
+        let Some(proof) = proof else { return Ok(None); };
+        // Converted images are a separate provenance boundary; only the
+        // membership transfer proves this unchanged native journal lineage.
+        if !matches!(proof.cause, crate::DfsMetadataShardHandoffCause::Membership)
+            || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                &proof.retiring_shard, &proof.desired_shard, &proof.acknowledged_node_ids.iter().cloned().collect(),
+            ) { return Ok(None); }
+        let Some(backend) = self.metadata_backend.as_deref_mut() else { return Ok(None); };
+        let evidence = completed_metadata_handoff_evidence(backend, &self.node_id, active, pending.as_ref(), Some(&proof))?;
+        Ok(evidence.filter(|(freeze, _)| freeze.activated_epoch == Some(active.epoch)))
+    }
+
+    /// A local Prepared status or a larger epoch alone cannot retire a phase.
+    pub(crate) fn prepared_operation_has_retired_authority_evidence(
+        &mut self, active: &DfsMetadataShardConfig, digest: &crate::DfsPreparedOperationDigest,
+    ) -> Result<bool, DfsError> {
+        if digest.file_system_id != active.file_system_id || digest.shard_id.0 != active.shard_id
+            || digest.owner_epoch >= active.epoch { return Ok(false); }
+        let Some((freeze, current_prefix)) = self.activated_metadata_handoff_for_current_owner(active)? else { return Ok(false); };
+        if digest.owner_epoch > freeze.retiring_epoch || digest.prepare_sequence > freeze.journal_sequence { return Ok(false); }
+        let Some(backend) = self.metadata_backend.as_deref() else { return Ok(false); };
+        let Some(Some(original)) = backend.prepared_operation_record_at_prefix(
+            &digest.shard_id, &current_prefix, &digest.operation_id,
+        )? else { return Ok(false); };
+        original.validate()?;
+        Ok(original.digest == *digest && original.status == crate::DfsPreparedOperationStatus::Prepared
+            && original.committed_entry.is_none())
     }
 
     /// Bind only this physical shard. A fresh lazy shell has no operational
@@ -1112,6 +1172,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object: &DfsObjectMetadata,
     ) -> Result<DfsMetadataQuorumSyncTarget, DfsError> {
+        self.capture_metadata_quorum_sync_target_for_namespace_scope(
+            &object.file_system_id, &object.path, object.object_id.as_str(),
+        )
+    }
+
+    /// Capture the same actual authoritative prefix for durable namespace
+    /// work whose original object may already have moved or been evicted.
+    /// The job's scope selects the owner; no synthetic object grants authority.
+    pub(crate) fn capture_metadata_quorum_sync_target_for_namespace_scope(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        namespace_path: &str,
+        subject: &str,
+    ) -> Result<DfsMetadataQuorumSyncTarget, DfsError> {
         let configured = if let Some(control) = self.control_plane.as_ref() {
             let projection =
                 control
@@ -1122,7 +1196,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })?;
             let prefix = format!(
                 "{}/",
-                crate::control_plane::metadata_shards_prefix(&object.file_system_id)
+                crate::control_plane::metadata_shards_prefix(file_system_id)
             );
             let entries = projection
                 .entries(&prefix)
@@ -1134,9 +1208,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|entry| entry.decode())
                 .collect::<Result<Vec<DfsMetadataShardConfig>, _>>()?;
             crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &object.file_system_id,
+                file_system_id,
                 &shards,
-                &object.path,
+                namespace_path,
             )?
         } else {
             None
@@ -1145,7 +1219,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsError::Distributed {
                 message: format!(
                     "filesystem {} has a control-plane client but no configured metadata authority for POSIX sync of {}",
-                    object.file_system_id, object.object_id
+                    file_system_id, subject
                 ),
             });
         }
@@ -1187,14 +1261,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         status
                             .file_system_id
                             .as_ref()
-                            .is_none_or(|file_system_id| file_system_id == &object.file_system_id)
+                            .is_none_or(|candidate| candidate == file_system_id)
                     })
                     .collect::<Vec<_>>();
                 if matching.len() != 1 {
                     return Err(DfsError::Metadata {
                         message: format!(
                             "cannot select a single local metadata shard for POSIX sync of {}",
-                            object.object_id
+                            subject
                         ),
                     });
                 }
@@ -1213,19 +1287,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && primary_node_id != &self.node_id
         {
             return Err(DfsError::StaleOwnerEpoch {
-                file_system_id: object.file_system_id.clone(),
+                file_system_id: file_system_id.clone(),
                 local_node_id: self.node_id.clone(),
                 primary_node_id: primary_node_id.clone(),
                 epoch: status.epoch.unwrap_or_default(),
             });
         }
         if let Some(status_file_system_id) = status.file_system_id.as_ref()
-            && status_file_system_id != &object.file_system_id
+            && status_file_system_id != file_system_id
         {
             return Err(DfsError::Metadata {
                 message: format!(
                     "local metadata shard {} belongs to filesystem {}, not POSIX sync filesystem {}",
-                    status.shard_id.0, status_file_system_id, object.file_system_id
+                    status.shard_id.0, status_file_system_id, file_system_id
                 ),
             });
         }
@@ -1245,7 +1319,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None => (self.node_id.clone(), None, Vec::new()),
         };
         Ok(DfsMetadataQuorumSyncTarget {
-            file_system_id: object.file_system_id.clone(),
+            file_system_id: file_system_id.clone(),
             shard_id: status.shard_id,
             primary_node_id,
             authority_epoch,

@@ -1,142 +1,135 @@
 # Authoritative distributed stat
 
-`posix_stat_distributed` and `posix_lstat_distributed` derive inode fields from
-current authenticated metadata authorities. A caller need not be a metadata
-replica, ingest journals, or replay an unrelated backlog. Local-only stat and
-namespace-record inspection retain their distinct contracts. In particular,
-namespace `lstat` and capability no-link opens must expose link records rather
-than erase them by following their targets.
+`posix_stat_distributed` and `posix_lstat_distributed` read inode metadata from
+its current authenticated authority. The canonical object owns its maintained
+namespace link count. Ordinary stat does not enumerate aliases or directory
+children, validate whole-shard journal generations, replay journals, or wait for
+unrelated writers to become quiet.
 
-## Read and generation contract
+Local-only stat and namespace-record inspection retain their distinct contracts.
+Namespace `lstat` and capability no-link opens expose link records rather than
+erase them by following their targets. Ordinary POSIX stat resolves links through
+the existing path and inode lookup rules.
 
-The ordinary path resolver selects the namespace path. A versioned stat query
-replaces its terminal object lookup and carries a fresh read identity and the
-complete current shard catalog. When the receiving Main already owns every
-contributing physical shard, it captures the canonical object and its derived
-count through those existing resident read scopes. It releases and reopens the
-snapshots to compare exact prefixes; re-reading the same pinned generation is
-insufficient. Changed cuts may use the existing four read rounds, sharing one
-128-entry namespace budget and the same absolute deadline across all attempts.
-No replacement backend, caller replica or journal ingestion is involved.
-Stat-only pins use the existing lock-free materialized-table reader and its
-storage-generation, rotation and corruption checks. A shared table image must
-match the cache allocation supplying its exact prefix. Pins grant no writer
-custody and do not run journal recovery; a retained source writer is left intact.
-Operator-status snapshots are never used to authorize these fields.
+## Count ownership
 
-The reply preserves the selected directory entry or explicit absence separately
-from the resolved canonical inode. Validated observations enter the existing
-first-read-wins namespace read set, so a later stat cannot rebase the comparisons
-of a mutation already being planned.
+A live non-directory inode counts its namespace names. A live directory reports
+two plus its immediate child directories. Hardlink markers refer to the canonical
+object; they do not maintain independent copies of its count. Directory fragment
+entry counts include regular files and are not the inode's link count.
 
-When participants have different owners, or the bounded owner projection cannot
-complete, the reply contains no derived count. The caller collects explicit
-pages from each configured authority. File link counts include the canonical
-link and every live alias whose path belongs to that shard's current assignment.
-Directory link counts are two plus live immediate child directories. Old
-ancestor-shard copies and physical source-eviction tombstones do not contribute.
-The canonical owner and derived fields must belong to the same validated object
-and view generation; incompatible evidence never becomes a partial count.
+The count belongs to current namespace metadata, not to an immutable content
+revision. Content overwrite, receipt refresh, repair and historical content
+restore preserve the current count. Replica installation and physical source
+copy eviction do not create or remove logical namespace names. A canonical
+object that changes path or authority carries its count with its stable identity.
+Removing its canonical name while promoting an alias removes one name without
+creating a second inode.
 
-Pages carry an exact materialized-prefix proof, request identity, explicit
-completeness flag and native continuation cursor. Continuation requires the
-same prefix. The requested page limit cannot exceed the existing 128-record
-bound. Aggregate owner reads consume that same budget across physical shards
-and validation attempts rather than multiplying it by the number of shards.
-Unknown content size remains unknown; file/symlink size comes from the exact
-object or matching version metadata, never the caller's historical manifests.
-Recorded locations do not assert that every content replica is reachable.
+Namespace producers own count changes. A same-shard mutation publishes affected
+entries and their canonical inode or parent count successors in the same
+namespace transaction. A cross-shard operation binds its count successors to the
+original durable job, expected object generations and exact namespace effects.
+Completion requires the corresponding count work to be settled. Retrying an
+uncertain operation observes or replays its original successor; it must not
+increment or decrement the current value again.
 
-The complete owner reply binds its fresh request, object, derived fields and
-prefix vector with an integrity digest. The digest detects corruption and
-misbinding; authenticated current authority remains mandatory and is not
-replaced by the digest. Paged cross-owner reads validate every collected prefix
-again and recheck the catalog. Exact-prefix stability establishes overlapping
-read intervals, not a persistent distributed snapshot or new consensus protocol.
-Concurrent publication, reconfiguration, namespace reservations or unavailable
-validation can make stat fail. Progress under continuous writes or arbitrary
-outages is not promised.
+Directory moves reserve any foreign canonical parents through the original
+namespace job before issuing namespace effects. These reservations exclude
+conflicting parent writes without adding stat read fences. Before effects, the
+job may release its exact reservations without changing counts. Once effects
+may have applied, the job must recover forward and settle its original count
+successors before completion.
 
-Cross-owner collection uses the existing four POSIX read rounds under that same
-absolute deadline. A validated current canonical object with a changed version,
-or an authenticated typed refusal proving a forward prefix change, discards
-the whole collection before starting a fresh read identity. Old pages and counts
-are never combined with the new view. Co-owned capture keeps its owner-side
-four-round bound; these loops are not nested. Continuous changes exhaust the
-bound and return an error. Unsupported or malformed evidence, non-forward prefix
-conflicts and authority changes do not become retry permission.
-Different content hashes under the same immutable version are inconsistent
-evidence and fail immediately; they are not treated as a new generation.
+Counts use checked arithmetic. Unknown counts cannot be inferred from a partial
+replica, a missing local alias index, or a default of one or two. A directory
+count of two does not establish emptiness: regular files do not contribute to it.
 
-An acknowledged link creation or unlink is therefore reflected by a subsequent
-successful stat without requiring local replay. Concurrent changes may instead
-produce an explicit error. The caller does not use a stale local count as a
-fallback. Existing cross-shard namespace-flight guards, authenticated requester
-checks and current-authority response validation remain mandatory.
+## Read contract
 
-The canonical-path reservation is checked by the authority that owns that path
-in the current authenticated catalog. An alias-only or child-only projection
-does not borrow a foreign shard's replica guard for the canonical path. Every
-actual object and alias returned by the queried physical scope still passes
-the existing namespace checks. Foreign guards remain installed; they are not
-deleted to make a stat succeed. Without a certified routing context, the
-conservative path guard remains in force.
+Path resolution selects a namespace entry using existing routing, symlink,
+authorization and namespace-reservation checks. A terminal path read addresses
+only that path's physical metadata authority. The canonical object and its count
+come from the same held materialized read view. Size may be enriched from the
+matching version record in that view. Recorded replica locations may be enriched
+from object-local receipts; they do not assert that each replica is reachable.
+Unknown content size remains unknown unless the existing exact immutable-content
+fallback can establish it.
 
-## Wire and mixed versions
+A successful read describes the inode at its authority read point. Later writes
+can make it old before the reply is delivered; they do not invalidate that
+already captured record. An acknowledged namespace operation must be reflected
+by a subsequent successful current-owner read. Readers do not reconstruct a
+simultaneous view of unrelated shards to establish that property.
 
-The existing namespace `MetadataQuery` route has three explicitly versioned
-query selections and matching results:
+Hardlink target discovery follows the existing bounded identity-resolution path.
+A target known only by object ID may require authority discovery. This is
+separate from counting names: once the canonical inode is found, its stored
+count supplies the result without alias pages or final generation fences.
 
-- `stat-at-path-v1` replaces the final object lookup with a request-bound owner
-  projection, or explicitly reports that distributed paging is required.
-- `stat-object-v1` resolves an inode identity within an exact physical shard.
-- `stat-projection-v1` returns a bounded alias/child page or revalidates its
-  captured prefix. Its page requires the request, prefix, object, entries,
-  `complete` and continuation fields as defined by the typed wire model.
+Validated path observations enter the existing first-read-wins namespace read
+set. A later read must not rebase the predicates of a mutation already being
+planned. Capability no-link opens preserve the selected object identity for
+subsequent content reads rather than resolving the original path again.
 
-`stat-projection-changed-v1` is a refusal of an old prefix, carrying the exact
-page request and current prefix. It carries no object, page or count. Only a
-well-formed strictly later prefix from the authenticated current owner permits
-a bounded fresh collection. Unknown refusal variants and older peers' ordinary
-errors remain explicit failures; no diagnostic error-string matching is used.
+Authentication, filesystem/shard/epoch binding, response identity, canonical
+path ownership and existing namespace-flight guards remain mandatory. An
+unavailable canonical authority, missing count initialization, malformed reply,
+or reservation involving the selected namespace may fail a read. Unrelated
+publication elsewhere in the namespace is not a reason to retry or reject stat.
+Stat grants no publication authority and creates no durable request, recovery
+job, or metadata write.
 
-An older server rejects the unknown selection. New callers require the matching
-versioned result and all generation/completeness evidence. Unsupported versions,
-wrong result kinds, wrong request identity, malformed or changed prefixes,
-stale filesystem/shard/epoch, unauthenticated source/destination, or missing
-required evidence cannot become a successful current stat. No compatibility
-fallback replays caller journals or substitutes an older local projection.
+## Wire and compatibility
 
-New servers continue serving the old metadata-query variants unchanged. Old
-clients retain their previous stat behavior; upgrading the server does not
-retroactively provide the new client-side guarantee. A mixed cluster can serve
-this contract only when every required authority implements these variants.
-If any alias-owning authority is unavailable or too old, complete stat is
-unavailable even when the canonical object's content remains readable.
+The existing namespace `MetadataQuery` route carries `stat-at-path-v2` for the
+current path owner's metadata. Its result is either that selected record or
+explicit authoritative absence. A live canonical record must contain a valid
+maintained count. A hardlink marker instead requires canonical target resolution.
+`stat-object-v1` remains the exact physical-shard inode-identity lookup used by
+that resolution path.
+
+The older aggregate path/projection variants are not a fallback for a
+maintained-count read. New callers reject an unsupported selection, mismatched
+result, wrong authority, invalid count or count-less legacy canonical record.
+They never recover success by scanning history or accepting a client-local count.
+
+An optional absent count preserves the encoding of historical object bodies,
+including their prepared-operation digests. It does not make an uninitialized
+live count valid. Storage and writer activation must prevent a count-unaware
+producer from erasing or failing to maintain an initialized count. Mixed active
+writers that do not share the count contract are unsupported.
+
+## Existing metadata
+
+Count initialization is explicit maintenance owned by the migration and native
+import mechanisms. It requires a complete stable authoritative namespace cut,
+not an independent count of each shard's local copies. Current assignments
+identify contributing entries; stale ancestor copies and physical source-eviction
+records must not be counted again.
+
+Conversion preserves original prepared bytes, digests and uncertain operation
+identities. In-flight namespace work must be settled or explicitly handled by
+its owning recovery protocol. Neither stat nor an ordinary mutation can guess
+an initial count. Installation and readiness require actual native source and
+activation evidence; a computed census is conversion data, not authority.
+
+Conversion stages and fences the complete authoritative shard set before any
+member activates. Ordinary writes remain unavailable until every member has
+activated count-aware storage. Partial failure retains the original fences and
+conversion identities for forward recovery; restarting an installed member
+does not independently release this maintenance barrier.
 
 ## Dispatch, cancellation and bounds
 
-The collector uses the existing 15-second read-freshness budget, shortened by
-any enclosing caller deadline. That absolute deadline spans pagination, target
-resolution and final validation and is restored on return. Individual metadata
-queries retain their existing transport limits and respect that enclosing
-budget. Pages use the existing 128-record query bound and existing RPC byte
-limits; hardlink resolution retains its sixteen-hop bound. Cancellation fails
-the read without publishing metadata or creating recovery work.
+The read retains the existing 15-second freshness budget, shortened by an
+enclosing caller deadline, and restores the caller's deadline on return.
+Cancellation fails the read without publishing metadata or creating recovery
+work. Hardlink resolution retains its sixteen-hop bound. These bounds do not
+permit retries merely because an unrelated shard changed.
 
-A Core owning one physical shard cannot impersonate a different shard merely
-because both primaries share its node ID. The same-node query uses the existing
-authenticated registered Main sender to reach the actual owner. It neither
-changes the Core's general dispatch role nor processes unrelated queued
-mutations. Returned frames retain their original identity and pass the same
-request/route/authority checks as remote responses.
-The physical-scope check follows the request's declared read footprint. A
-cross-owner path projection needs only its exact path shard and can use a Core
-that already owns that scope; unrelated catalog shards do not force it back
-through Main. A complete co-owned projection still requires every declared
-scope, and a genuinely different physical shard still uses registered Main.
-
-These queries are read data, not publication authority. They introduce no
-persistent format, replica, background scheduler, quorum rule or routing
-subsystem. Normal publication, source custody and protocol-read preemption
-continue to be owned by their existing mechanisms.
+A Core owning one physical shard cannot impersonate another shard because both
+primaries share a node ID. Same-node queries use the existing authenticated Main
+path when the actual physical owner differs. An exact local owner may read its
+resident view directly. Neither path creates another backend, ingests caller
+journal batches, or processes unrelated queued mutations to obtain stat.

@@ -3195,6 +3195,7 @@ fn local_owned_write_routes_to_owner() {
             object_id: object_id.clone(),
             file_system_id,
             path: "src/lib.rs".to_string(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: owner.clone(),

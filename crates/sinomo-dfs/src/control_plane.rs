@@ -464,7 +464,24 @@ fn merge_file_system_config_publication(
     merged.subtree_policies = current.subtree_policies.clone();
     merged.retention_policies = current.retention_policies.clone();
     merged.module_metadata = current.module_metadata.clone();
+    merged.namespace_count_activation = current.namespace_count_activation.clone();
     merged
+}
+
+fn validate_ordinary_namespace_count_activation(
+    expected: Option<&DfsFileSystemConfig>, desired: &DfsFileSystemConfig,
+) -> Result<(), KvError> {
+    if expected.and_then(|config| config.namespace_count_activation.as_ref())
+        != desired.namespace_count_activation.as_ref()
+    {
+        return Err(KvError::Serialization {
+            detail: "namespace-count activation is authored only by the native complete-cohort maintenance transaction".into(),
+        });
+    }
+    if let Some(activation) = &desired.namespace_count_activation {
+        activation.validate().map_err(|detail| KvError::Serialization { detail })?;
+    }
+    Ok(())
 }
 
 fn merge_file_system_config_defaults(
@@ -1930,6 +1947,7 @@ impl<'a> PlacementUpdatePublication<'a> {
         desired: &'a DfsFileSystemConfig,
         job: &DfsPlacementReconciliationJob,
     ) -> Result<Self, KvError> {
+        validate_ordinary_namespace_count_activation(Some(expected), desired)?;
         let mut durable_job = job.clone();
         durable_job.accepted_config = scoped_placement_config_for_job(desired, job);
         validate_v1_placement_reconciliation_job(&durable_job)?;
@@ -2365,6 +2383,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                     .to_string(),
             });
         }
+        validate_ordinary_namespace_count_activation(expected, desired)?;
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get(&key)?;
         let creating = expected.is_none() && current_entry.is_none();
@@ -4513,6 +4532,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     .to_string(),
             });
         }
+        validate_ordinary_namespace_count_activation(expected, desired)?;
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get_async(&key).await?;
         let creating = expected.is_none() && current_entry.is_none();
@@ -5834,6 +5854,17 @@ fn metadata_prepared_operation_member_compares(
             ),
         });
     }
+    // A capability policy grants permission; it cannot make an older assigned
+    // binary understand the maintained-count publication contract.
+    let count_capability = sinomo_core::node::DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY;
+    if !member.capabilities.iter().any(|capability| capability.as_str() == count_capability)
+        || !effective_capabilities.iter().any(|capability| capability.as_str() == count_capability)
+    {
+        return Err(KvError::Serialization {
+            detail: format!("metadata shard {} assigned node {} does not advertise and permit {}",
+                desired.shard_id, node_id, count_capability),
+        });
+    }
     if cluster_id
         .as_ref()
         .is_some_and(|cluster_id| *cluster_id != member.cluster_id)
@@ -6759,6 +6790,7 @@ mod tests {
             (1, 0, false),
         ] {
             let config = DfsFileSystemConfig {
+                namespace_count_activation: None,
                 file_system_id: DfsFileSystemId::generate(),
                 display_name: "structural-policy-DATA".into(),
                 owner_node_id: owner.clone(),
@@ -7121,6 +7153,7 @@ mod tests {
         desired_replicas: usize,
     ) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -7837,6 +7870,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let expected = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8104,6 +8138,7 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-monotonic-partial-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8460,6 +8495,7 @@ mod tests {
 
         store
             .put_file_system_config(&DfsFileSystemConfig {
+                namespace_count_activation: None,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: custom.file_system_id.clone(),
@@ -8477,6 +8513,7 @@ mod tests {
         assert_eq!(published.subtree_policies, custom.subtree_policies);
 
         let defaults = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: custom.file_system_id.clone(),
@@ -8516,6 +8553,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-publication-deleted-policy-owner");
         let deleted = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8621,6 +8659,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permit-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8718,6 +8757,7 @@ mod tests {
     fn stale_observed_generation_cannot_pass_the_authoritative_permit_transaction() {
         let owner = node("placement-stale-observed-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8799,6 +8839,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permanent-permit-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8906,6 +8947,7 @@ mod tests {
     fn placement_failed_release_survives_ephemeral_store_and_fresh_store_finishes_exact_delete() {
         let owner = node("placement-release-recovery-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8985,6 +9027,7 @@ mod tests {
     fn placement_ambiguous_acquisition_is_queued_before_any_metadata_mutation() {
         let owner = node("placement-ambiguous-acquisition-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9105,6 +9148,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-prior-process-owner");
         let base = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9571,6 +9615,7 @@ mod tests {
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(&mut kv, vec![node("node_owner"), node("node_replica")]);
         let file_system = DfsFileSystem {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -10283,6 +10328,31 @@ mod tests {
         })
         .join()
         .expect("actual native control-plane DATA producer")
+    }
+
+    #[test]
+    fn ordinary_filesystem_updates_preserve_and_cannot_author_count_activation() {
+        // Configuration DATA only; these comparisons grant no maintenance CAS.
+        let mut current = DfsFileSystemConfig::from(&crate::DfsFileSystem::sifs(node("count-config-owner")));
+        current.namespace_count_activation = Some(crate::DfsNamespaceCountActivation {
+            schema_version: crate::DFS_NAMESPACE_COUNT_ACTIVATION_SCHEMA_VERSION,
+            initialization_id: "original-complete-cut".into(), cohort_id: "original-cohort".into(),
+            activation_digest: format!("blake3:{}", "a".repeat(64)),
+        });
+        let mut ordinary = current.clone();
+        ordinary.namespace_count_activation = None;
+        ordinary.display_name = "renamed".into();
+        let merged = merge_file_system_config_publication(Some(&current), &ordinary);
+        assert_eq!(merged.namespace_count_activation, current.namespace_count_activation);
+        assert_eq!(merged.display_name, "renamed");
+        assert_eq!(merge_file_system_config_defaults(Some(&current), &ordinary).namespace_count_activation,
+            current.namespace_count_activation);
+        assert!(validate_ordinary_namespace_count_activation(Some(&current), &merged).is_ok());
+        assert!(validate_ordinary_namespace_count_activation(None, &current).is_err());
+        assert!(validate_ordinary_namespace_count_activation(Some(&current), &ordinary).is_err());
+        let mut replacement = current.clone();
+        replacement.namespace_count_activation.as_mut().unwrap().initialization_id = "another-cut".into();
+        assert!(validate_ordinary_namespace_count_activation(Some(&current), &replacement).is_err());
     }
 
     fn copy_native_member_fixture_data(kv: &mut InProcessKvStore, nodes: Vec<NodeId>) {
@@ -11152,6 +11222,13 @@ mod tests {
                 2 => {
                     actual[0].as_mut().unwrap().key = "/unrelated-participant".into();
                 }
+                3 => {
+                    let entry = actual[0].as_mut().unwrap();
+                    let mut member = entry.decode::<ClusterMemberRecord>()?;
+                    member.capabilities.retain(|capability| capability.as_str()
+                        != sinomo_core::node::DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY);
+                    entry.value = sinomo_core::kv::encode_kv_value(&member)?;
+                }
                 _ => {}
             }
             Ok(actual)
@@ -11200,8 +11277,12 @@ mod tests {
             metadata_prepared_operation_admission_compares(&observer, &shard),
             Err(KvError::Serialization { detail }) if detail.contains("exact key scope")
         ));
+        observer.negative_response.store(3, Ordering::SeqCst);
+        assert!(matches!(metadata_prepared_operation_admission_compares(&observer, &shard),
+            Err(KvError::Serialization { detail }) if detail.contains("namespace-counts.v1")),
+            "an existing assignment and an effective policy cannot supply missing binary support");
         assert_eq!(observer.scalar_reads.load(Ordering::SeqCst), 0);
-        assert_eq!(observer.consistent_reads.load(Ordering::SeqCst), 3);
+        assert_eq!(observer.consistent_reads.load(Ordering::SeqCst), 4);
         drop(observer);
         drop(fixture.service);
         fixture.runtime.clear_faults();

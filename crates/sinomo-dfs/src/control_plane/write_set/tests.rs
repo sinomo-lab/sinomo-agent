@@ -29,6 +29,7 @@ fn shard(primary: &NodeId, replicas: &[&NodeId], epoch: u64) -> DfsMetadataShard
 
 fn file_system_config(rules: Vec<DfsSubtreePolicy>) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        namespace_count_activation: None,
         file_system_id: fs(),
         display_name: "sifs".into(),
         owner_node_id: node("node_ws_a"),

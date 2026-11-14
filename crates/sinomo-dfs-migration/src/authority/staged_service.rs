@@ -23,6 +23,7 @@ pub(super) const CONTENT_VERIFY_ROUTE: &str = "/dfs-migration/retained-content-v
 pub(super) const PLACEMENT_CUSTODY_ROUTE: &str = "/dfs-migration/placement-request-custody-v7";
 pub(super) const NAMESPACE_JOB_ROUTE: &str = "/dfs-migration/current-namespace-job-data-v7";
 const ROUTES: &[&str] = &[
+    super::namespace_counts::PROBE_ROUTE,
     SNAPSHOT_ROUTE,
     PREFIX_ROUTE,
     BLUEPRINT_ROUTE,
@@ -619,7 +620,7 @@ impl NativeImportAuthority {
             "target-format-{}",
             sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
         );
-        let supported_target = |value: &str| value == "target-format-9" || value == current_target;
+        let supported_target = |value: &str| value == "target-format-9" || value == "target-format-10" || value == current_target;
         match parts.as_slice() {
             [actual_key, target, "current-image"] => {
                 Ok(supported_target(target) && *actual_key == key && capsules.is_empty())
@@ -1523,6 +1524,12 @@ impl Service for StagedImportService {
                 .parse::<sinomo_core::node::NodeId>()
                 .map_err(|e| ServiceError::Service(e.to_string()))?;
             match request.route.as_str() {
+                super::namespace_counts::PROBE_ROUTE => {
+                    let probe = context.decode_request_body::<super::namespace_counts::Probe>(&request).await?;
+                    let result = tokio::task::block_in_place(|| self.authority.receive_count_probe(source, probe))
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    context.respond_value(super::namespace_counts::PROBE_ROUTE, result)?;
+                }
                 PLACEMENT_CUSTODY_ROUTE => {
                     let data = context
                         .decode_request_body::<super::placement_work::PlacementCustodyRequest>(
@@ -1834,6 +1841,7 @@ mod ancestry_ledger_tests {
         // No ACKs, cfg, native receipt or permission is created by this
         // filesystem-boundary fixture. The verifier tests only durable framing.
         MetadataSourceCut {
+            namespace_count_cohort: None,
             source_root: root.to_owned(),
             source_identity: "ledger-fixture".into(),
             scope_shard: sinomo_dfs::DfsMetadataShardId::new("root"),

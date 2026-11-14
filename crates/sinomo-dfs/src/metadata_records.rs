@@ -1752,6 +1752,8 @@ pub struct DfsNamespaceJobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
 }
+mod parent_counts;
+pub use parent_counts::*;
 mod hardlink_fence;
 pub use hardlink_fence::DfsHardlinkTargetFence;
 
@@ -1763,6 +1765,8 @@ pub use hardlink_fence::DfsHardlinkTargetFence;
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DfsNamespaceJobReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_count: Option<DfsParentCountReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_copy: Option<Box<DfsContentCopyJobReceipt>>,
     pub job_id: String,
@@ -1791,6 +1795,9 @@ impl DfsNamespaceJobReceipt {
             return None;
         }
         Some(Self {
+            parent_count: job.parent_count_participant().map(|(participant, state)| DfsParentCountReceipt {
+                participant_id: participant.participant_id.clone(), state: state.clone(),
+            }),
             job_id: job.job_id.clone(),
             content_copy: job.pending_frames.iter().find_map(|frame| match frame {
                 DfsNamespaceJobFrame::ContentCopy { state } => state.result.clone().map(|result| {
@@ -1834,6 +1841,7 @@ pub enum DfsNamespaceJobKind {
     /// commits its exact namespace generation.
     HardlinkTargetFenceAcrossShardPrimary,
     RenameDirectoryAcrossShardPrimaries,
+    ParentCountParticipant,
 }
 
 impl DfsNamespaceJobKind {
@@ -1855,6 +1863,40 @@ pub enum DfsNamespaceJobStatus {
     Running,
     Completed,
     Failed,
+}
+
+/// Original directory-root membership changes. The exact destination
+/// predicate fixes whether a rename replaces an existing directory.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsDirectoryMoveCounts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_participants: Option<DfsParentCountPlan>,
+    pub expected_destination: crate::DfsNamespaceDestinationPrecondition,
+    pub source_parent_delta: i64,
+    pub target_parent_delta: i64,
+}
+
+impl DfsNamespaceJobRecord {
+    pub(crate) fn directory_move_counts(&self) -> std::result::Result<Option<&DfsDirectoryMoveCounts>, crate::MetadataBackendError> {
+        if self.kind != DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries { return Ok(None); }
+        let mut plans = self.pending_frames.iter().filter_map(|frame| match frame {
+            DfsNamespaceJobFrame::CrossShardDirFinish { count_plan: Some(plan), .. } => Some(plan),
+            _ => None,
+        });
+        let plan = plans.next().ok_or_else(|| crate::MetadataBackendError::Serde(
+            "legacy directory job has no original counted-parent plan".into()))?;
+        if plans.any(|other| other != plan) { return Err(crate::MetadataBackendError::Serde("directory job has conflicting counted-parent plans".into())); }
+        let target = self.target_path.as_ref().ok_or_else(|| crate::MetadataBackendError::Serde("directory job has no target path".into()))?;
+        let same_parent = crate::posix_path::parent_posix_path(&self.root_path) == crate::posix_path::parent_posix_path(target);
+        let replaces = matches!(plan.expected_destination, crate::DfsNamespaceDestinationPrecondition::Exact(_));
+        let expected_source = if same_parent && !replaces { 0 } else { -1 };
+        let expected_target = if same_parent || replaces { 0 } else { 1 };
+        if (plan.source_parent_delta, plan.target_parent_delta) != (expected_source, expected_target) {
+            return Err(crate::MetadataBackendError::Serde("directory job changes its logical parent membership deltas".into()));
+        }
+        Ok(Some(plan))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1891,6 +1933,11 @@ pub enum DfsNamespaceJobFrame {
     CrossShardAdopt {
         moved_object: DfsObjectMetadata,
         old_path: String,
+        /// Canonical unlink promotion consumes this exact selected alias.
+        /// It is checked against destination atomic prepare predicates through
+        /// the existing authenticated original-job witness.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promotion_alias: Option<crate::DfsNamespaceObjectPrecondition>,
         destination_primary_node_id: NodeId,
     },
     /// Cross-shard-primary move: locally tombstone the old path, evict the
@@ -1906,8 +1953,9 @@ pub enum DfsNamespaceJobFrame {
         target_object_id: DfsObjectId,
         destination_primary_node_id: NodeId,
     },
-    /// Cross-shard-primary hardlink: locally record the target's link-count
-    /// change (ctime bump).
+    /// Legacy creation completion lacks an exact target/count successor.
+    /// Decoding retains original DATA; execution requires explicit migration.
+    /// New creation jobs use the existing target-fence install/commit frames.
     CrossShardHardlinkComplete {
         target_object_id: DfsObjectId,
     },
@@ -1965,7 +2013,10 @@ pub enum DfsNamespaceJobFrame {
     /// mtime change once the whole subtree has moved.
     CrossShardDirFinish {
         source_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count_plan: Option<DfsDirectoryMoveCounts>,
     },
+    ParentCountParticipant { participant: Box<DfsParentCountParticipant>, state: DfsParentCountState },
 }
 
 /// Compact identity of the SAME current native record-stream image carried
@@ -2013,6 +2064,30 @@ pub struct DfsMetadataTableSnapshot {
     pub tables: Box<DfsMetadataTableSnapshotTables>,
     pub semantic_state_fingerprint: String,
     pub prefix_proof: DfsMetadataPrefixProof,
+}
+
+impl DfsMetadataTableSnapshot {
+    /// Validate native candidate-image DATA using the owning stream codec's identity.
+    /// This does not authenticate its source or authorize installation.
+    pub fn validate_candidate_image_identity(&self) -> crate::metadata_error::Result<()> {
+        if self.format_version != crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
+            || !self.prefix_proof.is_well_formed()
+            || self.prefix_proof.journal_sequence != self.materialized_through_sequence
+        {
+            return Err(crate::MetadataBackendError::Serde(
+                "metadata candidate snapshot identity is inconsistent".into(),
+            ));
+        }
+        let tables = crate::metadata_table_store::metadata_tables_from_snapshot((*self.tables).clone())?;
+        if crate::metadata_table_store::snapshot_semantic_fingerprint(
+            &tables, Some(self.materialized_through_sequence),
+        )? != self.semantic_state_fingerprint {
+            return Err(crate::MetadataBackendError::Serde(
+                "metadata candidate snapshot fingerprint differs from its native rows".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Return a content-addressed identity for one complete materialized shard

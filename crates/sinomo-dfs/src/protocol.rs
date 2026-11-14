@@ -48,7 +48,7 @@ pub(crate) fn content_reference_outcome_family_fingerprint(
 /// are transient scheduling output; the fields below are the authoritative
 /// identity needed to prove which object generation and content the operation
 /// committed (or why its durable admission terminated without committing).
-fn required_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn required_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de>,
@@ -804,6 +804,12 @@ pub enum DfsNamespaceOperation {
     },
     /// Distinct closed command; legacy variant ordinals stay unchanged.
     MkdirAtNoLinksWithAttrs(DfsMkdirAtNoLinksWithAttrs),
+    /// Exact parent WRITE-row phase of the original directory namespace job.
+    ParentCountParticipant {
+        coordinator_job: Box<DfsNamespaceJobRecord>,
+        participant: Box<crate::DfsParentCountParticipant>,
+        action: crate::DfsParentCountAction,
+    },
 }
 
 impl DfsNamespaceOperation {
@@ -822,6 +828,7 @@ impl DfsNamespaceOperation {
                 | Self::FileSync { .. }
                 | Self::DirectorySync { .. }
                 | Self::InstallHardlinkTargetFence { .. }
+                | Self::ParentCountParticipant { action: crate::DfsParentCountAction::Reserve | crate::DfsParentCountAction::Abort, .. }
                 | Self::VerifyObjectFamilyAdoption { .. }
                 | Self::ContentReference { .. }
                 | Self::BeginContentCopy { .. }
@@ -834,6 +841,7 @@ impl DfsNamespaceOperation {
     /// shards remain independently authoritative for their own journal lanes.
     pub(crate) fn routing_path(&self) -> Option<&str> {
         match self {
+            Self::ParentCountParticipant { participant, .. } => Some(&participant.expected.path),
             Self::BeginContentCopy { path, .. } => Some(path),
             Self::ContentReference { request } => Some(&request.path),
             Self::MetadataQuery { .. } => None,
@@ -896,6 +904,7 @@ impl DfsNamespaceOperation {
     /// root.
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
+            Self::ParentCountParticipant { participant, .. } => vec![&participant.expected.path],
             Self::BeginContentCopy { path, .. } => vec![path],
             // The locator belongs to the immutable operation digest. It may
             // differ from the stable object's current authority after rename.
@@ -1134,6 +1143,7 @@ pub enum DfsPosixCoordinationResult {
     },
     FileSync(DfsPosixFileSyncCertificate),
     DirectorySync(DfsPosixDirectorySyncCertificate),
+    ParentCountParticipant { participant_id: String, outcome: crate::DfsParentCountOutcome },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

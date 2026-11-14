@@ -184,6 +184,8 @@ pub struct OriginalMetadataHandoffReservation {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MetadataSourceCut {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_count_cohort: Option<Box<crate::namespace_count_cohort::NamespaceCountCohortSeal>>,
     pub source_root: PathBuf,
     pub source_identity: String,
     pub scope_shard: DfsMetadataShardId,
@@ -387,6 +389,18 @@ pub(crate) fn data_reservation_refs(
 }
 
 pub trait MetadataImportAuthority: Send + Sync {
+    /// Reobserve the existing complete-set activation owner. Serialized DATA
+    /// and a local installation flag are not readiness authority.
+    fn namespace_count_cohort_ready(&self, source: &MetadataSourceCut) -> Result<bool> {
+        Ok(source.namespace_count_cohort.is_none())
+    }
+    fn namespace_count_initializations_ready(
+        &self,
+        _shard: &DfsMetadataShardId,
+        obligations: &std::collections::BTreeSet<(DfsFileSystemId, String)>,
+    ) -> Result<bool> {
+        Ok(obligations.is_empty())
+    }
     fn queue_original_topology_after_install(
         &self,
         source: &MetadataSourceCut,
@@ -686,7 +700,7 @@ impl MetadataConverter {
         shard: &DfsMetadataShardId,
         budget: usize,
     ) -> Result<DfsStoragePreparation> {
-        self.prepare_source(destination, source, shard, budget, None, None)
+        self.prepare_source(destination, source, shard, budget, None, None, false)
     }
 
     /// A captured old reservation can coexist with a current local image. Its
@@ -705,6 +719,7 @@ impl MetadataConverter {
             budget,
             Some(reservation),
             None,
+            false,
         )
     }
 
@@ -721,7 +736,7 @@ impl MetadataConverter {
         if capsules.is_empty() {
             return Err(error("metadata DATA goal requires actual bound capsules"));
         }
-        self.prepare_source(destination, source, shard, budget, None, Some(capsules))
+        self.prepare_source(destination, source, shard, budget, None, Some(capsules), false)
     }
 
     fn prepare_source(
@@ -732,6 +747,7 @@ impl MetadataConverter {
         budget: usize,
         original_reservation: Option<&OriginalMetadataHandoffReservation>,
         data_capsules: Option<&[Value]>,
+        capture_only: bool,
     ) -> Result<DfsStoragePreparation> {
         if budget == 0 {
             return Err(error("metadata conversion budget must be positive"));
@@ -849,6 +865,7 @@ impl MetadataConverter {
             data_goal.as_ref(),
             original_goal.as_ref(),
             &mut completion,
+            capture_only,
         );
         tracing::trace!(
             target: "sinomo.dfs.perf",
@@ -881,6 +898,20 @@ impl MetadataConverter {
         }
         drop(session);
         if matches!(&result, Ok(DfsStoragePreparation::Ready)) {
+            let (ready, recovered) = self.namespace_count_ready_before_open(
+                &destination, shard, data_goal.as_ref(),
+            )?;
+            if !ready {
+                return Ok(DfsStoragePreparation::Pending { processed_records: 0 });
+            }
+            // A prior turn can have installed the root while holding Ready for
+            // other cohort members. Reconstruct deferred completion from the
+            // same retained source rather than losing it with the warm session.
+            if completion.is_none() {
+                if let Some(source) = recovered {
+                    completion = Some(InstalledCompletion::Published(source, destination.clone()));
+                }
+            }
             if let Some(completion) = completion {
                 let authority = self
                     .authority
@@ -903,6 +934,65 @@ impl MetadataConverter {
             result
         }
     }
+    fn namespace_count_ready_before_open(
+        &self,
+        destination: &Path,
+        shard: &DfsMetadataShardId,
+        data_goal: Option<&DataGoalStage>,
+    ) -> Result<(bool, Option<MetadataSourceCut>)> {
+        let marker = read_import_marker(destination, shard)?;
+        let snapshot_path = destination.join("records/tables/snapshot.sobj");
+        let obligations = if snapshot_path.is_file() && current_root(destination)? {
+            let snapshot = sinomo_dfs::read_metadata_candidate(destination)?;
+            sinomo_dfs::namespace_count_cohort_obligations(&snapshot, shard)?
+        } else {
+            // Journal-only roots are checked again from their actually decoded
+            // tables by the core's MetadataCountCohort provider call.
+            std::collections::BTreeSet::new()
+        };
+        let mut source = marker.map(|marker| marker.source_cut);
+        if source.as_ref().is_none_or(|cut| cut.namespace_count_cohort.is_none())
+            && !obligations.is_empty()
+        {
+            let base = conversion_stage_base_path(destination, shard)?;
+            let stage = stage_path_for_goal(base.clone(), data_goal);
+            for root in [stage, base] {
+                let path = root.join("namespace-count-source-cut.json");
+                if !path.is_file() { continue; }
+                let recovered: MetadataSourceCut = read_json(&path)?;
+                let seal = recovered.namespace_count_cohort.as_ref()
+                    .ok_or_else(|| error("retained count source cut omitted its cohort"))?;
+                seal.validate_bound_cut(&recovered)?;
+                if recovered.scope_shard != *shard {
+                    return Err(error("retained count source cut changes physical scope"));
+                }
+                if source.as_ref().is_some_and(|old| old.namespace_count_cohort.is_some() && old != &recovered) {
+                    return Err(error("retained count readiness evidence conflicts"));
+                }
+                source = Some(recovered);
+            }
+        }
+        let count_source = source.filter(|cut| cut.namespace_count_cohort.is_some());
+        if count_source.is_none() && obligations.is_empty() {
+            return Ok((true, None));
+        }
+        let Some(authority) = self.authority.as_ref() else { return Ok((false, None)); };
+        if let Some(cut) = count_source.as_ref() {
+            let seal = cut.namespace_count_cohort.as_ref().expect("filtered count source");
+            seal.validate_bound_cut(cut)?;
+            if cut.scope_shard != *shard {
+                return Err(error("count readiness source belongs to another physical scope"));
+            }
+            if !authority.namespace_count_cohort_ready(cut)? {
+                return Ok((false, None));
+            }
+        }
+        if !authority.namespace_count_initializations_ready(shard, &obligations)? {
+            return Ok((false, None));
+        }
+        Ok((true, count_source))
+    }
+
     fn prepare_with_source_inner(
         &self,
         destination: &Path,
@@ -914,6 +1004,7 @@ impl MetadataConverter {
         data_goal: Option<&DataGoalStage>,
         original_goal: Option<&DataGoalStage>,
         completion: &mut Option<InstalledCompletion>,
+        capture_only: bool,
     ) -> Result<DfsStoragePreparation> {
         if budget == 0 {
             return Err(error("metadata conversion budget must be positive"));
@@ -1060,6 +1151,7 @@ impl MetadataConverter {
         }
         let goal_capsules = data_goal.map_or(&[][..], |goal| goal.capsules.as_slice());
         if original_reservation.is_none()
+            && !namespace_count_capture_requested(destination, shard)?
             && current_root(destination)?
             && (goal_capsules.is_empty()
                 || published_data_goal_matches(destination, shard, goal_capsules)?)
@@ -1180,7 +1272,8 @@ impl MetadataConverter {
             }
             return Ok(DfsStoragePreparation::Ready);
         }
-        let discovered = if (original_reservation.is_some() || !goal_capsules.is_empty())
+        let discovered = if (original_reservation.is_some() || !goal_capsules.is_empty()
+            || namespace_count_capture_requested(destination, shard)?)
             && current_root(destination)?
         {
             Some(destination.to_owned())
@@ -1401,6 +1494,20 @@ impl MetadataConverter {
                 processed_records: processed,
             });
         }
+        if session.finalization.is_none()
+            && session.staged_root.join("namespace-count-source-cut.json").is_file() {
+            let path = session.staged_root.join("namespace-count-source-cut.json");
+            let bytes = fs::read(&path).map_err(error)?;
+            let cut: MetadataSourceCut = serde_json::from_slice(&bytes).map_err(error)?;
+            cut.namespace_count_cohort.as_ref().ok_or_else(|| error("count checkpoint has no cohort"))?
+                .validate_bound_cut(&cut)?;
+            if cut.source_identity != session.inventory.fingerprint || cut.source_root != session.source_root {
+                return Err(error("count checkpoint changed its retained original source"));
+            }
+            session.finalization = Some(Finalization::Plan {
+                cut, digest: blake3::hash(&bytes).to_hex().to_string(),
+            });
+        }
         if let Some(finalization) = session.finalization.take() {
             return self.advance_finalization(
                 session,
@@ -1409,6 +1516,7 @@ impl MetadataConverter {
                 goal_capsules,
                 finalization,
                 completion,
+                capture_only,
             );
         }
         let ids = session.projection.source_file_system_ids()?;
@@ -1559,6 +1667,11 @@ impl MetadataConverter {
                 processed_records: processed,
             });
         }
+        let (identity, converted_fingerprint, pending_mapping) = if authority_kind == MetadataImportAuthorityKind::Native
+            && namespace_count_capture_requested(&destination, shard)? {
+            let identity = build_count_maintenance_native_image(session, shard)?;
+            (identity.clone(), identity.state_fingerprint, Vec::new())
+        } else {
         let (mut tables, mut pending) = match authority_kind {
             MetadataImportAuthorityKind::Native => {
                 partition_projection(session, shard, &assignments)?
@@ -1619,7 +1732,7 @@ impl MetadataConverter {
         }
         if matches!(
             session.header.get("format_version").and_then(Value::as_u64),
-            Some(8 | 9)
+            Some(8 | 9 | 10)
         ) {
             if let Some(topology) = prior_native::topology_data(&session.source_root, shard)? {
                 pending.push(topology);
@@ -1632,9 +1745,10 @@ impl MetadataConverter {
                 .into_iter()
                 .flat_map(|goal| goal.capsules.iter().cloned()),
         );
-        let (identity, converted_fingerprint, pending_mapping) =
-            build_native_image(&session, shard, tables, pending)?;
+            build_native_image(&session, shard, tables, pending)?
+        };
         let mut cut = MetadataSourceCut {
+            namespace_count_cohort: None,
             source_root: session.source_root.clone(),
             source_identity: captured.source_identity,
             scope_shard: shard.clone(),
@@ -1690,6 +1804,7 @@ impl MetadataConverter {
         goal_capsules: &[Value],
         finalization: Finalization,
         completion: &mut Option<InstalledCompletion>,
+        capture_only: bool,
     ) -> Result<DfsStoragePreparation> {
         debug_assert!(budget > 0);
         let authority = self
@@ -1700,7 +1815,19 @@ impl MetadataConverter {
         session.inventory.verify(&session.source_root)?;
         match finalization {
             Finalization::Plan { cut, digest } => {
-                verify_json_checkpoint(&session.staged_root.join("source-cut.json"), &digest)?;
+                let cut_checkpoint = if cut.namespace_count_cohort.is_some() {
+                    "namespace-count-source-cut.json"
+                } else { "source-cut.json" };
+                verify_json_checkpoint(&session.staged_root.join(cut_checkpoint), &digest)?;
+                if capture_only || (cut.namespace_count_cohort.is_none()
+                    && (namespace_count_capture_requested(&destination, shard)?
+                        || (sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION >= 11
+                            && cut.source_format_version.is_none_or(|version| version < 11)))) {
+                    // Explicit complete-set enrollment must bind this exact source;
+                    // automatic per-shard cold-open cannot activate it independently.
+                    session.finalization = Some(Finalization::Plan { cut, digest });
+                    return Ok(DfsStoragePreparation::Pending { processed_records: 0 });
+                }
                 authority.validate_owned_source(
                     &session.source_root,
                     shard,
@@ -2049,7 +2176,7 @@ pub(crate) fn finalization_checkpoint_for_test(
 /// Prior native generations keep their own exact clocks while being imported.
 /// This classifier is conversion DATA, never admission to the current DFS reader.
 pub(crate) fn native_source_format(format: Option<u16>) -> bool {
-    matches!(format, Some(8 | 9))
+    matches!(format, Some(8 | 9 | 10))
         || format == Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
 }
 pub(crate) fn native_source_root(root: &Path, format: Option<u16>) -> Result<bool> {
@@ -2067,6 +2194,8 @@ pub(crate) fn native_source_root(root: &Path, format: Option<u16>) -> Result<boo
 pub(crate) fn original_native_root_format(root: &Path) -> Result<Option<u16>> {
     if current_root(root)? {
         Ok(Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION))
+    } else if metadata_root_at_format(root, 10)? {
+        Ok(Some(10))
     } else if metadata_root_at_format(root, 9)? {
         Ok(Some(9))
     } else {
@@ -2076,7 +2205,8 @@ pub(crate) fn original_native_root_format(root: &Path) -> Result<Option<u16>> {
 pub(crate) fn inspect_import_candidate(
     root: &Path,
 ) -> Result<sinomo_dfs::DfsMetadataCandidateIdentity> {
-    if native_source_root(root, Some(8))? || native_source_root(root, Some(9))? {
+    if native_source_root(root, Some(8))? || native_source_root(root, Some(9))?
+        || (sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION != 10 && native_source_root(root, Some(10))?) {
         prior_native::inspect(root)
     } else {
         sinomo_dfs::inspect_metadata_candidate(root)
@@ -4377,7 +4507,8 @@ fn install_certified_stage_bound(
         session.destination_root.as_path()
     };
     let prior =
-        native_source_root(image_root, Some(8))? || native_source_root(image_root, Some(9))?;
+        native_source_root(image_root, Some(8))? || native_source_root(image_root, Some(9))?
+            || (sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION != 10 && native_source_root(image_root, Some(10))?);
     let jobs = if prior {
         Vec::new()
     } else {
@@ -4827,10 +4958,23 @@ fn install_certified_stage_bound(
             }
             _ => false,
         };
+        let qualified_count_exchange = match (proposal, certificate, proposal.source_cut.namespace_count_cohort.as_deref()) {
+            (MetadataImportProposal::Native(native), MetadataImportCertificate::Native(seal), Some(cohort)) => {
+                cohort.validate_bound_cut(&proposal.source_cut)?;
+                native_source_format(proposal.source_cut.source_format_version)
+                    && session.source_root == session.destination_root
+                    && cohort.member(&proposal.source_cut.scope_shard)?.assignment == native.expected_handoff.retiring_shard
+                    && seal.joint_handoff_proof.retiring_shard == native.expected_handoff.retiring_shard
+                    && seal.joint_handoff_proof.desired_shard == native.expected_handoff.desired_shard
+                    && matches!(&seal.joint_handoff_proof.cause, sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. })
+            }
+            _ => false,
+        };
         if current_root(&session.destination_root)?
             && !(proposal.source_cut.original_handoff.is_some()
                 && session.source_root == session.destination_root)
             && !qualified_data_exchange
+            && !qualified_count_exchange
             && !certified_current_receiver
         {
             return Err(error(
@@ -5306,7 +5450,7 @@ mod recovery_session_tests {
                 .unwrap();
         drop(MigrationStreamWriter::resume(&path, &header, &Default::default()).unwrap());
         let original = fs::read(&path).unwrap();
-        assert_eq!(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, 10);
+        assert_eq!(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, 11);
         assert!(!current_root(&root).unwrap());
         assert_eq!(discover_metadata_source(&root, &root).unwrap(), Some(root));
         assert_eq!(fs::read(path).unwrap(), original);
@@ -5322,7 +5466,7 @@ mod recovery_session_tests {
         let progress = previous.join("progress.json");
         fs::write(&progress, b"retained source replay ledger").unwrap();
         let current = conversion_stage_base_path(&destination, &shard).unwrap();
-        assert_eq!(current, previous.join("target-format-10"));
+        assert_eq!(current, previous.join("target-format-11"));
         assert_eq!(
             fs::read(&progress).unwrap(),
             b"retained source replay ledger"
@@ -6093,5 +6237,273 @@ mod native_source_fenced_inspection_tests {
         drop(fence);
         drop(client);
         native.close().unwrap();
+    }
+}
+
+/// Immutable count-cohort DATA shares the existing durable import checkpoint writer.
+pub(crate) fn write_count_cohort_checkpoint(path: &Path, value: &impl Serialize) -> Result<()> {
+    if path.exists() {
+        if fs::read(path).map_err(error)? != serde_json::to_vec(value).map_err(error)? {
+            return Err(error("immutable namespace-count cohort checkpoint changed"));
+        }
+        return Ok(());
+    }
+    write_json_checkpoint(path, value).map(|_| ())
+}
+
+impl MetadataConverter {
+    /// Enroll one actual retained source session into a complete captured set.
+    /// Every retiring owner independently checks the same census DATA; the
+    /// ordinary native stage/fence/activation owners retain all effect authority.
+    pub fn enroll_namespace_count_source(
+        &self,
+        destination: &Path,
+        shard: &DfsMetadataShardId,
+        sources: &[crate::namespace_counts::NamespaceCountMaintenanceSource],
+        catalog: &[DfsMetadataShardConfig],
+        at: time::OffsetDateTime,
+        limits: crate::namespace_counts::NamespaceCountMaintenanceLimits,
+    ) -> Result<crate::namespace_count_cohort::NamespaceCountCohortSeal> {
+        let destination = canonical_destination(destination)?;
+        let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
+            .ok_or_else(|| error("count enrollment requires its retained source session"))?;
+        let mut held = slot.try_lock_session().ok_or_else(|| error("count source session is busy"))?;
+        let session = held.as_mut().ok_or_else(|| error("count source session disappeared"))?;
+        let Some(Finalization::Plan { cut, .. }) = session.finalization.as_ref() else {
+            return Err(error("count source is not at its settled census boundary"));
+        };
+        let original = cut.namespace_count_cohort.as_ref()
+            .map(|seal| seal.member(shard).map(|member| member.original_cut.clone())).transpose()?
+            .unwrap_or_else(|| cut.clone());
+        let own = sources.iter().filter(|source| source.source_cut.scope_shard == *shard).collect::<Vec<_>>();
+        let [own] = own.as_slice() else { return Err(error("count enrollment omits or repeats its own original source")); };
+        if own.source_cut != original { return Err(error("count enrollment replaces its actually retained source")); }
+        session.inventory.verify(&session.source_root)?;
+        if sinomo_dfs::inspect_metadata_candidate(&original.staged_root)? != own.candidate_identity {
+            return Err(error("count enrollment original candidate bytes changed"));
+        }
+        let stage = conversion_stage_base_path(&destination, shard)?;
+        let census_root = stage.join("namespace-count-census");
+        let initialized_root = stage.join("namespace-count-current-image");
+        let seal = crate::namespace_count_cohort::stage_namespace_count_cohort_at_roots(
+            &census_root, catalog, sources, at, limits,
+            &BTreeMap::from([(shard.clone(), initialized_root.clone())]),
+        )?;
+        let bound = seal.bind_cut(&original)?;
+        // Replay the identical deterministic initialization through the
+        // existing candidate writer. Both journal frames and image survive;
+        // copying a snapshot alone would lose the initialization journal.
+        let identity = sinomo_dfs::inspect_metadata_candidate(&initialized_root)?;
+        if identity.prefix_proof != bound.target_exact_prefix
+            || identity.state_fingerprint != bound.current_image_fingerprint {
+            return Err(error("count enrollment changed its initialized candidate image"));
+        }
+        write_count_cohort_checkpoint(&stage.join("namespace-count-source-cut.json"), &bound)?;
+        session.finalization = Some(Finalization::Plan { digest: blake3::hash(&serde_json::to_vec(&bound).map_err(error)?).to_hex().to_string(), cut: bound });
+        Ok(seal)
+    }
+    /// Explicit maintenance capture. Normal storage open never writes this intent.
+    /// The same converter session retains the actual original source fence.
+    pub fn capture_namespace_count_source(
+        &self, destination: &Path, shard: &DfsMetadataShardId,
+        catalog: &[DfsMetadataShardConfig], budget: usize,
+    ) -> Result<Option<crate::namespace_counts::NamespaceCountMaintenanceSource>> {
+        let authority = self.authority.as_ref().ok_or_else(|| error("count maintenance requires its actual import owner"))?;
+        if authority.kind() != MetadataImportAuthorityKind::Native {
+            return Err(error("complete-catalog count maintenance requires native source authority"));
+        }
+        let matching = catalog.iter().filter(|config| config.shard_id == shard.0).collect::<Vec<_>>();
+        let [assignment] = matching.as_slice() else { return Err(error("count maintenance requires one exact source scope")); };
+        if assignment.primary_node_id != authority.local_node_id()? {
+            return Err(error("only the actual retiring primary may capture a count-maintenance source"));
+        }
+        let mut current = authority.assignments(std::slice::from_ref(&assignment.file_system_id))?;
+        let mut expected = catalog.to_vec();
+        current.sort_by(|a,b| a.shard_id.cmp(&b.shard_id)); expected.sort_by(|a,b| a.shard_id.cmp(&b.shard_id));
+        if current != expected { return Err(error("count maintenance catalog is not the actual complete current assignment")); }
+        let destination = canonical_destination(destination)?;
+        authority.validate_owned_source(&destination, shard, std::slice::from_ref(&assignment.file_system_id))?;
+        let stage = conversion_stage_base_path(&destination, shard)?;
+        fs::create_dir_all(&stage).map_err(error)?;
+        write_count_cohort_checkpoint(&stage.join("namespace-count-capture.json"), &expected)?;
+        self.prepare_source(&destination, &destination, shard, budget, None, None, true)?;
+        let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
+            .ok_or_else(|| error("count maintenance lost its actual converter session"))?;
+        let Some(held) = slot.try_lock_session() else { return Ok(None); };
+        let Some(session) = held.as_ref() else { return Ok(None); };
+        let Some(Finalization::Plan { cut, .. }) = session.finalization.as_ref() else { return Ok(None); };
+        let original = if let Some(seal) = cut.namespace_count_cohort.as_deref() {
+            seal.validate_bound_cut(cut)?;
+            &seal.member(shard)?.original_cut
+        } else { cut };
+        session.inventory.verify(&session.source_root)?;
+        let snapshot = sinomo_dfs::read_metadata_candidate(&original.staged_root)?;
+        let candidate_identity = sinomo_dfs::inspect_metadata_candidate(&original.staged_root)?;
+        Ok(Some(crate::namespace_counts::NamespaceCountMaintenanceSource {
+            source_cut: original.clone(), snapshot, candidate_identity,
+        }))
+    }
+}
+
+fn namespace_count_capture_requested(destination: &Path, shard: &DfsMetadataShardId) -> Result<bool> {
+    let requested = conversion_stage_base_path(destination, shard)?.join("namespace-count-capture.json").is_file();
+    if !requested { return Ok(false); }
+    // After the certified physical exchange this path names the NEW image.
+    // Recover through the existing verified installed marker and retained
+    // original source, never reinterpret it as the original capture session.
+    if let Some(marker) = published_import_marker(destination, shard)?
+        && let Some(cohort) = marker.source_cut.namespace_count_cohort.as_deref() {
+        cohort.validate_bound_cut(&marker.source_cut)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(crate) fn validate_count_cohort_prefix(prefix: &DfsMetadataPrefixProof) -> Result<()> {
+    source_proof::validate(prefix)
+}
+pub(crate) fn namespace_count_plan_root(destination: &Path, shard: &DfsMetadataShardId) -> Result<PathBuf> {
+    Ok(conversion_stage_base_path(destination, shard)?.join("namespace-count-current-image"))
+}
+
+/// Explicit native maintenance preserves the original immutable history. The
+/// legacy repartitioner is intentionally not used for an unchanged native
+/// physical scope: it maps historical slots for different storage generations.
+fn build_count_maintenance_native_image(
+    session: &Session,
+    shard: &DfsMetadataShardId,
+) -> Result<sinomo_dfs::DfsMetadataCandidateIdentity> {
+    let generation = session.header.get("format_version").and_then(Value::as_u64)
+        .ok_or_else(|| error("count maintenance requires an original native snapshot"))?;
+    if generation != 10 && generation != u64::from(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION) {
+        return Err(error("count maintenance requires settled native10 or current DATA"));
+    }
+    session.inventory.verify(&session.source_root)?;
+    let original = if generation == u64::from(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION) {
+        sinomo_dfs::read_metadata_candidate(&session.source_root)?
+    } else {
+        prior_native::read_snapshot(&session.source_root)?.1
+    };
+    let mut state = sinomo_dfs::DfsMetadataCandidateState::new((*original.tables).clone())?;
+    if state.snapshot() != *original.tables {
+        return Err(error("native maintenance reconstruction changes original snapshot rows"));
+    }
+    let mut prefix = original.prefix_proof.clone();
+    let captured = session.source_prefix.as_ref()
+        .ok_or_else(|| error("native maintenance requires its complete authenticated source prefix"))?;
+    for sequence in prefix.journal_sequence + 1..=captured.journal_sequence {
+        let (document, raw) = read_verified_journal_document(&session.staged_root, sequence, &session.journal_frame_digests)?;
+        let entry: sinomo_dfs::DfsMetadataJournalEntry = serde_json::from_value(document).map_err(error)?;
+        if entry.shard_id != *shard || entry.sequence != sequence {
+            return Err(error("native maintenance journal changes its original scope/sequence"));
+        }
+        prefix = source_proof::extend_as(&prefix, sequence, &raw.bytes, 2)?;
+        state.replay_native_journal_entry(&entry)?;
+    }
+    if prefix != *captured { return Err(error("native maintenance reconstructed another exact source prefix")); }
+    let tables = state.snapshot();
+    if tables.prepared_operations_v7.iter().any(|record| record.status == sinomo_dfs::DfsPreparedOperationStatus::Prepared)
+        || tables.namespace_jobs.iter().any(|job| job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed)
+        || tables.namespace_requests.iter().any(|request| request.status == sinomo_dfs::DfsNamespaceRequestStatus::Pending)
+        || tables.intents.iter().any(|intent| matches!(intent.status, sinomo_dfs::DfsWriteIntentStatus::Staging | sinomo_dfs::DfsWriteIntentStatus::ReceiptsPending)) {
+        return Err(error("count maintenance requires original operations drained before upgrade"));
+    }
+    let root = session.staged_root.join("current-image");
+    let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&root)?;
+    // Copy complete original journal files, including old frames below the
+    // checkpoint. They remain byte-identical; count frames append afterwards.
+    for source in &session.inventory.files {
+        if !source.is_native_journal_data() { continue; }
+        let target = root.join(&source.relative);
+        let original_path = session.source_root.join(&source.relative);
+        let bytes = fs::read(&original_path).map_err(error)?;
+        if bytes.len() as u64 != source.len || blake3::hash(&bytes).to_hex().as_str() != source.blake3 {
+            return Err(error("native maintenance original journal bytes changed"));
+        }
+        if target.exists() {
+            if fs::read(&target).map_err(error)? != bytes { return Err(error("native maintenance retained journal copy changed")); }
+        } else {
+            fs::create_dir_all(target.parent().ok_or_else(|| error("journal copy has no parent"))?).map_err(error)?;
+            sinomo_core::storage::durable_file::write_file_atomic(&target, &bytes,
+                sinomo_core::storage::durable_file::DurableAtomicFileOptions::new("count-source", "tmp").sync_all()).map_err(error)?;
+        }
+    }
+    let identity = writer.write(tables.clone(), prefix)?;
+    let reconstructed = sinomo_dfs::read_metadata_candidate(&root)?;
+    if *reconstructed.tables != tables { return Err(error("native maintenance image changes original reconstructed rows")); }
+    session.inventory.verify(&session.source_root)?;
+    Ok(identity)
+}
+
+/// Copy only the authenticated original journal into a fresh hidden candidate.
+/// The enrolled source owner retains the source lock throughout this call.
+pub(crate) fn copy_count_source_journal(cut: &MetadataSourceCut, target: &Path) -> Result<()> {
+    validate_retained_source_identity(&cut.source_root, &cut.source_identity, &cut.source_snapshot_fingerprint)?;
+    let inventory = source::discover(&cut.source_root)?;
+    for file in &inventory.files {
+        if !file.is_native_journal_data() { continue; }
+        let bytes = fs::read(cut.source_root.join(&file.relative)).map_err(error)?;
+        if bytes.len() as u64 != file.len || blake3::hash(&bytes).to_hex().as_str() != file.blake3 {
+            return Err(error("original count source journal changed during enrollment"));
+        }
+        let path = target.join(&file.relative);
+        if path.exists() {
+            if fs::read(&path).map_err(error)? != bytes { return Err(error("count source journal copy changed before initialization")); }
+        } else {
+            fs::create_dir_all(path.parent().ok_or_else(|| error("count journal has no parent"))?).map_err(error)?;
+            sinomo_core::storage::durable_file::write_file_atomic(&path, &bytes,
+                sinomo_core::storage::durable_file::DurableAtomicFileOptions::new("count-source", "tmp").sync_all()).map_err(error)?;
+        }
+    }
+    inventory.verify(&cut.source_root)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn published_count_source_for_test(root: &Path, shard: &DfsMetadataShardId) -> Result<Option<MetadataSourceCut>> {
+    Ok(published_import_marker(root, shard)?.map(|marker| marker.source_cut))
+}
+
+#[cfg(test)]
+mod count_native_frame_tests {
+    use super::*;
+    #[test]
+    fn count_replay_rejects_changed_captured_native_frame_without_touching_original() {
+        let directory = sinomo_testdir::TestDir::new("count-native-frame-provenance");
+        let source_root = directory.join("source");
+        let stage = directory.join("stage");
+        let shard = DfsMetadataShardId::new("root");
+        let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&source_root).unwrap();
+        let prefix = source_proof::conversion_base(0, "original-frame", "empty-current-data");
+        writer.write(Default::default(), prefix.clone()).unwrap();
+        let payload = sinomo_dfs::DfsPreparedOperationPayload::for_metadata_effects(
+            sinomo_dfs::DfsPreparedOperationScope { file_system_id: sinomo_dfs::sifs_file_system_id(),
+                shard_id: shard, owner_epoch: 1, operation_id: "original-native-frame".into() },
+            Vec::new(), Vec::new(), vec![sinomo_dfs::DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: sinomo_dfs::DfsFileSystem::sifs(sinomo_core::node::NodeId::from_legacy_named("original-frame-owner").unwrap()),
+            }], time::OffsetDateTime::UNIX_EPOCH,
+        ).unwrap();
+        let (record, prefix) = writer.prepare(payload, &prefix).unwrap();
+        writer.commit(record, &prefix, time::OffsetDateTime::UNIX_EPOCH).unwrap();
+        drop(writer);
+        let inventory = source::discover(&source_root).unwrap();
+        let mut cursor = source::SourceCursor::new(inventory.clone());
+        let mut frames = 0;
+        while let Some(record) = source::next(&source_root, &mut cursor).unwrap() {
+            let source::SourceRecord::JournalFrame { entry, exact_bytes } = record else { continue; };
+            let sequence = entry["sequence"].as_u64().unwrap();
+            let path = evidence_path(&stage, sequence);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &exact_bytes).unwrap();
+            let digests = BTreeMap::from([(sequence, blake3::hash(&exact_bytes).to_hex().to_string())]);
+            assert_eq!(read_verified_journal_document(&stage, sequence, &digests).unwrap().0, entry);
+            let mut changed = exact_bytes.clone();
+            let last = changed.len() - 1; changed[last] ^= 1;
+            fs::write(&path, changed).unwrap();
+            assert!(read_verified_journal_document(&stage, sequence, &digests).is_err());
+            inventory.verify(&source_root).unwrap();
+            frames += 1;
+        }
+        assert_eq!(frames, 2, "real Prepare and Commit raw frames must both be checked");
     }
 }

@@ -47,6 +47,8 @@ mod intent;
 mod lifecycle;
 mod repair_deadlines;
 mod stat_projection;
+mod namespace_counts;
+pub use namespace_counts::{namespace_count_cohort_binding_initialization_id, namespace_count_cohort_initialization_ids, namespace_count_cohort_obligations};
 pub use lifecycle::*;
 mod local_state;
 mod maintenance;
@@ -83,6 +85,7 @@ mod metadata_pages;
 mod metadata_read_snapshot;
 mod metadata_receipt;
 mod metadata_records;
+pub use metadata_records::{DfsParentCountAction, DfsParentCountBinding, DfsParentCountOutcome, DfsParentCountParticipant, DfsParentCountPhase, DfsParentCountPlan, DfsParentCountReceipt, DfsParentCountRejection, DfsParentCountState};
 mod metadata_rejection;
 mod metadata_replay;
 mod metadata_replica_observer;
@@ -566,6 +569,7 @@ pub use metadata_records::{
     DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
     DfsMetadataTableSnapshotTables, DfsMetadataVersionPinPage, DfsMetadataVersionPinPageCursor,
     DfsMetadataVersionPinRecord, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobOrigin,
+    DfsDirectoryMoveCounts,
     DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespaceObjectVersionExpectation,
     DfsNamespacePathOccupantExpectation, DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt,
@@ -605,7 +609,7 @@ pub use metadata_replication::{
     DfsMetadataJournalReplicationTransport, DfsMetadataJournalReplicationTransportError,
     DfsMetadataJournalReplicationTransportFuture, DfsMetadataNodeTransport,
     DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
-    DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext,
+    DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext, DfsMetadataNamespaceCatalog,
     DfsMetadataSnapshotInstallSender, DfsPreparedClusterMetadataJournalPublish,
     LocalDfsMetadataJournalPublisherHost, cluster_dfs_metadata_replica_shard_context,
     dfs_events_advance_metadata_replica, dfs_events_should_publish_metadata,
@@ -647,6 +651,7 @@ pub use metadata_sharded_backend::{
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
     discard_local_metadata_shard_copies,
 };
+pub use sinomo_api::dfs::model::{DfsNamespaceCountActivation, DFS_NAMESPACE_COUNT_ACTIVATION_SCHEMA_VERSION};
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPlacementScope, DfsPolicyViolation, DfsSubtreePolicy, DfsTombstoneProvenance, ReadRoute,

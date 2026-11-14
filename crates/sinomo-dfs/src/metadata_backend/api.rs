@@ -95,6 +95,30 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             target_shard_id,
         )
     }
+    fn prepared_operation_family_page(
+        &self, shard_id: &DfsMetadataShardId, prefix: &str, after: Option<&str>, max_entries: usize,
+    ) -> Result<(Vec<DfsPreparedOperationRecord>, Option<String>)> {
+        if shard_id != &self.shard_id || prefix.is_empty() || after.is_some_and(|cursor| !cursor.starts_with(prefix)) {
+            return Err(MetadataBackendError::Serde("prepared-family query changed its physical scope or prefix".into()));
+        }
+        let limit = max_entries.max(1).min(OBJECT_LOCAL_METADATA_PAGE_SIZE);
+        let tables = self.current_tables_snapshot()?;
+        let start = after.map(|cursor| std::ops::Bound::Excluded(cursor.to_owned())).unwrap_or_else(|| Included(prefix.to_owned()));
+        let mut records = tables.prepared_operations_v7.range((start, Unbounded))
+            .take_while(|(key, _)| key.starts_with(prefix)).take(limit + 1).map(|(_, record)| record.clone()).collect::<Vec<_>>();
+        let next = if records.len() > limit { records.pop(); records.last().map(|record| record.operation_id.clone()) } else { None };
+        Ok((records, next))
+    }
+
+    fn prepared_operation_record_at_prefix(
+        &self, shard_id: &DfsMetadataShardId, prefix: &DfsMetadataPrefixProof, operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        if shard_id != &self.shard_id || &LocalSobjMetadataBackend::metadata_prefix_proof(self)? != prefix { return Ok(None); }
+        let observed = self.certified_prepared_record_at_held_cut(operation_id)?;
+        if &LocalSobjMetadataBackend::metadata_prefix_proof(self)? != prefix { return Ok(None); }
+        Ok(observed)
+    }
+
     fn prepared_operation_record(
         &self,
         operation_id: &str,
@@ -1609,6 +1633,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         object: &DfsObjectId,
     ) -> Result<Option<crate::DfsContentReferenceOutcomeRetention>> {
         self.reference_outcome_retention(fs, object)
+    }
+
+    fn parent_count_reservations(
+        &self, shard_id: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsNamespaceJobRecord>> {
+        if shard_id != &self.shard_id { return Err(MetadataBackendError::Serde("parent reservation physical shard mismatch".into())); }
+        let tables = self.current_tables_snapshot()?;
+        tables.parent_count_reservation_ids(file_system_id, object_id).map(|job_id| {
+            tables.namespace_jobs.get(job_id).cloned().ok_or_else(|| MetadataBackendError::Serde("parent reservation index lost its original job".into()))
+        }).collect()
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {

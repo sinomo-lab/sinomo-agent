@@ -34,6 +34,15 @@ pub(super) struct SourceFile {
     pub identity: Option<(u64, u64)>,
     kind: Kind,
 }
+impl SourceFile {
+    /// Immutable journal frames and the sequence cursor are DATA. Physical
+    /// writer freezes, admission bindings and acknowledgements stay with their
+    /// actual source owner and are never copied as target authority.
+    pub(super) fn is_native_journal_data(&self) -> bool {
+        matches!(self.kind, Kind::JournalSegment | Kind::JournalLoose)
+            || self.relative == Path::new("journal/head.sobj")
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct SourceInventory {
     pub files: Vec<SourceFile>,
@@ -592,6 +601,19 @@ fn next_inner(root: &Path, cursor: &mut SourceCursor) -> Result<Option<SourceRec
                                     raw_document: super::source_document::SourceRawDocument {
                                         bytes,
                                         row_pointer: "/Transfer/transfer".into(),
+                                    },
+                                }
+                            } else if let Some(record) = object
+                                .get("ReceiptWithdrawal").and_then(|value| value.get("record")) {
+                                let generation = u16::from_le_bytes([bytes[4], bytes[5]]);
+                                if generation < 10 || object.len() != 1
+                                    || object["ReceiptWithdrawal"].as_object().is_none_or(|row|row.len()!=1) {
+                                    return Err(invalid("receipt withdrawal changed its original native envelope"));
+                                }
+                                let _: sinomo_dfs::DfsReplicaReceiptWithdrawalRecord = serde_json::from_value(record.clone()).map_err(invalid)?;
+                                SourceRecord::SnapshotRow { table: "receipt_withdrawals".into(), row: record.clone(),
+                                    raw_document: super::source_document::SourceRawDocument {
+                                        bytes, row_pointer: "/ReceiptWithdrawal/record".into(),
                                     },
                                 }
                             } else if let Some(state) = object

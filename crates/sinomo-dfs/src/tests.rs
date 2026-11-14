@@ -566,6 +566,7 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
 
 fn file_system(owner: NodeId) -> DfsFileSystem {
     DfsFileSystem {
+        namespace_count_activation: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
@@ -580,6 +581,7 @@ fn file_metadata(owner: NodeId) -> DfsObjectMetadata {
         object_id: DfsObjectId::from_legacy_named("obj_file").expect("object"),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
         path: "src/lib.rs".to_string(),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         tombstone_provenance: None,
         owner_node_id: owner.clone(),

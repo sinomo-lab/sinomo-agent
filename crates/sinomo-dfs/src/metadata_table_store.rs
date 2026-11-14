@@ -37,9 +37,10 @@ use crate::metadata_tables::{
 
 /// Current storage schema. Older snapshots are decoded only by the external
 /// converter; the prepared-operation protocol remains independently versioned.
-/// Generation 10 requires original alias comparisons in durable job frames.
-/// Prior native declarations are admitted only by the external MIG converter.
-pub const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 10;
+/// Generation 11 requires maintained counts on authoritative live namespace rows.
+/// Prior format 10 is admitted only by the complete-cohort external converter;
+/// historical prepared bodies retain their original independently versioned codec.
+pub const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 11;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MetadataTableFileGeneration {

@@ -222,6 +222,7 @@ fn stat_prefers_backend_tombstone_over_stale_memory_file() {
     tombstone.object_id = object_id.clone();
     tombstone.path = path.to_string();
     tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.namespace_link_count = Some(0);
     tombstone.version = DfsVersion::from_legacy_named("version_2").expect("version");
     tombstone.content_hash = None;
     tombstone.content_size_bytes = None;
@@ -231,6 +232,7 @@ fn stat_prefers_backend_tombstone_over_stale_memory_file() {
 
     let mut stale_memory = tombstone.clone();
     stale_memory.kind = DfsObjectKind::File;
+    stale_memory.namespace_link_count = Some(1);
     stale_memory.version = DfsVersion::from_legacy_named("version_3").expect("version");
     stale_memory.content_hash = Some("blake3:stale-memory-file".to_string());
     stale_memory.content_size_bytes = Some(12);

@@ -1,11 +1,13 @@
 //! Owned incremental storage conversion, outside the current DFS runtime.
 pub mod content;
+pub mod namespace_counts;
+pub mod namespace_count_cohort;
 pub use content::{ContentConversionInspection, ContentConverter};
 pub mod authority;
 pub use authority::content_work::MetadataImportedRetainedContent;
 pub use authority::{
     staged_import_component_factory, standalone_storage_preparation_provider,
-    storage_preparation_provider,
+    storage_preparation_provider, NamespaceCountMaintenance,
 };
 mod legacy_prepare_codec;
 mod legacy_wire;

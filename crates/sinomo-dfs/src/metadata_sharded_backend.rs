@@ -3856,6 +3856,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 target_shard_id,
             )
     }
+    fn prepared_operation_family_page(
+        &self, shard_id: &DfsMetadataShardId, prefix: &str, after: Option<&str>, max_entries: usize,
+    ) -> Result<(Vec<DfsPreparedOperationRecord>, Option<String>)> {
+        self.shard_backend(shard_id)?.prepared_operation_family_page(shard_id, prefix, after, max_entries)
+    }
+
+    fn prepared_operation_record_at_prefix(
+        &self, shard_id: &DfsMetadataShardId, prefix: &DfsMetadataPrefixProof, operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        self.shard_backend(shard_id)?.prepared_operation_record_at_prefix(shard_id, prefix, operation_id)
+    }
+
     fn prepared_operation_record(
         &self,
         operation_id: &str,
@@ -5975,6 +5987,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let shard = self.require_shard_id_for_object(object)?;
         self.shard_backend(&shard)?
             .content_reference_outcome_retention(fs, object)
+    }
+
+    fn parent_count_reservations(
+        &self, shard_id: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsNamespaceJobRecord>> {
+        self.shard_backend(shard_id)?.parent_count_reservations(shard_id, file_system_id, object_id)
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {

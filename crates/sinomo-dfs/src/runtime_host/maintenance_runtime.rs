@@ -1183,12 +1183,24 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     }
     let restored = service_return.restore();
     if preserve_remote_continuation {
-        // No remote dispatch after a failed/foreign restoration. The existing
-        // actor remains the physical source/job custody owner.
-        if !restored? {
-            return Err(DaemonError::from(crate::DfsError::Metadata {
-                message: "owned namespace recovery could not restore its current service".into(),
-            }));
+        // This branch precedes remote dispatch. A rejected service restore
+        // must not strand an exact unclaimed local source/job writer and then
+        // wait for that same writer while opening the successor generation.
+        match restored {
+            Ok(true) => {}
+            rejected => {
+                if let Some((_, phase)) = remote_namespace_phase.as_ref() {
+                    #[cfg(test)]
+                    phase.trace_undispatched_custody();
+                    if let Err(error) = phase.cancel_local_before_failed_restore() {
+                        tracing::warn!(%error, "undispatched namespace source remains owned; exact unclaimed release was rejected");
+                    }
+                }
+                if let Err(error) = rejected { return Err(DaemonError::from(error)); }
+                return Err(DaemonError::from(crate::DfsError::Metadata {
+                    message: "owned namespace recovery could not restore its current service".into(),
+                }));
+            }
         }
     } else {
         match restored {

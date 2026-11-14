@@ -1361,6 +1361,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             let file_system = DfsFileSystem {
+                namespace_count_activation: None,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),

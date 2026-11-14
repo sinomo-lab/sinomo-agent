@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod namespace_counts;
+mod parent_counts;
+mod parent_supersession_negatives;
+
 /// The live object `node`'s durable metadata store holds at `path`.
 /// Callers delegating to their Main keep no store, so replica convergence is
 /// observed in the node's own store rather than through an authority read.

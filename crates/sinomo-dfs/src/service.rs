@@ -752,6 +752,15 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
             .map(|capability| capability.to_string()),
     )
     .with_concurrency_limit(dfs_service_route_concurrency_limit(route));
+    if matches!(route.route.as_str(),
+        DFS_METADATA_JOURNAL_BATCH_ROUTE | DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
+            | crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE
+            | crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE)
+    {
+        route = route.require_capability(
+            sinomo_core::node::DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY,
+        );
+    }
     if let Some(timeout) = dfs_service_route_timeout(route.route.as_str()) {
         route = route.with_timeout(timeout);
     }
@@ -2006,14 +2015,17 @@ mod tests {
                 service_route.auth_scope.as_deref(),
                 Some(module_route.auth_scope.as_str())
             );
-            assert_eq!(
-                service_route.required_capabilities,
-                module_route
-                    .required_capabilities
-                    .iter()
-                    .map(|capability| capability.as_str().to_string())
-                    .collect::<Vec<_>>()
-            );
+            let mut expected_capabilities = module_route.required_capabilities.iter()
+                .map(|capability| capability.as_str().to_string()).collect::<Vec<_>>();
+            // The action permission remains the declared module operation.
+            // Metadata ingest additionally requires protocol support so an old
+            // already-assigned sender cannot omit maintained counts.
+            if [DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+                crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+                crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE].contains(route) {
+                expected_capabilities.push(sinomo_core::node::DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY.into());
+            }
+            assert_eq!(service_route.required_capabilities, expected_capabilities);
             assert_eq!(
                 service_route.concurrency_limit,
                 Some(dfs_service_route_concurrency_limit(route))

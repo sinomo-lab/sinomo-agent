@@ -1163,6 +1163,7 @@ mod tests {
             object_id: oid(name),
             file_system_id: file_system_id(),
             path: path.into(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: node("node_a"),

@@ -196,7 +196,7 @@ The logical metadata model contains:
 
 | Record | Purpose |
 |---|---|
-| Object | Stable identity, path, kind, owner, policy, and visible version. |
+| Object | Stable identity, path, kind, owner, policy, visible version, and canonical namespace link count. |
 | Version | Content hash, length, manifest, parent/base, writer, and commit state. |
 | Intent | Base version, target version, authority epoch, placement, and required receipts. |
 | Receipt | Evidence that an eligible node durably holds the expected content. |
@@ -380,9 +380,11 @@ exists elsewhere. The branch never becomes a second canonical history.
 
 ## Reads and Caches
 
-Distributed POSIX stat derives current inode fields through bounded authenticated
-metadata projections; see [the authoritative stat contract](dfs-authoritative-stat.md)
-for generation, cross-shard completeness, compatibility and outage behavior.
+Distributed POSIX stat reads canonical inode metadata and its maintained link
+count from the current authority. Namespace mutations own count changes; stat
+does not reconstruct them across shards. See
+[the authoritative stat contract](dfs-authoritative-stat.md) for read semantics,
+compatibility and count initialization.
 Path and object metadata is answered by the shard's primary or one of its
 replicas. A node outside the replica set reads paths, open handles, inode
 identities and hardlink targets through the primary, plans its writes against

@@ -559,6 +559,9 @@ impl LocalSobjMetadataBackend {
         if backend.selected_original_data_layout.is_some() {
             Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
         }
+        crate::storage_preparation::require_count_cohort_preparation_owner(
+            &backend.root, &backend.shard_id, &backend.tables,
+        )?;
         metadata_table_apply::schedule_metadata_table_checkpoint_with_layout(
             &backend.root,
             &backend.tables,
@@ -917,6 +920,7 @@ impl LocalSobjMetadataBackend {
     ) -> Result<bool> {
         let candidate = snapshot.state()?;
         require_replica_snapshot_tables_file_system(&candidate.tables, permit.file_system_id())?;
+        permit.validate_counted_snapshot(&candidate.tables)?;
         drop(candidate);
         let _lock = self.begin_metadata_replica_ingest(permit, &source_shard_id)?;
         let archived = self.replace_with_replicated_snapshot_unlocked(
@@ -957,6 +961,7 @@ impl LocalSobjMetadataBackend {
         }
         let candidate = snapshot.state()?;
         require_replica_snapshot_tables_file_system(&candidate.tables, permit.file_system_id())?;
+        permit.validate_counted_snapshot(&candidate.tables)?;
         drop(candidate);
         let root = root.into();
         let mut backend = Self {

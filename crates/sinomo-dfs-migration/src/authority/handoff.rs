@@ -18,7 +18,20 @@ impl NativeImportAuthority {
     pub(super) fn import_cause(source: &MetadataSourceCut) -> Result<DfsMetadataShardHandoffCause> {
         Ok(DfsMetadataShardHandoffCause::StorageImport {
             cut: DfsMetadataStorageImportCut {
-                source_cut_digest: digest(&(
+                source_cut_digest: match &source.namespace_count_cohort {
+                    Some(cohort) => {
+                        cohort.validate_bound_cut(source)?;
+                        digest(&("namespace-count-import-v1", digest(&(
+                    source.source_identity.clone(),
+                    source.source_snapshot_fingerprint.clone(),
+                    source.source_exact_prefix.clone(),
+                    source.scope_shard.clone(),
+                    source.projection_assignments.clone(),
+                    source.converted_image_fingerprint.clone(),
+                    source.original_handoff.clone(),
+                ))?, &cohort.cohort_id))?
+                    }
+                    None => digest(&(
                     source.source_identity.clone(),
                     source.source_snapshot_fingerprint.clone(),
                     source.source_exact_prefix.clone(),
@@ -27,6 +40,7 @@ impl NativeImportAuthority {
                     source.converted_image_fingerprint.clone(),
                     source.original_handoff.clone(),
                 ))?,
+                },
                 source_journal_sequence: source.source_journal_sequence,
                 source_state_fingerprint: source.source_state_fingerprint.clone(),
                 target_prefix: source.target_exact_prefix.clone(),
@@ -221,6 +235,16 @@ impl NativeImportAuthority {
         Ok(found)
     }
     pub(super) fn validate_plan(plan: &MetadataImportPlan) -> Result<()> {
+        if let Some(cohort) = &plan.source_cut.namespace_count_cohort {
+            cohort.validate_bound_cut(&plan.source_cut)?;
+            let member = cohort.member(&plan.source_cut.scope_shard)?;
+            if plan.expected_assignments != cohort.catalog
+                || plan.expected_handoff.retiring_shard != member.assignment
+                || plan.target_exact_prefix != member.initialized_prefix
+                || plan.current_image_fingerprint != member.initialized_state_fingerprint {
+                return Err(error("native count import changes its complete cohort member"));
+            }
+        }
         let source = &plan.source_cut;
         let h = &plan.expected_handoff;
         let staged = Self::stage_record(&plan.stage_request)?
@@ -1070,6 +1094,7 @@ impl NativeImportAuthority {
             // The original request may not have crossed the native commit
             // boundary. Re-establish its exact blueprint custody before replay;
             // never choose a new ACK set or request ID for this import.
+            self.require_count_cohort_staged(plan)?;
             let activation = self.blueprint_commit(provenance_plan_root, request)?;
             Self::require_committed(&activation)?;
             let actual = self.check_handoff_state(plan)?.ok_or_else(|| {
@@ -1082,6 +1107,42 @@ impl NativeImportAuthority {
             }
             return Ok((stage, activation, actual));
         }
+        let (_, proof) = self.qualify_handoff(plan, resolved_image_root, provenance_plan_root)?;
+        self.require_count_cohort_staged(plan)?;
+        let h = &plan.expected_handoff;
+        let mut client = self.control_client(provenance_plan_root)?;
+        client.last_commit = None;
+        if !DfsControlPlaneStore::new(&mut client)
+            .complete_metadata_shard_membership_handoff(&h.retiring_shard, &h.desired_shard, &proof)
+            .map_err(error)?
+        {
+            return Err(error("native joint import activation did not commit"));
+        }
+        let activation = client
+            .last_commit
+            .clone()
+            .ok_or_else(|| error("joint activation returned no actual native commit receipt"))?;
+        Self::require_committed(&activation)?;
+        let actual = self
+            .check_handoff_state(plan)?
+            .ok_or_else(|| error("joint activation is not retained in actual native state"))?;
+        Ok((stage, activation, actual))
+    }
+    /// Establish this source's actual retiring fence and staged participant
+    /// proof without activating it. Count cohorts use this same native phase.
+    pub(super) fn qualify_handoff(
+        &self, plan: &MetadataImportPlan, resolved_image_root: &Path, provenance_plan_root: &Path,
+    ) -> Result<(DfsNativeTxnCommit, DfsMetadataShardMembershipHandoffProof)> {
+        if let Some(proof) = self.check_handoff_state(plan)? {
+            let stage = self.observe_original_import_commit(plan, plan.stage_request.clone())?;
+            Self::require_committed(&stage)?;
+            return Ok((stage, proof));
+        }
+        if self.local_node()? != plan.expected_handoff.retiring_shard.primary_node_id {
+            return Err(error("only the actual retiring primary can qualify its native import"));
+        }
+        let stage = self.recover_stage_commit(plan)?;
+        Self::require_committed(&stage)?;
         let h = &plan.expected_handoff;
         let mut client = self.control_client(provenance_plan_root)?;
         let fence = DfsMetadataShardMembershipHandoffFence {
@@ -1159,22 +1220,7 @@ impl NativeImportAuthority {
         Self::validate_joint_acknowledgements(&proof).map_err(|reason| {
             error(format!("{reason}; stage failures: {}", failures.join("; ")))
         })?;
-        client.last_commit = None;
-        if !DfsControlPlaneStore::new(&mut client)
-            .complete_metadata_shard_membership_handoff(&h.retiring_shard, &h.desired_shard, &proof)
-            .map_err(error)?
-        {
-            return Err(error("native joint import activation did not commit"));
-        }
-        let activation = client
-            .last_commit
-            .clone()
-            .ok_or_else(|| error("joint activation returned no actual native commit receipt"))?;
-        Self::require_committed(&activation)?;
-        let actual = self
-            .check_handoff_state(plan)?
-            .ok_or_else(|| error("joint activation is not retained in actual native state"))?;
-        Ok((stage, activation, actual))
+        Ok((stage, proof))
     }
     fn stage_rpc_value<T: serde::de::DeserializeOwned>(
         &self,

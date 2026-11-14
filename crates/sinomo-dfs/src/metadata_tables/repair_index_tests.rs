@@ -43,6 +43,7 @@ fn version(name: &str) -> DfsVersion {
 
 fn file_system() -> DfsFileSystem {
     DfsFileSystem {
+        namespace_count_activation: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: file_system_id(),
@@ -57,6 +58,7 @@ fn object(version_name: &str, hash: &str) -> DfsObjectMetadata {
         object_id: object_id(),
         file_system_id: file_system_id(),
         path: "/repair/index.bin".into(),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         tombstone_provenance: None,
         owner_node_id: owner(),

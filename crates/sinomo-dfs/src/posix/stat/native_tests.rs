@@ -202,13 +202,8 @@ fn directory_stat_root_counts_immediate_children_across_prefix_owners() {
         expected
     );
     let captured = cluster.deny_services_stat();
-    assert!(cluster.caller.posix_stat_distributed("/").is_err());
-    assert!(
-        captured_projection(&captured)
-            .entries
-            .iter()
-            .any(|entry| { entry.path == "/services" && entry.kind == DfsObjectKind::Directory })
-    );
+    assert_eq!(cluster.caller.posix_stat_distributed("/").unwrap().link_count, expected);
+    assert!(captured.lock().unwrap().is_empty(), "root count belongs to its canonical owner");
     cluster.runtime.clear_faults();
     assert_eq!(
         cluster
@@ -374,11 +369,11 @@ fn existing_shard_boundary_mkdir_all_is_an_authoritative_noop() {
 }
 
 #[test]
-fn directory_stat_scope_keeps_file_alias_projection_global() {
+fn file_stat_uses_maintained_count_without_global_alias_projection() {
     let mut cluster = SplitAuthorities::new("stat-file-alias-global-authorities");
     let path = "/stat-global-target";
-    // A same-shard alias proves that file stat still needs authoritative
-    // absence from every other shard; this does not exercise alias adoption.
+    // The canonical count includes this alias. Unrelated authorities do not
+    // participate in reading it; a held denial must remain unused.
     let alias = "/stat-global-alias";
     cluster
         .caller
@@ -409,17 +404,8 @@ fn directory_stat_scope_keeps_file_alias_projection_global() {
         );
     }
     let captured = cluster.deny_services_stat();
-    assert!(
-        cluster.caller.posix_stat_distributed(path).is_err(),
-        "an unavailable alias authority cannot produce a successful undercount"
-    );
-    let page = captured_projection(&captured);
-    assert_eq!(page.request.object_id, original.object_id);
-    assert_eq!(page.request.object_kind, DfsObjectKind::File);
-    assert!(
-        page.entries.is_empty(),
-        "the actual Services projection supplies absence, never a copied alias"
-    );
+    assert_eq!(cluster.caller.posix_stat_distributed(path).unwrap().link_count, 2);
+    assert!(captured.lock().unwrap().is_empty(), "no unrelated alias projection");
     cluster.runtime.clear_faults();
     assert_eq!(
         cluster

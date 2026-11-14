@@ -644,6 +644,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 return Err(DfsError::Metadata { message: "existing assignment has no retained genesis or certified metadata image; import/catch-up required".into() });
             }
         }
+        let mut missing_objects = Vec::new();
         for object in
             crate::distributed_sifs_bootstrap_objects_for_nodes(bootstrap_nodes, fallback_node)
         {
@@ -662,9 +663,10 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 .get_object_by_path(&object.file_system_id, &object.path)?
                 .is_none()
             {
-                service.add_object_metadata(object)?;
+                missing_objects.push(object);
             }
         }
+        service.publish_missing_bootstrap_objects(missing_objects)?;
         Ok(())
     }
 }

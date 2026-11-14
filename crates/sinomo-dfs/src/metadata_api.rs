@@ -462,6 +462,7 @@ impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
 /// that source-validation boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataReplicaIngestPermit {
+    namespace_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     file_system_id: DfsFileSystemId,
     shard_id: DfsMetadataShardId,
     source_node_id: NodeId,
@@ -591,6 +592,7 @@ impl DfsMetadataReplicaIngestPermit {
             shard_id,
             source_node_id,
             source_epoch,
+            namespace_catalog: None,
             pending_primary_handoff_id: None,
             floor_epoch_scope: None,
         }
@@ -612,6 +614,7 @@ impl DfsMetadataReplicaIngestPermit {
             shard_id,
             source_node_id,
             source_epoch,
+            namespace_catalog: None,
             pending_primary_handoff_id: Some(handoff_id),
             floor_epoch_scope: None,
         }
@@ -619,6 +622,19 @@ impl DfsMetadataReplicaIngestPermit {
 
     /// Scope acknowledgement floors to epochs for a write-set shard. The
     /// value is the switch epoch from the same validated shard record.
+    pub(crate) fn with_namespace_catalog(mut self, catalog: crate::DfsMetadataNamespaceCatalog) -> Self {
+        self.namespace_catalog = Some(catalog);
+        self
+    }
+    pub(crate) fn validate_counted_snapshot(&self, tables: &crate::metadata_tables::DfsMetadataTables) -> Result<()> {
+        let catalog = self.namespace_catalog.as_ref().filter(|catalog|
+            catalog.matches_ingress_scope(&self.file_system_id, &self.shard_id, &self.source_node_id, self.source_epoch))
+            .ok_or_else(|| MetadataBackendError::Serde(
+                "snapshot admission lacks its exact captured complete namespace catalog".into(),
+            ))?;
+        catalog.validate_snapshot(&self.shard_id, tables)
+    }
+
     pub(crate) fn with_floor_epoch_scope(mut self, scope: Option<u64>) -> Self {
         self.floor_epoch_scope = scope;
         self
@@ -864,6 +880,22 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         transfer_id: Option<&str>,
         target_shard_id: &DfsMetadataShardId,
     ) -> Result<DfsForeignShardSourceEvictionPlan>;
+    /// Bounded lookup in the existing operation-ID index; no journal recovery.
+    fn prepared_operation_family_page(
+        &self, shard_id: &DfsMetadataShardId, prefix: &str, after: Option<&str>, max_entries: usize,
+    ) -> Result<(Vec<crate::DfsPreparedOperationRecord>, Option<String>)> {
+        let _ = (shard_id, prefix, after, max_entries);
+        Err(MetadataBackendError::Serde("backend has no bounded prepared-family index".into()))
+    }
+    /// Observe the immutable record only at the supplied exact current cut.
+    /// None means the cut cannot be corroborated; Some(None) is proven absence.
+    fn prepared_operation_record_at_prefix(
+        &self, shard_id: &DfsMetadataShardId, prefix: &DfsMetadataPrefixProof, operation_id: &str,
+    ) -> Result<Option<Option<crate::DfsPreparedOperationRecord>>> {
+        let _ = (shard_id, prefix, operation_id);
+        Ok(None)
+    }
+
     fn prepared_operation_record(
         &self,
         operation_id: &str,
@@ -2467,6 +2499,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsPendingNamespaceRequestPage>;
 
     /// Fetch a namespace maintenance job by id.
+    /// Exact active parent-write participants on the physical owner. This is
+    /// an indexed view of existing namespace job rows, not new authority.
+    fn parent_count_reservations(
+        &self, shard_id: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsNamespaceJobRecord>> {
+        let _ = (shard_id, file_system_id, object_id);
+        Err(MetadataBackendError::Serde("backend has no indexed parent participant view".into()))
+    }
+
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>>;
 
     /// Fetch compact terminal namespace-job evidence by durable job id.

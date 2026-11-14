@@ -315,6 +315,7 @@ pub(crate) fn dfs_file_system_semantically_eq(left: &DfsFileSystem, right: &DfsF
         || (left.file_system_id == right.file_system_id
             && left.display_name == right.display_name
             && left.owner_node_id == right.owner_node_id
+            && left.namespace_count_activation == right.namespace_count_activation
             && left.retention_policies == right.retention_policies
             && left.module_metadata == right.module_metadata
             && canonical_subtree_policies(&left.subtree_policies)
@@ -4485,6 +4486,7 @@ pub(crate) fn scoped_placement_config_for_job(
     job: &DfsPlacementReconciliationJob,
 ) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        namespace_count_activation: config.namespace_count_activation.clone(),
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: config.file_system_id.clone(),
@@ -5582,6 +5584,7 @@ mod tests {
 
     fn placement_config(owner_node_id: NodeId) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5642,6 +5645,7 @@ mod tests {
             object_id: DfsObjectId::from_legacy_named(format!("object-{suffix}")).expect("object"),
             file_system_id: sifs_file_system_id(),
             path: path.to_string(),
+            namespace_link_count: (kind).initial_namespace_link_count(),
             kind,
             tombstone_provenance: None,
             owner_node_id,
@@ -5798,6 +5802,7 @@ mod tests {
         let services =
             DfsSubtreePolicy::new("/services", DfsObjectPolicy::ReplicatedEventual, 1, 2);
         let first = DfsFileSystem {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5845,6 +5850,7 @@ mod tests {
         let confirmed =
             DfsSubtreePolicy::new("/users/team", DfsObjectPolicy::ReplicatedConfirmed, 2, 2);
         let first = DfsFileSystem {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5900,6 +5906,7 @@ mod tests {
             ..first_rule.clone()
         };
         let first = DfsFileSystem {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5930,6 +5937,7 @@ mod tests {
     fn filesystem_semantics_do_not_assume_path_aliases_are_equivalent() {
         let owner = node("owner");
         let canonical = DfsFileSystem {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5979,6 +5987,7 @@ mod tests {
     #[test]
     fn self_rule_overrides_same_path_subtree_without_affecting_children() {
         let mut config = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("fs"),
@@ -6100,6 +6109,7 @@ mod tests {
     fn preview_honors_required_forbidden_and_zone_spread() {
         let fs = DfsFileSystemId::from_legacy_named("sifs").expect("fs");
         let config = DfsFileSystemConfig {
+            namespace_count_activation: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: fs,
@@ -8328,6 +8338,7 @@ mod shard_pager_tests {
             object_id: DfsObjectId::from_legacy_named(format!("obj_pager_{}", path.len())).unwrap(),
             file_system_id: crate::sifs_file_system_id(),
             path: path.to_string(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: owner.clone(),

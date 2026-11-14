@@ -255,7 +255,7 @@ pub(crate) fn acknowledged_source_floors_for_root(
     shard: &DfsMetadataShardId,
 ) -> Result<Vec<LegacyAcknowledgement>> {
     let current = super::current_root(root)?;
-    if source_format != Some(9)
+    if source_format != Some(9) && source_format != Some(10)
         && source_format != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
     {
         if current {

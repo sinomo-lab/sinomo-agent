@@ -86,46 +86,7 @@ pub(crate) fn query_stat_projection<B: DfsMetadataBackend + ?Sized>(
             && row.tombstone_provenance.is_none()
             && row.path == request.object_path
     });
-    if let Some(row) = object.as_mut()
-        && row.content_size_bytes.is_none()
-        && let Some(version) = backend.get_version(&row.object_id, &row.version)?
-        && version.content_hash == row.content_hash
-    {
-        row.content_size_bytes = version.size_bytes;
-    }
-    if let Some(row) = object.as_mut().filter(|row| row.content_hash.is_some()) {
-        // Preserve ordinary stat's current-version receipt-derived locations,
-        // under this same authority cut, with an explicit object-local bound.
-        let receipts = backend.receipts_for_version_page(
-            &row.object_id,
-            &row.version,
-            None,
-            crate::file_history_query::HISTORY_PAGE_LIMIT,
-        )?;
-        if receipts.next_cursor.is_some() {
-            return Err(invalid(
-                "stat receipt projection is incomplete within its record limit",
-            ));
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        row.current_locations
-            .retain(|node| seen.insert(node.clone()));
-        for receipt in receipts.receipts {
-            if receipt.receipt.file_system_id != row.file_system_id
-                || receipt.receipt.object_id != row.object_id
-                || receipt.receipt.committed_version != row.version
-            {
-                return Err(invalid(
-                    "stat receipt projection returned a foreign identity",
-                ));
-            }
-            if receipt.content_hash == row.content_hash
-                && !row.current_locations.contains(&receipt.replica_node_id)
-            {
-                row.current_locations.push(receipt.replica_node_id);
-            }
-        }
-    }
+    enrich_stat_object(backend, &mut object)?;
     let (entries, after) = if request.fence_only {
         (Vec::new(), None)
     } else if request.object_kind == DfsObjectKind::Directory {
@@ -187,10 +148,83 @@ pub(crate) fn query_stat_projection<B: DfsMetadataBackend + ?Sized>(
     })
 }
 
+/// Enrich only the selected inode from its held authority snapshot.
+/// This never enumerates aliases, children, or another shard.
+pub(crate) fn enrich_stat_object<B: DfsMetadataBackend + ?Sized>(
+    backend: &B,
+    object: &mut Option<DfsObjectMetadata>,
+) -> Result<(), MetadataBackendError> {
+    let invalid = |message: &str| MetadataBackendError::Serde(message.to_owned());
+    if let Some(row) = object.as_mut()
+        && row.content_size_bytes.is_none()
+        && let Some(version) = backend.get_version(&row.object_id, &row.version)?
+        && version.content_hash == row.content_hash
+    {
+        row.content_size_bytes = version.size_bytes;
+    }
+    if let Some(row) = object.as_mut().filter(|row| row.content_hash.is_some()) {
+        // Preserve ordinary stat's current-version receipt-derived locations,
+        // under this same authority cut, with an explicit object-local bound.
+        let receipts = backend.receipts_for_version_page(
+            &row.object_id,
+            &row.version,
+            None,
+            crate::file_history_query::HISTORY_PAGE_LIMIT,
+        )?;
+        if receipts.next_cursor.is_some() {
+            return Err(invalid(
+                "stat receipt projection is incomplete within its record limit",
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        row.current_locations
+            .retain(|node| seen.insert(node.clone()));
+        for receipt in receipts.receipts {
+            if receipt.receipt.file_system_id != row.file_system_id
+                || receipt.receipt.object_id != row.object_id
+                || receipt.receipt.committed_version != row.version
+            {
+                return Err(invalid(
+                    "stat receipt projection returned a foreign identity",
+                ));
+            }
+            if receipt.content_hash == row.content_hash
+                && !row.current_locations.contains(&receipt.replica_node_id)
+            {
+                row.current_locations.push(receipt.replica_node_id);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sinomo_core::object::serde_ext as sinomo_object_serde;
+
+    #[test]
+    fn maintained_stat_wire_requires_explicit_authoritative_absence() {
+        let absent = DfsMetadataQueryResult::StatAtPathV2 { object: None };
+        let encoded =
+            sinomo_object_serde::to_bytes(&absent, 1, sinomo_core::object::LengthMode::U32)
+                .unwrap();
+        let decoded: DfsMetadataQueryResult = sinomo_object_serde::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, absent);
+        assert!(
+            serde_json::from_value::<DfsMetadataQueryResult>(serde_json::json!({
+                "kind": "stat-at-path-v2"
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<DfsMetadataQueryResult>(serde_json::json!({
+                "kind": "stat-at-path-v2", "object": null
+            }))
+            .unwrap(),
+            absent
+        );
+    }
 
     #[test]
     fn stat_path_wire_roundtrip_preserves_named_prefix_records_and_catalog_binding() {

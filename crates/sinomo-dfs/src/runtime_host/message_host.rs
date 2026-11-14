@@ -3808,6 +3808,7 @@ fn daemon_dfs_genesis_ingress_scopes(
                     | Op::VerifyObjectFamilyAdoption { .. }
                     | Op::AdoptHardlinkAlias { .. }
                     | Op::InstallHardlinkTargetFence { .. }
+                    | Op::ParentCountParticipant { .. }
                     | Op::CommitHardlinkTargetFence { .. }
             ) =>
         {

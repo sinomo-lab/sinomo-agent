@@ -6,7 +6,7 @@
 //! SIFS metadata records. Durable metadata storage itself remains owned by
 //! `metadata_backend`.
 
-use crate::{DfsMetadataRejection, DfsMetadataRejectionCode};
+use crate::{DfsMetadataRejection, DfsMetadataRejectionCode, MetadataBackendError};
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -475,8 +475,68 @@ pub async fn execute_prepared_cluster_dfs_metadata_publish_with_async_peer_trans
     execute_prepared_dfs_metadata_journal_publish_async(plan, &transport, options).await
 }
 
+/// Complete operation-scoped namespace routing input. Fields are private so an
+/// arbitrary partial vector cannot assert that a snapshot row has another owner.
+/// Native ingress rechecks this catalog against its current configuration fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMetadataNamespaceCatalog {
+    file_system_id: DfsFileSystemId,
+    shards: Vec<DfsMetadataShardConfig>,
+}
+impl DfsMetadataNamespaceCatalog {
+    pub(crate) fn capture(
+        projection: &crate::DfsAuthoritativePrefixProjection,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Self, DfsError> {
+        if !projection.is_complete() {
+            return Err(DfsError::Metadata { message: "namespace count catalog is incomplete".into() });
+        }
+        let shards = crate::metadata_authority_projection::metadata_shards_from_authority_projection(projection, file_system_id)?;
+        if shards.is_empty() {
+            return Err(DfsError::Metadata { message: "namespace count catalog has no assignments".into() });
+        }
+        Ok(Self { file_system_id: file_system_id.clone(), shards })
+    }
+    pub(crate) fn matches_entries(&self, entries: &[sinomo_core::kv::KvEntry]) -> Result<bool, DfsError> {
+        Ok(crate::metadata_authority_projection::metadata_shards_from_authority_entries(
+            entries, &self.file_system_id,
+        )? == self.shards)
+    }
+    pub(crate) fn binds(&self, shard: &DfsMetadataShardConfig) -> bool {
+        self.file_system_id == shard.file_system_id && self.shards.iter().any(|current| current == shard)
+    }
+    pub(crate) fn matches_ingress_scope(&self, filesystem: &DfsFileSystemId, shard: &DfsMetadataShardId, source: &NodeId, epoch: u64) -> bool {
+        self.file_system_id == *filesystem && self.shards.iter().any(|assignment|
+            assignment.shard_id == shard.0 && assignment.file_system_id == *filesystem
+                && assignment.primary_node_id == *source && assignment.epoch == epoch)
+    }
+    pub(crate) fn validate_snapshot(&self, shard_id: &DfsMetadataShardId, tables: &crate::metadata_tables::DfsMetadataTables) -> crate::metadata_error::Result<()> {
+        if !self.shards.iter().any(|shard| shard.shard_id == shard_id.0) {
+            return Err(MetadataBackendError::Serde("count snapshot has no catalog assignment".into()));
+        }
+        for object in tables.objects.values() {
+            if object.file_system_id != self.file_system_id || object.kind == crate::DfsObjectKind::Tombstone
+                || object.tombstone_provenance.is_some() { continue; }
+            let owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &self.file_system_id, &self.shards, &object.path,
+            ).map_err(|error| MetadataBackendError::Serde(error.to_string()))?.ok_or_else(|| MetadataBackendError::Serde("snapshot live row has no namespace owner".into()))?;
+            if owner.shard_id != shard_id.0 { continue; }
+            let valid = match object.kind {
+                crate::DfsObjectKind::Hardlink => object.namespace_link_count.is_none(),
+                crate::DfsObjectKind::Directory => object.namespace_link_count.is_some_and(|count| count >= 2),
+                _ => object.namespace_link_count.is_some_and(|count| count > 0),
+            };
+            if !valid {
+                return Err(MetadataBackendError::Serde(format!("current snapshot owner row {} has no initialized namespace count", object.object_id)));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataReplicaShardContext {
+    pub namespace_catalog: Option<DfsMetadataNamespaceCatalog>,
     pub local_node_id: NodeId,
     pub shard: DfsMetadataShardConfig,
     pub pending_membership_handoff: Option<DfsMetadataShardMembershipHandoff>,
@@ -6277,6 +6337,7 @@ fn bind_pending_primary_handoff_snapshot_for_target(
 
     command.primary_handoff_id = Some(handoff.handoff_id.clone());
     let receiver_context = DfsMetadataReplicaShardContext {
+        namespace_catalog: sender_context.namespace_catalog.clone(),
         local_node_id: target_node_id.clone(),
         shard: sender_context.shard.clone(),
         pending_membership_handoff: Some(handoff.clone()),
@@ -7224,6 +7285,7 @@ fn cluster_dfs_metadata_resident_shard_context_for_outbound_handoff(
         .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
         .transpose()?;
     Ok(shard.map(|shard| DfsMetadataReplicaShardContext {
+        namespace_catalog: None, // Observational outbound hint, never snapshot admission.
         local_node_id: state.local_node_id,
         // An outbound handoff hint carries no write-set authority.
         write_set: None,
@@ -7402,7 +7464,9 @@ pub(crate) fn metadata_snapshot_install_permit(
 ) -> std::result::Result<DfsMetadataReplicaIngestPermit, String> {
     let handoff_id = validated_pending_primary_handoff_snapshot_id(context, command)?;
     let scope = context.floor_epoch_scope();
-    Ok(if let Some(handoff_id) = handoff_id {
+    let catalog = context.namespace_catalog.as_ref().filter(|catalog| catalog.binds(&context.shard))
+        .ok_or_else(|| "snapshot admission has no complete current namespace catalog".to_string())?;
+    Ok((if let Some(handoff_id) = handoff_id {
         DfsMetadataReplicaIngestPermit::new_validated_pending_primary_handoff(
             context.shard.file_system_id.clone(),
             command.shard_id.clone(),
@@ -7419,7 +7483,7 @@ pub(crate) fn metadata_snapshot_install_permit(
             context.shard.epoch,
         )
         .with_floor_epoch_scope(scope)
-    })
+    }).with_namespace_catalog(catalog.clone()))
 }
 
 pub fn process_dfs_metadata_snapshot_install(
@@ -9900,3 +9964,7 @@ pub(crate) fn payload_visible_paths(
         )
         .collect()
 }
+
+#[cfg(test)]
+#[path = "metadata_replication/namespace_counts_tests.rs"]
+mod namespace_count_tests;
