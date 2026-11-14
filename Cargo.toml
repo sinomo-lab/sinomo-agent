@@ -194,6 +194,7 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+winresource = "0.1"
 cc = "1"
 pkg-config = "0.3"
 sha2 = "0.11"

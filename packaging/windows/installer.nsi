@@ -4,6 +4,7 @@ Unicode true
 !include LogicLib.nsh
 !include FileFunc.nsh
 Name "Sinomo"
+Icon "{{installer_icon}}"
 OutFile "{{out_file}}"
 RequestExecutionLevel user
 InstallDir "$LOCALAPPDATA\Programs\Sinomo"

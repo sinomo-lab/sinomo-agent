@@ -17,7 +17,7 @@ pub mod theme;
 pub mod ui;
 mod updates;
 
-use sui::{App, Window, default_sui_logo_image};
+use sui::{App, Window};
 use sui_lucide::LucideIcon;
 
 use crate::backend::Backend;
@@ -26,6 +26,8 @@ use crate::state::{AppState, Shared, Tab};
 use crate::state::{ConnectEvent, ReadyState};
 use crate::ui::Shell;
 use crate::ui::shell::{logo_image_handle, tab_icons};
+
+const LOGO_SVG: &[u8] = include_bytes!("../assets/logo.svg");
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
 const ANDROID_SAFE_AREA_CHANGED: sui::CommandKey<sui::Insets> =
@@ -135,12 +137,11 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
             for icon in tab_icons().into_iter().chain([LucideIcon::User]) {
                 resources.image(icon.handle(), icon.registered_mask_image()?)?;
             }
-            let logo = default_sui_logo_image(96)?;
-            resources.image(logo_image_handle(), logo)
+            resources.svg_image_at_size_with_handle(logo_image_handle(), 96, 96, LOGO_SVG)
         })
         .map(|app| {
             let placement = shared.borrow().window_placement;
-            let mut window = Window::new("Sinomo");
+            let mut window = Window::new("Sinomo").icon_svg(LOGO_SVG);
             if let Some([width, height]) = placement.size
                 && width.is_finite()
                 && height.is_finite()
