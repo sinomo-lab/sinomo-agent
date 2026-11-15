@@ -18,6 +18,7 @@ use crate::{
     DfsMetadataWriteSetEvent, DfsMetadataWriteSetTxnOutcome, DfsWriteSetKeepingTxn,
     DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
 };
+#[cfg(any(test, feature = "test-support"))]
 use sinomo_core::network::PeerPathVerdict;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -165,7 +166,7 @@ struct Keeper {
     runtime: tokio::runtime::Handle,
     authority: Arc<sinomo_dfs::DfsMetadataAuthorityRuntime>,
     events: ComponentEventClient,
-    verdicts: KeeperVerdicts,
+    verdicts: super::peer_verdicts::DfsPeerVerdicts,
     shards: BTreeMap<ShardKey, ShardKeeping>,
     /// The record epoch last seen for each switched shard this node holds a
     /// copy of: a member's acceptance fence is checked only when it moves.
@@ -185,7 +186,7 @@ impl Keeper {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let (completion_tx, completions) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            verdicts: KeeperVerdicts::new(&data_dir, &cluster_paths, &state),
+            verdicts: super::peer_verdicts::DfsPeerVerdicts::new(&data_dir, &cluster_paths, &state),
             local: state.local_node_id.clone(),
             data_dir,
             cluster_paths,
@@ -291,6 +292,8 @@ impl Keeper {
                 .switched()
                 .is_some()
         });
+        #[cfg(any(test, feature = "test-support"))]
+        record_test_reachability_interest(&self.data_dir.root(), keeps_switched_shard);
         self.verdicts.retain(keeps_switched_shard);
         let verdicts = self.verdicts.current();
         // Without the cluster scopes no member can be judged; the publication
@@ -312,7 +315,7 @@ impl Keeper {
         snapshot: &crate::DfsConfigurationSnapshot,
         entries: &[sinomo_core::kv::KvEntry],
         members: &BTreeMap<NodeId, MemberRecord>,
-        verdicts: &KeeperVerdictSnapshot,
+        verdicts: &super::peer_verdicts::DfsPeerVerdictSnapshot,
     ) {
         let entry = |key: &str| {
             entries
@@ -1177,17 +1180,17 @@ fn read_pending_write_set_adds(
 
 /// One cluster member as the keeper reads it from the publication.
 #[derive(Clone, Debug)]
-struct MemberRecord {
-    eligible: bool,
-    departed: bool,
-    mobile: bool,
+pub(super) struct MemberRecord {
+    pub(super) eligible: bool,
+    pub(super) departed: bool,
+    pub(super) mobile: bool,
 }
 
 /// The cluster's member facts, or `None` while this publication does not
 /// carry the cluster scopes (only the metadata publication has arrived): no
 /// member may then be judged departed or ineligible. A record that does not
 /// decode is not eligible and not departed.
-fn cluster_member_facts(
+pub(super) fn cluster_member_facts(
     snapshot: &crate::DfsConfigurationSnapshot,
 ) -> Option<BTreeMap<NodeId, MemberRecord>> {
     const MEMBERS: &str = "/cluster/members/";
@@ -1251,118 +1254,6 @@ fn cluster_member_facts(
     Some(facts)
 }
 
-/// This node's per-peer verdicts, as the keeper acts on them.
-#[derive(Clone, Debug, Default)]
-struct KeeperVerdictSnapshot {
-    generation: u64,
-    peers: BTreeMap<NodeId, (PeerPathVerdict, bool)>,
-}
-
-impl KeeperVerdictSnapshot {
-    fn reach(&self, node: &NodeId) -> DfsWriteSetMemberReach {
-        match self.peers.get(node) {
-            Some((PeerPathVerdict::Path, false)) => DfsWriteSetMemberReach::Path,
-            Some((PeerPathVerdict::NoPath, false)) => DfsWriteSetMemberReach::NoPath,
-            _ => DfsWriteSetMemberReach::Unsettled,
-        }
-    }
-}
-
-/// The network layer's verdicts, subscribed only while this node keeps a
-/// switched shard. Tests may supply them instead.
-struct KeeperVerdicts {
-    cluster_paths: ClusterPaths,
-    state: sinomo_core::ClusterBootstrapState,
-    subscription: Option<sinomo_core::network::PeerReachabilitySubscription>,
-    #[cfg(any(test, feature = "test-support"))]
-    test: Option<std::path::PathBuf>,
-}
-
-impl KeeperVerdicts {
-    fn new(
-        _data_dir: &SinomoDataDir,
-        cluster_paths: &ClusterPaths,
-        state: &sinomo_core::ClusterBootstrapState,
-    ) -> Self {
-        Self {
-            cluster_paths: cluster_paths.clone(),
-            state: state.clone(),
-            subscription: None,
-            #[cfg(any(test, feature = "test-support"))]
-            test: Some(_data_dir.root()),
-        }
-    }
-
-    fn retain(&mut self, needed: bool) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(root) = self.test.as_ref() {
-            record_test_reachability_interest(root, needed);
-            if test_verdicts_installed(root) {
-                self.subscription = None;
-                return;
-            }
-        }
-        if needed && self.subscription.is_none() {
-            self.subscription = Some(sinomo_core::network::subscribe_peer_reachability(
-                &self.cluster_paths,
-                &self.state,
-            ));
-        } else if !needed {
-            self.subscription = None;
-        }
-    }
-
-    fn current(&self) -> KeeperVerdictSnapshot {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(root) = self.test.as_ref()
-            && let Some(snapshot) = test_verdict_snapshot(root)
-        {
-            return snapshot;
-        }
-        self.subscription
-            .as_ref()
-            .map(|subscription| {
-                let current = subscription.current();
-                KeeperVerdictSnapshot {
-                    generation: current.generation,
-                    peers: current
-                        .peers
-                        .iter()
-                        .map(|(node, peer)| (node.clone(), (peer.verdict, peer.verifying)))
-                        .collect(),
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    async fn changed(&mut self) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(root) = self.test.as_ref()
-            && test_verdicts_installed(root)
-        {
-            let wake = test_verdict_wake(root);
-            wake.notified().await;
-            return;
-        }
-        match self.subscription.as_mut() {
-            Some(subscription) => {
-                subscription.changed().await;
-            }
-            None => std::future::pending::<()>().await,
-        }
-    }
-
-    fn request_verification(&self, peer: &NodeId) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(root) = self.test.as_ref()
-            && test_verdicts_installed(root)
-        {
-            record_test_verification_request(root, peer);
-            return;
-        }
-        sinomo_core::network::request_peer_verification(&self.cluster_paths, &self.state, peer);
-    }
-}
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn keeping_suspended(_data_dir: &SinomoDataDir) -> bool {
@@ -1379,18 +1270,9 @@ mod test_control {
     use std::sync::{LazyLock, Mutex};
 
     #[derive(Default)]
-    struct VerdictState {
-        generation: u64,
-        peers: BTreeMap<NodeId, (PeerPathVerdict, bool)>,
-        verification_requests: Vec<NodeId>,
-        wake: Arc<tokio::sync::Notify>,
-    }
-
-    #[derive(Default)]
     struct Control {
         suspended: BTreeSet<PathBuf>,
         enabled: BTreeSet<PathBuf>,
-        verdicts: BTreeMap<PathBuf, VerdictState>,
         events: BTreeMap<PathBuf, Vec<(String, DfsMetadataWriteSetEvent)>>,
         failures: BTreeMap<PathBuf, Vec<String>>,
         /// Whether each keeper's last evaluation wanted a reachability
@@ -1449,51 +1331,20 @@ mod test_control {
         control().reachability.get(root).copied()
     }
 
-    pub(super) fn test_verdicts_installed(root: &PathBuf) -> bool {
-        control().verdicts.contains_key(root)
-    }
-
-    pub(super) fn test_verdict_snapshot(root: &PathBuf) -> Option<KeeperVerdictSnapshot> {
-        control().verdicts.get(root).map(|state| KeeperVerdictSnapshot {
-            generation: state.generation,
-            peers: state.peers.clone(),
-        })
-    }
-
-    pub(super) fn test_verdict_wake(root: &std::path::Path) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&control().verdicts.entry(root.to_path_buf()).or_default().wake)
-    }
-
-    pub(super) fn record_test_verification_request(root: &PathBuf, peer: &NodeId) {
-        if let Some(state) = control().verdicts.get_mut(root) {
-            state.verification_requests.push(peer.clone());
-        }
-    }
-
-    /// Set the verdict the keeper of `root` sees for `peer`.
+    /// Set the verdict every write-set role of `root` sees for `peer`, and
+    /// wake its keeper, which may not have been waiting on test verdicts yet.
     pub(crate) fn set_test_peer_verdict(
         root: PathBuf,
         peer: NodeId,
         verdict: PeerPathVerdict,
         verifying: bool,
     ) {
-        let wake = {
-            let mut control = control();
-            let state = control.verdicts.entry(root).or_default();
-            state.peers.insert(peer, (verdict, verifying));
-            state.generation += 1;
-            Arc::clone(&state.wake)
-        };
-        wake.notify_waiters();
+        super::super::peer_verdicts::test_seam::set_peer_verdict(root, peer, verdict, verifying);
         WAKE.notify_waiters();
     }
 
     pub(crate) fn test_verification_requests(root: &PathBuf) -> Vec<NodeId> {
-        control()
-            .verdicts
-            .get(root)
-            .map(|state| state.verification_requests.clone())
-            .unwrap_or_default()
+        super::super::peer_verdicts::test_seam::verification_requests(root)
     }
 
     pub(super) fn record_keeping_event_for_test(

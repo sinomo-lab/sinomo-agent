@@ -213,6 +213,7 @@ mod service_write;
 mod service_write_set_keeping;
 pub(crate) use service_write_set_keeping::{DfsWriteSetAlignment, DfsWriteSetJoin};
 mod smoke;
+pub mod takeover_corroboration;
 mod transfer;
 mod write_configuration_inputs;
 mod write_configuration_projection;
@@ -822,7 +823,8 @@ pub use routes::{
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE,
     DFS_DATA_WRITE_RESPONSE_ROUTE, DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE,
     DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE,
+    DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
     DFS_STATUS_ROUTE, DfsMessageExecutionScope, decode_dfs_inspection_rpc_response,
     decode_dfs_message_rpc_request, decode_dfs_message_rpc_response,
     decode_dfs_metadata_journal_batch_rpc_response,
@@ -925,9 +927,13 @@ mod tests;
 
 pub use control_plane::select_metadata_shard_config_for_path;
 pub(crate) use control_plane::{
-    DfsWriteSetKeepingTxn, DfsWriteSetKeepingView, DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
-    DfsWriteSetRemoveCause, DfsWriteSetShrinkCause, metadata_shard_configured_node_ids,
-    metadata_write_set_reduction, plan_metadata_write_set_keeping,
+    DfsTakeoverCause, DfsTakeoverHandOffDecision, DfsTakeoverPlan, DfsTakeoverRoundEntry,
+    DfsTakeoverRoundOutcome, DfsTakeoverStanding, DfsTakeoverView, DfsWriteSetKeepingTxn,
+    DfsWriteSetKeepingView, DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
+    DfsWriteSetRemoveCause, DfsWriteSetShrinkCause, decide_metadata_takeover_hand_off,
+    decide_metadata_takeover_round, metadata_shard_configured_node_ids,
+    metadata_write_set_reduction, plan_metadata_takeover, plan_metadata_write_set_keeping,
+    rank_metadata_takeover_candidates,
 };
 pub use intent::{
     stable_create_object_id, stable_operation_order_token, stable_write_target_version,

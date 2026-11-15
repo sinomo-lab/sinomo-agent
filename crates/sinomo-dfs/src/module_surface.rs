@@ -266,6 +266,15 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             )
             .require_exact_member_identity(),
         )
+        .with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                crate::DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE,
+                DFS_RPC_CATEGORY,
+                "dfs.metadata.replicate",
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .require_exact_member_identity(),
+        )
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_SMOKE_ROUTE,
             DFS_RPC_CATEGORY,
@@ -418,6 +427,7 @@ mod tests {
                 || route.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
                 || route.route == crate::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
                 || route.route == crate::source_adoption::SOURCE_ADOPTION_ROUTE
+                || route.route == crate::DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE
                 || crate::dfs_route_is_message_data_plane(&route.route);
             assert_eq!(
                 route.exact_member_identity, expected_exact,
@@ -427,7 +437,7 @@ mod tests {
         }
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
-            DFS_OBJECT_RPC_ROUTES.len() + 4
+            DFS_OBJECT_RPC_ROUTES.len() + 5
         );
         assert!(
             registration

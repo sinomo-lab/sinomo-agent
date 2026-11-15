@@ -17,6 +17,9 @@ pub use sinomo_api::dfs::routes::DFS_INSPECTION_ROUTE;
 pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
+/// Takeover corroboration between write-set members. Served by its own
+/// service and kept outside `DFS_OBJECT_RPC_ROUTES`, like source adoption.
+pub const DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE: &str = "/dfs/metadata/takeover-corroboration";
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
 pub const DFS_DATA_READ_ROUTE: &str = "/dfs/data/read";
 pub const DFS_DATA_READ_RESPONSE_ROUTE: &str = "/dfs/data/read/response";

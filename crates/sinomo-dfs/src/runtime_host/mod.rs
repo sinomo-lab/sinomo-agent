@@ -3408,7 +3408,12 @@ pub(crate) use maintenance_runtime::{
     run_daemon_dfs_maintenance_tick_in_blocking_task,
     run_daemon_dfs_repair_executor_turn_in_blocking_task,
 };
+mod peer_verdicts;
 mod write_set_keeping;
+mod write_set_takeover;
+pub(crate) use write_set_takeover::answer_dfs_takeover_corroboration;
+#[cfg(test)]
+pub(crate) use write_set_takeover::ask_dfs_takeover_corroboration_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use write_set_keeping::{
     keeping_events_for_test, keeping_failures_for_test, keeping_reachability_interest_for_test,

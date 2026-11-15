@@ -245,6 +245,42 @@ impl Service for DfsSourceAdoptionService {
     }
 }
 
+/// Answers takeover corroboration from write-set members. It holds no shard
+/// lock, lane or admission, so it answers while the mutation lanes are busy.
+struct DfsTakeoverCorroborationService {
+    data_dir: SinomoDataDir,
+    runtime: tokio::runtime::Handle,
+}
+impl Service for DfsTakeoverCorroborationService {
+    fn name(&self) -> &'static str {
+        "dfs-takeover-corroboration"
+    }
+    fn routes(&self) -> &'static [&'static str] {
+        &[crate::DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE]
+    }
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![dfs_service_route(
+            crate::DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE,
+        )]
+    }
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let data_dir = self.data_dir.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let route = crate::DFS_METADATA_TAKEOVER_CORROBORATION_ROUTE;
+            let caller = authenticated_dfs_cluster_source_node_id(&ctx, route)?;
+            let request: crate::takeover_corroboration::DfsMetadataTakeoverCorroborationRequest =
+                ctx.decode_request_body_bounded(&request, 64 * 1024).await?;
+            let reply = crate::runtime_host::answer_dfs_takeover_corroboration(
+                data_dir, runtime, caller, request,
+            )
+            .await;
+            ctx.respond_value(route, reply)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
 impl Service for DfsMetricExporterService {
     fn name(&self) -> &'static str {
         "dfs-metric-exporter"
@@ -546,6 +582,10 @@ fn component_factory_with_selected_layout(
                 )?;
                 builder = builder.register(DfsSourceAdoptionService {
                     actor: Arc::clone(&source_adoption),
+                });
+                builder = builder.register(DfsTakeoverCorroborationService {
+                    data_dir: data_dir.clone(),
+                    runtime: runtime.clone(),
                 });
                 // Recover exact retained captures before strict startup opens
                 // can wait for their already-owned metadata writers.

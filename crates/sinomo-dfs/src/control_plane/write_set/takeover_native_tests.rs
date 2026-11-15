@@ -717,3 +717,131 @@ fn native_takeover_promise_refuses_the_primary_whose_keeper_shrinks_the_candidat
     });
     runtime.close().unwrap();
 }
+
+fn corroboration_request(
+    config: &DfsMetadataShardConfig,
+    record: &DfsMetadataShardRecordCut,
+    candidate: &NodeId,
+) -> crate::takeover_corroboration::DfsMetadataTakeoverCorroborationRequest {
+    crate::takeover_corroboration::DfsMetadataTakeoverCorroborationRequest {
+        format: crate::takeover_corroboration::DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT,
+        attempt_id: sinomo_core::Id::generate().to_string(),
+        kind: crate::takeover_corroboration::DfsTakeoverCorroborationKind::Query,
+        file_system_id: config.file_system_id.clone(),
+        shard_id: shard_id_of(config),
+        epoch: record.shard.epoch,
+        write_set_generation: record.write_set_state().switched().unwrap().generation,
+        primary_node_id: record.shard.primary_node_id.clone(),
+        candidate_node_id: candidate.clone(),
+    }
+}
+
+fn ask(
+    runtime: &crate::test_support::DfsTestRuntime,
+    asker: &NodeId,
+    member: &NodeId,
+    request: &crate::takeover_corroboration::DfsMetadataTakeoverCorroborationRequest,
+) -> crate::takeover_corroboration::DfsMetadataTakeoverCorroborationReply {
+    crate::runtime_host::ask_dfs_takeover_corroboration_for_test(
+        runtime.data_dir(asker),
+        &runtime.runtime_handle(),
+        member,
+        request,
+    )
+    .expect("the member answers")
+}
+
+/// A member answers whether it still reaches the primary from its own record
+/// and its own verdict: a path vetoes, a settled no-path is a loss that
+/// carries its durable head, a later record tells the asker to follow, and a
+/// caller that does not name itself as the candidate is refused.
+#[test]
+fn native_corroboration_answers_from_the_members_record_and_verdict() {
+    use crate::takeover_corroboration::{DfsTakeoverAbstainReason, DfsTakeoverPrimaryReach};
+    use sinomo_core::network::PeerPathVerdict;
+    let (runtime, config) = switched("native-takeover-corroboration", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    client_write(&runtime, &config, &c, "/services/corroboration.txt");
+    let head = catch_up(&runtime, &config, &c);
+    let record = cut(&runtime, &config);
+    let request = corroboration_request(&config, &record, &b);
+    let expected = crate::DfsMetadataMemberRecordView {
+        epoch: record.shard.epoch,
+        generation: request.write_set_generation,
+        primary_node_id: p.clone(),
+    };
+
+    runtime.set_peer_verdict(&c, &p, PeerPathVerdict::Path, false);
+    let reply = ask(&runtime, &b, &c, &request);
+    assert_eq!(reply.answer, DfsTakeoverPrimaryReach::Reaches, "{reply:?}");
+    assert_eq!(reply.member_node_id, c);
+    assert_eq!(reply.attempt_id, request.attempt_id);
+    assert_eq!(reply.record_view.as_ref(), Some(&expected));
+    assert!(reply.verdict_evidence.is_some());
+    // Unless its verdict already settled no path, the member asked the
+    // network to verify the primary first.
+    assert!(runtime.peer_verification_requests(&c).contains(&p));
+
+    runtime.set_peer_verdict(&c, &p, PeerPathVerdict::NoPath, false);
+    let reply = ask(&runtime, &b, &c, &request);
+    assert_eq!(reply.answer, DfsTakeoverPrimaryReach::Lost, "{reply:?}");
+    assert_eq!(reply.durable_sequence, Some(head.journal_sequence));
+
+    let stale = crate::takeover_corroboration::DfsMetadataTakeoverCorroborationRequest {
+        epoch: record.shard.epoch - 1,
+        ..request.clone()
+    };
+    let reply = ask(&runtime, &b, &c, &stale);
+    assert_eq!(
+        reply.answer,
+        DfsTakeoverPrimaryReach::Abstain {
+            reason: DfsTakeoverAbstainReason::NewerRecord
+        }
+    );
+    assert_eq!(reply.record_view.as_ref(), Some(&expected));
+
+    let forged = crate::takeover_corroboration::DfsMetadataTakeoverCorroborationRequest {
+        candidate_node_id: c.clone(),
+        ..request
+    };
+    assert_eq!(
+        ask(&runtime, &b, &c, &forged).answer,
+        DfsTakeoverPrimaryReach::Abstain {
+            reason: DfsTakeoverAbstainReason::Malformed
+        }
+    );
+    runtime.close().unwrap();
+}
+
+/// A member whose network is still verifying the primary answers once the
+/// verdict settles, not from the verdict it held when it was asked.
+#[test]
+fn native_corroboration_waits_for_a_verdict_being_verified() {
+    use crate::takeover_corroboration::DfsTakeoverPrimaryReach;
+    use sinomo_core::network::PeerPathVerdict;
+    let (runtime, config) = switched("native-takeover-corroboration-wait", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let record = cut(&runtime, &config);
+    let request = corroboration_request(&config, &record, &b);
+    runtime.set_peer_verdict(&c, &p, PeerPathVerdict::Path, true);
+    let data_dir = runtime.data_dir(&b).clone();
+    let handle = runtime.runtime_handle();
+    let reply = std::thread::scope(|scope| {
+        let asked = scope.spawn(|| {
+            crate::runtime_host::ask_dfs_takeover_corroboration_for_test(
+                &data_dir, &handle, &c, &request,
+            )
+            .expect("the member answers")
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!asked.is_finished(), "the answer waits for the verdict");
+        runtime.set_peer_verdict(&c, &p, PeerPathVerdict::NoPath, false);
+        asked.join().unwrap()
+    });
+    assert_eq!(reply.answer, DfsTakeoverPrimaryReach::Lost);
+    runtime.close().unwrap();
+}

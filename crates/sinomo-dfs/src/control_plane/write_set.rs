@@ -21,6 +21,7 @@ use sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY;
 
 mod bounds;
 mod keeping;
+mod takeover;
 pub use bounds::{
     DfsMetadataShardBounds, DfsMetadataWriteSetCandidate, DfsMetadataWriteSetCandidateKind,
     metadata_commit_write_set_floor,
@@ -31,6 +32,12 @@ pub(crate) use keeping::{
     DfsWriteSetKeepingTxn, DfsWriteSetKeepingView, DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
     DfsWriteSetRemoveCause, DfsWriteSetShrinkCause, metadata_write_set_reduction,
     plan_metadata_write_set_keeping,
+};
+pub(crate) use takeover::{
+    DfsTakeoverCause, DfsTakeoverHandOffDecision, DfsTakeoverPlan, DfsTakeoverRoundEntry,
+    DfsTakeoverRoundOutcome, DfsTakeoverStanding, DfsTakeoverView,
+    decide_metadata_takeover_hand_off, decide_metadata_takeover_round, plan_metadata_takeover,
+    rank_metadata_takeover_candidates,
 };
 
 #[cfg(test)]
