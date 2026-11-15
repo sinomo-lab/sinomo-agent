@@ -1526,3 +1526,359 @@ fn native_takeover_member_with_a_divergent_prefix_is_repaired_by_snapshot() {
     );
     runtime.close().unwrap();
 }
+
+/// What `node` holds for a recovered change, in a form two nodes can be
+/// compared by: each journal record's sequence, kind and operation; the
+/// settled status of the original and of its recovery body; and digests of
+/// the object and of the whole shard table state.
+#[derive(Debug, PartialEq, Eq)]
+struct SettledView {
+    journal: Vec<String>,
+    original: Option<crate::DfsPreparedOperationStatus>,
+    recovery: Option<crate::DfsPreparedOperationStatus>,
+    object: Option<(u32, String)>,
+    tables: String,
+}
+
+fn settled_view(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+    original: &str,
+    recovery: &str,
+    object: &crate::DfsObjectId,
+) -> SettledView {
+    use crate::DfsMetadataBackend as _;
+    let backend = crate::LocalSobjMetadataBackend::open_for_inspection(
+        shard_id_of(config),
+        shard_root(runtime, node, config),
+    )
+    .unwrap();
+    let status = |operation: &str| {
+        backend
+            .prepared_operation_record(operation)
+            .ok()
+            .flatten()
+            .map(|record| record.status)
+    };
+    let digest = |text: String| blake3::hash(text.as_bytes()).to_hex()[..16].to_string();
+    SettledView {
+        journal: backend
+            .journal_since(0)
+            .unwrap()
+            .into_iter()
+            .map(|entry| {
+                let text = format!("{:?}", entry.mutation);
+                let kind = text.split([' ', '{', '(']).next().unwrap_or("").to_string();
+                let operation = text
+                    .split("operation_id: \"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or("");
+                format!("{}:{kind}:{operation}", entry.sequence)
+            })
+            .collect(),
+        original: status(original),
+        recovery: status(recovery),
+        object: backend
+            .get_object(object)
+            .unwrap()
+            .map(|object| (object.mode, digest(format!("{object:?}")))),
+        tables: digest(format!(
+            "{:?}",
+            backend
+                .export_shard_table_snapshot(&shard_id_of(config))
+                .unwrap()
+        )),
+    }
+}
+
+/// Every node in `nodes` holds the same history, statuses and state.
+fn assert_one_history(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    nodes: &[&NodeId],
+    original: &str,
+    recovery: &str,
+    object: &crate::DfsObjectId,
+) -> SettledView {
+    let views = nodes
+        .iter()
+        .map(|node| settled_view(runtime, node, config, original, recovery, object))
+        .collect::<Vec<_>>();
+    for (node, view) in nodes.iter().zip(&views).skip(1) {
+        assert_eq!(view, &views[0], "{node} differs from {}", nodes[0]);
+    }
+    assert_eq!(
+        views[0].original,
+        Some(crate::DfsPreparedOperationStatus::Superseded),
+        "the original is superseded by its recovery"
+    );
+    assert_eq!(
+        views[0].recovery,
+        Some(crate::DfsPreparedOperationStatus::Committed)
+    );
+    views.into_iter().next().unwrap()
+}
+
+/// The recovery body of the first `recover:` record in `node`'s journal, and
+/// its original's operation id.
+fn recovered_operation(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+) -> (String, String) {
+    use crate::DfsMetadataBackend as _;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let recovery = loop {
+        let found = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id_of(config),
+            shard_root(runtime, node, config),
+        )
+        .ok()
+        .and_then(|backend| backend.journal_since(0).ok())
+        .and_then(|entries| {
+            entries.into_iter().find_map(|entry| {
+                format!("{:?}", entry.mutation)
+                    .split("operation_id: \"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .filter(|operation| operation.starts_with("recover:"))
+                    .map(str::to_string)
+            })
+        });
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "{node} recovered nothing");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let original = recovery
+        .strip_prefix("recover:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .map(|(original, _)| original.to_string())
+        .unwrap();
+    (original, recovery)
+}
+
+/// A change every member stored but whose outcome is unknown when its
+/// primary stops is recovered by the successor as `recover:<op>:<epoch>`:
+/// the same body, a new operation id and owner epoch, and an effect that
+/// marks the original superseded. A member cut off during the recovery and
+/// the old primary both catch up to that same history: every node holds the
+/// same journal, statuses, object and table state, also after a restart.
+#[test]
+fn native_takeover_recovered_change_reaches_one_history_everywhere() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-recovered", Some((1, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let current = {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/recovered")
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // Both members store X, but P never hears their acknowledgements.
+    let gates =
+        [&b, &c].map(|member| super::commit_native_tests::hold_replies(&runtime, &config, member));
+    prepare_unknown(&runtime, &config, &current, "recovered-x");
+    wait_until("both members hold X", &runtime, &[&b, &c], || {
+        [&b, &c]
+            .into_iter()
+            .all(|member| operation_status(&runtime, member, &config, "recovered-x").is_some())
+    });
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    runtime.stop_node(&p).unwrap();
+    for gate in &gates {
+        super::commit_native_tests::release(gate);
+    }
+    runtime.partition_node(
+        &c,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::NoPath, false);
+    reelect(&runtime, &b);
+    lose(&runtime, &[&b], &p);
+    wait_until("B takes over", &runtime, &[&b], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id == b
+    });
+    let recovery = format!("recover:recovered-x:{}", config.epoch + 1);
+    wait_until("B recovers X", &runtime, &[&b], || {
+        operation_status(&runtime, &b, &config, &recovery)
+            == Some(crate::DfsPreparedOperationStatus::Committed)
+    });
+    runtime.partition_node(&c, Partition::default());
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::Path, false);
+    catch_up_from(
+        &runtime,
+        &record_from(&runtime, &config, &b).shard,
+        &b,
+        &[&c],
+    );
+    assert_one_history(
+        &runtime,
+        &config,
+        &[&b, &c],
+        "recovered-x",
+        &recovery,
+        &current.object_id,
+    );
+
+    runtime.reopen_node(p.clone()).unwrap();
+    runtime.set_peer_verdict(&b, &p, PeerPathVerdict::Path, false);
+    wait_until("B re-adds P", &runtime, &[&b], || {
+        write_set_of(&runtime, &config).contains(&p)
+    });
+    catch_up_from(
+        &runtime,
+        &record_from(&runtime, &config, &b).shard,
+        &b,
+        &[&c, &p],
+    );
+    let view = assert_one_history(
+        &runtime,
+        &config,
+        &[&b, &c, &p],
+        "recovered-x",
+        &recovery,
+        &current.object_id,
+    );
+    assert_eq!(view.object.as_ref().map(|(mode, _)| *mode), Some(0o640));
+    runtime.stop_node(&c).unwrap();
+    runtime.reopen_node(c.clone()).unwrap();
+    assert_one_history(
+        &runtime,
+        &config,
+        &[&b, &c, &p],
+        "recovered-x",
+        &recovery,
+        &current.object_id,
+    );
+    runtime.close().unwrap();
+}
+
+/// P commits a write, but its commit record never reaches B or C before P
+/// stops: the record sits past the successor's epoch start on P alone. The
+/// successor recovers the write from its prepared body, with identical
+/// effects, so even while P is away every node shows the same object, and
+/// only P's own status reads committed. When P rejoins, alignment discards
+/// that record and P converges on the new history; nothing is applied twice.
+#[test]
+fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-own-commit", Some((1, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/own-commit");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for member in [&b, &c] {
+        runtime.install_fault(FaultRule {
+            source: Some(p.clone()),
+            target: Some(member.clone()),
+            route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 8,
+            action: FaultAction::PauseWriteCommitPublication {
+                gate: Arc::clone(&gate),
+                captured: Arc::clone(&captured),
+            },
+        });
+    }
+    let written = runtime
+        .client(&p)
+        .unwrap()
+        .posix_write_file(
+            "/services/own-commit/x.txt",
+            b"own commit bytes",
+            crate::DfsWriteOptions::replicated_eventual(vec![p.clone(), b.clone(), c.clone()]),
+        )
+        .expect("P commits the write");
+    let object = written.object_id.clone();
+    for member in [&b, &c] {
+        assert!(
+            journal_head(&runtime, member, &config) < journal_head(&runtime, &p, &config),
+            "{member} lacks P's commit record"
+        );
+    }
+    runtime.stop_node(&p).unwrap();
+    runtime.clear_faults();
+    reelect(&runtime, &b);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("a member takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id != p
+    });
+    let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
+    let (original, recovery) = recovered_operation(&runtime, &winner, &config);
+    wait_until(
+        "the successor commits the recovery",
+        &runtime,
+        &[&b, &c],
+        || {
+            [&b, &c].into_iter().all(|member| {
+                operation_status(&runtime, member, &config, &recovery)
+                    == Some(crate::DfsPreparedOperationStatus::Committed)
+            })
+        },
+    );
+    let members = assert_one_history(&runtime, &config, &[&b, &c], &original, &recovery, &object);
+    // P is away: only its own status for the original differs.
+    let away = settled_view(&runtime, &p, &config, &original, &recovery, &object);
+    assert_eq!(
+        away.original,
+        Some(crate::DfsPreparedOperationStatus::Committed)
+    );
+    assert_eq!(away.recovery, None);
+    assert_eq!(
+        away.object, members.object,
+        "the same object even before P rejoins"
+    );
+
+    runtime.reopen_node(p.clone()).unwrap();
+    runtime.set_peer_verdict(&winner, &p, PeerPathVerdict::Path, false);
+    wait_until("P rejoins", &runtime, &[&b, &c], || {
+        write_set_of(&runtime, &config).contains(&p)
+    });
+    let others = [&p, &b, &c]
+        .into_iter()
+        .filter(|node| **node != winner)
+        .collect::<Vec<_>>();
+    catch_up_from(
+        &runtime,
+        &record_from(&runtime, &config, &winner).shard,
+        &winner,
+        &others,
+    );
+    assert_one_history(
+        &runtime,
+        &config,
+        &[&winner, &p, others[1]],
+        &original,
+        &recovery,
+        &object,
+    );
+    runtime.stop_node(&p).unwrap();
+    runtime.reopen_node(p.clone()).unwrap();
+    assert_one_history(
+        &runtime,
+        &config,
+        &[&winner, &p, others[1]],
+        &original,
+        &recovery,
+        &object,
+    );
+    runtime.close().unwrap();
+}

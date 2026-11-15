@@ -198,7 +198,7 @@ pub(super) fn fail_journal_calls(runtime: &DfsTestRuntime, config: &DfsMetadataS
     }
 }
 
-fn hold_replies(
+pub(super) fn hold_replies(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     member: &NodeId,
@@ -234,7 +234,7 @@ fn hold_replies(
     gate
 }
 
-fn release(gate: &tokio::sync::Semaphore) {
+pub(super) fn release(gate: &tokio::sync::Semaphore) {
     gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
 }
 
