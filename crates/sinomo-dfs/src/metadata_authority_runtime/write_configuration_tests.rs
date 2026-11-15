@@ -2368,7 +2368,7 @@ async fn write_snapshot_capture_lends_the_checked_publication_during_contiguous_
 }
 
 #[tokio::test]
-async fn failed_refresh_is_resent_on_a_bounded_delay_until_it_succeeds() {
+async fn failed_refresh_is_resent_on_a_doubling_delay_until_it_succeeds() {
     let host = NativeProjectionHost::new(true);
     host.inputs.lock().unwrap().floor_unavailable = true;
     let runtime = Arc::new(DfsMetadataAuthorityRuntime::new());
@@ -2395,18 +2395,96 @@ async fn failed_refresh_is_resent_on_a_bounded_delay_until_it_succeeds() {
         "a success ends the re-send sequence"
     );
     assert_eq!(runtime.refresh_failures.load(Ordering::Acquire), 0);
+}
 
-    // An unavailable floor stays unavailable: the sequence is bounded.
+/// In a quiet cluster no committed edge requests another refresh. Six and
+/// more consecutive failures keep re-sending, one re-send at a time, and the
+/// first success loads the projection and ends the sequence.
+#[tokio::test]
+async fn failed_refresh_is_resent_without_an_attempt_limit_until_it_succeeds() {
+    let host = NativeProjectionHost::new(true);
     host.inputs.lock().unwrap().floor_unavailable = true;
-    runtime.observe_discontinuity(KvRevision(10));
-    let mut refreshes = 0;
-    while host.queued_count() > 0 {
+    let runtime = Arc::new(DfsMetadataAuthorityRuntime::new());
+    assert!(runtime.attach_host(host.clone()));
+    let mut ready = Box::pin(runtime.ensure_write_configuration_ready_async());
+    require_pending(ready.as_mut()).await;
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let failures = 6;
+    for failed in 1..failures {
+        assert_eq!(host.queued_count(), 1, "one pending re-send");
+        assert_eq!(runtime.refresh_failures.load(Ordering::Acquire), failed);
+        // The re-send waits, then starts the next refresh, which fails.
         host.run_next().await;
-        refreshes += 1;
-        assert!(refreshes < 64, "re-sends must stop");
+        assert_eq!(host.queued_count(), 1);
+        host.run_next().await;
     }
+    assert_eq!(runtime.refresh_failures.load(Ordering::Acquire), failures);
+    assert_eq!(runtime.authority_refresh_count(), failures as u64);
+    require_pending(ready.as_mut()).await;
+
+    host.inputs.lock().unwrap().floor_unavailable = false;
+    host.run_next().await;
+    host.run_next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(runtime.configuration_snapshot().revision().is_some());
+    assert_eq!(runtime.refresh_failures.load(Ordering::Acquire), 0);
     assert_eq!(
-        runtime.refresh_failures.load(Ordering::Acquire),
-        DFS_CONFIGURATION_REFRESH_RETRY_LIMIT + 1
+        host.queued_count(),
+        0,
+        "a success ends the re-send sequence"
     );
+}
+
+/// A refresh requested by an edge that succeeds while a re-send is still
+/// waiting supersedes it: the stale re-send starts no refresh.
+#[tokio::test]
+async fn successful_refresh_supersedes_a_pending_resend() {
+    let host = NativeProjectionHost::new(true);
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    let runtime = Arc::new(DfsMetadataAuthorityRuntime::new());
+    assert!(runtime.attach_host(host.clone()));
+    let mut ready = Box::pin(runtime.ensure_write_configuration_ready_async());
+    require_pending(ready.as_mut()).await;
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    assert_eq!(host.queued_count(), 1, "the failure queued its re-send");
+    let stale_resend = host.take_task().expect("the pending re-send");
+
+    host.inputs.lock().unwrap().floor_unavailable = false;
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let refreshes = runtime.authority_refresh_count();
+    assert_eq!(runtime.refresh_failures.load(Ordering::Acquire), 0);
+
+    stale_resend.await;
+    assert_eq!(runtime.authority_refresh_count(), refreshes);
+    assert_eq!(
+        host.queued_count(),
+        0,
+        "the stale re-send requested nothing"
+    );
+}
+
+#[test]
+fn refresh_resend_delay_doubles_up_to_the_liveness_interval_without_a_limit() {
+    let delays = (0..64)
+        .map(super::dfs_configuration_refresh_resend_delay)
+        .collect::<Vec<_>>();
+    assert_eq!(delays[0], std::time::Duration::from_millis(100));
+    assert_eq!(delays[1], std::time::Duration::from_millis(200));
+    assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(
+        delays
+            .iter()
+            .all(|delay| *delay <= sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+    );
+    assert_eq!(delays[63], sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
 }

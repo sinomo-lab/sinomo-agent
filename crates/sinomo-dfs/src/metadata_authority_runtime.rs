@@ -26,11 +26,25 @@ use std::sync::{
 
 pub const DFS_METADATA_AUTHORITY_PREFIX: &str = "/dfs/filesystems/";
 
-/// A failed bounded refresh is re-sent at most this many consecutive times.
-const DFS_CONFIGURATION_REFRESH_RETRY_LIMIT: u32 = 5;
-/// First re-send delay; each later attempt doubles it.
+/// First re-send delay of a failed bounded refresh; each later attempt
+/// doubles it, up to the network liveness interval.
 const DFS_CONFIGURATION_REFRESH_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(100);
+
+/// The re-send delay after `failures` consecutive failed refreshes.
+fn dfs_configuration_refresh_resend_delay(failures: u32) -> std::time::Duration {
+    DFS_CONFIGURATION_REFRESH_RETRY_DELAY
+        .saturating_mul(1u32.checked_shl(failures).unwrap_or(u32::MAX))
+        .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+}
+
+/// The one re-send a failed refresh may have pending. A refresh that succeeds
+/// advances the generation, which supersedes a re-send still waiting.
+#[derive(Debug, Default)]
+struct DfsConfigurationRefreshResend {
+    generation: u64,
+    pending: bool,
+}
 
 pub type DfsMetadataAuthorityReadFuture<'a> = Pin<
     Box<
@@ -183,6 +197,7 @@ pub struct DfsMetadataAuthorityRuntime {
     refresh_release_pending: AtomicBool,
     refresh_completion: tokio::sync::watch::Sender<u64>,
     refresh_failures: std::sync::atomic::AtomicU32,
+    refresh_resend: Mutex<DfsConfigurationRefreshResend>,
     /// Unit fixtures that drive each refresh task by hand opt out of re-sends.
     #[cfg(test)]
     refresh_resend_disabled: AtomicBool,
@@ -334,6 +349,7 @@ impl DfsMetadataAuthorityRuntime {
             refresh_release_pending: AtomicBool::new(false),
             refresh_completion: tokio::sync::watch::channel(0).0,
             refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            refresh_resend: Mutex::default(),
             #[cfg(test)]
             refresh_resend_disabled: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -1357,11 +1373,12 @@ impl DfsMetadataAuthorityRuntime {
                     .is_some_and(|writer| writer.metadata.refresh_required_after(revision))
             });
             drop(refresh_owner);
+            if proof_revision.is_some() {
+                runtime.supersede_refresh_resend();
+            }
             if refresh_required {
                 runtime.request_authoritative_refresh();
-            } else if proof_revision.is_some() {
-                runtime.refresh_failures.store(0, Ordering::Release);
-            } else {
+            } else if proof_revision.is_none() {
                 runtime.resend_failed_refresh(&task_host);
             }
         }));
@@ -1369,26 +1386,60 @@ impl DfsMetadataAuthorityRuntime {
 
     /// A failed bounded refresh leaves the publication unavailable, and no
     /// later committed edge is guaranteed to request another one. Re-send it
-    /// on a bounded doubling delay; a success resets the sequence and an
-    /// exhausted sequence waits for the next edge. Waiters keep their own
-    /// operation deadlines throughout.
+    /// on a doubling delay capped at the network liveness interval, with no
+    /// attempt limit: this is a re-send timer, never a point where the runtime
+    /// gives up. At most one re-send is pending; a refresh that succeeds in
+    /// the meantime, on any edge, supersedes it and resets the sequence. The
+    /// re-send ends with the runtime, and with the host that owns its task.
+    /// Waiters keep their own operation deadlines throughout.
     fn resend_failed_refresh(self: &Arc<Self>, host: &Arc<dyn DfsMetadataAuthorityHost>) {
         #[cfg(test)]
         if self.refresh_resend_disabled.load(Ordering::Acquire) {
             return;
         }
-        let attempt = self.refresh_failures.fetch_add(1, Ordering::AcqRel);
-        if attempt >= DFS_CONFIGURATION_REFRESH_RETRY_LIMIT {
-            return;
-        }
-        let delay = DFS_CONFIGURATION_REFRESH_RETRY_DELAY.saturating_mul(1 << attempt);
+        let failures = self.refresh_failures.fetch_add(1, Ordering::AcqRel);
+        let generation = {
+            let mut resend = self
+                .refresh_resend
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if resend.pending {
+                return;
+            }
+            resend.pending = true;
+            resend.generation
+        };
+        let delay = dfs_configuration_refresh_resend_delay(failures);
         let runtime = Arc::downgrade(self);
         host.spawn(Box::pin(async move {
             tokio::time::sleep(delay).await;
-            if let Some(runtime) = runtime.upgrade() {
-                runtime.request_authoritative_refresh();
+            let Some(runtime) = runtime.upgrade() else {
+                return;
+            };
+            {
+                let mut resend = runtime
+                    .refresh_resend
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !resend.pending || resend.generation != generation {
+                    return;
+                }
+                resend.pending = false;
             }
+            runtime.request_authoritative_refresh();
         }));
+    }
+
+    /// A refresh succeeded: the re-send sequence starts over, and a re-send
+    /// still waiting no longer runs.
+    fn supersede_refresh_resend(&self) {
+        self.refresh_failures.store(0, Ordering::Release);
+        let mut resend = self
+            .refresh_resend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resend.generation = resend.generation.wrapping_add(1);
+        resend.pending = false;
     }
 
     fn apply_read_result(
