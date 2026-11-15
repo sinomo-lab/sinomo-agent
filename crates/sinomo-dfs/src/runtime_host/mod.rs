@@ -603,6 +603,10 @@ struct TestDfsClusterAccess {
     authority_data_dir: SinomoDataDir,
     peers: Option<Arc<DfsTestClusterPeerBridge>>,
     object_rpc: Option<Arc<dyn ComponentObjectRpcTransport>>,
+    /// A voter reads on its own consensus state and forwards a read it cannot
+    /// serve over the fixture carrier, as a daemon does. A single-voter
+    /// fixture's learners instead read on the sole voter's directory.
+    forward_reads: bool,
     full_commit_calls: AtomicUsize,
     compact_commit_calls: AtomicUsize,
 }
@@ -611,6 +615,12 @@ struct TestDfsClusterAccess {
 impl TestDfsClusterAccess {
     fn cluster_paths(&self) -> ClusterPaths {
         ClusterPaths::new(&self.authority_data_dir)
+    }
+    fn read_host(&self) -> TestDfsClusterQuorumHost {
+        TestDfsClusterQuorumHost {
+            peers: self.peers.clone(),
+            object_rpc: self.object_rpc.clone().filter(|_| self.forward_reads),
+        }
     }
     fn local_cluster_paths(&self) -> ClusterPaths {
         ClusterPaths::new(&self.local_data_dir)
@@ -654,20 +664,127 @@ impl DfsTestClusterPeerBridge {
             .insert(node, (data, available));
     }
 
-    fn paths(&self, node: &NodeId) -> Result<ClusterPaths, sinomo_core::network::NetworkError> {
+    /// The live KV store of `node`, as seen by the caller with `state`. A
+    /// configured member that is not running fails as a routed call to a
+    /// dead peer does; only a node outside the membership is unknown.
+    fn paths(
+        &self,
+        state: &sinomo_core::ClusterBootstrapState,
+        node: &NodeId,
+    ) -> Result<ClusterPaths, sinomo_core::network::NetworkError> {
         let peers = self.peers.lock().expect("native fixture peer registry");
-        let (data, available) =
-            peers
-                .get(node)
-                .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
-                    node_id: node.clone(),
-                })?;
-        if !available.load(Ordering::Acquire) {
-            return Err(sinomo_core::network::NetworkError::UnknownNode {
-                node_id: node.clone(),
-            });
+        match peers.get(node) {
+            Some((data, available)) if available.load(Ordering::Acquire) => {
+                Ok(ClusterPaths::new(data))
+            }
+            _ => Err(unavailable_test_kv_peer(state, node)),
         }
-        Ok(ClusterPaths::new(data))
+    }
+
+    /// Record one target-bound KV call from the caller with `state`, as the
+    /// routed client does after every call (`None` is an authenticated
+    /// response), so liveness evidence can unblock a request-owned election.
+    fn record_target_outcome(
+        &self,
+        state: &sinomo_core::ClusterBootstrapState,
+        target: &NodeId,
+        error: Option<&sinomo_core::network::NetworkError>,
+    ) {
+        let source = self
+            .peers
+            .lock()
+            .expect("native fixture peer registry")
+            .get(&state.local_node_id)
+            .map(|(data, _)| ClusterPaths::new(data));
+        if let Some(source) = source {
+            sinomo_core::network::record_cluster_target_rpc_outcome_for_test_carrier(
+                &source, state, target, error,
+            );
+        }
+    }
+
+    /// One Raft peer RPC from the caller with `state` to `target`: `receive`
+    /// runs as the target's authenticated handler. The caller's bounded wait
+    /// never drops admitted native work; case lifecycle owns and joins the
+    /// receiver task independently. Any handler reply, a refusal included,
+    /// is an authenticated response from the target.
+    async fn call_peer<T, F, R>(
+        &self,
+        state: &sinomo_core::ClusterBootstrapState,
+        target: &NodeId,
+        operation: &'static str,
+        timeout: Duration,
+        receive: F,
+    ) -> Result<T, sinomo_core::network::NetworkError>
+    where
+        T: Send + 'static,
+        F: FnOnce(ClusterPaths, sinomo_core::cluster::ClusterAuthenticatedPeer) -> R,
+        R: std::future::Future<Output = Result<T, sinomo_core::network::NetworkError>>
+            + Send
+            + 'static,
+    {
+        let reply = self
+            .deliver_to_peer(state, target, operation, timeout, receive)
+            .await;
+        self.record_target_outcome(state, target, reply.as_ref().err());
+        reply?
+    }
+
+    async fn deliver_to_peer<T, F, R>(
+        &self,
+        state: &sinomo_core::ClusterBootstrapState,
+        target: &NodeId,
+        operation: &'static str,
+        timeout: Duration,
+        receive: F,
+    ) -> Result<Result<T, sinomo_core::network::NetworkError>, sinomo_core::network::NetworkError>
+    where
+        T: Send + 'static,
+        F: FnOnce(ClusterPaths, sinomo_core::cluster::ClusterAuthenticatedPeer) -> R,
+        R: std::future::Future<Output = Result<T, sinomo_core::network::NetworkError>>
+            + Send
+            + 'static,
+    {
+        let paths = self.paths(state, target)?;
+        let source = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
+                node_id: state.local_node_id.clone(),
+            })?;
+        let authenticated = sinomo_core::cluster::ClusterAuthenticatedPeer {
+            node_id: source.node_id.to_string(),
+            public_key: source.node_public_key.clone(),
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let received = receive(paths, authenticated);
+        let task = tokio::spawn(async move {
+            let _ = response_tx.send(received.await);
+            Ok(())
+        });
+        self.native_effects
+            .lock()
+            .expect("owned fixture native peer tasks")
+            .push(task);
+        tokio::time::timeout_at(deadline, response_rx)
+            .await
+            .map_err(|_| {
+                sinomo_core::network::NetworkError::timeout(
+                    operation,
+                    sinomo_core::network::NetworkTimeoutPhase::Overall,
+                    timeout,
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                )
+            })?
+            .map_err(|error| {
+                sinomo_core::network::NetworkError::delivery_failed(
+                    format!("{operation} receiver"),
+                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    error.to_string(),
+                )
+            })
     }
 
     pub(crate) async fn join(self: &Arc<Self>, timeout: Duration) -> Result<(), String> {
@@ -748,15 +865,27 @@ impl DfsTestClusterPeerBridge {
     }
 }
 
+/// What a caller with `state` sees for a KV peer that is not running. A
+/// configured member fails as a routed call to a dead peer does: every path
+/// is exhausted and nothing was sent. Only a node outside the membership is
+/// unknown.
 #[cfg(any(test, feature = "test-support"))]
-fn test_dfs_cluster_transport_unavailable<'a, T: 'a>(
-    operation: &'static str,
-) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, T> {
-    Box::pin(async move {
-        Err(sinomo_core::network::NetworkError::ClusterReadOnly {
-            detail: format!("DFS single-voter test unexpectedly attempted {operation}"),
-        })
-    })
+pub(crate) fn unavailable_test_kv_peer(
+    state: &sinomo_core::ClusterBootstrapState,
+    node: &NodeId,
+) -> sinomo_core::network::NetworkError {
+    if state.members.iter().any(|member| member.node_id == *node) {
+        sinomo_core::network::NetworkError::RetryExhausted {
+            operation: format!("establish routed session to {node}"),
+            attempts: 1,
+            delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            detail: "native fixture member is not running".to_string(),
+        }
+    } else {
+        sinomo_core::network::NetworkError::UnknownNode {
+            node_id: node.clone(),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1068,56 +1197,24 @@ impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for TestDfsClusterQuorumHost
                     node_id: target.clone(),
                 }
             })?;
-            let paths = peers.paths(target)?;
-            let source = state
-                .members
-                .iter()
-                .find(|member| member.node_id == state.local_node_id)
-                .ok_or_else(|| sinomo_core::network::NetworkError::UnknownNode {
-                    node_id: state.local_node_id.clone(),
-                })?;
-            let authenticated = sinomo_core::cluster::ClusterAuthenticatedPeer {
-                node_id: source.node_id.to_string(),
-                public_key: source.node_public_key.clone(),
-            };
-            let deadline = tokio::time::Instant::now() + timeout;
             let request = request.clone();
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            // The caller's bounded wait never drops admitted native work.
-            // Case lifecycle owns and joins this receiver task independently.
-            let task = tokio::spawn(async move {
-                let response = sinomo_core::cluster::handle_cluster_raft_append_request_async(
-                    &tokio::runtime::Handle::current(),
-                    &paths,
-                    request,
-                    &authenticated,
-                )
-                .await;
-                let _ = response_tx.send(response);
-                Ok(())
-            });
             peers
-                .native_effects
-                .lock()
-                .expect("owned fixture native append tasks")
-                .push(task);
-            tokio::time::timeout_at(deadline, response_rx)
+                .call_peer(
+                    state,
+                    target,
+                    "native fixture learner append",
+                    timeout,
+                    |paths, authenticated| async move {
+                        sinomo_core::cluster::handle_cluster_raft_append_request_async(
+                            &tokio::runtime::Handle::current(),
+                            &paths,
+                            request,
+                            &authenticated,
+                        )
+                        .await
+                    },
+                )
                 .await
-                .map_err(|_| {
-                    sinomo_core::network::NetworkError::timeout(
-                        "native fixture learner append",
-                        sinomo_core::network::NetworkTimeoutPhase::Overall,
-                        timeout,
-                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-                    )
-                })?
-                .map_err(|error| {
-                    sinomo_core::network::NetworkError::delivery_failed(
-                        "native fixture learner append receiver",
-                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-                        error.to_string(),
-                    )
-                })?
         })
     }
 
@@ -1190,7 +1287,7 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost for TestDfsClusterQ
 
     fn send_cluster_kv_watch_events_to_node_async<'a>(
         &'a mut self,
-        _state: &'a sinomo_core::ClusterBootstrapState,
+        state: &'a sinomo_core::ClusterBootstrapState,
         target: &'a NodeId,
         request: &'a sinomo_core::kv::ClusterKvWatchEventsRequest,
         timeout: Duration,
@@ -1204,7 +1301,9 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost for TestDfsClusterQ
                     node_id: target.clone(),
                 }
             })?;
-            let paths = peers.paths(target)?;
+            let paths = peers.paths(state, target).inspect_err(|error| {
+                peers.record_target_outcome(state, target, Some(error));
+            })?;
             let started = Instant::now();
             let result = tokio::task::block_in_place(|| {
                 let state = sinomo_core::cluster::read_cluster_state(&paths)?;
@@ -1216,13 +1315,16 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost for TestDfsClusterQ
                 .map_err(sinomo_core::network::NetworkError::directory)
             });
             if started.elapsed() >= timeout {
-                return Err(sinomo_core::network::NetworkError::timeout(
+                let error = sinomo_core::network::NetworkError::timeout(
                     "native fixture watch-event delivery",
                     sinomo_core::network::NetworkTimeoutPhase::Overall,
                     timeout,
                     sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-                ));
+                );
+                peers.record_target_outcome(state, target, Some(&error));
+                return Err(error);
             }
+            peers.record_target_outcome(state, target, None);
             result
         })
     }
@@ -1250,15 +1352,247 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost for TestDf
 impl sinomo_core::cluster::ClusterKvTxnQuorumAsyncHost for TestDfsClusterQuorumHost {
     fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
-        _state: &'a sinomo_core::ClusterBootstrapState,
-        _target_node_id: &'a NodeId,
-        _request: &'a sinomo_core::kv::ClusterKvStateAuthorityVoteRequest,
-        _timeout: Duration,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        request: &'a sinomo_core::kv::ClusterKvStateAuthorityVoteRequest,
+        timeout: Duration,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<
         'a,
         sinomo_core::kv::ClusterKvStateAuthorityVoteResponse,
     > {
-        test_dfs_cluster_transport_unavailable("a remote state-authority vote")
+        Box::pin(async move {
+            let peers = self.peers.as_ref().ok_or_else(|| {
+                sinomo_core::network::NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                }
+            })?;
+            test_cluster_kv_vote(peers, state, target_node_id, request, timeout).await
+        })
+    }
+
+    /// Every vote is sent at once, as the daemon does; the round stops
+    /// waiting once `required_grants` voters granted this term.
+    fn request_kv_state_authority_votes_async<'a>(
+        &'a mut self,
+        state: &'a sinomo_core::ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &'a sinomo_core::kv::ClusterKvStateAuthorityVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        Vec<(
+            NodeId,
+            Result<
+                sinomo_core::kv::ClusterKvStateAuthorityVoteResponse,
+                sinomo_core::network::NetworkError,
+            >,
+        )>,
+    > {
+        use futures_util::StreamExt as _;
+        Box::pin(async move {
+            let peers =
+                self.peers
+                    .as_ref()
+                    .ok_or_else(|| sinomo_core::network::NetworkError::Io {
+                        operation: "concurrent native fixture Raft votes".to_string(),
+                        detail: "no native fixture peer bridge".to_string(),
+                    })?;
+            let mut votes = targets
+                .into_iter()
+                .map(|target| async move {
+                    let result =
+                        test_cluster_kv_vote(peers, state, &target, request, timeout).await;
+                    (target, result)
+                })
+                .collect::<futures_util::stream::FuturesUnordered<_>>();
+            let mut granted = 0_usize;
+            let mut outcomes = Vec::new();
+            while let Some((target, result)) = votes.next().await {
+                if result.as_ref().is_ok_and(|response| {
+                    response.accepted
+                        && response.vote.vote_granted
+                        && response.vote.term == request.vote.term
+                }) {
+                    granted = granted.saturating_add(1);
+                }
+                outcomes.push((target, result));
+                if granted >= required_grants {
+                    break;
+                }
+            }
+            Ok(outcomes)
+        })
+    }
+}
+
+/// One RequestVote to `target`, handled by its own Raft vote handler.
+#[cfg(any(test, feature = "test-support"))]
+async fn test_cluster_kv_vote(
+    peers: &DfsTestClusterPeerBridge,
+    state: &sinomo_core::ClusterBootstrapState,
+    target: &NodeId,
+    request: &sinomo_core::kv::ClusterKvStateAuthorityVoteRequest,
+    timeout: Duration,
+) -> Result<sinomo_core::kv::ClusterKvStateAuthorityVoteResponse, sinomo_core::network::NetworkError>
+{
+    let request = request.clone();
+    peers
+        .call_peer(
+            state,
+            target,
+            "native fixture vote",
+            timeout,
+            |paths, authenticated| async move {
+                sinomo_core::cluster::handle_cluster_raft_vote_request_async(
+                    &tokio::runtime::Handle::current(),
+                    &paths,
+                    request,
+                    &authenticated,
+                )
+                .await
+            },
+        )
+        .await
+}
+
+/// Promote `node` to a cluster-KV Raft voter through the production
+/// state-authority lifecycle, run on the KV leader at `leader` over the
+/// native peer bridge: the learner proves catch-up, then the quorum-backed
+/// configuration change commits. Returns whether anything changed.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn promote_test_cluster_kv_voter(
+    runtime: &tokio::runtime::Handle,
+    leader: &SinomoDataDir,
+    peers: &Arc<DfsTestClusterPeerBridge>,
+    node: &NodeId,
+) -> Result<bool, sinomo_core::network::NetworkError> {
+    let paths = ClusterPaths::new(leader);
+    let state = sinomo_core::cluster::read_cluster_state(&paths)?;
+    let mut host = TestDfsClusterMemberMutationHost {
+        runtime: runtime.clone(),
+        peers: Arc::clone(peers),
+    };
+    sinomo_core::cluster::update_cluster_state_authority_with_host(
+        &paths,
+        state,
+        node.clone(),
+        sinomo_core::ClusterMemberRole::Voter,
+        time::OffsetDateTime::now_utc(),
+        &mut host,
+    )
+    .map(|update| update.changed)
+}
+
+/// Membership mutations on the KV leader, carried by the native peer bridge.
+#[cfg(any(test, feature = "test-support"))]
+struct TestDfsClusterMemberMutationHost {
+    runtime: tokio::runtime::Handle,
+    peers: Arc<DfsTestClusterPeerBridge>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestDfsClusterMemberMutationHost {
+    fn quorum_host(&self) -> TestDfsClusterQuorumHost {
+        TestDfsClusterQuorumHost {
+            peers: Some(Arc::clone(&self.peers)),
+            object_rpc: None,
+        }
+    }
+
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(future))
+        } else {
+            self.runtime.block_on(future)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl sinomo_core::cluster::ClusterMemberMutationHost for TestDfsClusterMemberMutationHost {
+    fn authoritative_cluster_kv_snapshot(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut sinomo_core::ClusterBootstrapState,
+    ) -> Result<
+        sinomo_core::kv::KvAuthoritativeRead<sinomo_core::kv::KvSnapshot>,
+        sinomo_core::network::NetworkError,
+    > {
+        let mut host = self.quorum_host();
+        let runtime = self.runtime.clone();
+        self.block_on(
+            sinomo_core::cluster::read_cluster_kv_authoritative_snapshot_async_with_host(
+                &runtime,
+                paths,
+                state,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true),
+                &mut host,
+            ),
+        )
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut sinomo_core::ClusterBootstrapState,
+        request: sinomo_core::kv::KvTxnRequest,
+    ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, sinomo_core::network::NetworkError> {
+        let mut host = self.quorum_host();
+        let runtime = self.runtime.clone();
+        self.block_on(
+            sinomo_core::cluster::commit_cluster_kv_txn_with_quorum_response_async_with_host(
+                &runtime,
+                paths,
+                state,
+                request,
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .kv_txn_quorum_options(true),
+                &mut host,
+            ),
+        )
+    }
+
+    fn prove_cluster_raft_member_caught_up(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &sinomo_core::ClusterBootstrapState,
+        node_id: &NodeId,
+        required_log_index: u64,
+        now: time::OffsetDateTime,
+    ) -> Result<sinomo_core::kv::ClusterKvRaftCatchUpProof, sinomo_core::network::NetworkError>
+    {
+        let mut host = self.quorum_host();
+        let timeout = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true)
+            .raft_append_timeout;
+        let response = self.block_on(async {
+            let request = paths
+                .kv_paths()
+                .locked_build_raft_append_request_from_next_index_async(state, 1)
+                .await
+                .map_err(sinomo_core::network::NetworkError::directory)?;
+            sinomo_core::cluster::ClusterKvQuorumAsyncHost::send_cluster_kv_replication_to_node_async(
+                &mut host, paths, state, node_id, &request, timeout,
+            )
+            .await
+        })?;
+        if !response.accepted || response.append.match_index < required_log_index {
+            return Err(sinomo_core::network::NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "learner `{node_id}` caught up only to Raft index {} ({} required): {}",
+                    response.append.match_index, required_log_index, response.detail
+                ),
+            });
+        }
+        Ok(sinomo_core::kv::ClusterKvRaftCatchUpProof {
+            node_id: node_id.clone(),
+            term: response.append.term,
+            required_log_index,
+            observed_match_index: response.append.match_index,
+            observed_at: now,
+        })
     }
 }
 
@@ -1312,10 +1646,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost {
-                peers: self.peers.clone(),
-                object_rpc: None,
-            };
+            let mut host = self.read_host();
             sinomo_core::cluster::read_cluster_kv_authoritative_entry_async_with_host(
                 &runtime,
                 &paths,
@@ -1350,10 +1681,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost {
-                peers: self.peers.clone(),
-                object_rpc: None,
-            };
+            let mut host = self.read_host();
             sinomo_core::cluster::read_cluster_kv_authoritative_entries_async_with_host(
                 &runtime, &paths, &mut state, keys, options, &mut host,
             )
@@ -1383,10 +1711,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost {
-                peers: self.peers.clone(),
-                object_rpc: None,
-            };
+            let mut host = self.read_host();
             sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
                 &runtime, &paths, &mut state, prefix, options, &mut host,
             )
@@ -1409,10 +1734,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost {
-                peers: self.peers.clone(),
-                object_rpc: None,
-            };
+            let mut host = self.read_host();
             sinomo_core::cluster::read_cluster_kv_authoritative_complete_range_prefix_async_with_host(
                 &runtime, &paths, &mut state, prefix, options, &mut host,
             )
@@ -1442,10 +1764,7 @@ impl sinomo_core::service::ClusterAccess for TestDfsClusterAccess {
             let paths = self.cluster_paths();
             let mut state = self.state()?;
             let runtime = tokio::runtime::Handle::current();
-            let mut host = TestDfsClusterQuorumHost {
-                peers: self.peers.clone(),
-                object_rpc: None,
-            };
+            let mut host = self.read_host();
             sinomo_core::cluster::read_cluster_kv_request_outcome_async_with_host(
                 &runtime, &paths, &mut state, request_id, true, options, &mut host,
             )
@@ -1594,6 +1913,26 @@ pub(crate) fn test_cluster_access_for_node_on_voter_with_rpc(
         authority_data_dir: authority_data_dir.clone(),
         peers,
         object_rpc,
+        forward_reads: false,
+        full_commit_calls: AtomicUsize::new(0),
+        compact_commit_calls: AtomicUsize::new(0),
+    })
+}
+
+/// A Raft voter's own access: it commits and reads on its own consensus
+/// state and forwards over `object_rpc` what it cannot serve itself.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_cluster_access_for_voter_with_rpc(
+    data_dir: &SinomoDataDir,
+    peers: Option<Arc<DfsTestClusterPeerBridge>>,
+    object_rpc: Option<Arc<dyn ComponentObjectRpcTransport>>,
+) -> Arc<dyn sinomo_core::service::ClusterAccess> {
+    Arc::new(TestDfsClusterAccess {
+        local_data_dir: data_dir.clone(),
+        authority_data_dir: data_dir.clone(),
+        peers,
+        object_rpc,
+        forward_reads: true,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     })
@@ -1697,6 +2036,7 @@ fn test_dfs_runtime_host(data_dir: &SinomoDataDir) -> Arc<DfsRuntimeHost> {
                 authority_data_dir: data_dir.clone(),
                 peers: None,
                 object_rpc: None,
+                forward_reads: false,
                 full_commit_calls: AtomicUsize::new(0),
                 compact_commit_calls: AtomicUsize::new(0),
             }),

@@ -605,6 +605,27 @@ impl Endpoint {
     }
 }
 
+/// The error for a target that does not admit `route`. A KV call to a
+/// configured member whose KV is not running fails as a routed call to a
+/// dead peer does; every other refusal keeps naming the target unknown.
+fn unavailable_target(
+    source_data: &SinomoDataDir,
+    target: &NodeId,
+    route: &str,
+    kv_stopped: bool,
+) -> NetworkError {
+    if kv_stopped
+        && sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&route)
+        && let Ok(state) =
+            sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(source_data))
+    {
+        return crate::runtime_host::unavailable_test_kv_peer(&state, target);
+    }
+    NetworkError::UnknownNode {
+        node_id: target.clone(),
+    }
+}
+
 struct Transfer {
     source: NodeId,
     target: NodeId,
@@ -882,7 +903,7 @@ impl Carrier {
         // endpoint/reference below must end before this counter-only guard
         // publishes idle. Its notification cannot itself pin the old owner.
         let mut _invocation;
-        let endpoint = {
+        let (source_data, endpoint) = {
             let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
             let source = nodes
                 .get(&self.source)
@@ -903,19 +924,25 @@ impl Carrier {
                     node_id: self.source.clone(),
                 });
             }
-            let endpoint = nodes
+            let source_data = Arc::clone(&source.data_dir);
+            let Some(endpoint) = nodes
                 .get(target)
+                .filter(|endpoint| endpoint.admits_route(&call.request.route))
                 .cloned()
-                .ok_or_else(|| NetworkError::UnknownNode {
-                    node_id: target.clone(),
-                })?;
-            if !endpoint.admits_route(&call.request.route) {
-                return Err(NetworkError::UnknownNode {
-                    node_id: target.clone(),
-                });
-            }
+            else {
+                let kv_stopped = nodes
+                    .get(target)
+                    .is_none_or(|endpoint| !endpoint.kv_available.load(Ordering::Acquire));
+                drop(nodes);
+                return Err(unavailable_target(
+                    &source_data,
+                    target,
+                    &call.request.route,
+                    kv_stopped,
+                ));
+            };
             endpoint.active.fetch_add(1, Ordering::AcqRel);
-            endpoint
+            (source_data, endpoint)
         };
         _invocation = Invocation {
             active: Arc::clone(&endpoint.active),
@@ -925,10 +952,15 @@ impl Carrier {
             completed: false,
         };
         if !endpoint.admits_route(&call.request.route) {
-            return Err(NetworkError::UnknownNode {
-                node_id: target.clone(),
-            });
+            let kv_stopped = !endpoint.kv_available.load(Ordering::Acquire);
+            return Err(unavailable_target(
+                &source_data,
+                target,
+                &call.request.route,
+                kv_stopped,
+            ));
         }
+        drop(source_data);
         observation.phase = RpcPhase::BeforeDispatch;
         self.fabric.record(observation.clone());
         let fault = self.fabric.fault(&observation, &call.request);
@@ -1083,20 +1115,35 @@ impl Carrier {
             observation: observation.clone(),
             write_reply_capture: write_reply_capture.clone(),
         };
-        NATIVE_RPC_CALL_CONTEXT
+        let dispatched = NATIVE_RPC_CALL_CONTEXT
             .scope(
                 native_call,
                 endpoint.registry.dispatch(context, incoming.request),
             )
-            .await
-            .map_err(|error| NetworkError::Io {
-                operation: "shared DFS native service dispatch".into(),
+            .await;
+        let mut outgoing = match dispatched {
+            // A KV handler's refusal reaches the caller as the daemon sends
+            // it: an error response the caller types again, so a busy or
+            // non-leader authority is recognized as one.
+            Err(error)
+                if sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&observation.route.as_str()) =>
+            {
+                ObjectRpcOutgoingResponse::value(ObjectRpcResponse::encode_error(
+                    observation.route.clone(),
+                    error.to_string(),
+                )?)
+            }
+            Err(error) => {
+                return Err(NetworkError::Io {
+                    operation: "shared DFS native service dispatch".into(),
+                    detail: error.to_string(),
+                });
+            }
+            Ok(_) => response_rx.await.map_err(|error| NetworkError::Io {
+                operation: "receive shared DFS native service response".into(),
                 detail: error.to_string(),
-            })?;
-        let mut outgoing = response_rx.await.map_err(|error| NetworkError::Io {
-            operation: "receive shared DFS native service response".into(),
-            detail: error.to_string(),
-        })?;
+            })?,
+        };
         observation.phase = RpcPhase::AfterDispatch;
         self.fabric.record(observation.clone());
         if let Some(FaultAction::PauseAfterDispatch(gate)) = &fault {
@@ -1733,6 +1780,8 @@ impl Carrier {
         let dispatch_started = Arc::new(AtomicBool::new(false));
         let call_id = observation.call_id;
         let timeout = observation.options.overall_timeout();
+        let kv_route =
+            sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&call.request.route.as_str());
         let operation = self.deliver(target, call, observation, dispatch_started.clone());
         let result = if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, operation)
@@ -1756,7 +1805,47 @@ impl Carrier {
         if let Err(error) = &result {
             self.fabric.record_returned_error(call_id, error);
         }
+        if kv_route {
+            self.record_kv_target_outcome(
+                target,
+                &result,
+                dispatch_started.load(Ordering::Acquire),
+            );
+        }
         result
+    }
+
+    /// Report a target-bound KV call as the routed client does after every
+    /// call, so a dead KV leader's liveness evidence can unblock the
+    /// request-owned election. A reply from the target's own handler, a
+    /// refusal included, is an authenticated response.
+    fn record_kv_target_outcome(
+        &self,
+        target: &NodeId,
+        result: &Result<ObjectRpcResult, NetworkError>,
+        reached_target: bool,
+    ) {
+        let source_data = self
+            .fabric
+            .nodes
+            .lock()
+            .expect("DFS test nodes")
+            .get(&self.source)
+            .map(|endpoint| Arc::clone(&endpoint.data_dir));
+        let Some(source_data) = source_data else {
+            return;
+        };
+        let paths = ClusterPaths::new(&source_data);
+        let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&paths) else {
+            return;
+        };
+        let error = match result {
+            Err(error) if !(reached_target && error.delivery_state().is_none()) => Some(error),
+            _ => None,
+        };
+        sinomo_core::network::record_cluster_target_rpc_outcome_for_test_carrier(
+            &paths, &state, target, error,
+        );
     }
 }
 /// Negative body-only pause over the receiver's actual source. Its native head
@@ -2718,6 +2807,10 @@ pub struct DfsTestRuntime {
     authority: Arc<dyn ClusterAccess>,
     kv_peers: Arc<crate::runtime_host::DfsTestClusterPeerBridge>,
     kv_bootstrapped: bool,
+    /// Every node is a cluster-KV Raft voter, promoted through the production
+    /// lifecycle at startup. Otherwise the bootstrap node is the sole voter
+    /// and every other node a learner.
+    kv_voters: bool,
     resident_pins: BTreeMap<NodeId, sinomo_core::kv::ResidentRaftNodeRegistryPin>,
     fabric: Arc<Fabric>,
     nodes: BTreeMap<NodeId, Node>,
@@ -2881,6 +2974,42 @@ impl DfsTestRuntime {
         }
         runtime.start_nodes()?;
         Ok((runtime, nodes))
+    }
+
+    /// [`Self::start_cluster`] with every node a cluster-KV Raft voter, so
+    /// losing any one node, the KV leader included, leaves a voter quorum.
+    pub fn start_cluster_with_voters(
+        name: &str,
+        node_count: usize,
+    ) -> Result<(Self, Vec<NodeId>), String> {
+        if node_count == 0 {
+            return Err("native DFS cluster requires at least one node".into());
+        }
+        let nodes = Self::ordered_node_ids(name, node_count);
+        let mut runtime = Self::new(name, nodes[0].clone())?;
+        runtime.use_kv_voters()?;
+        for node in &nodes[1..] {
+            runtime.define_node(node.clone())?;
+        }
+        runtime.start_nodes()?;
+        Ok((runtime, nodes))
+    }
+
+    /// Make every node a cluster-KV Raft voter. Nodes still join as learners;
+    /// startup promotes each through the production state-authority
+    /// lifecycle (catch-up proof, then the quorum-backed configuration
+    /// change). Must precede startup.
+    pub fn use_kv_voters(&mut self) -> Result<(), String> {
+        if self.kv_bootstrapped || self.nodes.values().any(|node| node.reconciler.is_some()) {
+            return Err("choose the KV voter topology before native startup".into());
+        }
+        self.kv_voters = true;
+        Ok(())
+    }
+
+    /// Whether every node is a cluster-KV Raft voter.
+    pub fn kv_voters(&self) -> bool {
+        self.kv_voters
     }
 
     /// Start the SAME normal embedded owner for an explicitly supplied node.
@@ -3099,6 +3228,7 @@ impl DfsTestRuntime {
             authority,
             kv_peers,
             kv_bootstrapped: false,
+            kv_voters: false,
             resident_pins: BTreeMap::new(),
             fabric,
             nodes,
@@ -3187,7 +3317,11 @@ impl DfsTestRuntime {
             .map_err(|error| error.to_string())?;
         let paths = ClusterPaths::new(self.data_dir(node));
         let initialize_resident = !self.resident_pins.contains_key(node);
-        if node != &self.primary {
+        // A voter that already holds Raft state restarts from it, and the
+        // current leader catches it up, as for a restarted daemon. Copying the
+        // bootstrap node's log could replay a deposed leader's view.
+        let restarts_from_own_state = self.kv_voters && !initialize_resident;
+        if node != &self.primary && !restarts_from_own_state {
             let mut local_state = primary_state.clone();
             local_state.local_node_id = node.clone();
             sinomo_core::cluster::write_cluster_state(&paths, &local_state)
@@ -3301,7 +3435,7 @@ impl DfsTestRuntime {
             Some(executor().handle()),
         )
         .map_err(|error| error.to_string())?;
-        let cluster = Arc::clone(&self.authority);
+        let cluster = self.kv_read_authority();
         run_unit(Box::pin(async move {
             let committed = tokio::time::timeout_at(
                 deadline,
@@ -3525,10 +3659,11 @@ impl DfsTestRuntime {
                 .map_err(|error| error.to_string())
         }))?;
         run_unit(Box::pin(self.kv_peers.join(CLOSE_TIMEOUT)))?;
+        let authority = self.kv_read_authority();
         run_unit(Box::pin(async {
             tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
                 loop {
-                    let read = self.authority
+                    let read = authority
                         .kv_range_prefix_authoritative_async(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX.into())
                         .await.map_err(|error| error.to_string())?;
                     let providers = crate::cluster_service::dfs_provider_node_ids_from_current_entries(
@@ -3594,12 +3729,20 @@ impl DfsTestRuntime {
             fabric: self.fabric.clone(),
             origin: RpcOrigin::RegisteredHost,
         });
-        let cluster = crate::runtime_host::test_cluster_access_for_node_on_voter_with_rpc(
-            &data_dir,
-            self.data_dir(&self.primary),
-            Some(Arc::clone(&self.kv_peers)),
-            Some(carrier.clone()),
-        );
+        let cluster = if self.kv_voters {
+            crate::runtime_host::test_cluster_access_for_voter_with_rpc(
+                &data_dir,
+                Some(Arc::clone(&self.kv_peers)),
+                Some(carrier.clone()),
+            )
+        } else {
+            crate::runtime_host::test_cluster_access_for_node_on_voter_with_rpc(
+                &data_dir,
+                self.data_dir(&self.primary),
+                Some(Arc::clone(&self.kv_peers)),
+                Some(carrier.clone()),
+            )
+        };
         // Mounted clients opened on this node subscribe to the component's own
         // bus, as they do to the daemon event stream it is bridged to.
         let event_bus = ComponentEventBus::default();
@@ -3721,6 +3864,20 @@ impl DfsTestRuntime {
                 timing.mark("native-replica-projection-completed");
             }
         }
+        if self.kv_voters {
+            // Each caught-up learner becomes a voter, one quorum-backed
+            // configuration change at a time, as `sinomo cluster promote` does.
+            for id in ids.iter().filter(|id| **id != self.primary) {
+                crate::runtime_host::promote_test_cluster_kv_voter(
+                    executor().handle(),
+                    self.data_dir(&self.primary),
+                    &self.kv_peers,
+                    id,
+                )
+                .map_err(|error| format!("promote {id} to a KV voter: {error}"))?;
+            }
+            timing.mark("native-kv-voter-promotion-completed");
+        }
         self.start_nodes_after_projection(ids, timing)
     }
 
@@ -3770,10 +3927,11 @@ impl DfsTestRuntime {
                 move |_| catalog_wake.notify_one(),
             );
         timing.mark("native-catalog-wait-started");
+        let authority = self.kv_read_authority();
         run_unit(Box::pin(async {
             tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
                 loop {
-                    let read = self.authority
+                    let read = authority
                         .kv_range_prefix_authoritative_async(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX.into())
                         .await.map_err(|error| error.to_string())?;
                     let providers = crate::cluster_service::dfs_provider_node_ids_from_current_entries(
@@ -4026,6 +4184,19 @@ impl DfsTestRuntime {
 
     pub fn data_dir(&self, node: &NodeId) -> &SinomoDataDir {
         &self.nodes[node].data_dir
+    }
+
+    /// The access a fixture-level authoritative read runs through. With KV
+    /// voters it is a running node's own access, so a stopped KV leader never
+    /// answers; otherwise it is the sole voter's.
+    fn kv_read_authority(&self) -> Arc<dyn ClusterAccess> {
+        if self.kv_voters {
+            let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
+            if let Some(endpoint) = nodes.get(&self.primary).or_else(|| nodes.values().next()) {
+                return Arc::clone(&endpoint.cluster);
+            }
+        }
+        Arc::clone(&self.authority)
     }
     pub fn file_system(&self) -> DfsFileSystem {
         default_cluster_sifs(&self.state)
@@ -5929,6 +6100,9 @@ impl DfsTestRuntime {
 
 #[cfg(test)]
 mod pilot;
+
+#[cfg(test)]
+mod kv_voter_tests;
 
 // Rooted shared native request-boundary instrumentation. Successful calls
 // always continue through the same actual Raft implementation.

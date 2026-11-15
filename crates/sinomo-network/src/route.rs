@@ -72,17 +72,40 @@ pub(crate) fn record_cluster_target_rpc_outcome(
     target_node_id: &NodeId,
     result: &Result<ObjectRpcResult, NetworkError>,
 ) {
+    record_cluster_target_rpc_error(paths, state, target_node_id, result.as_ref().err());
+}
+
+/// Records a test carrier's target-bound call that bypasses
+/// [`ClusterObjectRpcClient::call_target`], with the same liveness semantics.
+/// `None` is an authenticated response from the target.
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_cluster_target_rpc_outcome_for_test_carrier(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    error: Option<&NetworkError>,
+) {
+    record_cluster_target_rpc_error(paths, state, target_node_id, error);
+}
+
+/// One target-bound call's outcome; `None` is an authenticated response.
+fn record_cluster_target_rpc_error(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    error: Option<&NetworkError>,
+) {
     let Ok(mut failures) = CLUSTER_TARGET_RPC_FAILURES.lock() else {
         return;
     };
     let now = Instant::now();
     failures.retain(|_, failure| failure.expires_at > now);
     let key = cluster_target_rpc_failure_key(paths, state, target_node_id);
-    match result {
-        Ok(_) => {
+    match error {
+        None => {
             failures.remove(&key);
         }
-        Err(error) if cluster_target_rpc_failed_after_route_admission(error) => {
+        Some(error) if cluster_target_rpc_failed_after_route_admission(error) => {
             failures.insert(
                 key,
                 ClusterTargetRpcFailure {
@@ -100,7 +123,7 @@ pub(crate) fn record_cluster_target_rpc_outcome(
                 failures.remove(&oldest);
             }
         }
-        Err(_) => {}
+        Some(_) => {}
     }
 }
 

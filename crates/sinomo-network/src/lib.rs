@@ -320,6 +320,7 @@ pub use route::{
 #[cfg(any(test, feature = "test-support"))]
 pub use route::{
     prepared_dynamic_route_cache_contains_for_test, prepared_dynamic_route_cache_insert_for_test,
+    record_cluster_target_rpc_outcome_for_test_carrier,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_INVITE_PUBLISH_ROUTE,

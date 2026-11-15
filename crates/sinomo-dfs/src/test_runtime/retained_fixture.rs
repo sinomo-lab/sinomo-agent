@@ -191,6 +191,7 @@ impl DfsTestRuntime {
             authority,
             kv_peers,
             kv_bootstrapped: true,
+            kv_voters: false,
             resident_pins: BTreeMap::new(),
             fabric: Arc::new(Fabric {
                 dropped_observations: AtomicUsize::new(0),

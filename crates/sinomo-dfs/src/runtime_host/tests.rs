@@ -13481,6 +13481,7 @@ fn daemon_dfs_transactions_do_not_materialize_post_commit_snapshots() {
         authority_data_dir: data_dir.clone(),
         peers: None,
         object_rpc: None,
+        forward_reads: false,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
@@ -16706,6 +16707,7 @@ fn maintenance_loop_iterations_with_pending_executor_work(
         authority_data_dir: data_dir.clone(),
         peers: None,
         object_rpc: None,
+        forward_reads: false,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
@@ -16840,6 +16842,7 @@ fn first_maintenance_launch_with_pending_request_and_executor_wake(name: &str) -
         authority_data_dir: data_dir.clone(),
         peers: None,
         object_rpc: None,
+        forward_reads: false,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
@@ -16914,6 +16917,7 @@ fn executor_turns_around_an_exclusion_expiry(name: &str, parked_target_expires: 
         authority_data_dir: data_dir.clone(),
         peers: None,
         object_rpc: None,
+        forward_reads: false,
         full_commit_calls: AtomicUsize::new(0),
         compact_commit_calls: AtomicUsize::new(0),
     });
