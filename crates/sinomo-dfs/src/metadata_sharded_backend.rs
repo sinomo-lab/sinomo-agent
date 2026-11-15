@@ -384,6 +384,7 @@ mod routing_topology_history_tests {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalMetadataShardOpenMode {
     Strict,
+    NativeGenesis,
     ReplicaRepair,
     Inspection,
 }
@@ -394,6 +395,7 @@ struct LocalMetadataShardSlot {
     root: PathBuf,
     open_mode: LocalMetadataShardOpenMode,
     selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    native_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     initialization: Mutex<()>,
     backend: OnceLock<Box<LocalSobjMetadataBackend>>,
 }
@@ -411,6 +413,7 @@ struct ResidentLocalMetadataShardSlot {
     root: PathBuf,
     open_mode: LocalMetadataShardOpenMode,
     selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    native_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     state: Mutex<ResidentLocalMetadataShardState>,
     available: Condvar,
     async_available: tokio::sync::Notify,
@@ -580,6 +583,7 @@ impl ResidentLocalMetadataShardSlot {
             root,
             open_mode,
             selected_original_data_layout,
+            native_catalog,
             initialization: _,
             backend,
         } = slot;
@@ -592,6 +596,7 @@ impl ResidentLocalMetadataShardSlot {
             root,
             open_mode,
             selected_original_data_layout,
+            native_catalog,
             state: Mutex::new(match backend {
                 Some(backend) => ResidentLocalMetadataShardState::Available(backend),
                 None => ResidentLocalMetadataShardState::Unopened,
@@ -606,7 +611,7 @@ impl ResidentLocalMetadataShardSlot {
     }
 
     fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone()).map(Box::new)
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref()).map(Box::new)
     }
 
     fn try_checkout(self: &Arc<Self>) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
@@ -826,41 +831,39 @@ impl ResidentLocalMetadataShardSlot {
         }
         drop(state);
 
-        let opened = self.open_backend();
-        match opened {
-            Ok(backend) => {
-                let snapshot =
-                    initialize_resident_metadata_shard_status_snapshot(&self.config, &backend);
-                self.operator_status
-                    .write()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .snapshot = Some(snapshot);
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                debug_assert!(matches!(*state, ResidentLocalMetadataShardState::Opening));
-                *state = ResidentLocalMetadataShardState::Unopened;
-                self.available.notify_all();
-                self.async_available.notify_waiters();
-                drop(state);
-                drop(backend);
-                Ok(())
+        // Status is an observer of current DATA. It must neither hydrate a
+        // serving writer nor make one cold/staged unit block unrelated units.
+        let inspected = (|| -> Result<ResidentLocalMetadataShardStatusSnapshot> {
+            let generation = crate::storage_generation::read_generation(&self.root)?;
+            if generation.identity.file_system_id != self.config.file_system_id
+                || generation.identity.shard_id.0 != self.config.shard_id {
+                return Err(MetadataBackendError::Serde("status generation belongs to another physical unit".into()));
             }
+            let backend = open_local_metadata_shard_backend(
+                &self.config, &self.root, LocalMetadataShardOpenMode::Inspection,
+                self.selected_original_data_layout.clone(), None,
+            )?;
+            let mut snapshot = initialize_resident_metadata_shard_status_snapshot(&self.config, &backend);
+            if matches!(generation.state, crate::storage_generation::GenerationState::Staged { .. }) {
+                snapshot.incomplete_reasons.push("metadata storage generation is staged".into());
+            }
+            Ok(snapshot)
+        })();
+        let snapshot = match inspected {
+            Ok(snapshot) => Some(snapshot),
             Err(error) => {
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                *state = ResidentLocalMetadataShardState::Unopened;
-                self.available.notify_all();
-                self.async_available.notify_waiters();
-                if self.open_mode == LocalMetadataShardOpenMode::ReplicaRepair
-                    && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&error)
-                {
-                    self.operator_status.write().unwrap_or_else(|error| error.into_inner()).snapshot = None;
-                    tracing::warn!(target: "sinomo.dfs", shard = %self.config.shard_id,
-                        error = %error, "replica status unavailable; authenticated snapshot repair required");
-                    Ok(())
-                } else {
-                    Err(error)
-                }
+                tracing::warn!(target: "sinomo.dfs", shard = %self.config.shard_id,
+                    error = %error, "current unit status unavailable; owned preparation or authenticated repair required");
+                None
             }
-        }
+        };
+        self.operator_status.write().unwrap_or_else(|error| error.into_inner()).snapshot = snapshot;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(matches!(*state, ResidentLocalMetadataShardState::Opening));
+        *state = ResidentLocalMetadataShardState::Unopened;
+        self.available.notify_all();
+        self.async_available.notify_waiters();
+        Ok(())
     }
 
     /// Return a bounded operator projection without waiting for ownership of
@@ -1079,9 +1082,39 @@ impl ResidentLocalMetadataShardHandle {
                 "genesis ingress preparation requires its exact strict primary slot".into(),
             ));
         }
-        let Some(mut lease) = self.try_checkout()? else {
-            return Ok(None);
+        let opened = match self.try_checkout() {
+            Ok(opened) => opened,
+            Err(failure) => {
+                // Staged storage never enters an ordinary resident slot. The
+                // existing initial-genesis owner may inspect its exact original
+                // Prepared solely to refuse this mutation before any binding.
+                if expected.epoch == 1 && expected.replica_node_ids.is_empty()
+                    && operation_id == crate::default_cluster::genesis::genesis_operation_id(expected)
+                    && let Ok(generation) = crate::storage_generation::read_generation(&self.slot.root)
+                    && generation.identity.is_native_genesis()
+                    && matches!(generation.state, crate::DfsMetadataGenerationState::Staged { .. })
+                    && let Some(catalog) = self.slot.native_catalog.as_ref() {
+                    if !catalog.binds(expected) { return Err(failure); }
+                    catalog.validate_generation(&generation.identity)?;
+                    let mut original = LocalSobjMetadataBackend::open_staged_native_genesis(
+                        expected, self.slot.root.clone(), self.slot.selected_original_data_layout.clone(),
+                    )?;
+                    original.begin_consistent_read_snapshot()?;
+                    original.end_consistent_read_snapshot();
+                    if let Some(Some(record)) = original.read_certified_prepared_record_for_ingress(operation_id)? {
+                        catalog.validate_native_genesis_preparation(&record)?;
+                        let original_fs = crate::default_cluster::genesis::original_genesis_file_system(&record, expected)
+                            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+                        if generation.identity.matches_native_file_system_storage(original_fs.metadata_storage.as_ref())
+                            && record.status == crate::DfsPreparedOperationStatus::Prepared {
+                            return Ok(Some(Some(record)));
+                        }
+                    }
+                }
+                return Err(failure);
+            }
         };
+        let Some(mut lease) = opened else { return Ok(None); };
         if let Some(record) = lease.try_read_certified_prepared_record_for_ingress(operation_id)? {
             return Ok(Some(record));
         }
@@ -1384,12 +1417,13 @@ impl ResidentLocalShardedMetadataBackend {
     /// admission; this DATA comparison creates no writer capability.
     /// Rebuild the router for `shards`. The local copies named by `discarded`
     /// are deleted before the changed slots reopen.
-    pub(crate) fn into_reconfigured_for_replica_repair(
+    pub(crate) fn into_reconfigured_for_replica_repair_and_catalog(
         self,
         root: PathBuf,
         mut shards: Vec<DfsMetadataShardConfig>,
         local_node_id: &NodeId,
         discarded: &BTreeSet<DfsMetadataShardId>,
+        native_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     ) -> Result<Self> {
         canonicalize_routing_topology(&mut shards);
         let reusable = self.with_router(
@@ -1417,6 +1451,12 @@ impl ResidentLocalShardedMetadataBackend {
                     if slot.config != *config
                         || slot.root != root.join(key_segment(&shard_id.0))
                         || slot.open_mode != open_mode
+                        || !match (&slot.native_catalog, &native_catalog) {
+                            (None, None) => true,
+                            (Some(previous), Some(current)) =>
+                                previous.has_same_storage_admission_for(current, config),
+                            _ => false,
+                        }
                     {
                         continue;
                     }
@@ -1462,7 +1502,8 @@ impl ResidentLocalShardedMetadataBackend {
             Some(local_node_id),
             &retained_ids,
             selected_layout,
-            true,
+            false,
+            native_catalog.as_ref(),
         )?
         .into_resident();
         let inner = Arc::get_mut(&mut current.inner).ok_or_else(|| {
@@ -1767,6 +1808,7 @@ impl ResidentLocalShardedMetadataBackend {
                 root: slot.root.clone(),
                 open_mode: slot.open_mode,
                 selected_original_data_layout: slot.selected_original_data_layout.clone(),
+                native_catalog: slot.native_catalog.clone(),
                 initialization: Mutex::new(()),
                 backend: OnceLock::new(),
             };
@@ -1896,6 +1938,7 @@ impl LocalMetadataShardSlot {
             root,
             open_mode,
             selected_original_data_layout: None,
+            native_catalog: None,
             initialization: Mutex::new(()),
             backend: OnceLock::new(),
         }
@@ -1906,7 +1949,7 @@ impl LocalMetadataShardSlot {
     }
 
     fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone()).map(Box::new)
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref()).map(Box::new)
     }
 
     fn backend(&self) -> Result<&LocalSobjMetadataBackend> {
@@ -1955,8 +1998,52 @@ fn open_local_metadata_shard_backend(
     root: &Path,
     open_mode: LocalMetadataShardOpenMode,
     selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    native_catalog: Option<&crate::DfsMetadataNamespaceCatalog>,
 ) -> Result<LocalSobjMetadataBackend> {
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+    if let Some(catalog) = native_catalog {
+        if !catalog.binds(config) {
+            return Err(MetadataBackendError::Serde("physical slot configuration differs from its captured catalog".into()));
+        }
+        if let Err(failure) = crate::storage_preparation::prepare_storage_root_before_open(root,
+            &crate::DfsStoragePreparationScope::Metadata(shard_id.clone())) {
+            if open_mode == LocalMetadataShardOpenMode::ReplicaRepair
+                && matches!(&failure, MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::ReplicaUnreadable, .. }) {
+                // The preparation owner proved an absent replica, not Ready.
+                // Preserve the existing repair-only ingress so its typed
+                // rejection requests an authenticated snapshot, not a transport
+                // failure before the receiver can answer. Pending/ambiguous
+                // originals never enter this branch.
+                return LocalSobjMetadataBackend::open_for_replica_repair_with_layout(
+                    shard_id, root.to_owned(),
+                    selected_layout.clone().map(|layout| (config.file_system_id.clone(), layout)),
+                );
+            }
+            return Err(failure);
+        }
+        if root.join("metadata-generation.sobj").exists() {
+            let admission = crate::storage_generation::read_generation(root)
+                .and_then(|generation| catalog.validate_read_generation(&generation));
+            if let Err(failure) = admission {
+                if open_mode == LocalMetadataShardOpenMode::ReplicaRepair
+                    && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&failure) {
+                    // A replica that missed the storage import still has an
+                    // older Active envelope. It cannot serve that generation,
+                    // but the authenticated current snapshot receiver must be
+                    // able to archive and replace it through repair-only ingress.
+                    return LocalSobjMetadataBackend::open_for_replica_repair_with_layout(
+                        shard_id, root.to_owned(),
+                        selected_layout.clone().map(|layout| (config.file_system_id.clone(), layout)),
+                    );
+                }
+                return Err(failure);
+            }
+        }
+    }
+    if open_mode == LocalMetadataShardOpenMode::NativeGenesis {
+        return LocalSobjMetadataBackend::open_staged_native_genesis(config, root.to_owned(), selected_layout);
+    }
     if let Some(layout) = selected_layout {
         if open_mode == LocalMetadataShardOpenMode::Inspection {
             return LocalSobjMetadataBackend::open_for_inspection_with_layout(
@@ -1979,6 +2066,7 @@ fn open_local_metadata_shard_backend(
         }
     }
     let mut backend = match open_mode {
+        LocalMetadataShardOpenMode::NativeGenesis => unreachable!("handled with native scope above"),
         LocalMetadataShardOpenMode::Strict => {
             LocalSobjMetadataBackend::new(shard_id, root.to_path_buf())?
         }
@@ -2022,6 +2110,34 @@ pub struct LocalShardedMetadataBackend {
 }
 
 impl LocalShardedMetadataBackend {
+    pub(crate) fn open_with_native_catalog(
+        root: PathBuf,
+        shards: Vec<DfsMetadataShardConfig>,
+        local_node_id: &NodeId,
+        layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+        catalog: &crate::DfsMetadataNamespaceCatalog,
+    ) -> Result<Self> {
+        Self::open_with_retained_shards_and_layout(root, shards, true, Some(local_node_id), &BTreeSet::new(), layout, false, Some(catalog))
+    }
+    pub(crate) fn open_for_native_genesis(
+        root: PathBuf,
+        shards: Vec<DfsMetadataShardConfig>,
+        local_node_id: &NodeId,
+        fresh: &BTreeSet<DfsMetadataShardId>,
+        layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    ) -> Result<Self> {
+        let mut backend = Self::open_with_retained_shards_and_layout(
+            root, shards, true, Some(local_node_id), &BTreeSet::new(), layout, false, None,
+        )?;
+        for shard in fresh {
+            let slot = backend.shards.get_mut(shard).ok_or_else(|| MetadataBackendError::Serde("genesis scope is absent from router".into()))?;
+            if slot.config.primary_node_id != *local_node_id || slot.config.epoch != 1 || !slot.config.replica_node_ids.is_empty() {
+                return Err(MetadataBackendError::Serde("genesis router differs from its selected singleton owner".into()));
+            }
+            slot.open_mode = LocalMetadataShardOpenMode::NativeGenesis;
+        }
+        Ok(backend)
+    }
     /// Open or initialize a local router over the configured metadata shards.
     ///
     /// Each shard config gets its own `LocalSobjMetadataBackend` under `root`.
@@ -2059,6 +2175,7 @@ impl LocalShardedMetadataBackend {
             &BTreeSet::new(),
             Some(layout),
             true,
+            None,
         )
     }
 
@@ -2158,6 +2275,7 @@ impl LocalShardedMetadataBackend {
             retained_ids,
             None,
             eager_open,
+            None,
         )
     }
 
@@ -2169,6 +2287,7 @@ impl LocalShardedMetadataBackend {
         retained_ids: &BTreeSet<DfsMetadataShardId>,
         selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
         eager_open: bool,
+        native_catalog: Option<&crate::DfsMetadataNamespaceCatalog>,
     ) -> Result<Self> {
         if let Some(layout) = &selected_layout {
             layout.check_routing_root(&root)?;
@@ -2225,6 +2344,7 @@ impl LocalShardedMetadataBackend {
             }
             let mut slot = LocalMetadataShardSlot::new(shard, shard_root, open_mode);
             slot.selected_original_data_layout = selected_layout.clone();
+            slot.native_catalog = native_catalog.cloned();
             shard_slots.push((shard_id, slot));
         }
         let replica_repair_local_node_id = replica_repair_local_node_id.cloned();
@@ -2967,6 +3087,16 @@ mod lazy_replica_slot_tests {
         NodeId::from_legacy_named(value).expect("valid node id")
     }
 
+    fn native_metadata_data(root: &Path) -> PathBuf {
+        let metadata_root = root.join("metadata");
+        for shard in ["root", "services"] {
+            let destination = metadata_root.join(shard);
+            std::fs::create_dir_all(&destination).unwrap();
+            crate::test_runtime::copy_native_genesis_data(&destination, shard);
+        }
+        metadata_root
+    }
+
     fn configs(local_node_id: &NodeId) -> Vec<DfsMetadataShardConfig> {
         vec![
             DfsMetadataShardConfig {
@@ -3161,7 +3291,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn replica_repair_router_defers_non_primary_shard_until_first_access() {
         let root = sinomo_testdir::TestDir::new("dfs-lazy-replica-shard-slot");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("lazy-slot-local");
         let root_shard_id = DfsMetadataShardId::new("root");
         let replica_shard_id = DfsMetadataShardId::new("services");
@@ -3189,7 +3319,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn strict_and_inspection_routers_keep_eager_open_contract() {
         let root = sinomo_testdir::TestDir::new("dfs-eager-compatible-shard-slots");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("eager-slot-local");
         let expected = BTreeSet::from([
             DfsMetadataShardId::new("root"),
@@ -3212,7 +3342,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn lazy_slots_preserve_distinct_backend_instances_between_routers() {
         let root = sinomo_testdir::TestDir::new("dfs-distinct-lazy-shard-slots");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("distinct-slot-local");
         let replica_shard_id = DfsMetadataShardId::new("services");
         let first = LocalShardedMetadataBackend::new_with_replica_repair(
@@ -3243,7 +3373,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn resident_handles_move_open_backends_and_open_deferred_shards_once() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-shard-open-once");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("resident-open-local");
         let file_system_id = crate::sifs_file_system_id();
         let root_shard_id = DfsMetadataShardId::new("root");
@@ -3292,7 +3422,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn resident_topology_match_requires_exact_root_and_config_generation() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-topology-identity");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("resident-topology-local");
         let shards = configs(&local_node_id);
         let resident = LocalShardedMetadataBackend::new(&metadata_root, shards.clone())
@@ -3330,7 +3460,7 @@ mod lazy_replica_slot_tests {
         let config = configs(&local)[0].clone();
         let shard = DfsMetadataShardId::new(&config.shard_id);
         let resident = LocalShardedMetadataBackend::new_with_replica_repair(
-            root.path().join("metadata"), vec![config.clone()], &local,
+            native_metadata_data(root.path()), vec![config.clone()], &local,
         ).unwrap().into_resident();
         let handle = resident.scope_shard(&config.file_system_id, &shard).unwrap();
         let lease = handle.checkout().unwrap();
@@ -3358,7 +3488,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn bounded_status_keeps_an_unopened_local_primary_blocking() {
         let root = sinomo_testdir::TestDir::new("dfs-bounded-status-unhydrated-primary");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("bounded-status-primary-local");
         let shard = configs(&local_node_id)[0].clone();
         let shard_id = DfsMetadataShardId::new(&shard.shard_id);
@@ -3432,7 +3562,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn historical_routing_zero_lock_proof_requires_every_shard_summary() {
         let root = sinomo_testdir::TestDir::new("dfs-bounded-status-routing-zero-incomplete");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("bounded-status-routing-zero-incomplete-local");
         let root_shard = configs(&local_node_id)[0].clone();
         drop(
@@ -3482,7 +3612,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn explicit_startup_status_initialization_proves_zero_across_deferred_replicas() {
         let root = sinomo_testdir::TestDir::new("dfs-bounded-status-startup-initialization");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("bounded-status-startup-local");
         let root_shard = configs(&local_node_id)[0].clone();
         drop(
@@ -3547,7 +3677,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn resident_handles_share_instance_local_handoff_authority() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-shard-handoff-authority");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("resident-handoff-local");
         let file_system_id = crate::sifs_file_system_id();
         let shard_id = DfsMetadataShardId::new("root");
@@ -3597,7 +3727,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn resident_global_checkout_returns_same_instances_and_router_updates() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-global-checkout");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("resident-global-local");
         let file_system_id = crate::sifs_file_system_id();
         let shard_id = DfsMetadataShardId::new("root");
@@ -3662,7 +3792,7 @@ mod lazy_replica_slot_tests {
     #[test]
     fn resident_backend_serializes_one_shard_without_blocking_another() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-disjoint-shard-locks");
-        let metadata_root = root.path().join("metadata");
+        let metadata_root = native_metadata_data(root.path());
         let local_node_id = node("resident-lock-local");
         let file_system_id = crate::sifs_file_system_id();
         let resident = LocalShardedMetadataBackend::new(&metadata_root, configs(&local_node_id))
@@ -3728,6 +3858,11 @@ impl LocalShardedMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    fn activate_native_genesis_storage_generation(&mut self, shard: &DfsMetadataShardConfig) -> Result<()> {
+        let id = DfsMetadataShardId::new(&shard.shard_id);
+        self.require_prepared_operation_shard(&shard.file_system_id, &id)?;
+        self.shard_backend_mut(&id)?.activate_native_genesis_storage_generation(shard)
+    }
     #[cfg(test)]
     fn retain_native_prefix_history(
         &mut self,round:&crate::node_transport::OwnedNativeMetadataPrefixRound,
@@ -6271,7 +6406,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<Option<DfsMetadataTableSnapshot>> {
         Ok(Some(LocalSobjMetadataBackend::export_table_snapshot(
             self.shard_backend(shard_id)?,
-        )))
+        )?))
     }
 
     fn metadata_prefix_proof(
@@ -6450,9 +6585,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             ));
         }
         let slot = self.shards.values().next().expect("one physical shard");
-        Ok(LocalSobjMetadataBackend::export_table_snapshot(
-            slot.backend()?,
-        ))
+        LocalSobjMetadataBackend::export_table_snapshot(slot.backend()?)
     }
 
     fn observe_metadata_replication_cursors(
@@ -6655,7 +6788,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.require_replica_ingest_permit_for_shard(permit, &source_shard_id)?;
         let mut affected_object_ids = self
             .shard_backend(&source_shard_id)?
-            .export_table_snapshot()
+            .export_table_snapshot()?
             .tables
             .objects
             .into_iter()

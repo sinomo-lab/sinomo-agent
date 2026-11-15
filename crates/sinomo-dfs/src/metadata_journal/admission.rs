@@ -533,8 +533,11 @@ mod tests {
 
     #[test]
     fn owned_checkpoint_keeps_stronger_certified_deferred_prefix() {
-        let root = empty_owner("journal-admission-owned-deferred-prefix");
+        let root = sinomo_testdir::TestDir::new("journal-admission-owned-deferred-prefix");
         let shard = DfsMetadataShardId::new("services");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), &shard.0);
+        fs::create_dir_all(root.path().join("journal")).unwrap();
+        fs::File::create(crate::metadata_cursor::journal_write_lock_path(root.path())).unwrap();
         let mut prefix = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
         let mut proofs = Vec::new();
         for sequence in 1..=2 {

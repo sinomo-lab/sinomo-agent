@@ -423,7 +423,7 @@ impl LocalContentStore {
             extents: Vec::new(),
         };
         self.inline_check_manifest_conflict(&manifest)?;
-        let existing = match self.read_manifest(object_id, version) {
+        let existing = match self.read_current_manifest(object_id, version) {
             Ok(existing) => {
                 if existing.content_hash != manifest.content_hash
                     || existing.size_bytes != manifest.size_bytes
@@ -686,6 +686,7 @@ impl LocalContentStore {
 pub struct ContentStoreStagingWriter {
     store: LocalContentStore,
     _owner: fs::File,
+    import_identity: Option<String>,
 }
 
 #[cfg(feature = "storage-conversion")]
@@ -698,6 +699,10 @@ impl std::ops::Deref for ContentStoreStagingWriter {
 
 #[cfg(feature = "storage-conversion")]
 impl ContentStoreStagingWriter {
+    pub(in crate::content_store) fn current_import_identity(&self) -> Option<&str> {
+        self.import_identity.as_deref()
+    }
+
     /// Opens an existing candidate or begins from an empty current catalog.
     /// A populated ordinary store cannot acquire this staging capability.
     pub fn open_candidate(root: &Path) -> Result<Self> {
@@ -742,7 +747,29 @@ impl ContentStoreStagingWriter {
         Ok(Self {
             store,
             _owner: owner,
+            import_identity: None,
         })
+    }
+
+    /// Merge verified current rows into an exposed partial import. This is a
+    /// current representation primitive: original source decoding and proof
+    /// remain with the migration owner. Current live/deleted bindings win.
+    pub fn open_import_target(root: &Path, identity: &str) -> Result<Self> {
+        if !root.join("content-reservations/00/batch-format-v1.sobj").is_file() {
+            return Err(inline_error("current import target has no representation header"));
+        }
+        let store = LocalContentStore::initialize_current(root.to_owned())?;
+        let _guard = store.content_mutation_guard()?;
+        let sentinel = store.inline_sentinel_unlocked()?.ok_or_else(|| inline_error("current import target has no sentinel"))?;
+        crate::content_store::preparation::require_pending_inventory(&sentinel, identity)?;
+        let path = root.join("catalog-staging-owner.lock");
+        let owner = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&path).map_err(|source| ContentStoreError::Io { path: path.clone(), source })?;
+        owner.try_lock_exclusive().map_err(|source| ContentStoreError::Io { path: path.clone(), source })?;
+        owner.sync_all().map_err(|source| ContentStoreError::Io { path, source })?;
+        sync_dir(root)?;
+        drop(_guard);
+        Ok(Self { store, _owner: owner, import_identity: Some(identity.to_owned()) })
     }
 }
 
@@ -784,9 +811,47 @@ impl ContentStoreStagingWriter {
             not_before,
         } = &row
         {
-            return self.ensure_content_reservation_not_before(identity, *not_before);
+            return self.ensure_content_reservation_not_before_for_inventory(identity, *not_before, self.import_identity.as_deref());
         }
         let reservation = self.lock_content_reservations_for_write()?;
+        if let Some(identity) = &self.import_identity {
+            crate::content_store::preparation::require_pending_inventory(&reservation.sentinel, identity)?;
+            match &row {
+                ContentStoreStagingRow::Manifest { manifest, .. } => match self.inline_version_state(&manifest.object_id, &manifest.version)? {
+                    Some(InlineVersionState::Deleted { .. }) => return Ok(()),
+                    Some(InlineVersionState::Live(entry)) => {
+                        if entry.manifest != *manifest { return Err(inline_error("import conflicts with a current immutable binding")); }
+                        return Ok(());
+                    }
+                    None => {}
+                },
+                ContentStoreStagingRow::VersionTombstone { object_id, version, content_hash } => {
+                    if let Some(state) = self.inline_version_state(object_id, version)? {
+                        if let InlineVersionState::Live(entry) = state {
+                            if entry.manifest.content_hash != *content_hash { return Err(inline_error("import tombstone conflicts with current immutable identity")); }
+                        }
+                        return Ok(());
+                    }
+                }
+                ContentStoreStagingRow::Blob { content_hash, bytes, .. } => {
+                    ensure_bytes_match_hash(content_hash, bytes)?;
+                    if self.inline_blob_deleted(content_hash)? { return Ok(()); }
+                }
+                ContentStoreStagingRow::BlobTombstone { content_hash } => {
+                    // A retained current binding wins. This is a presence check,
+                    // not permission to serve unverified bytes; ordinary reads
+                    // retain their own content validation.
+                    if self.inline_blob_entry(content_hash)?.is_some()
+                        || self.blob_path(content_hash)?.try_exists().map_err(|source| ContentStoreError::Io { path: self.root.clone(), source })?
+                        || self.inline_blob_deleted(content_hash)? { return Ok(()); }
+                }
+                // An old release cannot revoke a newer current reservation.
+                ContentStoreStagingRow::RetentionRelease(identity) => {
+                    if self.inline_reservation_state(identity)?.is_some() { return Ok(()); }
+                }
+                ContentStoreStagingRow::RetentionRoot { .. } => unreachable!(),
+            }
+        }
         let cache_key = match &row {
             ContentStoreStagingRow::Manifest { manifest, .. } => {
                 Some(self.manifest_path(&manifest.object_id, &manifest.version))

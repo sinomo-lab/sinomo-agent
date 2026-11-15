@@ -2249,6 +2249,9 @@ fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
         ),
         updated_at_unix_nanos: dfs_now_unix_nanos(),
     };
+    let suppressed_root = root.join("suppressed/root");
+    std::fs::create_dir_all(&suppressed_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&suppressed_root, "root");
     let mut host = RecordingMetadataJournalPublisherHost::new(root.join("suppressed"));
 
     let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
@@ -2279,6 +2282,13 @@ fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
         ]
     );
 
+    let changed_root = root.join("epoch-changed/root");
+    std::fs::create_dir_all(&changed_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&changed_root, "root");
+    let mut caught_up = LocalSobjMetadataBackend::new(shard_id.clone(), &changed_root).unwrap();
+    let caught_up_sequence = caught_up.metadata_prefix_proof().unwrap().journal_sequence;
+    caught_up.put_metadata_replication_cursor(&replica, &shard_id, caught_up_sequence).unwrap();
+    drop(caught_up);
     let mut host = RecordingMetadataJournalPublisherHost::new(root.join("epoch-changed"));
     let mut changed_epoch_shard = shard;
     changed_epoch_shard.epoch = 8;
@@ -2303,7 +2313,7 @@ fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
         vec![DfsMetadataJournalReplicationOutcome::NoChanges {
             target_node_id: replica,
             shard_id,
-            after_sequence: 0,
+            after_sequence: caught_up_sequence,
         }]
     );
 
@@ -2418,7 +2428,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
     // Synchronize the existing real prefix before introducing two new hidden
     // operations. Automatic traffic remains paused; explicit calls still use
     // the authenticated native registry and persisted receiver.
-    let mut base_head = 0;
+    let mut base_head = receiver.metadata_prefix_proof().unwrap().journal_sequence;
     loop {
         let backend = source.metadata_backend.as_ref().unwrap();
         let Some(batch) = backend
@@ -2961,7 +2971,7 @@ fn metadata_authority_empty_probe_confirms_only_exact_snapshot_covered_prepare()
             LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
                 .unwrap();
         receiver.begin_inspection_snapshot().unwrap();
-        let tables = receiver.export_table_snapshot();
+        let tables = receiver.export_table_snapshot().unwrap();
         let authority_floor = receiver.metadata_authority_ack_floor(&shard_id).unwrap();
         let prefix_floor = receiver.metadata_prefix_ack_floor(&shard_id).unwrap();
         let frames = receiver
@@ -3960,7 +3970,7 @@ fn captured_native_publication_prefix(
     let object = source.get_object(&published.object_id).unwrap().unwrap();
     assert_eq!(object.version, published.version);
     assert_eq!(object.content_hash, published.content_hash);
-    let snapshot = source.export_table_snapshot();
+    let snapshot = source.export_table_snapshot().unwrap();
     assert!(snapshot.prefix_proof.is_well_formed());
     assert_eq!(
         snapshot.prefix_proof.journal_sequence,
@@ -4707,7 +4717,7 @@ fn routed_create_cleanup_preserves_the_original_unpublished_opening() {
             &root,
         )
         .unwrap()
-        .export_table_snapshot()
+        .export_table_snapshot().unwrap()
     };
     let before = inspect();
     let openings = before

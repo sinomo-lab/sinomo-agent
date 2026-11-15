@@ -2025,6 +2025,7 @@ pub enum DfsNamespaceJobFrame {
 #[serde(deny_unknown_fields)]
 pub struct DfsMetadataSnapshotImageDescriptor {
     pub format_version: u16,
+    pub generation: crate::DfsMetadataGenerationIdentity,
     pub materialized_through_sequence: u64,
     pub semantic_state_fingerprint: String,
     pub prefix_proof: DfsMetadataPrefixProof,
@@ -2035,6 +2036,7 @@ pub struct DfsMetadataSnapshotImageDescriptor {
 
 impl DfsMetadataSnapshotImageDescriptor {
     pub(crate) fn validate(&self) -> std::result::Result<(), crate::MetadataBackendError> {
+        self.generation.validate()?;
         if self.format_version
             != crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
             || !self.prefix_proof.is_well_formed()
@@ -2124,6 +2126,8 @@ thread_local! {
 
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]
 pub struct DfsMetadataTableSnapshotTables {
+    // Match the one current native snapshot serializer order.
+    pub prepared_operation_evictions: Vec<DfsPreparedOperationEviction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_systems: Vec<DfsFileSystem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2167,7 +2171,6 @@ pub struct DfsMetadataTableSnapshotTables {
     pub namespace_transaction_receipts: Vec<DfsNamespaceTransactionReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepared_operations_v7: Vec<DfsPreparedOperationRecord>,
-    pub prepared_operation_evictions: Vec<DfsPreparedOperationEviction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub namespace_jobs: Vec<DfsNamespaceJobRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

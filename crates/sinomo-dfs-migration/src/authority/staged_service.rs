@@ -23,6 +23,7 @@ pub(super) const CONTENT_VERIFY_ROUTE: &str = "/dfs-migration/retained-content-v
 pub(super) const PLACEMENT_CUSTODY_ROUTE: &str = "/dfs-migration/placement-request-custody-v7";
 pub(super) const NAMESPACE_JOB_ROUTE: &str = "/dfs-migration/current-namespace-job-data-v7";
 const ROUTES: &[&str] = &[
+    super::owner::filesystem::ROUTE,
     super::namespace_counts::PROBE_ROUTE,
     SNAPSHOT_ROUTE,
     PREFIX_ROUTE,
@@ -445,16 +446,27 @@ impl NativeImportAuthority {
                     "existing immutable receiver candidate belongs to another cut",
                 ));
             }
-        } else {
-            let inspection = sinomo_dfs::write_metadata_candidate_image_inspected(&root, image, fs)?;
-            let actual = self.retained_plan_file.retain_candidate(&root, inspection)?;
-            if actual.prefix_proof != cut.target_prefix
-                || actual.state_fingerprint != cut.converted_image_fingerprint
-            {
-                return Err(error(
-                    "actual current candidate checksum differs after durable write",
-                ));
+        }
+        // The ordinary candidate writer also qualifies exact replay and the
+        // current generation seal. Contention is unreadable/Pending, never an
+        // installation ACK or a reduced native quorum.
+        let inspection = match sinomo_dfs::write_metadata_candidate_image_inspected(&root, image, fs) {
+            Ok(inspection) => inspection,
+            Err(failure) if candidate_publication_busy(&failure) => {
+                return Ok(DfsMetadataSnapshotInstallResponse {
+                    request_id: command.request_id.clone(), shard_id: command.shard_id.clone(),
+                    next_after_sequence: command.next_after_sequence,
+                    result: DfsMetadataSnapshotInstallResult::Rejected {
+                        code: sinomo_dfs::DfsMetadataRejectionCode::ReplicaUnreadable,
+                        reason: failure.to_string(),
+                    },
+                });
             }
+            Err(failure) => return Err(failure),
+        };
+        let actual = self.retained_plan_file.retain_candidate(&root, inspection)?;
+        if actual.prefix_proof != cut.target_prefix || actual.state_fingerprint != cut.converted_image_fingerprint {
+            return Err(error("actual current candidate checksum differs after durable write"));
         }
         Self::save_blueprint(&root, "native-import-plan.json", &envelope.plan)?;
         Self::save_blueprint(
@@ -622,6 +634,11 @@ impl NativeImportAuthority {
         );
         let supported_target = |value: &str| value == "target-format-9" || value == "target-format-10" || value == current_target;
         match parts.as_slice() {
+            [actual_key, target, "namespace-count-current-image"] => {
+                let Some(cohort) = &cut.namespace_count_cohort else { return Ok(false); };
+                cohort.validate_bound_cut(cut)?;
+                Ok(*target == current_target && *actual_key == key && capsules.is_empty())
+            }
             [actual_key, target, "current-image"] => {
                 Ok(supported_target(target) && *actual_key == key && capsules.is_empty())
             }
@@ -1474,6 +1491,7 @@ impl NativeImportAuthority {
             &format!("native-request-{}.json", envelope.request.request_id),
             &envelope.request,
         )?;
+        super::owner::filesystem::enqueue_received_generation(&self.component_context, &envelope.plan, &root)?;
         Ok(BlueprintStored {
             request_id: envelope.request.request_id,
             handoff_id: h.handoff_id.clone(),
@@ -1524,6 +1542,12 @@ impl Service for StagedImportService {
                 .parse::<sinomo_core::node::NodeId>()
                 .map_err(|e| ServiceError::Service(e.to_string()))?;
             match request.route.as_str() {
+                super::owner::filesystem::ROUTE => {
+                    let work = context.decode_request_body_bounded::<super::owner::filesystem::Request>(&request, 64 * 1024 * 1024).await?;
+                    let response = tokio::task::block_in_place(|| super::owner::filesystem::receive(&self.component_context, source, work))
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    context.respond_value(super::owner::filesystem::ROUTE, response)?;
+                }
                 super::namespace_counts::PROBE_ROUTE => {
                     let probe = context.decode_request_body::<super::namespace_counts::Probe>(&request).await?;
                     let result = tokio::task::block_in_place(|| self.authority.receive_count_probe(source, probe))
@@ -1818,7 +1842,7 @@ pub(super) fn factory()
                         "staged service has no actual current provider lifecycle",
                     )
                 })?;
-            let runtime = super::shared_runtime(context, lifecycle)?;
+            let runtime = super::shared_owner(context, lifecycle)?;
             scope.set_services(
                 ServiceRegistryBuilder::default()
                     .register(StagedImportService {
@@ -1841,6 +1865,7 @@ mod ancestry_ledger_tests {
         // No ACKs, cfg, native receipt or permission is created by this
         // filesystem-boundary fixture. The verifier tests only durable framing.
         MetadataSourceCut {
+            retained_placement_reservations: Vec::new(),
             namespace_count_cohort: None,
             source_root: root.to_owned(),
             source_identity: "ledger-fixture".into(),
@@ -2212,5 +2237,20 @@ mod ancestry_ledger_tests {
         pure_v1["prefix_proof"] = serde_json::to_value(old).unwrap();
         write(&pure_v1);
         assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&prefix)).is_err());
+    }
+}
+
+fn candidate_publication_busy(failure: &MetadataBackendError) -> bool {
+    matches!(failure, MetadataBackendError::Io { source, .. } if source.kind() == std::io::ErrorKind::WouldBlock)
+}
+#[cfg(test)]
+mod candidate_contention_tests {
+    use super::*;
+    #[test]
+    fn only_actual_candidate_would_block_is_pending() {
+        let busy = MetadataBackendError::Io { path: "owned/metadata-candidate.lock".into(), source: std::io::Error::from(std::io::ErrorKind::WouldBlock) };
+        assert!(candidate_publication_busy(&busy));
+        assert!(!candidate_publication_busy(&MetadataBackendError::Serde("malformed image".into())));
+        assert!(!candidate_publication_busy(&MetadataBackendError::Io { path: "owned/image".into(), source: std::io::Error::from(std::io::ErrorKind::InvalidData) }));
     }
 }

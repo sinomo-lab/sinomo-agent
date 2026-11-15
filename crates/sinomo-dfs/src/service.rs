@@ -481,15 +481,39 @@ fn component_factory_with_selected_layout(
                         component_id: caller.component_id.clone(),
                         detail: error.to_string(),
                     })?;
+                // Drains run in reverse registration order. The preparation
+                // owner must first join its steps and release idle warm source
+                // leases before ordinary children waiting on those leases join.
+                // Fill this holder with the exact normal objects below; it does
+                // not create a second runtime or a replacement custody owner.
+                let child_drain_targets = Arc::new(std::sync::OnceLock::<(
+                    Arc<crate::runtime_host::DfsRuntimeHost>,
+                    Arc<crate::source_adoption::DfsSourceAdoptionActor>,
+                )>::new());
+                let drain_targets = Arc::clone(&child_drain_targets);
+                scope.on_task_drain("DFS runtime children and source custody", move |deadline| {
+                    let targets = Arc::clone(&drain_targets);
+                    async move {
+                        let Some((host, source)) = targets.get() else { return Ok(()); };
+                        host.shutdown_and_wait(deadline).await?;
+                        source.closed_custody_disposition().map(|disposition| {
+                            if disposition == crate::source_adoption::DfsSourceAdoptionCloseDisposition::Retained {
+                                tracing::debug!(target: "sinomo.dfs.source_custody",
+                                    "closed DFS source effects remain in exact retained native custody");
+                            }
+                        }).map_err(|error| error.to_string())
+                    }
+                });
                 let storage_preparation = preparation.as_ref().map(|provider| {
                     let lifecycle = scope.shutdown_receiver();
-                    let provider = provider(context, lifecycle.clone())?;
+                    let binding = provider(context, scope, lifecycle.clone())?;
+                    let provider = binding.provider;
                     let owner = Arc::clone(&data_owner);
                     let owned: crate::DfsStoragePreparationProvider = Arc::new(move |root, shard, budget| {
                         let _actual_owner = Arc::clone(&owner);
                         provider(root, shard, budget)
                     });
-                    crate::register_dfs_storage_preparation_provider(data_dir.root().to_owned(), owned, Some(lifecycle))
+                    crate::storage_preparation::register_provider(data_dir.root().to_owned(), owned, Some(lifecycle), Some(binding.readiness))
                         .map_err(|error| sinomo_module::ComponentError::Component { component_id: caller.component_id.clone(), detail: error.to_string() })
                 }).transpose()?;
                 let events = context.event_client(&caller)?;
@@ -523,6 +547,9 @@ fn component_factory_with_selected_layout(
                     Arc::clone(&data_owner),
                     scope.shutdown_receiver(),
                 )?;
+                child_drain_targets.set((Arc::clone(&host), Arc::clone(&source_adoption)))
+                    .map_err(|_| sinomo_module::ComponentError::component(&caller.component_id,
+                        "DFS child drain ownership was already assigned"))?;
                 builder = builder.register(DfsSourceAdoptionService {
                     actor: Arc::clone(&source_adoption),
                 });
@@ -630,20 +657,12 @@ fn component_factory_with_selected_layout(
                         .cloned()
                         .expect("active DFS runtime was already resolved"),
                 });
-                let drain_host = Arc::clone(&host);
-                let drain_source = Arc::clone(&source_adoption);
-                scope.on_task_drain("DFS runtime children and source custody", move |deadline| {
-                    let host = Arc::clone(&drain_host);
-                    let source = Arc::clone(&drain_source);
-                    async move {
-                        host.shutdown_and_wait(deadline).await?;
-                        source.closed_custody_disposition().map(|disposition| {
-                            if disposition == crate::source_adoption::DfsSourceAdoptionCloseDisposition::Retained {
-                                tracing::debug!(target: "sinomo.dfs.source_custody",
-                                    "closed DFS source effects remain in exact retained native custody");
-                            }
-                        }).map_err(|error| error.to_string())
-                    }
+                // Signal cancellation before preparation owners release idle
+                // physical leases; the later child join retains every task.
+                let cancel_host = Arc::clone(&host);
+                scope.on_task_drain("signal DFS runtime children shutdown", move |_| {
+                    cancel_host.shutdown();
+                    async { Ok(()) }
                 });
                 let data_dir_for_drop = data_dir.clone();
                 #[cfg(any(test, feature = "test-support"))]
@@ -670,6 +689,7 @@ fn component_factory_with_selected_layout(
                     }
                     host.shutdown();
                     crate::browser_service::release_browser_backends(&data_dir_for_drop);
+                    crate::runtime_host::release_idle_namespace_reconciliation_work(&data_dir_for_drop, &data_owner);
                     crate::runtime_host::unregister_dfs_runtime_host(&data_dir_for_drop);
                     drop(host);
                     drop(storage_preparation);
@@ -758,7 +778,7 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
             | crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE)
     {
         route = route.require_capability(
-            sinomo_core::node::DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY,
+            sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY,
         );
     }
     if let Some(timeout) = dfs_service_route_timeout(route.route.as_str()) {
@@ -2023,7 +2043,7 @@ mod tests {
             if [DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
                 crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
                 crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE].contains(route) {
-                expected_capabilities.push(sinomo_core::node::DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY.into());
+                expected_capabilities.push(sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY.into());
             }
             assert_eq!(service_route.required_capabilities, expected_capabilities);
             assert_eq!(
@@ -2245,9 +2265,12 @@ mod tests {
     async fn dfs_metadata_snapshot_install_requires_authenticated_cluster_signer() {
         let registry = register_services(ServiceRegistry::builder()).build();
         let (_root, data_dir) = temp_data_dir();
+        let source_root = data_dir.root().join("snapshot-source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        crate::test_runtime::copy_native_genesis_data(&source_root, "snapshot-source");
         let snapshot = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("snapshot-source"),
-            data_dir.root().join("snapshot-source"),
+            source_root,
         )
         .expect("source metadata")
         .export_snapshot_image()
@@ -2292,6 +2315,9 @@ mod tests {
         .unwrap();
         let primary = config.primary_node_id.clone();
         let receiver = config.replica_node_ids[0].clone();
+        let shard = DfsMetadataShardId::new(config.shard_id.clone());
+        let receiver_head = runtime.node_metadata(&receiver).unwrap()
+            .metadata_prefix_proof(&shard).unwrap().unwrap().journal_sequence;
         source
             .posix_write_file(
                 "/native-host-replica-data",
@@ -2303,10 +2329,9 @@ mod tests {
         // current owning Core, not the requester's older browser image.
         drop(source);
         let source = runtime.metadata_primary_service("/").unwrap();
-        let shard = DfsMetadataShardId::new(config.shard_id.clone());
         let backend = source.metadata_backend().unwrap();
         let selected = backend
-            .journal_batch_for_shard_since_limited(&shard, 0, 128, 16 * 1024 * 1024)
+            .journal_batch_for_shard_since_limited(&shard, receiver_head, 128, 16 * 1024 * 1024)
             .unwrap()
             .unwrap();
         let frames = backend.journal_frames_for_batch(&selected).unwrap();
@@ -2443,9 +2468,12 @@ mod tests {
                     && reason.contains(claimed.as_str())
         ));
 
+        let source_root = data_dir.root().join("snapshot-source-mismatch");
+        std::fs::create_dir_all(&source_root).unwrap();
+        crate::test_runtime::copy_native_genesis_data(&source_root, "snapshot-source");
         let snapshot_backend = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("snapshot-source"),
-            data_dir.root().join("snapshot-source-mismatch"),
+            source_root,
         )
         .expect("source metadata");
         let snapshot = DfsMetadataSnapshotInstallCommand {

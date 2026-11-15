@@ -1,8 +1,12 @@
 //! Owned, resumable metadata conversion. Existing visibility is imported only
 //! after the native host certifies the exact source/current cut.
 pub(crate) mod ack_floor;
+pub(crate) mod canonical_generation;
 mod legacy_projection;
 mod prior_native;
+mod placement_reservations;
+pub use placement_reservations::RetainedPlacementReservation;
+pub(crate) use placement_reservations::validate_placement_reservations;
 mod recovery;
 mod retained_content;
 pub(crate) mod scope_mapping;
@@ -184,6 +188,8 @@ pub struct OriginalMetadataHandoffReservation {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MetadataSourceCut {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_placement_reservations: Vec<RetainedPlacementReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_count_cohort: Option<Box<crate::namespace_count_cohort::NamespaceCountCohortSeal>>,
     pub source_root: PathBuf,
@@ -333,7 +339,8 @@ pub(crate) fn data_reservation_refs(
     source: &MetadataSourceCut,
 ) -> Result<Vec<MetadataDataReservationRef>> {
     let mut result = std::collections::BTreeSet::new();
-    for row in &source.pending_operations {
+    validate_placement_reservations(&source.retained_placement_reservations, &source.file_system_ids, &source.scope_shard)?;
+    for row in source.data_reservation_capsules() {
         if row["disposition"].as_str() != Some("data-after-original-reservation-retirement") {
             continue;
         }
@@ -394,13 +401,6 @@ pub trait MetadataImportAuthority: Send + Sync {
     fn namespace_count_cohort_ready(&self, source: &MetadataSourceCut) -> Result<bool> {
         Ok(source.namespace_count_cohort.is_none())
     }
-    fn namespace_count_initializations_ready(
-        &self,
-        _shard: &DfsMetadataShardId,
-        obligations: &std::collections::BTreeSet<(DfsFileSystemId, String)>,
-    ) -> Result<bool> {
-        Ok(obligations.is_empty())
-    }
     fn queue_original_topology_after_install(
         &self,
         source: &MetadataSourceCut,
@@ -425,6 +425,17 @@ pub trait MetadataImportAuthority: Send + Sync {
         installed_root: &Path,
         jobs: &[sinomo_dfs::DfsNamespaceJobRecord],
     ) -> Result<()>;
+    fn standalone_generation_for_source(&self, _source: &canonical_generation::CapturedMetadataSource)
+        -> Result<sinomo_dfs::DfsMetadataGenerationIdentity> {
+        Err(error("only the explicitly selected standalone source owner chooses a local generation"))
+    }
+    fn require_standalone_census_coverage(&self, _source: &canonical_generation::CapturedMetadataSource) -> Result<()> {
+        Err(error("standalone source ownership does not yet prove complete active filesystem census coverage"))
+    }
+    fn activate_standalone_installed_generation(&self, _proposal: &MetadataImportProposal,
+        _certificate: &MetadataImportCertificate, _actual_source: &Path, _installed: &Path) -> Result<()> {
+        Err(error("standalone generation activation requires its original source certificate"))
+    }
     fn kind(&self) -> MetadataImportAuthorityKind;
     fn validate_owned_source(
         &self,
@@ -593,6 +604,7 @@ enum Finalization {
 }
 struct Session {
     finalization: Option<Finalization>,
+    captured_unit: Option<Arc<canonical_generation::CapturedMetadataUnit>>,
     _source_lock: Arc<File>,
     source_root: PathBuf,
     destination_root: PathBuf,
@@ -677,12 +689,179 @@ impl RootSlot {
 pub struct MetadataConverter {
     roots: Mutex<BTreeMap<PathBuf, Arc<RootSlot>>>,
     authority: Option<Arc<dyn MetadataImportAuthority>>,
+    #[cfg(test)]
+    step_hook: Mutex<Option<PreparationStepHook>>,
 }
+#[cfg(test)]
+type PreparationStepHook = Arc<dyn Fn(&Path, &DfsMetadataShardId, usize, Option<DfsStoragePreparation>) -> Result<()> + Send + Sync>;
 impl MetadataConverter {
+    #[cfg(test)]
+    pub(crate) fn observe_steps_for_test(&self, hook: PreparationStepHook) {
+        *self.step_hook.lock().unwrap() = Some(hook);
+    }
+    /// Release warm source custody after the sole owner has joined its workers.
+    /// Durable event/checkpoint files remain the restart source of truth.
+    pub(crate) fn release_checkpointed_sessions(&self) -> Result<()> {
+        let mut roots = self.roots.lock().map_err(error)?;
+        let slots = roots.values().cloned().collect::<Vec<_>>();
+        let mut held = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let guard = match slot.session.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Err(error("source sessions cannot drain while an owner step is still active")),
+            };
+            held.push(guard);
+        }
+        let sessions = held.iter_mut().filter_map(|session| session.take()).collect::<Vec<_>>();
+        for slot in &slots { slot.session.clear_poison(); }
+        roots.clear();
+        drop(held);
+        drop(roots);
+        drop(sessions);
+        Ok(())
+    }
+
+    /// Drive only the bounded, source-fenced DATA replay. Native planning,
+    /// candidate activation and ordinary Ready are owned by the component job.
+    pub(crate) fn capture_metadata_unit(&self, destination: &Path, source: &Path,
+        shard: &DfsMetadataShardId, budget: usize)
+        -> Result<Option<Arc<canonical_generation::CapturedMetadataUnit>>> {
+        self.capture_metadata_unit_progress(destination, source, shard, budget).map(|(_, unit)| unit)
+    }
+    fn capture_metadata_unit_progress(&self, destination: &Path, source: &Path,
+        shard: &DfsMetadataShardId, budget: usize)
+        -> Result<(DfsStoragePreparation, Option<Arc<canonical_generation::CapturedMetadataUnit>>)> {
+        if source.join("metadata-generation.sobj").exists()
+            && matches!(sinomo_dfs::inspect_metadata_storage_generation(source)?.state,
+                sinomo_dfs::DfsMetadataGenerationState::Staged { .. }) {
+            return Err(error("a staged current target is not a new original source; resume its existing owner job"));
+        }
+        let progress = self.prepare_source(destination, source, shard, budget, None, None, true)?;
+        let destination = canonical_destination(destination)?;
+        let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
+            .ok_or_else(|| error("source capture lost its checkpointed session"))?;
+        let Some(session) = slot.try_lock_session() else { return Ok((progress, None)); };
+        Ok((progress, session.as_ref().and_then(|session| session.captured_unit.clone())))
+    }
+
+    /// Re-enter the existing original source checkpoint after exchange. The
+    /// installed target is never reinterpreted as a fresh source capture.
+    pub(crate) fn resume_captured_metadata_unit(&self, destination: &Path,
+        shard: &DfsMetadataShardId, budget: usize)
+        -> Result<(DfsStoragePreparation, Option<Arc<canonical_generation::CapturedMetadataUnit>>)> {
+        let destination = canonical_destination(destination)?;
+        let stage = conversion_stage_base_path(&destination, shard)?;
+        let original: canonical_generation::CapturedMetadataUnit = read_json(&stage.join("captured-unit.json"))?;
+        original.validate()?;
+        if original.source.physical_shard != *shard {
+            return Err(error("retained capture names another physical unit"));
+        }
+        let actual_source = if let Some(interrupted) = recovery::resolve_interrupted_installation(&destination, &stage)? {
+            if !original.source.matches_source_cut(&interrupted.proposal.source_cut) {
+                return Err(error("interrupted installation differs from the original capture"));
+            }
+            interrupted.actual_source
+        } else if let Some(marker) = read_import_marker(&destination, shard)? {
+            if !original.source.matches_source_cut(&marker.source_cut) || marker.receiver_local_source.is_some() {
+                return Err(error("installed source marker differs from this retiring-owner capture"));
+            }
+            marker.retained_source_root
+        } else { original.source.actual_source_root.clone() };
+        original.verify_retained_source_at(&actual_source)?;
+        self.capture_metadata_unit_progress(&destination, &actual_source, shard, budget)
+    }
+
+    /// The explicit standalone owner supplies its complete source census. This
+    /// is never selected merely because a native cluster client is unavailable.
+    pub(crate) fn enroll_standalone_source(&self, destination: &Path, shard: &DfsMetadataShardId,
+        counted_objects: &[sinomo_dfs::DfsObjectMetadata]) -> Result<MetadataSourceCut> {
+        let authority = self.authority.as_ref().ok_or_else(|| error("standalone enrollment requires its explicit owner"))?;
+        if authority.kind() != MetadataImportAuthorityKind::Standalone {
+            return Err(error("native source cannot choose standalone enrollment"));
+        }
+        let destination = canonical_destination(destination)?;
+        let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
+            .ok_or_else(|| error("standalone enrollment has no captured source session"))?;
+        let mut held = slot.try_lock_session().ok_or_else(|| error("standalone source session is busy"))?;
+        let session = held.as_mut().ok_or_else(|| error("standalone source session disappeared"))?;
+        let captured = session.captured_unit.as_ref().ok_or_else(|| error("standalone source capture is incomplete"))?;
+        captured.verify_retained_source_at(&session.source_root)?;
+        authority.require_standalone_census_coverage(&captured.source)?;
+        let generation = authority.standalone_generation_for_source(&captured.source)?;
+        let built = canonical_generation::build_canonical_generation(captured, &generation, counted_objects,
+            &captured.source.planned_target_root)?;
+        let source = &captured.source;
+        let cut = MetadataSourceCut {
+            retained_placement_reservations: Vec::new(),
+            namespace_count_cohort: None, source_root: source.actual_source_root.clone(), source_identity: source.source_identity.clone(),
+            scope_shard: source.physical_shard.clone(), file_system_ids: source.file_system_ids.clone(),
+            source_snapshot_fingerprint: source.source_snapshot_fingerprint.clone(), source_format_version: source.source_format,
+            source_exact_prefix: source.exact_prefix.clone(), converted_image_fingerprint: captured.projection_fingerprint().into(),
+            current_image_fingerprint: built.identity.state_fingerprint, target_exact_prefix: built.identity.prefix_proof,
+            source_journal_sequence: source.source_journal_sequence, source_state_fingerprint: source.source_state_fingerprint.clone(),
+            projection_assignments: Vec::new(), original_handoff: None, staged_root: source.planned_target_root.clone(),
+            pending_operations: Vec::new(),
+        };
+        captured.verify_retained_source_at(&session.source_root)?;
+        let digest = write_json_checkpoint(&session.staged_root.join("source-cut.json"), &cut)?;
+        session.finalization = Some(Finalization::Plan { cut: cut.clone(), digest });
+        Ok(cut)
+    }
+
+    /// Receiver-only native installation. A saved stage is only a lookup hint;
+    /// received()/received_recovered() re-earn actual assignment, native request
+    /// outcomes and source ancestry before this method installs anything.
+    pub(crate) fn prepare_received_metadata_unit(&self, destination: &Path,
+        shard: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, budget: usize)
+        -> Result<Option<DfsStoragePreparation>> {
+        if budget == 0 { return Err(error("receiver preparation budget must be positive")); }
+        let authority = self.authority.as_ref().ok_or_else(|| error("received image requires its actual native owner"))?;
+        if authority.kind() != MetadataImportAuthorityKind::Native
+            || !authority.current_receiver_stage_pending(destination, shard)? {
+            return Ok(None);
+        }
+        let destination = canonical_destination(destination)?;
+        let stage = conversion_stage_base_path(&destination, shard)?;
+        if let Some(interrupted) = recovery::resolve_interrupted_installation(&destination, &stage)? {
+            let Some(certificate) = authority.received_recovered(&interrupted.proposal,
+                &interrupted.actual_source, &interrupted.resolved_image_root, &interrupted.provenance_plan_root)? else { return Ok(None); };
+            let session = open_session_shell(&destination, &interrupted.actual_source, shard, stage, None)?;
+            install_certified_stage(&session, &interrupted.proposal, &certificate, authority.as_ref())?;
+        } else {
+            let session = open_session_shell(&destination, &destination, shard, stage, None)?;
+            let path = destination.join("records/tables/snapshot.sobj");
+            let prefix = if path.is_file() && sinomo_core::storage::migration::stream::is_stream(&path).map_err(error)? {
+                let bytes = sinomo_core::storage::migration::stream::read_header(&path).map_err(error)?;
+                let header = source_document::decode_original_document(&bytes)?;
+                header.get("prefix_proof").filter(|value| !value.is_null()).map(|value|
+                    serde_json::from_value::<DfsMetadataPrefixProof>(value.clone()).map_err(error)).transpose()?
+            } else { legacy_source_checkpoint_header(&destination)?.map(|header| header.prefix_proof) };
+            if let Some(prefix) = &prefix { source_proof::validate(prefix)?; }
+            let scope = MetadataSourceContentWorkScope {
+                source_root: destination.clone(), source_identity: session.inventory.fingerprint.clone(),
+                source_snapshot_fingerprint: session.inventory.snapshot_fingerprint().unwrap_or(&session.inventory.fingerprint).to_owned(),
+                // This is only the actual materialized checkpoint, never an
+                // inferred durable tail or evidence that missing DATA is empty.
+                source_journal_sequence: prefix.as_ref().map_or(0, |prefix| prefix.journal_sequence),
+                file_system_ids: vec![file_system_id.clone()], scope_shard: shard.clone(),
+                projection_assignments: authority.assignments(std::slice::from_ref(file_system_id))?, original_handoff: None,
+            };
+            let Some((proposal, certificate)) = authority.received(&scope, prefix.as_ref())? else { return Ok(None); };
+            session.inventory.verify(&session.source_root)?;
+            install_certified_stage(&session, &proposal, &certificate, authority.as_ref())?;
+        }
+        let active = sinomo_dfs::inspect_metadata_storage_generation(&destination)?;
+        Ok(Some(if matches!(active.state, sinomo_dfs::DfsMetadataGenerationState::Active { .. }) {
+            DfsStoragePreparation::Ready
+        } else { DfsStoragePreparation::Pending { processed_records: 1 } }))
+    }
     pub fn with_authority(authority: Arc<dyn MetadataImportAuthority>) -> Self {
         Self {
             roots: Mutex::new(BTreeMap::new()),
             authority: Some(authority),
+            #[cfg(test)]
+            step_hook: Mutex::new(None),
         }
     }
     pub fn prepare(
@@ -783,6 +962,16 @@ impl MetadataConverter {
                 processed_records: 0,
             });
         };
+        #[cfg(test)]
+        let step_hook = self.step_hook.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(hook) = &step_hook {
+            match hook(&destination, shard, budget, None) {
+                Err(MetadataBackendError::StoragePreparationPending { processed_records, .. }) =>
+                    return Ok(DfsStoragePreparation::Pending { processed_records }),
+                result => result?,
+            }
+        }
         // Resolve both persisted stage roles once under this destination's
         // custody. The exact validated DATA is local to this bounded call.
         let goals = (|| {
@@ -867,6 +1056,10 @@ impl MetadataConverter {
             &mut completion,
             capture_only,
         );
+        #[cfg(test)]
+        if let (Some(hook), Ok(progress)) = (&step_hook, &result) {
+            hook(&destination, shard, budget, Some(*progress))?;
+        }
         tracing::trace!(
             target: "sinomo.dfs.perf",
             converter = ?(self as *const Self),
@@ -898,7 +1091,7 @@ impl MetadataConverter {
         }
         drop(session);
         if matches!(&result, Ok(DfsStoragePreparation::Ready)) {
-            let (ready, recovered) = self.namespace_count_ready_before_open(
+            let (ready, recovered) = self.current_generation_ready_before_open(
                 &destination, shard, data_goal.as_ref(),
             )?;
             if !ready {
@@ -934,63 +1127,20 @@ impl MetadataConverter {
             result
         }
     }
-    fn namespace_count_ready_before_open(
+    fn current_generation_ready_before_open(
         &self,
         destination: &Path,
         shard: &DfsMetadataShardId,
-        data_goal: Option<&DataGoalStage>,
+        _data_goal: Option<&DataGoalStage>,
     ) -> Result<(bool, Option<MetadataSourceCut>)> {
-        let marker = read_import_marker(destination, shard)?;
-        let snapshot_path = destination.join("records/tables/snapshot.sobj");
-        let obligations = if snapshot_path.is_file() && current_root(destination)? {
-            let snapshot = sinomo_dfs::read_metadata_candidate(destination)?;
-            sinomo_dfs::namespace_count_cohort_obligations(&snapshot, shard)?
-        } else {
-            // Journal-only roots are checked again from their actually decoded
-            // tables by the core's MetadataCountCohort provider call.
-            std::collections::BTreeSet::new()
-        };
-        let mut source = marker.map(|marker| marker.source_cut);
-        if source.as_ref().is_none_or(|cut| cut.namespace_count_cohort.is_none())
-            && !obligations.is_empty()
-        {
-            let base = conversion_stage_base_path(destination, shard)?;
-            let stage = stage_path_for_goal(base.clone(), data_goal);
-            for root in [stage, base] {
-                let path = root.join("namespace-count-source-cut.json");
-                if !path.is_file() { continue; }
-                let recovered: MetadataSourceCut = read_json(&path)?;
-                let seal = recovered.namespace_count_cohort.as_ref()
-                    .ok_or_else(|| error("retained count source cut omitted its cohort"))?;
-                seal.validate_bound_cut(&recovered)?;
-                if recovered.scope_shard != *shard {
-                    return Err(error("retained count source cut changes physical scope"));
-                }
-                if source.as_ref().is_some_and(|old| old.namespace_count_cohort.is_some() && old != &recovered) {
-                    return Err(error("retained count readiness evidence conflicts"));
-                }
-                source = Some(recovered);
-            }
+        // Current admission is generation-bound, never an interpretation of
+        // archived count operation names. Core owns the actual activation
+        // witness and checks it again on ordinary open.
+        let header = sinomo_dfs::inspect_metadata_storage_generation(destination)?;
+        if header.identity.shard_id != *shard {
+            return Err(error("current generation belongs to another physical scope"));
         }
-        let count_source = source.filter(|cut| cut.namespace_count_cohort.is_some());
-        if count_source.is_none() && obligations.is_empty() {
-            return Ok((true, None));
-        }
-        let Some(authority) = self.authority.as_ref() else { return Ok((false, None)); };
-        if let Some(cut) = count_source.as_ref() {
-            let seal = cut.namespace_count_cohort.as_ref().expect("filtered count source");
-            seal.validate_bound_cut(cut)?;
-            if cut.scope_shard != *shard {
-                return Err(error("count readiness source belongs to another physical scope"));
-            }
-            if !authority.namespace_count_cohort_ready(cut)? {
-                return Ok((false, None));
-            }
-        }
-        if !authority.namespace_count_initializations_ready(shard, &obligations)? {
-            return Ok((false, None));
-        }
-        Ok((true, count_source))
+        Ok((matches!(header.state, sinomo_dfs::DfsMetadataGenerationState::Active { .. }), None))
     }
 
     fn prepare_with_source_inner(
@@ -1013,7 +1163,7 @@ impl MetadataConverter {
             unversioned_conversion_stage_base_path(destination, shard)?,
             original_goal,
         );
-        if let Some(interrupted) =
+        if !capture_only && let Some(interrupted) =
             recovery::resolve_interrupted_installation(destination, &previous)?
         {
             let authority = self
@@ -1082,7 +1232,7 @@ impl MetadataConverter {
         }
         let conversion_stage =
             stage_path_for_goal(conversion_stage_base_path(destination, shard)?, data_goal);
-        if let Some(interrupted) =
+        if !capture_only && let Some(interrupted) =
             recovery::resolve_interrupted_installation(destination, &conversion_stage)?
         {
             let authority = self
@@ -1150,12 +1300,26 @@ impl MetadataConverter {
             return Ok(DfsStoragePreparation::Ready);
         }
         let goal_capsules = data_goal.map_or(&[][..], |goal| goal.capsules.as_slice());
-        if original_reservation.is_none()
+        if !capture_only && original_reservation.is_none()
             && !namespace_count_capture_requested(destination, shard)?
             && current_root(destination)?
             && (goal_capsules.is_empty()
                 || published_data_goal_matches(destination, shard, goal_capsules)?)
         {
+            if let Some(authority) = self.authority.as_ref().filter(|authority| authority.kind() == MetadataImportAuthorityKind::Standalone) {
+                let header = sinomo_dfs::inspect_metadata_storage_generation(destination)?;
+                if matches!(header.identity.origin, sinomo_dfs::DfsMetadataGenerationOrigin::StandaloneOwned { .. })
+                    && matches!(header.state, sinomo_dfs::DfsMetadataGenerationState::Staged { .. }) {
+                    let marker = read_import_marker(destination, shard)?
+                        .ok_or_else(|| error("staged standalone target has no original certified installation"))?;
+                    let proposal: MetadataImportProposal = read_json(&conversion_stage.join("import-proposal.json"))?;
+                    let certificate = authority.certify_recovered(&proposal, &marker.retained_source_root,
+                        destination, &conversion_stage)?;
+                    validate_certificate(&proposal, &certificate)?;
+                    authority.activate_standalone_installed_generation(&proposal, &certificate,
+                        &marker.retained_source_root, destination)?;
+                }
+            }
             if let Some(authority) = self.authority.as_ref() {
                 if authority.current_receiver_stage_pending(destination, shard)? {
                     // Representation readiness does not install an activated peer image.
@@ -1176,7 +1340,7 @@ impl MetadataConverter {
                             .ok_or_else(|| {
                                 error("current receiver has no actual materialized prefix")
                             })?;
-                    let snapshot = local.export_table_snapshot();
+                    let snapshot = local.export_table_snapshot()?;
                     let mut ids = std::collections::BTreeSet::new();
                     ids.extend(
                         snapshot
@@ -1494,30 +1658,17 @@ impl MetadataConverter {
                 processed_records: processed,
             });
         }
-        if session.finalization.is_none()
-            && session.staged_root.join("namespace-count-source-cut.json").is_file() {
-            let path = session.staged_root.join("namespace-count-source-cut.json");
-            let bytes = fs::read(&path).map_err(error)?;
-            let cut: MetadataSourceCut = serde_json::from_slice(&bytes).map_err(error)?;
-            cut.namespace_count_cohort.as_ref().ok_or_else(|| error("count checkpoint has no cohort"))?
-                .validate_bound_cut(&cut)?;
-            if cut.source_identity != session.inventory.fingerprint || cut.source_root != session.source_root {
-                return Err(error("count checkpoint changed its retained original source"));
+        if session.source_current_membership.is_some() && session.source_hint_next.is_none()
+            && let Some(finalization) = session.finalization.take()
+        {
+            // A warm source session already reconstructed its derived hints.
+            // Cold sessions must re-earn that state below before finalization.
+            if capture_only {
+                session.finalization = Some(finalization);
+                return Ok(DfsStoragePreparation::Pending { processed_records: processed });
             }
-            session.finalization = Some(Finalization::Plan {
-                cut, digest: blake3::hash(&bytes).to_hex().to_string(),
-            });
-        }
-        if let Some(finalization) = session.finalization.take() {
-            return self.advance_finalization(
-                session,
-                shard,
-                budget - processed,
-                goal_capsules,
-                finalization,
-                completion,
-                capture_only,
-            );
+            return self.advance_finalization(session, shard, budget - processed, goal_capsules,
+                finalization, completion, capture_only);
         }
         let ids = session.projection.source_file_system_ids()?;
         authority.validate_owned_source(&session.source_root, shard, &ids)?;
@@ -1643,6 +1794,50 @@ impl MetadataConverter {
                 processed_records: processed,
             });
         }
+        if session.finalization.is_none()
+            && session.staged_root.join("namespace-count-source-cut.json").is_file() {
+            let path = session.staged_root.join("namespace-count-source-cut.json");
+            let bytes = fs::read(&path).map_err(error)?;
+            let cut: MetadataSourceCut = serde_json::from_slice(&bytes).map_err(error)?;
+            cut.namespace_count_cohort.as_ref().ok_or_else(|| error("count checkpoint has no cohort"))?
+                .validate_bound_cut(&cut)?;
+            if cut.source_identity != session.inventory.fingerprint {
+                return Err(error("count checkpoint changed its retained original source"));
+            }
+            let original: canonical_generation::CapturedMetadataUnit = read_json(&session.staged_root.join("captured-unit.json"))?;
+            let replayed = if original.has_unresolved_work() {
+                canonical_generation::capture_projected_source(session, &captured, shard)?
+            } else { original };
+            replayed.verify_retained_source_at(&session.source_root)?;
+            if !replayed.source.matches_source_cut(&cut)
+                || replayed.projection_fingerprint() != cut.converted_image_fingerprint {
+                return Err(error("count checkpoint differs from its original captured source facts"));
+            }
+            session.captured_unit = Some(Arc::new(replayed));
+            session.finalization = Some(Finalization::Plan {
+                cut, digest: blake3::hash(&bytes).to_hex().to_string(),
+            });
+        }
+        if capture_only && session.finalization.is_some() {
+            return Ok(DfsStoragePreparation::Pending { processed_records: processed });
+        }
+        if let Some(finalization) = session.finalization.take() {
+            return self.advance_finalization(
+                session,
+                shard,
+                budget - processed,
+                goal_capsules,
+                finalization,
+                completion,
+                capture_only,
+            );
+        }
+        if capture_only {
+            if session.captured_unit.is_none() {
+                session.captured_unit = Some(Arc::new(canonical_generation::capture_projected_source(session, &captured, shard)?));
+            }
+            return Ok(DfsStoragePreparation::Pending { processed_records: processed });
+        }
         if let Some((proposal, certificate)) =
             authority.received(&work_scope, captured.source_exact_prefix.as_ref())?
         {
@@ -1667,133 +1862,13 @@ impl MetadataConverter {
                 processed_records: processed,
             });
         }
-        let (identity, converted_fingerprint, pending_mapping) = if authority_kind == MetadataImportAuthorityKind::Native
-            && namespace_count_capture_requested(&destination, shard)? {
-            let identity = build_count_maintenance_native_image(session, shard)?;
-            (identity.clone(), identity.state_fingerprint, Vec::new())
-        } else {
-        let (mut tables, mut pending) = match authority_kind {
-            MetadataImportAuthorityKind::Native => {
-                partition_projection(session, shard, &assignments)?
-            }
-            MetadataImportAuthorityKind::Standalone => {
-                if !assignments.is_empty() {
-                    return Err(error(
-                        "explicit standalone import cannot carry native assignments",
-                    ));
-                }
-                let stage = session.staged_root.clone();
-                let digests = &session.journal_frame_digests;
-                session.projection.resolve_deferred(&|seq| {
-                    read_verified_journal_document(&stage, seq, digests)
-                })?;
-                let mut tables = session.projection.current_tables()?;
-                let mut pending = session.projection.pending_operations()?;
-                let (mappings, unresolved) = scope_mapping::resolve_standalone_adoption_work(
-                    &mut tables,
-                    &mut pending,
-                    session.projection.required_native_work(),
-                    shard,
-                    &local,
-                )?;
-                pending.extend(mappings);
-                for work in unresolved {
-                    pending.push(serde_json::json!({"disposition":"requires-native-row-work",
-                        "family":work.family,"reason":work.reason,"source_row":work.source_row}));
-                }
-                for job in &tables.namespace_jobs {
-                    if job.status == sinomo_dfs::DfsNamespaceJobStatus::Running {
-                        pending.push(
-                            serde_json::json!({"disposition":"restored-current-job-data",
-                            "current_job_data":job,"current_effects_authored":false}),
-                        );
-                    }
-                }
-                (tables, pending)
-            }
-        };
-        let mut remaining = budget.saturating_sub(processed);
-        if !retained_content::fulfill(
-            session,
-            &work_scope,
-            authority.as_ref(),
-            &mut tables,
-            &mut remaining,
-        )? {
-            return Ok(DfsStoragePreparation::Pending {
-                processed_records: budget - remaining,
-            });
+        if session.captured_unit.is_none() {
+            session.captured_unit = Some(Arc::new(canonical_generation::capture_projected_source(session, &captured, shard)?));
         }
-        processed = budget - remaining;
-        if remaining == 0 {
-            return Ok(DfsStoragePreparation::Pending {
-                processed_records: processed,
-            });
-        }
-        if matches!(
-            session.header.get("format_version").and_then(Value::as_u64),
-            Some(8 | 9 | 10)
-        ) {
-            if let Some(topology) = prior_native::topology_data(&session.source_root, shard)? {
-                pending.push(topology);
-            }
-        }
-        pending.extend(
-            session
-                .data_goal
-                .as_ref()
-                .into_iter()
-                .flat_map(|goal| goal.capsules.iter().cloned()),
-        );
-            build_native_image(&session, shard, tables, pending)?
-        };
-        let mut cut = MetadataSourceCut {
-            namespace_count_cohort: None,
-            source_root: session.source_root.clone(),
-            source_identity: captured.source_identity,
-            scope_shard: shard.clone(),
-            file_system_ids: captured.file_system_ids,
-            source_snapshot_fingerprint: captured.source_snapshot_fingerprint,
-            source_format_version: captured.source_format_version,
-            source_exact_prefix: captured.source_exact_prefix,
-            converted_image_fingerprint: converted_fingerprint,
-            current_image_fingerprint: identity.state_fingerprint.clone(),
-            target_exact_prefix: identity.prefix_proof.clone(),
-            source_journal_sequence: captured.source_journal_sequence,
-            source_state_fingerprint: captured.source_state_fingerprint,
-            projection_assignments: captured.projection_assignments,
-            staged_root: session.staged_root.join("current-image"),
-            pending_operations: pending_mapping,
-            original_handoff: captured.original_handoff,
-        };
-        require_placement_goal_refs(&cut, goal_capsules)?;
-        let cut_path = session.staged_root.join("source-cut.json");
-        let cut_digest = if cut_path.is_file() {
-            let bytes = fs::read(&cut_path).map_err(error)?;
-            let retained: MetadataSourceCut = serde_json::from_slice(&bytes).map_err(error)?;
-            if retained.source_identity != session.inventory.fingerprint
-                || retained.current_image_fingerprint != identity.state_fingerprint
-                || retained.target_exact_prefix != identity.prefix_proof
-            {
-                return Err(error(
-                    "retained import blueprint differs from the immutable source/candidate",
-                ));
-            }
-            require_placement_goal_refs(&retained, &goal_capsules)?;
-            cut = retained;
-            blake3::hash(&bytes).to_hex().to_string()
-        } else {
-            write_json_checkpoint(&cut_path, &cut)?
-        };
-        session.finalization = Some(Finalization::Plan {
-            cut,
-            digest: cut_digest,
-        });
-        // The saved source-cut is one actual durable checkpoint record. It is
-        // incomplete preparation; source admission and image checks are retained.
-        Ok(DfsStoragePreparation::Pending {
-            processed_records: processed + 1,
-        })
+        // Source replay alone cannot choose a target generation, restamp old
+        // operations or install an image. The owning job supplies the actual
+        // Pending identity and complete census through explicit enrollment.
+        Ok(DfsStoragePreparation::Pending { processed_records: processed })
     }
 
     fn advance_finalization(
@@ -1819,7 +1894,8 @@ impl MetadataConverter {
                     "namespace-count-source-cut.json"
                 } else { "source-cut.json" };
                 verify_json_checkpoint(&session.staged_root.join(cut_checkpoint), &digest)?;
-                if capture_only || (cut.namespace_count_cohort.is_none()
+                if capture_only || (authority.kind() == MetadataImportAuthorityKind::Native
+                    && cut.namespace_count_cohort.is_none()
                     && (namespace_count_capture_requested(&destination, shard)?
                         || (sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION >= 11
                             && cut.source_format_version.is_none_or(|version| version < 11)))) {
@@ -1954,7 +2030,17 @@ impl MetadataConverter {
                     &proposal.file_system_ids,
                 )?;
                 require_placement_goal_refs(&proposal.source_cut, goal_capsules)?;
-                let certificate = authority.certify(&proposal)?;
+                let certificate = match authority.certify(&proposal) {
+                    Ok(certificate) => certificate,
+                    Err(MetadataBackendError::StoragePreparationPending { processed_records, .. }) => {
+                        // A cohort predecessor still owns progress. Keep this
+                        // exact proposal and physical source custody while the
+                        // sole worker advances that dependency.
+                        session.finalization = Some(Finalization::Certify { proposal, digest });
+                        return Ok(DfsStoragePreparation::Pending { processed_records });
+                    }
+                    Err(failure) => return Err(failure),
+                };
                 // This private finalization owns the unchanged proposal and
                 // the digest produced by serializing that same value. The
                 // native certifier independently binds its current input.
@@ -2170,13 +2256,14 @@ pub(crate) fn finalization_checkpoint_for_test(
         return Err(error("unknown finalization observation"));
     }
     let root = canonical_destination(root)?;
+    let name = if name == "source-cut.json" { "namespace-count-source-cut.json" } else { name };
     let path = conversion_stage_base_path(&root, shard)?.join(name);
     Ok(path.is_file().then_some(path))
 }
 /// Prior native generations keep their own exact clocks while being imported.
 /// This classifier is conversion DATA, never admission to the current DFS reader.
 pub(crate) fn native_source_format(format: Option<u16>) -> bool {
-    matches!(format, Some(8 | 9 | 10))
+    matches!(format, Some(8 | 9 | 10 | 11))
         || format == Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
 }
 pub(crate) fn native_source_root(root: &Path, format: Option<u16>) -> Result<bool> {
@@ -2194,6 +2281,8 @@ pub(crate) fn native_source_root(root: &Path, format: Option<u16>) -> Result<boo
 pub(crate) fn original_native_root_format(root: &Path) -> Result<Option<u16>> {
     if current_root(root)? {
         Ok(Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION))
+    } else if metadata_root_at_format(root, 11)? {
+        Ok(Some(11))
     } else if metadata_root_at_format(root, 10)? {
         Ok(Some(10))
     } else if metadata_root_at_format(root, 9)? {
@@ -2205,7 +2294,7 @@ pub(crate) fn original_native_root_format(root: &Path) -> Result<Option<u16>> {
 pub(crate) fn inspect_import_candidate(
     root: &Path,
 ) -> Result<sinomo_dfs::DfsMetadataCandidateIdentity> {
-    if native_source_root(root, Some(8))? || native_source_root(root, Some(9))?
+    if native_source_root(root, Some(11))? || native_source_root(root, Some(8))? || native_source_root(root, Some(9))?
         || (sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION != 10 && native_source_root(root, Some(10))?) {
         prior_native::inspect(root)
     } else {
@@ -2596,6 +2685,7 @@ fn open_session_shell(
     };
     let replay_source = source::SourceCursor::new(inventory.clone());
     Ok(Session {
+        captured_unit: None,
         finalization: None,
         _source_lock: lock,
         source_root: source.to_owned(),
@@ -3898,183 +3988,6 @@ mod native_sequence_mapping_tests {
     }
 }
 
-fn build_native_image(
-    session: &Session,
-    shard: &DfsMetadataShardId,
-    mut tables: sinomo_dfs::DfsMetadataTableSnapshotTables,
-    pending: Vec<Value>,
-) -> Result<(sinomo_dfs::DfsMetadataCandidateIdentity, String, Vec<Value>)> {
-    let projection_fingerprint = format!(
-        "blake3:{}",
-        blake3::hash(&serde_json::to_vec(&(&tables, &pending)).map_err(error)?).to_hex()
-    );
-    let receipt_path = session.staged_root.join("built-image.json");
-    let root = session.staged_root.join("current-image");
-    if receipt_path.is_file() {
-        let built: BuiltImage = read_json(&receipt_path)?;
-        if built.source_fingerprint != session.inventory.fingerprint
-            || built.projection_fingerprint != projection_fingerprint
-        {
-            return Err(error(
-                "completed native candidate belongs to another conversion cut",
-            ));
-        }
-        let identity = sinomo_dfs::inspect_metadata_candidate(&root)?;
-        if identity != built.identity {
-            return Err(error(
-                "completed native candidate changed before activation",
-            ));
-        }
-        return Ok((identity, projection_fingerprint, built.pending_mapping));
-    }
-    let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&root)?;
-    // A crash before the durable build receipt leaves only an unmounted,
-    // exclusively owned candidate. Rebuild that candidate from retained data.
-    for entry in fs::read_dir(&root).map_err(error)? {
-        let entry = entry.map_err(error)?;
-        let name = entry.file_name();
-        if matches!(
-            name.to_str(),
-            Some("metadata-candidate-v7.json" | "metadata-candidate.lock")
-        ) {
-            continue;
-        }
-        if entry.file_type().map_err(error)?.is_dir() {
-            fs::remove_dir_all(entry.path()).map_err(error)?;
-        } else {
-            fs::remove_file(entry.path()).map_err(error)?;
-        }
-    }
-    let source_sequence = session.source_head.max(session.materialized_through);
-    let mut proof = source_proof::conversion_base(
-        source_sequence,
-        &session.inventory.fingerprint,
-        &projection_fingerprint,
-    );
-    let mut mapping = Vec::new();
-    for mut source in pending {
-        if source
-            .get("import_terminal_identity_only")
-            .and_then(Value::as_bool)
-            == Some(true)
-            || matches!(
-                source.get("disposition").and_then(Value::as_str),
-                Some(
-                    "requires-original-source-retirement"
-                        | "requires-original-source-scope"
-                        | "requires-native-row-work"
-                        | "data-after-original-reservation-retirement"
-                        | "restored-current-job-data"
-                        | "preserved-original-terminal-data"
-                )
-            )
-        {
-            source["current_effects_authored"] = Value::Bool(false);
-            mapping.push(source);
-            continue;
-        }
-
-        let mut payload: sinomo_dfs::DfsPreparedOperationPayload = serde_json::from_value(
-            source
-                .get("payload")
-                .cloned()
-                .ok_or_else(|| error("converted operation lacks its current body"))?,
-        )
-        .map_err(error)?;
-        if payload.shard_id != *shard {
-            return Err(error(
-                "converted operation crosses the physical candidate shard",
-            ));
-        }
-        let status: sinomo_dfs::DfsPreparedOperationStatus = serde_json::from_value(
-            source
-                .get("status")
-                .cloned()
-                .ok_or_else(|| error("converted operation lacks its exact source status"))?,
-        )
-        .map_err(error)?;
-        let retired = source
-            .get("retired_reservation")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let compact = source
-            .get("compact_terminal")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let terminal_at = source
-            .get("terminal_at")
-            .filter(|v| !v.is_null())
-            .map(|value| serde_json::from_value::<String>(value.clone()).map_err(error))
-            .transpose()?
-            .map(|value| {
-                time::OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
-                    .map_err(error)
-            })
-            .transpose()?
-            .unwrap_or(payload.transaction.created_at);
-        if source
-            .get("requires_native_sequence_mapping")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            let original_cut = payload.expected_journal_sequence.ok_or_else(|| {
-                error("native sequence mapping lost its original journal-cut clause")
-            })?;
-            validate_native_source_slot(&source, original_cut).map_err(|cause| {
-                error(format!(
-                    "native sequence mapping: filesystem {} shard {} operation {}: {cause}",
-                    payload.file_system_id, payload.shard_id.0, payload.operation_id,
-                ))
-            })?;
-            // Source payload, digest and slot stay archival. The current body
-            // binds the exact preceding prefix of this exclusively owned image,
-            // and CandidateWriter hashes that body and its actual new slot.
-            payload.expected_journal_sequence = Some(proof.journal_sequence);
-            source["payload"] = serde_json::to_value(&payload).map_err(error)?;
-        }
-        let (mut record, after_prepare) = writer.prepare(payload, &proof)?;
-        proof = after_prepare;
-        if retired {
-            record.status = sinomo_dfs::DfsPreparedOperationStatus::Superseded;
-        } else if status == sinomo_dfs::DfsPreparedOperationStatus::Committed {
-            let (committed, after_commit) = writer.commit(record, &proof, terminal_at)?;
-            record = committed;
-            proof = after_commit;
-        } else {
-            record.status = status;
-        }
-        record.validate()?;
-        source
-            .as_object_mut()
-            .ok_or_else(|| error("operation mapping is not a record"))?
-            .insert(
-                "current_digest".into(),
-                serde_json::to_value(&record.digest).map_err(error)?,
-            );
-        if compact && !retired && status != sinomo_dfs::DfsPreparedOperationStatus::Prepared {
-            tables
-                .prepared_operation_evictions
-                .push(sinomo_dfs::DfsPreparedOperationEviction {
-                    digest: record.digest,
-                    status: record.status,
-                    committed_entry: record.committed_entry,
-                });
-        } else {
-            tables.prepared_operations_v7.push(record);
-        }
-        mapping.push(source);
-    }
-    let identity = writer.write(tables, proof)?;
-    drop(writer);
-    let built = BuiltImage {
-        source_fingerprint: session.inventory.fingerprint.clone(),
-        projection_fingerprint: projection_fingerprint.clone(),
-        identity: identity.clone(),
-        pending_mapping: mapping.clone(),
-    };
-    write_json(&receipt_path, &built)?;
-    Ok((identity, projection_fingerprint, mapping))
-}
 
 fn validate_certificate(
     proposal: &MetadataImportProposal,
@@ -4507,7 +4420,7 @@ fn install_certified_stage_bound(
         session.destination_root.as_path()
     };
     let prior =
-        native_source_root(image_root, Some(8))? || native_source_root(image_root, Some(9))?
+        native_source_root(image_root, Some(11))? || native_source_root(image_root, Some(8))? || native_source_root(image_root, Some(9))?
             || (sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION != 10 && native_source_root(image_root, Some(10))?);
     let jobs = if prior {
         Vec::new()
@@ -4827,6 +4740,10 @@ fn install_certified_stage_bound(
             )?;
         }
         complete_installation_intent(&session.staged_root, prior)?;
+        if !prior && matches!(certificate, MetadataImportCertificate::Standalone(_)) {
+            authority.activate_standalone_installed_generation(proposal, certificate,
+                &session.source_root, &session.destination_root)?;
+        }
         return Ok(());
     }
     let parent = session
@@ -4916,7 +4833,7 @@ fn install_certified_stage_bound(
         &candidate_marker,
         &MetadataImportMarker {
             format_version: 7,
-            retained_source_root: source_retained,
+            retained_source_root: source_retained.clone(),
             source_identity: session.inventory.fingerprint.clone(),
             source_snapshot_fingerprint: session
                 .inventory
@@ -5059,6 +4976,10 @@ fn install_certified_stage_bound(
         )?;
     }
     complete_installation_intent(&session.staged_root, prior)?;
+    if !prior && matches!(certificate, MetadataImportCertificate::Standalone(_)) {
+        authority.activate_standalone_installed_generation(proposal, certificate,
+            &source_retained, &session.destination_root)?;
+    }
     Ok(())
 }
 
@@ -5103,7 +5024,7 @@ mod current_layout_data_tests {
             )
             .unwrap();
             assert!(
-                normal.export_table_snapshot().materialized_through_sequence
+                normal.export_table_snapshot().unwrap().materialized_through_sequence
                     >= expected.journal_sequence
             );
             drop(normal);
@@ -5450,7 +5371,7 @@ mod recovery_session_tests {
                 .unwrap();
         drop(MigrationStreamWriter::resume(&path, &header, &Default::default()).unwrap());
         let original = fs::read(&path).unwrap();
-        assert_eq!(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, 11);
+        assert_eq!(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, 12);
         assert!(!current_root(&root).unwrap());
         assert_eq!(discover_metadata_source(&root, &root).unwrap(), Some(root));
         assert_eq!(fs::read(path).unwrap(), original);
@@ -5466,7 +5387,7 @@ mod recovery_session_tests {
         let progress = previous.join("progress.json");
         fs::write(&progress, b"retained source replay ledger").unwrap();
         let current = conversion_stage_base_path(&destination, &shard).unwrap();
-        assert_eq!(current, previous.join("target-format-11"));
+        assert_eq!(current, previous.join("target-format-12"));
         assert_eq!(
             fs::read(&progress).unwrap(),
             b"retained source replay ledger"
@@ -5538,14 +5459,23 @@ mod recovery_session_tests {
             fs::read(&unknown).unwrap(),
             b"retained unknown original bytes"
         );
-        // Only a real current backend can establish the current declaration.
-        let current = root.path().join("current");
+        // The real native genesis owner establishes the current declaration.
+        let (mut native, nodes) = sinomo_dfs::test_support::DfsTestRuntime::start_cluster(
+            "metadata-writer-current-control", 1,
+        ).unwrap();
+        let current = sinomo_dfs::local_dfs_metadata_shard_path(
+            native.data_dir(&nodes[0]), &DfsMetadataShardId::new("root"),
+        );
+        // This control classifies the native bytes. Drain ordinary background
+        // writers before taking the source inspection fence exercised above.
+        native.stop_node(&nodes[0]).unwrap();
         let backend =
-            sinomo_dfs::LocalSobjMetadataBackend::new(DfsMetadataShardId::new("current"), &current)
+            sinomo_dfs::LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &current)
                 .unwrap();
         drop(backend);
         assert!(current_root(&current).unwrap());
         assert!(!source::has_migration_source_data(&current).unwrap());
+        native.close().unwrap();
     }
 
     #[test]
@@ -5556,12 +5486,13 @@ mod recovery_session_tests {
         let mut runtime =
             sinomo_dfs::test_support::DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
         runtime.start_nodes().unwrap();
+        let retiring = runtime.root_shard().unwrap();
+        runtime.stop_node(&nodes[0]).unwrap();
         let handle = runtime.runtime_handle();
         let _entered = handle.enter();
-        let retiring = runtime.root_shard().unwrap();
         let shard = DfsMetadataShardId::new(&retiring.shard_id);
         let dir = sinomo_testdir::TestDir::new(name);
-        let destination = dir.join("root");
+        let destination = runtime.data_dir(&nodes[0]).dfs_dir().join("metadata/root");
         let candidate = dir.join("candidate");
         let archived = dir.join("retained");
         let mut retained =
@@ -5582,8 +5513,16 @@ mod recovery_session_tests {
         )
         .unwrap();
         let digest = retained.prepare_operation(payload.clone(), None).unwrap();
-        let snapshot = retained.export_table_snapshot();
-        let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&candidate).unwrap();
+        let snapshot = retained.export_table_snapshot().unwrap();
+        let writer = sinomo_dfs::DfsMetadataCandidateWriter::open_generation(&candidate,
+            sinomo_dfs::DfsMetadataGenerationIdentity {
+                file_system_id: retiring.file_system_id.clone(),
+                shard_id: shard.clone(),
+                generation: "local-fence-model-candidate".into(),
+                origin: sinomo_dfs::DfsMetadataGenerationOrigin::StorageTransition {
+                    transition_id: "local-fence-model".into(),
+                },
+            }).unwrap();
         let identity = writer
             .write(*snapshot.tables, snapshot.prefix_proof)
             .unwrap();
@@ -5597,6 +5536,7 @@ mod recovery_session_tests {
         let proof = DfsMetadataShardMembershipHandoffProof {
             cause: sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport {
                 cut: sinomo_dfs::DfsMetadataStorageImportCut {
+                    storage_transition_id: None,
                     source_cut_digest: "local-fence-model".into(),
                     source_journal_sequence: identity.prefix_proof.journal_sequence,
                     source_state_fingerprint: identity.prefix_proof.digest.clone(),
@@ -5644,8 +5584,11 @@ mod recovery_session_tests {
             retained.prepare_operation(payload.clone(), None),
             Err(MetadataBackendError::MembershipHandoffFrozen { .. })
         ));
+        assert!(matches!(sinomo_dfs::LocalSobjMetadataBackend::new(shard.clone(), &destination),
+            Err(MetadataBackendError::StoragePreparationPending { .. })),
+            "a modeled freeze cannot activate its private staged generation");
         let mut cold =
-            sinomo_dfs::LocalSobjMetadataBackend::new(shard.clone(), &destination).unwrap();
+            sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &destination).unwrap();
         assert!(matches!(
             cold.prepare_operation(payload, None),
             Err(MetadataBackendError::MembershipHandoffFrozen { .. })
@@ -5801,16 +5744,21 @@ mod recovery_session_tests {
     #[test]
     fn concurrent_directory_aliases_share_one_stable_slot() {
         let root = sinomo_testdir::TestDir::new("metadata-conversion-alias-slot");
+        let (native, nodes) = sinomo_dfs::test_support::DfsTestRuntime::start_cluster(
+            "metadata-conversion-current-alias-slot", 1,
+        ).unwrap();
+        let shard = DfsMetadataShardId::new("root");
+        let destination = sinomo_dfs::local_dfs_metadata_shard_path(
+            native.data_dir(&nodes[0]), &shard,
+        );
         let alias = root.path().join("alias");
-        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
-        let destination = root.path().join("new-current-root");
-        let aliased = alias.join("new-current-root");
+        std::os::unix::fs::symlink(destination.parent().unwrap(), &alias).unwrap();
+        let aliased = alias.join("root");
         let physical = canonical_destination(&destination).unwrap();
         assert_eq!(physical, canonical_destination(&aliased).unwrap());
         let converter = Arc::new(MetadataConverter::default());
-        let shard = DfsMetadataShardId::new("current");
-        // An empty root needs no conversion. Actual preparation establishes the
-        // slot; no fabricated source data, certificate or Ready callback exists.
+        // Actual native genesis needs no conversion. Preparation establishes
+        // the slot without fabricating source data or a Ready callback.
         assert_eq!(
             converter.prepare(&destination, &shard, 1).unwrap(),
             DfsStoragePreparation::Ready
@@ -5849,6 +5797,9 @@ mod recovery_session_tests {
             assert!(Arc::ptr_eq(slots.get(&physical).unwrap(), &slot));
         }
         assert!(slot.session.lock().unwrap().is_none());
+        drop(slot);
+        drop(converter);
+        native.close().unwrap();
     }
 }
 
@@ -6255,59 +6206,114 @@ impl MetadataConverter {
     /// Enroll one actual retained source session into a complete captured set.
     /// Every retiring owner independently checks the same census DATA; the
     /// ordinary native stage/fence/activation owners retain all effect authority.
-    pub fn enroll_namespace_count_source(
-        &self,
-        destination: &Path,
-        shard: &DfsMetadataShardId,
+    pub(crate) fn enroll_namespace_count_source(
+        &self, destination: &Path, shard: &DfsMetadataShardId,
+        pending_file_system: &sinomo_dfs::DfsFileSystemConfig,
         sources: &[crate::namespace_counts::NamespaceCountMaintenanceSource],
-        catalog: &[DfsMetadataShardConfig],
-        at: time::OffsetDateTime,
+        catalog: &[DfsMetadataShardConfig], at: time::OffsetDateTime,
         limits: crate::namespace_counts::NamespaceCountMaintenanceLimits,
+        owned_roots: &BTreeMap<DfsMetadataShardId, PathBuf>,
+        qualified: Option<&crate::namespace_count_cohort::NamespaceCountCohortSeal>,
     ) -> Result<crate::namespace_count_cohort::NamespaceCountCohortSeal> {
         let destination = canonical_destination(destination)?;
         let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
             .ok_or_else(|| error("count enrollment requires its retained source session"))?;
         let mut held = slot.try_lock_session().ok_or_else(|| error("count source session is busy"))?;
         let session = held.as_mut().ok_or_else(|| error("count source session disappeared"))?;
-        let Some(Finalization::Plan { cut, .. }) = session.finalization.as_ref() else {
-            return Err(error("count source is not at its settled census boundary"));
-        };
-        let original = cut.namespace_count_cohort.as_ref()
-            .map(|seal| seal.member(shard).map(|member| member.original_cut.clone())).transpose()?
-            .unwrap_or_else(|| cut.clone());
-        let own = sources.iter().filter(|source| source.source_cut.scope_shard == *shard).collect::<Vec<_>>();
+        let actual = session.captured_unit.as_ref().ok_or_else(|| error("source is not at its verified capture boundary"))?;
+        let own = sources.iter().filter(|source| source.captured.source.physical_shard == *shard).collect::<Vec<_>>();
         let [own] = own.as_slice() else { return Err(error("count enrollment omits or repeats its own original source")); };
-        if own.source_cut != original { return Err(error("count enrollment replaces its actually retained source")); }
-        session.inventory.verify(&session.source_root)?;
-        if sinomo_dfs::inspect_metadata_candidate(&original.staged_root)? != own.candidate_identity {
-            return Err(error("count enrollment original candidate bytes changed"));
+        if own.captured.projection_fingerprint() != actual.projection_fingerprint() {
+            return Err(error("count enrollment replaces its actual captured source projection"));
         }
-        let stage = conversion_stage_base_path(&destination, shard)?;
-        let census_root = stage.join("namespace-count-census");
-        let initialized_root = stage.join("namespace-count-current-image");
-        let seal = crate::namespace_count_cohort::stage_namespace_count_cohort_at_roots(
-            &census_root, catalog, sources, at, limits,
-            &BTreeMap::from([(shard.clone(), initialized_root.clone())]),
-        )?;
-        let bound = seal.bind_cut(&original)?;
-        // Replay the identical deterministic initialization through the
-        // existing candidate writer. Both journal frames and image survive;
-        // copying a snapshot alone would lose the initialization journal.
-        let identity = sinomo_dfs::inspect_metadata_candidate(&initialized_root)?;
-        if identity.prefix_proof != bound.target_exact_prefix
-            || identity.state_fingerprint != bound.current_image_fingerprint {
-            return Err(error("count enrollment changed its initialized candidate image"));
+        actual.verify_retained_source_at(&session.source_root)?;
+        let enrolled = session.finalization.as_ref().and_then(|phase| match phase {
+            Finalization::Plan { cut, .. } => cut.namespace_count_cohort.as_deref().map(|seal| (cut, seal)),
+            Finalization::Certify { proposal, .. } => proposal.source_cut.namespace_count_cohort.as_deref().map(|seal| (&proposal.source_cut, seal)),
+        });
+        let validate_seal = |seal: &crate::namespace_count_cohort::NamespaceCountCohortSeal| -> Result<()> {
+            seal.validate()?;
+            let Some(sinomo_dfs::DfsMetadataStorageState::PendingTransition { transition_id, target_generation, .. }) = &pending_file_system.metadata_storage else {
+                return Err(error("enrollment resume requires the original Pending transition"));
+            };
+            if transition_id != &seal.transition_id || target_generation != &seal.target_generation
+                || catalog != seal.catalog || sources.len() != seal.members.len()
+                || sources.iter().any(|source| seal.member(&source.captured.source.physical_shard)
+                    .map_or(true, |member| member.captured_projection_fingerprint != source.captured.projection_fingerprint())) {
+                return Err(error("enrollment resume changes the original cohort sources or generation"));
+            }
+            Ok(())
+        };
+        if let Some((cut, seal)) = enrolled {
+            seal.validate_bound_cut(cut)?;
+            validate_seal(seal)?;
+            // Reuse the exact prior stage/installed image. Its current target
+            // is never treated as a new source and no count effects reexecute.
+            let image = if let Some(interrupted) = recovery::resolve_interrupted_installation(&session.destination_root, &session.staged_root)? {
+                interrupted.resolved_image_root
+            } else if read_import_marker(&session.destination_root, shard)?.is_some() {
+                session.destination_root.clone()
+            } else { cut.staged_root.clone() };
+            let current = sinomo_dfs::inspect_metadata_candidate(&image)?;
+            let member = seal.member(shard)?;
+            if current.prefix_proof != member.initialized_seal.prefix_proof
+                || current.state_fingerprint != member.initialized_seal.state_fingerprint
+                || current.file_fingerprint != member.initialized_seal.file_fingerprint {
+                return Err(error("enrolled current image differs from its original sealed member"));
+            }
+            return Ok(seal.clone());
         }
-        write_count_cohort_checkpoint(&stage.join("namespace-count-source-cut.json"), &bound)?;
+        let initialized_root = session.staged_root.join("namespace-count-current-image");
+        if owned_roots.get(shard) != Some(&initialized_root) {
+            return Err(error("local cohort staging changed its captured destination"));
+        }
+        let stage = || crate::namespace_count_cohort::stage_namespace_count_cohort_at_roots(
+            &session.staged_root.join("namespace-count-census"), pending_file_system,
+            catalog, sources, at, limits, owned_roots,
+        );
+        let seal = if let Some(qualified) = qualified {
+            validate_seal(qualified)?;
+            if !initialized_root.join("metadata-generation.sobj").is_file() {
+                // Older interrupted enrollments may have staged only one local
+                // member. Rebuild missing private images under the SAME seal.
+                if stage()? != *qualified {
+                    return Err(error("recovered local images change their original complete cohort"));
+                }
+            }
+            qualified.clone()
+        } else { stage()? };
+        let member = seal.member(shard)?;
+        let image = sinomo_dfs::inspect_metadata_candidate(&initialized_root)?;
+        if image.prefix_proof != member.initialized_seal.prefix_proof
+            || image.state_fingerprint != member.initialized_seal.state_fingerprint
+            || image.file_fingerprint != member.initialized_seal.file_fingerprint {
+            return Err(error("local candidate differs from its qualified complete cohort"));
+        }
+        let original = &actual.source;
+        let cut = MetadataSourceCut {
+            retained_placement_reservations: original.retained_placement_reservations.clone(),
+            namespace_count_cohort: None,
+            source_root: original.actual_source_root.clone(), source_identity: original.source_identity.clone(),
+            scope_shard: original.physical_shard.clone(), file_system_ids: original.file_system_ids.clone(),
+            source_snapshot_fingerprint: original.source_snapshot_fingerprint.clone(), source_format_version: original.source_format,
+            source_exact_prefix: original.exact_prefix.clone(), converted_image_fingerprint: actual.projection_fingerprint().into(),
+            current_image_fingerprint: member.initialized_state_fingerprint.clone(), target_exact_prefix: member.initialized_prefix.clone(),
+            source_journal_sequence: original.source_journal_sequence, source_state_fingerprint: original.source_state_fingerprint.clone(),
+            projection_assignments: original.projection_assignments.clone(), original_handoff: original.original_handoff.clone(),
+            staged_root: initialized_root, pending_operations: Vec::new(),
+        };
+        let bound = seal.bind_cut(&cut)?;
+        actual.verify_retained_source_at(&session.source_root)?;
+        write_count_cohort_checkpoint(&session.staged_root.join("namespace-count-source-cut.json"), &bound)?;
         session.finalization = Some(Finalization::Plan { digest: blake3::hash(&serde_json::to_vec(&bound).map_err(error)?).to_hex().to_string(), cut: bound });
         Ok(seal)
     }
     /// Explicit maintenance capture. Normal storage open never writes this intent.
     /// The same converter session retains the actual original source fence.
-    pub fn capture_namespace_count_source(
+    pub(crate) fn capture_namespace_count_source(
         &self, destination: &Path, shard: &DfsMetadataShardId,
-        catalog: &[DfsMetadataShardConfig], budget: usize,
-    ) -> Result<Option<crate::namespace_counts::NamespaceCountMaintenanceSource>> {
+        catalog: &[DfsMetadataShardConfig], reservations: &[RetainedPlacementReservation], budget: usize,
+    ) -> Result<(DfsStoragePreparation, Option<crate::namespace_counts::NamespaceCountMaintenanceSource>)> {
         let authority = self.authority.as_ref().ok_or_else(|| error("count maintenance requires its actual import owner"))?;
         if authority.kind() != MetadataImportAuthorityKind::Native {
             return Err(error("complete-catalog count maintenance requires native source authority"));
@@ -6325,23 +6331,33 @@ impl MetadataConverter {
         authority.validate_owned_source(&destination, shard, std::slice::from_ref(&assignment.file_system_id))?;
         let stage = conversion_stage_base_path(&destination, shard)?;
         fs::create_dir_all(&stage).map_err(error)?;
+        validate_placement_reservations(reservations, std::slice::from_ref(&assignment.file_system_id), shard)?;
+        let evidence = stage.join("placement-reservations.json");
+        let captured = conversion_stage_path(&destination, shard)?.join("captured-unit.json");
+        if captured.exists() {
+            let original: canonical_generation::CapturedMetadataUnit = read_json(&captured)?;
+            original.validate()?;
+            if original.source.retained_placement_reservations != reservations {
+                return Err(error("placement evidence cannot change after source capture"));
+            }
+        }
+        if !evidence.exists() && !reservations.is_empty()
+            && stage.join("captured-source-cut.json").exists() {
+            return Err(error("new placement evidence cannot attach to retained original source facts"));
+        }
+        write_count_cohort_checkpoint(&evidence, &reservations)?;
         write_count_cohort_checkpoint(&stage.join("namespace-count-capture.json"), &expected)?;
-        self.prepare_source(&destination, &destination, shard, budget, None, None, true)?;
-        let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
-            .ok_or_else(|| error("count maintenance lost its actual converter session"))?;
-        let Some(held) = slot.try_lock_session() else { return Ok(None); };
-        let Some(session) = held.as_ref() else { return Ok(None); };
-        let Some(Finalization::Plan { cut, .. }) = session.finalization.as_ref() else { return Ok(None); };
-        let original = if let Some(seal) = cut.namespace_count_cohort.as_deref() {
-            seal.validate_bound_cut(cut)?;
-            &seal.member(shard)?.original_cut
-        } else { cut };
-        session.inventory.verify(&session.source_root)?;
-        let snapshot = sinomo_dfs::read_metadata_candidate(&original.staged_root)?;
-        let candidate_identity = sinomo_dfs::inspect_metadata_candidate(&original.staged_root)?;
-        Ok(Some(crate::namespace_counts::NamespaceCountMaintenanceSource {
-            source_cut: original.clone(), snapshot, candidate_identity,
-        }))
+        self.capture_metadata_unit_progress(&destination, &destination, shard, budget)
+            .map(|(progress, captured)| (progress, captured.map(|captured| crate::namespace_counts::NamespaceCountMaintenanceSource { captured })))
+    }
+}
+
+fn read_placement_capture(destination: &Path, shard: &DfsMetadataShardId) -> Result<Vec<RetainedPlacementReservation>> {
+    let path = conversion_stage_base_path(destination, shard)?.join("placement-reservations.json");
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(error),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(cause) => Err(MetadataBackendError::Io { path, source: cause }),
     }
 }
 
@@ -6366,98 +6382,6 @@ pub(crate) fn namespace_count_plan_root(destination: &Path, shard: &DfsMetadataS
     Ok(conversion_stage_base_path(destination, shard)?.join("namespace-count-current-image"))
 }
 
-/// Explicit native maintenance preserves the original immutable history. The
-/// legacy repartitioner is intentionally not used for an unchanged native
-/// physical scope: it maps historical slots for different storage generations.
-fn build_count_maintenance_native_image(
-    session: &Session,
-    shard: &DfsMetadataShardId,
-) -> Result<sinomo_dfs::DfsMetadataCandidateIdentity> {
-    let generation = session.header.get("format_version").and_then(Value::as_u64)
-        .ok_or_else(|| error("count maintenance requires an original native snapshot"))?;
-    if generation != 10 && generation != u64::from(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION) {
-        return Err(error("count maintenance requires settled native10 or current DATA"));
-    }
-    session.inventory.verify(&session.source_root)?;
-    let original = if generation == u64::from(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION) {
-        sinomo_dfs::read_metadata_candidate(&session.source_root)?
-    } else {
-        prior_native::read_snapshot(&session.source_root)?.1
-    };
-    let mut state = sinomo_dfs::DfsMetadataCandidateState::new((*original.tables).clone())?;
-    if state.snapshot() != *original.tables {
-        return Err(error("native maintenance reconstruction changes original snapshot rows"));
-    }
-    let mut prefix = original.prefix_proof.clone();
-    let captured = session.source_prefix.as_ref()
-        .ok_or_else(|| error("native maintenance requires its complete authenticated source prefix"))?;
-    for sequence in prefix.journal_sequence + 1..=captured.journal_sequence {
-        let (document, raw) = read_verified_journal_document(&session.staged_root, sequence, &session.journal_frame_digests)?;
-        let entry: sinomo_dfs::DfsMetadataJournalEntry = serde_json::from_value(document).map_err(error)?;
-        if entry.shard_id != *shard || entry.sequence != sequence {
-            return Err(error("native maintenance journal changes its original scope/sequence"));
-        }
-        prefix = source_proof::extend_as(&prefix, sequence, &raw.bytes, 2)?;
-        state.replay_native_journal_entry(&entry)?;
-    }
-    if prefix != *captured { return Err(error("native maintenance reconstructed another exact source prefix")); }
-    let tables = state.snapshot();
-    if tables.prepared_operations_v7.iter().any(|record| record.status == sinomo_dfs::DfsPreparedOperationStatus::Prepared)
-        || tables.namespace_jobs.iter().any(|job| job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed)
-        || tables.namespace_requests.iter().any(|request| request.status == sinomo_dfs::DfsNamespaceRequestStatus::Pending)
-        || tables.intents.iter().any(|intent| matches!(intent.status, sinomo_dfs::DfsWriteIntentStatus::Staging | sinomo_dfs::DfsWriteIntentStatus::ReceiptsPending)) {
-        return Err(error("count maintenance requires original operations drained before upgrade"));
-    }
-    let root = session.staged_root.join("current-image");
-    let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&root)?;
-    // Copy complete original journal files, including old frames below the
-    // checkpoint. They remain byte-identical; count frames append afterwards.
-    for source in &session.inventory.files {
-        if !source.is_native_journal_data() { continue; }
-        let target = root.join(&source.relative);
-        let original_path = session.source_root.join(&source.relative);
-        let bytes = fs::read(&original_path).map_err(error)?;
-        if bytes.len() as u64 != source.len || blake3::hash(&bytes).to_hex().as_str() != source.blake3 {
-            return Err(error("native maintenance original journal bytes changed"));
-        }
-        if target.exists() {
-            if fs::read(&target).map_err(error)? != bytes { return Err(error("native maintenance retained journal copy changed")); }
-        } else {
-            fs::create_dir_all(target.parent().ok_or_else(|| error("journal copy has no parent"))?).map_err(error)?;
-            sinomo_core::storage::durable_file::write_file_atomic(&target, &bytes,
-                sinomo_core::storage::durable_file::DurableAtomicFileOptions::new("count-source", "tmp").sync_all()).map_err(error)?;
-        }
-    }
-    let identity = writer.write(tables.clone(), prefix)?;
-    let reconstructed = sinomo_dfs::read_metadata_candidate(&root)?;
-    if *reconstructed.tables != tables { return Err(error("native maintenance image changes original reconstructed rows")); }
-    session.inventory.verify(&session.source_root)?;
-    Ok(identity)
-}
-
-/// Copy only the authenticated original journal into a fresh hidden candidate.
-/// The enrolled source owner retains the source lock throughout this call.
-pub(crate) fn copy_count_source_journal(cut: &MetadataSourceCut, target: &Path) -> Result<()> {
-    validate_retained_source_identity(&cut.source_root, &cut.source_identity, &cut.source_snapshot_fingerprint)?;
-    let inventory = source::discover(&cut.source_root)?;
-    for file in &inventory.files {
-        if !file.is_native_journal_data() { continue; }
-        let bytes = fs::read(cut.source_root.join(&file.relative)).map_err(error)?;
-        if bytes.len() as u64 != file.len || blake3::hash(&bytes).to_hex().as_str() != file.blake3 {
-            return Err(error("original count source journal changed during enrollment"));
-        }
-        let path = target.join(&file.relative);
-        if path.exists() {
-            if fs::read(&path).map_err(error)? != bytes { return Err(error("count source journal copy changed before initialization")); }
-        } else {
-            fs::create_dir_all(path.parent().ok_or_else(|| error("count journal has no parent"))?).map_err(error)?;
-            sinomo_core::storage::durable_file::write_file_atomic(&path, &bytes,
-                sinomo_core::storage::durable_file::DurableAtomicFileOptions::new("count-source", "tmp").sync_all()).map_err(error)?;
-        }
-    }
-    inventory.verify(&cut.source_root)?;
-    Ok(())
-}
 
 #[cfg(test)]
 pub(crate) fn published_count_source_for_test(root: &Path, shard: &DfsMetadataShardId) -> Result<Option<MetadataSourceCut>> {
@@ -6473,7 +6397,17 @@ mod count_native_frame_tests {
         let source_root = directory.join("source");
         let stage = directory.join("stage");
         let shard = DfsMetadataShardId::new("root");
-        let writer = sinomo_dfs::DfsMetadataCandidateWriter::open(&source_root).unwrap();
+        let writer = sinomo_dfs::DfsMetadataCandidateWriter::open_generation(
+            &source_root,
+            sinomo_dfs::DfsMetadataGenerationIdentity {
+                file_system_id: sinomo_dfs::sifs_file_system_id(),
+                shard_id: shard.clone(),
+                generation: "original-native-frame".into(),
+                origin: sinomo_dfs::DfsMetadataGenerationOrigin::StorageTransition {
+                    transition_id: "original-frame-data".into(),
+                },
+            },
+        ).unwrap();
         let prefix = source_proof::conversion_base(0, "original-frame", "empty-current-data");
         writer.write(Default::default(), prefix.clone()).unwrap();
         let payload = sinomo_dfs::DfsPreparedOperationPayload::for_metadata_effects(
@@ -6506,4 +6440,290 @@ mod count_native_frame_tests {
         }
         assert_eq!(frames, 2, "real Prepare and Commit raw frames must both be checked");
     }
+}
+
+/// Bounded, read-only presence classification for the owner dispatcher. It
+/// neither takes a source fence nor hashes/replays DATA. False means the known
+/// metadata trees are empty; an exhausted probe is conservatively retained DATA.
+pub(crate) fn original_source_present(root: &Path) -> Result<bool> {
+    for name in ["metadata-import-v7.json", "metadata-candidate-v7.json"] {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(source) => return Err(MetadataBackendError::Io { path: root.join(name), source }),
+        }
+    }
+    let mut pending = vec![(root.join("records"), 0usize), (root.join("journal"), 0usize)];
+    let mut budget = 64usize;
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(MetadataBackendError::Io { path: directory, source }),
+        };
+        for entry in entries {
+            if budget == 0 { return Ok(true); }
+            budget -= 1;
+            let entry = entry.map_err(error)?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(error)?;
+            if kind.is_dir() {
+                if depth >= 4 { return Ok(true); }
+                pending.push((path, depth + 1));
+            } else if entry.file_name() != "write.lock" {
+                // Even malformed or zero-length persisted records are retained
+                // evidence, not permission to invent a fresh native generation.
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// True only for an empty physical unit with no original scope checkpoint.
+/// This is not Ready or birth authority: the caller may report ReplicaUnreadable
+/// so the core's existing authenticated snapshot repair can own the missing copy.
+pub(crate) fn original_unit_absent(root: &Path, shard: &DfsMetadataShardId) -> Result<bool> {
+    let canonical = canonical_destination(root)?;
+    let root = canonical.as_path();
+    fn present(path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(MetadataBackendError::Io { path: path.to_owned(), source }),
+        }
+    }
+    if present(&root.join("metadata-generation.sobj"))?
+        || present(&unversioned_conversion_stage_base_path(root, shard)?)?
+        || original_source_present(root)? {
+        return Ok(false);
+    }
+    // Older combined roots can own an absent split scope. Do not classify that
+    // source as empty merely because its later physical directory is missing.
+    let combined = root.parent().ok_or_else(|| error("metadata unit has no parent"))?.join("root");
+    if combined != root && original_source_present(&combined)?
+        && sinomo_dfs::inspect_metadata_storage_generation(&combined).is_err() {
+        return Ok(false);
+    }
+    let mut directories = vec![root.to_owned()];
+    let mut remaining = 64usize;
+    while let Some(directory) = directories.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(MetadataBackendError::Io { path: directory, source }),
+        };
+        for entry in entries {
+            if remaining == 0 { return Ok(false); }
+            remaining -= 1;
+            let entry = entry.map_err(error)?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(error)?;
+            if kind.is_dir() {
+                if directory == root && !matches!(entry.file_name().to_str(), Some("records" | "journal")) {
+                    return Ok(false);
+                }
+                directories.push(path);
+            } else if path != root.join("journal/write.lock") || !kind.is_file()
+                || entry.metadata().map_err(error)?.len() != 0 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod original_unit_absence_tests {
+    use super::*;
+    #[test]
+    fn missing_replica_is_distinct_from_retained_or_ambiguous_source() {
+        let directory = sinomo_testdir::TestDir::new("original-metadata-unit-absence");
+        let root = directory.join("metadata/users");
+        let shard = DfsMetadataShardId::new("users");
+        assert!(original_unit_absent(&root, &shard).unwrap());
+        fs::create_dir_all(root.join("journal/segments")).unwrap();
+        fs::write(root.join("journal/write.lock"), b"").unwrap();
+        assert!(original_unit_absent(&root, &shard).unwrap());
+        fs::write(root.join("journal/write.lock"), b"unknown retained bytes").unwrap();
+        assert!(!original_unit_absent(&root, &shard).unwrap());
+        fs::write(root.join("journal/write.lock"), b"").unwrap();
+        fs::write(root.join("journal/segments/retained.sobj"), b"unreadable original").unwrap();
+        assert!(!original_unit_absent(&root, &shard).unwrap());
+        fs::remove_file(root.join("journal/segments/retained.sobj")).unwrap();
+        fs::write(root.join("metadata-generation.sobj"), b"invalid current identity").unwrap();
+        assert!(!original_unit_absent(&root, &shard).unwrap());
+        fs::remove_file(root.join("metadata-generation.sobj")).unwrap();
+        let stage = unversioned_conversion_stage_base_path(&root, &shard).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        assert!(!original_unit_absent(&root, &shard).unwrap());
+        fs::remove_dir(&stage).unwrap();
+        let combined = root.parent().unwrap().join("root/records");
+        fs::create_dir_all(&combined).unwrap();
+        fs::write(combined.join("original.sobj"), b"combined original scope").unwrap();
+        assert!(!original_unit_absent(&root, &shard).unwrap());
+    }
+}
+
+/// Resolve only this capture's existing installation lineage. The original
+/// source facts stay immutable while its physical directory moves to archive.
+pub(crate) fn resolve_captured_original_source(
+    source: &canonical_generation::CapturedMetadataSource,
+) -> Result<PathBuf> {
+    let destination = &source.actual_source_root;
+    if let Some(interrupted) = recovery::resolve_interrupted_installation(destination, &source.evidence_root)? {
+        if !source.matches_source_cut(&interrupted.proposal.source_cut) {
+            return Err(error("source coverage installation differs from its immutable capture"));
+        }
+        return Ok(interrupted.actual_source);
+    }
+    if let Some(marker) = read_import_marker(destination, &source.physical_shard)? {
+        if !source.matches_source_cut(&marker.source_cut) || marker.receiver_local_source.is_some() {
+            return Err(error("source coverage marker differs from its actual original source"));
+        }
+        return Ok(marker.retained_source_root);
+    }
+    Ok(destination.clone())
+}
+
+impl MetadataConverter {
+    /// Qualify an inactive archive association against the explicit local
+    /// owner's existing coverage and installed generation. This is observation,
+    /// not serving, activation, or collection authority.
+    pub(crate) fn owns_completed_standalone_lineage(
+        &self,
+        destination: &Path,
+        cut: &MetadataSourceCut,
+    ) -> Result<bool> {
+        let authority = self.authority.as_ref()
+            .ok_or_else(|| error("standalone archive observation has no explicit owner"))?;
+        if authority.kind() != MetadataImportAuthorityKind::Standalone {
+            return Err(error("native owner cannot qualify standalone archive lineage"));
+        }
+        let checkpoint = conversion_stage_base_path(destination, &cut.scope_shard)?
+            .join("captured-unit.json");
+        let captured: canonical_generation::CapturedMetadataUnit = read_json(&checkpoint)?;
+        captured.validate()?;
+        if !captured.source.matches_source_cut(cut) {
+            return Err(error("standalone archive changed its original captured source"));
+        }
+        authority.require_standalone_census_coverage(&captured.source)?;
+        let expected = authority.standalone_generation_for_source(&captured.source)?;
+        let header = sinomo_dfs::inspect_metadata_storage_generation(destination)?;
+        Ok(header.identity == expected
+            && matches!(header.state, sinomo_dfs::DfsMetadataGenerationState::Active { .. }))
+    }
+
+    /// The same owner drives source capture, checked local census and the
+    /// existing explicit standalone certificate/install continuation. No native
+    /// catalog is fabricated and no second scheduler is introduced.
+    pub(crate) fn prepare_standalone_current_generation(
+        &self, destination: &Path, shard: &DfsMetadataShardId, budget: usize,
+    ) -> Result<DfsStoragePreparation> {
+        let authority = self.authority.as_ref().ok_or_else(|| error("standalone preparation has no explicit owner"))?;
+        if authority.kind() != MetadataImportAuthorityKind::Standalone {
+            return Err(error("native owner cannot select standalone preparation"));
+        }
+        if budget == 0 { return Err(error("standalone preparation budget must be positive")); }
+        let destination = canonical_destination(destination)?;
+        let stage = conversion_stage_base_path(&destination, shard)?;
+        // Installed/interrupted images resume their exact original proposal;
+        // they are never captured as a new source or recounted.
+        if read_import_marker(&destination, shard)?.is_some()
+            || recovery::resolve_interrupted_installation(&destination, &stage)?.is_some() {
+            return self.prepare_with_source(&destination, &destination, shard, budget);
+        }
+        let (progress, captured) = self.capture_metadata_unit_progress(&destination, &destination, shard, budget)?;
+        let Some(captured) = captured else { return Ok(progress); };
+        let enrolled = {
+            let slot = self.roots.lock().map_err(error)?.get(&destination).cloned()
+                .ok_or_else(|| error("standalone capture lost its actual session"))?;
+            let Some(held) = slot.try_lock_session() else { return Ok(DfsStoragePreparation::Pending { processed_records: 0 }); };
+            held.as_ref().is_some_and(|session| session.finalization.is_some())
+        };
+        if !enrolled {
+            authority.require_standalone_census_coverage(&captured.source)?;
+            let source = crate::namespace_counts::NamespaceCountMaintenanceSource { captured };
+            let limits = crate::namespace_counts::NamespaceCountMaintenanceLimits {
+                max_objects: 1_000_000, max_encoded_bytes: 64 * 1024 * 1024,
+                deadline: std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            };
+            let plan = crate::namespace_counts::plan_standalone_namespace_count_maintenance(std::slice::from_ref(&source), limits)?;
+            let objects = plan.counted_objects(&source, limits)?;
+            self.enroll_standalone_source(&destination, shard, &objects)?;
+        }
+        self.prepare_with_source(&destination, &destination, shard, budget)
+    }
+}
+
+/// Association DATA from an existing completed installation record. This is
+/// neither archive integrity, native completion, Ready nor GC permission. The
+/// owner must qualify its current authoritative filesystem/generation before
+/// recording even an inactive retained-original observation.
+#[derive(Clone, Debug)]
+pub(crate) struct AssociatedCompletedMetadataLineage {
+    pub source_cut: MetadataSourceCut,
+    pub retained_root: PathBuf,
+    pub evidence_root: PathBuf,
+}
+
+pub(crate) fn associated_completed_metadata_lineage(
+    destination: &Path,
+) -> Result<Option<AssociatedCompletedMetadataLineage>> {
+    let destination = canonical_destination(destination)?;
+    let path = destination.join("metadata-import-v7.json");
+    let bytes = match sinomo_core::storage::durable_file::read_object_file_bytes(&path, 64 * 1024 * 1024) {
+        Ok(bytes) => bytes,
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(cause) => return Err(error(cause)),
+    };
+    let original: MetadataImportMarker = serde_json::from_slice(&bytes).map_err(error)?;
+    let Some(marker) = read_import_marker(&destination, &original.source_cut.scope_shard)? else { return Ok(None); };
+    if !marker.installation_complete { return Ok(None); }
+    let header = sinomo_dfs::inspect_metadata_storage_generation(&destination)?;
+    if !matches!(header.state, sinomo_dfs::DfsMetadataGenerationState::Active { .. }) {
+        return Ok(None);
+    }
+    if header.identity.shard_id != marker.source_cut.scope_shard
+        || !marker.source_cut.file_system_ids.contains(&header.identity.file_system_id) {
+        return Err(error("completed artifact lineage differs from the current physical generation scope"));
+    }
+    let evidence_root = conversion_stage_base_path(&destination, &marker.source_cut.scope_shard)?;
+    Ok(Some(AssociatedCompletedMetadataLineage {
+        source_cut: marker.source_cut, retained_root: marker.retained_source_root, evidence_root,
+    }))
+}
+
+pub(crate) fn associate_completed_metadata_artifact(
+    destination: &Path, artifact: &Path,
+) -> Result<Option<MetadataSourceCut>> {
+    let Some(lineage) = associated_completed_metadata_lineage(destination)? else { return Ok(None); };
+    let artifact = canonical_destination(artifact)?;
+    if artifact != canonical_destination(&lineage.retained_root)?
+        && artifact != canonical_destination(&lineage.evidence_root)? {
+        return Ok(None);
+    }
+    Ok(Some(lineage.source_cut))
+}
+
+/// Exact installed-lineage DATA, including a still-Staged representation. This
+/// does not authorize activation or Ready: the owner must independently match
+/// its original job/target generation and actual completed native proof.
+pub(crate) fn installed_metadata_source_cut(
+    destination: &Path, shard: &DfsMetadataShardId,
+) -> Result<Option<MetadataSourceCut>> {
+    let Some(marker) = read_import_marker(destination, shard)? else { return Ok(None); };
+    if !marker.installation_complete { return Ok(None); }
+    let header = sinomo_dfs::inspect_metadata_storage_generation(destination)?;
+    if header.identity.shard_id != *shard
+        || !marker.source_cut.file_system_ids.contains(&header.identity.file_system_id) {
+        return Err(error("installed lineage differs from its exact current physical generation scope"));
+    }
+    if let Some(seal) = marker.source_cut.namespace_count_cohort.as_ref() {
+        seal.validate_bound_cut(&marker.source_cut)?;
+        if seal.member(shard)?.initialized_generation != header.identity {
+            return Err(error("installed lineage changes its original sealed member generation"));
+        }
+    }
+    Ok(Some(marker.source_cut))
 }

@@ -49,9 +49,12 @@ The history module uses its namespace to translate source and capture provenance
 into user-facing history. Other modules can retain immutable revisions under
 their own namespaces without introducing a second content database or modifying
 history's semantics. `sinomo-dfs-migration` alone interprets retained legacy
-records and converts them into the current representation. The DFS runtime
-accepts only its current storage and wire protocols; incompatible nodes must be
-upgraded before participating.
+records and converts them into the current representation. One component-owned
+migration lifecycle covers background conversion of cold data and prioritized
+requests from DFS operations. Ready data remains available where its authority
+allows; incomplete migration never establishes absence or permits collection.
+The DFS runtime accepts only its current storage and wire protocols; incompatible
+nodes must be upgraded before participating.
 
 A disabled feature exposes no routes or
 workers, while core create/read/overwrite/rename/unlink remains available.

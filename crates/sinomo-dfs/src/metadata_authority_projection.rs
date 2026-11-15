@@ -70,9 +70,10 @@ pub(crate) fn metadata_storage_configuration_changed(
             let crate::DfsFileSystemConfig {
                 file_system_id,
                 owner_node_id,
+                metadata_storage,
                 ..
             } = config;
-            (file_system_id, owner_node_id)
+            (file_system_id, owner_node_id, metadata_storage)
         })
     };
     match (previous, current) {

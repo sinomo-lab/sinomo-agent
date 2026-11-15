@@ -473,8 +473,17 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 ),
             });
         }
+        let original = self.genesis_backend.as_ref()
+            .ok_or_else(|| DfsError::Metadata { message: "initial assignment requires its actual staged genesis owner".into() })?
+            .shard_backend(&DfsMetadataShardId::new(&desired.shard_id))?
+            .prepared_operation_record(&genesis::genesis_operation_id(desired))?
+            .ok_or_else(|| DfsError::Metadata { message: "initial assignment has no original prepared genesis".into() })?;
+        if original.status != crate::DfsPreparedOperationStatus::Prepared {
+            return Err(DfsError::Metadata { message: "missing initial assignment cannot re-seed a terminal genesis".into() });
+        }
+        let captured_storage = genesis::original_genesis_file_system(&original, desired)?.metadata_storage.clone();
         if !DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
-            .compare_and_put_metadata_shard(current.as_ref(), desired)
+            .compare_and_put_metadata_shard_for_genesis(desired, captured_storage.as_ref())
             .await?
         {
             return Err(DfsError::Distributed {
@@ -621,6 +630,25 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
             }
             if current.primary_node_id == self.local_node_id {
                 let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
+                let root = crate::local_dfs_metadata_shard_path(&self.data_dir, &shard_id);
+                if root.join("metadata-generation.sobj").exists() {
+                    let generation = crate::storage_generation::read_generation(&root)?;
+                    if generation.identity.file_system_id == current.file_system_id
+                        && generation.identity.shard_id == shard_id
+                        && generation.identity.is_native_genesis()
+                        && matches!(generation.state, crate::storage_generation::GenerationState::Staged { .. }) {
+                        // Resume only the exact current initial generation. A
+                        // committed original may have survived before its local
+                        // representation activation was sealed; no new body or
+                        // assignment is inferred from a directory's existence.
+                        let mut backend = crate::LocalSobjMetadataBackend::open_staged_native_genesis(
+                            &current, root, self.publication_owners.selected_original_data_layout()?,
+                        )?;
+                        let committed = genesis::native_genesis_committed(&backend, &current)?;
+                        if committed { backend.activate_native_genesis_storage_generation(&current)?; }
+                        return Ok(committed);
+                    }
+                }
                 if let Some(resident) = self.resident_metadata_backend.as_ref() {
                     let handle = resident.scope_shard(&current.file_system_id, &shard_id)?;
                     let backend = handle.checkout()?;

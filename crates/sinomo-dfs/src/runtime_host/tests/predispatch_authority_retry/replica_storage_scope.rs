@@ -85,6 +85,11 @@ fn exercise_replica_storage_scope(
         )
     };
     let shard_id = DfsMetadataShardId::new(&context.shard.shard_id);
+    let mut receiver_head = {
+        let native = fixture.native.lock().unwrap();
+        native.as_ref().unwrap().node_metadata(&fixture.remote).unwrap()
+            .metadata_prefix_proof(&shard_id).unwrap().unwrap().journal_sequence
+    };
     let call = |command: &crate::DfsMetadataJournalBatchCommand| {
         let request = sinomo_core::network::ObjectRpcRequest::encode_body(
             "/dfs/metadata/journal-batch",
@@ -109,15 +114,15 @@ fn exercise_replica_storage_scope(
         // Warm only the genuine committed predecessor. The operation tested
         // below has not been prepared yet and cannot borrow an earlier ACK.
         let backend = source.metadata_backend.as_ref().unwrap();
-        let predecessor = backend
+        if let Some(predecessor) = backend
             .journal_batch_for_shard_since_limited(
                 &shard_id,
-                0,
+                receiver_head,
                 crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
                 crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
             )
             .unwrap()
-            .unwrap();
+        {
         let warm = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
             &fixture.local,
             &fixture.remote,
@@ -134,6 +139,8 @@ fn exercise_replica_storage_scope(
             call(&warm).unwrap().decode_body().unwrap();
         assert_eq!(warmed.result, crate::DfsMetadataJournalBatchResult::Applied);
         assert_eq!(warmed.next_after_sequence, predecessor.next_after_sequence);
+        receiver_head = predecessor.next_after_sequence;
+        }
     }
     // This control must test the first ingest while the receiver's unrelated
     // writer configuration is paused. The normal source publisher is also
@@ -179,7 +186,7 @@ fn exercise_replica_storage_scope(
     let logical = backend
         .journal_batch_for_shard_since_limited(
             &shard_id,
-            0,
+            receiver_head,
             crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
             crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )

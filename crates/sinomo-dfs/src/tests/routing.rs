@@ -1731,6 +1731,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     );
 
     let snapshot_root = temp_root("rpc_helper_snapshot");
+    crate::test_runtime::copy_native_genesis_data(&snapshot_root, &shard_id.0);
     let snapshot = LocalSobjMetadataBackend::new(shard_id.clone(), &snapshot_root)
         .expect("metadata backend")
         .export_snapshot_image()

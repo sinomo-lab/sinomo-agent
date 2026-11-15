@@ -27,6 +27,7 @@ pub(crate) struct DaemonDefaultDfsReconciliationReactor {
     pub(super) runtime: sinomo_dfs::DefaultDfsReconciliationRuntime,
     data_dir: SinomoDataDir,
     foreground_quiet: Option<(DaemonDefaultDfsExactRetryGeneration, Instant)>,
+    preparation_readiness: Option<tokio::sync::watch::Receiver<u64>>,
     #[cfg(test)]
     pub(super) _projection_tx: tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
 }
@@ -84,14 +85,14 @@ impl DaemonDefaultDfsReconciliationReactor {
             metadata_authority_generation,
             placement_authority_process_identity,
         )?;
+        let data_dir = SinomoDataDir::new(cluster_paths.root.parent().ok_or(DaemonError::ClusterOrphan)?);
+        // Subscribe before host preparation can observe Pending. A later wake
+        // only permits another actual root/authority check; it is not Ready.
+        let preparation_readiness = crate::dfs_storage_preparation_readiness(&data_dir.root());
         Ok(Self {
             foreground_quiet: None,
-            data_dir: SinomoDataDir::new(
-                cluster_paths
-                    .root
-                    .parent()
-                    .ok_or(DaemonError::ClusterOrphan)?,
-            ),
+            preparation_readiness,
+            data_dir,
             #[cfg(test)]
             _projection_tx: owner_runtime.projection_sender(),
             runtime: owner_runtime,
@@ -485,6 +486,7 @@ pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
     tracing::debug!(target: "sinomo.dfs.reconciliation", node = %expected_node_id,
         "default DFS reconciliation reactor task started");
     let mut failure_streak = 0_u32;
+    let mut preparation_readiness = reactor.preparation_readiness.take();
     // Recheck the same owner's current obligation on every pass: consuming a
     // parked handoff can require normal startup admission after an earlier idle.
     loop {
@@ -507,6 +509,11 @@ pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
         }
         let foreground_preemptible = !reactor.runtime.mandatory_generation_pending();
         let attempted_generation = reactor.exact_retry_generation();
+        if let Some(readiness) = preparation_readiness.as_mut() {
+            // The upcoming attempt observes changes that preceded it. Changes
+            // during the attempt remain pending on this same subscription.
+            drop(readiness.borrow_and_update());
+        }
         let result = reactor
             .reconcile_pending_async(
                 &paths,
@@ -593,6 +600,7 @@ pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
                 continue;
             }
             Err(error) => {
+                let preparation_pending = matches!(&error, DaemonError::StoragePreparationPending { .. });
                 failure_streak = failure_streak.saturating_add(1);
                 let retry_delay = daemon_default_dfs_reconciliation_retry_delay(failure_streak);
                 tracing::warn!(
@@ -604,13 +612,24 @@ pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
                 // A timer exists only while real work is failing. Preserve its
                 // absolute deadline across ordinary placement/connectivity
                 // churn: only an exact handoff, proof, shard-authority, permit,
-                // or subscribed replica generation can make the failed work
-                // runnable before that deadline.
+                // subscribed replica generation, or actual preparation-owner
+                // progress can make the failed work runnable before that deadline.
                 let failed_generation = reactor.exact_retry_generation();
                 let retry_deadline = tokio::time::Instant::now() + retry_delay;
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep_until(retry_deadline) => break,
+                        changed = async {
+                            match preparation_readiness.as_mut() {
+                                Some(readiness) => readiness.changed().await,
+                                None => std::future::pending().await,
+                            }
+                        }, if preparation_pending => {
+                            if changed.is_ok() { break; }
+                            // An unloaded provider is not progress and must not
+                            // produce a closed-channel retry loop.
+                            preparation_readiness = None;
+                        }
                         _ = reactor.changed_signal() => {
                             if reactor.exact_retry_generation() != failed_generation {
                                 break;

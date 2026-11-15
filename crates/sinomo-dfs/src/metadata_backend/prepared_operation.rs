@@ -2258,19 +2258,10 @@ fn validate_metadata_effects(
                 slot_generations.insert(withdrawal.slot_key(), withdrawal.generation);
             }
             E::RemovePreparedOperation { digest } => {
-                let target = tables
-                    .prepared_operations_v7
-                    .get(&digest.operation_id)
-                    .ok_or_else(|| MetadataBackendError::Serde("eviction target missing".into()))?;
-                if target.digest != *digest
-                    || target.status == DfsPreparedOperationStatus::Prepared
-                    || digest.file_system_id != record.file_system_id
-                    || digest.shard_id != record.shard_id
-                {
-                    return Err(MetadataBackendError::Serde(
-                        "eviction target changed/scope mismatch".into(),
-                    ));
+                if digest.file_system_id != record.file_system_id || digest.shard_id != record.shard_id {
+                    return Err(MetadataBackendError::Serde("eviction target changed/scope mismatch".into()));
                 }
+                tables.terminal_eviction_for_digest(digest)?;
             }
             E::ResolvePreparedOperation { digest, status } => {
                 let old = tables

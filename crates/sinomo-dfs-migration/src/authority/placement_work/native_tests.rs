@@ -1,6 +1,6 @@
 //! Genuine source DATA plus real current native import/publication.
 use super::*;
-use crate::authority::{shared_runtime, storage_preparation_provider};
+use crate::authority::{shared_owner, storage_preparation_provider};
 use sinomo_dfs::{DfsStoragePreparation, DfsStoragePreparationScope};
 
 pub(in crate::authority) fn native_migration_cluster(
@@ -32,11 +32,11 @@ pub(in crate::authority) fn native_migration_cluster(
 
 pub(in crate::authority) fn canonical_migration_runtime(
     context: &sinomo_module::ComponentContext,
-) -> Arc<crate::authority::MigrationRuntime> {
+) -> Arc<crate::authority::MigrationOwner> {
     let root = context.data_dir_root().canonicalize().unwrap();
     let lifecycle = sinomo_dfs::dfs_storage_preparation_lifecycle(&root)
         .expect("normal DFS factory registered its actual provider lifecycle");
-    let runtime = shared_runtime(context, lifecycle.clone()).unwrap();
+    let runtime = shared_owner(context, lifecycle.clone()).unwrap();
     assert!(runtime.lifecycle.same_channel(&lifecycle));
     runtime
 }
@@ -229,8 +229,15 @@ struct OriginalV0Job<'a> {
 }
 
 #[test]
-fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
-    let name = "migration-native8-pending-placement-data";
+fn pending_v0_goal_imports_actual_native_sources_and_publishes_current_job() {
+    pending_goal_with_current_permit(false);
+}
+#[test]
+fn pending_v1_goal_imports_actual_native_sources_behind_a_current_permit() {
+    pending_goal_with_current_permit(true);
+}
+fn pending_goal_with_current_permit(v1: bool) {
+    let name = if v1 { "migration-native-v1-pending-placement-data" } else { "migration-native8-pending-placement-data" };
     let (mut native, nodes) = native_migration_cluster(name, 1);
     let node = &nodes[0];
     let context = native.component_context(node).unwrap();
@@ -274,77 +281,6 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
         .await
     })
     .expect("ordinary sampled content advertisement before source import");
-    let source = OriginalV0Job {
-        job_id: "original-placement-pending",
-        file_system_id: fs.as_str(),
-        path: "/users",
-        scope: "subtree",
-        state: "pending",
-        total_object_count: 0,
-        scanned_object_count: 0,
-        matched_object_count: 0,
-        updated_object_count: 0,
-        scheduled_repair_count: 0,
-        completed_repair_count: 0,
-        pending_repair_count: 0,
-        revision: 1,
-        created_at_unix_nanos: 1,
-        updated_at_unix_nanos: 1,
-    };
-    let old_key = format!(
-        "/dfs/filesystems/{fs}/placement-reconciliations/{}",
-        source.job_id
-    );
-    let original =
-        sinomo_core::object::serde_ext::to_bytes(&source, 1, sinomo_core::object::LengthMode::U32)
-            .unwrap();
-    // Converter fixture input only: faithful original wire enters actual native
-    // KV. No old DFS writer or successful synthetic authority receipt exists.
-    let write = runtime
-        .authority
-        .commit(KvTxnRequest::generated(KvTxn {
-            compares: vec![KvCompare::Missing {
-                key: old_key.clone(),
-            }],
-            success: vec![KvOp::Put {
-                key: old_key.clone(),
-                value: original.clone(),
-                lease_id: None,
-            }],
-            failure: Vec::new(),
-        }))
-        .unwrap();
-    NativeImportAuthority::require_committed(&write).unwrap();
-    let goals = runtime
-        .authority
-        .capture_original_placement_goals(4)
-        .unwrap()
-        .unwrap();
-    assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].job.entry.value, original);
-    let required = runtime
-        .authority
-        .required_original_placement_sources(&goals)
-        .unwrap();
-    assert!(
-        !required.is_empty(),
-        "pending original DATA needs actual native retirement"
-    );
-    let provider = storage_preparation_provider(&context, runtime.lifecycle.clone()).unwrap();
-    let content_root = context.data_dir().dfs_dir().join("content");
-    // This original row was encountered after the normal factory's initial
-    // configuration pass. Advance its actual captured capsules through the
-    // shared owned DATA entry; preserve the canonical readiness fact.
-    let configuration_ready = runtime
-        .configuration_ready
-        .load(std::sync::atomic::Ordering::Acquire);
-    let prepare_original_data = || {
-        let prepared = runtime.prepare_captured_placement_goals(&goals, 4)?;
-        if matches!(prepared, DfsStoragePreparation::Pending { .. }) {
-            return Ok(prepared);
-        }
-        provider(&content_root, &DfsStoragePreparationScope::Content, 4)
-    };
     // A genuine current producer creates unrelated job B and retains its
     // ordinary named permit while old job A is restored. No holder row is made
     // by this fixture, and the closure utility retains no shared CP mutex.
@@ -370,9 +306,79 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
     );
     drop(store);
     drop(current);
+    let source = OriginalV0Job {
+        job_id: "original-placement-pending",
+        file_system_id: fs.as_str(),
+        path: "/users",
+        scope: "subtree",
+        state: "pending",
+        total_object_count: 0,
+        scanned_object_count: 0,
+        matched_object_count: 0,
+        updated_object_count: 0,
+        scheduled_repair_count: 0,
+        completed_repair_count: 0,
+        pending_repair_count: 0,
+        revision: 1,
+        created_at_unix_nanos: 1,
+        updated_at_unix_nanos: 1,
+    };
+    let (old_key, original) = if v1 {
+        let goal = seed_pending_v1_goal(&native, node, &runtime, source.job_id);
+        (goal.job.entry.key, goal.job.entry.value)
+    } else {
+        let old_key = format!(
+            "/dfs/filesystems/{fs}/placement-reconciliations/{}",
+            source.job_id
+        );
+        let original =
+            sinomo_core::object::serde_ext::to_bytes(&source, 1, sinomo_core::object::LengthMode::U32)
+                .unwrap();
+        // Converter fixture input only: faithful original wire enters actual native
+        // KV. No old DFS writer or successful synthetic authority receipt exists.
+        let write = runtime
+            .authority
+            .commit(KvTxnRequest::generated(KvTxn {
+                compares: vec![KvCompare::Missing {
+                    key: old_key.clone(),
+                }],
+                success: vec![KvOp::Put {
+                    key: old_key.clone(),
+                    value: original.clone(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            }))
+            .unwrap();
+        NativeImportAuthority::require_committed(&write).unwrap();
+        (old_key, original)
+    };
+    let goals = runtime
+        .authority
+        .capture_original_placement_goals(4)
+        .unwrap()
+        .unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].job.entry.value, original);
+    let required = runtime
+        .authority
+        .required_original_placement_sources(&goals)
+        .unwrap();
+    assert!(
+        !required.is_empty(),
+        "pending original DATA needs actual native retirement"
+    );
+    let configuration_ready = runtime.configuration_ready.load(std::sync::atomic::Ordering::Acquire);
+    let prepare_original_data = || -> Result<DfsStoragePreparation> {
+        let retained = runtime.authority.read_exact(std::slice::from_ref(&old_key))?.0;
+        Ok(if retained[0].entry.is_none() && runtime.authority.required_original_placement_sources(&goals)?.is_empty() {
+            DfsStoragePreparation::Ready
+        } else { DfsStoragePreparation::Pending { processed_records: 0 } })
+    };
     let key = goals[0].job.current_job_key().unwrap();
     native
         .with_current_placement_permit(node, &fs, &held_job.job_id, || {
+            runtime.schedule_placement_work().unwrap();
             // The actual unrelated current permit may defer storage admission.
             // Observe the normal attempt without claiming the import completed.
             match prepare_original_data() {
@@ -389,11 +395,20 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
             let pass = native
                 .maintenance_tick(node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
                 .unwrap();
-            assert!(
-                pass.outcome.is_ok(),
-                "ordinary maintenance must complete or defer while the original goal remains unimported: {:?}",
-                pass.outcome
-            );
+            if !v1 {
+                assert!(
+                    pass.outcome.is_ok(),
+                    "ordinary maintenance must complete or defer while the original goal remains unimported: {:?}",
+                    pass.outcome
+                );
+            } else {
+                // This queue itself still contains an original nested codec.
+                // Current readers must reject it until migration retires the
+                // row; they cannot treat it as executable current placement.
+                let original_entry = runtime.authority.read_exact(std::slice::from_ref(&old_key)).unwrap().0[0].entry.clone().unwrap();
+                assert_eq!(original_entry.value, original);
+                assert!(original_entry.decode::<sinomo_dfs::DfsPlacementReconciliationJob>().is_err());
+            }
             assert_eq!(pass.omitted_kv_event_count, 0);
             assert!(
                 !pass.committed_kv_events.iter().any(|event| {
@@ -412,26 +427,20 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
             );
         })
         .unwrap(); // The existing current producer releases the SAME exact handle.
-    let mut ready = false;
-    for _ in 0..4096 {
-        match prepare_original_data() {
-            Ok(DfsStoragePreparation::Ready) => {
-                ready = true;
-                break;
+    let mut changed = runtime.binding().readiness;
+    block_native(&native.runtime_handle(), async {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            match prepare_original_data()? {
+                DfsStoragePreparation::Ready => break,
+                DfsStoragePreparation::Pending { .. } => {}
             }
-            Ok(DfsStoragePreparation::Pending { .. })
-            | Err(MetadataBackendError::StoragePreparationPending { .. }) => {
-                // The SAME provider retains the owned source cursor/custody;
-                // actual native tasks continue on the shared Main executor.
-            }
-            Err(failed) => panic!("canonical source preparation rejected original DATA: {failed}"),
+            tokio::time::timeout_at(deadline, changed.changed()).await
+                .map_err(|_| error("managed original placement did not complete within the native deadline"))?
+                .map_err(error)?;
         }
-        std::thread::yield_now();
-    }
-    assert!(
-        ready,
-        "bounded canonical controller must finish actual per-scope imports after the real permit is released"
-    );
+        Ok::<_, MetadataBackendError>(())
+    }).unwrap();
     assert!(
         runtime
             .authority
@@ -487,6 +496,23 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
         assert_eq!(plan.source_cut.scope_shard, cut.scope_shard);
         let refs = crate::metadata::data_reservation_refs(&cut).unwrap();
         assert_eq!(refs.len(), 1);
+        assert!(cut.pending_operations.is_empty(), "original placement DATA must not become executable pending operations");
+        assert_eq!(cut.retained_placement_reservations.len(), 1);
+        let cohort = cut.namespace_count_cohort.as_ref().unwrap();
+        cohort.validate_bound_cut(&cut).unwrap();
+        let mut omitted = cut.clone();
+        omitted.retained_placement_reservations.clear();
+        assert!(cohort.validate_bound_cut(&omitted).is_err());
+        let mut repeated = cut.clone();
+        repeated.retained_placement_reservations.push(cut.retained_placement_reservations[0].clone());
+        assert!(crate::metadata::data_reservation_refs(&repeated).is_err());
+        assert!(cohort.validate_bound_cut(&repeated).is_err());
+        let mut changed = original_scope.capsules[0].clone();
+        changed["original_source_scope"]["shard_id"] = serde_json::json!("foreign-source");
+        assert!(crate::metadata::RetainedPlacementReservation::from_capsule(changed).is_err());
+        let mut changed = original_scope.capsules[0].clone();
+        changed["source_row"]["version"] = serde_json::json!(u64::MAX);
+        assert!(crate::metadata::RetainedPlacementReservation::from_capsule(changed).is_err());
         assert_eq!(
             refs[0],
             OriginalPlacementJob::verify_capsule(&original_scope.capsules[0]).unwrap()
@@ -524,7 +550,7 @@ fn pending_v0_goal_imports_actual_native8_sources_and_publishes_current_job() {
         published,
         "same normal current builder must durably reissue original pending DATA"
     );
-    drop(provider);
+    drop(changed);
     drop(runtime);
     drop(context);
     native.close().unwrap();
@@ -736,6 +762,8 @@ fn terminal_v1_without_routing_uses_actual_native_owner_and_shared_winning_recei
     config.file_system_id = sinomo_core::Id::generate();
     config.display_name = name.into();
     config.subtree_policies.clear();
+    config.catalog_generation = 0;
+    config.metadata_storage = None;
     store.put_file_system_config(&config).unwrap();
     assert!(
         store
@@ -1136,4 +1164,92 @@ fn owned_saved_attempts_repeat_custody_after_save_before_fanout_for_both_phases(
     drop(runtime);
     drop(context);
     native.close().unwrap();
+}
+
+type GoalHook = Arc<dyn Fn(&str, Option<&DfsNativeTxnCommit>) -> bool + Send + Sync>;
+static GOAL_HOOKS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, GoalHook>>> = std::sync::OnceLock::new();
+pub(in crate::authority) struct GoalHookGuard(PathBuf);
+impl Drop for GoalHookGuard {
+    fn drop(&mut self) {
+        GOAL_HOOKS.get().unwrap().lock().unwrap().remove(&self.0);
+    }
+}
+pub(in crate::authority) fn install_goal_hook(root: &Path, hook: GoalHook) -> GoalHookGuard {
+    assert!(GOAL_HOOKS.get_or_init(Default::default).lock().unwrap().insert(root.to_owned(), hook).is_none());
+    GoalHookGuard(root.to_owned())
+}
+pub(super) fn observe_goal_step(authority: &NativeImportAuthority, point: &str, commit: Option<&DfsNativeTxnCommit>) -> bool {
+    let hook = GOAL_HOOKS.get().and_then(|hooks| hooks.lock().unwrap().get(&authority.data_root).cloned());
+    hook.is_none_or(|hook| hook(point, commit))
+}
+
+pub(in crate::authority) fn seed_pending_v0_goal(owner: &MigrationOwner, job_id: &str) -> OriginalPlacementGoal {
+    let fs = sinomo_dfs::sifs_file_system_id();
+    let source = OriginalV0Job {
+        job_id, file_system_id: fs.as_str(), path: "/users", scope: "subtree", state: "pending",
+        total_object_count: 0, scanned_object_count: 0, matched_object_count: 0, updated_object_count: 0,
+        scheduled_repair_count: 0, completed_repair_count: 0, pending_repair_count: 0,
+        revision: 1, created_at_unix_nanos: 1, updated_at_unix_nanos: 1,
+    };
+    let key = format!("/dfs/filesystems/{fs}/placement-reconciliations/{job_id}");
+    let value = sinomo_core::object::serde_ext::to_bytes(&source, 1, sinomo_core::object::LengthMode::U32).unwrap();
+    let commit = owner.authority.commit(KvTxnRequest::generated(KvTxn {
+        compares: vec![KvCompare::Missing { key: key.clone() }],
+        success: vec![KvOp::Put { key: key.clone(), value, lease_id: None }], failure: Vec::new(),
+    })).unwrap();
+    NativeImportAuthority::require_committed(&commit).unwrap();
+    owner.authority.capture_original_placement_goals(256).unwrap().unwrap()
+        .into_iter().find(|goal| goal.job.entry.key == key).unwrap()
+}
+
+pub(in crate::authority) fn seed_pending_v1_goal(
+    native: &sinomo_dfs::test_support::DfsTestRuntime,
+    node: &sinomo_core::node::NodeId,
+    owner: &MigrationOwner,
+    job_id: &str,
+) -> OriginalPlacementGoal {
+    let fs = sinomo_dfs::sifs_file_system_id();
+    let mut client = native.client(node).unwrap();
+    let candidates = client.placement_content_candidates().unwrap();
+    let mut store = DfsControlPlaneStore::new(client.control_plane_client_mut().unwrap());
+    let config = store.get_file_system_config(&fs).unwrap().unwrap();
+    let current = sinomo_dfs::build_placement_reconciliation_job(
+        job_id.into(), &config, "/users".into(), sinomo_dfs::DfsPlacementScope::Subtree,
+        BTreeSet::new(), candidates, None,
+        u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap(),
+    ).unwrap();
+    drop(store); drop(client);
+    // Released initial-v1 nested configuration shape, using genuine native
+    // identities/candidates. This is source DATA, never an old writer/receipt.
+    let mut original = serde_json::to_value(&current).unwrap();
+    for field in ["retention_policies", "module_metadata", "metadata_format", "catalog_generation", "metadata_storage"] {
+        original["accepted_config"].as_object_mut().unwrap().remove(field);
+    }
+    if let Some(rules) = original["accepted_config"].get_mut("subtree_policies") {
+        for rule in rules.as_array_mut().unwrap() {
+            rule.as_object_mut().unwrap().remove("min_commit_replicas");
+            rule.as_object_mut().unwrap().remove("desired_replicas");
+        }
+    }
+    let key = sinomo_dfs::placement_reconciliation_key(&fs, job_id);
+    // Keep the producer's atomic job/queue/activity shape. Only the original
+    // nested job representation is source DATA; no partial queue is invented.
+    let plan = sinomo_dfs::DfsPlacementUpdatePlan::new(&config, &config, &current).unwrap();
+    let (captured, _) = owner.authority.read_exact(plan.keys()).unwrap();
+    let entries = captured.into_iter().map(|row| row.entry).collect::<Vec<_>>();
+    let queued_keys = plan.queued_job_keys(entries.clone()).unwrap().unwrap();
+    let queued = if queued_keys.is_empty() { Vec::new() }
+        else { owner.authority.read_exact(&queued_keys).unwrap().0.into_iter().map(|row| row.entry).collect() };
+    let mut transaction = plan.transaction(entries, queued).unwrap().unwrap();
+    let mut replaced = 0;
+    for operation in &mut transaction.success {
+        if let KvOp::Put { key: target, value, .. } = operation {
+            if target == &key { *value = sinomo_core::kv::encode_kv_value(&original).unwrap(); replaced += 1; }
+        }
+    }
+    assert_eq!(replaced, 1);
+    let commit = owner.authority.commit(KvTxnRequest::generated(transaction)).unwrap();
+    NativeImportAuthority::require_committed(&commit).unwrap();
+    owner.authority.capture_original_placement_goals(256).unwrap().unwrap()
+        .into_iter().find(|goal| goal.job.entry.key == key).unwrap()
 }

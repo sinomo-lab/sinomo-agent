@@ -27,18 +27,16 @@ fn capture(
     runtime
         .wait_published_configuration_current(receiver)
         .unwrap();
-    let mut reader = runtime.local_shard_copy_service(receiver, config).unwrap();
-    reader.refresh_control_plane_latest().unwrap();
-    let context = reader
-        .retained_metadata_replica_context(
-            &config.file_system_id,
-            &DfsMetadataShardId::new(&config.shard_id),
+    // Borrow the actual mounted Main projection without eagerly opening an
+    // unhydrated replica. This is the same production context reader and
+    // retains the receiver's actual node identity and maintenance admission.
+    let context = runtime.with_main_maintenance_service(receiver, |reader| {
+        reader.retained_metadata_replica_context(
+            &config.file_system_id, &DfsMetadataShardId::new(&config.shard_id),
         )
-        .unwrap()
-        .unwrap();
+    }).unwrap().unwrap().unwrap();
     assert_eq!(context.shard, *config);
     assert!(context.namespace_catalog.is_some());
-    drop(reader);
     let image = runtime
         .node_metadata(&config.primary_node_id)
         .unwrap()

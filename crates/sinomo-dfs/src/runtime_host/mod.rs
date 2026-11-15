@@ -2062,11 +2062,11 @@ pub fn open_dfs_runtime_service(
 pub fn open_dfs_runtime_content_store(
     data_dir: &SinomoDataDir,
 ) -> Result<LocalContentStore, DfsRuntimeError> {
-    if let Some(owner) = daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(data_dir))? {
-        owner.open_native_content()
-    } else {
-        LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(Into::into)
-    }
+    // A missing managed live root may be an interrupted owned publication.
+    // Only the actual mounted owner can select fresh initialization or ask its
+    // preparation provider to recover it. Unmanaged DATA uses LocalContentStore.
+    require_daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(data_dir))?
+        .open_native_content()
 }
 
 /// sinomo:kv-configuration: Discover configured membership and capability offers through the active native owner's bounded configuration client.
@@ -3486,6 +3486,7 @@ pub fn owned_storage_import_control_plane_client(
 }
 
 pub use maintenance_host::{queue_namespace_reconciliation_work, wake_namespace_reconciliation};
+pub(crate) use maintenance_host::release_idle_namespace_reconciliation_work;
 
 #[cfg(test)]
 pub(crate) mod native_request_outcome_test;

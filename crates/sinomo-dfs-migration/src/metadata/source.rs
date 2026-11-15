@@ -659,7 +659,7 @@ fn next_inner(root: &Path, cursor: &mut SourceCursor) -> Result<Option<SourceRec
                                 // missing-custody rejection; do not current-
                                 // decode them before that boundary.
                                 let generation = u16::from_le_bytes([bytes[4], bytes[5]]);
-                                if matches!(generation, 8 | 9) {
+                                if matches!(generation, 8 | 9 | 11) {
                                     crate::legacy_wire::validate_original_v7_record(record)?;
                                 } else {
                                     let current: sinomo_dfs::DfsPreparedOperationRecord =

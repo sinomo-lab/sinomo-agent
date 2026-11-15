@@ -102,16 +102,6 @@ enum InlineOperation {
     },
     Reserve(ContentStoreReservationRecord),
     Release(ContentStoreReservationIdentity),
-    /// A retained repair payload root of the removed original-repair
-    /// custody. Records written before its removal still decode; they retain
-    /// nothing, so content GC reclaims what no other root holds, and
-    /// compaction drops them.
-    RetainRepairPayload(RepairPayloadRoot),
-    ReleaseRepairPayload(RepairPayloadRoot),
-    RestoreRepairPayload {
-        root: RepairPayloadRoot,
-        released: bool,
-    },
     DeleteVersion {
         object_id: String,
         version: String,
@@ -219,7 +209,7 @@ struct InlineResidentState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct InlineFileIdentity {
+pub(in crate::content_store) struct InlineFileIdentity {
     length: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
@@ -232,11 +222,14 @@ struct InlineFileIdentity {
 }
 
 impl InlineFileIdentity {
-    fn read(path: &Path) -> Result<Self> {
+    pub(in crate::content_store) fn read(path: &Path) -> Result<Self> {
         let metadata = fs::metadata(path).map_err(|source| ContentStoreError::Io {
             path: path.to_owned(),
             source,
         })?;
+        Self::from_metadata(&metadata)
+    }
+    pub(in crate::content_store) fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
         if !metadata.is_file() {
             return Err(inline_error("active segment is not a regular file"));
         }
@@ -820,13 +813,6 @@ fn validate_operation(
                 ));
             }
         }
-        InlineOperation::RetainRepairPayload(_)
-        | InlineOperation::ReleaseRepairPayload(_)
-        | InlineOperation::RestoreRepairPayload { .. } => {
-            if payload_bytes != 0 {
-                return Err(inline_error("control frame has payload"));
-            }
-        }
         InlineOperation::RemoveBlob { content_hash } => {
             if payload_bytes != 0 {
                 return Err(inline_error("control frame has payload"));
@@ -960,9 +946,6 @@ fn apply_operation(
         }
         // A retained repair payload root of the removed custody retains
         // nothing.
-        InlineOperation::RetainRepairPayload(_)
-        | InlineOperation::ReleaseRepairPayload(_)
-        | InlineOperation::RestoreRepairPayload { .. } => {}
         InlineOperation::DeleteVersion {
             object_id,
             version,
@@ -1338,6 +1321,42 @@ fn append_operation(
 }
 
 impl LocalContentStore {
+    /// Inspect only the admitted current header/catalog identity. This neither
+    /// initializes a missing layout nor replays frames or calls preparation.
+    pub fn validate_current_layout(&self) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        let sentinel = self.inline_sentinel_unlocked()?.ok_or_else(||
+            inline_error("current content layout has no incarnation header"))?;
+        read_catalog_for_format(&self.root, &sentinel.store_incarnation, INLINE_FORMAT_VERSION)?;
+        Ok(())
+    }
+
+    /// Re-certify current layout durability after an interrupted publication.
+    /// This grants neither authority nor inventory coverage. It never rewrites
+    /// the sentinel (including its newer causal epoch), creates a root, calls
+    /// preparation, or replays content. Ordinary reads/stat do not use it.
+    pub fn certify_current_layout_durability(&self, expected_incarnation: &str) -> Result<()> {
+        let _owner = self.content_mutation_guard()?;
+        let sentinel = self.inline_sentinel_unlocked()?.ok_or_else(||
+            inline_error("current layout durability has no existing sentinel"))?;
+        if sentinel.store_incarnation != expected_incarnation {
+            return Err(inline_error("current layout durability changed its original incarnation"));
+        }
+        let catalog = read_catalog_for_format(&self.root, expected_incarnation, INLINE_FORMAT_VERSION)?;
+        let path = self.content_reservation_batch_sentinel_path();
+        let mut file = fs::OpenOptions::new().read(true).write(true).open(&path)
+            .map_err(|source| ContentStoreError::Io { path: path.clone(), source })?;
+        durable_file::sync_open_file(&mut file, &path, durable_file::DurableFileSync::All)
+            .map_err(content_durable_file_error)?;
+        sync_dir(path.parent().expect("sentinel parent"))?;
+        sync_dir(&self.root.join("content-reservations"))?;
+        certify_catalog(&self.root, &catalog)?;
+        if self.inline_sentinel_unlocked()?.as_ref() != Some(&sentinel) {
+            return Err(inline_error("current sentinel changed during durability certification"));
+        }
+        Ok(())
+    }
+
     pub(in crate::content_store) fn validate_owner_sentinel(
         &self,
         sentinel: &ContentStoreReservationBatchSentinel,

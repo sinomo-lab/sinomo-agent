@@ -102,8 +102,10 @@ writers that do not share the count contract are unsupported.
 
 ## Existing metadata
 
-Count initialization is explicit maintenance owned by the migration and native
-import mechanisms. It requires a complete stable authoritative namespace cut,
+Count initialization belongs to the single migration owner and native import
+mechanisms. Background discovery covers cold metadata; demand can prioritize
+the same conversion without computing counts inside stat. Initialization requires
+a complete stable authoritative namespace cut,
 not an independent count of each shard's local copies. Current assignments
 identify contributing entries; stale ancestor copies and physical source-eviction
 records must not be counted again.

@@ -1153,9 +1153,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let rejection = if rejection.is_none() {
             self.validate_metadata_snapshot_against_local_state(
                 &command,
-                permit
-                    .as_ref()
-                    .and_then(DfsMetadataReplicaIngestPermit::floor_epoch_scope),
+                permit.as_ref(),
             )?
                 .map(DfsMetadataRejection::from)
         } else {
@@ -1243,14 +1241,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn validate_metadata_snapshot_against_local_state(
         &mut self,
         command: &DfsMetadataSnapshotInstallCommand,
-        floor_epoch_scope: Option<u64>,
+        permit: Option<&DfsMetadataReplicaIngestPermit>,
     ) -> Result<Option<String>, DfsError> {
         if let Some(backend) = self.metadata_backend.as_deref()
             && let Some(reason) =
                 crate::metadata_replication::validate_dfs_metadata_snapshot_install_state(
                     backend,
                     command,
-                    floor_epoch_scope,
+                    permit,
                 )?
         {
             return Ok(Some(reason));

@@ -502,6 +502,7 @@ fn current_tables_snapshot_once<'a>(
                     replay_incremental_table_suffix(root, &path, table_log_offset, &mut tables)?;
                 let state = DfsMetadataTableState {
                     tables,
+                    generation: Some(crate::storage_generation::read_generation(root)?.identity),
                     table_log_offset: replay.offset,
 
                     materialized_through_sequence: max_optional_sequence(
@@ -710,7 +711,8 @@ mod tests {
 
     fn file_system(label: &str, display_name_bytes: usize) -> DfsFileSystem {
         DfsFileSystem {
-            namespace_count_activation: None,
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named(format!("fs_{label}"))
@@ -722,6 +724,7 @@ mod tests {
     }
 
     fn persist_genesis(root: &Path) {
+        crate::metadata_candidate::stage_current_test_generation(root, "shard-test");
         let proof = dfs_metadata_prefix_proof_genesis(&DfsMetadataShardId::new("shard-test"));
         persist_metadata_table_snapshot(root, &DfsMetadataTables::default(), Some(0), Some(&proof))
             .unwrap();
@@ -1088,27 +1091,30 @@ mod tests {
     fn preprobe_same_generation_shrink_fences_native_writer_and_inspection_refresh() {
         use crate::DfsMetadataBackend;
 
-        let root = sinomo_testdir::TestDir::new("metadata-native-preprobe-shrink");
-        let shard_id = DfsMetadataShardId::new("shard-test");
-        let mut writer =
-            crate::LocalSobjMetadataBackend::new(shard_id.clone(), root.path()).unwrap();
-        let first = file_system("native", 1);
-        append_file_system(root.path(), 1, first.clone());
-        let mut second = first.clone();
-        second.display_name = "updated native display".into();
-        append_file_system(root.path(), 2, second.clone());
-        drop(writer);
-        let mut writer = crate::LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("shard-test"),
-            root.path(),
-        )
-        .unwrap();
-        let mut inspector =
-            crate::LocalSobjMetadataBackend::open_for_inspection(shard_id, root.path()).unwrap();
+        let (mut native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+            "metadata-native-preprobe-shrink", 1,
+        ).unwrap();
+        let node = nodes[0].clone();
+        let shard_id = DfsMetadataShardId::new("root");
+        {
+            let mut client = native.client(&node).unwrap();
+            client.posix_write_file(
+                "/preprobe-file", b"original committed bytes",
+                crate::DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            ).unwrap();
+        }
+        let second = native.file_system();
+        let root = crate::local_dfs_metadata_shard_path(native.data_dir(&node), &shard_id);
+        native.stop_node(&node).unwrap();
+        let mut writer = crate::LocalSobjMetadataBackend::new(shard_id.clone(), &root).unwrap();
+        let mut inspector = crate::LocalSobjMetadataBackend::open_for_inspection(
+            shard_id.clone(), &root,
+        ).unwrap();
+        assert!(fs::metadata(metadata_table_path(&root)).unwrap().len() > 0);
         let journal_head = writer.journal_last_sequence();
         OpenOptions::new()
             .write(true)
-            .open(metadata_table_path(root.path()))
+            .open(metadata_table_path(&root))
             .unwrap()
             .set_len(0)
             .unwrap();
@@ -1120,7 +1126,7 @@ mod tests {
         attempted.display_name = "must not be published".into();
         assert!(
             matches!(writer.prepare_operation(crate::DfsPreparedOperationPayload::for_metadata_effects(crate::DfsPreparedOperationScope {
-                file_system_id: attempted.file_system_id.clone(), shard_id: DfsMetadataShardId::new("shard-test"), owner_epoch: 1,
+                file_system_id: attempted.file_system_id.clone(), shard_id: shard_id.clone(), owner_epoch: 1,
                 operation_id: "must-not-append".into(),
             }, Vec::new(), Vec::new(), vec![crate::DfsPreparedMetadataEffect::PutFileSystem { file_system: attempted }], time::OffsetDateTime::UNIX_EPOCH).unwrap(), None), Err(MetadataBackendError::Serde(ref message))
             if message.contains("without a generation change"))
@@ -1130,6 +1136,9 @@ mod tests {
             journal_head,
             "corrupt table cursor must stop the writer before a new journal effect"
         );
+        drop(inspector);
+        drop(writer);
+        native.close().unwrap();
     }
 
     #[test]

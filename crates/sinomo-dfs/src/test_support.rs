@@ -579,3 +579,23 @@ pub fn native_replica_journal_command(
         false,
     )
 }
+
+/// Actual local OS data-owner lease for explicit standalone component tests.
+/// This registers only the existing weak owner slot: no native host, cluster
+/// client, preparation result, source certificate or storage authority is made.
+pub struct StandaloneDataOwnerFixture {
+    _owner: std::sync::Arc<crate::runtime_host::DfsDataOwnerLock>,
+}
+impl StandaloneDataOwnerFixture {
+    pub fn acquire(context: &sinomo_module::ComponentContext) -> Result<Self, String> {
+        if context.cluster_access().is_some()
+            || context.host_role() == sinomo_module::ComponentHostRole::Shadow
+            || crate::runtime_host::registered_component_cluster(context).map_err(|e| e.to_string())?.is_some() {
+            return Err("standalone owner fixture requires an actual non-native context".into());
+        }
+        let paths = crate::runtime_host::DfsRuntimePaths::for_host_role(context.data_dir(), context.host_role());
+        let owner = std::sync::Arc::new(crate::runtime_host::DfsDataOwnerLock::acquire(&paths).map_err(|e| e.to_string())?);
+        crate::runtime_host::register_daemon_dfs_data_owner_lock(&paths, &owner).map_err(|e| e.to_string())?;
+        Ok(Self { _owner: owner })
+    }
+}

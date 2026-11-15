@@ -10,6 +10,9 @@ thread_local! {
 }
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
+    fn activate_native_genesis_storage_generation(&mut self, shard: &crate::DfsMetadataShardConfig) -> Result<()> {
+        LocalSobjMetadataBackend::activate_native_genesis_storage_generation(self, shard)
+    }
     #[cfg(test)]
     fn retain_native_prefix_history(
         &mut self,round:&crate::node_transport::OwnedNativeMetadataPrefixRound,
@@ -1790,7 +1793,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
-        Ok(LocalSobjMetadataBackend::export_table_snapshot(self))
+        LocalSobjMetadataBackend::export_table_snapshot(self)
     }
 
     fn export_shard_snapshot_image(
@@ -1808,7 +1811,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<DfsMetadataTableSnapshot>> {
         if shard_id == &self.shard_id {
-            return Ok(Some(LocalSobjMetadataBackend::export_table_snapshot(self)));
+            return Ok(Some(LocalSobjMetadataBackend::export_table_snapshot(self)?));
         }
         Ok(None)
     }

@@ -25,10 +25,10 @@ pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reco
 /// nodes must upgrade before participating in a shard.
 pub const DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY: &str =
     "dfs.metadata.prepared-operation.v7";
-/// Supports maintained canonical namespace counts and complete-cohort activation.
+/// Supports current storage generation headers and native Pending/Active admission.
 /// This advertises binary support, independently of any particular DATA's readiness.
-pub const DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY: &str =
-    "dfs.metadata.namespace-counts.v1";
+pub const DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY: &str =
+    "dfs.metadata.storage-generation.v1";
 /// Supports shard metadata write sets: the write-set record beside the shard
 /// configuration, the durable member epoch fence, epoch-scoped
 /// acknowledgement floors and acknowledgement views. A shard switches to the
@@ -58,7 +58,7 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new(MODULE_NATIVE_RUST_ADMIN_CAPABILITY).expect("static capability"),
         CapabilityName::new(MODULE_HOT_UNLOAD_ADMIN_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
-        CapabilityName::new(DFS_METADATA_NAMESPACE_COUNTS_V1_CAPABILITY)
+        CapabilityName::new(DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY)
             .expect("valid maintained namespace-count capability"),
         CapabilityName::new(DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY)
             .expect("valid prepared-operation protocol capability"),

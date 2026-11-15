@@ -23,6 +23,15 @@ const MARKER_BYTES: &[u8] = b"dfs-local-state-converted-v8\n";
 fn error(value: impl std::fmt::Display) -> MetadataBackendError {
     MetadataBackendError::Serde(format!("local DFS storage conversion: {value}"))
 }
+pub(crate) fn current(root: &Path) -> Result<bool> {
+    if !root.exists() { return Ok(true); }
+    let marker = root.join(MARKER);
+    if !marker.exists() { return Ok(false); }
+    if bounded_read(&marker)? != MARKER_BYTES {
+        return Err(error("local storage conversion marker is malformed"));
+    }
+    Ok(true)
+}
 #[derive(Clone, Copy)]
 enum Kind {
     Pins,

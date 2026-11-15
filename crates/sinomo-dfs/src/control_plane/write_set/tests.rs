@@ -29,7 +29,8 @@ fn shard(primary: &NodeId, replicas: &[&NodeId], epoch: u64) -> DfsMetadataShard
 
 fn file_system_config(rules: Vec<DfsSubtreePolicy>) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
-        namespace_count_activation: None,
+        catalog_generation: 0,
+        metadata_storage: None,
         file_system_id: fs(),
         display_name: "sifs".into(),
         owner_node_id: node("node_ws_a"),
@@ -803,4 +804,38 @@ fn write_set_record_round_trips_and_rejects_an_unknown_format() {
         metadata_shard_write_set_state(&fixture.cut().shard, Some(&bytes)),
         DfsMetadataShardWriteSetState::Unreadable { .. }
     ));
+}
+
+#[test]
+fn pending_storage_transition_blocks_write_set_changes_and_prebuilt_requests() {
+    // Structural transaction model; native filesystem transition admission is
+    // exercised separately against the registered cluster owner.
+    let mut fixture = Fixture::new();
+    let cut = fixture.cut();
+    let initial = fixture.nodes[..3].iter().cloned().collect();
+    let prebuilt = build_metadata_write_set_switch(&cut, &initial).unwrap();
+    let mut config = cut.file_system_config().unwrap().unwrap();
+    config.metadata_storage = Some(crate::DfsMetadataStorageState::PendingTransition {
+        source_activation: None,
+        transition_id: "write-set-transition".into(), source_catalog_generation: config.catalog_generation,
+        target_generation: "next-generation".into(), target_format: 12,
+        expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
+    });
+    put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    assert!(!fixture.apply(&prebuilt), "a request built before Pending cannot cross its exact config compare");
+    assert!(matches!(build_metadata_write_set_switch(&fixture.cut(), &initial),
+        Err(KvError::Serialization { detail }) if detail.contains("reserved")));
+    config.metadata_storage = None;
+    put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    fixture.switch_all();
+    config.metadata_storage = Some(crate::DfsMetadataStorageState::PendingTransition {
+        source_activation: None,
+        transition_id: "write-set-transition".into(), source_catalog_generation: config.catalog_generation,
+        target_generation: "next-generation".into(), target_format: 12,
+        expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
+    });
+    put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    let cut = fixture.cut();
+    assert!(matches!(build_metadata_write_set_shrink(&cut, &fixture.nodes[2], &bounds(2, 3)),
+        Err(KvError::Serialization { detail }) if detail.contains("reserved")));
 }

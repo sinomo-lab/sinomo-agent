@@ -1,4 +1,4 @@
-//! Read-only inspection of original native generation-8, generation-9 and generation-10 images.
+//! Read-only inspection of original native generation-8 through generation-11 images.
 //! Its hashes describe retained DATA; native recovery separately replays the
 //! exact saved plan and committed activation request. DFS never opens this image.
 use super::{Result, error, source_proof};
@@ -73,6 +73,9 @@ pub(super) fn payload_data(mut value: Value) -> Result<DfsPreparedOperationPaylo
     {
         for effect in effects {
             match effect.get("type").and_then(Value::as_str) {
+                Some("put-file-system") if effect["file_system"].get("namespace_count_activation").is_some() => {
+                    effect["file_system"] = serde_json::to_value(legacy_wire::native11_file_system_data(effect["file_system"].clone())?).map_err(error)?;
+                }
                 Some("put-namespace-job") => {
                     effect["job"] = serde_json::to_value(legacy_wire::normalize_namespace_job(
                         effect["job"].clone(),
@@ -160,7 +163,10 @@ impl Serialize for Prepares<'_> {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for row in self.0 {
-            seq.serialize_element(&legacy_wire::Native8Prepare(row))?;
+            if let Ok(record) = serde_json::from_value::<DfsPreparedOperationRecord>(row.clone())
+                && serde_json::to_value(&record).map_err(serde::ser::Error::custom)? == *row {
+                seq.serialize_element(&record)?;
+            } else { seq.serialize_element(&legacy_wire::Native8Prepare(row))?; }
         }
         seq.end()
     }
@@ -172,6 +178,8 @@ struct Tables<'a> {
     jobs: &'a [Value],
     prepares: &'a [Value],
     generation: u16,
+    original_file_systems: &'a [Value],
+    owned_snapshot_order: bool,
 }
 impl Serialize for Tables<'_> {
     fn serialize<S: serde::Serializer>(
@@ -188,11 +196,21 @@ impl Serialize for Tables<'_> {
                 }
             };
         }
-        map.serialize_entry(
-            "prepared_operation_evictions",
-            &t.prepared_operation_evictions,
-        )?;
-        rows!(file_systems);
+        if !self.owned_snapshot_order {
+            map.serialize_entry("prepared_operation_evictions", &t.prepared_operation_evictions)?;
+        }
+        if self.generation == 11 && !self.original_file_systems.is_empty() {
+            struct OriginalFs<'a>(&'a [Value]);
+            impl Serialize for OriginalFs<'_> {
+                fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                    use serde::ser::SerializeSeq;
+                    let mut out = serializer.serialize_seq(Some(self.0.len()))?;
+                    for row in self.0 { out.serialize_element(&legacy_wire::Native11FileSystem(row))?; }
+                    out.end()
+                }
+            }
+            map.serialize_entry("file_systems", &OriginalFs(self.original_file_systems))?;
+        } else { rows!(file_systems); }
         rows!(objects);
         rows!(file_system_objects);
         rows!(paths);
@@ -216,7 +234,9 @@ impl Serialize for Tables<'_> {
         rows!(advisory_lock_states);
         rows!(namespace_transaction_receipts);
         if self.generation >= 10 {
-            rows!(prepared_operations_v7);
+            if self.generation == 11 && !self.prepares.is_empty() { map.serialize_entry("prepared_operations_v7", &Prepares(self.prepares))?; }
+            else { rows!(prepared_operations_v7); }
+            if self.owned_snapshot_order { map.serialize_entry("prepared_operation_evictions", &t.prepared_operation_evictions)?; }
             rows!(namespace_jobs);
         } else if !self.prepares.is_empty() {
             map.serialize_entry("prepared_operations_v7", &Prepares(self.prepares))?;
@@ -251,7 +271,7 @@ pub(super) fn read_snapshot(
         MigrationStreamReader::from_file(file.try_clone().map_err(error)?).map_err(error)?;
     let header: Header = serde_ext::from_bytes(&reader.header).map_err(error)?;
     let generation = header.format_version;
-    if !matches!(generation, 8 | 9 | 10) {
+    if !matches!(generation, 8 | 9 | 10 | 11) {
         return Err(error("unknown original native image generation"));
     }
     native_document(&reader.header, generation)?;
@@ -264,6 +284,7 @@ pub(super) fn read_snapshot(
     let mut tables = DfsMetadataTableSnapshotTables::default();
     let mut jobs = BTreeMap::new();
     let mut prepares = BTreeMap::new();
+    let mut original_file_systems = BTreeMap::new();
     while let Some(bytes) = reader
         .next_record(MAX_RECORD_BYTES as usize)
         .map_err(error)?
@@ -275,6 +296,14 @@ pub(super) fn read_snapshot(
                 // Deserialize the complete current row after the one owned old
                 // job-stage adaptation. Unknown operation fields remain errors.
                 let mut current_op = op.clone();
+                if generation == 11 && op["type"].as_str() == Some("put-file-system") {
+                    let original = op["file_system"].clone();
+                    let projected = legacy_wire::native11_file_system_data(original.clone())?;
+                    if original_file_systems.insert(projected.file_system_id.clone(), original).is_some() {
+                        return Err(error("native11 snapshot repeats a filesystem"));
+                    }
+                    current_op["file_system"] = serde_json::to_value(projected).map_err(error)?;
+                }
                 if op["type"].as_str() == Some("put-namespace-job") {
                     let original = op["job"].clone();
                     legacy_wire::validate_original_source_job(&original)?;
@@ -338,7 +367,7 @@ pub(super) fn read_snapshot(
             }
             Record::Prepared { record } => {
                 let id = validate_prepare(&record)?;
-                if generation >= 9 {
+                if generation >= 9 && generation != 11 {
                     let original: DfsPreparedOperationRecord =
                         serde_json::from_value(record.clone()).map_err(error)?;
                     original.validate()?;
@@ -352,7 +381,7 @@ pub(super) fn read_snapshot(
                 }
             }
             Record::ReceiptWithdrawal { record } => {
-                if generation != 10 {
+                if generation < 10 {
                     return Err(error(
                         "receipt withdrawals require original native generation 10",
                     ));
@@ -386,7 +415,8 @@ pub(super) fn read_snapshot(
         tables: T,
     }
     let mut semantic = blake3::Hasher::new();
-    if generation == 8 || generation == 10 {
+    let original_file_systems = original_file_systems.into_values().collect::<Vec<_>>();
+    if generation == 8 || generation >= 10 {
         serde_json::to_writer(
             &mut semantic,
             &Semantic {
@@ -397,6 +427,8 @@ pub(super) fn read_snapshot(
                     jobs: &jobs,
                     prepares: &prepares,
                     generation,
+                    original_file_systems: &original_file_systems,
+                    owned_snapshot_order: false,
                 },
             },
         )
@@ -414,7 +446,21 @@ pub(super) fn read_snapshot(
         )
         .map_err(error)?;
     }
-    let fingerprint = format!("blake3:{}", semantic.finalize().to_hex());
+    let mut fingerprint = format!("blake3:{}", semantic.finalize().to_hex());
+    if fingerprint != header.semantic_state_fingerprint && generation >= 10 {
+        // The original native writer used BorrowedMetadataTableSnapshotTables;
+        // original converter snapshots used the owned DTO field ordering. Both
+        // are exact historical checksums, not a normalized replacement hash.
+        let mut owned_hash = blake3::Hasher::new();
+        serde_json::to_writer(&mut owned_hash, &Semantic {
+            format_version: generation,
+            materialized_through_sequence: header.materialized_through_sequence,
+            tables: Tables { current_data: &tables, jobs: &jobs, prepares: &prepares,
+                generation, original_file_systems: &original_file_systems,
+                owned_snapshot_order: true },
+        }).map_err(error)?;
+        fingerprint = format!("blake3:{}", owned_hash.finalize().to_hex());
+    }
     if fingerprint != header.semantic_state_fingerprint {
         return Err(error("prior native image semantic checksum mismatch"));
     }
@@ -837,7 +883,15 @@ mod count_native10_tests {
         let proof =
             source_proof::conversion_base(0, "original-native10-codec", "original-unknown-count");
         let current_root = temp.join("current-data");
-        let writer = DfsMetadataCandidateWriter::open(&current_root).unwrap();
+        let writer = DfsMetadataCandidateWriter::open_generation(&current_root,
+            DfsMetadataGenerationIdentity {
+                file_system_id: sifs_file_system_id(),
+                shard_id: DfsMetadataShardId::new("root"),
+                generation: "original-native10-codec-data".into(),
+                origin: DfsMetadataGenerationOrigin::StorageTransition {
+                    transition_id: "original-native10-codec-data".into(),
+                },
+            }).unwrap();
         writer.write(tables.clone(), proof.clone()).unwrap();
         drop(writer);
         #[derive(Serialize)]
@@ -856,6 +910,8 @@ mod count_native10_tests {
                     current_data: &tables,
                     jobs: &[],
                     prepares: &[],
+                    original_file_systems: &[],
+                    owned_snapshot_order: false,
                     generation: 10,
                 },
             },
@@ -902,5 +958,42 @@ mod count_native10_tests {
         changed[index] ^= 1;
         std::fs::write(&path, changed).unwrap();
         assert!(read_snapshot(&source).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_native11_tests {
+    #[test]
+    #[ignore = "requires an immutable original native11 DATA directory"]
+    fn inspect_original_native11_without_rewriting_source() {
+        let root = std::path::PathBuf::from(std::env::var_os("SINOMO_ORIGINAL_NATIVE11_ROOT").expect("original source root"));
+        let snapshot = root.join("records/tables/snapshot.sobj");
+        let before = std::fs::read(&snapshot).unwrap();
+        let (identity, captured) = super::read_snapshot(&root).unwrap();
+        assert_eq!(captured.format_version, 11);
+        assert_eq!(identity.prefix_proof, captured.prefix_proof);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+        eprintln!("verified original native11 checkpoint sequence={} objects={} filesystem_rows={}", captured.materialized_through_sequence, captured.tables.objects.len(), captured.tables.file_systems.len());
+        let inventory = super::super::source::discover(&root).unwrap();
+        let mut cursor = super::super::source::SourceCursor::new(inventory.clone());
+        let mut preparations = 0usize;
+        while let Some(record) = super::super::source::next(&root, &mut cursor).unwrap() {
+            match record {
+                super::super::source::SourceRecord::JournalFrame { entry, .. }
+                    if entry["mutation"]["type"] == "prepare-operation-v7" => {
+                    crate::legacy_wire::validate_original_v7_record(&entry["mutation"]["record"]).unwrap();
+                    preparations += 1;
+                }
+                super::super::source::SourceRecord::SnapshotRow { table, row, .. }
+                    if table == "prepared_operations_v7" => {
+                    crate::legacy_wire::validate_original_v7_record(&row).unwrap();
+                    preparations += 1;
+                }
+                _ => {}
+            }
+        }
+        inventory.verify(&root).unwrap();
+        assert!(preparations > 0, "fixture must exercise original native journal preparations");
+        eprintln!("validated {preparations} original journal preparations without rewriting source");
     }
 }

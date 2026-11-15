@@ -22,6 +22,7 @@ pub(crate) const SNAPSHOT_FORMAT: u16 =
 #[serde(deny_unknown_fields)]
 struct SnapshotHeader {
     format_version: u16,
+    generation: crate::DfsMetadataGenerationIdentity,
     materialized_through_sequence: u64,
     prefix_proof: DfsMetadataPrefixProof,
     semantic_state_fingerprint: String,
@@ -269,7 +270,9 @@ fn header(
     tables: &DfsMetadataTables,
     sequence: u64,
     proof: &DfsMetadataPrefixProof,
+    generation: &crate::DfsMetadataGenerationIdentity,
 ) -> Result<SnapshotHeader> {
+    generation.validate()?;
     if !proof.is_well_formed() || proof.journal_sequence != sequence {
         return Err(error(
             "current snapshot requires its exact certified journal prefix",
@@ -277,6 +280,7 @@ fn header(
     }
     Ok(SnapshotHeader {
         format_version: SNAPSHOT_FORMAT,
+        generation: generation.clone(),
         materialized_through_sequence: sequence,
         prefix_proof: proof.clone(),
         semantic_state_fingerprint: snapshot_semantic_fingerprint(tables, Some(sequence))?,
@@ -365,6 +369,7 @@ pub(crate) fn decode_snapshot_image_with_descriptor(
     }
     let mut reader = MigrationStreamReader::from_file(file).map_err(error)?;
     let stored: SnapshotHeader = serde_ext::from_bytes(&reader.header).map_err(error)?;
+    stored.generation.validate()?;
     if stored.format_version != SNAPSHOT_FORMAT
         || !stored.prefix_proof.is_well_formed()
         || stored.prefix_proof.journal_sequence != stored.materialized_through_sequence
@@ -373,6 +378,7 @@ pub(crate) fn decode_snapshot_image_with_descriptor(
     }
     if expected.is_some_and(|expected| {
         expected.format_version != stored.format_version
+            || expected.generation != stored.generation
             || expected.materialized_through_sequence != stored.materialized_through_sequence
             || expected.semantic_state_fingerprint != stored.semantic_state_fingerprint
             || expected.prefix_proof != stored.prefix_proof
@@ -399,6 +405,7 @@ pub(crate) fn decode_snapshot_image_with_descriptor(
         &tables,
         stored.materialized_through_sequence,
         &stored.prefix_proof,
+        &stored.generation,
     )? != stored
     {
         return Err(MetadataBackendError::replica_diverged(
@@ -407,6 +414,7 @@ pub(crate) fn decode_snapshot_image_with_descriptor(
     }
     let descriptor = DfsMetadataSnapshotImageDescriptor {
         format_version: stored.format_version,
+        generation: stored.generation.clone(),
         materialized_through_sequence: stored.materialized_through_sequence,
         semantic_state_fingerprint: stored.semantic_state_fingerprint,
         prefix_proof: stored.prefix_proof.clone(),
@@ -419,6 +427,7 @@ pub(crate) fn decode_snapshot_image_with_descriptor(
     Ok((
         DfsMetadataTableState {
             tables,
+            generation: Some(stored.generation),
             materialized_through_sequence: Some(stored.materialized_through_sequence),
             prefix_proof: Some(stored.prefix_proof),
             snapshot_format_version: Some(SNAPSHOT_FORMAT),
@@ -442,6 +451,7 @@ pub(crate) fn verify_snapshot_stream_identity(
     let mut reader = MigrationStreamReader::from_file(file).map_err(error)?;
     let stored: SnapshotHeader = serde_ext::from_bytes(&reader.header).map_err(error)?;
     if stored.format_version != expected.format_version
+        || stored.generation != expected.generation
         || stored.materialized_through_sequence != expected.materialized_through_sequence
         || stored.semantic_state_fingerprint != expected.semantic_state_fingerprint
         || stored.prefix_proof != expected.prefix_proof
@@ -526,6 +536,7 @@ impl StagedSnapshot {
             len: descriptor.total_size_bytes,
             native_header: SnapshotHeader {
                 format_version: descriptor.format_version,
+                generation: descriptor.generation.clone(),
                 materialized_through_sequence: descriptor.materialized_through_sequence,
                 prefix_proof: descriptor.prefix_proof.clone(),
                 semantic_state_fingerprint: descriptor.semantic_state_fingerprint.clone(),
@@ -543,6 +554,7 @@ impl StagedSnapshot {
     ) -> crate::metadata_records::DfsMetadataSnapshotImageDescriptor {
         crate::metadata_records::DfsMetadataSnapshotImageDescriptor {
             format_version: self.native_header.format_version,
+            generation: self.native_header.generation.clone(),
             materialized_through_sequence: self.native_header.materialized_through_sequence,
             semantic_state_fingerprint: self.native_header.semantic_state_fingerprint.clone(),
             prefix_proof: self.native_header.prefix_proof.clone(),
@@ -588,7 +600,8 @@ pub(crate) fn stage_snapshot(
             .ok_or_else(|| error("snapshot has no parent"))?,
     )
     .map_err(error)?;
-    let native_header = header(tables, sequence, proof)?;
+    let generation = crate::storage_generation::read_generation(root)?;
+    let native_header = header(tables, sequence, proof, &generation.identity)?;
     let mut stage = StagedSnapshot {
         path,
         len: 0,
@@ -642,7 +655,8 @@ mod verified_copy_tests {
             &root,
         )
         .unwrap();
-        let snapshot = backend.export_table_snapshot();
+        let snapshot = backend.export_table_snapshot().unwrap();
+        let generation = crate::inspect_metadata_storage_generation(&root).unwrap().identity;
         let sequence = snapshot.materialized_through_sequence;
         let proof = snapshot.prefix_proof.clone();
         let tables = crate::metadata_table_store::metadata_tables_from_table_snapshot(
@@ -651,6 +665,7 @@ mod verified_copy_tests {
         )
         .unwrap();
         let directory = sinomo_testdir::TestDir::new(name);
+        drop(crate::DfsMetadataCandidateWriter::open_generation(directory.path(), generation).unwrap());
         let original = stage_snapshot(directory.path(), &tables, sequence, &proof).unwrap();
         let original_bytes = fs::read(original.path()).unwrap();
         let (copied, state) =

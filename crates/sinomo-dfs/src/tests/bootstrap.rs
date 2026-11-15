@@ -257,6 +257,9 @@ fn cluster_dfs_message_command_processor_uses_cluster_local_node_id() {
         },
     };
 
+    let physical = data_dir.dfs_dir().join("metadata/root");
+    std::fs::create_dir_all(&physical).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&physical, "root");
     let error = process_cluster_dfs_message_command(&data_dir, &cluster_paths, command, None)
         .expect_err("wrong target rejected");
 

@@ -1,6 +1,7 @@
 //! Explicit local source ownership. A missing cluster client never mints this
 //! capability; the caller must choose this factory and retain normal ownership.
 use super::*;
+mod coverage;
 use crate::metadata::{
     StandaloneMetadataImportCertificate, StandaloneMetadataImportPlan,
     StandaloneMetadataImportProposal, StandaloneSourceOwnerEvidence,
@@ -13,6 +14,7 @@ pub(crate) struct StandaloneStorageImportCapability {
     owner_evidence: Vec<StandaloneSourceOwnerEvidence>,
     _data_owner: Arc<sinomo_dfs::runtime_host::DfsDataOwnerLock>,
     _source_fence: Arc<std::fs::File>,
+    current_generation: Option<(sinomo_dfs::DfsMetadataGenerationIdentity, sinomo_dfs::DfsMetadataGenerationSeal)>,
 }
 impl StandaloneStorageImportCapability {
     pub(crate) fn binding(&self) -> &str {
@@ -57,6 +59,7 @@ impl StandaloneStorageImportCapability {
 }
 
 pub(crate) struct ExplicitStandaloneSourceFactory {
+    component_context: sinomo_module::ComponentContext,
     data_root: PathBuf,
     runtime_data_dir: sinomo_core::local::SinomoDataDir,
     content_root: PathBuf,
@@ -106,6 +109,7 @@ impl ExplicitStandaloneSourceFactory {
             ));
         }
         Ok(Self {
+            component_context: context.clone(),
             data_root,
             runtime_data_dir: context.data_dir().clone(),
             content_root: context.data_dir().dfs_dir().join("content"),
@@ -121,6 +125,11 @@ impl ExplicitStandaloneSourceFactory {
         evidence: &[StandaloneSourceOwnerEvidence],
         actual_source_root: &Path,
     ) -> Result<String> {
+        self.binding_for_facts(&source.file_system_ids, &source.scope_shard, &source.source_identity,
+            &source.source_snapshot_fingerprint, evidence, actual_source_root)
+    }
+    fn binding_for_facts(&self, file_system_ids: &[sinomo_dfs::DfsFileSystemId], shard: &sinomo_dfs::DfsMetadataShardId,
+        source_identity: &str, source_snapshot_fingerprint: &str, evidence: &[StandaloneSourceOwnerEvidence], actual_source_root: &Path) -> Result<String> {
         let root = actual_source_root.canonicalize().map_err(error)?;
         let ids = evidence
             .iter()
@@ -128,11 +137,11 @@ impl ExplicitStandaloneSourceFactory {
             .collect::<BTreeSet<_>>();
         if !root.starts_with(&self.data_root)
             || evidence.is_empty()
-            || ids != source.file_system_ids.iter().cloned().collect()
+            || ids != file_system_ids.iter().cloned().collect()
             || evidence.iter().any(|e| {
                 e.owner_epoch != 0
                     || e.owner_node_id != self.node_id
-                    || e.shard_id != source.scope_shard
+                    || e.shard_id != *shard
             })
         {
             return Err(error(
@@ -143,8 +152,8 @@ impl ExplicitStandaloneSourceFactory {
         crate::metadata::validate_standalone_source_owner_evidence(&root, evidence, &self.node_id)?;
         crate::metadata::validate_retained_source_identity(
             &root,
-            &source.source_identity,
-            &source.source_snapshot_fingerprint,
+            source_identity,
+            source_snapshot_fingerprint,
         )?;
         digest(&(
             "explicit-standalone-storage-source-v1",
@@ -154,8 +163,8 @@ impl ExplicitStandaloneSourceFactory {
             self.owner_file_identity,
             file_identity(&fence)?,
             evidence,
-            &source.source_identity,
-            &source.source_snapshot_fingerprint,
+            source_identity,
+            source_snapshot_fingerprint,
         ))
     }
     pub(crate) fn mint(
@@ -164,6 +173,9 @@ impl ExplicitStandaloneSourceFactory {
         actual_source_root: &Path,
         actual_image_root: &Path,
     ) -> Result<Arc<StandaloneStorageImportCapability>> {
+        if actual_image_root.join("metadata-generation.sobj").exists() {
+            self.require_coverage_for_cut(&proposal.source_cut)?;
+        }
         let root = actual_source_root.canonicalize().map_err(error)?;
         if !root.starts_with(&self.data_root) {
             return Err(error(
@@ -224,6 +236,15 @@ impl ExplicitStandaloneSourceFactory {
             owner_evidence: proposal.source_owner_evidence.clone(),
             _data_owner: Arc::clone(&self.data_owner),
             _source_fence: source_fence,
+            current_generation: if actual_image_root.join("metadata-generation.sobj").exists() {
+                let header = sinomo_dfs::inspect_metadata_storage_generation(actual_image_root)?;
+                let seal = match header.state {
+                    sinomo_dfs::DfsMetadataGenerationState::Staged { seal: Some(seal) } => seal,
+                    sinomo_dfs::DfsMetadataGenerationState::Active { standalone_seal: Some(seal), .. } => seal,
+                    _ => return Err(error("standalone current image has no exact source-owned generation seal")),
+                };
+                Some((header.identity, seal))
+            } else { None },
         });
         capability.validate_import(proposal, &root, actual_image_root)?;
         Ok(capability)
@@ -310,7 +331,80 @@ impl StandaloneImportAuthority {
     }
 }
 
+struct StandaloneGenerationWitness<'a> {
+    proposal: &'a StandaloneMetadataImportProposal,
+    certificate: &'a StandaloneMetadataImportCertificate,
+    source: &'a Path,
+    target: &'a Path,
+}
+impl sinomo_dfs::DfsStandaloneStorageActivationWitness for StandaloneGenerationWitness<'_> {
+    fn data_owner(&self) -> &Arc<sinomo_dfs::runtime_host::DfsDataOwnerLock> { &self.certificate.owner._data_owner }
+    fn source_fence(&self) -> &std::fs::File { &self.certificate.owner._source_fence }
+    fn actual_source_root(&self) -> &Path { self.source }
+    fn installed_target_root(&self) -> &Path { self.target }
+    fn source_binding(&self) -> &str { &self.certificate.owner.binding }
+    fn file_system_ids(&self) -> &[sinomo_dfs::DfsFileSystemId] { &self.proposal.file_system_ids }
+    fn revalidate_original_certificate(&self, image: &Path, identity: &sinomo_dfs::DfsMetadataGenerationIdentity,
+        seal: &sinomo_dfs::DfsMetadataGenerationSeal) -> Result<()> {
+        let owner = &self.certificate.owner;
+        if owner.current_generation.as_ref() != Some(&(identity.clone(), seal.clone()))
+            || self.certificate.proposal_fingerprint != digest(&ImportProposal::Standalone(self.proposal.clone()))?
+            || self.certificate.current_image_fingerprint != seal.state_fingerprint
+            || self.certificate.target_exact_prefix != seal.prefix_proof {
+            return Err(error("standalone activation differs from its actual original certificate/image"));
+        }
+        owner.validate_import(self.proposal, self.source, image)?;
+        for fs in &self.proposal.file_system_ids {
+            let floors = crate::metadata::ack_floor::acknowledged_source_floors_for_root(self.source, fs,
+                self.proposal.source_cut.source_format_version, &self.proposal.scope_shard)?;
+            let mut reader = crate::metadata::source_ancestry::source_ancestry_reader(&self.proposal.source_cut,
+                self.source, &floors, &[])?;
+            while reader.next_chunk(crate::metadata::source_ancestry::MAX_SOURCE_ANCESTRY_CHUNK_BYTES)?.is_some() {}
+        }
+        Ok(())
+    }
+}
+
 impl MetadataImportAuthority for StandaloneImportAuthority {
+    fn require_standalone_census_coverage(&self, source: &crate::metadata::canonical_generation::CapturedMetadataSource) -> Result<()> {
+        self.factory.require_complete_coverage(source)
+    }
+    fn standalone_generation_for_source(&self, source: &crate::metadata::canonical_generation::CapturedMetadataSource)
+        -> Result<sinomo_dfs::DfsMetadataGenerationIdentity> {
+        if !source.projection_assignments.is_empty() || source.original_handoff.is_some() {
+            return Err(error("explicit standalone source cannot borrow native assignments/handoff"));
+        }
+        let evidence = source.file_system_ids.iter().map(|fs| StandaloneSourceOwnerEvidence {
+            file_system_id: fs.clone(), shard_id: source.physical_shard.clone(), owner_node_id: self.factory.node_id.clone(), owner_epoch: 0,
+        }).collect::<Vec<_>>();
+        let actual_source = crate::metadata::resolve_captured_original_source(source)?;
+        let binding = self.factory.binding_for_facts(&source.file_system_ids, &source.physical_shard,
+            &source.source_identity, &source.source_snapshot_fingerprint, &evidence, &actual_source)?;
+        self.factory.coverage_generation_identity(source, binding)
+    }
+    fn activate_standalone_installed_generation(&self, proposal: &ImportProposal, certificate: &ImportCertificate,
+        actual_source: &Path, installed: &Path) -> Result<()> {
+        let (ImportProposal::Standalone(proposal), ImportCertificate::Standalone(certificate)) = (proposal, certificate) else {
+            return Err(error("standalone activation cannot consume native authority"));
+        };
+        // The existing source-owner certificate alone says nothing about
+        // other active roots of this filesystem. Counted publication remains
+        // closed until the owner supplies the separately qualified coverage.
+        let checkpoint = proposal.source_cut.staged_root.parent()
+            .ok_or_else(|| error("standalone target has no capture checkpoint owner"))?.join("captured-unit.json");
+        let captured: crate::metadata::canonical_generation::CapturedMetadataUnit =
+            serde_json::from_slice(&std::fs::read(checkpoint).map_err(error)?).map_err(error)?;
+        captured.validate()?;
+        self.require_standalone_census_coverage(&captured.source)?;
+        if !Arc::ptr_eq(&certificate.owner._data_owner, &self.factory.data_owner) {
+            return Err(error("standalone activation has another actual source owner"));
+        }
+        let (identity, seal) = certificate.owner.current_generation.as_ref()
+            .ok_or_else(|| error("historical source certificate is not a current generation activation"))?;
+        let witness = StandaloneGenerationWitness { proposal, certificate, source: actual_source, target: installed };
+        sinomo_dfs::activate_standalone_metadata_storage_generation(&self.factory.component_context,
+            installed, identity, seal, &witness)
+    }
     fn queue_original_topology_after_install(
         &self,
         source: &MetadataSourceCut,
@@ -638,67 +732,13 @@ impl MetadataImportAuthority for StandaloneImportAuthority {
 /// selects this mode from a missing cluster client.
 pub fn storage_preparation_provider(
     context: &sinomo_module::ComponentContext,
-) -> std::result::Result<DfsStoragePreparationProvider, sinomo_module::ComponentError> {
+    scope: &mut sinomo_module::ComponentScope,
+    lifecycle: tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<sinomo_dfs::DfsStoragePreparationProviderBinding, sinomo_module::ComponentError> {
     let factory = ExplicitStandaloneSourceFactory::from_context(context)
-        .map_err(|e| sinomo_module::ComponentError::component("dfs-migration", e))?;
-    let owner = Arc::clone(&factory.data_owner);
-    let authority = Arc::new(StandaloneImportAuthority { factory });
-    let metadata = MetadataConverter::with_authority(authority);
-    let content = crate::content::ContentConverter::default();
-    let local_state = crate::local_state::LocalStateConverter::default();
-    let dfs_root = context.data_dir().dfs_dir();
-    let metadata_root = dfs_root.join("metadata");
-    Ok(Arc::new(move |root, scope, budget| {
-        let _owner = &owner;
-        if matches!(scope, DfsStoragePreparationScope::MetadataCountCohort { .. }) {
-            return Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records: 0 });
-        }
-        if matches!(scope, DfsStoragePreparationScope::MetadataRouting) {
-            if root != metadata_root {
-                return Err(error("standalone routing state changes actual owner root"));
-            }
-            return if super::routing_cache::current(root)? {
-                Ok(sinomo_dfs::DfsStoragePreparation::Ready)
-            } else {
-                Err(error(
-                    "retained routing topology requires actual native configuration authority",
-                ))
-            };
-        }
-        let local = local_state.prepare(&dfs_root, budget)?;
-        if matches!(local, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-            return Ok(local);
-        }
-        match scope {
-            DfsStoragePreparationScope::MetadataCountCohort { .. } => unreachable!("native cohort requires native activation authority"),
-            DfsStoragePreparationScope::Metadata(shard) => {
-                let preparation = content.prepare(&dfs_root.join("content"), budget)?;
-                if matches!(
-                    preparation,
-                    sinomo_dfs::DfsStoragePreparation::Pending { .. }
-                ) {
-                    return Ok(preparation);
-                }
-                let combined = metadata_root.join("root");
-                let source = if root != combined && !root.exists() && combined.exists() {
-                    combined.as_path()
-                } else {
-                    root
-                };
-                metadata.prepare_with_source(root, source, shard, budget)
-            }
-            DfsStoragePreparationScope::Content => content.prepare(root, budget),
-            DfsStoragePreparationScope::MetadataRouting => {
-                unreachable!("handled by actual routing owner")
-            }
-            DfsStoragePreparationScope::LocalState => {
-                if root != dfs_root {
-                    return Err(error("standalone local state changes actual owner root"));
-                }
-                Ok(sinomo_dfs::DfsStoragePreparation::Ready)
-            }
-        }
-    }))
+        .map_err(|failure| sinomo_module::ComponentError::component("dfs-migration", failure))?;
+    super::storage_preparation_with_source_authority(context, scope, lifecycle,
+        Arc::new(StandaloneImportAuthority { factory }))
 }
 
 fn file_identity(file: &std::fs::File) -> Result<(u64, u64)> {

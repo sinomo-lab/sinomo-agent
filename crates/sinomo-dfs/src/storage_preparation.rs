@@ -14,15 +14,26 @@ pub enum DfsStoragePreparation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DfsStoragePreparationScope {
     Metadata(DfsMetadataShardId),
-    /// Post-decode readiness for journal/table-log-only roots. The provider must
-    /// validate current activation directly, without reopening this backend.
-    MetadataCountCohort {
-        shard: DfsMetadataShardId,
-        obligations: std::collections::BTreeSet<(crate::DfsFileSystemId, String)>,
+    /// Current immutable metadata generation selected by the native owner.
+    MetadataGeneration {
+        identity: crate::DfsMetadataGenerationIdentity,
     },
     /// Derived metadata-routing representation under the same data owner.
     MetadataRouting,
+    /// Admission of the current root representation, not completeness of all
+    /// immutable versions retained beneath it.
     Content,
+    /// Admission of one immutable version. Undiscovered retained data remains
+    /// pending rather than becoming a false missing-version result.
+    ContentVersion {
+        object_id: String,
+        version: String,
+    },
+    ContentBlob { hash: String },
+    ContentObject { object_id: String },
+    /// Completeness required by retention and garbage collection; ordinary
+    /// reads of an admitted version do not wait for this coverage.
+    ContentInventory,
     /// Node-local representation preparation under the SAME component owner.
     LocalState,
 }
@@ -30,9 +41,10 @@ pub enum DfsStoragePreparationScope {
 pub type DfsStoragePreparationProviderBuilder = Arc<
     dyn Fn(
             &sinomo_module::ComponentContext,
+            &mut sinomo_module::ComponentScope,
             tokio::sync::watch::Receiver<bool>,
         )
-            -> std::result::Result<DfsStoragePreparationProvider, sinomo_module::ComponentError>
+            -> std::result::Result<DfsStoragePreparationProviderBinding, sinomo_module::ComponentError>
         + Send
         + Sync,
 >;
@@ -42,10 +54,17 @@ pub type DfsStoragePreparationProvider = Arc<
         + Send
         + Sync,
 >;
+/// The worker belongs to the component scope. This watch only wakes consumers;
+/// each consumer must recheck its exact unit before using storage.
+pub struct DfsStoragePreparationProviderBinding {
+    pub provider: DfsStoragePreparationProvider,
+    pub readiness: tokio::sync::watch::Receiver<u64>,
+}
 struct Entry {
     id: u64,
     provider: DfsStoragePreparationProvider,
     lifecycle: Option<tokio::sync::watch::Receiver<bool>>,
+    readiness: Option<tokio::sync::watch::Receiver<u64>>,
 }
 #[derive(Default)]
 struct Registry {
@@ -78,6 +97,14 @@ pub fn register_dfs_storage_preparation_provider(
     provider: DfsStoragePreparationProvider,
     lifecycle: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<DfsStoragePreparationRegistration> {
+    register_provider(data_root, provider, lifecycle, None)
+}
+pub(crate) fn register_provider(
+    data_root: PathBuf,
+    provider: DfsStoragePreparationProvider,
+    lifecycle: Option<tokio::sync::watch::Receiver<bool>>,
+    readiness: Option<tokio::sync::watch::Receiver<u64>>,
+) -> Result<DfsStoragePreparationRegistration> {
     let root = std::fs::canonicalize(&data_root).map_err(|source| MetadataBackendError::Io {
         path: data_root,
         source,
@@ -101,9 +128,18 @@ pub fn register_dfs_storage_preparation_provider(
             id,
             provider,
             lifecycle,
+            readiness,
         },
     );
     Ok(DfsStoragePreparationRegistration { root, id })
+}
+
+/// Subscribe to the already-owned preparation worker without starting work.
+pub fn dfs_storage_preparation_readiness(
+    data_root: &Path,
+) -> Option<tokio::sync::watch::Receiver<u64>> {
+    let root = std::fs::canonicalize(data_root).ok()?;
+    PROVIDERS.get()?.lock().ok()?.roots.get(&root)?.readiness.clone()
 }
 
 /// Retain the actual provider component's watch, without creating an owner.
@@ -170,165 +206,14 @@ pub(crate) fn prepare_storage_root_before_open(
                 });
             }
         }
-    } else if let DfsStoragePreparationScope::Metadata(shard) = scope
-        && imported_metadata_needs_preparation_owner(&physical, shard)?
-    {
+    } else if matches!(scope,
+        DfsStoragePreparationScope::ContentVersion { .. }
+        | DfsStoragePreparationScope::ContentBlob { .. }
+        | DfsStoragePreparationScope::ContentObject { .. }
+        | DfsStoragePreparationScope::ContentInventory
+        | DfsStoragePreparationScope::MetadataGeneration { .. }) {
         return Err(MetadataBackendError::StoragePreparationPending {
-            root: physical,
-            processed_records: 0,
-        });
-    }
-    Ok(())
-}
-
-// This is a refusal-only inspection of the existing converter marker. It
-// cannot certify a cohort from saved flags; the registered owner must reobserve
-// native outcomes. Completed non-cohort imports retain their ordinary open.
-fn imported_metadata_needs_preparation_owner(
-    root: &Path,
-    shard: &DfsMetadataShardId,
-) -> Result<bool> {
-    use std::io::Read;
-    let path = root.join("metadata-import-v7.json");
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => return Err(MetadataBackendError::Io { path, source }),
-    }
-    let file = std::fs::File::open(&path).map_err(|source| MetadataBackendError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    const MAX_MARKER_BYTES: usize = 8 * 1024 * 1024;
-    let mut bytes = Vec::new();
-    file.take((MAX_MARKER_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    if bytes.len() > MAX_MARKER_BYTES {
-        return Ok(true);
-    }
-    let marker: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        MetadataBackendError::Serde(format!("unreadable import readiness marker: {error}"))
-    })?;
-    let invalid = || {
-        MetadataBackendError::Serde(
-            "import readiness marker has invalid source/image binding".into(),
-        )
-    };
-    if marker
-        .get("format_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(7)
-    {
-        return Err(invalid());
-    }
-    let cut = marker
-        .get("source_cut")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(invalid)?;
-    let scope: DfsMetadataShardId =
-        serde_json::from_value(cut.get("scope_shard").cloned().ok_or_else(invalid)?)
-            .map_err(|_| invalid())?;
-    if scope != *shard {
-        return Err(invalid());
-    }
-    if cut
-        .get("namespace_count_cohort")
-        .is_some_and(|cohort| !cohort.is_null())
-    {
-        return Ok(true);
-    }
-    if marker
-        .get("installation_complete")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        return Ok(true);
-    }
-    let image = marker
-        .get("native_image")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(invalid)?;
-    let prefix: crate::DfsMetadataPrefixProof =
-        serde_json::from_value(image.get("prefix_proof").cloned().ok_or_else(invalid)?)
-            .map_err(|_| invalid())?;
-    if !prefix.is_well_formed()
-        || image.get("prefix_proof") != cut.get("target_exact_prefix")
-        || image.get("state_fingerprint") != cut.get("current_image_fingerprint")
-        || [
-            "authority_binding",
-            "source_identity",
-            "source_snapshot_fingerprint",
-            "retained_source_root",
-        ]
-        .iter()
-        .any(|field| {
-            marker
-                .get(*field)
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(str::is_empty)
-        })
-        || ["state_fingerprint", "file_fingerprint"]
-            .iter()
-            .any(|field| {
-                image
-                    .get(*field)
-                    .and_then(serde_json::Value::as_str)
-                    .is_none_or(str::is_empty)
-            })
-    {
-        return Err(invalid());
-    }
-    Ok(false)
-}
-
-/// A validated journal obligation survives loss of the convenience import
-/// marker and compaction of the original body. Only the existing preparation
-/// owner can settle it; finding it never certifies successful activation.
-pub(crate) fn require_count_cohort_preparation_owner(
-    root: &Path,
-    shard: &DfsMetadataShardId,
-    tables: &crate::metadata_tables::DfsMetadataTables,
-) -> Result<()> {
-    let obligations =
-        crate::namespace_counts::namespace_count_cohort_obligations_from_tables(tables, shard)?;
-    if obligations.is_empty() {
-        return Ok(());
-    }
-    let physical = std::fs::canonicalize(root).map_err(|source| MetadataBackendError::Io {
-        path: root.to_owned(),
-        source,
-    })?;
-    let provider = PROVIDERS.get().and_then(|registry| {
-        registry
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .roots
-            .iter()
-            .filter(|(prefix, _)| physical.starts_with(prefix))
-            .max_by_key(|(prefix, _)| prefix.components().count())
-            .map(|(_, entry)| Arc::clone(&entry.provider))
-    });
-    let result = match provider {
-        Some(provider) => provider(
-            &physical,
-            &DfsStoragePreparationScope::MetadataCountCohort {
-                shard: shard.clone(),
-                obligations,
-            },
-            DFS_STORAGE_PREPARATION_RECORD_BUDGET,
-        )?,
-        None => DfsStoragePreparation::Pending {
-            processed_records: 0,
-        },
-    };
-    if let DfsStoragePreparation::Pending { processed_records } = result {
-        return Err(MetadataBackendError::StoragePreparationPending {
-            root: physical,
-            processed_records,
+            root: physical, processed_records: 0,
         });
     }
     Ok(())
@@ -340,10 +225,51 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn installed_current_metadata_stays_pending_while_provider_finishes_its_cohort() {
-        let root = sinomo_testdir::TestDir::new("storage-count-cohort-ready");
+    fn undiscovered_content_units_without_an_owner_stay_pending() {
+        let root = sinomo_testdir::TestDir::new("unowned-content-preparation");
+        for unit in [
+            DfsStoragePreparationScope::ContentVersion { object_id: "opaque object".into(), version: "opaque version".into() },
+            DfsStoragePreparationScope::ContentObject { object_id: "opaque object".into() },
+            DfsStoragePreparationScope::ContentBlob { hash: "immutable hash".into() },
+            DfsStoragePreparationScope::ContentInventory,
+        ] {
+            assert!(matches!(prepare_storage_root_before_open(root.path(), &unit),
+                Err(MetadataBackendError::StoragePreparationPending { processed_records: 0, .. })));
+        }
+    }
+
+    #[test]
+    fn readiness_watch_is_advisory_and_keeps_exact_unit_admission() {
+        let root = sinomo_testdir::TestDir::new("storage-owner-readiness-watch");
+        let (signal, change) = tokio::sync::watch::channel(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let registration = register_provider(root.path().to_owned(), Arc::new(move |_, unit, _| {
+            assert_eq!(unit, &DfsStoragePreparationScope::ContentObject { object_id: "a".into() });
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsStoragePreparation::Pending { processed_records: 0 })
+        }), None, Some(change)).unwrap();
+        let receiver = dfs_storage_preparation_readiness(root.path()).unwrap();
+        signal.send(1).unwrap();
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a wake never executes conversion or admission");
+        assert!(matches!(prepare_storage_root_before_open(root.path(), &DfsStoragePreparationScope::ContentObject { object_id: "a".into() }),
+            Err(MetadataBackendError::StoragePreparationPending { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(registration);
+        assert!(dfs_storage_preparation_readiness(root.path()).is_none());
+    }
+
+    #[test]
+    fn provider_ready_cannot_activate_a_staged_current_generation() {
+        let root = sinomo_testdir::TestDir::new("storage-generation-ready");
         let shard = DfsMetadataShardId::new("root");
-        let writer = crate::DfsMetadataCandidateWriter::open(root.path()).unwrap();
+        let writer = crate::DfsMetadataCandidateWriter::open_generation(root.path(), crate::DfsMetadataGenerationIdentity {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: shard.clone(),
+            generation: "current-data-only".into(),
+            origin: crate::DfsMetadataGenerationOrigin::StorageTransition { transition_id: "data-only-transition".into() },
+        }).unwrap();
         let proof = crate::DfsMetadataPrefixProof {
             version: 2,
             journal_sequence: 0,
@@ -387,7 +313,8 @@ mod tests {
             None,
         )
         .unwrap();
-        crate::LocalSobjMetadataBackend::new(shard, root.path()).unwrap();
+        assert!(matches!(crate::LocalSobjMetadataBackend::new(shard, root.path()),
+            Err(MetadataBackendError::StoragePreparationPending { .. })));
         drop(ready);
     }
 }

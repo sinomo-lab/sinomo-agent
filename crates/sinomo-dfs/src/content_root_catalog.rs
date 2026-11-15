@@ -1963,7 +1963,8 @@ mod tests {
     fn file_system_config() -> DfsFileSystemConfig {
         let shard = shard_config();
         DfsFileSystemConfig {
-            namespace_count_activation: None,
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: shard.file_system_id,
@@ -2762,7 +2763,8 @@ mod tests {
     fn configured_file_system_without_shards_cannot_authorize_collection() {
         let configured = file_system_config();
         let configured_without_shards = DfsFileSystemConfig {
-            namespace_count_activation: None,
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: fs("catalog-empty-fs"),

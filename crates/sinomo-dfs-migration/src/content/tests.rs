@@ -356,8 +356,9 @@ fn actual_native_provider_converts_legacy_content_without_recursive_metadata_pre
     let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = observed.clone();
     let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder = std::sync::Arc::new(
-        move |context, lifecycle| {
-            let provider = crate::authority::storage_preparation_provider(context, lifecycle)?;
+        move |context, scope, lifecycle| {
+            let binding = crate::authority::storage_preparation_provider(context, scope, lifecycle)?;
+            let provider = &binding.provider;
             let content = context
                 .data_dir()
                 .dfs_dir()
@@ -367,9 +368,9 @@ fn actual_native_provider_converts_legacy_content_without_recursive_metadata_pre
             assert!(
                 matches!(
                     provider(&content, &sinomo_dfs::DfsStoragePreparationScope::Content, 1).unwrap(),
-                    DfsStoragePreparation::Pending { processed_records } if processed_records <= 1
+                    DfsStoragePreparation::Ready | DfsStoragePreparation::Pending { processed_records: 0 }
                 ),
-                "unfinished actual old content remains bounded Pending"
+                "admission schedules no conversion; the background owner may already have completed"
             );
             assert!(
                 !context
@@ -390,7 +391,7 @@ fn actual_native_provider_converts_legacy_content_without_recursive_metadata_pre
                 "same provider cannot prepare a different content owner root"
             );
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(provider)
+            Ok(binding)
         },
     );
     native
@@ -424,4 +425,156 @@ fn actual_native_provider_converts_legacy_content_without_recursive_metadata_pre
     assert_eq!(native.metadata_shards().unwrap().len(), 3);
     drop(client);
     native.close().unwrap();
+}
+
+#[test]
+fn current_content_gate_requires_current_header_and_matching_catalog_identity() {
+    let dir=sinomo_testdir::TestDir::new("content-current-identity-gate");
+    let root=dir.path().join("current");
+    let store=LocalContentStore::new(&root).unwrap();
+    assert!(current(&root).unwrap());
+    drop(store);
+    let marker_path=root.join(MARKER);
+    let original=fs::read(&marker_path).unwrap();
+    #[derive(Serialize, Deserialize)]
+    struct Marker { format_version:u32, marker:String, store_incarnation:String, catalog_scan_epoch:u64,
+        content_binding_layout:String, #[serde(default,skip_serializing_if="Option::is_none")] inventory:Option<serde_json::Value> }
+    let mut marker:Marker=serde_ext::from_bytes(&original).unwrap();
+    marker.format_version=3;
+    write(&marker_path,&marker).unwrap();
+    assert!(!current(&root).unwrap(),"retired format3 cannot be current-format Ready");
+    marker.format_version=LocalContentStore::FORMAT_VERSION;
+    marker.store_incarnation=sinomo_core::Id::generate().to_string();
+    write(&marker_path,&marker).unwrap();
+    assert!(current(&root).is_err(),"a syntactically valid foreign header cannot match another catalog");
+    fs::write(&marker_path,&original).unwrap();
+    fs::remove_file(root.join("inline-bindings/current.sobj")).unwrap();
+    assert!(current(&root).is_err(),"retained current header without catalog is not ready");
+}
+
+fn retained_staged_three(root:&Path, bytes:&[u8])->Vec<u8> {
+    use super::incremental::{Phase,Progress};
+    source(root,bytes,false);
+    let converter=ContentConverter::default();
+    for _ in 0..1000 {
+        let _=converter.prepare(root,1).unwrap();
+        let progress:Progress=read(&root.join(CONVERSION).join("progress.sobj")).unwrap();
+        if progress.phase==Phase::Install {break;}
+    }
+    drop(converter);
+    let work=root.join(CONVERSION);
+    // Retained older-producer DATA at the same real parent cursor. Keep the
+    // current fixture candidate too; no original source/checkpoint is deleted.
+    fs::rename(work.join("store"),work.join("current-fixture-store")).unwrap();
+    super::original_v3::write_original_v3_named_fixture_data(&work.join("store"),bytes,"object","v1");
+    File::create(work.join("store/catalog-staging-owner.lock")).unwrap().sync_all().unwrap();
+    fs::read(work.join("progress.sobj")).unwrap()
+}
+
+#[test]
+fn retained_legacy_parent_upgrades_staged_three_without_restarting_original_cursor() {
+    let root=sinomo_testdir::TestDir::new("legacy-parent-staged-three");let bytes=b"retained parent data";
+    let original_cursor=retained_staged_three(root.path(),bytes);
+    let converter=ContentConverter::default();let reference=converter.enroll(root.path()).unwrap().unwrap();
+    assert_eq!(fs::read(root.join(CONVERSION).join("progress.sobj")).unwrap(),original_cursor);
+    let mut upgraded=false;
+    for _ in 0..1000 {
+        let _=converter.prepare(root.path(),1).unwrap();
+        if root.join(CONVERSION).join("target-upgrade-v3/original").exists() {
+            assert_eq!(fs::read(root.join(CONVERSION).join("progress.sobj")).unwrap(),original_cursor,
+                "subordinate conversion never advances the original parent cursor");
+        }
+        if source_format(&root.join(CONVERSION).join("store")).unwrap()==Some(LocalContentStore::FORMAT_VERSION) {
+            upgraded=true;break;
+        }
+    }
+    assert!(upgraded);drop(converter);
+    let resumed=ContentConverter::default();assert_eq!(resumed.enroll(root.path()).unwrap().unwrap(),reference);
+    finish(&resumed,root.path(),1);
+    assert!(current(root.path()).unwrap());
+    assert_eq!(LocalContentStore::new(root.path()).unwrap().read_object_version("object","v1").unwrap().1,bytes);
+    assert!(root.join(CONVERSION).join("target-upgrade-v3/original/inline-bindings/current.sobj").exists());
+}
+
+#[test]
+fn retained_legacy_published_three_has_exact_relocatable_successor_not_false_ready() {
+    use super::incremental::{Phase,Progress};
+    let directory=sinomo_testdir::TestDir::new("legacy-parent-published-three");let root=directory.join("live");
+    let bytes=b"published original survives";retained_staged_three(&root,bytes);
+    let path=root.join(CONVERSION).join("progress.sobj");let mut progress:Progress=read(&path).unwrap();
+    progress.phase=Phase::Publish;progress.publication_step=2;
+    fs::rename(root.join(CONVERSION).join("store/inline-bindings"),root.join("inline-bindings")).unwrap();
+    write(&path,&progress).unwrap();
+    let converter=ContentConverter::default();let original=converter.enroll(&root).unwrap().unwrap();
+    assert!(matches!(converter.prepare(&root,1).unwrap(),DfsStoragePreparation::Pending{..}));
+    assert_eq!(source_format(&root).unwrap(),Some(3));assert!(!current(&root).unwrap());
+    let successor=converter.published_v3_successor(&root).unwrap().unwrap();assert_eq!(successor.predecessor,original);
+    drop(converter);
+    let retained=directory.join("retained");fs::rename(&root,&retained).unwrap();
+    assert_eq!(ContentConverter::default().published_v3_successor(&retained).unwrap(),Some(successor));
+    assert!(retained.join("objects/object/v1/manifest.sobj").exists(),"handoff preserves archived original input instead of cleaning it");
+}
+
+#[test]
+fn legacy_large_payload_keeps_parent_cursor_before_effect_and_resumes_bounded_bytes() {
+    for packed in [false,true] {
+        let root=sinomo_testdir::TestDir::new("legacy-byte-bounded");
+        let bytes=vec![0x68;2*1024*1024];let manifest=source(root.path(),&bytes,packed);
+        let mut converter=ContentConverter::default();let job=converter.enroll(root.path()).unwrap().unwrap();
+        let progress=root.join(CONVERSION).join("progress.sobj");
+        let before=fs::read(&progress).unwrap();
+        assert!(matches!(converter.prepare_bounded(root.path(),1,64*1024,std::time::Instant::now()).unwrap(),DfsStoragePreparation::Pending{processed_records:0}));
+        assert_eq!(fs::read(&progress).unwrap(),before,"expired turn cannot advance an original cursor");
+        let origin=if packed{"packed-0"}else{"loose"};
+        let receipt=root.join(CONVERSION).join("payload-receipts").join(&manifest.content_hash[7..]).join(format!("{origin}.sobj"));
+        let mut partial=false;
+        for _ in 0..1000 {
+            let result=converter.prepare_bounded(root.path(),1,64*1024,std::time::Instant::now()+std::time::Duration::from_millis(50)).unwrap();
+            if receipt.exists() {
+                let value:serde_json::Value=read(&receipt).unwrap();
+                if let Some(copy)=value.get("pending_copy").filter(|value|!value.is_null()) {
+                    let copied=copy["copied"].as_u64().unwrap();
+                    if copied>0 && copied<bytes.len() as u64 {
+                        let p:super::incremental::Progress=read(&progress).unwrap();
+                        assert_eq!(p.phase,if packed{super::incremental::Phase::Packed}else{super::incremental::Phase::Loose});
+                        assert!(!root.join(CONVERSION).join("store/blobs").join(&manifest.content_hash[7..9]).join(&manifest.content_hash[7..]).exists());
+                        partial=true;break;
+                    }
+                }
+            }
+            assert!(!matches!(result,DfsStoragePreparation::Ready),"large byte unit cannot complete before bounded intermediate progress");
+        }
+        assert!(partial);drop(converter);converter=ContentConverter::default();
+        assert_eq!(converter.enroll(root.path()).unwrap().unwrap(),job);
+        let mut done=false;
+        for _ in 0..1000 {
+            match converter.prepare_bounded(root.path(),1,64*1024,std::time::Instant::now()+std::time::Duration::from_millis(50)).unwrap() {
+                DfsStoragePreparation::Ready=>{done=true;break;},
+                DfsStoragePreparation::Pending{processed_records}=>assert!(processed_records<=1),
+            }
+        }
+        assert!(done);assert!(converter.existing_job_complete(root.path()).unwrap());
+        assert_eq!(LocalContentStore::new(root.path()).unwrap().read_object_version("object","v1").unwrap().1,bytes);
+    }
+}
+
+#[test]
+fn legacy_current_publication_replay_preserves_newer_marker_and_original_job() {
+    use super::incremental::{Phase,Progress};
+    let root=sinomo_testdir::TestDir::new("legacy-current-marker-replay");let bytes=b"original current bytes";
+    source(root.path(),bytes,false);let converter=ContentConverter::default();
+    let original=converter.enroll(root.path()).unwrap().unwrap();
+    // Produce the actual verified payload, archived hints and current catalog
+    // before replaying an unacknowledged publication cursor. This fixture does
+    // not skip the real GC-hint prerequisite or invent its completion flags.
+    finish(&converter,root.path(),1);
+    drop(converter);
+    let progress_path=root.join(CONVERSION).join("progress.sobj");let mut p:Progress=read(&progress_path).unwrap();p.phase=Phase::Publish;p.publication_step=2;write(&progress_path,&p).unwrap();
+    let current_store=LocalContentStore::new(root.path()).unwrap();
+    current_store.begin_inventory_import("later-current-lineage").unwrap();current_store.complete_inventory_import("later-current-lineage").unwrap();
+    let latest=fs::read(root.join(MARKER)).unwrap();
+    let resumed=ContentConverter::default();assert_eq!(resumed.existing_job_reference(root.path()).unwrap(),Some(original));
+    assert!(!resumed.existing_job_complete(root.path()).unwrap());finish(&resumed,root.path(),1);
+    assert!(resumed.existing_job_complete(root.path()).unwrap());
+    assert_eq!(fs::read(root.join(MARKER)).unwrap(),latest,"observe/certify replay cannot restamp a newer live sentinel");
 }

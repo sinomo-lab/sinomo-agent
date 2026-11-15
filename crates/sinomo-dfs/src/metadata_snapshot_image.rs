@@ -110,7 +110,7 @@ impl DfsMetadataSnapshotImage {
     pub fn validate(&self) -> Result<()> {
         self.state().map(|_| ())
     }
-    #[cfg(feature = "storage-conversion")]
+    #[cfg(any(test, feature = "storage-conversion"))]
     pub fn validate_file_system(&self, fs: &crate::DfsFileSystemId) -> Result<()> {
         let state = self.state()?;
         crate::metadata_backend::snapshot_validation::require_replica_snapshot_tables_file_system(

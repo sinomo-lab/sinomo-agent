@@ -350,6 +350,26 @@ pub(crate) fn genesis_operation_id(shard: &DfsMetadataShardConfig) -> String {
     format!("genesis:{}:{}:1", shard.file_system_id, shard.shard_id)
 }
 
+pub(crate) fn original_genesis_file_system<'a>(record: &'a crate::DfsPreparedOperationRecord,
+    shard: &DfsMetadataShardConfig) -> Result<&'a DfsFileSystem, DfsError> {
+    record.validate()?;
+    if shard.epoch != 1 || !shard.replica_node_ids.is_empty()
+        || record.digest.owner_epoch != 1 || record.digest.file_system_id != shard.file_system_id
+        || record.digest.shard_id.0 != shard.shard_id || record.digest.operation_id != genesis_operation_id(shard) {
+        return Err(DfsError::Metadata { message: "native birth binding has a different original scope".into() });
+    }
+    let rows = record.payload.metadata_effects.iter().filter_map(|effect|
+        if let DfsPreparedMetadataEffect::PutFileSystem { file_system } = effect { Some(file_system) } else { None })
+        .collect::<Vec<_>>();
+    let [original] = rows.as_slice() else {
+        return Err(DfsError::Metadata { message: "native birth has no unique original filesystem".into() });
+    };
+    if original.file_system_id != shard.file_system_id {
+        return Err(DfsError::Metadata { message: "native birth original filesystem differs".into() });
+    }
+    Ok(original)
+}
+
 // GC collects the immutable body but retains the same unified operation's
 // exact terminal digest and commit reference. Neither representation authorizes
 // publication; cold bootstrap only verifies the original genesis outcome.
@@ -392,14 +412,27 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         shards: Vec<DfsMetadataShardConfig>,
     ) -> Result<crate::LocalShardedMetadataBackend, DfsError> {
         let root = default_dfs_metadata_shards_root(&self.data_dir);
-        Ok(match self.publication_owners.selected_original_data_layout()? {
-            Some(layout) => crate::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
-                root, shards, &self.local_node_id, layout,
-            )?,
-            None => open_local_sharded_metadata_backend_for_replica_repair(
-                root, shards, &self.local_node_id,
-            )?,
-        })
+        let mut staged = BTreeSet::new();
+        for shard in &shards {
+            if shard.primary_node_id != self.local_node_id || shard.epoch != 1 || !shard.replica_node_ids.is_empty() {
+                continue;
+            }
+            let id = DfsMetadataShardId::new(&shard.shard_id);
+            let physical = crate::local_dfs_metadata_shard_path(&self.data_dir, &id);
+            if physical.join("metadata-generation.sobj").exists() {
+                let generation = crate::storage_generation::read_generation(&physical)?;
+                if generation.identity.file_system_id == shard.file_system_id
+                    && generation.identity.shard_id == id
+                    && generation.identity.is_native_genesis()
+                    && matches!(generation.state, crate::storage_generation::GenerationState::Staged { .. }) {
+                    staged.insert(id);
+                }
+            }
+        }
+        Ok(crate::LocalShardedMetadataBackend::open_for_native_genesis(
+            root, shards, &self.local_node_id, &staged,
+            self.publication_owners.selected_original_data_layout()?,
+        )?)
     }
 
     pub(super) async fn prepare_native_genesis(
@@ -432,6 +465,32 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         }
         if missing.is_empty() {
             return Ok(());
+        }
+        let original_config: crate::DfsFileSystemConfig = self.control_plane
+            .get_async(&crate::file_system_config_key(&file_system.file_system_id)).await?
+            .ok_or_else(|| DfsError::Metadata { message: "native genesis requires its actual filesystem configuration".into() })?
+            .decode()?;
+        if original_config.file_system_id != file_system.file_system_id {
+            return Err(DfsError::Metadata { message: "native genesis filesystem configuration is misbound".into() });
+        }
+        if let Some(storage) = &original_config.metadata_storage {
+            storage.validate_at_catalog_generation(original_config.catalog_generation)
+                .map_err(|message| DfsError::Metadata { message })?;
+            if !matches!(storage, crate::DfsMetadataStorageState::Active { target_format, .. }
+                if *target_format == u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)) {
+                return Err(DfsError::Metadata { message: "native shard birth requires a settled current filesystem storage generation".into() });
+            }
+        }
+        let activation = original_config.metadata_storage.as_ref().and_then(|storage| storage.active_descriptor());
+        let original_file_system: DfsFileSystem = original_config.into();
+        let selected_layout = self.publication_owners.selected_original_data_layout()?;
+        for shard in &missing {
+            crate::storage_generation::stage_native_genesis_storage_generation(
+                &crate::local_dfs_metadata_shard_path(&self.data_dir, &DfsMetadataShardId::new(&shard.shard_id)),
+                shard,
+                activation.as_ref(),
+                selected_layout.as_deref(),
+            )?;
         }
         let mut backend = self.open_owned_bootstrap_metadata(shards.to_vec())?;
         for shard in missing {
@@ -523,7 +582,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             payload
                 .metadata_effects
                 .push(DfsPreparedMetadataEffect::PutFileSystem {
-                    file_system: file_system.clone(),
+                    file_system: original_file_system.clone(),
                 });
             // This hidden body precedes the native assignment CAS. No guard is
             // minted and no namespace row becomes visible at this boundary.
@@ -642,6 +701,10 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 .is_none()
             {
                 return Err(DfsError::Metadata { message: "existing assignment has no retained genesis or certified metadata image; import/catch-up required".into() });
+            }
+            if shard.epoch == 1 && shard.replica_node_ids.is_empty() {
+                service.metadata_backend.as_mut().expect("bootstrap backend")
+                    .activate_native_genesis_storage_generation(shard)?;
             }
         }
         let mut missing_objects = Vec::new();

@@ -3682,11 +3682,16 @@ fn sifs_non_replica_directory_listing_reads_the_owner_without_ingest() {
     assert!(observer.metadata_backend().is_none());
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
     let node_prefix = || {
-        _runtime
-            .node_metadata(&observer_node)
-            .unwrap()
-            .metadata_prefix_proof(&shard)
-            .unwrap()
+        // A non-replica need not have a certified local prefix. Inspect its
+        // actual optional cut and rows without opening or initializing a shard.
+        let root = crate::default_dfs_metadata_shards_root(_runtime.data_dir(&observer_node))
+            .join(crate::metadata_keys::key_segment(&shard.0));
+        let state = crate::metadata_table_store::read_metadata_table_state_lenient(&root).unwrap();
+        (
+            state.prefix_proof,
+            crate::metadata_table_store::metadata_tables_snapshot(&state.tables),
+            crate::metadata_journal::read_next_journal_sequence_lenient(&root).unwrap(),
+        )
     };
     let before = node_prefix();
     let listed =

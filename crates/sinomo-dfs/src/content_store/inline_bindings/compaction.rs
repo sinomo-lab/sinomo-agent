@@ -36,11 +36,6 @@ enum CanonicalKey {
     Blob(String),
     Version(VersionKey),
     Reservation(ContentStoreReservationIdentity),
-    /// Key spaces of the removed repair custody: never produced, kept so a
-    /// plan's later keys keep their encoding.
-    RepairPayload(RepairPayloadSubject),
-    ReceivedPrepared(String),
-    ReceivedBound(String),
     DeletedBlob(String),
 }
 

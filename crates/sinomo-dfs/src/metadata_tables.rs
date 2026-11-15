@@ -388,6 +388,7 @@ enum DfsMetadataStatusMutationEffect {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DfsMetadataTableState {
     pub(crate) tables: DfsMetadataTables,
+    pub(crate) generation: Option<crate::DfsMetadataGenerationIdentity>,
     pub(crate) table_log_offset: u64,
 
     pub(crate) materialized_through_sequence: Option<u64>,
@@ -1132,6 +1133,28 @@ impl DfsMetadataTables {
         }
         result
     }
+    pub(crate) fn terminal_eviction_for_digest(
+        &self, digest: &crate::DfsPreparedOperationDigest,
+    ) -> Result<DfsPreparedOperationEviction> {
+        if let Some(record) = self.prepared_operations_v7.get(&digest.operation_id) {
+            if record.digest != *digest {
+                return Err(MetadataBackendError::Serde("eviction changes its original operation digest".into()));
+            }
+            let terminal = DfsPreparedOperationEviction::from_terminal_record(record)?;
+            if let Some(retained) = self.prepared_operation_evictions.get(&digest.operation_id) {
+                retained.validate_against_record(record)?;
+            }
+            return Ok(terminal);
+        }
+        let retained = self.prepared_operation_evictions.get(&digest.operation_id)
+            .ok_or_else(|| MetadataBackendError::Serde("eviction has neither original body nor exact terminal evidence".into()))?;
+        retained.validate()?;
+        if retained.digest != *digest {
+            return Err(MetadataBackendError::Serde("eviction replay changes its retained terminal identity".into()));
+        }
+        Ok(retained.clone())
+    }
+
     pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
         match op {
             DfsMetadataTableOp::PutNamespaceJob { job } if job.kind == crate::DfsNamespaceJobKind::ParentCountParticipant => {
@@ -1158,19 +1181,7 @@ impl DfsMetadataTables {
                 committed_entry,
             } => self.validate_prepared_operation_v7_commit(digest, committed_entry),
             DfsMetadataTableOp::RemovePreparedOperation { digest } => {
-                let record = self
-                    .prepared_operations_v7
-                    .get(&digest.operation_id)
-                    .ok_or_else(|| {
-                        MetadataBackendError::Serde("eviction has no retained operation".into())
-                    })?;
-                if record.digest != *digest || record.status == DfsPreparedOperationStatus::Prepared
-                {
-                    return Err(MetadataBackendError::Serde(
-                        "cannot evict another or active operation".into(),
-                    ));
-                }
-                Ok(())
+                self.terminal_eviction_for_digest(digest).map(drop)
             }
             DfsMetadataTableOp::ResolvePreparedOperation { digest, status } => {
                 let record = self
@@ -1342,25 +1353,16 @@ impl DfsMetadataTables {
                 self.commit_prepared_operation_v7_with_rollback(&digest, &committed_entry, rollback)
             }
             DfsMetadataTableOp::RemovePreparedOperation { digest } => {
-                let op = DfsMetadataTableOp::RemovePreparedOperation {
-                    digest: digest.clone(),
-                };
-                self.validate_checked(&op)?;
+                // Derive and compare the original witness before changing any
+                // table. Exact replay keeps the retained terminal unchanged.
+                let terminal = self.terminal_eviction_for_digest(&digest)?;
+                if !self.prepared_operations_v7.contains_key(&digest.operation_id) { return Ok(()); }
+                let op = DfsMetadataTableOp::RemovePreparedOperation { digest: digest.clone() };
                 rollback.record(self, &op);
-                let record = self
-                    .prepared_operations_v7
-                    .remove(&digest.operation_id)
-                    .expect("validated eviction");
+                let record = self.prepared_operations_v7.remove(&digest.operation_id).expect("validated eviction");
                 self.unindex_namespace_prepare_footprint(&record);
                 self.unindex_namespace_prepare_request(&record);
-                self.prepared_operation_evictions.insert(
-                    digest.operation_id.clone(),
-                    DfsPreparedOperationEviction {
-                        digest: record.digest,
-                        status: record.status,
-                        committed_entry: record.committed_entry,
-                    },
-                );
+                self.prepared_operation_evictions.insert(digest.operation_id.clone(), terminal);
                 Ok(())
             }
             DfsMetadataTableOp::ResolvePreparedOperation { digest, status } => {

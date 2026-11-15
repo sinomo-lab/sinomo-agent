@@ -21,7 +21,7 @@ fn cut(
     )
     .unwrap();
     backend.begin_inspection_snapshot().unwrap();
-    let result = backend.export_table_snapshot();
+    let result = backend.export_table_snapshot().unwrap();
     backend.end_inspection_snapshot();
     result
 }

@@ -74,6 +74,7 @@ fn permit(epoch: u64, scope: Option<u64>) -> DfsMetadataReplicaIngestPermit {
 }
 
 fn backend(root: &sinomo_testdir::TestDir) -> LocalSobjMetadataBackend {
+    crate::test_runtime::copy_native_genesis_data(root.path(), &shard_id().0);
     LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap()
 }
 

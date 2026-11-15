@@ -814,11 +814,10 @@ fn namespace_transaction_proves_operation_completed(
             transaction: expected,
             ..
         } => expected.transaction_id == transaction.transaction_id,
-        DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => {
-            transaction.objects.iter().any(|candidate| {
-                candidate.object_id == object.object_id && candidate.path == object.path
-            })
-        }
+        // Object publication precedes verification of the complete family and
+        // its quorum barrier. Only the full-family producer can complete this
+        // request with its exact coordination receipt.
+        DfsNamespaceOperation::AdoptObjectAtPath { .. } => false,
         DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => {
             transaction.objects.iter().any(|candidate| {
                 candidate.object_id == alias.object_id && candidate.path == alias.path

@@ -3807,6 +3807,7 @@ mod tests {
         let _entered = handle.enter();
         let dir = sinomo_testdir::TestDir::new(name);
         let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
+        crate::test_runtime::copy_native_genesis_data(dir.path(), &shard.0);
         let mut backend = LocalSobjMetadataBackend::new(shard.clone(), dir.path()).unwrap();
         let identity = inspect_metadata_candidate(dir.path()).unwrap();
         let freeze = backend
@@ -3825,6 +3826,7 @@ mod tests {
         let proof = DfsMetadataShardMembershipHandoffProof {
             cause: DfsMetadataShardHandoffCause::StorageImport {
                 cut: DfsMetadataStorageImportCut {
+                    storage_transition_id: None,
                     source_cut_digest: name.into(),
                     source_journal_sequence: freeze.journal_sequence,
                     source_state_fingerprint: freeze.state_fingerprint.clone(),
@@ -4636,7 +4638,7 @@ mod tests {
             .unwrap()
         };
         let initial_prefix = observed_source()
-            .export_table_snapshot()
+            .export_table_snapshot().unwrap()
             .materialized_through_sequence;
         // The negative control places the next accepted append after startup,
         // matching the reproduced durable8/materialized7 late-publication gap.
@@ -4675,7 +4677,7 @@ mod tests {
         let object = source.get_object(&expected.object_id).unwrap().unwrap();
         assert_eq!(object.version, expected.version);
         assert_eq!(object.content_hash, expected.content_hash);
-        let published = source.export_table_snapshot();
+        let published = source.export_table_snapshot().unwrap();
         assert!(published.prefix_proof.is_well_formed());
         assert_eq!(
             published.prefix_proof.journal_sequence,

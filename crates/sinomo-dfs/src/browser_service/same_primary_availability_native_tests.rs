@@ -39,7 +39,7 @@ fn fresh_cut(
     reader
         .begin_inspection_snapshot()
         .map_err(|error| error.to_string())?;
-    let snapshot = reader.export_table_snapshot();
+    let snapshot = reader.export_table_snapshot().unwrap();
     reader.end_inspection_snapshot();
     Ok(snapshot)
 }

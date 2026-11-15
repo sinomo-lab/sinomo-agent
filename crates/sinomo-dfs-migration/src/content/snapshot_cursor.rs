@@ -17,6 +17,7 @@ fn number(file: &mut File, mode: LengthMode) -> Result<u64> {
 fn string(file: &mut File, mode: LengthMode) -> Result<String> {
     let len = usize::try_from(number(file, mode)?).map_err(error)?;
     let position = file.stream_position().map_err(error)?;
+    if len>64*1024 {return Err(error("packed snapshot single string exceeds bounded record limit"));}
     if len as u64
         > file
             .metadata()
@@ -30,7 +31,8 @@ fn string(file: &mut File, mode: LengthMode) -> Result<String> {
     file.read_exact(&mut bytes).map_err(error)?;
     String::from_utf8(bytes).map_err(error)
 }
-fn skip(file: &mut File, mode: LengthMode, kind: TypeId, depth: usize) -> Result<()> {
+fn skip(file: &mut File, mode: LengthMode, kind: TypeId, depth: usize, start:u64) -> Result<()> {
+    if file.stream_position().map_err(error)?.saturating_sub(start)>64*1024 {return Err(error("packed snapshot single value exceeds bounded record limit"));}
     if depth > 16 {
         return Err(error("packed snapshot row nesting is unsupported"));
     }
@@ -62,6 +64,7 @@ fn skip(file: &mut File, mode: LengthMode, kind: TypeId, depth: usize) -> Result
                     mode,
                     TypeId::from_byte(kind[0]).map_err(error)?,
                     depth + 1,
+                    start,
                 )?;
             }
         }
@@ -115,7 +118,8 @@ pub(super) fn open(path: &Path) -> Result<MapCursor> {
                 mode: mode.code(),
             });
         } else {
-            skip(&mut file, mode, kind, 0)?;
+            let start=file.stream_position().map_err(error)?;
+            skip(&mut file, mode, kind, 0,start)?;
         }
     }
     Err(error("packed snapshot has no entries map"))
@@ -123,6 +127,8 @@ pub(super) fn open(path: &Path) -> Result<MapCursor> {
 pub(super) fn next<T: for<'de> Deserialize<'de>>(
     path: &Path,
     cursor: &mut MapCursor,
+    record_limit:u64,
+    remaining:u64,
 ) -> Result<Option<(String, T, u64)>> {
     if cursor.remaining == 0 {
         return Ok(None);
@@ -140,11 +146,15 @@ pub(super) fn next<T: for<'de> Deserialize<'de>>(
         mode,
         TypeId::from_byte(kind[0]).map_err(error)?,
         0,
+        start,
     )?;
     let end = file.stream_position().map_err(error)?;
     if end > file.metadata().map_err(error)?.len() {
         return Err(error("packed snapshot entry exceeds certified source"));
     }
+    let consumed=end-original_offset;
+    if end-start>64*1024 || consumed>record_limit {return Err(error("packed snapshot single row exceeds configured record/turn limit; aggregate source preserved"));}
+    if consumed>remaining {return Err(MetadataBackendError::StoragePreparationPending{root:path.to_owned(),processed_records:0});}
     let mut element = vec![0; usize::try_from(end - start).map_err(error)?];
     file.seek(SeekFrom::Start(start)).map_err(error)?;
     file.read_exact(&mut element).map_err(error)?;

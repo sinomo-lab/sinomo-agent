@@ -622,7 +622,8 @@ mod tests {
 
     fn file_system() -> DfsFileSystem {
         DfsFileSystem {
-            namespace_count_activation: None,
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),

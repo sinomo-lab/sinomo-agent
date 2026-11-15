@@ -231,7 +231,7 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let root = dfs::local_dfs_metadata_shard_path(&data, &shard);
     let capture = || {
         LocalSobjMetadataBackend::open_for_inspection(shard.clone(), root.clone())
-            .map(|backend| backend.export_table_snapshot())
+            .and_then(|backend| backend.export_table_snapshot())
             .map_err(|error| fail(error.to_string()))
     };
     let before = capture()?;

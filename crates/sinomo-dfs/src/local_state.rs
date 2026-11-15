@@ -1474,6 +1474,14 @@ mod tests {
         NodeId::from_legacy_named(value).expect("node id")
     }
 
+    fn seed_native_metadata_data(metadata_root: &Path, shards: &[&str]) {
+        for shard in shards {
+            let destination = metadata_root.join(shard);
+            fs::create_dir_all(&destination).unwrap();
+            crate::test_runtime::copy_native_genesis_data(&destination, shard);
+        }
+    }
+
     #[test]
     fn topology_observation_excludes_unrelated_payload_without_losing_shards_or_completeness() {
         let root = sinomo_testdir::TestDir::new("dfs-native-topology-production-payload");
@@ -2063,9 +2071,20 @@ mod tests {
         .unwrap();
         let mut changed = original.clone();
         changed.display_name = "native changed configuration".into();
+        let control = runtime.shared_control_plane().unwrap();
+        let authority_config = control.with_client(|client| {
+            crate::DfsControlPlaneStore::new(client.as_mut())
+                .get_file_system_config(&shard.file_system_id)
+                .unwrap()
+                .unwrap()
+        });
         // Filesystem publication belongs to the store-backed owning service.
         let mut writer = runtime.metadata_primary_service("/").unwrap();
         writer.add_file_system(changed.clone()).unwrap();
+        // Ordinary publication preserves catalog/storage authority from the
+        // actual native configuration, even if the old metadata row predates it.
+        changed.catalog_generation = authority_config.catalog_generation;
+        changed.metadata_storage = authority_config.metadata_storage;
         for _ in 0..2 {
             let actual =
                 with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {
@@ -2105,6 +2124,7 @@ mod tests {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let metadata_root = default_dfs_metadata_shards_root(&data_dir);
+        seed_native_metadata_data(&metadata_root, &["root"]);
         drop(
             open_local_sharded_metadata_backend(metadata_root.clone(), vec![shard.clone()])
                 .expect("initialize shard store"),
@@ -2191,6 +2211,7 @@ mod tests {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let metadata_root = default_dfs_metadata_shards_root(&data_dir);
+        seed_native_metadata_data(&metadata_root, &["root"]);
         drop(
             open_local_sharded_metadata_backend(metadata_root.clone(), vec![older_shard.clone()])
                 .expect("initialize shard store"),
@@ -2287,6 +2308,7 @@ mod tests {
         };
         let shards = vec![local_primary, local_replica];
         let metadata_root = default_dfs_metadata_shards_root(&data_dir);
+        seed_native_metadata_data(&metadata_root, &["root", "services"]);
         drop(
             open_local_sharded_metadata_backend(metadata_root.clone(), shards.clone())
                 .expect("initialize shard stores"),

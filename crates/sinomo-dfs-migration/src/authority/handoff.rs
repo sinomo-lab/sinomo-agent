@@ -18,6 +18,7 @@ impl NativeImportAuthority {
     pub(super) fn import_cause(source: &MetadataSourceCut) -> Result<DfsMetadataShardHandoffCause> {
         Ok(DfsMetadataShardHandoffCause::StorageImport {
             cut: DfsMetadataStorageImportCut {
+                storage_transition_id: source.namespace_count_cohort.as_ref().map(|cohort| cohort.transition_id.clone()),
                 source_cut_digest: match &source.namespace_count_cohort {
                     Some(cohort) => {
                         cohort.validate_bound_cut(source)?;
@@ -340,7 +341,7 @@ impl NativeImportAuthority {
             let path = root.join("native-activation-request.json");
             if path.exists() {
                 let request: KvTxnRequest =
-                    serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?;
+                    serde_json::from_slice(&std::fs::read(&path).map_err(|source| MetadataBackendError::Io { path: path.clone(), source })?).map_err(error)?;
                 if Self::activation_proof(&request)?.is_some_and(|proof| {
                     proof.handoff_id == handoff.handoff_id
                         && proof.cause == handoff.cause
@@ -355,15 +356,15 @@ impl NativeImportAuthority {
             }
         }
         let mut found = None;
-        for entry in std::fs::read_dir(root).map_err(error)? {
-            let entry = entry.map_err(error)?;
+        for entry in std::fs::read_dir(root).map_err(|source| MetadataBackendError::Io { path: root.to_owned(), source })? {
+            let entry = entry.map_err(|source| MetadataBackendError::Io { path: root.to_owned(), source })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.starts_with("native-request-") || !name.ends_with(".json") {
                 continue;
             }
             let request: KvTxnRequest =
-                serde_json::from_slice(&std::fs::read(entry.path()).map_err(error)?)
+                serde_json::from_slice(&std::fs::read(entry.path()).map_err(|source| MetadataBackendError::Io { path: entry.path(), source })?)
                     .map_err(error)?;
             let matches = if activation {
                 Self::activation_proof(&request)?.is_some_and(|proof| {
@@ -543,8 +544,13 @@ impl NativeImportAuthority {
         plan: &MetadataImportPlan,
         request: KvTxnRequest,
     ) -> Result<DfsNativeTxnCommit> {
-        self.evaluate_original_import_commit(plan, request)
-            .map_err(NativeEvaluationError::into_metadata)
+        self.evaluate_original_import_commit(plan, request).map_err(|failure| match failure {
+            NativeEvaluationError::Native(failure) => {
+                tracing::debug!(error=%failure, "original import outcome remains pending at its native owner");
+                MetadataBackendError::StoragePreparationPending { root: plan.source_cut.staged_root.clone(), processed_records: 0 }
+            }
+            NativeEvaluationError::Domain(failure) => failure,
+        })
     }
     pub(super) fn evaluate_original_import_commit(
         &self,
@@ -579,8 +585,13 @@ impl NativeImportAuthority {
         owner: &sinomo_core::node::NodeId,
         captured_issuer_rows: &[MetadataCapturedKvEntry],
     ) -> Result<DfsNativeTxnCommit> {
-        self.evaluate_original_native_commit(request, owner, captured_issuer_rows)
-            .map_err(NativeEvaluationError::into_metadata)
+        self.evaluate_original_native_commit(request, owner, captured_issuer_rows).map_err(|failure| match failure {
+            NativeEvaluationError::Native(failure) => {
+                tracing::debug!(error=%failure, "original native outcome remains pending without a replacement request");
+                MetadataBackendError::StoragePreparationPending { root: self.data_root.clone(), processed_records: 0 }
+            }
+            NativeEvaluationError::Domain(failure) => failure,
+        })
     }
     pub(super) fn evaluate_original_native_commit(
         &self,
@@ -905,7 +916,6 @@ impl NativeImportAuthority {
             || proof.desired_shard != h.desired_shard
             || proof.journal_sequence != plan.target_exact_prefix.journal_sequence
             || proof.state_fingerprint != plan.current_image_fingerprint
-            || request.txn.success.len() != 4
             || !request.txn.failure.is_empty()
         {
             return Err(error(
@@ -945,7 +955,7 @@ impl NativeImportAuthority {
                 .cloned()
                 .collect(),
         };
-        let expected = vec![
+        let mut expected = vec![
             KvOp::put_serde(cfg_key.clone(), &h.desired_shard, None).map_err(error)?,
             KvOp::put_serde(watermark_key, &watermark, None).map_err(error)?,
             KvOp::put_serde(proof_key, proof, None).map_err(error)?,
@@ -953,6 +963,41 @@ impl NativeImportAuthority {
                 key: pending_key.clone(),
             },
         ];
+        let fs_key = sinomo_dfs::file_system_config_key(&h.retiring_shard.file_system_id);
+        let fs_predecessors = request.txn.compares.iter().filter_map(|compare| match compare {
+            KvCompare::ValueEquals { key, value } if key == &fs_key => Some(value),
+            _ => None,
+        }).collect::<Vec<_>>();
+        if let Some(seal) = plan.source_cut.namespace_count_cohort.as_deref() {
+            let [value] = fs_predecessors.as_slice() else {
+                return Err(error("cohort activation omits or repeats its exact filesystem generation CAS"));
+            };
+            let mut config: sinomo_dfs::DfsFileSystemConfig = sinomo_core::kv::decode_kv_value(value).map_err(error)?;
+            let maximum = seal.source_catalog_generation.checked_add(u64::try_from(seal.members.len()).map_err(error)?)
+                .ok_or_else(|| error("cohort catalog generation exhausted"))?;
+            if config.file_system_id != h.retiring_shard.file_system_id
+                || config.catalog_generation < seal.source_catalog_generation || config.catalog_generation >= maximum
+                || !matches!(&config.metadata_storage, Some(sinomo_dfs::DfsMetadataStorageState::PendingTransition {
+                    transition_id, source_catalog_generation, target_generation, target_format, expected_catalog_digest, ..
+                }) if transition_id == &seal.transition_id && *source_catalog_generation == seal.source_catalog_generation
+                    && target_generation == &seal.target_generation && *target_format == seal.target_format
+                    && expected_catalog_digest == &seal.catalog_digest) {
+                return Err(error("cohort activation changes its original pending generation"));
+            }
+            // Validate the real producer's companion effect, retaining every
+            // ordinary filesystem field. This DATA check grants no KV authority.
+            config.catalog_generation = config.catalog_generation.checked_add(1)
+                .ok_or_else(|| error("cohort catalog generation exhausted"))?;
+            expected.push(KvOp::put_serde(fs_key, &config, None).map_err(error)?);
+        } else if !fs_predecessors.is_empty() {
+            let [value] = fs_predecessors.as_slice() else {
+                return Err(error("activation repeats its filesystem predecessor"));
+            };
+            let config: sinomo_dfs::DfsFileSystemConfig = sinomo_core::kv::decode_kv_value(value).map_err(error)?;
+            let successor = sinomo_dfs::metadata_catalog_generation_successor(&config).map_err(error)?;
+            if config.file_system_id != h.retiring_shard.file_system_id { return Err(error("activation has foreign filesystem generation")); }
+            expected.push(KvOp::put_serde(fs_key, &successor, None).map_err(error)?);
+        }
         if request.txn.success != expected || !request.txn.compares.iter().any(|compare| matches!(compare, KvCompare::ValueEquals { key, value } if *key == cfg_key && sinomo_core::kv::decode_kv_value::<DfsMetadataShardConfig>(value).is_ok_and(|cfg| cfg == h.retiring_shard))) {
             return Err(error("activation blueprint changes native effects or omits the retiring config CAS"));
         }
@@ -1133,6 +1178,24 @@ impl NativeImportAuthority {
     pub(super) fn qualify_handoff(
         &self, plan: &MetadataImportPlan, resolved_image_root: &Path, provenance_plan_root: &Path,
     ) -> Result<(DfsNativeTxnCommit, DfsMetadataShardMembershipHandoffProof)> {
+        match self.qualify_handoff_attempt(plan, resolved_image_root, provenance_plan_root) {
+            Ok(qualified) => Ok(qualified),
+            Err(failure) => {
+                // Another turn of this same native owner may complete the exact
+                // immutable handoff while a stage/probe is in flight. Only the
+                // actual matching committed proof can supersede that stage error.
+                if let Some(proof) = self.check_handoff_state(plan)? {
+                    let stage = self.observe_original_import_commit(plan, plan.stage_request.clone())?;
+                    Self::require_committed(&stage)?;
+                    return Ok((stage, proof));
+                }
+                Err(failure)
+            }
+        }
+    }
+    fn qualify_handoff_attempt(
+        &self, plan: &MetadataImportPlan, resolved_image_root: &Path, provenance_plan_root: &Path,
+    ) -> Result<(DfsNativeTxnCommit, DfsMetadataShardMembershipHandoffProof)> {
         if let Some(proof) = self.check_handoff_state(plan)? {
             let stage = self.observe_original_import_commit(plan, plan.stage_request.clone())?;
             Self::require_committed(&stage)?;
@@ -1173,6 +1236,7 @@ impl NativeImportAuthority {
         let local = self.local_node()?;
         let mut acknowledged = BTreeSet::new();
         let mut failures = Vec::new();
+        let mut pending_stage = false;
         for node in configured {
             let command = sinomo_dfs::DfsMetadataSnapshotInstallCommand {
                 request_id: sinomo_core::Id::generate().to_string(),
@@ -1205,6 +1269,7 @@ impl NativeImportAuthority {
                 Ok(()) => {
                     acknowledged.insert(node);
                 }
+                Err(MetadataBackendError::StoragePreparationPending { .. }) => pending_stage = true,
                 Err(error) => failures.push(format!("{node}: {error}")),
             }
         }
@@ -1217,9 +1282,14 @@ impl NativeImportAuthority {
             state_fingerprint: plan.current_image_fingerprint.clone(),
             acknowledged_node_ids: acknowledged.into_iter().collect(),
         };
-        Self::validate_joint_acknowledgements(&proof).map_err(|reason| {
-            error(format!("{reason}; stage failures: {}", failures.join("; ")))
-        })?;
+        if let Err(reason) = Self::validate_joint_acknowledgements(&proof) {
+            if pending_stage && failures.is_empty() {
+                return Err(MetadataBackendError::StoragePreparationPending {
+                    root: resolved_image_root.to_owned(), processed_records: 0,
+                });
+            }
+            return Err(error(format!("{reason}; stage failures: {}", failures.join("; "))));
+        }
         Ok((stage, proof))
     }
     fn stage_rpc_value<T: serde::de::DeserializeOwned>(
@@ -1357,17 +1427,8 @@ impl NativeImportAuthority {
             sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
                 .map_err(error)?
         };
-        if response.request_id != request_id
-            || response.shard_id != shard
-            || response.next_after_sequence != sequence
-            || !matches!(
-                response.result,
-                sinomo_dfs::DfsMetadataSnapshotInstallResult::Installed { .. }
-            )
-        {
-            return Err(error(
-                "snapshot response is not the exact submitted stage effect",
-            ));
+        if !stage_reply_installed(&response, &request_id, &shard, sequence)? {
+            return Err(MetadataBackendError::StoragePreparationPending { root: plan.source_cut.staged_root.clone(), processed_records: 0 });
         }
         let probe = sinomo_dfs::DfsMetadataPrefixProbe {
             barrier_id: sinomo_core::Id::generate().to_string(),
@@ -1417,9 +1478,42 @@ impl NativeImportAuthority {
     }
 }
 
+fn stage_reply_installed(response: &sinomo_dfs::DfsMetadataSnapshotInstallResponse,
+    request_id: &str, shard: &sinomo_dfs::DfsMetadataShardId, sequence: u64) -> Result<bool> {
+    if response.request_id != request_id || &response.shard_id != shard || response.next_after_sequence != sequence {
+        return Err(error("snapshot response is not the exact submitted stage effect"));
+    }
+    match &response.result {
+        sinomo_dfs::DfsMetadataSnapshotInstallResult::Installed { .. } => Ok(true),
+        sinomo_dfs::DfsMetadataSnapshotInstallResult::Rejected { code: sinomo_dfs::DfsMetadataRejectionCode::ReplicaUnreadable, .. } => Ok(false),
+        _ => Err(error("snapshot response rejected its exact submitted stage effect")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_pending_never_qualifies_an_ack_or_mismatched_reply() {
+        let shard = sinomo_dfs::DfsMetadataShardId::new("root");
+        let mut reply = sinomo_dfs::DfsMetadataSnapshotInstallResponse {
+            request_id: "original-stage".into(), shard_id: shard.clone(), next_after_sequence: 8,
+            result: sinomo_dfs::DfsMetadataSnapshotInstallResult::Rejected {
+                code: sinomo_dfs::DfsMetadataRejectionCode::ReplicaUnreadable,
+                reason: "candidate writer currently owned".into(),
+            },
+        };
+        assert!(!stage_reply_installed(&reply, "original-stage", &shard, 8).unwrap());
+        assert!(stage_reply_installed(&reply, "different-stage", &shard, 8).is_err());
+        assert!(stage_reply_installed(&reply, "original-stage", &shard, 9).is_err());
+        reply.result = sinomo_dfs::DfsMetadataSnapshotInstallResult::Rejected {
+            code: sinomo_dfs::DfsMetadataRejectionCode::Other, reason: "malformed image".into(),
+        };
+        assert!(stage_reply_installed(&reply, "original-stage", &shard, 8).is_err());
+        reply.result = sinomo_dfs::DfsMetadataSnapshotInstallResult::Installed { archived_existing: false };
+        assert!(stage_reply_installed(&reply, "original-stage", &shard, 8).unwrap());
+    }
 
     // These are untrusted blueprint rows, not native receipts or network ACKs.
     // The parser and set checks cannot construct an import certificate.
@@ -1440,6 +1534,7 @@ mod tests {
         DfsMetadataShardMembershipHandoff {
             cause: DfsMetadataShardHandoffCause::StorageImport {
                 cut: DfsMetadataStorageImportCut {
+                    storage_transition_id: None,
                     source_cut_digest: "untrusted-cut".into(),
                     source_journal_sequence: 1,
                     source_state_fingerprint: "untrusted-source".into(),

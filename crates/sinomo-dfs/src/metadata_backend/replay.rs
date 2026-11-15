@@ -80,6 +80,15 @@ impl LocalSobjMetadataBackend {
         expected_operation: Option<&crate::DfsMetadataAuthorityOperation>,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.require_replication_source_shard(&batch.shard_id)?;
+        if self.replica_repair_only {
+            // A repair-only handle has no qualified current serving image.
+            // Journal durability cannot create its mandatory generation or
+            // clear this state; the existing authenticated snapshot path does.
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::ReplicaUnreadable,
+                message: "metadata replica requires an authenticated current-generation snapshot before journal acknowledgement".into(),
+            });
+        }
         validate_replicated_journal_batch_entry_order(batch)?;
         if batch.entries.is_empty() {
             return Ok(DfsMetadataReplicaApplyReport::default());

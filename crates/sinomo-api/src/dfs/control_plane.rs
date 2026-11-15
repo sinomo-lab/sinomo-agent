@@ -46,8 +46,11 @@ pub enum DfsPlacementAuthorityRecoveryOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "DfsFileSystemConfigWire")]
 pub struct DfsFileSystemConfig {
+    /// Monotonic generation of this filesystem's complete metadata-shard catalog.
+    #[serde(default, skip_serializing_if = "is_zero_catalog_generation")]
+    pub catalog_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace_count_activation: Option<DfsNamespaceCountActivation>,
+    pub metadata_storage: Option<DfsMetadataStorageState>,
     pub file_system_id: DfsFileSystemId,
     pub display_name: String,
     pub owner_node_id: NodeId,
@@ -60,8 +63,11 @@ pub struct DfsFileSystemConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DfsFileSystemConfigWire {
+    /// Monotonic generation of this filesystem's complete metadata-shard catalog.
+    #[serde(default, skip_serializing_if = "is_zero_catalog_generation")]
+    pub catalog_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace_count_activation: Option<DfsNamespaceCountActivation>,
+    pub metadata_storage: Option<DfsMetadataStorageState>,
     pub file_system_id: DfsFileSystemId,
     pub display_name: String,
     pub owner_node_id: NodeId,
@@ -76,13 +82,14 @@ impl TryFrom<DfsFileSystemConfigWire> for DfsFileSystemConfig {
     fn try_from(wire: DfsFileSystemConfigWire) -> Result<Self, Self::Error> {
         let policies = wire.retention_policies;
         let module_metadata = wire.module_metadata;
-        if let Some(activation) = &wire.namespace_count_activation {
-            activation.validate()?;
+        if let Some(activation) = &wire.metadata_storage {
+            activation.validate_at_catalog_generation(wire.catalog_generation)?;
         }
         validate_retention_policies(&policies)?;
         validate_module_metadata_map(&module_metadata)?;
         Ok(Self {
-            namespace_count_activation: wire.namespace_count_activation,
+            catalog_generation: wire.catalog_generation,
+            metadata_storage: wire.metadata_storage,
             file_system_id: wire.file_system_id,
             display_name: wire.display_name,
             owner_node_id: wire.owner_node_id,
@@ -96,7 +103,8 @@ impl TryFrom<DfsFileSystemConfigWire> for DfsFileSystemConfig {
 impl From<&DfsFileSystem> for DfsFileSystemConfig {
     fn from(file_system: &DfsFileSystem) -> Self {
         Self {
-            namespace_count_activation: file_system.namespace_count_activation.clone(),
+            catalog_generation: file_system.catalog_generation,
+            metadata_storage: file_system.metadata_storage.clone(),
             file_system_id: file_system.file_system_id.clone(),
             display_name: file_system.display_name.clone(),
             owner_node_id: file_system.owner_node_id.clone(),
@@ -110,7 +118,8 @@ impl From<&DfsFileSystem> for DfsFileSystemConfig {
 impl From<DfsFileSystemConfig> for DfsFileSystem {
     fn from(config: DfsFileSystemConfig) -> Self {
         Self {
-            namespace_count_activation: config.namespace_count_activation,
+            catalog_generation: config.catalog_generation,
+            metadata_storage: config.metadata_storage,
             file_system_id: config.file_system_id,
             display_name: config.display_name,
             owner_node_id: config.owner_node_id,
@@ -158,3 +167,5 @@ mod placement_authority_status_schema_tests {
         }
     }
 }
+
+fn is_zero_catalog_generation(value: &u64) -> bool { *value == 0 }

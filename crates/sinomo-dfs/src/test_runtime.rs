@@ -7165,3 +7165,8 @@ mod owned_fault_cleanup_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod data_fixture;
+#[cfg(test)]
+pub(crate) use data_fixture::{copy_native_genesis_data, copy_native_genesis_data_into_selected};
