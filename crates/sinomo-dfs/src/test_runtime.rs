@@ -592,6 +592,8 @@ struct Endpoint {
     registry: ServiceRegistry,
     kv_available: Arc<AtomicBool>,
     accepting: AtomicBool,
+    // The mounted host's own calls; see [`NativeHostIdentity::sending`].
+    sending: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     idle: Arc<Notify>,
 }
@@ -824,6 +826,11 @@ impl Drop for Invocation {
 struct NativeHostIdentity {
     generation: Arc<()>,
     cluster_id: ClusterId,
+    data_dir: Arc<SinomoDataDir>,
+    /// Whether this mounted host sends. It does from its mount until its stop
+    /// begins, whether or not it accepts inbound calls yet, as a daemon sends
+    /// before its own ingress is ready.
+    sending: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -835,6 +842,41 @@ struct Carrier {
     origin: RpcOrigin,
 }
 impl Carrier {
+    /// The source's data directory if it may send `route` now. A mounted host
+    /// sends while its [`NativeHostIdentity::sending`] holds; a retired host
+    /// generation never borrows its successor's. A raw fixture call keeps the
+    /// source endpoint's own route admission.
+    fn sending_source(
+        &self,
+        nodes: &BTreeMap<NodeId, Arc<Endpoint>>,
+        route: &str,
+    ) -> Result<Arc<SinomoDataDir>, NetworkError> {
+        let Some(host) = &self.host_identity else {
+            let source = nodes
+                .get(&self.source)
+                .filter(|source| source.admits_route(route))
+                .ok_or_else(|| NetworkError::UnknownNode {
+                    node_id: self.source.clone(),
+                })?;
+            return Ok(Arc::clone(&source.data_dir));
+        };
+        if nodes
+            .get(&self.source)
+            .is_some_and(|source| !Arc::ptr_eq(&host.generation, &source.host_generation))
+        {
+            return Err(NetworkError::delivery_failed(
+                "native host generation admission",
+                NetworkDeliveryState::DefinitelyNotSent,
+                "retired native host generation cannot borrow its successor's authority",
+            ));
+        }
+        if !host.sending.load(Ordering::Acquire) {
+            return Err(NetworkError::UnknownNode {
+                node_id: self.source.clone(),
+            });
+        }
+        Ok(Arc::clone(&host.data_dir))
+    }
     fn observation(
         &self,
         target: &NodeId,
@@ -921,26 +963,7 @@ impl Carrier {
         let mut _invocation;
         let (source_data, endpoint) = {
             let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
-            let source = nodes
-                .get(&self.source)
-                .ok_or_else(|| NetworkError::UnknownNode {
-                    node_id: self.source.clone(),
-                })?;
-            if self.host_identity.as_ref().is_some_and(|host| {
-                !Arc::ptr_eq(&host.generation, &source.host_generation)
-            }) {
-                return Err(NetworkError::delivery_failed(
-                    "native host generation admission",
-                    NetworkDeliveryState::DefinitelyNotSent,
-                    "retired native host generation cannot borrow its successor's authority",
-                ));
-            }
-            if !source.admits_route(&call.request.route) {
-                return Err(NetworkError::UnknownNode {
-                    node_id: self.source.clone(),
-                });
-            }
-            let source_data = Arc::clone(&source.data_dir);
+            let source_data = self.sending_source(&nodes, &call.request.route)?;
             if self
                 .fabric
                 .partitioned(&self.source, target, &call.request.route)
@@ -1075,19 +1098,10 @@ impl Carrier {
             None
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let source_state = self
-            .fabric
-            .nodes
-            .lock()
-            .expect("DFS test source identity")
-            .get(&self.source)
-            .filter(|source| source.admits_route(&incoming.request.route)
-                && self.host_identity.as_ref().is_none_or(|host|
-                    Arc::ptr_eq(&host.generation, &source.host_generation)))
-            .map(|source| source.data_dir.clone());
-        let source_data = source_state.ok_or_else(|| NetworkError::UnknownNode {
-            node_id: self.source.clone(),
-        })?;
+        let source_data = self.sending_source(
+            &self.fabric.nodes.lock().expect("DFS test source identity"),
+            &incoming.request.route,
+        )?;
         let source_state =
             sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&source_data))?;
         let public_key = source_state.members.iter()
@@ -1998,7 +2012,18 @@ impl ComponentObjectRpcTransport for Carrier {
                 .get(node)
                 .is_some_and(|endpoint| endpoint.accepting.load(Ordering::Acquire))
         };
-        if callable(&self.source) && callable(target) {
+        // A mounted host has a path while it sends, ready or not; the
+        // target must accept the call.
+        let sends = match &self.host_identity {
+            Some(host) => {
+                host.sending.load(Ordering::Acquire)
+                    && nodes
+                        .get(&self.source)
+                        .is_none_or(|source| Arc::ptr_eq(&host.generation, &source.host_generation))
+            }
+            None => callable(&self.source),
+        };
+        if sends && callable(target) {
             sinomo_core::network::RoutedAvailability::Candidate
         } else {
             sinomo_core::network::RoutedAvailability::NoPath
@@ -3654,6 +3679,7 @@ impl DfsTestRuntime {
                 .clone(),
             kv_available: Arc::clone(&endpoint.kv_available),
             accepting: AtomicBool::new(false),
+            sending: Arc::clone(&endpoint.sending),
             active: Arc::new(AtomicUsize::new(0)),
             idle: Arc::new(Notify::new()),
         });
@@ -3736,10 +3762,13 @@ impl DfsTestRuntime {
         let data_dir = self.nodes[node].data_dir.clone();
         crate::runtime_host::suspend_write_set_keeping_unless_enabled(data_dir.root());
         let host_generation = Arc::new(());
+        let sending = Arc::new(AtomicBool::new(true));
         let carrier = Arc::new(Carrier {
             host_identity: Some(NativeHostIdentity {
                 generation: Arc::clone(&host_generation),
                 cluster_id: self.state.cluster_id.clone(),
+                data_dir: data_dir.clone(),
+                sending: Arc::clone(&sending),
             }),
             source: node.clone(),
             fabric: self.fabric.clone(),
@@ -3771,12 +3800,20 @@ impl DfsTestRuntime {
             .with_object_rpc_transport(carrier)
             .with_event_bus(event_bus);
         let mut reconciler = ComponentReconciler::new(context, ServiceRegistry::default());
-        let factories = self.node_component_factories(true, node)?;
-        reconciler
-            .reconcile(&factories)
-            .map_err(|e| e.to_string())?;
-        if reconciler.active_component_ids().is_empty() {
-            return Err("embedded DFS component did not activate".into());
+        // A host that fails to mount never sends: no stop will end it.
+        let mounted = self
+            .node_component_factories(true, node)
+            .and_then(|factories| reconciler.reconcile(&factories).map_err(|e| e.to_string()))
+            .and_then(|_| {
+                if reconciler.active_component_ids().is_empty() {
+                    Err("embedded DFS component did not activate".to_string())
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = mounted {
+            sending.store(false, Ordering::Release);
+            return Err(error);
         }
         let endpoint = Arc::new(Endpoint {
             host_generation,
@@ -3789,6 +3826,7 @@ impl DfsTestRuntime {
                 .clone(),
             kv_available: Arc::clone(&self.nodes[node].kv_available),
             accepting: AtomicBool::new(false),
+            sending,
             active: Arc::new(AtomicUsize::new(0)),
             idle: Arc::new(Notify::new()),
         });
@@ -5674,6 +5712,11 @@ impl DfsTestRuntime {
             crate::mounted_sifs::register_mounted_sifs_test_event_bus(context.data_dir(), None);
         }
         observe_owner("after-mounted-context-drop");
+        // The node's own calls end as its stop begins, before its KV and
+        // ingress are withdrawn, as a stopping daemon's do.
+        if let Some(endpoint) = self.fabric.nodes.lock().unwrap().get(node) {
+            endpoint.sending.store(false, Ordering::Release);
+        }
         self.nodes[node]
             .kv_available
             .store(false, Ordering::Release);
@@ -7107,6 +7150,116 @@ mod normal_native_kv_admission_tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&wal).unwrap(), before);
+        native.close().unwrap();
+    }
+
+    /// A reopened node sends before it is ready, as a daemon sends before its
+    /// own ingress is: its calls pass the fabric while calls to it are still
+    /// refused. Its stop ends its own calls, and a call to the stopped member
+    /// still fails as a call to a dead peer does.
+    #[test]
+    fn reopened_host_sends_before_it_is_ready_and_stops_sending_when_it_stops() {
+        let name = "native-host-sends-before-ready";
+        let (mut native, nodes) = DfsTestRuntime::start_cluster(name, 2).unwrap();
+        let (a, b) = (nodes[0].clone(), nodes[1].clone());
+        let transport = |native: &DfsTestRuntime, node: &NodeId| {
+            native.nodes[node]
+                .mounted_context
+                .as_ref()
+                .unwrap()
+                .object_rpc_transport()
+                .unwrap()
+        };
+        let dfs_call = || {
+            ObjectRpcCall::value(
+                ObjectRpcRequest::encode_body(crate::DFS_DIRECT_READ_ROUTE, "dfs", &()).unwrap(),
+            )
+        };
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+        });
+        let payload = sinomo_core::kv::cluster_kv_txn_rpc_payload(&request).unwrap();
+        let kv_call = || {
+            ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
+                payload.route,
+                payload.category,
+                payload.body.clone(),
+            ))
+        };
+        let options = ClusterObjectRpcOptions::default;
+        native.stop_node(&b).unwrap();
+        native.prepare_projection(&b).unwrap();
+        native.mount_node(&b).unwrap();
+        assert!(
+            !native.fabric.nodes.lock().unwrap()[&b]
+                .accepting
+                .load(Ordering::Acquire),
+            "B is mounted but not ready"
+        );
+        let from_b = transport(&native, &b);
+        let from_a = transport(&native, &a);
+        // B's call passes the fabric's source and target admission and
+        // reaches dispatch, where this rule ends it without effect.
+        native.install_fault(FaultRule {
+            source: Some(b.clone()),
+            target: Some(a.clone()),
+            route: Some(crate::DFS_DIRECT_READ_ROUTE.to_string()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 1,
+            action: FaultAction::TransientRouteFailureBeforeDispatch,
+        });
+        let sent = run_rpc(from_b.call_async(&a, dfs_call(), options(), true));
+        native.clear_faults();
+        assert!(
+            matches!(&sent, Err(NetworkError::DeliveryFailed { detail, .. })
+                if detail == "bounded injected no usable route before dispatch"),
+            "{sent:?}"
+        );
+        assert_eq!(
+            from_b.availability(&a),
+            sinomo_core::network::RoutedAvailability::Candidate
+        );
+        // A call to B is refused until B is ready.
+        let refused = run_rpc(from_a.call_async(&b, dfs_call(), options(), true));
+        assert!(
+            matches!(&refused, Err(NetworkError::UnknownNode { node_id }) if *node_id == b),
+            "{refused:?}"
+        );
+        assert_eq!(
+            from_a.availability(&b),
+            sinomo_core::network::RoutedAvailability::NoPath
+        );
+        native.wait_native_authority(&b).unwrap();
+        native.ready_node(&b).unwrap();
+        native
+            .wait_startup_completion_with_budget(None, Some(&b))
+            .unwrap();
+        native.stop_node(&b).unwrap();
+        // The stopped host's own calls end with its stop.
+        let after_stop = run_rpc(from_b.call_async(&a, dfs_call(), options(), true));
+        assert!(
+            matches!(&after_stop, Err(NetworkError::UnknownNode { node_id }) if *node_id == b),
+            "{after_stop:?}"
+        );
+        // A call to the stopped member, on a KV or DFS route, fails as a call
+        // to a dead peer does.
+        for call in [kv_call(), dfs_call()] {
+            let dead = run_rpc(from_a.call_async(&b, call, options(), true));
+            assert!(
+                matches!(
+                    &dead,
+                    Err(NetworkError::RetryExhausted {
+                        delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                        ..
+                    })
+                ),
+                "{dead:?}"
+            );
+        }
+        drop((from_a, from_b));
         native.close().unwrap();
     }
 }
