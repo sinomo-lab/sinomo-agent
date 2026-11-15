@@ -3411,7 +3411,14 @@ pub(crate) use maintenance_runtime::{
 mod peer_verdicts;
 mod write_set_keeping;
 mod write_set_takeover;
-pub(crate) use write_set_takeover::answer_dfs_takeover_corroboration;
+pub(crate) use write_set_takeover::{
+    DFS_TAKEOVER_EVENT_KINDS, answer_dfs_takeover_corroboration, dfs_takeover_event_publication,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use write_set_takeover::{
+    hold_takeover_activation_for_test, stop_takeover_after_promise_for_test,
+    takeover_events_for_test, takeover_trace_for_test,
+};
 #[cfg(test)]
 pub(crate) use write_set_takeover::ask_dfs_takeover_corroboration_for_test;
 #[cfg(any(test, feature = "test-support"))]

@@ -805,10 +805,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     response.member_view.as_ref(),
                 );
             }
-            if let Some(record) = response.refusing_member_record() {
-                self.replication
-                    .metadata_authority_refusals
-                    .insert(response.request_id.clone(), record.clone());
+            if let DfsMetadataJournalBatchResult::Rejected { code, .. } = &response.result
+                && (code.refuses_source_epoch()
+                    || *code == DfsMetadataRejectionCode::EpochAlignmentRequired)
+            {
+                self.replication.metadata_authority_rejections.insert(
+                    response.request_id.clone(),
+                    (*code, response.member_record.clone()),
+                );
             }
             self.replication
                 .metadata_authority_probe_results

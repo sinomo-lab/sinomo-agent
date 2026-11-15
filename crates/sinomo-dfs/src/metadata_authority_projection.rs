@@ -85,27 +85,6 @@ pub(crate) fn metadata_storage_configuration_changed(
     }
 }
 
-pub(crate) fn metadata_storage_configuration_changed_in_projection(
-    previous: &[sinomo_core::kv::KvEntry],
-    current: &[sinomo_core::kv::KvEntry],
-) -> bool {
-    let find = |entries: &[sinomo_core::kv::KvEntry], key: &str| {
-        entries
-            .binary_search_by(|entry| entry.key.as_str().cmp(key))
-            .ok()
-    };
-    previous.iter().any(|entry| {
-        metadata_storage_configuration_changed(
-            &entry.key,
-            Some(entry),
-            find(current, &entry.key).map(|index| &current[index]),
-        )
-    }) || current.iter().any(|entry| {
-        find(previous, &entry.key).is_none()
-            && metadata_storage_configuration_changed(&entry.key, None, Some(entry))
-    })
-}
-
 /// Whether a change of one shard configuration, together with its write-set
 /// key before and after, is a rebind for `local` rather than a storage change.
 ///

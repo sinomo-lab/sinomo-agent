@@ -38,7 +38,9 @@ impl LocalSobjMetadataBackend {
             return Ok(None);
         }
         let checkpoint =
-            crate::metadata_table_store::read_metadata_table_snapshot_for_replica_repair(&self.root)?;
+            crate::metadata_table_store::read_metadata_table_snapshot_for_replica_repair(
+                &self.root,
+            )?;
         let base = checkpoint.materialized_through_sequence.unwrap_or(0);
         if base > sequence {
             return Ok(None);
@@ -125,15 +127,29 @@ impl LocalSobjMetadataBackend {
             ))
         })?;
         let floors = [
-            metadata_cursor::metadata_prefix_ack_floor(&self.root, &self.shard_id)?
-                .map(|floor| (floor.authority_epoch, floor.journal_sequence, floor.durable_prefix_proof)),
-            metadata_cursor::metadata_authority_ack_floor(&self.root, &self.shard_id)?
-                .map(|floor| (floor.authority_epoch, floor.journal_sequence, floor.durable_prefix_proof)),
+            metadata_cursor::metadata_prefix_ack_floor(&self.root, &self.shard_id)?.map(|floor| {
+                (
+                    floor.authority_epoch,
+                    floor.journal_sequence,
+                    floor.durable_prefix_proof,
+                )
+            }),
+            metadata_cursor::metadata_authority_ack_floor(&self.root, &self.shard_id)?.map(
+                |floor| {
+                    (
+                        floor.authority_epoch,
+                        floor.journal_sequence,
+                        floor.durable_prefix_proof,
+                    )
+                },
+            ),
         ];
         let at_epoch = floors
             .iter()
             .flatten()
-            .filter(|(floor_epoch, _, _)| floor_epoch.is_some_and(|floor_epoch| floor_epoch >= epoch))
+            .filter(|(floor_epoch, _, _)| {
+                floor_epoch.is_some_and(|floor_epoch| floor_epoch >= epoch)
+            })
             .collect::<Vec<_>>();
         let past_target = at_epoch
             .iter()
@@ -157,7 +173,11 @@ impl LocalSobjMetadataBackend {
                 self.shard_id.0, head.journal_sequence, target.journal_sequence
             )));
         }
-        if self.historical_prefix_proof_at(target.journal_sequence)?.as_ref() != Some(target) {
+        if self
+            .historical_prefix_proof_at(target.journal_sequence)?
+            .as_ref()
+            != Some(target)
+        {
             return Err(MetadataBackendError::replica_diverged(format!(
                 "metadata shard {} journal differs from the epoch {epoch} history at sequence {}, or no longer reaches it",
                 self.shard_id.0, target.journal_sequence
@@ -202,9 +222,14 @@ impl LocalSobjMetadataBackend {
     /// Cut the journal back to `target` and rebuild the tables to it: they are
     /// reset to the table checkpoint, which must not be past `target`, and the
     /// retained journal up to `target` is replayed into them.
-    fn truncate_replica_journal_to_locked(&mut self, target: &DfsMetadataPrefixProof) -> Result<()> {
+    fn truncate_replica_journal_to_locked(
+        &mut self,
+        target: &DfsMetadataPrefixProof,
+    ) -> Result<()> {
         let checkpoint =
-            crate::metadata_table_store::read_metadata_table_snapshot_for_replica_repair(&self.root)?;
+            crate::metadata_table_store::read_metadata_table_snapshot_for_replica_repair(
+                &self.root,
+            )?;
         let base = checkpoint.materialized_through_sequence.unwrap_or(0);
         if base > target.journal_sequence {
             return Err(MetadataBackendError::replica_diverged(format!(
@@ -227,7 +252,10 @@ impl LocalSobjMetadataBackend {
         crate::metadata_journal::admission::invalidate(&self.root)?;
         crate::metadata_table_store::remove_metadata_table_checkpoint_log(&self.root)?;
         crate::metadata_table_store::truncate_metadata_table_log(&self.root)?;
-        crate::metadata_journal::truncate_segmented_journal_after(&self.root, target.journal_sequence)?;
+        crate::metadata_journal::truncate_segmented_journal_after(
+            &self.root,
+            target.journal_sequence,
+        )?;
         metadata_cursor::write_journal_head(&self.root, target.journal_sequence.saturating_add(1))?;
         self.tables = checkpoint.tables;
         self.tables.clear_repair_index_changes();

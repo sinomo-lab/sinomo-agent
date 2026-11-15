@@ -176,6 +176,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Bring `member` to this primary's head and durably require its
     /// acknowledgement before its add is submitted.
     ///
+    /// On an epoch that started at a takeover or handoff, the member is
+    /// aligned with the epoch start before anything is replicated to it.
+    ///
     /// The ordinary durability barrier transfers what the member lacks from
     /// its matching prefix, or a snapshot when its copy differs or is empty.
     /// A probe naming the record's generation then confirms the exact head
@@ -197,6 +200,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A store reopened after a membership change keeps its completed
         // handoff marker until it is bound again; bind it as a lane does.
         self.rebind_completed_local_metadata_shard_instance_if_frozen(shard)?;
+        // A member that missed this epoch's start is aligned with it first:
+        // its tail past the start is dropped, or a head it ends at is checked
+        // against this primary's journal. A member whose journal differs is
+        // repaired by the catch-up below, which installs a snapshot.
+        if let DfsWriteSetAlignment::NotReady { reason } =
+            self.align_write_set_member(cut, member, sender)?
+        {
+            return Ok(DfsWriteSetJoin::NotReady { reason });
+        }
         let head = self.write_set_journal_head(&shard_id)?;
         let caught_up =
             self.catch_up_metadata_shard_member(shard, &shard_id, &head, member, None, true)?;

@@ -8,7 +8,9 @@
 //! decide differently still produce at most one new primary.
 
 use super::*;
-use crate::takeover_corroboration::{DfsTakeoverAbstainReason, DfsTakeoverPrimaryReach, DfsTakeoverRank};
+use crate::takeover_corroboration::{
+    DfsTakeoverAbstainReason, DfsTakeoverPrimaryReach, DfsTakeoverRank,
+};
 use std::collections::BTreeMap;
 
 /// Why the primary is judged lost.
@@ -29,12 +31,14 @@ impl DfsTakeoverCause {
     }
 }
 
-/// A veto or a hand-off this node recorded for a shard. No new attempt starts
-/// until the record or this node's verdicts move past it.
+/// How an earlier attempt for a shard ended on its own evidence: a veto, a
+/// newer record, or a confirm read or promise that failed. No new attempt
+/// starts until the record, this node's publication or its verdicts move.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DfsTakeoverStanding {
     pub(crate) epoch: u64,
     pub(crate) generation: u64,
+    pub(crate) publication_generation: u64,
     pub(crate) verdict_generation: u64,
 }
 
@@ -52,6 +56,7 @@ pub(crate) struct DfsTakeoverView<'a> {
     /// An attempt or an unsettled promise is in progress for the shard.
     pub(crate) busy: bool,
     pub(crate) standing: Option<DfsTakeoverStanding>,
+    pub(crate) publication_generation: u64,
     pub(crate) verdict_generation: u64,
 }
 
@@ -85,6 +90,7 @@ pub(crate) fn plan_metadata_takeover(view: &DfsTakeoverView<'_>) -> DfsTakeoverP
                 == DfsTakeoverStanding {
                     epoch: view.shard.epoch,
                     generation: write_set.generation,
+                    publication_generation: view.publication_generation,
                     verdict_generation: view.verdict_generation,
                 }
         })
@@ -93,8 +99,9 @@ pub(crate) fn plan_metadata_takeover(view: &DfsTakeoverView<'_>) -> DfsTakeoverP
     }
     let facts = |node: &NodeId| view.members.get(node);
     let departed = |node: &NodeId| facts(node).is_none_or(|facts| facts.departed);
-    let no_path =
-        |node: &NodeId| facts(node).is_some_and(|facts| facts.reach == DfsWriteSetMemberReach::NoPath);
+    let no_path = |node: &NodeId| {
+        facts(node).is_some_and(|facts| facts.reach == DfsWriteSetMemberReach::NoPath)
+    };
     let cause = if departed(primary) {
         DfsTakeoverCause::PrimaryDeparted
     } else if no_path(primary) {
@@ -357,6 +364,7 @@ mod tests {
                 store_ready: self.store_ready,
                 busy: self.busy,
                 standing: self.standing,
+                publication_generation: 4,
                 verdict_generation: 9,
             })
         }
@@ -365,9 +373,17 @@ mod tests {
     #[test]
     fn only_a_write_set_member_that_judges_the_primary_lost_starts() {
         let case = Case::new(&["a", "b", "c"]);
-        assert_eq!(case.plan_from("b"), DfsTakeoverPlan::Idle, "the primary has a path");
+        assert_eq!(
+            case.plan_from("b"),
+            DfsTakeoverPlan::Idle,
+            "the primary has a path"
+        );
         let case = Case::new(&["a", "b", "c"]).reach("a", DfsWriteSetMemberReach::Unsettled);
-        assert_eq!(case.plan_from("b"), DfsTakeoverPlan::Idle, "a verifying verdict waits");
+        assert_eq!(
+            case.plan_from("b"),
+            DfsTakeoverPlan::Idle,
+            "a verifying verdict waits"
+        );
         let case = Case::new(&["a", "b", "c"]).reach("a", DfsWriteSetMemberReach::NoPath);
         assert_eq!(
             case.plan_from("b"),
@@ -376,8 +392,16 @@ mod tests {
                 asked: [node("c")].into_iter().collect(),
             }
         );
-        assert_eq!(case.plan_from("a"), DfsTakeoverPlan::Idle, "the primary itself");
-        assert_eq!(case.plan_from("d"), DfsTakeoverPlan::Idle, "not in the write set");
+        assert_eq!(
+            case.plan_from("a"),
+            DfsTakeoverPlan::Idle,
+            "the primary itself"
+        );
+        assert_eq!(
+            case.plan_from("d"),
+            DfsTakeoverPlan::Idle,
+            "not in the write set"
+        );
         let mut unswitched = Case::new(&["a", "b", "c"]).reach("a", DfsWriteSetMemberReach::NoPath);
         unswitched.state = DfsMetadataShardWriteSetState::Unswitched;
         assert_eq!(unswitched.plan_from("b"), DfsTakeoverPlan::Idle);
@@ -416,18 +440,27 @@ mod tests {
     #[test]
     fn a_standing_veto_holds_until_the_record_or_the_verdicts_move() {
         let mut case = Case::new(&["a", "b", "c"]).reach("a", DfsWriteSetMemberReach::NoPath);
-        case.standing = Some(DfsTakeoverStanding {
+        let standing = DfsTakeoverStanding {
             epoch: 3,
             generation: 5,
+            publication_generation: 4,
             verdict_generation: 9,
-        });
+        };
+        case.standing = Some(standing);
         assert_eq!(case.plan_from("b"), DfsTakeoverPlan::Idle);
         case.standing = Some(DfsTakeoverStanding {
-            epoch: 3,
-            generation: 5,
             verdict_generation: 8,
+            ..standing
         });
         assert!(matches!(case.plan_from("b"), DfsTakeoverPlan::Start { .. }));
+        case.standing = Some(DfsTakeoverStanding {
+            publication_generation: 3,
+            ..standing
+        });
+        assert!(
+            matches!(case.plan_from("b"), DfsTakeoverPlan::Start { .. }),
+            "a new publication, such as one after KV returns, plans again"
+        );
     }
 
     #[test]
@@ -438,7 +471,10 @@ mod tests {
             rank("d", 9, false),
             rank("e", 9, false),
         ]);
-        let order = ranked.iter().map(|rank| rank.node_id.clone()).collect::<Vec<_>>();
+        let order = ranked
+            .iter()
+            .map(|rank| rank.node_id.clone())
+            .collect::<Vec<_>>();
         assert_eq!(order, vec![node("d"), node("e"), node("b"), node("c")]);
     }
 

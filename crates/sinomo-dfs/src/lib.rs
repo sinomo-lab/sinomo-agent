@@ -385,7 +385,8 @@ pub use control_plane::{
     DfsMetadataShardRecordCut, DfsMetadataShardRecruit, DfsMetadataShardSubstitute,
     DfsMetadataShardWriteSet,
     DfsMetadataShardWriteSetChange, DfsMetadataShardWriteSetChangeKind,
-    DfsMetadataShardWriteSetState, DfsMetadataTakeoverSettlement, DfsMetadataWriteSetCandidate,
+    DfsMetadataShardWriteSetState, DfsMetadataTakeoverEvent, DfsMetadataTakeoverSettlement,
+    DfsMetadataWriteSetCandidate, DfsTakeoverAnswerSummary,
     DfsMetadataWriteSetChangeRequest, DfsMetadataWriteSetEvent, DfsMetadataWriteSetTxnOutcome,
     build_metadata_takeover_swap, build_metadata_write_set_add, build_metadata_write_set_recruit,
     build_metadata_write_set_raise_n, build_metadata_write_set_remove,
@@ -933,7 +934,6 @@ pub(crate) use control_plane::{
     DfsWriteSetRemoveCause, DfsWriteSetShrinkCause, decide_metadata_takeover_hand_off,
     decide_metadata_takeover_round, metadata_shard_configured_node_ids,
     metadata_write_set_reduction, plan_metadata_takeover, plan_metadata_write_set_keeping,
-    rank_metadata_takeover_candidates,
 };
 pub use intent::{
     stable_create_object_id, stable_operation_order_token, stable_write_target_version,

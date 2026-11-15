@@ -10,11 +10,11 @@ use crate::DfsMetadataShardId;
 use sinomo_core::kv::KvRequestId;
 use std::time::{Duration, Instant};
 
-fn shard_id_of(config: &DfsMetadataShardConfig) -> DfsMetadataShardId {
+pub(super) fn shard_id_of(config: &DfsMetadataShardConfig) -> DfsMetadataShardId {
     DfsMetadataShardId::new(config.shard_id.clone())
 }
 
-fn member_state_path(
+pub(super) fn member_state_path(
     runtime: &crate::test_support::DfsTestRuntime,
     node: &NodeId,
     config: &DfsMetadataShardConfig,
@@ -24,7 +24,7 @@ fn member_state_path(
         .join("write-set-member-state.sobj")
 }
 
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+pub(super) fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(90);
     while !done() {
         assert!(Instant::now() < deadline, "{what} did not happen");
@@ -106,7 +106,10 @@ fn native_takeover_retires_the_member_fence_and_the_deposed_primary_releases_pen
         })
         .unwrap()
         .unwrap();
-    assert!(member_state_path(&runtime, &b, &config).exists(), "B keeps its fence");
+    assert!(
+        member_state_path(&runtime, &b, &config).exists(),
+        "B keeps its fence"
+    );
 
     runtime.enable_write_set_keeping(&b);
     runtime.enable_write_set_keeping(&p);
@@ -161,7 +164,7 @@ fn client_write(
     }
 }
 
-fn holds_object(
+pub(super) fn holds_object(
     runtime: &crate::test_support::DfsTestRuntime,
     node: &NodeId,
     config: &DfsMetadataShardConfig,
@@ -232,10 +235,18 @@ fn native_takeover_clears_freeze_markers_the_record_moved_past() {
         .with_main_maintenance_service(&b, |service| {
             let backend = service.metadata_backend_mut().unwrap();
             backend
-                .freeze_metadata_shard_for_membership_handoff(&shard_id, "earlier", config.epoch - 1)
+                .freeze_metadata_shard_for_membership_handoff(
+                    &shard_id,
+                    "earlier",
+                    config.epoch - 1,
+                )
                 .unwrap();
             backend
-                .mark_metadata_shard_membership_handoff_activated(&shard_id, "earlier", config.epoch)
+                .mark_metadata_shard_membership_handoff_activated(
+                    &shard_id,
+                    "earlier",
+                    config.epoch,
+                )
                 .unwrap()
         })
         .unwrap();
@@ -258,7 +269,9 @@ fn native_takeover_clears_freeze_markers_the_record_moved_past() {
     hand_takeover(&runtime, &config, &b);
     // B's writer is not fenced by its earlier marker.
     let after = client_write(&runtime, &config, &c, "/services/markers-after.txt");
-    wait_for("the new primary commits", || holds_object(&runtime, &b, &config, &after));
+    wait_for("the new primary commits", || {
+        holds_object(&runtime, &b, &config, &after)
+    });
     assert!(!marker(&b).exists(), "B's activated marker is removed");
     // P follows the new primary: its pending marker no longer refuses ingest.
     catch_up(&runtime, &config, &p);
@@ -280,7 +293,8 @@ fn align(
     let handle = runtime.runtime_handle();
     runtime
         .with_main_maintenance_service(primary, |service| {
-            let (peer, _) = crate::runtime_host::daemon_dfs_peer_transports_on_runtime(&data_dir, &handle);
+            let (peer, _) =
+                crate::runtime_host::daemon_dfs_peer_transports_on_runtime(&data_dir, &handle);
             let sender =
                 crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
                     &data_dir, peer,
@@ -294,7 +308,7 @@ fn align(
 /// Commit one mode change to `current` at the current primary with a short
 /// caller deadline; members whose journal routes are faulted leave it
 /// prepared.
-fn prepare_unknown(
+pub(super) fn prepare_unknown(
     runtime: &crate::test_support::DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     current: &crate::DfsObjectMetadata,
@@ -304,7 +318,8 @@ fn prepare_unknown(
     service
         .transport
         .set_operation_deadline(Some(Instant::now() + Duration::from_secs(2)));
-    let outcome = service.publish_prepared_operation(mode_change(config, current, 0o640, operation));
+    let outcome =
+        service.publish_prepared_operation(mode_change(config, current, 0o640, operation));
     service.transport.set_operation_deadline(None);
     match outcome {
         Err(crate::DfsError::MetadataCommitOutcomeUnknown { .. }) => {}
@@ -344,8 +359,15 @@ fn native_takeover_aligns_members_with_the_epoch_start() {
     prepare_unknown(&runtime, &config, &z2, "align-z2");
     // Before the takeover nothing else writes these journals: P runs past
     // C's head and B ends before it.
-    let candidate = durable_prefix(&runtime, &c, &config).unwrap().journal_sequence;
-    assert!(durable_prefix(&runtime, &p, &config).unwrap().journal_sequence > candidate);
+    let candidate = durable_prefix(&runtime, &c, &config)
+        .unwrap()
+        .journal_sequence;
+    assert!(
+        durable_prefix(&runtime, &p, &config)
+            .unwrap()
+            .journal_sequence
+            > candidate
+    );
     let behind = durable_prefix(&runtime, &b, &config).unwrap();
     assert!(behind.journal_sequence < candidate);
     let (_, start) = hand_takeover(&runtime, &config, &c);
@@ -368,7 +390,8 @@ fn native_takeover_aligns_members_with_the_epoch_start() {
     wait_for("the new primary commits with B", || {
         holds_object(&runtime, &c, &config, &after)
     });
-    for (node, journal) in [&p, &b].map(|node| (node.clone(), shard_root(&runtime, node, &config))) {
+    for (node, journal) in [&p, &b].map(|node| (node.clone(), shard_root(&runtime, node, &config)))
+    {
         assert!(
             !std::fs::read_dir(&journal)
                 .unwrap()
@@ -400,8 +423,15 @@ fn native_takeover_member_aligns_inline_on_the_new_epochs_first_batch() {
     // Z reaches B but not C.
     fail_journal_calls(&runtime, &config, &c);
     prepare_unknown(&runtime, &config, &z, "inline-z");
-    let candidate = durable_prefix(&runtime, &c, &config).unwrap().journal_sequence;
-    assert!(durable_prefix(&runtime, &b, &config).unwrap().journal_sequence > candidate);
+    let candidate = durable_prefix(&runtime, &c, &config)
+        .unwrap()
+        .journal_sequence;
+    assert!(
+        durable_prefix(&runtime, &b, &config)
+            .unwrap()
+            .journal_sequence
+            > candidate
+    );
     hand_takeover(&runtime, &config, &c);
     runtime.clear_faults();
 
@@ -522,10 +552,9 @@ fn send_from(
         &data_dir,
         &runtime.runtime_handle(),
     );
-    let sender =
-        crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
-            &data_dir, peer,
-        );
+    let sender = crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
+        &data_dir, peer,
+    );
     sender(target, command, None).expect("the member answers")
 }
 
@@ -591,7 +620,10 @@ fn native_takeover_member_refusal_names_the_new_primary_to_the_old_one() {
     };
     let head = durable_prefix(&runtime, &c, &config).unwrap();
     for (epoch, code) in [
-        (config.epoch, crate::DfsMetadataRejectionCode::SourceEpochSuperseded),
+        (
+            config.epoch,
+            crate::DfsMetadataRejectionCode::SourceEpochSuperseded,
+        ),
         (
             record.shard.epoch + 2,
             crate::DfsMetadataRejectionCode::WriteSetViewBehind,
@@ -634,7 +666,12 @@ fn native_takeover_promise_refuses_the_primary_whose_keeper_shrinks_the_candidat
     }
     runtime.enable_write_set_keeping(&p);
     for member in [&b, &c] {
-        runtime.set_peer_verdict(&p, member, sinomo_core::network::PeerPathVerdict::Path, false);
+        runtime.set_peer_verdict(
+            &p,
+            member,
+            sinomo_core::network::PeerPathVerdict::Path,
+            false,
+        );
     }
     // B promises a candidate's takeover; the swap is not submitted yet.
     let promised = cut(&runtime, &config);
@@ -665,11 +702,14 @@ fn native_takeover_promise_refuses_the_primary_whose_keeper_shrinks_the_candidat
         !super::commit_native_tests::write_set_of(&runtime, &config).contains(&b)
     });
     wait_for("the shrink's event names the fence as its cause", || {
-        runtime.write_set_keeping_events(&p).iter().any(|(name, event)| {
-            name == crate::DfsMetadataWriteSetEvent::SHRUNK
-                && event.cause == "member-fenced"
-                && event.node_ids.contains(&b)
-        })
+        runtime
+            .write_set_keeping_events(&p)
+            .iter()
+            .any(|(name, event)| {
+                name == crate::DfsMetadataWriteSetEvent::SHRUNK
+                    && event.cause == "member-fenced"
+                    && event.node_ids.contains(&b)
+            })
     });
     // The same body commits without B, by this retry or by the recovery pass
     // the shrink requests.

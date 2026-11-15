@@ -1,0 +1,1452 @@
+//! The candidate role: per-shard takeover attempts, driven from the keeper's
+//! evaluation and from the completions of the steps they start.
+
+use super::super::peer_verdicts::DfsPeerVerdictSnapshot;
+use super::super::write_set_keeping::MemberRecord;
+use super::super::*;
+use super::ShardKey;
+use super::steps::{
+    TakeOutcome, activate_metadata_takeover, align_metadata_takeover_members,
+    read_takeover_promise, retire_takeover_fence, settle_takeover_promise, take_metadata_shard,
+};
+use crate::takeover_corroboration::{
+    DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT, DfsMetadataTakeoverCorroborationReply,
+    DfsMetadataTakeoverCorroborationRequest, DfsTakeoverCorroborationKind,
+    DfsTakeoverHandOffOutcome, DfsTakeoverPrimaryReach, DfsTakeoverRank,
+};
+use crate::{
+    DfsMetadataShardConfig, DfsMetadataShardWriteSet, DfsMetadataShardWriteSetState,
+    DfsMetadataTakeoverEvent, DfsMetadataTakeoverPromise, DfsMetadataTakeoverSettlement,
+    DfsTakeoverAnswerSummary, DfsTakeoverRoundEntry, DfsTakeoverRoundOutcome, DfsTakeoverStanding,
+    DfsWriteSetMemberFacts, DfsWriteSetMemberReach,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+/// The first re-send of an unknown swap; each later one doubles, up to the
+/// network's own timeout. The timer only re-sends: it never decides.
+const TAKEOVER_RESEND_FIRST: Duration = Duration::from_millis(250);
+
+/// One switched or switching shard this node is configured for.
+pub(in crate::runtime_host) struct TakeoverShard {
+    pub(in crate::runtime_host) key: ShardKey,
+    pub(in crate::runtime_host) shard: DfsMetadataShardConfig,
+    pub(in crate::runtime_host) state: DfsMetadataShardWriteSetState,
+}
+
+/// What one step the candidate role started ended with.
+pub(in crate::runtime_host) enum TakeoverCompletion {
+    LocalHead {
+        key: ShardKey,
+        attempt: String,
+        journal_sequence: Option<u64>,
+    },
+    Answer {
+        key: ShardKey,
+        attempt: String,
+        member: NodeId,
+        reply: Option<DfsMetadataTakeoverCorroborationReply>,
+    },
+    HandOff {
+        key: ShardKey,
+        attempt: String,
+        member: NodeId,
+        reply: Option<DfsMetadataTakeoverCorroborationReply>,
+    },
+    Taken {
+        key: ShardKey,
+        attempt: String,
+        outcome: TakeOutcome,
+    },
+    Resend {
+        key: ShardKey,
+        attempt: String,
+    },
+    Activated {
+        key: ShardKey,
+        epoch: u64,
+        result: Result<Vec<(NodeId, crate::DfsWriteSetAlignment)>, String>,
+    },
+    Aligned {
+        key: ShardKey,
+        members: Vec<NodeId>,
+        result: Result<Vec<(NodeId, crate::DfsWriteSetAlignment)>, String>,
+    },
+}
+
+struct Attempt {
+    id: String,
+    epoch: u64,
+    generation: u64,
+    primary: NodeId,
+    cause: &'static str,
+    promised: bool,
+    /// Which members are mobile, for the ranking.
+    mobile: BTreeSet<NodeId>,
+    /// The asker of a hand-off this attempt runs, answered once it settles.
+    reply: Option<tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>>,
+    step: Step,
+}
+
+enum Step {
+    Corroborating {
+        local: Option<DfsTakeoverRank>,
+        pending: BTreeSet<NodeId>,
+        entries: BTreeMap<NodeId, DfsTakeoverRoundEntry>,
+        declined: BTreeSet<NodeId>,
+    },
+    HandingOff {
+        local: DfsTakeoverRank,
+        to: NodeId,
+        entries: BTreeMap<NodeId, DfsTakeoverRoundEntry>,
+        declined: BTreeSet<NodeId>,
+    },
+    Taking,
+    Unknown {
+        promise: DfsMetadataTakeoverPromise,
+        interval: Duration,
+        resending: bool,
+    },
+    /// The swap applied here, or the member this node handed off to runs the
+    /// takeover: the next publication decides what comes next.
+    Following {
+        publication_generation: u64,
+    },
+}
+
+/// The candidate role's attempts, and the activations it ran as a new
+/// primary.
+pub(in crate::runtime_host) struct TakeoverRole {
+    local: NodeId,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    runtime: tokio::runtime::Handle,
+    events: ComponentEventClient,
+    done: tokio::sync::mpsc::UnboundedSender<TakeoverCompletion>,
+    attempts: BTreeMap<ShardKey, Attempt>,
+    standing: BTreeMap<ShardKey, DfsTakeoverStanding>,
+    resumed: BTreeSet<ShardKey>,
+    activated: BTreeMap<ShardKey, u64>,
+    activating: BTreeSet<ShardKey>,
+    aligning: BTreeSet<(ShardKey, NodeId)>,
+    last_events: BTreeMap<ShardKey, sinomo_core::Id>,
+    /// Activations that failed, with the inputs they saw: retried only once
+    /// the publication or the verdicts move.
+    activation_blocked: BTreeMap<ShardKey, (u64, u64, u64)>,
+    publication_generation: u64,
+    verdict_generation: u64,
+}
+
+impl TakeoverRole {
+    pub(in crate::runtime_host) fn new(
+        local: NodeId,
+        data_dir: SinomoDataDir,
+        runtime: tokio::runtime::Handle,
+        events: ComponentEventClient,
+        done: tokio::sync::mpsc::UnboundedSender<TakeoverCompletion>,
+    ) -> Self {
+        Self {
+            local,
+            cluster_paths: ClusterPaths::new(&data_dir),
+            data_dir,
+            runtime,
+            events,
+            done,
+            attempts: BTreeMap::new(),
+            standing: BTreeMap::new(),
+            resumed: BTreeSet::new(),
+            activated: BTreeMap::new(),
+            activating: BTreeSet::new(),
+            aligning: BTreeSet::new(),
+            last_events: BTreeMap::new(),
+            activation_blocked: BTreeMap::new(),
+            publication_generation: 0,
+            verdict_generation: 0,
+        }
+    }
+
+    /// Whether the candidate role needs this node's verdicts: it is a
+    /// write-set member other than the primary of some switched shard.
+    pub(in crate::runtime_host) fn needs_verdicts(&self, shards: &[TakeoverShard]) -> bool {
+        shards.iter().any(|shard| {
+            shard.shard.primary_node_id != self.local
+                && shard
+                    .state
+                    .switched()
+                    .is_some_and(|write_set| write_set.contains(&self.local))
+        })
+    }
+
+    /// Plan and drive every shard. Returns the primaries a delivery failure
+    /// asked to verify whose verdicts are neither settled lost nor verifying.
+    pub(in crate::runtime_host) fn evaluate(
+        &mut self,
+        shards: &[TakeoverShard],
+        members: &BTreeMap<NodeId, MemberRecord>,
+        verdicts: &DfsPeerVerdictSnapshot,
+        unreachable_primaries: &BTreeSet<ShardKey>,
+        publication_generation: u64,
+    ) -> Vec<NodeId> {
+        self.verdict_generation = verdicts.generation;
+        self.publication_generation = publication_generation;
+        let present = shards
+            .iter()
+            .map(|shard| shard.key.clone())
+            .collect::<BTreeSet<_>>();
+        self.attempts.retain(|key, attempt| {
+            present.contains(key) || matches!(attempt.step, Step::Taking | Step::Unknown { .. })
+        });
+        self.standing.retain(|key, _| present.contains(key));
+        let mut verify = Vec::new();
+        for shard in shards {
+            let Some(write_set) = shard.state.switched() else {
+                self.drop_unless_settling(&shard.key);
+                continue;
+            };
+            if shard.shard.primary_node_id == self.local {
+                self.drop_unless_settling(&shard.key);
+                // Activation follows this node's own settlement, so its swap
+                // and promise end are recorded first.
+                if !self.attempts.contains_key(&shard.key) {
+                    self.activate_if_new(shard, write_set, verdicts);
+                }
+                continue;
+            }
+            if !write_set.contains(&self.local) {
+                self.drop_unless_settling(&shard.key);
+                continue;
+            }
+            let primary = &shard.shard.primary_node_id;
+            if unreachable_primaries.contains(&shard.key) {
+                let (_, verifying) = verdicts.entry(primary);
+                if !verifying && verdicts.reach(primary) != DfsWriteSetMemberReach::NoPath {
+                    verify.push(primary.clone());
+                }
+            }
+            // A promise on disk from before this process started is settled
+            // before anything else.
+            if self.resumed.insert(shard.key.clone())
+                && !self.attempts.contains_key(&shard.key)
+                && self.resume_promise(shard)
+            {
+                continue;
+            }
+            let facts = takeover_member_facts(shard, members, verdicts);
+            if self.attempts.contains_key(&shard.key) {
+                self.drive(shard, write_set, &facts, verdicts);
+                continue;
+            }
+            let view = crate::DfsTakeoverView {
+                local: &self.local,
+                shard: &shard.shard,
+                state: &shard.state,
+                members: &facts,
+                // A store that cannot promise from its exact materialized head
+                // refuses inside the promise itself.
+                store_ready: true,
+                busy: false,
+                standing: self.standing.get(&shard.key).copied(),
+                publication_generation,
+                verdict_generation: verdicts.generation,
+            };
+            let crate::DfsTakeoverPlan::Start { cause, asked } =
+                crate::plan_metadata_takeover(&view)
+            else {
+                continue;
+            };
+            // A promise left by an earlier attempt is settled, never replaced.
+            if self.resume_promise(shard) {
+                continue;
+            }
+            self.start(shard, write_set, &facts, cause, asked, verdicts);
+        }
+        verify
+    }
+
+    /// Run a hand-off from another member's round: that member ranked this
+    /// node first. A round of this node's own gives way to it; an attempt
+    /// already promising or settling answers that the asker should follow.
+    pub(in crate::runtime_host) fn hand_off(
+        &mut self,
+        shards: &[TakeoverShard],
+        hand_off: super::TakeoverHandOff,
+        reply: tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>,
+    ) {
+        let decline = |reason: &str| DfsTakeoverHandOffOutcome::Declined {
+            reason: reason.into(),
+            prefer: None,
+        };
+        let Some(shard) = shards.iter().find(|shard| shard.key == hand_off.key) else {
+            let _ = reply.send(decline("no-record"));
+            return;
+        };
+        if shard.shard.epoch != hand_off.epoch || shard.shard.primary_node_id != hand_off.primary {
+            let _ = reply.send(DfsTakeoverHandOffOutcome::Followed);
+            return;
+        }
+        if !shard
+            .state
+            .switched()
+            .is_some_and(|write_set| write_set.contains(&self.local))
+            || shard.shard.primary_node_id == self.local
+        {
+            let _ = reply.send(decline("not-eligible"));
+            return;
+        }
+        if let Some(attempt) = self.attempts.get_mut(&shard.key) {
+            match attempt.step {
+                Step::Corroborating { .. } | Step::HandingOff { .. } => {
+                    attempt.step = Step::Taking;
+                    attempt.reply = Some(reply);
+                    self.spawn_take(shard);
+                }
+                Step::Taking if attempt.reply.is_none() => attempt.reply = Some(reply),
+                _ => {
+                    let _ = reply.send(DfsTakeoverHandOffOutcome::Followed);
+                }
+            }
+            return;
+        }
+        if self.resume_promise(shard) {
+            let _ = reply.send(DfsTakeoverHandOffOutcome::Followed);
+            return;
+        }
+        let Some(write_set) = shard.state.switched() else {
+            return;
+        };
+        self.attempts.insert(
+            shard.key.clone(),
+            Attempt {
+                id: sinomo_core::Id::generate().to_string(),
+                epoch: shard.shard.epoch,
+                generation: write_set.generation,
+                primary: shard.shard.primary_node_id.clone(),
+                cause: "hand-off",
+                promised: false,
+                mobile: BTreeSet::new(),
+                reply: Some(reply),
+                step: Step::Taking,
+            },
+        );
+        self.spawn_take(shard);
+    }
+
+    /// Forget an attempt the record moved past, unless its swap is still
+    /// being settled: a promise is always ended by its own swap's outcome.
+    fn drop_unless_settling(&mut self, key: &ShardKey) {
+        if self
+            .attempts
+            .get(key)
+            .is_some_and(|attempt| !matches!(attempt.step, Step::Taking | Step::Unknown { .. }))
+        {
+            self.attempts.remove(key);
+        }
+    }
+
+    /// Resume an unsettled promise found on disk: re-send its identical swap.
+    fn resume_promise(&mut self, shard: &TakeoverShard) -> bool {
+        let Some(promise) = read_takeover_promise(&self.data_dir, &shard.key.1) else {
+            return false;
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        super::record_takeover_trace_for_test(
+            &self.data_dir,
+            format!("resume promise {}", promise.swap_request_id),
+        );
+        if promise.cut.shard.file_system_id != shard.key.0 {
+            return false;
+        }
+        let id = sinomo_core::Id::generate().to_string();
+        self.attempts.insert(
+            shard.key.clone(),
+            Attempt {
+                id: id.clone(),
+                epoch: promise.cut.shard.epoch,
+                generation: promise
+                    .cut
+                    .write_set_state()
+                    .switched()
+                    .map_or(0, |write_set| write_set.generation),
+                primary: promise.cut.shard.primary_node_id.clone(),
+                cause: "restart-resume",
+                promised: true,
+                mobile: BTreeSet::new(),
+                reply: None,
+                step: Step::Unknown {
+                    promise: promise.clone(),
+                    interval: TAKEOVER_RESEND_FIRST,
+                    resending: true,
+                },
+            },
+        );
+        self.spawn_settle(shard.key.clone(), id, promise);
+        true
+    }
+
+    fn start(
+        &mut self,
+        shard: &TakeoverShard,
+        write_set: &DfsMetadataShardWriteSet,
+        facts: &BTreeMap<NodeId, DfsWriteSetMemberFacts>,
+        cause: crate::DfsTakeoverCause,
+        asked: BTreeSet<NodeId>,
+        verdicts: &DfsPeerVerdictSnapshot,
+    ) {
+        let id = sinomo_core::Id::generate().to_string();
+        self.attempts.insert(
+            shard.key.clone(),
+            Attempt {
+                id: id.clone(),
+                epoch: shard.shard.epoch,
+                generation: write_set.generation,
+                primary: shard.shard.primary_node_id.clone(),
+                cause: cause.as_str(),
+                promised: false,
+                reply: None,
+                mobile: facts
+                    .iter()
+                    .filter(|(_, facts)| facts.mobile)
+                    .map(|(node, _)| node.clone())
+                    .collect(),
+                step: if asked.is_empty() {
+                    Step::Taking
+                } else {
+                    Step::Corroborating {
+                        local: None,
+                        pending: asked.clone(),
+                        entries: BTreeMap::new(),
+                        declined: BTreeSet::new(),
+                    }
+                },
+            },
+        );
+        let mut started = self.event(&shard.key, None, Vec::new());
+        started.node_ids = asked.iter().cloned().collect();
+        let primary_evidence = if cause == crate::DfsTakeoverCause::PrimaryDeparted {
+            format!(
+                "sinomo-cluster:member/{}/departed",
+                shard.shard.primary_node_id
+            )
+        } else {
+            format!(
+                "sinomo-network:peer-reachability/{}/{}/{}",
+                self.local, shard.shard.primary_node_id, verdicts.generation
+            )
+        };
+        self.publish(
+            &shard.key,
+            DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+            started,
+            vec![
+                primary_evidence,
+                format!(
+                    "dfs:write-set/{}/{}/{}/{}",
+                    shard.key.0, shard.key.1.0, shard.shard.epoch, write_set.generation
+                ),
+            ],
+        );
+        if asked.is_empty() {
+            self.spawn_take(shard);
+            return;
+        }
+        self.spawn_local_head(shard.key.clone(), id.clone());
+        for member in asked {
+            let request = self.request(&shard.key, DfsTakeoverCorroborationKind::Query);
+            if let Some(request) = request {
+                self.spawn_ask(shard.key.clone(), member, request, false);
+            }
+        }
+    }
+
+    fn request(
+        &self,
+        key: &ShardKey,
+        kind: DfsTakeoverCorroborationKind,
+    ) -> Option<DfsMetadataTakeoverCorroborationRequest> {
+        let attempt = self.attempts.get(key)?;
+        Some(DfsMetadataTakeoverCorroborationRequest {
+            format: DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT,
+            attempt_id: attempt.id.clone(),
+            kind,
+            file_system_id: key.0.clone(),
+            shard_id: key.1.clone(),
+            epoch: attempt.epoch,
+            write_set_generation: attempt.generation,
+            primary_node_id: attempt.primary.clone(),
+            candidate_node_id: self.local.clone(),
+        })
+    }
+
+    /// Advance an attempt on a wake that is not its own completion.
+    fn drive(
+        &mut self,
+        shard: &TakeoverShard,
+        write_set: &DfsMetadataShardWriteSet,
+        facts: &BTreeMap<NodeId, DfsWriteSetMemberFacts>,
+        verdicts: &DfsPeerVerdictSnapshot,
+    ) {
+        enum Next {
+            Nothing,
+            Drop,
+            Decide,
+        }
+        let key = &shard.key;
+        let Some(attempt) = self.attempts.get_mut(key) else {
+            return;
+        };
+        let moved = shard.shard.epoch != attempt.epoch;
+        let primary_reached = facts
+            .get(&attempt.primary)
+            .is_some_and(|facts| !facts.departed && facts.reach == DfsWriteSetMemberReach::Path);
+        let next = match &mut attempt.step {
+            Step::Taking | Step::Unknown { .. } => Next::Nothing,
+            Step::Following {
+                publication_generation,
+            } => {
+                if moved
+                    || write_set.generation != attempt.generation
+                    || *publication_generation != self.publication_generation
+                {
+                    Next::Drop
+                } else {
+                    Next::Nothing
+                }
+            }
+            _ if moved || primary_reached => Next::Drop,
+            Step::Corroborating {
+                pending, entries, ..
+            } => {
+                // A member this node no longer reaches is left out.
+                for member in pending.clone() {
+                    if verdicts.reach(&member) == DfsWriteSetMemberReach::NoPath {
+                        pending.remove(&member);
+                        entries.insert(member, DfsTakeoverRoundEntry::LeftOut);
+                    }
+                }
+                Next::Decide
+            }
+            Step::HandingOff { .. } => Next::Nothing,
+        };
+        match next {
+            Next::Nothing => {}
+            Next::Drop => {
+                self.attempts.remove(key);
+            }
+            Next::Decide => self.decide_if_complete(shard),
+        }
+    }
+
+    /// Decide the round once every asked member settled and the local head
+    /// is known.
+    fn decide_if_complete(&mut self, shard: &TakeoverShard) {
+        let Some(Attempt {
+            step:
+                Step::Corroborating {
+                    local: Some(local),
+                    pending,
+                    entries,
+                    declined,
+                },
+            ..
+        }) = self.attempts.get(&shard.key)
+        else {
+            return;
+        };
+        if !pending.is_empty() {
+            return;
+        }
+        let (local, entries, declined) = (local.clone(), entries.clone(), declined.clone());
+        self.decide(shard, local, entries, declined);
+    }
+
+    fn decide(
+        &mut self,
+        shard: &TakeoverShard,
+        local: DfsTakeoverRank,
+        entries: BTreeMap<NodeId, DfsTakeoverRoundEntry>,
+        declined: BTreeSet<NodeId>,
+    ) {
+        let key = shard.key.clone();
+        let answers = answer_summaries(&entries);
+        match crate::decide_metadata_takeover_round(&local, &entries, &declined) {
+            DfsTakeoverRoundOutcome::Vetoed { by } => {
+                self.end_standing(&key);
+                let mut event = self.event(&key, None, answers);
+                event.node_ids = vec![by];
+                self.publish(
+                    &key,
+                    DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
+                    event,
+                    Vec::new(),
+                );
+                self.attempts.remove(&key);
+            }
+            DfsTakeoverRoundOutcome::Follow => {
+                self.end_standing(&key);
+                self.attempts.remove(&key);
+            }
+            DfsTakeoverRoundOutcome::Proceed => {
+                if let Some(attempt) = self.attempts.get_mut(&key) {
+                    attempt.step = Step::Taking;
+                }
+                self.spawn_take(shard);
+            }
+            DfsTakeoverRoundOutcome::HandOff { to, ranking } => {
+                let Some(request) =
+                    self.request(&key, DfsTakeoverCorroborationKind::HandOff { ranking })
+                else {
+                    return;
+                };
+                if let Some(attempt) = self.attempts.get_mut(&key) {
+                    attempt.step = Step::HandingOff {
+                        local,
+                        to: to.clone(),
+                        entries,
+                        declined,
+                    };
+                }
+                let mut event = self.event(&key, None, answers);
+                event.node_ids = vec![to.clone()];
+                self.publish(
+                    &key,
+                    DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF,
+                    event,
+                    Vec::new(),
+                );
+                self.spawn_ask(key, to, request, true);
+            }
+        }
+    }
+
+    /// Record that this attempt ended on its own evidence: no new attempt
+    /// starts until the record or this node's verdicts move.
+    fn end_standing(&mut self, key: &ShardKey) {
+        if let Some(attempt) = self.attempts.get(key) {
+            self.standing.insert(
+                key.clone(),
+                DfsTakeoverStanding {
+                    epoch: attempt.epoch,
+                    generation: attempt.generation,
+                    publication_generation: self.publication_generation,
+                    verdict_generation: self.verdict_generation,
+                },
+            );
+        }
+    }
+
+    /// Handle one completion. Returns the event the keeper's primary role
+    /// names as the cause of its next event for the shard.
+    pub(in crate::runtime_host) fn complete(
+        &mut self,
+        completion: TakeoverCompletion,
+        shards: &[TakeoverShard],
+    ) -> Option<(ShardKey, sinomo_core::Id)> {
+        let shard_for = |key: &ShardKey| shards.iter().find(|shard| &shard.key == key);
+        match completion {
+            TakeoverCompletion::LocalHead {
+                key,
+                attempt,
+                journal_sequence,
+            } => {
+                if let Some(current) = self.attempts.get_mut(&key)
+                    && current.id == attempt
+                {
+                    let mobile = current.mobile.contains(&self.local);
+                    if let Step::Corroborating { local, .. } = &mut current.step {
+                        *local = Some(DfsTakeoverRank {
+                            node_id: self.local.clone(),
+                            journal_sequence: journal_sequence.unwrap_or(0),
+                            mobile,
+                        });
+                    }
+                }
+                if let Some(shard) = shard_for(&key) {
+                    self.decide_if_complete(shard);
+                }
+            }
+            TakeoverCompletion::Answer {
+                key,
+                attempt,
+                member,
+                reply,
+            } => {
+                if let Some(current) = self.attempts.get_mut(&key)
+                    && current.id == attempt
+                {
+                    let mobile = current.mobile.contains(&member);
+                    if let Step::Corroborating {
+                        pending, entries, ..
+                    } = &mut current.step
+                        && pending.remove(&member)
+                    {
+                        entries.insert(
+                            member,
+                            reply.map_or(DfsTakeoverRoundEntry::LeftOut, |reply| {
+                                DfsTakeoverRoundEntry::Replied {
+                                    answer: reply.answer,
+                                    durable_sequence: reply.durable_sequence,
+                                    mobile,
+                                }
+                            }),
+                        );
+                    }
+                }
+                if let Some(shard) = shard_for(&key) {
+                    self.decide_if_complete(shard);
+                }
+            }
+            TakeoverCompletion::HandOff {
+                key,
+                attempt,
+                member,
+                reply,
+            } => {
+                #[cfg(any(test, feature = "test-support"))]
+                super::record_takeover_trace_for_test(
+                    &self.data_dir,
+                    format!(
+                        "hand-off {attempt} to {member}: {:?}",
+                        reply.as_ref().map(|reply| &reply.hand_off)
+                    ),
+                );
+                let Some(Attempt {
+                    id,
+                    step:
+                        Step::HandingOff {
+                            local,
+                            to,
+                            entries,
+                            declined,
+                        },
+                    ..
+                }) = self.attempts.get(&key)
+                else {
+                    return None;
+                };
+                if id != &attempt || to != &member {
+                    return None;
+                }
+                match reply.and_then(|reply| reply.hand_off) {
+                    Some(
+                        DfsTakeoverHandOffOutcome::Swapped | DfsTakeoverHandOffOutcome::Followed,
+                    ) => {
+                        let publication_generation = self.publication_generation;
+                        if let Some(current) = self.attempts.get_mut(&key) {
+                            current.step = Step::Following {
+                                publication_generation,
+                            };
+                        }
+                    }
+                    // A decline or a failed call: rank again without it.
+                    _ => {
+                        let (local, entries) = (local.clone(), entries.clone());
+                        let mut declined = declined.clone();
+                        declined.insert(member);
+                        if let Some(shard) = shard_for(&key) {
+                            self.decide(shard, local, entries, declined);
+                        }
+                    }
+                }
+            }
+            TakeoverCompletion::Taken {
+                key,
+                attempt,
+                outcome,
+            } => {
+                let epoch = shard_for(&key).map(|shard| shard.shard.epoch);
+                self.taken(key, attempt, outcome, epoch);
+            }
+            TakeoverCompletion::Resend { key, attempt } => {
+                if let Some(current) = self.attempts.get_mut(&key)
+                    && current.id == attempt
+                    && let Step::Unknown {
+                        promise, resending, ..
+                    } = &mut current.step
+                    && !*resending
+                {
+                    *resending = true;
+                    let promise = promise.clone();
+                    self.spawn_settle(key, attempt, promise);
+                }
+            }
+            TakeoverCompletion::Activated { key, epoch, result } => {
+                self.activating.remove(&key);
+                match result {
+                    Ok(aligned) => {
+                        self.activated.insert(key.clone(), epoch);
+                        return self.activated_events(&key, shard_for(&key), &aligned);
+                    }
+                    Err(error) => {
+                        tracing::debug!(target: "sinomo.dfs.write_set", %error, shard = %key.1.0, "takeover activation not completed");
+                        self.activation_blocked.insert(
+                            key,
+                            (epoch, self.publication_generation, self.verdict_generation),
+                        );
+                    }
+                }
+            }
+            TakeoverCompletion::Aligned {
+                key,
+                members,
+                result,
+            } => {
+                for member in members {
+                    self.aligning.remove(&(key.clone(), member));
+                }
+                match result {
+                    Ok(aligned) => self.aligned_events(&key, shard_for(&key), &aligned),
+                    Err(error) => {
+                        tracing::debug!(target: "sinomo.dfs.write_set", %error, shard = %key.1.0, "members not aligned");
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn taken(
+        &mut self,
+        key: ShardKey,
+        attempt: String,
+        outcome: TakeOutcome,
+        record_epoch: Option<u64>,
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        super::record_takeover_trace_for_test(
+            &self.data_dir,
+            format!(
+                "taken {attempt} current={:?} outcome={}",
+                self.attempts.get(&key).map(|current| current.id.clone()),
+                match &outcome {
+                    TakeOutcome::NotTaken { follow, reason } =>
+                        format!("not-taken follow={follow} {reason}"),
+                    TakeOutcome::Failed { reason } => format!("failed {reason}"),
+                    TakeOutcome::Settled { settlement, .. } => format!("settled {settlement:?}"),
+                }
+            ),
+        );
+        if self
+            .attempts
+            .get(&key)
+            .is_none_or(|current| current.id != attempt)
+        {
+            return;
+        }
+        if let Some(reply) = self
+            .attempts
+            .get_mut(&key)
+            .and_then(|current| current.reply.take())
+        {
+            let _ = reply.send(match &outcome {
+                TakeOutcome::Settled { settlement, .. } => match settlement {
+                    DfsMetadataTakeoverSettlement::Applied => DfsTakeoverHandOffOutcome::Swapped,
+                    DfsMetadataTakeoverSettlement::RejectedEpochUnchanged => {
+                        DfsTakeoverHandOffOutcome::Declined {
+                            reason: "released".into(),
+                            prefer: None,
+                        }
+                    }
+                    // A superseded swap or one still re-sent: the asker waits
+                    // for the publication.
+                    DfsMetadataTakeoverSettlement::RejectedEpochAdvanced
+                    | DfsMetadataTakeoverSettlement::Unknown { .. } => {
+                        DfsTakeoverHandOffOutcome::Followed
+                    }
+                },
+                TakeOutcome::NotTaken { follow: true, .. } => DfsTakeoverHandOffOutcome::Followed,
+                TakeOutcome::NotTaken { .. } => DfsTakeoverHandOffOutcome::Declined {
+                    reason: "no-quorum".into(),
+                    prefer: None,
+                },
+                TakeOutcome::Failed { reason } => DfsTakeoverHandOffOutcome::Declined {
+                    reason: reason.clone(),
+                    prefer: None,
+                },
+            });
+        }
+        let (promise, settlement) = match outcome {
+            TakeOutcome::NotTaken { follow, reason } => {
+                tracing::debug!(target: "sinomo.dfs.write_set", %reason, follow, shard = %key.1.0, "takeover not confirmed");
+                self.end_standing(&key);
+                self.attempts.remove(&key);
+                return;
+            }
+            TakeOutcome::Failed { reason } => {
+                tracing::debug!(target: "sinomo.dfs.write_set", %reason, shard = %key.1.0, "takeover attempt failed");
+                self.end_standing(&key);
+                self.attempts.remove(&key);
+                return;
+            }
+            TakeOutcome::Settled {
+                promise,
+                settlement,
+            } => (promise, settlement),
+        };
+        let first = self
+            .attempts
+            .get_mut(&key)
+            .is_some_and(|current| !std::mem::replace(&mut current.promised, true));
+        let request = format!("sinomo-kv:request/{}", promise.swap_request_id);
+        if first {
+            let event = self.event(&key, Some(&promise), Vec::new());
+            self.publish(
+                &key,
+                DfsMetadataTakeoverEvent::PROMISED,
+                event,
+                vec![
+                    format!(
+                        "dfs:prefix/{}/{}/{}",
+                        key.1.0, promise.epoch_start.journal_sequence, promise.epoch_start.digest
+                    ),
+                    request.clone(),
+                    format!("dfs:takeover-attempt/{attempt}"),
+                ],
+            );
+        }
+        let ended = match settlement {
+            DfsMetadataTakeoverSettlement::Applied => {
+                let mut event = self.event(&key, Some(&promise), Vec::new());
+                event.next_epoch = Some(promise.cut.shard.epoch.saturating_add(1));
+                self.publish(
+                    &key,
+                    DfsMetadataTakeoverEvent::SWAPPED,
+                    event,
+                    vec![request],
+                );
+                let publication_generation = self.publication_generation;
+                if let Some(current) = self.attempts.get_mut(&key) {
+                    current.step = Step::Following {
+                        publication_generation,
+                    };
+                }
+                false
+            }
+            DfsMetadataTakeoverSettlement::RejectedEpochUnchanged => {
+                let event = self.event(&key, Some(&promise), Vec::new());
+                self.publish(
+                    &key,
+                    DfsMetadataTakeoverEvent::PROMISE_RELEASED,
+                    event,
+                    vec![request],
+                );
+                true
+            }
+            DfsMetadataTakeoverSettlement::RejectedEpochAdvanced => {
+                let event = self.event(&key, Some(&promise), Vec::new());
+                self.publish(
+                    &key,
+                    DfsMetadataTakeoverEvent::SWAP_SUPERSEDED,
+                    event,
+                    vec![request],
+                );
+                // The kept fence is retired once this node's record reached
+                // it; if the record is there already, now.
+                if let Some(epoch) = record_epoch.filter(|epoch| *epoch > promise.cut.shard.epoch) {
+                    let (data_dir, runtime, shard_id) =
+                        (self.data_dir.clone(), self.runtime.clone(), key.1.clone());
+                    self.runtime.spawn_blocking(move || {
+                        if let Err(error) = retire_takeover_fence(&data_dir, &runtime, &shard_id, epoch) {
+                            tracing::debug!(target: "sinomo.dfs.write_set", %error, shard = %shard_id.0, "member fence not retired");
+                        }
+                    });
+                }
+                true
+            }
+            DfsMetadataTakeoverSettlement::Unknown { detail } => {
+                tracing::debug!(target: "sinomo.dfs.write_set", %detail, shard = %key.1.0, "takeover swap outcome unknown; re-sending");
+                let Some(current) = self.attempts.get_mut(&key) else {
+                    return;
+                };
+                let interval = match &current.step {
+                    Step::Unknown { interval, .. } => interval
+                        .saturating_mul(2)
+                        .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                    _ => TAKEOVER_RESEND_FIRST,
+                };
+                current.step = Step::Unknown {
+                    promise,
+                    interval,
+                    resending: false,
+                };
+                let done = self.done.clone();
+                let resend = (key.clone(), attempt.clone());
+                self.runtime.spawn(async move {
+                    tokio::time::sleep(interval).await;
+                    let (key, attempt) = resend;
+                    let _ = done.send(TakeoverCompletion::Resend { key, attempt });
+                });
+                false
+            }
+        };
+        if ended {
+            self.attempts.remove(&key);
+        }
+    }
+
+    /// Run activation once per takeover epoch at which this node became
+    /// primary: after its own swap, after a hand-off, or after a restart.
+    fn activate_if_new(
+        &mut self,
+        shard: &TakeoverShard,
+        write_set: &DfsMetadataShardWriteSet,
+        verdicts: &DfsPeerVerdictSnapshot,
+    ) {
+        if !matches!(
+            write_set.last_change.kind,
+            crate::DfsMetadataShardWriteSetChangeKind::Takeover { .. }
+        ) || write_set.epoch_start.is_none()
+            || self.activated.get(&shard.key) == Some(&shard.shard.epoch)
+            || self.activation_blocked.get(&shard.key)
+                == Some(&(
+                    shard.shard.epoch,
+                    self.publication_generation,
+                    verdicts.generation,
+                ))
+            || !self.activating.insert(shard.key.clone())
+        {
+            return;
+        }
+        let unreachable = write_set
+            .write_set
+            .iter()
+            .filter(|member| verdicts.reach(member) == DfsWriteSetMemberReach::NoPath)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let members = crate::metadata_shard_configured_node_ids(&shard.shard)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (data_dir, cluster_paths, runtime, local, done) = (
+            self.data_dir.clone(),
+            self.cluster_paths.clone(),
+            self.runtime.clone(),
+            self.local.clone(),
+            self.done.clone(),
+        );
+        let key = shard.key.clone();
+        let epoch = shard.shard.epoch;
+        self.runtime.spawn_blocking(move || {
+            let result = activate_metadata_takeover(
+                &data_dir,
+                &cluster_paths,
+                &runtime,
+                &local,
+                &key,
+                &members,
+                &unreachable,
+            );
+            let _ = done.send(TakeoverCompletion::Activated { key, epoch, result });
+        });
+    }
+
+    /// Align members a commit or the publisher found unaligned with the
+    /// current epoch start, once per member at a time.
+    pub(in crate::runtime_host) fn align_members(
+        &mut self,
+        shard: &TakeoverShard,
+        members: BTreeSet<NodeId>,
+    ) {
+        if shard.shard.primary_node_id != self.local
+            || shard
+                .state
+                .switched()
+                .is_none_or(|write_set| write_set.epoch_start.is_none())
+        {
+            return;
+        }
+        let targets = members
+            .into_iter()
+            .filter(|member| self.aligning.insert((shard.key.clone(), member.clone())))
+            .collect::<BTreeSet<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        let cut_members = crate::metadata_shard_configured_node_ids(&shard.shard)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (data_dir, cluster_paths, runtime, done) = (
+            self.data_dir.clone(),
+            self.cluster_paths.clone(),
+            self.runtime.clone(),
+            self.done.clone(),
+        );
+        let key = shard.key.clone();
+        self.runtime.spawn_blocking(move || {
+            let result = align_metadata_takeover_members(
+                &data_dir,
+                &cluster_paths,
+                &runtime,
+                &key,
+                &cut_members,
+                &targets,
+            );
+            let _ = done.send(TakeoverCompletion::Aligned {
+                key,
+                members: targets.into_iter().collect(),
+                result,
+            });
+        });
+    }
+
+    fn spawn_local_head(&self, key: ShardKey, attempt: String) {
+        let data_dir = self.data_dir.clone();
+        let done = self.done.clone();
+        self.runtime.spawn(async move {
+            let journal_sequence = super::local_durable_sequence(&data_dir, &key.0, &key.1).await;
+            let _ = done.send(TakeoverCompletion::LocalHead {
+                key,
+                attempt,
+                journal_sequence,
+            });
+        });
+    }
+
+    fn spawn_ask(
+        &self,
+        key: ShardKey,
+        member: NodeId,
+        request: DfsMetadataTakeoverCorroborationRequest,
+        hand_off: bool,
+    ) {
+        let (_, peer) = daemon_dfs_peer_transports_on_runtime(&self.data_dir, &self.runtime);
+        let done = self.done.clone();
+        self.runtime.spawn(async move {
+            let reply = super::ask_dfs_takeover_corroboration(peer, &member, &request)
+                .await
+                .ok();
+            let attempt = request.attempt_id;
+            let _ = done.send(if hand_off {
+                TakeoverCompletion::HandOff {
+                    key,
+                    attempt,
+                    member,
+                    reply,
+                }
+            } else {
+                TakeoverCompletion::Answer {
+                    key,
+                    attempt,
+                    member,
+                    reply,
+                }
+            });
+        });
+    }
+
+    fn spawn_take(&self, shard: &TakeoverShard) {
+        let Some(attempt) = self.attempts.get(&shard.key) else {
+            return;
+        };
+        let (data_dir, cluster_paths, runtime, local, done) = (
+            self.data_dir.clone(),
+            self.cluster_paths.clone(),
+            self.runtime.clone(),
+            self.local.clone(),
+            self.done.clone(),
+        );
+        let key = shard.key.clone();
+        let (id, epoch, primary) = (attempt.id.clone(), attempt.epoch, attempt.primary.clone());
+        let members = crate::metadata_shard_configured_node_ids(&shard.shard)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.runtime.spawn_blocking(move || {
+            let outcome = take_metadata_shard(
+                &data_dir,
+                &cluster_paths,
+                &runtime,
+                &local,
+                &key,
+                epoch,
+                &primary,
+                &members,
+            );
+            let _ = done.send(TakeoverCompletion::Taken {
+                key,
+                attempt: id,
+                outcome,
+            });
+        });
+    }
+
+    fn spawn_settle(&self, key: ShardKey, attempt: String, promise: DfsMetadataTakeoverPromise) {
+        let (data_dir, cluster_paths, runtime, local, done) = (
+            self.data_dir.clone(),
+            self.cluster_paths.clone(),
+            self.runtime.clone(),
+            self.local.clone(),
+            self.done.clone(),
+        );
+        self.runtime.spawn_blocking(move || {
+            let outcome = settle_takeover_promise(
+                &data_dir,
+                &cluster_paths,
+                &runtime,
+                &local,
+                &key.1,
+                promise,
+            );
+            let _ = done.send(TakeoverCompletion::Taken {
+                key,
+                attempt,
+                outcome,
+            });
+        });
+    }
+
+    fn event(
+        &self,
+        key: &ShardKey,
+        promise: Option<&DfsMetadataTakeoverPromise>,
+        answers: Vec<DfsTakeoverAnswerSummary>,
+    ) -> DfsMetadataTakeoverEvent {
+        let attempt = self.attempts.get(key);
+        DfsMetadataTakeoverEvent {
+            file_system_id: key.0.clone(),
+            shard_id: key.1.0.clone(),
+            epoch: attempt.map_or(0, |attempt| attempt.epoch),
+            next_epoch: None,
+            generation: attempt.map_or(0, |attempt| attempt.generation),
+            previous_primary_node_id: attempt
+                .map_or_else(|| self.local.clone(), |attempt| attempt.primary.clone()),
+            candidate_node_id: self.local.clone(),
+            attempt_id: attempt.map_or_else(String::new, |attempt| attempt.id.clone()),
+            swap_request_id: promise.map(|promise| promise.swap_request_id.to_string()),
+            epoch_start: promise.map(|promise| promise.epoch_start.clone()),
+            cause: attempt.map_or("", |attempt| attempt.cause).to_string(),
+            answers,
+            node_ids: Vec::new(),
+            dropped_records: None,
+        }
+    }
+
+    fn activated_events(
+        &mut self,
+        key: &ShardKey,
+        shard: Option<&TakeoverShard>,
+        aligned: &[(NodeId, crate::DfsWriteSetAlignment)],
+    ) -> Option<(ShardKey, sinomo_core::Id)> {
+        let shard = shard?;
+        let write_set = shard.state.switched()?;
+        let previous = match &write_set.last_change.kind {
+            crate::DfsMetadataShardWriteSetChangeKind::Takeover {
+                previous_primary_node_id,
+            } => previous_primary_node_id.clone(),
+            _ => return None,
+        };
+        let base = DfsMetadataTakeoverEvent {
+            file_system_id: key.0.clone(),
+            shard_id: key.1.0.clone(),
+            epoch: shard.shard.epoch.saturating_sub(1),
+            next_epoch: Some(shard.shard.epoch),
+            generation: write_set.generation,
+            previous_primary_node_id: previous,
+            candidate_node_id: self.local.clone(),
+            attempt_id: String::new(),
+            swap_request_id: Some(write_set.last_change.change_id.clone()),
+            epoch_start: write_set.epoch_start.clone(),
+            cause: "activation".into(),
+            answers: Vec::new(),
+            node_ids: Vec::new(),
+            dropped_records: None,
+        };
+        let request = format!("dfs:takeover-request/{}", write_set.last_change.change_id);
+        self.publish_aligned(key, &base, aligned, &request);
+        let mut activated = base;
+        activated.node_ids = aligned.iter().map(|(member, _)| member.clone()).collect();
+        let id = self.publish(
+            key,
+            DfsMetadataTakeoverEvent::ACTIVATED,
+            activated,
+            vec![request],
+        );
+        Some((key.clone(), id))
+    }
+
+    fn aligned_events(
+        &mut self,
+        key: &ShardKey,
+        shard: Option<&TakeoverShard>,
+        aligned: &[(NodeId, crate::DfsWriteSetAlignment)],
+    ) {
+        let Some(shard) = shard else {
+            return;
+        };
+        let Some(write_set) = shard.state.switched() else {
+            return;
+        };
+        let base = DfsMetadataTakeoverEvent {
+            file_system_id: key.0.clone(),
+            shard_id: key.1.0.clone(),
+            epoch: shard.shard.epoch.saturating_sub(1),
+            next_epoch: Some(shard.shard.epoch),
+            generation: write_set.generation,
+            previous_primary_node_id: self.local.clone(),
+            candidate_node_id: self.local.clone(),
+            attempt_id: String::new(),
+            swap_request_id: Some(write_set.last_change.change_id.clone()),
+            epoch_start: write_set.epoch_start.clone(),
+            cause: "alignment-required".into(),
+            answers: Vec::new(),
+            node_ids: Vec::new(),
+            dropped_records: None,
+        };
+        let request = format!("dfs:takeover-request/{}", write_set.last_change.change_id);
+        self.publish_aligned(key, &base, aligned, &request);
+    }
+
+    fn publish_aligned(
+        &mut self,
+        key: &ShardKey,
+        base: &DfsMetadataTakeoverEvent,
+        aligned: &[(NodeId, crate::DfsWriteSetAlignment)],
+        request: &str,
+    ) {
+        for (member, alignment) in aligned {
+            let crate::DfsWriteSetAlignment::Aligned { head } = alignment else {
+                continue;
+            };
+            let mut event = base.clone();
+            event.node_ids = vec![member.clone()];
+            self.publish(
+                key,
+                DfsMetadataTakeoverEvent::ALIGNED,
+                event,
+                vec![
+                    format!(
+                        "dfs:prefix/{}/{}/{}",
+                        key.1.0, head.journal_sequence, head.digest
+                    ),
+                    request.to_string(),
+                ],
+            );
+        }
+    }
+
+    /// Publish one typed event on the component bus with its evidence, linked
+    /// to the shard's previous takeover event.
+    fn publish(
+        &mut self,
+        key: &ShardKey,
+        name: &'static str,
+        payload: DfsMetadataTakeoverEvent,
+        refs: Vec<String>,
+    ) -> sinomo_core::Id {
+        let event_id = sinomo_core::Id::generate();
+        let previous = self.last_events.insert(key.clone(), event_id.clone());
+        #[cfg(any(test, feature = "test-support"))]
+        super::record_takeover_event_for_test(&self.data_dir, name, &payload);
+        let salience = if matches!(
+            name,
+            DfsMetadataTakeoverEvent::SWAPPED
+                | DfsMetadataTakeoverEvent::ACTIVATED
+                | DfsMetadataTakeoverEvent::CORROBORATION_VETOED
+        ) {
+            0.5
+        } else {
+            0.3
+        };
+        let Ok(value) = serde_json::to_value(&payload) else {
+            return event_id;
+        };
+        let (Ok(source), Ok(kind), Ok(salience), Ok(confidence)) = (
+            sinomo_core::Source::new("component/sinomo-dfs"),
+            sinomo_core::EventKind::new(name.to_string()),
+            sinomo_core::Salience::new(salience),
+            sinomo_core::Confidence::new(1.0),
+        ) else {
+            return event_id;
+        };
+        let mut envelope = sinomo_core::EventEnvelope::new(
+            event_id.clone(),
+            time::OffsetDateTime::now_utc(),
+            self.local.clone(),
+            source,
+            kind,
+            salience,
+            confidence,
+            sinomo_core::RoutingMetadata::new(
+                sinomo_core::RoutingScope::Local,
+                sinomo_core::LatencyClass::Reactive,
+                sinomo_core::PrivacyClass::Derived,
+            ),
+        )
+        .with_payload(value);
+        for reference in refs {
+            envelope.evidence.refs.push(sinomo_core::EvidenceRef::new(
+                reference,
+                sinomo_core::EvidenceKind::Other,
+            ));
+        }
+        if let Some(previous) = previous {
+            envelope.links.caused_by.push(previous);
+        }
+        let publication = super::dfs_takeover_event_publication(name);
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = events.publish(&publication, envelope).await {
+                tracing::debug!(target: "sinomo.dfs.write_set", %error, "takeover event not published");
+            }
+        });
+        event_id
+    }
+}
+
+fn answer_summaries(
+    entries: &BTreeMap<NodeId, DfsTakeoverRoundEntry>,
+) -> Vec<DfsTakeoverAnswerSummary> {
+    entries
+        .iter()
+        .map(|(member, entry)| {
+            let (answer, journal_sequence) = match entry {
+                DfsTakeoverRoundEntry::Replied {
+                    answer,
+                    durable_sequence,
+                    ..
+                } => (
+                    match answer {
+                        DfsTakeoverPrimaryReach::Reaches => "reaches".to_string(),
+                        DfsTakeoverPrimaryReach::Lost => "lost".to_string(),
+                        DfsTakeoverPrimaryReach::Abstain { reason } => {
+                            format!(
+                                "abstain-{}",
+                                serde_json::to_value(reason)
+                                    .ok()
+                                    .and_then(|value| value.as_str().map(str::to_string))
+                                    .unwrap_or_default()
+                            )
+                        }
+                    },
+                    *durable_sequence,
+                ),
+                DfsTakeoverRoundEntry::LeftOut => ("left-out".to_string(), None),
+            };
+            DfsTakeoverAnswerSummary {
+                member_node_id: member.clone(),
+                answer,
+                journal_sequence,
+            }
+        })
+        .collect()
+}
+
+/// The facts the takeover planner reads for a shard's members and primary.
+fn takeover_member_facts(
+    shard: &TakeoverShard,
+    members: &BTreeMap<NodeId, MemberRecord>,
+    verdicts: &DfsPeerVerdictSnapshot,
+) -> BTreeMap<NodeId, DfsWriteSetMemberFacts> {
+    crate::metadata_shard_configured_node_ids(&shard.shard)
+        .into_iter()
+        .map(|node| {
+            let record = members.get(&node);
+            let facts = DfsWriteSetMemberFacts {
+                eligible: record.is_some_and(|record| record.eligible),
+                departed: record.is_none_or(|record| record.departed),
+                mobile: record.is_some_and(|record| record.mobile),
+                reach: verdicts.reach(&node),
+                view: None,
+                fenced: false,
+            };
+            (node, facts)
+        })
+        .collect()
+}

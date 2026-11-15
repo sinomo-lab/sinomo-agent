@@ -4264,6 +4264,27 @@ fn dfs_metadata_replication_suppression_for<'a>(
     })
 }
 
+/// A target that must first be aligned with this epoch's start is the
+/// keeper's: the publisher's own batches cannot reach it until then.
+fn post_dfs_metadata_alignment_demand(
+    local_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    target_node_id: &NodeId,
+    code: DfsMetadataRejectionCode,
+) {
+    if code == DfsMetadataRejectionCode::EpochAlignmentRequired {
+        crate::write_set_keeping_signals::post_commit_demand(
+            local_node_id,
+            file_system_id,
+            shard_id,
+            crate::write_set_keeping_signals::DfsWriteSetCommitDemand::AlignmentRequired(
+                [target_node_id.clone()].into_iter().collect(),
+            ),
+        );
+    }
+}
+
 fn record_dfs_metadata_replication_topology_mismatch(
     data_dir: &SinomoDataDir,
     target_node_id: &NodeId,
@@ -5301,6 +5322,13 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                         outcomes,
                     )?;
                 } else {
+                    post_dfs_metadata_alignment_demand(
+                        local_node_id,
+                        &file_system_id,
+                        &shard_id,
+                        &target_node_id,
+                        code,
+                    );
                     record_dfs_metadata_replication_topology_mismatch(
                         data_dir,
                         &target_node_id,
@@ -6131,6 +6159,13 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     )
                     .await?;
                 } else {
+                    post_dfs_metadata_alignment_demand(
+                        local_node_id,
+                        &file_system_id,
+                        &shard_id,
+                        &target_node_id,
+                        code,
+                    );
                     record_dfs_metadata_replication_topology_mismatch_async(
                         data_dir,
                         &target_node_id,

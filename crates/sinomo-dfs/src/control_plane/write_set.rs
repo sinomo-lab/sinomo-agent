@@ -37,7 +37,6 @@ pub(crate) use takeover::{
     DfsTakeoverCause, DfsTakeoverHandOffDecision, DfsTakeoverPlan, DfsTakeoverRoundEntry,
     DfsTakeoverRoundOutcome, DfsTakeoverStanding, DfsTakeoverView,
     decide_metadata_takeover_hand_off, decide_metadata_takeover_round, plan_metadata_takeover,
-    rank_metadata_takeover_candidates,
 };
 
 #[cfg(test)]
@@ -46,6 +45,8 @@ mod commit_native_tests;
 mod keeping_native_tests;
 #[cfg(test)]
 mod native_tests;
+#[cfg(test)]
+mod takeover_driver_native_tests;
 #[cfg(test)]
 mod takeover_native_tests;
 #[cfg(test)]
@@ -1372,6 +1373,60 @@ impl DfsMetadataWriteSetEvent {
             },
         )
     }
+}
+
+/// Typed events of one takeover attempt. The attempt id and the swap request
+/// id link a candidate's events with the new primary's alignment of its
+/// members.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataTakeoverEvent {
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: String,
+    /// The read epoch: the epoch whose primary was judged lost.
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_epoch: Option<u64>,
+    pub generation: u64,
+    pub previous_primary_node_id: NodeId,
+    pub candidate_node_id: NodeId,
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_start: Option<crate::DfsMetadataPrefixProof>,
+    pub cause: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<DfsTakeoverAnswerSummary>,
+    /// The vetoing member, the hand-off target or the aligned members.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_records: Option<u64>,
+}
+
+/// One member's corroboration answer as a takeover event reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsTakeoverAnswerSummary {
+    pub member_node_id: NodeId,
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_sequence: Option<u64>,
+}
+
+impl DfsMetadataTakeoverEvent {
+    pub const CORROBORATION_STARTED: &'static str =
+        "dfs.metadata.takeover.corroboration_started";
+    pub const CORROBORATION_VETOED: &'static str = "dfs.metadata.takeover.corroboration_vetoed";
+    pub const CORROBORATION_HANDED_OFF: &'static str =
+        "dfs.metadata.takeover.corroboration_handed_off";
+    pub const PROMISED: &'static str = DfsMetadataWriteSetEvent::PROMISED;
+    pub const SWAPPED: &'static str = DfsMetadataWriteSetEvent::SWAPPED;
+    pub const SWAP_SUPERSEDED: &'static str = "dfs.metadata.takeover.swap_superseded";
+    pub const PROMISE_RELEASED: &'static str = DfsMetadataWriteSetEvent::PROMISE_RELEASED;
+    pub const ACTIVATED: &'static str = "dfs.metadata.takeover.activated";
+    pub const ALIGNED: &'static str = "dfs.metadata.takeover.aligned";
 }
 
 /// The write-set compare a cooperative handoff transaction includes, and the

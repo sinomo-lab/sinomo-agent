@@ -2122,11 +2122,11 @@ impl LocalMetadataShardSlot {
 
 /// Test support: how often each shard root's backend was opened, across
 /// threads, so tests can tell a rebind in place from a reopen.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 static METADATA_SHARD_BACKEND_OPENS: std::sync::LazyLock<Mutex<BTreeMap<PathBuf, usize>>> =
     std::sync::LazyLock::new(Default::default);
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn metadata_shard_backend_opens_for_test(root: &Path) -> usize {
     METADATA_SHARD_BACKEND_OPENS
         .lock()
@@ -2142,7 +2142,7 @@ fn open_local_metadata_shard_backend(
     open_mode: LocalMetadataShardOpenMode,
     selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
 ) -> Result<LocalSobjMetadataBackend> {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     {
         *METADATA_SHARD_BACKEND_OPENS
             .lock()

@@ -157,8 +157,13 @@ pub(crate) fn takeover_corroboration_record_check(
     local: &NodeId,
     shard: Option<&DfsMetadataShardConfig>,
     write_set: Option<&DfsMetadataShardWriteSet>,
-) -> Result<DfsMetadataMemberRecordView, (Option<DfsMetadataMemberRecordView>, DfsTakeoverAbstainReason)>
-{
+) -> Result<
+    DfsMetadataMemberRecordView,
+    (
+        Option<DfsMetadataMemberRecordView>,
+        DfsTakeoverAbstainReason,
+    ),
+> {
     if request.format != DFS_METADATA_TAKEOVER_CORROBORATION_FORMAT
         || &request.candidate_node_id != caller
         || request.attempt_id.is_empty()
@@ -224,7 +229,11 @@ mod tests {
             assignment: crate::DfsMetadataShardAssignment::Root,
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
-        let mut members = vec![node("corroborate-a"), node("corroborate-b"), node("corroborate-c")];
+        let mut members = vec![
+            node("corroborate-a"),
+            node("corroborate-b"),
+            node("corroborate-c"),
+        ];
         members.sort();
         let write_set = DfsMetadataShardWriteSet {
             format: crate::DFS_METADATA_SHARD_WRITE_SET_FORMAT,
@@ -323,8 +332,9 @@ mod tests {
         let b = node("corroborate-b");
         let c = node("corroborate-c");
         let query = request(DfsTakeoverCorroborationKind::Query);
-        let view = takeover_corroboration_record_check(&query, &b, &c, Some(&config), Some(&write_set))
-            .unwrap();
+        let view =
+            takeover_corroboration_record_check(&query, &b, &c, Some(&config), Some(&write_set))
+                .unwrap();
         assert_eq!((view.epoch, view.generation), (3, 7));
         // The caller must be the candidate it names.
         assert_eq!(

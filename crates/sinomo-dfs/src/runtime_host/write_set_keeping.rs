@@ -59,6 +59,7 @@ pub(crate) async fn run_dfs_write_set_keeping(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut keeper = Keeper::new(data_dir, authority, events, state, runtime);
+    let _hand_offs = super::write_set_takeover::TakeoverKeeperRegistration::new(&keeper.local);
     let mut published = keeper.authority.subscribe_configuration_snapshot();
     let evidence = crate::write_set_member_evidence::metadata_member_view_wake(&keeper.local);
     let demands = crate::write_set_keeping_signals::commit_demand_wake(&keeper.local);
@@ -70,6 +71,13 @@ pub(crate) async fn run_dfs_write_set_keeping(
         }
         if !keeping_suspended(&keeper.data_dir) {
             keeper.evaluate();
+        } else {
+            for (_, reply) in super::write_set_takeover::take_takeover_hand_offs(&keeper.local) {
+                let _ = reply.send(crate::takeover_corroboration::DfsTakeoverHandOffOutcome::Declined {
+                    reason: "keeping-suspended".into(),
+                    prefer: None,
+                });
+            }
         }
         #[cfg(any(test, feature = "test-support"))]
         let test_wake = test_control.notified();
@@ -86,6 +94,9 @@ pub(crate) async fn run_dfs_write_set_keeping(
             () = demands.notified() => {}
             () = test_wake => {}
             Some(completion) = keeper.completions.recv() => keeper.complete(completion),
+            Some(completion) = keeper.takeover_completions.recv() => {
+                keeper.complete_takeover(completion);
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return;
@@ -173,6 +184,11 @@ struct Keeper {
     member_epochs: BTreeMap<ShardKey, u64>,
     completion_tx: tokio::sync::mpsc::UnboundedSender<Completion>,
     completions: tokio::sync::mpsc::UnboundedReceiver<Completion>,
+    /// The candidate role: takeover of a lost primary, and activation once
+    /// this node is the new one.
+    takeover: super::write_set_takeover::TakeoverRole,
+    takeover_completions:
+        tokio::sync::mpsc::UnboundedReceiver<super::write_set_takeover::TakeoverCompletion>,
 }
 
 impl Keeper {
@@ -185,7 +201,16 @@ impl Keeper {
     ) -> Self {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let (completion_tx, completions) = tokio::sync::mpsc::unbounded_channel();
+        let (takeover_tx, takeover_completions) = tokio::sync::mpsc::unbounded_channel();
         Self {
+            takeover: super::write_set_takeover::TakeoverRole::new(
+                state.local_node_id.clone(),
+                data_dir.clone(),
+                runtime.clone(),
+                events.clone(),
+                takeover_tx,
+            ),
+            takeover_completions,
             verdicts: super::peer_verdicts::DfsPeerVerdicts::new(&data_dir, &cluster_paths, &state),
             local: state.local_node_id.clone(),
             data_dir,
@@ -210,10 +235,22 @@ impl Keeper {
         else {
             return;
         };
-        for ((file_system_id, shard_id), demands) in
-            crate::write_set_keeping_signals::take_commit_demands(&self.local)
-        {
-            let shard = self.shards.entry((file_system_id, shard_id)).or_default();
+        let mut unreachable_primaries = BTreeSet::new();
+        let mut alignment = BTreeMap::<ShardKey, BTreeSet<NodeId>>::new();
+        for (key, demands) in crate::write_set_keeping_signals::take_commit_demands(&self.local) {
+            if demands.primary_unreachable {
+                unreachable_primaries.insert(key.clone());
+            }
+            if !demands.alignment.is_empty() {
+                alignment.entry(key.clone()).or_default().extend(demands.alignment);
+            }
+            if demands.raise_n == 0
+                && demands.unreachable.is_empty()
+                && demands.fenced.is_empty()
+            {
+                continue;
+            }
+            let shard = self.shards.entry(key).or_default();
             shard.demanded_w = shard.demanded_w.max(demands.raise_n);
             shard.awaited.extend(demands.unreachable);
             for member in demands.fenced {
@@ -275,10 +312,13 @@ impl Keeper {
             crate::write_set_member_evidence::forget_metadata_member_views(&self.local, &key.1);
         }
         self.retire_reached_member_fences(&entries, &member_shards);
+        let takeover_shards = takeover_shards(&entries, &member_shards);
         // Network verdicts are needed only while this node is primary of a
-        // switched shard: an unswitched shard is never shrunk, re-added or
-        // recruited for, so it holds no reachability subscription.
-        let keeps_switched_shard = primary_shards.iter().any(|(key, (shard, _))| {
+        // switched shard, or a write-set member that may take one over: an
+        // unswitched shard is never shrunk, re-added, recruited for or taken
+        // over, so it holds no reachability subscription.
+        let keeps_switched_shard = self.takeover.needs_verdicts(&takeover_shards)
+            || primary_shards.iter().any(|(key, (shard, _))| {
             let value = entries
                 .binary_search_by(|entry| {
                     entry
@@ -301,8 +341,39 @@ impl Keeper {
         let Some(members) = cluster_member_facts(&snapshot) else {
             return;
         };
+        for peer in self.takeover.evaluate(
+            &takeover_shards,
+            &members,
+            &verdicts,
+            &unreachable_primaries,
+            snapshot.generation(),
+        ) {
+            self.verdicts.request_verification(&peer);
+        }
+        for (key, members) in alignment {
+            if let Some(shard) = takeover_shards.iter().find(|shard| shard.key == key) {
+                self.takeover.align_members(shard, members);
+            }
+        }
+        for (hand_off, reply) in super::write_set_takeover::take_takeover_hand_offs(&self.local) {
+            self.takeover.hand_off(&takeover_shards, hand_off, reply);
+        }
         for (key, (shard, shards)) in primary_shards {
             self.evaluate_shard(&key, &shard, &shards, &snapshot, &entries, &members, &verdicts);
+        }
+    }
+
+    fn complete_takeover(&mut self, completion: super::write_set_takeover::TakeoverCompletion) {
+        let snapshot = self.authority.configuration_snapshot();
+        let entries = snapshot
+            .entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let member_shards = configured_switched_shards(&entries, &self.local);
+        let shards = takeover_shards(&entries, &member_shards);
+        // The new primary's first keeping event names its activation.
+        if let Some((key, event)) = self.takeover.complete(completion, &shards) {
+            self.shards.entry(key).or_default().last_event = Some(event);
         }
     }
 
@@ -1146,6 +1217,60 @@ fn request_prepared_change_recovery(data_dir: &SinomoDataDir) {
     {
         tracing::debug!(target: "sinomo.dfs.write_set", %error, "prepared-change recovery not requested");
     }
+}
+
+/// Every shard the local node is configured for, by key.
+fn configured_switched_shards(
+    entries: &[sinomo_core::kv::KvEntry],
+    local: &NodeId,
+) -> BTreeMap<ShardKey, DfsMetadataShardConfig> {
+    let mut shards = BTreeMap::new();
+    for (file_system_id, index) in
+        crate::metadata_authority_projection::metadata_shard_index_from_authority_entries(entries)
+    {
+        let (Ok(index), Ok(file_system_id)) = (index, file_system_id.parse::<DfsFileSystemId>())
+        else {
+            continue;
+        };
+        for shard in index {
+            if crate::metadata_shard_configured_node_ids(&shard).contains(local) {
+                shards.insert(
+                    (
+                        file_system_id.clone(),
+                        DfsMetadataShardId::new(shard.shard_id.clone()),
+                    ),
+                    shard,
+                );
+            }
+        }
+    }
+    shards
+}
+
+/// The shards the candidate role reads, with their write-set state.
+fn takeover_shards(
+    entries: &[sinomo_core::kv::KvEntry],
+    member_shards: &BTreeMap<ShardKey, DfsMetadataShardConfig>,
+) -> Vec<super::write_set_takeover::TakeoverShard> {
+    member_shards
+        .iter()
+        .map(|(key, shard)| {
+            let value = entries
+                .binary_search_by(|entry| {
+                    entry
+                        .key
+                        .as_str()
+                        .cmp(crate::metadata_shard_write_set_key(&key.0, &key.1.0).as_str())
+                })
+                .ok()
+                .map(|index| entries[index].value.as_slice());
+            super::write_set_takeover::TakeoverShard {
+                key: key.clone(),
+                shard: shard.clone(),
+                state: crate::metadata_shard_write_set_state(shard, value),
+            }
+        })
+        .collect()
 }
 
 /// The shard's durable member state, read without the writer lock: callers

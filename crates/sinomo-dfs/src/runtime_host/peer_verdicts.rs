@@ -129,11 +129,6 @@ impl DfsPeerVerdicts {
         }
         sinomo_core::network::request_peer_verification(&self.cluster_paths, &self.state, peer)
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn supplied_by_test(&self) -> bool {
-        test_seam::installed(&self.test)
-    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -154,8 +149,7 @@ pub(super) mod test_seam {
         wake: Arc<tokio::sync::Notify>,
     }
 
-    static VERDICTS: LazyLock<Mutex<BTreeMap<PathBuf, State>>> =
-        LazyLock::new(Default::default);
+    static VERDICTS: LazyLock<Mutex<BTreeMap<PathBuf, State>>> = LazyLock::new(Default::default);
 
     fn verdicts() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, State>> {
         VERDICTS.lock().unwrap_or_else(|error| error.into_inner())

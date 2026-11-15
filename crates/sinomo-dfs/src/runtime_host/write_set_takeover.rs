@@ -1,13 +1,29 @@
-//! Takeover of a write-set shard's lost primary on Main: the member side of
-//! corroboration.
+//! Takeover of a write-set shard's lost primary on Main.
 //!
-//! A write-set member that judges the primary lost asks every other
-//! write-set member whether it still reaches that primary. This node answers
-//! from its own retained record and its own network verdict, after asking
-//! the network to verify the primary unless its verdict already settled that
-//! there is no path. The answer takes no shard lock, lane or admission, so it
-//! is given while the shard's mutation lanes are busy, and it never waits on a
-//! DFS timer: the network bounds a verification episode.
+//! The candidate role runs inside the keeper on every write-set member other
+//! than the primary. When this node judges the primary lost (its network
+//! settled that there is no path, or the primary left the cluster), it asks
+//! the other write-set members whether they still reach the primary. Any
+//! member that does vetoes the attempt. Otherwise the member with the longest
+//! durable journal confirms the record with one authoritative read, promises
+//! to accept nothing more at the read epoch, and submits the guarded swap
+//! that makes it primary at the next epoch. An unknown swap is re-sent as the
+//! identical request until its own outcome settles it. Once this node's
+//! publication names it primary at a takeover epoch, activation rebinds its
+//! store, aligns the write set with the epoch start and requests the
+//! reconciliation that resumes the shard's work.
+//!
+//! The member side answers corroboration from this node's own retained record
+//! and its own network verdict, after asking the network to verify the
+//! primary unless its verdict already settled that there is no path. The
+//! answer takes no shard lock, lane or admission, so it is given while the
+//! shard's mutation lanes are busy, and it never waits on a DFS timer: the
+//! network bounds a verification episode.
+//!
+//! Every wait is an event: a verdict change, a publication, a reply, or a
+//! completion. The only timer re-sends an unknown swap, because while it is
+//! unknown no primary can commit and no publication may arrive to wake the
+//! candidate; it never decides an outcome.
 
 use super::peer_verdicts::DfsPeerVerdicts;
 use super::write_set_keeping::cluster_member_facts;
@@ -18,7 +34,104 @@ use crate::takeover_corroboration::{
     DfsTakeoverPrimaryReach, DfsTakeoverRank, DfsTakeoverVerdictEvidence,
     takeover_corroboration_judgement, takeover_corroboration_record_check,
 };
-use crate::{DfsWriteSetMemberReach, DfsMetadataShardId};
+use crate::{DfsMetadataShardId, DfsMetadataTakeoverEvent, DfsWriteSetMemberReach};
+use std::collections::BTreeSet;
+
+mod candidate;
+mod steps;
+pub(super) use candidate::{TakeoverCompletion, TakeoverRole, TakeoverShard};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use steps::test_hooks::{
+    hold_takeover_activation_for_test, stop_takeover_after_promise_for_test,
+};
+
+pub(super) type ShardKey = (crate::DfsFileSystemId, DfsMetadataShardId);
+
+/// Event schema of the takeover events this component publishes.
+pub(crate) const DFS_TAKEOVER_EVENT_SCHEMA_ID: &str = "sinomo.dfs.metadata-takeover";
+pub(crate) const DFS_TAKEOVER_EVENT_SCHEMA_VERSION: &str = "1.0.0";
+
+/// Every takeover event kind this component publishes.
+pub(crate) const DFS_TAKEOVER_EVENT_KINDS: [&str; 9] = [
+    DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+    DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
+    DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF,
+    DfsMetadataTakeoverEvent::PROMISED,
+    DfsMetadataTakeoverEvent::SWAPPED,
+    DfsMetadataTakeoverEvent::SWAP_SUPERSEDED,
+    DfsMetadataTakeoverEvent::PROMISE_RELEASED,
+    DfsMetadataTakeoverEvent::ACTIVATED,
+    DfsMetadataTakeoverEvent::ALIGNED,
+];
+
+pub(crate) fn dfs_takeover_event_publication(
+    kind: &str,
+) -> sinomo_module::ComponentEventPublication {
+    sinomo_module::ComponentEventPublication::new(
+        kind,
+        DFS_TAKEOVER_EVENT_SCHEMA_ID,
+        DFS_TAKEOVER_EVENT_SCHEMA_VERSION,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TAKEOVER_EVENTS_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<std::path::PathBuf, Vec<(String, DfsMetadataTakeoverEvent)>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(any(test, feature = "test-support"))]
+fn record_takeover_event_for_test(
+    data_dir: &SinomoDataDir,
+    name: &str,
+    event: &DfsMetadataTakeoverEvent,
+) {
+    TAKEOVER_EVENTS_FOR_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(data_dir.root())
+        .or_default()
+        .push((name.to_string(), event.clone()));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static TAKEOVER_TRACE_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<std::path::PathBuf, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test support: one line of what `data_dir`'s candidate role did.
+#[cfg(any(test, feature = "test-support"))]
+fn record_takeover_trace_for_test(data_dir: &SinomoDataDir, line: String) {
+    TAKEOVER_TRACE_FOR_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(data_dir.root())
+        .or_default()
+        .push(line);
+}
+
+/// Test support: what `root`'s candidate role did, for diagnostics.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn takeover_trace_for_test(root: &std::path::Path) -> Vec<String> {
+    TAKEOVER_TRACE_FOR_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(root)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Test support: the takeover events `root`'s node published, with names.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn takeover_events_for_test(
+    root: &std::path::Path,
+) -> Vec<(String, DfsMetadataTakeoverEvent)> {
+    TAKEOVER_EVENTS_FOR_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(root)
+        .cloned()
+        .unwrap_or_default()
+}
 
 /// Answer one corroboration request from the authenticated `caller`.
 pub(crate) async fn answer_dfs_takeover_corroboration(
@@ -60,7 +173,9 @@ pub(crate) async fn answer_dfs_takeover_corroboration(
         &caller,
         &local,
         context.as_ref().map(|context| &context.shard),
-        context.as_ref().and_then(|context| context.write_set.as_ref()),
+        context
+            .as_ref()
+            .and_then(|context| context.write_set.as_ref()),
     ) {
         Ok(view) => view,
         Err((view, reason)) => {
@@ -83,17 +198,19 @@ pub(crate) async fn answer_dfs_takeover_corroboration(
     verdicts.retain(true);
     let (answer, evidence) =
         judge_takeover_primary(&mut verdicts, &request.primary_node_id, departed).await;
-    let durable_sequence = local_durable_sequence(&data_dir, &request.file_system_id, &request.shard_id).await;
+    let durable_sequence =
+        local_durable_sequence(&data_dir, &request.file_system_id, &request.shard_id).await;
+    // This node has the asker's evidence: its own keeper evaluates the shard
+    // and may be the member the ranking picks.
+    if answer == DfsTakeoverPrimaryReach::Lost {
+        crate::write_set_keeping_signals::wake_write_set_keeper(&local);
+    }
     let hand_off = match &request.kind {
         DfsTakeoverCorroborationKind::Query => None,
-        DfsTakeoverCorroborationKind::HandOff { ranking } => Some(decline_or_run_hand_off(
-            &local,
-            &answer,
-            durable_sequence,
-            mobile,
-            &request.candidate_node_id,
-            ranking,
-        )),
+        DfsTakeoverCorroborationKind::HandOff { ranking } => Some(
+            run_or_decline_hand_off(&local, &request, &answer, durable_sequence, mobile, ranking)
+                .await,
+        ),
     };
     DfsMetadataTakeoverCorroborationReply {
         attempt_id: request.attempt_id.clone(),
@@ -148,70 +265,151 @@ async fn judge_takeover_primary(
     }
 }
 
-/// This node's durable journal head for the shard, from the last completed
-/// resident status projection: the shard is not checked out for it.
+/// This node's durable journal head sequence for the shard, from its journal
+/// head without a shard lock or checkout. It only ranks candidates: the
+/// promise captures the exact head under the writer lock.
 async fn local_durable_sequence(
     data_dir: &SinomoDataDir,
-    file_system_id: &crate::DfsFileSystemId,
+    _file_system_id: &crate::DfsFileSystemId,
     shard_id: &DfsMetadataShardId,
 ) -> Option<u64> {
-    let data_dir = data_dir.clone();
-    let file_system_id = file_system_id.clone();
-    let shard_id = shard_id.clone();
+    let root = crate::default_dfs_metadata_shards_root(data_dir)
+        .join(crate::metadata_keys::key_segment(&shard_id.0));
     tokio::task::spawn_blocking(move || {
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths).ok()??;
-        let resident = daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot).ok()?;
-        let status = resident.bounded_status_snapshot().ok()?;
-        status
-            .metadata_shards
-            .iter()
-            .find(|shard| {
-                shard.shard_id == shard_id
-                    && shard.file_system_id.as_ref() == Some(&file_system_id)
-            })
-            .map(|shard| shard.journal_last_sequence)
+        root.exists()
+            .then(|| crate::metadata_journal::read_next_journal_sequence_lenient(&root).ok())
+            .flatten()
+            .map(|next| next.saturating_sub(1))
     })
     .await
     .ok()
     .flatten()
 }
 
-/// A hand-off's outcome on this member. Running the takeover from the
-/// asker's round belongs to the candidate driver; until it accepts the run,
-/// a member that would run it declines without preference, and the asker
-/// ranks again without it.
-fn decline_or_run_hand_off(
+/// A hand-off's outcome on this member: it runs the takeover from the
+/// asker's round when it judges the primary lost and still ranks itself first
+/// with its own head, and declines otherwise. The run belongs to this node's
+/// candidate role, so one node never runs two attempts for a shard.
+async fn run_or_decline_hand_off(
     local: &NodeId,
+    request: &DfsMetadataTakeoverCorroborationRequest,
     answer: &DfsTakeoverPrimaryReach,
     durable_sequence: Option<u64>,
     mobile: bool,
-    asker: &NodeId,
     ranking: &[DfsTakeoverRank],
 ) -> DfsTakeoverHandOffOutcome {
+    let decline = |reason: &str, prefer| DfsTakeoverHandOffOutcome::Declined {
+        reason: reason.into(),
+        prefer,
+    };
     let Some(journal_sequence) = durable_sequence else {
-        return DfsTakeoverHandOffOutcome::Declined {
-            reason: "no-durable-head".into(),
-            prefer: None,
-        };
+        return decline("no-durable-head", None);
     };
     let own = DfsTakeoverRank {
         node_id: local.clone(),
         journal_sequence,
         mobile,
     };
-    match crate::decide_metadata_takeover_hand_off(&own, answer, asker, ranking) {
-        crate::DfsTakeoverHandOffDecision::Run => DfsTakeoverHandOffOutcome::Declined {
-            reason: "no-driver".into(),
-            prefer: None,
-        },
-        crate::DfsTakeoverHandOffDecision::Decline { reason, prefer } => {
-            DfsTakeoverHandOffOutcome::Declined {
-                reason: reason.into(),
-                prefer,
-            }
+    match crate::decide_metadata_takeover_hand_off(
+        &own,
+        answer,
+        &request.candidate_node_id,
+        ranking,
+    ) {
+        crate::DfsTakeoverHandOffDecision::Decline { reason, prefer } => decline(reason, prefer),
+        crate::DfsTakeoverHandOffDecision::Run => {
+            let Some(outcome) = post_takeover_hand_off(
+                local,
+                TakeoverHandOff {
+                    key: (request.file_system_id.clone(), request.shard_id.clone()),
+                    epoch: request.epoch,
+                    primary: request.primary_node_id.clone(),
+                },
+            ) else {
+                return decline("no-keeper", None);
+            };
+            outcome
+                .await
+                .unwrap_or_else(|_| decline("keeper-stopped", None))
         }
     }
+}
+
+/// A hand-off this node's candidate role runs from another member's round.
+pub(super) struct TakeoverHandOff {
+    pub(super) key: ShardKey,
+    pub(super) epoch: u64,
+    pub(super) primary: NodeId,
+}
+
+type TakeoverHandOffReply = tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>;
+
+static TAKEOVER_HAND_OFFS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<NodeId, Vec<(TakeoverHandOff, TakeoverHandOffReply)>>>,
+> = std::sync::LazyLock::new(Default::default);
+static TAKEOVER_KEEPERS: std::sync::LazyLock<std::sync::Mutex<BTreeSet<NodeId>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Hand `hand_off` to `local`'s keeper; `None` when no keeper runs here.
+fn post_takeover_hand_off(
+    local: &NodeId,
+    hand_off: TakeoverHandOff,
+) -> Option<tokio::sync::oneshot::Receiver<DfsTakeoverHandOffOutcome>> {
+    if !TAKEOVER_KEEPERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(local)
+    {
+        return None;
+    }
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    TAKEOVER_HAND_OFFS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(local.clone())
+        .or_default()
+        .push((hand_off, reply));
+    crate::write_set_keeping_signals::wake_write_set_keeper(local);
+    Some(outcome)
+}
+
+/// The keeper of `local` runs from now until the guard drops.
+pub(super) struct TakeoverKeeperRegistration(NodeId);
+
+impl TakeoverKeeperRegistration {
+    pub(super) fn new(local: &NodeId) -> Self {
+        TAKEOVER_KEEPERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(local.clone());
+        Self(local.clone())
+    }
+}
+
+impl Drop for TakeoverKeeperRegistration {
+    fn drop(&mut self) {
+        TAKEOVER_KEEPERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+        for (_, reply) in take_takeover_hand_offs(&self.0) {
+            let _ = reply.send(DfsTakeoverHandOffOutcome::Declined {
+                reason: "keeper-stopped".into(),
+                prefer: None,
+            });
+        }
+    }
+}
+
+/// Every hand-off posted for `local`'s keeper since it last took them.
+pub(super) fn take_takeover_hand_offs(
+    local: &NodeId,
+) -> Vec<(TakeoverHandOff, TakeoverHandOffReply)> {
+    TAKEOVER_HAND_OFFS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(local)
+        .unwrap_or_default()
 }
 
 /// Ask `member` one corroboration question over direct object RPC. No

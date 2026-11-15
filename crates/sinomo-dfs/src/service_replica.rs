@@ -690,6 +690,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut rejected_node_ids = BTreeSet::new();
         let mut lagging_node_ids = BTreeSet::new();
         let mut refusals = BTreeMap::new();
+        let mut unaligned = BTreeSet::new();
         let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
             shard,
             operation,
@@ -700,11 +701,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &mut rejected_node_ids,
             &mut lagging_node_ids,
             &mut refusals,
+            &mut unaligned,
         )?;
         self.check_cancelled("metadata authority result")?;
-        // A member that refuses this epoch is not caught up: no catch-up can
-        // make it acknowledge the epoch.
+        // A member that refuses this epoch, or that must first be aligned with
+        // the epoch start, is not caught up: no catch-up can make it
+        // acknowledge the epoch.
         self.end_metadata_authority_attempt_on_refusal(shard, operation, &refusals)?;
+        self.post_metadata_authority_alignment_demand(shard, &unaligned);
         if acknowledged.len() == targets.len() + 1
             || (rejected_node_ids.is_empty() && lagging_node_ids.is_empty())
         {
@@ -735,9 +739,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // for that member rather than for a majority of the targets.
         let behind = rejected_node_ids
             .union(&lagging_node_ids)
-            .filter(|node_id| !acknowledged.contains(*node_id))
+            .filter(|node_id| !acknowledged.contains(*node_id) && !unaligned.contains(*node_id))
             .cloned()
             .collect::<Vec<_>>();
+        if behind.is_empty() && !unaligned.is_empty() {
+            return Ok(acknowledged);
+        }
         for member in behind {
             if !self.catch_up_metadata_authority_member(
                 shard,
@@ -777,6 +784,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut rejected_again = BTreeSet::new();
         let mut lagging_again = BTreeSet::new();
         let mut refusals = BTreeMap::new();
+        let mut unaligned = BTreeSet::new();
         let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
             shard,
             operation,
@@ -787,10 +795,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &mut rejected_again,
             &mut lagging_again,
             &mut refusals,
+            &mut unaligned,
         )?;
         self.check_cancelled("metadata authority refreshed result")?;
         self.end_metadata_authority_attempt_on_refusal(shard, operation, &refusals)?;
+        self.post_metadata_authority_alignment_demand(shard, &unaligned);
         Ok(acknowledged)
+    }
+
+    /// Members that must be aligned with the epoch start count as missing
+    /// acknowledgements; the keeper's primary role aligns them.
+    fn post_metadata_authority_alignment_demand(
+        &self,
+        shard: &DfsMetadataShardConfig,
+        unaligned: &BTreeSet<NodeId>,
+    ) {
+        if unaligned.is_empty() {
+            return;
+        }
+        crate::write_set_keeping_signals::post_commit_demand(
+            &self.node_id,
+            &shard.file_system_id,
+            &DfsMetadataShardId::new(shard.shard_id.clone()),
+            crate::write_set_keeping_signals::DfsWriteSetCommitDemand::AlignmentRequired(
+                unaligned.clone(),
+            ),
+        );
     }
 
     /// End an attempt that a write-set member refused at this epoch. A member
@@ -944,6 +974,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         rejected_node_ids: &mut BTreeSet<NodeId>,
         lagging_node_ids: &mut BTreeSet<NodeId>,
         refusals: &mut BTreeMap<NodeId, crate::DfsMetadataMemberRecordView>,
+        unaligned: &mut BTreeSet<NodeId>,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         #[cfg(any(test, feature = "test-support"))]
         let diagnostic_root = self.native_publication_owner_for_observation().map(|(root, _)| root)
@@ -1303,13 +1334,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             let target_node_id = &request.target_node_id;
                             // A refused epoch is definite even for an empty
                             // confirmation: no re-send can be acknowledged.
-                            if let Some(record) = self
+                            match self
                                 .replication
-                                .metadata_authority_refusals
+                                .metadata_authority_rejections
                                 .get(&request.request_id)
                             {
-                                refusals.insert(target_node_id.clone(), record.clone());
-                                rejected_node_ids.insert(target_node_id.clone());
+                                Some((code, Some(record))) if code.refuses_source_epoch() => {
+                                    refusals.insert(target_node_id.clone(), record.clone());
+                                    rejected_node_ids.insert(target_node_id.clone());
+                                }
+                                Some((DfsMetadataRejectionCode::EpochAlignmentRequired, _)) => {
+                                    unaligned.insert(target_node_id.clone());
+                                    rejected_node_ids.insert(target_node_id.clone());
+                                }
+                                _ => {}
                             }
                             if let Some(hedge) =
                                 request.hedge.as_mut().filter(|hedge| !hedge.judged)
@@ -1526,6 +1564,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             Ok((MetadataAuthorityDirectReply::Rejected, response)) => {
                                 if let Some(record) = response.refusing_member_record() {
                                     refusals.insert(target_node_id.clone(), record.clone());
+                                }
+                                if response.result.rejection_code()
+                                    == Some(DfsMetadataRejectionCode::EpochAlignmentRequired)
+                                {
+                                    unaligned.insert(target_node_id.clone());
                                 }
                                 rejected_node_ids.insert(target_node_id);
                             }
@@ -1815,7 +1858,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .metadata_authority_probe_results
                 .remove(request_id);
             self.replication
-                .metadata_authority_refusals
+                .metadata_authority_rejections
                 .remove(request_id);
         }
     }

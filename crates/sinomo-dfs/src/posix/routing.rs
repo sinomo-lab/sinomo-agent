@@ -876,6 +876,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     }
                 }
+                Err(error @ DfsError::NetworkDelivery { .. }) => {
+                    self.post_routed_namespace_delivery_hint(&operation);
+                    return Err(DfsPosixError::Dfs(error));
+                }
                 Err(error) => return Err(DfsPosixError::Dfs(error)),
             };
             match routed.result.clone() {
@@ -1015,6 +1019,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     }
                 }
+                Err(error @ DfsError::NetworkDelivery { .. }) => {
+                    self.post_routed_namespace_delivery_hint(&operation);
+                    return Err(DfsPosixError::Dfs(error));
+                }
                 Err(error) => return Err(DfsPosixError::Dfs(error)),
             };
             match routed {
@@ -1082,7 +1090,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             *primary = shard.primary_node_id;
             return Ok(RoutedNamespaceNetworkRecovery::Retry);
         }
+        post_namespace_primary_unreachable(&self.node_id, &shard);
         Ok(RoutedNamespaceNetworkRecovery::Unchanged)
+    }
+
+    /// A request that could not be delivered to the shard primary is a hint
+    /// for this node's candidate role, which asks the network to verify the
+    /// primary when this node may take the shard over.
+    fn post_routed_namespace_delivery_hint(&mut self, operation: &DfsNamespaceOperation) {
+        if let Some(path) = operation.routing_path()
+            && let Ok(Some(shard)) = self.select_sifs_metadata_shard_for_path_fresh(path)
+        {
+            post_namespace_primary_unreachable(&self.node_id, &shard);
+        }
     }
 
     /// Executes a routed namespace operation on the namespace authority.
@@ -1792,4 +1812,14 @@ where
             ),
         }))
     }
+}
+
+/// Tell this node's candidate role it could not deliver to `shard`'s primary.
+fn post_namespace_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
+    crate::write_set_keeping_signals::post_commit_demand(
+        local,
+        &shard.file_system_id,
+        &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+        crate::write_set_keeping_signals::DfsWriteSetCommitDemand::PrimaryUnreachable,
+    );
 }

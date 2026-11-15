@@ -6047,6 +6047,33 @@ impl DfsTestRuntime {
         crate::runtime_host::keeping_events_for_test(&self.data_dir(node).root())
     }
 
+    /// Takeover events `node`'s candidate role published, with their names.
+    pub fn write_set_takeover_events(
+        &self,
+        node: &NodeId,
+    ) -> Vec<(String, crate::DfsMetadataTakeoverEvent)> {
+        crate::runtime_host::takeover_events_for_test(&self.data_dir(node).root())
+    }
+
+    /// What `node`'s candidate role did, for diagnostics.
+    pub fn write_set_takeover_trace(&self, node: &NodeId) -> Vec<String> {
+        crate::runtime_host::takeover_trace_for_test(&self.data_dir(node).root())
+    }
+
+    /// Stop `node`'s takeover attempts between the durable promise and the
+    /// swap, as a crash there would.
+    pub fn stop_takeover_after_promise(&self, node: &NodeId, stop: bool) {
+        crate::runtime_host::stop_takeover_after_promise_for_test(
+            self.data_dir(node).root(),
+            stop,
+        );
+    }
+
+    /// Hold `node`'s activation as a new primary until released.
+    pub fn hold_takeover_activation(&self, node: &NodeId, hold: bool) {
+        crate::runtime_host::hold_takeover_activation_for_test(self.data_dir(node).root(), hold);
+    }
+
     /// Whether `node`'s keeper held a network reachability subscription at
     /// its last evaluation; `None` before it first evaluated.
     pub fn write_set_keeping_holds_reachability(&self, node: &NodeId) -> Option<bool> {

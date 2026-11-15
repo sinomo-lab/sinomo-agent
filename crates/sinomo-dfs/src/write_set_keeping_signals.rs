@@ -1,10 +1,12 @@
-//! Demands a commit attempt leaves for the shard primary's write-set keeper.
+//! Demands DFS operations leave for this node's write-set keeper.
 //!
 //! The commit path is a DFS operation root and reads no KV; changing the
 //! write-set record is the keeper's. When a commit ends unknown because the
 //! record must change first (its content W is above the W the record accepts,
 //! a required member could not be reached, or one refused the epoch for a
-//! takeover candidate), it posts the demand here and wakes the keeper. Demands are in memory only: a lost demand is posted
+//! takeover candidate), or a member must first be aligned with the epoch
+//! start, it posts the demand here and wakes the keeper. A requester that
+//! could not deliver to a shard primary posts a hint for the candidate role. Demands are in memory only: a lost demand is posted
 //! again by the next attempt on the same prepared body, including the
 //! recovery pass that runs when the primary activates.
 
@@ -23,6 +25,12 @@ pub(crate) enum DfsWriteSetCommitDemand {
     /// These required members refused the primary's epoch: each promised a
     /// takeover candidate to accept nothing more at it.
     Fenced(BTreeSet<NodeId>),
+    /// These members must be aligned with the epoch start before they can
+    /// acknowledge anything at this epoch.
+    AlignmentRequired(BTreeSet<NodeId>),
+    /// A request from this node could not be delivered to the shard primary:
+    /// the candidate role asks the network to verify it.
+    PrimaryUnreachable,
 }
 
 /// The demands collected for one shard since the keeper last took them.
@@ -31,6 +39,8 @@ pub(crate) struct DfsWriteSetShardDemands {
     pub(crate) raise_n: usize,
     pub(crate) unreachable: BTreeSet<NodeId>,
     pub(crate) fenced: BTreeSet<NodeId>,
+    pub(crate) alignment: BTreeSet<NodeId>,
+    pub(crate) primary_unreachable: bool,
 }
 
 #[derive(Default)]
@@ -58,9 +68,25 @@ pub(crate) fn post_commit_demand(
             DfsWriteSetCommitDemand::RaiseN(w) => entry.raise_n = entry.raise_n.max(w),
             DfsWriteSetCommitDemand::Unreachable(members) => entry.unreachable.extend(members),
             DfsWriteSetCommitDemand::Fenced(members) => entry.fenced.extend(members),
+            DfsWriteSetCommitDemand::AlignmentRequired(members) => entry.alignment.extend(members),
+            DfsWriteSetCommitDemand::PrimaryUnreachable => entry.primary_unreachable = true,
         }
         signals.wakes.get(local).cloned()
     };
+    if let Some(wake) = wake {
+        wake.notify_one();
+    }
+}
+
+/// Wake `local`'s keeper without a demand: another member asked it about a
+/// shard primary it judges lost.
+pub(crate) fn wake_write_set_keeper(local: &NodeId) {
+    let wake = SIGNALS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .wakes
+        .get(local)
+        .cloned();
     if let Some(wake) = wake {
         wake.notify_one();
     }

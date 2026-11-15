@@ -467,6 +467,11 @@ fn component_factory_with_selected_layout(
             ))
             .subscribe_event(crate::runtime_host::host_cluster_control_subscription())
             .subscribe_event(crate::runtime_host::host_connectivity_subscription());
+    let descriptor = crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS
+        .into_iter()
+        .fold(descriptor, |descriptor, kind| {
+            descriptor.publish_event(crate::runtime_host::dfs_takeover_event_publication(kind))
+        });
     let caller = descriptor.clone();
     Ok(
         sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
@@ -1754,16 +1759,21 @@ mod tests {
                 "feature route remains core-owned {route}"
             );
         }
-        // Three DFS events and the write-set keeper's typed events.
+        // Three DFS events, the write-set keeper's typed events and the
+        // takeover events.
         let publications = &factory.descriptor().event_publications;
         assert_eq!(
             publications.len(),
             3 + crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS.len()
+                + crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS.len()
         );
-        for kind in crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS {
+        for kind in crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS
+            .into_iter()
+            .chain(crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS)
+        {
             assert!(
                 publications.iter().any(|publication| publication.kind == kind),
-                "missing write-set event publication {kind}"
+                "missing event publication {kind}"
             );
         }
         assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
