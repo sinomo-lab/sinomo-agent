@@ -1732,7 +1732,7 @@ where
     };
     #[cfg(test)]
     pause_authoritative_barrier_after_initial_fence(&paths.root).await;
-    let mut resend = crate::raft_quorum::ReadIndexResendTimer::new();
+    let mut resend = crate::raft_quorum::ReadIndexResendTimer::new(paths);
 
     'refence: loop {
         *state = fence.projected_state.clone();
@@ -1774,7 +1774,7 @@ where
             // Voters did not acknowledge this wave. While the term still holds
             // a commit the next wave is re-sent on the timer, not back to back.
             if fence.read_state.has_current_term_commit {
-                resend.wait_before(deadline).await;
+                resend.wait_before(deadline).await?;
             }
             continue;
         }
@@ -1951,7 +1951,7 @@ where
             // Voters did not acknowledge this wave. While the term still holds
             // a commit the next wave is re-sent on the timer, not back to back.
             if fence.read_state.has_current_term_commit {
-                resend.wait_before(deadline).await;
+                resend.wait_before(deadline).await?;
             }
             continue;
         }
@@ -2161,7 +2161,7 @@ fn commit_cluster_kv_authoritative_barrier_sync_with_initial_fence(
         Some(fence) => fence,
         None => prepare_authoritative_barrier_fence_sync(paths, state, deadline)?,
     };
-    let mut resend = crate::raft_quorum::ReadIndexResendTimer::new();
+    let mut resend = crate::raft_quorum::ReadIndexResendTimer::new(paths);
 
     'refence: loop {
         *state = fence.projected_state.clone();
@@ -2175,7 +2175,7 @@ fn commit_cluster_kv_authoritative_barrier_sync_with_initial_fence(
             // Voters did not acknowledge this wave. While the term still holds
             // a commit the next wave is re-sent on the timer, not back to back.
             if fence.read_state.has_current_term_commit {
-                resend.wait_before_blocking(deadline);
+                resend.wait_before_blocking(deadline)?;
             }
             continue;
         }
@@ -2318,7 +2318,7 @@ fn commit_cluster_kv_authoritative_barrier_sync_with_initial_fence(
                 }
                 fence = prepare_authoritative_barrier_fence_sync(paths, state, deadline)?;
                 if fence.read_state.has_current_term_commit {
-                    resend.wait_before_blocking(deadline);
+                    resend.wait_before_blocking(deadline)?;
                 }
             }
         }
@@ -3450,39 +3450,47 @@ pub async fn commit_cluster_kv_txn_with_quorum_response_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(options.raft_append_timeout)
-        .unwrap_or(started);
-    let mut consensus_state = project_committed_cluster_raft_authority_before_deadline(
-        runtime,
+    let request_id = request.request_id.to_string();
+    crate::raft_quorum::until_cluster_kv_node_stops(
         paths,
-        state,
-        deadline,
-        "project committed cluster Raft config for transaction",
+        crate::raft_quorum::ClusterKvStopOutcome::Commit { request_id },
+        async move {
+            let started = Instant::now();
+            let deadline = started
+                .checked_add(options.raft_append_timeout)
+                .unwrap_or(started);
+            let mut consensus_state = project_committed_cluster_raft_authority_before_deadline(
+                runtime,
+                paths,
+                state,
+                deadline,
+                "project committed cluster Raft config for transaction",
+            )
+            .await?;
+            let allow_forwarding = options.allow_forwarding;
+            let mut kv_host = NetworkClusterKvTxnQuorumAsyncHost {
+                runtime,
+                paths,
+                options,
+                deadline,
+                host,
+            };
+            let result = sinomo_kv::commit_cluster_kv_txn_with_quorum_async_with_host(
+                &mut consensus_state,
+                request,
+                sinomo_kv::ClusterKvTxnQuorumDriverOptions { allow_forwarding },
+                &mut kv_host,
+            )
+            .await?;
+            state.term = state.term.max(consensus_state.term);
+            state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
+            // The post-commit snapshot is this operation's result. The forwarding
+            // node's own view converges through Raft: a missed fan-out leaves it
+            // known-behind at the leader until a restored route or its contact.
+            Ok(result)
+        },
     )
-    .await?;
-    let allow_forwarding = options.allow_forwarding;
-    let mut kv_host = NetworkClusterKvTxnQuorumAsyncHost {
-        runtime,
-        paths,
-        options,
-        deadline,
-        host,
-    };
-    let result = sinomo_kv::commit_cluster_kv_txn_with_quorum_async_with_host(
-        &mut consensus_state,
-        request,
-        sinomo_kv::ClusterKvTxnQuorumDriverOptions { allow_forwarding },
-        &mut kv_host,
-    )
-    .await?;
-    state.term = state.term.max(consensus_state.term);
-    state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
-    // The post-commit snapshot is this operation's result. The forwarding
-    // node's own view converges through Raft: a missed fan-out leaves it
-    // known-behind at the leader until a restored route or its contact.
-    Ok(result)
+    .await
 }
 
 pub async fn commit_cluster_kv_txn_compact_with_quorum_response_async_with_host<H>(
@@ -3550,13 +3558,20 @@ pub async fn read_cluster_kv_authoritative_snapshot_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let started = Instant::now();
-    let result = read_cluster_kv_authoritative_snapshot_async_with_host_inner(
-        runtime, paths, state, options, host,
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Read,
+        async move {
+            let started = Instant::now();
+            let result = read_cluster_kv_authoritative_snapshot_async_with_host_inner(
+                runtime, paths, state, options, host,
+            )
+            .await;
+            record_async_authoritative_read_latency(started, "snapshot", result.is_ok());
+            result
+        },
     )
-    .await;
-    record_async_authoritative_read_latency(started, "snapshot", result.is_ok());
-    result
+    .await
 }
 
 async fn read_cluster_kv_authoritative_snapshot_async_with_host_inner<H>(
@@ -3696,154 +3711,51 @@ pub async fn read_cluster_kv_request_outcome_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let deadline = Instant::now() + options.raft_append_timeout;
-    let mut consensus_state = state.clone();
-    let request_id_for_read = request_id.clone();
-    let remaining = remaining_authoritative_read_budget(
-        deadline,
-        "authoritative KV request-outcome ReadIndex",
-    )?;
-    let (local_admission_busy, forward_only) =
-        match read_cluster_raft_with_read_index_attempt_async_with_host_and_admission(
-            runtime,
-            paths,
-            &mut consensus_state,
-            remaining,
-            options.raft_append_replication_options,
-            ClusterRaftReadIndexAdmissionMode::ForwardOnBusy,
-            move |storage| storage.read_index_request_outcome(&request_id_for_read),
-            host,
-        )
-        .await?
-        {
-            ClusterRaftReadIndexAttempt::Confirmed(read) => {
-                let read = overlay_node_local_request_attempt_after_authoritative_history(
-                    runtime,
-                    paths,
-                    &request_id,
-                    retained_request_outcome_read(read),
-                    consult_node_local_attempt,
-                    deadline,
-                )
-                .await?;
-                adopt_newer_authoritative_consensus_members(state, &consensus_state);
-                state.term = state
-                    .term
-                    .max(consensus_state.term)
-                    .max(read.authority.term);
-                state.kv_revision = state
-                    .kv_revision
-                    .max(consensus_state.kv_revision)
-                    .max(read.authority.revision.0);
-                return Ok(read);
-            }
-            ClusterRaftReadIndexAttempt::NeedsBarrier(fence) => {
-                let request_id_for_read = request_id.clone();
-                let read = commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence(
-                    runtime,
-                    paths,
-                    &mut consensus_state,
-                    options,
-                    deadline,
-                    Some(fence.into()),
-                    move |storage| storage.read_index_request_outcome(&request_id_for_read),
-                    host,
-                )
-                .await?;
-                let read = overlay_node_local_request_attempt_after_authoritative_history(
-                    runtime,
-                    paths,
-                    &request_id,
-                    retained_request_outcome_read(read),
-                    consult_node_local_attempt,
-                    deadline,
-                )
-                .await?;
-                adopt_newer_authoritative_consensus_members(state, &consensus_state);
-                state.term = state
-                    .term
-                    .max(consensus_state.term)
-                    .max(read.authority.term);
-                state.kv_revision = state
-                    .kv_revision
-                    .max(consensus_state.kv_revision)
-                    .max(read.authority.revision.0);
-                return Ok(read);
-            }
-            ClusterRaftReadIndexAttempt::NotLeader => (false, None),
-            ClusterRaftReadIndexAttempt::ForwardOnly(reason) => {
-                reason.apply_forwarding_floor(&mut consensus_state)?;
-                (false, Some(reason))
-            }
-            ClusterRaftReadIndexAttempt::LocalAdmissionBusy => (true, None),
-        };
-
-    let mut forwarding_failure = None;
-    if options.allow_forwarding {
-        remaining_authoritative_read_budget(
-            deadline,
-            "authoritative KV request-outcome forwarding",
-        )?;
-        match forward_cluster_kv_request_outcome_recovering_stale_leader_async(
-            runtime,
-            paths,
-            &consensus_state,
-            &request_id,
-            options.forward_options,
-            deadline,
-            host,
-        )
-        .await
-        {
-            Ok(Some(read)) => {
-                let read = overlay_node_local_request_attempt_after_authoritative_history(
-                    runtime,
-                    paths,
-                    &request_id,
-                    read,
-                    consult_node_local_attempt,
-                    deadline,
-                )
-                .await?;
-                adopt_newer_authoritative_consensus_members(state, &consensus_state);
-                state.term = state
-                    .term
-                    .max(consensus_state.term)
-                    .max(read.authority.term);
-                state.kv_revision = state
-                    .kv_revision
-                    .max(consensus_state.kv_revision)
-                    .max(read.authority.revision.0);
-                return Ok(read);
-            }
-            Ok(None) => {}
-            Err(error) => forwarding_failure = Some(error),
-        }
-    }
-    if let Some(reason) = forward_only {
-        return Err(reason.into_error());
-    }
-    if local_admission_busy {
+    crate::raft_quorum::until_cluster_kv_node_stops(paths, crate::raft_quorum::ClusterKvStopOutcome::Read, async move {
+        let deadline = Instant::now() + options.raft_append_timeout;
+        let mut consensus_state = state.clone();
         let request_id_for_read = request_id.clone();
-        if let Ok(Some(retry)) = retry_local_read_index_after_busy_forward(
-            runtime,
-            paths,
-            &mut consensus_state,
-            options,
+        let remaining = remaining_authoritative_read_budget(
             deadline,
-            "authoritative KV request-outcome local admission retry",
-            ClusterRaftReadProjectionPolicy::DeadlineBounded,
-            LOCAL_READ_INDEX_BUSY_RETRY_BUDGET,
-            move |storage| storage.read_index_request_outcome(&request_id_for_read),
-            host,
-        )
-        .await
-        {
-            let read = match retry {
-                ClusterRaftReadIndexAttempt::Confirmed(read) => Some(read),
+            "authoritative KV request-outcome ReadIndex",
+        )?;
+        let (local_admission_busy, forward_only) =
+            match read_cluster_raft_with_read_index_attempt_async_with_host_and_admission(
+                runtime,
+                paths,
+                &mut consensus_state,
+                remaining,
+                options.raft_append_replication_options,
+                ClusterRaftReadIndexAdmissionMode::ForwardOnBusy,
+                move |storage| storage.read_index_request_outcome(&request_id_for_read),
+                host,
+            )
+            .await?
+            {
+                ClusterRaftReadIndexAttempt::Confirmed(read) => {
+                    let read = overlay_node_local_request_attempt_after_authoritative_history(
+                        runtime,
+                        paths,
+                        &request_id,
+                        retained_request_outcome_read(read),
+                        consult_node_local_attempt,
+                        deadline,
+                    )
+                    .await?;
+                    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                    state.term = state
+                        .term
+                        .max(consensus_state.term)
+                        .max(read.authority.term);
+                    state.kv_revision = state
+                        .kv_revision
+                        .max(consensus_state.kv_revision)
+                        .max(read.authority.revision.0);
+                    return Ok(read);
+                }
                 ClusterRaftReadIndexAttempt::NeedsBarrier(fence) => {
                     let request_id_for_read = request_id.clone();
-                    commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence(
+                    let read = commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence(
                         runtime,
                         paths,
                         &mut consensus_state,
@@ -3853,110 +3765,216 @@ where
                         move |storage| storage.read_index_request_outcome(&request_id_for_read),
                         host,
                     )
-                    .await
-                    .ok()
+                    .await?;
+                    let read = overlay_node_local_request_attempt_after_authoritative_history(
+                        runtime,
+                        paths,
+                        &request_id,
+                        retained_request_outcome_read(read),
+                        consult_node_local_attempt,
+                        deadline,
+                    )
+                    .await?;
+                    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                    state.term = state
+                        .term
+                        .max(consensus_state.term)
+                        .max(read.authority.term);
+                    state.kv_revision = state
+                        .kv_revision
+                        .max(consensus_state.kv_revision)
+                        .max(read.authority.revision.0);
+                    return Ok(read);
                 }
+                ClusterRaftReadIndexAttempt::NotLeader => (false, None),
                 ClusterRaftReadIndexAttempt::ForwardOnly(reason) => {
-                    return Err(reason.into_error());
+                    reason.apply_forwarding_floor(&mut consensus_state)?;
+                    (false, Some(reason))
                 }
-                ClusterRaftReadIndexAttempt::NotLeader
-                | ClusterRaftReadIndexAttempt::LocalAdmissionBusy => None,
+                ClusterRaftReadIndexAttempt::LocalAdmissionBusy => (true, None),
             };
-            if let Some(read) = read {
-                let read = overlay_node_local_request_attempt_after_authoritative_history(
-                    runtime,
-                    paths,
-                    &request_id,
-                    retained_request_outcome_read(read),
-                    consult_node_local_attempt,
-                    deadline,
-                )
-                .await?;
-                adopt_newer_authoritative_consensus_members(state, &consensus_state);
-                state.term = state
-                    .term
-                    .max(consensus_state.term)
-                    .max(read.authority.term);
-                state.kv_revision = state
-                    .kv_revision
-                    .max(consensus_state.kv_revision)
-                    .max(read.authority.revision.0);
-                return Ok(read);
+
+        let mut forwarding_failure = None;
+        if options.allow_forwarding {
+            remaining_authoritative_read_budget(
+                deadline,
+                "authoritative KV request-outcome forwarding",
+            )?;
+            match forward_cluster_kv_request_outcome_recovering_stale_leader_async(
+                runtime,
+                paths,
+                &consensus_state,
+                &request_id,
+                options.forward_options,
+                deadline,
+                host,
+            )
+            .await
+            {
+                Ok(Some(read)) => {
+                    let read = overlay_node_local_request_attempt_after_authoritative_history(
+                        runtime,
+                        paths,
+                        &request_id,
+                        read,
+                        consult_node_local_attempt,
+                        deadline,
+                    )
+                    .await?;
+                    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                    state.term = state
+                        .term
+                        .max(consensus_state.term)
+                        .max(read.authority.term);
+                    state.kv_revision = state
+                        .kv_revision
+                        .max(consensus_state.kv_revision)
+                        .max(read.authority.revision.0);
+                    return Ok(read);
+                }
+                Ok(None) => {}
+                Err(error) => forwarding_failure = Some(error),
             }
         }
-        return Err(forwarding_failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
-            detail: "local Raft admission is busy and no authority accepted the forwarded request-outcome read; local election was skipped"
-                .to_string(),
-        }));
-    }
-    if !sinomo_kv::cluster_kv_raft_local_is_voter(&consensus_state) {
-        return Err(forwarding_failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
-            detail: "local node is not a Raft voter and could not forward an authoritative request outcome"
-                .to_string(),
-        }));
-    }
-    if !options.allow_forwarding {
-        return Err(NetworkError::ClusterReadOnly {
-            detail: format!(
-                "{FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL}; forwarded requests do not start elections"
-            ),
-        });
-    }
-    let election_options = cluster_raft_leader_election_options_before_deadline(
-        options.leader_election_options,
-        deadline,
-        "authoritative KV request-outcome leader election",
-    )?;
-    if !elect_cluster_raft_leader_async_with_host(
-        runtime,
-        paths,
-        &consensus_state,
-        election_options,
-        host,
-    )
-    .await?
-    {
-        return Err(NetworkError::ClusterReadOnly {
-            detail: forwarding_failure.map_or_else(
-                || "local node could not establish current-term Raft leadership".to_string(),
-                |error| {
-                    format!(
-                        "local node could not establish current-term Raft leadership; forwarding failed: {error}"
+        if let Some(reason) = forward_only {
+            return Err(reason.into_error());
+        }
+        if local_admission_busy {
+            let request_id_for_read = request_id.clone();
+            if let Ok(Some(retry)) = retry_local_read_index_after_busy_forward(
+                runtime,
+                paths,
+                &mut consensus_state,
+                options,
+                deadline,
+                "authoritative KV request-outcome local admission retry",
+                ClusterRaftReadProjectionPolicy::DeadlineBounded,
+                LOCAL_READ_INDEX_BUSY_RETRY_BUDGET,
+                move |storage| storage.read_index_request_outcome(&request_id_for_read),
+                host,
+            )
+            .await
+            {
+                let read = match retry {
+                    ClusterRaftReadIndexAttempt::Confirmed(read) => Some(read),
+                    ClusterRaftReadIndexAttempt::NeedsBarrier(fence) => {
+                        let request_id_for_read = request_id.clone();
+                        commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence(
+                            runtime,
+                            paths,
+                            &mut consensus_state,
+                            options,
+                            deadline,
+                            Some(fence.into()),
+                            move |storage| storage.read_index_request_outcome(&request_id_for_read),
+                            host,
+                        )
+                        .await
+                        .ok()
+                    }
+                    ClusterRaftReadIndexAttempt::ForwardOnly(reason) => {
+                        return Err(reason.into_error());
+                    }
+                    ClusterRaftReadIndexAttempt::NotLeader
+                    | ClusterRaftReadIndexAttempt::LocalAdmissionBusy => None,
+                };
+                if let Some(read) = read {
+                    let read = overlay_node_local_request_attempt_after_authoritative_history(
+                        runtime,
+                        paths,
+                        &request_id,
+                        retained_request_outcome_read(read),
+                        consult_node_local_attempt,
+                        deadline,
                     )
-                },
-            ),
-        });
-    }
-    let request_id_for_read = request_id.clone();
-    let read = commit_cluster_kv_authoritative_barrier_then_read(
-        runtime,
-        paths,
-        &mut consensus_state,
-        options,
-        deadline,
-        move |storage| storage.read_index_request_outcome(&request_id_for_read),
-        host,
-    )
-    .await?;
-    let read = overlay_node_local_request_attempt_after_authoritative_history(
-        runtime,
-        paths,
-        &request_id,
-        retained_request_outcome_read(read),
-        consult_node_local_attempt,
-        deadline,
-    )
-    .await?;
-    adopt_newer_authoritative_consensus_members(state, &consensus_state);
-    state.term = state
-        .term
-        .max(consensus_state.term)
-        .max(read.authority.term);
-    state.kv_revision = state
-        .kv_revision
-        .max(consensus_state.kv_revision)
-        .max(read.authority.revision.0);
-    Ok(read)
+                    .await?;
+                    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                    state.term = state
+                        .term
+                        .max(consensus_state.term)
+                        .max(read.authority.term);
+                    state.kv_revision = state
+                        .kv_revision
+                        .max(consensus_state.kv_revision)
+                        .max(read.authority.revision.0);
+                    return Ok(read);
+                }
+            }
+            return Err(forwarding_failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
+                detail: "local Raft admission is busy and no authority accepted the forwarded request-outcome read; local election was skipped"
+                    .to_string(),
+            }));
+        }
+        if !sinomo_kv::cluster_kv_raft_local_is_voter(&consensus_state) {
+            return Err(forwarding_failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
+                detail: "local node is not a Raft voter and could not forward an authoritative request outcome"
+                    .to_string(),
+            }));
+        }
+        if !options.allow_forwarding {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "{FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL}; forwarded requests do not start elections"
+                ),
+            });
+        }
+        let election_options = cluster_raft_leader_election_options_before_deadline(
+            options.leader_election_options,
+            deadline,
+            "authoritative KV request-outcome leader election",
+        )?;
+        if !elect_cluster_raft_leader_async_with_host(
+            runtime,
+            paths,
+            &consensus_state,
+            election_options,
+            host,
+        )
+        .await?
+        {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: forwarding_failure.map_or_else(
+                    || "local node could not establish current-term Raft leadership".to_string(),
+                    |error| {
+                        format!(
+                            "local node could not establish current-term Raft leadership; forwarding failed: {error}"
+                        )
+                    },
+                ),
+            });
+        }
+        let request_id_for_read = request_id.clone();
+        let read = commit_cluster_kv_authoritative_barrier_then_read(
+            runtime,
+            paths,
+            &mut consensus_state,
+            options,
+            deadline,
+            move |storage| storage.read_index_request_outcome(&request_id_for_read),
+            host,
+        )
+        .await?;
+        let read = overlay_node_local_request_attempt_after_authoritative_history(
+            runtime,
+            paths,
+            &request_id,
+            retained_request_outcome_read(read),
+            consult_node_local_attempt,
+            deadline,
+        )
+        .await?;
+        adopt_newer_authoritative_consensus_members(state, &consensus_state);
+        state.term = state
+            .term
+            .max(consensus_state.term)
+            .max(read.authority.term);
+        state.kv_revision = state
+            .kv_revision
+            .max(consensus_state.kv_revision)
+            .max(read.authority.revision.0);
+        Ok(read)
+    })
+    .await
 }
 
 /// Reads an ordered exact-key set from one quorum-confirmed resident Raft
@@ -3974,13 +3992,20 @@ pub async fn read_cluster_kv_authoritative_entries_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let started = Instant::now();
-    let result = read_cluster_kv_authoritative_entries_async_with_host_inner(
-        runtime, paths, state, keys, options, host,
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Read,
+        async move {
+            let started = Instant::now();
+            let result = read_cluster_kv_authoritative_entries_async_with_host_inner(
+                runtime, paths, state, keys, options, host,
+            )
+            .await;
+            record_async_authoritative_read_latency(started, "entries", result.is_ok());
+            result
+        },
     )
-    .await;
-    record_async_authoritative_read_latency(started, "entries", result.is_ok());
-    result
+    .await
 }
 
 async fn read_cluster_kv_authoritative_entries_async_with_host_inner<H>(
@@ -4378,13 +4403,20 @@ pub async fn read_cluster_kv_authoritative_entry_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let started = Instant::now();
-    let result = read_cluster_kv_authoritative_entry_async_with_host_inner(
-        runtime, paths, state, key, options, host,
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Read,
+        async move {
+            let started = Instant::now();
+            let result = read_cluster_kv_authoritative_entry_async_with_host_inner(
+                runtime, paths, state, key, options, host,
+            )
+            .await;
+            record_async_authoritative_read_latency(started, "entry", result.is_ok());
+            result
+        },
     )
-    .await;
-    record_async_authoritative_read_latency(started, "entry", result.is_ok());
-    result
+    .await
 }
 
 async fn read_cluster_kv_authoritative_entry_async_with_host_inner<H>(
@@ -4705,24 +4737,33 @@ pub async fn read_cluster_kv_authoritative_complete_range_prefix_async_with_host
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let started = Instant::now();
-    let read = read_cluster_kv_complete_projection_async_with_host(
-        runtime,
+    crate::raft_quorum::until_cluster_kv_node_stops(
         paths,
-        state,
-        options,
-        CompleteReadProjection::Prefix(prefix.clone()),
-        host,
+        crate::raft_quorum::ClusterKvStopOutcome::Read,
+        async move {
+            let started = Instant::now();
+            let read = read_cluster_kv_complete_projection_async_with_host(
+                runtime,
+                paths,
+                state,
+                options,
+                CompleteReadProjection::Prefix(prefix.clone()),
+                host,
+            )
+            .await
+            .and_then(complete_read_prefix);
+            let result = read.and_then(|read| {
+                sinomo_kv::validate_cluster_kv_authoritative_complete_range_prefix_read(
+                    &prefix, &read,
+                )
+                .map_err(kv_err)?;
+                Ok(read)
+            });
+            record_async_authoritative_read_latency(started, "complete_prefix", result.is_ok());
+            result
+        },
     )
     .await
-    .and_then(complete_read_prefix);
-    let result = read.and_then(|read| {
-        sinomo_kv::validate_cluster_kv_authoritative_complete_range_prefix_read(&prefix, &read)
-            .map_err(kv_err)?;
-        Ok(read)
-    });
-    record_async_authoritative_read_latency(started, "complete_prefix", result.is_ok());
-    result
 }
 
 pub async fn read_cluster_kv_authoritative_range_prefix_async_with_host<H>(
@@ -4736,13 +4777,20 @@ pub async fn read_cluster_kv_authoritative_range_prefix_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let started = Instant::now();
-    let result = read_cluster_kv_authoritative_range_prefix_async_with_host_inner(
-        runtime, paths, state, prefix, options, host,
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Read,
+        async move {
+            let started = Instant::now();
+            let result = read_cluster_kv_authoritative_range_prefix_async_with_host_inner(
+                runtime, paths, state, prefix, options, host,
+            )
+            .await;
+            record_async_authoritative_read_latency(started, "prefix", result.is_ok());
+            result
+        },
     )
-    .await;
-    record_async_authoritative_read_latency(started, "prefix", result.is_ok());
-    result
+    .await
 }
 
 async fn read_cluster_kv_authoritative_range_prefix_async_with_host_inner<H>(
@@ -5359,16 +5407,24 @@ pub async fn handle_cluster_kv_txn_request_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let mut state = read_cluster_state_without_kv_async(runtime, paths)
-        .await
-        .map_err(|error| match error {
-            NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
-                detail: "local node has no cluster state".to_string(),
-            },
-            other => other,
-        })?;
-    commit_cluster_kv_txn_with_quorum_response_async_with_host(
-        runtime, paths, &mut state, request, options, host,
+    let request_id = request.request_id.to_string();
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Commit { request_id },
+        async move {
+            let mut state = read_cluster_state_without_kv_async(runtime, paths)
+                .await
+                .map_err(|error| match error {
+                    NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
+                        detail: "local node has no cluster state".to_string(),
+                    },
+                    other => other,
+                })?;
+            commit_cluster_kv_txn_with_quorum_response_async_with_host(
+                runtime, paths, &mut state, request, options, host,
+            )
+            .await
+        },
     )
     .await
 }
@@ -5386,22 +5442,30 @@ pub async fn handle_cluster_kv_txn_request_compact_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let config_read_span = tracing::trace_span!(
-        target: "sinomo.perf", "cluster.kv.config_read",
-        stage = "cluster.kv.config_read", request_id = %request.request_id,
-        cluster_root = %paths.root.display(),
-    );
-    let mut state = read_cluster_state_without_kv_async(runtime, paths)
-        .instrument(config_read_span)
-        .await
-        .map_err(|error| match error {
-            NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
-                detail: "local node has no cluster state".to_string(),
-            },
-            other => other,
-        })?;
-    commit_cluster_kv_txn_compact_with_quorum_response_async_with_host(
-        runtime, paths, &mut state, request, options, host,
+    let request_id = request.request_id.to_string();
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Commit { request_id },
+        async move {
+            let config_read_span = tracing::trace_span!(
+                target: "sinomo.perf", "cluster.kv.config_read",
+                stage = "cluster.kv.config_read", request_id = %request.request_id,
+                cluster_root = %paths.root.display(),
+            );
+            let mut state = read_cluster_state_without_kv_async(runtime, paths)
+                .instrument(config_read_span)
+                .await
+                .map_err(|error| match error {
+                    NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
+                        detail: "local node has no cluster state".to_string(),
+                    },
+                    other => other,
+                })?;
+            commit_cluster_kv_txn_compact_with_quorum_response_async_with_host(
+                runtime, paths, &mut state, request, options, host,
+            )
+            .await
+        },
     )
     .await
 }
@@ -5419,31 +5483,35 @@ pub async fn handle_forwarded_cluster_kv_txn_rpc_request_compact_async_with_host
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let compact = handle_cluster_kv_txn_request_compact_async_with_host(
-        runtime, paths, request, options, host,
-    )
-    .await?;
-    let txn_response = compact
-        .txn_response
-        .ok_or_else(|| NetworkError::Serialization {
-            detail: "cluster KV compact commit omitted its transaction response".to_string(),
-        })?;
-    if txn_response.revision != compact.authority.revision {
-        return Err(NetworkError::Serialization {
-            detail: format!(
-                "cluster KV compact transaction revision {} does not match authority revision {}",
-                txn_response.revision.0, compact.authority.revision.0
-            ),
-        });
-    }
-    Ok(ClusterKvTxnRpcResponse {
-        request_id: compact.request_id,
-        submitted_command_digest: compact.submitted_command_digest,
-        command_digest: compact.command_digest,
-        txn_response: Some(txn_response),
-        authority: compact.authority,
-        replayed_committed_request: compact.replayed_committed_request,
+    let request_id = request.request_id.to_string();
+    crate::raft_quorum::until_cluster_kv_node_stops(paths, crate::raft_quorum::ClusterKvStopOutcome::Commit { request_id }, async move {
+        let compact = handle_cluster_kv_txn_request_compact_async_with_host(
+            runtime, paths, request, options, host,
+        )
+        .await?;
+        let txn_response = compact
+            .txn_response
+            .ok_or_else(|| NetworkError::Serialization {
+                detail: "cluster KV compact commit omitted its transaction response".to_string(),
+            })?;
+        if txn_response.revision != compact.authority.revision {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "cluster KV compact transaction revision {} does not match authority revision {}",
+                    txn_response.revision.0, compact.authority.revision.0
+                ),
+            });
+        }
+        Ok(ClusterKvTxnRpcResponse {
+            request_id: compact.request_id,
+            submitted_command_digest: compact.submitted_command_digest,
+            command_digest: compact.command_digest,
+            txn_response: Some(txn_response),
+            authority: compact.authority,
+            replayed_committed_request: compact.replayed_committed_request,
+        })
     })
+    .await
 }
 
 pub async fn handle_cluster_kv_authoritative_snapshot_request_async_with_host<H>(
@@ -5456,17 +5524,25 @@ pub async fn handle_cluster_kv_authoritative_snapshot_request_async_with_host<H>
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_request_body(body).map_err(kv_err)?;
-    let mut state = read_cluster_state_without_kv_async(runtime, paths)
-        .await
-        .map_err(|error| match error {
-            NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
-                detail: "local node has no cluster state".to_string(),
-            },
-            other => other,
-        })?;
-    read_cluster_kv_authoritative_snapshot_async_with_host(
-        runtime, paths, &mut state, options, host,
+    crate::raft_quorum::until_cluster_kv_node_stops(
+        paths,
+        crate::raft_quorum::ClusterKvStopOutcome::Read,
+        async move {
+            sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_request_body(body)
+                .map_err(kv_err)?;
+            let mut state = read_cluster_state_without_kv_async(runtime, paths)
+                .await
+                .map_err(|error| match error {
+                    NetworkError::ClusterOrphan => NetworkError::ClusterReadOnly {
+                        detail: "local node has no cluster state".to_string(),
+                    },
+                    other => other,
+                })?;
+            read_cluster_kv_authoritative_snapshot_async_with_host(
+                runtime, paths, &mut state, options, host,
+            )
+            .await
+        },
     )
     .await
 }
@@ -10139,6 +10215,10 @@ mod tests {
         probe_waves: Vec<Instant>,
         accepted_appends: usize,
         holders: Vec<std::thread::JoinHandle<()>>,
+        /// How long a forwarded point read waits on the peer, as a peer
+        /// without quorum keeps re-sending its own wave until its budget.
+        forward_stall: Duration,
+        forwards: usize,
     }
 
     impl UnconfirmedReadIndexHost {
@@ -10159,6 +10239,8 @@ mod tests {
                 probe_waves: Vec::new(),
                 accepted_appends: 0,
                 holders: Vec::new(),
+                forward_stall: Duration::from_secs(60),
+                forwards: 0,
             }
         }
 
@@ -10327,6 +10409,23 @@ mod tests {
     }
 
     impl ClusterKvTxnQuorumAsyncHost for UnconfirmedReadIndexHost {
+        fn forward_cluster_kv_authoritative_entry_async<'a>(
+            &'a mut self,
+            _runtime: &'a tokio::runtime::Handle,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _key: &'a str,
+            _options: ClusterKvTxnForwardOptions,
+        ) -> ClusterMembershipRpcFuture<'a, Option<KvAuthoritativeRead<Option<sinomo_kv::KvEntry>>>>
+        {
+            self.forwards = self.forwards.saturating_add(1);
+            let stall = self.forward_stall;
+            Box::pin(async move {
+                tokio::time::sleep(stall).await;
+                Ok(None)
+            })
+        }
+
         fn request_kv_state_authority_vote_async<'a>(
             &'a mut self,
             _state: &'a ClusterBootstrapState,
@@ -10544,6 +10643,162 @@ mod tests {
                 host.wave_gaps()
             );
         }
+    }
+
+    /// A read still re-sending to fast-failing voters, in the middle of a
+    /// paced wait, ends promptly when its caller is cancelled and when its
+    /// node's host stops the node, well inside the read's own budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authoritative_barrier_read_ends_on_cancellation_and_node_stop() {
+        let fixture = cold_barrier_fixture("read_index_resend_cancel_and_stop");
+        clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+        commit_current_term_barrier(&fixture);
+        let options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true);
+        let budget = Duration::from_secs(20);
+        // Past the first two re-sends, the read sleeps in a one-second wait.
+        let into_wait = Duration::from_millis(1200);
+
+        let read_paths = fixture.paths.clone();
+        let read_local = fixture.local.clone();
+        let mut read_state = fixture.state.clone();
+        let cancelled = tokio::spawn(async move {
+            let mut host = UnconfirmedReadIndexHost::new(
+                &read_paths,
+                &read_local,
+                usize::MAX,
+                UnconfirmedProbe::FailedFast,
+                false,
+            );
+            commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
+                &tokio::runtime::Handle::current(),
+                &read_paths,
+                &mut read_state,
+                options,
+                Instant::now() + budget,
+                None,
+                ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
+                |storage| storage.read_index_snapshot(),
+                &mut host,
+            )
+            .await
+            .map(|_| ())
+        });
+        tokio::time::sleep(into_wait).await;
+        cancelled.abort();
+        let started = Instant::now();
+        let joined = cancelled.await;
+        assert!(
+            joined.as_ref().is_err_and(|error| error.is_cancelled()),
+            "{joined:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the cancelled read ended with its caller"
+        );
+        clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+
+        let mut host = UnconfirmedReadIndexHost::new(
+            &fixture.paths,
+            &fixture.local,
+            usize::MAX,
+            UnconfirmedProbe::FailedFast,
+            false,
+        );
+        let stopper_paths = fixture.paths.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(into_wait).await;
+            crate::raft_quorum::mark_cluster_kv_node_stopping(&stopper_paths);
+        });
+        let mut state = fixture.state.clone();
+        let started = Instant::now();
+        let read =
+            commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
+                &tokio::runtime::Handle::current(),
+                &fixture.paths,
+                &mut state,
+                options,
+                started + budget,
+                None,
+                ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
+                |storage| storage.read_index_snapshot(),
+                &mut host,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        stopper.await.expect("join stopper");
+        crate::raft_quorum::mark_cluster_kv_node_started(&fixture.paths);
+        clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+
+        let error = read.expect_err("the stopping node ends the read");
+        assert!(error.to_string().contains("stopping"), "{error}");
+        assert!(
+            elapsed < into_wait + Duration::from_millis(500),
+            "the stop, not the interval or the budget, ended it: {elapsed:?}"
+        );
+        assert!(host.probe_waves.len() >= 2, "the read was re-sending");
+    }
+
+    /// A follower forwards a read to a peer that has no quorum, so the peer
+    /// keeps the forwarded read waiting until its own budget. When this node
+    /// stops, the read ends here at once with the node's stopping error,
+    /// without waiting for the peer and without sending it anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarded_read_ends_when_its_node_stops_while_the_peer_has_no_quorum() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-forwarded-read-node-stops");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let state = three_voter_state();
+        crate::write_cluster_state(&paths, &state).expect("cluster state");
+        crate::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("seed cluster raft");
+        // A later term makes this node a follower, so it forwards its read.
+        paths
+            .kv_paths()
+            .raft_store()
+            .observe_term_compact(&state.local_node_id, state.term + 5)
+            .expect("follow a later term");
+        let mut host = UnconfirmedReadIndexHost::new(
+            &paths,
+            &state.local_node_id,
+            0,
+            UnconfirmedProbe::Rejected,
+            false,
+        );
+        let options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true);
+        let stopper_paths = paths.clone();
+        let stop_after = Duration::from_millis(300);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(stop_after).await;
+            crate::raft_quorum::mark_cluster_kv_node_stopping(&stopper_paths);
+        });
+        let mut caller = read_cluster_state_without_kv(&paths).expect("caller state");
+        let started = Instant::now();
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_cluster_kv_authoritative_entry_async_with_host(
+                &tokio::runtime::Handle::current(),
+                &paths,
+                &mut caller,
+                "/test/forwarded".to_string(),
+                options,
+                &mut host,
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        stopper.await.expect("join stopper");
+        crate::raft_quorum::mark_cluster_kv_node_started(&paths);
+
+        let read = read.expect("the stopping node ended its forwarded read");
+        let error = read.expect_err("a stopped read has no result");
+        assert!(error.to_string().contains("stopping"), "{error}");
+        assert_eq!(host.forwards, 1, "the read was waiting on the peer");
+        assert!(
+            elapsed < stop_after + Duration::from_secs(1),
+            "the stop, not the peer, ended it: {elapsed:?}"
+        );
     }
 
     /// A new leader's first authoritative read commits the compact barrier,

@@ -1790,6 +1790,10 @@ pub async fn run_daemon_control_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+    // The daemon owns its node's cluster KV lifecycle: paced KV re-sends run
+    // normally while it serves and end when it shuts down.
+    let lifecycle_paths = cluster_paths.clone();
+    sinomo_core::cluster::mark_cluster_kv_node_started(&lifecycle_paths);
     let reverse_affinity = if daemon_paths_are_shadow(&paths) {
         sinomo_core::network::DestinationProcessAffinity::Any
     } else {
@@ -1909,6 +1913,7 @@ pub async fn run_daemon_control_accept_loop(
             }
         }
     }
+    sinomo_core::cluster::mark_cluster_kv_node_stopping(&lifecycle_paths);
     Ok(())
 }
 

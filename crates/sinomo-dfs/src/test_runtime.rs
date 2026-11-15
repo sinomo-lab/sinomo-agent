@@ -3393,6 +3393,7 @@ impl DfsTestRuntime {
             self.resident_pins.insert(node.clone(), pin);
         }
         let node_state = &self.nodes[node];
+        sinomo_core::cluster::mark_cluster_kv_node_started(&paths);
         node_state.kv_available.store(true, Ordering::Release);
         self.kv_peers.register(
             node.clone(),
@@ -5649,6 +5650,14 @@ impl DfsTestRuntime {
         self.nodes[node]
             .kv_available
             .store(false, Ordering::Release);
+        // A voter node's in-flight KV work ends now, before its ingress and
+        // tasks are drained. A single-voter fixture's nodes all use the sole
+        // voter's store, which stays open for the live nodes when it stops.
+        if self.kv_voters {
+            sinomo_core::cluster::mark_cluster_kv_node_stopping(&ClusterPaths::new(
+                self.nodes[node].data_dir.as_ref(),
+            ));
+        }
         let endpoint = {
             let nodes = self.fabric.nodes.lock().unwrap();
             let endpoint = nodes

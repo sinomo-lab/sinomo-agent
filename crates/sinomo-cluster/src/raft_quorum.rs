@@ -4683,17 +4683,130 @@ where
 /// each later one doubles, up to the network's liveness interval.
 pub(crate) const READ_INDEX_RESEND_FIRST: Duration = Duration::from_millis(250);
 
+/// The local node's cluster KV lifecycle as paced re-sends observe it. A host
+/// that stops its node closes it, which wakes every paced wait of that node
+/// at once; a node that starts again begins a fresh lifecycle.
+#[derive(Default)]
+struct ClusterKvNodeLifecycle {
+    stopping: Mutex<bool>,
+    changed: Condvar,
+    notify: tokio::sync::Notify,
+}
+
+impl ClusterKvNodeLifecycle {
+    fn is_stopping(&self) -> bool {
+        *self
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn stop(&self) {
+        *self
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+        self.notify.notify_waiters();
+    }
+}
+
+static CLUSTER_KV_NODE_LIFECYCLES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, Arc<ClusterKvNodeLifecycle>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn cluster_kv_node_lifecycle(paths: &ClusterPaths) -> Arc<ClusterKvNodeLifecycle> {
+    let mut lifecycles = CLUSTER_KV_NODE_LIFECYCLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(lifecycles.entry(paths.root.clone()).or_default())
+}
+
+/// The host is stopping this node: every paced ReadIndex re-send of the node
+/// ends now, and one that starts before the node starts again ends at its
+/// first wait, rather than sleeping out its interval.
+pub fn mark_cluster_kv_node_stopping(paths: &ClusterPaths) {
+    cluster_kv_node_lifecycle(paths).stop();
+}
+
+/// The host started this node again; its paced re-sends wait normally.
+pub fn mark_cluster_kv_node_started(paths: &ClusterPaths) {
+    let mut lifecycles = CLUSTER_KV_NODE_LIFECYCLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if lifecycles
+        .get(&paths.root)
+        .is_some_and(|lifecycle| lifecycle.is_stopping())
+    {
+        lifecycles.insert(paths.root.clone(), Arc::default());
+    }
+}
+
+fn cluster_kv_node_stopping_error() -> NetworkError {
+    NetworkError::ClusterReadOnly {
+        detail:
+            "local cluster KV node is stopping; its unacknowledged ReadIndex wave is not re-sent"
+                .to_string(),
+    }
+}
+
+/// What a KV operation of a stopping node reports.
+pub(crate) enum ClusterKvStopOutcome {
+    /// A read: whatever it did changed no state.
+    Read,
+    /// A commit of this request: once it started it may have been sent.
+    Commit { request_id: String },
+}
+
+/// Runs one of this node's KV operations until it completes or the node's
+/// host stops the node. A stopping node ends its own operations here; it
+/// never waits for another node to answer or abandon them, and nothing is
+/// sent to a peer to cancel them. An operation that starts on a stopped node
+/// is refused before it sends anything; a commit stopped while in flight
+/// reports its outcome as unknown, as any cancelled caller would.
+pub(crate) async fn until_cluster_kv_node_stops<T>(
+    paths: &ClusterPaths,
+    outcome: ClusterKvStopOutcome,
+    operation: impl std::future::Future<Output = Result<T, NetworkError>>,
+) -> Result<T, NetworkError> {
+    let lifecycle = cluster_kv_node_lifecycle(paths);
+    let stopping = lifecycle.notify.notified();
+    tokio::pin!(stopping);
+    // Register before reading the flag so a stop between the two is kept.
+    stopping.as_mut().enable();
+    if lifecycle.is_stopping() {
+        return Err(cluster_kv_node_stopping_error());
+    }
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => result,
+        () = stopping => Err(match outcome {
+            ClusterKvStopOutcome::Read => cluster_kv_node_stopping_error(),
+            ClusterKvStopOutcome::Commit { request_id } => NetworkError::outcome_unknown(
+                "commit cluster KV transaction",
+                Some(&request_id),
+                "the local cluster KV node stopped while the commit was in flight; it may have been sent",
+            ),
+        }),
+    }
+}
+
 /// Paces the re-sends of a ReadIndex wave that voters did not acknowledge, so
 /// a voter that fails fast is not probed back to back. The timer only paces
 /// re-sends: it never decides, and the caller's budget still ends the read.
+/// A wait ends early, with an error, when the node's host stops it; a
+/// cancelled caller drops the wait with its future.
 pub(crate) struct ReadIndexResendTimer {
     next: Duration,
+    lifecycle: Arc<ClusterKvNodeLifecycle>,
 }
 
 impl ReadIndexResendTimer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(paths: &ClusterPaths) -> Self {
         Self {
             next: READ_INDEX_RESEND_FIRST,
+            lifecycle: cluster_kv_node_lifecycle(paths),
         }
     }
 
@@ -4709,15 +4822,44 @@ impl ReadIndexResendTimer {
     }
 
     /// Waits for the next re-send, never past `deadline`.
-    pub(crate) async fn wait_before(&mut self, deadline: Instant) {
+    pub(crate) async fn wait_before(&mut self, deadline: Instant) -> Result<(), NetworkError> {
         let wake = self.next_wake_before(deadline);
-        tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+        let stopping = self.lifecycle.notify.notified();
+        tokio::pin!(stopping);
+        // Register before reading the flag so a stop between the two is kept.
+        stopping.as_mut().enable();
+        if self.lifecycle.is_stopping() {
+            return Err(cluster_kv_node_stopping_error());
+        }
+        tokio::select! {
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => Ok(()),
+            () = stopping => Err(cluster_kv_node_stopping_error()),
+        }
     }
 
     /// Waits for the next re-send on a blocking caller, never past `deadline`.
-    pub(crate) fn wait_before_blocking(&mut self, deadline: Instant) {
+    pub(crate) fn wait_before_blocking(&mut self, deadline: Instant) -> Result<(), NetworkError> {
         let wake = self.next_wake_before(deadline);
-        std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+        let mut stopping = self
+            .lifecycle
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if *stopping {
+                return Err(cluster_kv_node_stopping_error());
+            }
+            let remaining = wake.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            stopping = self
+                .lifecycle
+                .changed
+                .wait_timeout(stopping, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
     }
 }
 
@@ -4744,7 +4886,7 @@ where
     H: ClusterRaftQuorumAsyncHost,
 {
     let deadline = Instant::now() + options.timeout;
-    let mut resend = ReadIndexResendTimer::new();
+    let mut resend = ReadIndexResendTimer::new(paths);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -4792,7 +4934,7 @@ where
                 });
             }
         }
-        resend.wait_before(deadline).await;
+        resend.wait_before(deadline).await?;
     }
 }
 
@@ -7432,6 +7574,140 @@ mod read_index_tests {
     use time::OffsetDateTime;
 
     const TEST_KEY: &str = "/read-index/value";
+
+    fn resend_lifecycle_paths(name: &str) -> (sinomo_testdir::TestDir, ClusterPaths) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(&root));
+        (root, paths)
+    }
+
+    /// A commit stopped in flight reports its outcome as unknown, with its
+    /// request; a read reports the stop; work that starts on a stopped node is
+    /// refused before it runs at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_node_ends_its_operations_with_truthful_outcomes() {
+        let (_root, paths) = resend_lifecycle_paths("sinomo-cluster-stop-ends-operations");
+        let stopper_paths = paths.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            mark_cluster_kv_node_stopping(&stopper_paths);
+        });
+        let commit = until_cluster_kv_node_stops(
+            &paths,
+            ClusterKvStopOutcome::Commit {
+                request_id: "request-in-flight".to_string(),
+            },
+            async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<(), NetworkError>(())
+            },
+        )
+        .await
+        .expect_err("the stop ends the commit");
+        stopper.await.expect("join stopper");
+        assert!(
+            matches!(
+                &commit,
+                NetworkError::OutcomeUnknown { operation_id: Some(id), .. }
+                    if id == "request-in-flight"
+            ),
+            "{commit:?}"
+        );
+
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = std::sync::Arc::clone(&started);
+        let refused = until_cluster_kv_node_stops(
+            &paths,
+            ClusterKvStopOutcome::Commit {
+                request_id: "request-after-stop".to_string(),
+            },
+            async move {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<(), NetworkError>(())
+            },
+        )
+        .await
+        .expect_err("a stopped node refuses new work");
+        assert!(
+            matches!(&refused, NetworkError::ClusterReadOnly { .. }),
+            "nothing was sent, so the refusal is definite: {refused:?}"
+        );
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+
+        mark_cluster_kv_node_started(&paths);
+        until_cluster_kv_node_stops(&paths, ClusterKvStopOutcome::Read, async {
+            Ok::<(), NetworkError>(())
+        })
+        .await
+        .expect("a started node runs its operations");
+    }
+
+    /// A paced wait at its longest interval ends as soon as the node's host
+    /// stops it, async or blocking; one that starts while the node is stopped
+    /// ends at once; after the node starts again, waits pace normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paced_resend_wait_ends_when_its_node_stops() {
+        let (_root, paths) = resend_lifecycle_paths("sinomo-cluster-paced-wait-node-stops");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut timer = ReadIndexResendTimer::new(&paths);
+        timer.next = sinomo_network::DEFAULT_NETWORK_TIMEOUT;
+        let stopper_paths = paths.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            mark_cluster_kv_node_stopping(&stopper_paths);
+        });
+        let started = Instant::now();
+        let error = timer
+            .wait_before(deadline)
+            .await
+            .expect_err("the stopping node ends the wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woken by the stop, not the interval: {:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("stopping"), "{error}");
+        stopper.await.expect("join stopper");
+
+        let started = Instant::now();
+        let mut late = ReadIndexResendTimer::new(&paths);
+        late.wait_before(deadline)
+            .await
+            .expect_err("a wait on a stopped node ends at once");
+        late.wait_before_blocking(deadline)
+            .expect_err("a blocking wait on a stopped node ends at once");
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        mark_cluster_kv_node_started(&paths);
+        let mut blocking = ReadIndexResendTimer::new(&paths);
+        blocking.next = sinomo_network::DEFAULT_NETWORK_TIMEOUT;
+        let stopper_paths = paths.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            mark_cluster_kv_node_stopping(&stopper_paths);
+        });
+        let started = Instant::now();
+        let error = tokio::task::spawn_blocking(move || blocking.wait_before_blocking(deadline))
+            .await
+            .expect("join blocking wait")
+            .expect_err("the stopping node ends the blocking wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woken by the stop, not the interval: {:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("stopping"), "{error}");
+        stopper.join().expect("join blocking stopper");
+
+        mark_cluster_kv_node_started(&paths);
+        let mut paced = ReadIndexResendTimer::new(&paths);
+        let started = Instant::now();
+        paced
+            .wait_before(deadline)
+            .await
+            .expect("a started node paces its re-send");
+        assert!(started.elapsed() >= READ_INDEX_RESEND_FIRST);
+    }
 
     fn expired_supervised_test_timeout() -> NetworkError {
         NetworkError::timeout(

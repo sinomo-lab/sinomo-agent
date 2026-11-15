@@ -538,6 +538,7 @@ pub use raft_quorum::{
     commit_cluster_raft_command_with_local_storage_and_transport,
     commit_cluster_raft_command_with_quorum_driver,
 };
+pub use raft_quorum::{mark_cluster_kv_node_started, mark_cluster_kv_node_stopping};
 #[cfg(any(test, feature = "test-support"))]
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
