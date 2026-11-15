@@ -782,7 +782,7 @@ pub use protocol::{
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof, DfsMessageCommand, DfsMessageResponse,
     DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataDurableReplication,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsMetadataMemberAckView,
+    DfsMetadataMemberAckView, DfsMetadataMemberRecordView,
     DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
     DfsMkdirAtNoLinksWithAttrs, DfsNamespaceChangePollRequest, DfsNamespaceChangePollResponse,

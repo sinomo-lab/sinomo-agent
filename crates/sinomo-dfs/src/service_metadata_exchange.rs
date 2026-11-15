@@ -805,6 +805,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     response.member_view.as_ref(),
                 );
             }
+            if let Some(record) = response.refusing_member_record() {
+                self.replication
+                    .metadata_authority_refusals
+                    .insert(response.request_id.clone(), record.clone());
+            }
             self.replication
                 .metadata_authority_probe_results
                 .insert(response.request_id, accepted);
@@ -1505,6 +1510,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     verified_authority_probe_id: verified_primary_handoff_id,
                     result: DfsMetadataJournalBatchResult::Applied,
                     member_view: None,
+                    member_record: None,
                 }),
             )?;
             return Ok(NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
@@ -1649,6 +1655,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             verified_authority_probe_id,
                             result: DfsMetadataJournalBatchResult::Applied,
                             member_view: None,
+                            member_record: None,
                         },
                     ),
                 )?;
@@ -1668,7 +1675,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &command.request_id,
                     &shard_id,
                     next_after_sequence,
-                    error,
+                    DfsMetadataRejection::from(error)
+                        .with_member_record(Some(&validated_source.replica_context)),
                 )?;
                 Ok(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
                     request_id: command.request_id,
@@ -1696,7 +1704,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Err(DfsMetadataRejection::new(
                 crate::DfsMetadataRejectionCode::WriteSetViewBehind,
                 "an epoch-start alignment probe is answered on the direct journal-batch route",
-            )));
+            )
+            .with_member_record(Some(context))));
         }
         let backend = self
             .metadata_backend
@@ -1752,6 +1761,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         next_after_sequence: u64,
         reason: impl Into<DfsMetadataRejection>,
     ) -> Result<(), DfsError> {
+        let rejection = reason.into();
         self.send_dfs_message_if_routable(
             source_node_id,
             DfsNetworkMessage::MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse {
@@ -1761,8 +1771,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 applied_entries: 0,
                 verified_prefix_only: false,
                 verified_authority_probe_id: None,
-                result: DfsMetadataJournalBatchResult::from_rejection(reason),
                 member_view: None,
+                member_record: rejection.member_record.clone(),
+                result: DfsMetadataJournalBatchResult::from_rejection(rejection),
             }),
         )?;
         Ok(())
@@ -1897,9 +1908,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .into(),
             ));
         };
-        let shard = context.shard;
-        let pending_membership_handoff = context.pending_membership_handoff;
-        let write_set = context.write_set;
+        if command
+            .file_system_id
+            .as_ref()
+            .is_none_or(|id| id == &context.shard.file_system_id)
+            && let Some(rejection) = crate::metadata_replication::write_set_source_epoch_rejection(
+                crate::metadata_replication::dfs_metadata_journal_command_source_epoch(command),
+                &context,
+            )
+        {
+            return Ok(Err(rejection));
+        }
+        let shard = context.shard.clone();
+        let pending_membership_handoff = context.pending_membership_handoff.clone();
+        let write_set = context.write_set.clone();
         if ordinary_applied_batch
             && (command.file_system_id.as_ref() != Some(&shard.file_system_id)
                 || command.authority_epoch != Some(shard.epoch))
@@ -1916,7 +1938,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "metadata journal source {source_node_id} is not shard {} primary {}",
                     shard.shard_id, shard.primary_node_id
                 ),
-            )));
+            )
+            .with_member_record(Some(&context))));
         }
         if let Some(probe) = command.authority_probe.as_ref() {
             let has_authority_payload = !batch.journal_frames.is_empty();
@@ -1981,7 +2004,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "metadata shard {} write-set view has not reached generation {generation}",
                     shard.shard_id
                 ),
-            )));
+            )
+            .with_member_record(Some(&context))));
         }
         if shard.primary_node_id == self.node_id {
             return Ok(Err(
@@ -2135,6 +2159,7 @@ mod response_bookkeeping_tests {
             verified_authority_probe_id: confirmation_id.map(str::to_string),
             result: DfsMetadataJournalBatchResult::Applied,
             member_view: None,
+            member_record: None,
         }
     }
 

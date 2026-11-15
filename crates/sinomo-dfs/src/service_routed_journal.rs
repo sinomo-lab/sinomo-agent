@@ -413,6 +413,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason,
                 ),
                 member_view: None,
+                member_record: None,
             }),
         )?;
         Ok(())

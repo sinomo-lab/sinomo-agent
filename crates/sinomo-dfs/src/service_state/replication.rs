@@ -18,6 +18,10 @@ pub(crate) struct DfsReplicationState {
     pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pub(crate) pending_metadata_authority_probes: BTreeMap<String, PendingMetadataAuthorityProbe>,
     pub(crate) metadata_authority_probe_results: BTreeMap<String, bool>,
+    /// The record view a member sent when it refused an authority probe's
+    /// source epoch, by request id: the attempt cannot gather that member's
+    /// acknowledgement at this epoch.
+    pub(crate) metadata_authority_refusals: BTreeMap<String, crate::DfsMetadataMemberRecordView>,
 }
 
 impl DfsReplicationState {
@@ -34,5 +38,6 @@ impl DfsReplicationState {
         self.pending_metadata_replications.is_empty()
             && self.pending_metadata_authority_probes.is_empty()
             && self.metadata_authority_probe_results.is_empty()
+            && self.metadata_authority_refusals.is_empty()
     }
 }

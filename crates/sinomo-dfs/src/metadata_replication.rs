@@ -5599,6 +5599,7 @@ mod concurrent_target_publish_tests {
                     verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::Applied,
                     member_view: None,
+                    member_record: None,
                 })
             })
         };
@@ -5712,6 +5713,7 @@ mod concurrent_target_publish_tests {
                             verified_authority_probe_id: None,
                             result: DfsMetadataJournalBatchResult::Applied,
                             member_view: None,
+                            member_record: None,
                         })
                     })
                 })
@@ -5826,6 +5828,7 @@ mod concurrent_target_publish_tests {
                             verified_authority_probe_id: None,
                             result: DfsMetadataJournalBatchResult::Applied,
                             member_view: None,
+                            member_record: None,
                         })
                     })
                 })
@@ -6764,6 +6767,7 @@ fn align_dfs_metadata_replica_to_epoch(
             verified_authority_probe_id: None,
             member_view: head.and_then(|head| context.member_ack_view(Some(head))),
             result,
+            member_record: None,
         }
     };
     let probe = command
@@ -6875,7 +6879,71 @@ pub fn process_dfs_metadata_journal_batch(
     context: Option<&DfsMetadataReplicaShardContext>,
     command: DfsMetadataJournalBatchCommand,
 ) -> DfsMetadataJournalBatchResponse {
-    process_dfs_metadata_journal_batch_inner(backend, context, command)
+    let mut response = process_dfs_metadata_journal_batch_inner(backend, context, command);
+    // The backend's typed refusals (a fenced epoch, a required alignment)
+    // carry this member's record view like the source checks' do.
+    if response.member_record.is_none()
+        && let DfsMetadataJournalBatchResult::Rejected { code, .. } = &response.result
+        && code.names_member_record()
+    {
+        response.member_record = context.and_then(crate::DfsMetadataMemberRecordView::of);
+    }
+    response
+}
+
+/// The epoch a journal command's source claims: its authority epoch, else
+/// the epoch of the shard its authority or prefix probe names.
+pub(crate) fn dfs_metadata_journal_command_source_epoch(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Option<u64> {
+    command
+        .authority_epoch
+        .or_else(|| {
+            command
+                .authority_probe
+                .as_ref()
+                .map(|probe| probe.expected_shard.epoch)
+        })
+        .or_else(|| {
+            command
+                .prefix_probe
+                .as_ref()
+                .and_then(|probe| probe.authority_epoch)
+        })
+}
+
+/// On a write-set shard, a source naming another epoch than this member's
+/// own record is answered with a typed code and the member's record view. An
+/// earlier epoch was superseded: its primary was replaced. A later one means
+/// this member's view is behind, and the primary asks again once it can have
+/// moved. Shards on the all-member rule keep their untyped answers.
+pub(crate) fn write_set_source_epoch_rejection(
+    source_epoch: Option<u64>,
+    context: &DfsMetadataReplicaShardContext,
+) -> Option<DfsMetadataRejection> {
+    context.write_set.as_ref()?;
+    let source_epoch = source_epoch?;
+    let (code, relation) = match source_epoch.cmp(&context.shard.epoch) {
+        std::cmp::Ordering::Less => (
+            DfsMetadataRejectionCode::SourceEpochSuperseded,
+            "was superseded",
+        ),
+        std::cmp::Ordering::Greater => (
+            DfsMetadataRejectionCode::WriteSetViewBehind,
+            "is ahead of this member's view",
+        ),
+        std::cmp::Ordering::Equal => return None,
+    };
+    Some(
+        DfsMetadataRejection::new(
+            code,
+            format!(
+                "metadata shard {} source epoch {source_epoch} {relation}: this member follows {} at epoch {}",
+                context.shard.shard_id, context.shard.primary_node_id, context.shard.epoch
+            ),
+        )
+        .with_member_record(Some(context)),
+    )
 }
 
 fn process_dfs_metadata_journal_batch_inner(
@@ -6927,6 +6995,7 @@ fn process_dfs_metadata_journal_batch_inner(
                     verified_prefix_only: true,
                     verified_authority_probe_id: verified_primary_handoff_id,
                     result: DfsMetadataJournalBatchResult::Applied,
+                    member_record: None,
                 },
                 Err(reason) => DfsMetadataJournalBatchResponse {
                     request_id: command.request_id,
@@ -6937,6 +7006,7 @@ fn process_dfs_metadata_journal_batch_inner(
                     verified_authority_probe_id: None,
                     result: DfsMetadataJournalBatchResult::from_rejection(reason),
                     member_view: None,
+                    member_record: None,
                 },
             };
         #[cfg(any(test, feature = "test-support"))]
@@ -7006,6 +7076,7 @@ fn process_dfs_metadata_journal_batch_inner(
             verified_authority_probe_id: Some(confirmation),
             result: DfsMetadataJournalBatchResult::Applied,
             member_view: context.member_ack_view(Some(&floor.durable_prefix_proof)),
+            member_record: None,
         };
     }
     let context = context.expect("validated metadata replica ingest has a shard context");
@@ -7108,11 +7179,15 @@ fn process_dfs_metadata_journal_batch_inner(
                         authority_epoch: permit.floor_authority_epoch(),
                     })
                 {
+                    // A fenced epoch keeps its code; other failures stay untyped.
                     return dfs_metadata_journal_rejection_response(
                         &command,
-                        format!(
-                            "persist metadata authority acknowledgement floor for shard {} sequence {}: {error}",
-                            command.batch.shard_id.0, command.batch.next_after_sequence
+                        DfsMetadataRejection::new(
+                            dfs_metadata_floor_refusal_code(&error),
+                            format!(
+                                "persist metadata authority acknowledgement floor for shard {} sequence {}: {error}",
+                                command.batch.shard_id.0, command.batch.next_after_sequence
+                            ),
                         ),
                     );
                 }
@@ -7133,6 +7208,7 @@ fn process_dfs_metadata_journal_batch_inner(
                     .and_then(|_| context.member_ack_view(apply_report.durable_prefix_proof())),
                 verified_authority_probe_id,
                 result: DfsMetadataJournalBatchResult::Applied,
+                member_record: None,
             };
             #[cfg(any(test, feature = "test-support"))]
             if let Some(trace) = native_trace.as_mut() {
@@ -7167,6 +7243,7 @@ fn process_dfs_metadata_journal_batch_inner(
                 verified_authority_probe_id: None,
                 result: DfsMetadataJournalBatchResult::from_rejection(error),
                 member_view: None,
+                member_record: None,
             }
         }
     }
@@ -7303,12 +7380,24 @@ fn verify_dfs_metadata_journal_prefix_with_receiver_budget(
             authority_epoch: context.floor_authority_epoch(),
         })
         .map_err(|error| {
-            format!(
-                "persist metadata prefix acknowledgement floor for shard {} sequence {}: {error}",
-                batch.shard_id.0, probe.journal_sequence
+            DfsMetadataRejection::new(
+                dfs_metadata_floor_refusal_code(&error),
+                format!(
+                    "persist metadata prefix acknowledgement floor for shard {} sequence {}: {error}",
+                    batch.shard_id.0, probe.journal_sequence
+                ),
             )
         })?;
     Ok(verified_primary_handoff_id)
+}
+
+/// The code of a failed acknowledgement-floor write: a member that refuses the
+/// source's epoch says so; any other failure stays untyped.
+fn dfs_metadata_floor_refusal_code(error: &crate::MetadataBackendError) -> DfsMetadataRejectionCode {
+    match error.rejection_code() {
+        code if code.refuses_source_epoch() => code,
+        _ => DfsMetadataRejectionCode::Other,
+    }
 }
 
 /// Compatibility authority lookup for host-agnostic callers.
@@ -7880,6 +7969,14 @@ pub fn validate_dfs_metadata_journal_batch_source(
             "metadata journal batch has no local shard config".to_string(),
         ));
     }
+    if command.file_system_id.as_ref().is_none_or(|id| id == &context.shard.file_system_id)
+        && let Some(rejection) = write_set_source_epoch_rejection(
+            dfs_metadata_journal_command_source_epoch(command),
+            context,
+        )
+    {
+        return Some(dfs_metadata_journal_rejection_response(command, rejection));
+    }
     let ordinary_applied_batch = !command.verify_prefix_only && command.authority_probe.is_none();
     if ordinary_applied_batch
         && (command.file_system_id.as_ref() != Some(&context.shard.file_system_id)
@@ -7953,7 +8050,8 @@ pub fn validate_dfs_metadata_journal_batch_source(
                     "metadata journal source {source_node_id} is not shard {} primary {}",
                     context.shard.shard_id, context.shard.primary_node_id
                 ),
-            ),
+            )
+            .with_member_record(Some(context)),
         ));
     }
     if context.shard.primary_node_id == context.local_node_id {
@@ -8008,6 +8106,7 @@ pub(crate) fn write_set_probe_generation_rejection(
                     context.shard.shard_id
                 ),
             )
+            .with_member_record(Some(context))
         })
 }
 
@@ -8210,6 +8309,7 @@ fn dfs_metadata_journal_rejection_response(
     command: &DfsMetadataJournalBatchCommand,
     reason: impl Into<DfsMetadataRejection>,
 ) -> DfsMetadataJournalBatchResponse {
+    let rejection = reason.into();
     DfsMetadataJournalBatchResponse {
         request_id: command.request_id.clone(),
         shard_id: command.batch.shard_id.clone(),
@@ -8217,8 +8317,9 @@ fn dfs_metadata_journal_rejection_response(
         applied_entries: 0,
         verified_prefix_only: false,
         verified_authority_probe_id: None,
-        result: DfsMetadataJournalBatchResult::from_rejection(reason),
         member_view: None,
+        member_record: rejection.member_record.clone(),
+        result: DfsMetadataJournalBatchResult::from_rejection(rejection),
     }
 }
 

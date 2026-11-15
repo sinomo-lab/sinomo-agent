@@ -389,7 +389,8 @@ impl From<MetadataBackendError> for DfsError {
                 root,
                 processed_records,
             },
-            error @ MetadataBackendError::Rejected { .. } => Self::MetadataRejection {
+            error @ (MetadataBackendError::Rejected { .. }
+            | MetadataBackendError::SourceEpochFenced { .. }) => Self::MetadataRejection {
                 code: error.rejection_code(),
                 message: error.to_string(),
             },

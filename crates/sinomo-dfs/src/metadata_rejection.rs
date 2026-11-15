@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct DfsMetadataRejection {
     pub code: DfsMetadataRejectionCode,
     pub reason: String,
+    /// The receiver's own record view, sent with the codes that name it.
+    pub member_record: Option<crate::DfsMetadataMemberRecordView>,
 }
 
 impl DfsMetadataRejection {
@@ -14,7 +16,20 @@ impl DfsMetadataRejection {
         Self {
             code,
             reason: reason.into(),
+            member_record: None,
         }
+    }
+
+    /// Attach the receiver's record view from `context` when the code names
+    /// it and the shard is on the write-set protocol.
+    pub fn with_member_record(
+        mut self,
+        context: Option<&crate::DfsMetadataReplicaShardContext>,
+    ) -> Self {
+        if self.member_record.is_none() && self.code.names_member_record() {
+            self.member_record = context.and_then(crate::DfsMetadataMemberRecordView::of);
+        }
+        self
     }
 }
 
@@ -74,6 +89,13 @@ pub enum DfsMetadataRejectionCode {
     /// been aligned with that epoch's start and cannot be inline: the new
     /// primary sends an epoch-start alignment probe first.
     EpochAlignmentRequired,
+    /// The receiver refuses the source's epoch: it promised a takeover
+    /// candidate to accept nothing more at that epoch, or it already holds an
+    /// acknowledgement floor at a later one.
+    SourceEpochFenced,
+    /// The source names an epoch below the receiver's own record: that
+    /// epoch's primary was replaced.
+    SourceEpochSuperseded,
     /// Explicitly non-repairable here. Unknown future codes fail closed and
     /// never fall back to interpreting the accompanying diagnostic text.
     #[serde(other)]
@@ -88,8 +110,30 @@ impl DfsMetadataRejectionCode {
         )
     }
 
+    /// Replication to the receiver at the source's epoch can never succeed:
+    /// the receiver follows another primary there, or a later epoch. A fenced
+    /// receiver is not suppressed, because a takeover that does not apply
+    /// releases its fence at the same epoch.
     pub fn suppresses_replication(self) -> bool {
-        self == Self::PrimaryMismatch
+        matches!(self, Self::PrimaryMismatch | Self::SourceEpochSuperseded)
+    }
+
+    /// The receiver refuses the source's epoch for good or until a takeover
+    /// settles: an attempt at that epoch cannot gather its acknowledgement.
+    pub fn refuses_source_epoch(self) -> bool {
+        matches!(self, Self::SourceEpochFenced | Self::SourceEpochSuperseded)
+    }
+
+    /// Codes sent with the receiver's own record view on a write-set shard.
+    pub fn names_member_record(self) -> bool {
+        matches!(
+            self,
+            Self::SourceEpochFenced
+                | Self::SourceEpochSuperseded
+                | Self::EpochAlignmentRequired
+                | Self::PrimaryMismatch
+                | Self::WriteSetViewBehind
+        )
     }
 }
 

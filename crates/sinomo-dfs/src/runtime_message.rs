@@ -635,6 +635,7 @@ pub(crate) fn dfs_metadata_journal_rejection_for(
     next_after_sequence: u64,
     reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataJournalBatchResponse {
+    let rejection = reason.into();
     crate::DfsMetadataJournalBatchResponse {
         request_id,
         shard_id,
@@ -642,8 +643,9 @@ pub(crate) fn dfs_metadata_journal_rejection_for(
         applied_entries: 0,
         verified_prefix_only: false,
         verified_authority_probe_id: None,
-        result: crate::DfsMetadataJournalBatchResult::from_rejection(reason),
         member_view: None,
+        member_record: rejection.member_record.clone(),
+        result: crate::DfsMetadataJournalBatchResult::from_rejection(rejection),
     }
 }
 

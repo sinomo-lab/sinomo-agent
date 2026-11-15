@@ -1132,6 +1132,7 @@ impl Service for DfsService {
                                 code: crate::DfsMetadataRejectionCode::Other,
                             },
                             member_view: None,
+                            member_record: None,
                         };
                         ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
                         operation_metrics.succeed();

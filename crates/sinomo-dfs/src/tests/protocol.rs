@@ -2943,6 +2943,75 @@ fn write_set_probe_generation_is_omitted_unless_asked_for() {
 }
 
 #[test]
+fn member_record_is_sent_only_with_the_codes_that_name_it() {
+    let record = crate::DfsMetadataMemberRecordView {
+        epoch: 5,
+        generation: 9,
+        primary_node_id: NodeId::from_legacy_named("node_record_primary").unwrap(),
+    };
+    let response = |code, member_record| DfsMetadataJournalBatchResponse {
+        request_id: "request".into(),
+        shard_id: DfsMetadataShardId::new("root"),
+        next_after_sequence: 7,
+        applied_entries: 0,
+        verified_prefix_only: false,
+        verified_authority_probe_id: None,
+        result: DfsMetadataJournalBatchResult::rejected(code, "refused"),
+        member_view: None,
+        member_record,
+    };
+    let plain = serde_json::to_value(response(DfsMetadataRejectionCode::Other, None)).unwrap();
+    assert!(plain.get("member_record").is_none(), "{plain}");
+    for code in [
+        DfsMetadataRejectionCode::SourceEpochFenced,
+        DfsMetadataRejectionCode::SourceEpochSuperseded,
+    ] {
+        let refused = response(code, Some(record.clone()));
+        let encoded = serde_json::to_vec(&refused).unwrap();
+        let decoded: DfsMetadataJournalBatchResponse = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, refused);
+        assert_eq!(decoded.refusing_member_record(), Some(&record));
+        assert!(code.refuses_source_epoch() && code.names_member_record());
+        assert!(!code.allows_snapshot_repair());
+    }
+    // Only a superseded epoch suppresses replication: a fence is released at
+    // the same epoch when the candidate's takeover does not apply.
+    assert!(DfsMetadataRejectionCode::SourceEpochSuperseded.suppresses_replication());
+    assert!(!DfsMetadataRejectionCode::SourceEpochFenced.suppresses_replication());
+    let behind = response(DfsMetadataRejectionCode::WriteSetViewBehind, Some(record.clone()));
+    assert_eq!(behind.refusing_member_record(), None);
+    for (wire, code) in [
+        ("source-epoch-fenced", DfsMetadataRejectionCode::SourceEpochFenced),
+        ("source-epoch-superseded", DfsMetadataRejectionCode::SourceEpochSuperseded),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<DfsMetadataRejectionCode>(serde_json::json!(wire)).unwrap(),
+            code
+        );
+    }
+    // A decoder that predates the field ignores it.
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct PreChangeResponse {
+        request_id: String,
+        shard_id: DfsMetadataShardId,
+        next_after_sequence: u64,
+        applied_entries: usize,
+        verified_prefix_only: bool,
+        verified_authority_probe_id: Option<String>,
+        result: DfsMetadataJournalBatchResult,
+        #[serde(default)]
+        member_view: Option<serde_json::Value>,
+    }
+    let encoded = serde_json::to_vec(&response(
+        DfsMetadataRejectionCode::SourceEpochSuperseded,
+        Some(record),
+    ))
+    .unwrap();
+    assert!(serde_json::from_slice::<PreChangeResponse>(&encoded).is_ok());
+}
+
+#[test]
 fn epoch_start_alignment_is_omitted_unless_a_new_primary_aligns() {
     let probe = DfsMetadataPrefixProbe {
         barrier_id: "barrier".into(),

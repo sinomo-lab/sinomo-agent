@@ -881,6 +881,7 @@ fn namespace_prepare_outcome_unknown(
         cause: crate::DfsCommitOutcomeUnknownCause::Interrupted {
             detail: "the durable prepare is awaiting recovery".into(),
         },
+        current_primary_node_id: None,
     }
 }
 

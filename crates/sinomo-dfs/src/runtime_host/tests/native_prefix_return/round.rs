@@ -210,6 +210,7 @@ impl DfsPeerTransport for MatchingUnprovenPeer {
                 verified_authority_probe_id: None,
                 result: crate::DfsMetadataJournalBatchResult::Applied,
                 member_view: None,
+                member_record: None,
             },
         )
         .map(ObjectRpcResult::value)

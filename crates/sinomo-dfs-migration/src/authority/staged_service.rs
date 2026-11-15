@@ -544,6 +544,7 @@ impl NativeImportAuthority {
             verified_authority_probe_id: Some(id),
             result: DfsMetadataJournalBatchResult::Applied,
             member_view: None,
+            member_record: None,
         })
     }
     fn source_ancestry_root(&self, handoff_id: &str, request_id: &str) -> Result<PathBuf> {

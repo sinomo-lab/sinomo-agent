@@ -91,6 +91,33 @@ fn metadata_authority_direct_reply(
     }
 }
 
+/// An attempt a write-set member refused at this epoch ends unknown as a
+/// record change: the member promised a takeover candidate, or its own record
+/// names a later epoch. The cause names the latest epoch a refusal shows, at
+/// least the next one, and the outcome names that record's primary when it
+/// is another node. A refusal is a hint: the attempt's own context is kept.
+pub(crate) fn metadata_authority_refusal_outcome(
+    local_node_id: &NodeId,
+    shard: &DfsMetadataShardConfig,
+    operation: &DfsMetadataAuthorityOperation,
+    refusals: &BTreeMap<NodeId, crate::DfsMetadataMemberRecordView>,
+) -> Option<DfsError> {
+    let latest = refusals.values().max_by_key(|record| record.epoch)?;
+    let DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } = operation;
+    Some(DfsError::MetadataCommitOutcomeUnknown {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: shard.shard_id.clone(),
+        epoch: shard.epoch,
+        operation_id: operation_id.clone(),
+        cause: crate::DfsCommitOutcomeUnknownCause::RecordChanged {
+            epoch: latest.epoch.max(shard.epoch.saturating_add(1)),
+        },
+        current_primary_node_id: (latest.epoch > shard.epoch
+            && &latest.primary_node_id != local_node_id)
+            .then(|| latest.primary_node_id.clone()),
+    })
+}
+
 /// The empty confirmation sent as a hedge: the same operation and exact
 /// prefix challenge, without journal frames.
 fn metadata_authority_hedge_command(
@@ -662,6 +689,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let deadline = self.transport.operation_deadline();
         let mut rejected_node_ids = BTreeSet::new();
         let mut lagging_node_ids = BTreeSet::new();
+        let mut refusals = BTreeMap::new();
         let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
             shard,
             operation,
@@ -671,8 +699,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             hedge_after,
             &mut rejected_node_ids,
             &mut lagging_node_ids,
+            &mut refusals,
         )?;
         self.check_cancelled("metadata authority result")?;
+        // A member that refuses this epoch is not caught up: no catch-up can
+        // make it acknowledge the epoch.
+        self.end_metadata_authority_attempt_on_refusal(shard, operation, &refusals)?;
         if acknowledged.len() == targets.len() + 1
             || (rejected_node_ids.is_empty() && lagging_node_ids.is_empty())
         {
@@ -744,6 +776,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // assigned replicas. No further catch-up round is started here.
         let mut rejected_again = BTreeSet::new();
         let mut lagging_again = BTreeSet::new();
+        let mut refusals = BTreeMap::new();
         let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
             shard,
             operation,
@@ -753,9 +786,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             hedge_after,
             &mut rejected_again,
             &mut lagging_again,
+            &mut refusals,
         )?;
         self.check_cancelled("metadata authority refreshed result")?;
+        self.end_metadata_authority_attempt_on_refusal(shard, operation, &refusals)?;
         Ok(acknowledged)
+    }
+
+    /// End an attempt that a write-set member refused at this epoch. A member
+    /// still at this epoch promised a takeover candidate: it is posted to the
+    /// keeper, which may shrink it rather than let it stall every write.
+    fn end_metadata_authority_attempt_on_refusal(
+        &self,
+        shard: &DfsMetadataShardConfig,
+        operation: &DfsMetadataAuthorityOperation,
+        refusals: &BTreeMap<NodeId, crate::DfsMetadataMemberRecordView>,
+    ) -> Result<(), DfsError> {
+        let fenced = refusals
+            .iter()
+            .filter(|(_, record)| record.epoch <= shard.epoch)
+            .map(|(member, _)| member.clone())
+            .collect::<BTreeSet<_>>();
+        if !fenced.is_empty() {
+            crate::write_set_keeping_signals::post_commit_demand(
+                &self.node_id,
+                &shard.file_system_id,
+                &DfsMetadataShardId::new(shard.shard_id.clone()),
+                crate::write_set_keeping_signals::DfsWriteSetCommitDemand::Fenced(fenced),
+            );
+        }
+        match metadata_authority_refusal_outcome(&self.node_id, shard, operation, refusals) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Catch one member up to `prefix` through the existing durability path
@@ -880,6 +943,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         hedge_after: Duration,
         rejected_node_ids: &mut BTreeSet<NodeId>,
         lagging_node_ids: &mut BTreeSet<NodeId>,
+        refusals: &mut BTreeMap<NodeId, crate::DfsMetadataMemberRecordView>,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         #[cfg(any(test, feature = "test-support"))]
         let diagnostic_root = self.native_publication_owner_for_observation().map(|(root, _)| root)
@@ -1237,6 +1301,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                         Some(false) => {
                             let target_node_id = &request.target_node_id;
+                            // A refused epoch is definite even for an empty
+                            // confirmation: no re-send can be acknowledged.
+                            if let Some(record) = self
+                                .replication
+                                .metadata_authority_refusals
+                                .get(&request.request_id)
+                            {
+                                refusals.insert(target_node_id.clone(), record.clone());
+                                rejected_node_ids.insert(target_node_id.clone());
+                            }
                             if let Some(hedge) =
                                 request.hedge.as_mut().filter(|hedge| !hedge.judged)
                             {
@@ -1449,7 +1523,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 );
                                 acknowledged_node_ids.insert(target_node_id);
                             }
-                            Ok((MetadataAuthorityDirectReply::Rejected, _)) => {
+                            Ok((MetadataAuthorityDirectReply::Rejected, response)) => {
+                                if let Some(record) = response.refusing_member_record() {
+                                    refusals.insert(target_node_id.clone(), record.clone());
+                                }
                                 rejected_node_ids.insert(target_node_id);
                             }
                             // An unconfirmed reply or a failed direct call
@@ -1736,6 +1813,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .remove(request_id);
             self.replication
                 .metadata_authority_probe_results
+                .remove(request_id);
+            self.replication
+                .metadata_authority_refusals
                 .remove(request_id);
         }
     }
@@ -2397,6 +2477,58 @@ mod authority_cursor_tests {
         assert!(!metadata_authority_probe_names_follower_assignment(
             &moved, &shard, true
         ));
+    }
+
+    #[test]
+    fn a_refused_epoch_ends_the_attempt_as_a_record_change() {
+        let node = |name: &str| NodeId::from_legacy_named(name).unwrap();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "refusal".into(),
+            primary_node_id: node("refusal-a"),
+            replica_node_ids: vec![node("refusal-b"), node("refusal-c")],
+            epoch: 4,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let operation = DfsMetadataAuthorityOperation::PreparedOperation {
+            operation_id: "refused-op".into(),
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("refusal"),
+            owner_epoch: 4,
+            prepare_sequence: 7,
+            payload_digest: "digest".into(),
+        };
+        let record = |epoch, primary: &str| crate::DfsMetadataMemberRecordView {
+            epoch,
+            generation: 9,
+            primary_node_id: node(primary),
+        };
+        let outcome = |refusals: &BTreeMap<NodeId, crate::DfsMetadataMemberRecordView>| {
+            match metadata_authority_refusal_outcome(&node("refusal-a"), &shard, &operation, refusals) {
+                Some(DfsError::MetadataCommitOutcomeUnknown {
+                    cause: crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch },
+                    current_primary_node_id,
+                    operation_id,
+                    epoch: attempt_epoch,
+                    ..
+                }) => {
+                    assert_eq!((operation_id.as_str(), attempt_epoch), ("refused-op", 4));
+                    Some((epoch, current_primary_node_id))
+                }
+                Some(other) => panic!("{other:?}"),
+                None => None,
+            }
+        };
+        assert_eq!(outcome(&BTreeMap::new()), None);
+        // A member fenced for a candidate still names this primary: the
+        // record is changing, to no known primary yet.
+        let fenced = BTreeMap::from([(node("refusal-b"), record(4, "refusal-a"))]);
+        assert_eq!(outcome(&fenced), Some((5, None)));
+        // A member whose record moved on names its primary.
+        let mut superseded = fenced.clone();
+        superseded.insert(node("refusal-c"), record(6, "refusal-c"));
+        assert_eq!(outcome(&superseded), Some((6, Some(node("refusal-c")))));
     }
 
     #[test]

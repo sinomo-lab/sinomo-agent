@@ -3,8 +3,8 @@
 //! The commit path is a DFS operation root and reads no KV; changing the
 //! write-set record is the keeper's. When a commit ends unknown because the
 //! record must change first (its content W is above the W the record accepts,
-//! or a required member could not be reached), it posts the demand here and
-//! wakes the keeper. Demands are in memory only: a lost demand is posted
+//! a required member could not be reached, or one refused the epoch for a
+//! takeover candidate), it posts the demand here and wakes the keeper. Demands are in memory only: a lost demand is posted
 //! again by the next attempt on the same prepared body, including the
 //! recovery pass that runs when the primary activates.
 
@@ -20,6 +20,9 @@ pub(crate) enum DfsWriteSetCommitDemand {
     RaiseN(usize),
     /// These required members could not be reached by any attempt.
     Unreachable(BTreeSet<NodeId>),
+    /// These required members refused the primary's epoch: each promised a
+    /// takeover candidate to accept nothing more at it.
+    Fenced(BTreeSet<NodeId>),
 }
 
 /// The demands collected for one shard since the keeper last took them.
@@ -27,6 +30,7 @@ pub(crate) enum DfsWriteSetCommitDemand {
 pub(crate) struct DfsWriteSetShardDemands {
     pub(crate) raise_n: usize,
     pub(crate) unreachable: BTreeSet<NodeId>,
+    pub(crate) fenced: BTreeSet<NodeId>,
 }
 
 #[derive(Default)]
@@ -53,6 +57,7 @@ pub(crate) fn post_commit_demand(
         match demand {
             DfsWriteSetCommitDemand::RaiseN(w) => entry.raise_n = entry.raise_n.max(w),
             DfsWriteSetCommitDemand::Unreachable(members) => entry.unreachable.extend(members),
+            DfsWriteSetCommitDemand::Fenced(members) => entry.fenced.extend(members),
         }
         signals.wakes.get(local).cloned()
     };

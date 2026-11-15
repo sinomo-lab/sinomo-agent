@@ -449,6 +449,7 @@ fn shards_on_the_all_member_rule_keep_their_floor_and_reply_encoding() {
         verified_authority_probe_id: None,
         result: crate::DfsMetadataJournalBatchResult::Applied,
         member_view: None,
+        member_record: None,
     };
     let encoded =
         String::from_utf8_lossy(&sinomo_core::kv::encode_kv_value(&reply).unwrap()).to_string();

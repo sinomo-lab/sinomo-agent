@@ -1050,6 +1050,16 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 && command.authority_epoch == Some(context.shard.epoch)
                 && context.shard.primary_node_id == authenticated_source_node_id;
             if !exact_authority {
+                if command.file_system_id.as_ref() == Some(&context.shard.file_system_id)
+                    && command.batch.shard_id.0 == context.shard.shard_id
+                    && let Some(rejection) =
+                        crate::metadata_replication::write_set_source_epoch_rejection(
+                            command.authority_epoch,
+                            &context,
+                        )
+                {
+                    return Ok(daemon_dfs_metadata_journal_rejection(&command, rejection));
+                }
                 return Ok(daemon_dfs_metadata_journal_rejection(
                     &command,
                     format!(

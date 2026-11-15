@@ -1222,6 +1222,11 @@ pub enum DfsNamespacePosixError {
         epoch: u64,
         operation_id: String,
         cause: crate::DfsCommitOutcomeUnknownCause,
+        /// The shard's primary as the attempt last learned it, when that is
+        /// another node: from the publication, or from a write-set member's
+        /// own record. A hint for where to retry, never authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_primary_node_id: Option<NodeId>,
     },
 }
 
@@ -1574,6 +1579,29 @@ pub struct DfsMetadataMemberAckView {
     pub durable_prefix: crate::DfsMetadataPrefixProof,
 }
 
+/// A write-set member's own shard record, sent with a rejection that names
+/// it: the epoch, write-set generation and primary the member follows. It is
+/// a hint about where the shard's authority moved, never authority itself.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataMemberRecordView {
+    pub epoch: u64,
+    pub generation: u64,
+    pub primary_node_id: NodeId,
+}
+
+impl DfsMetadataMemberRecordView {
+    /// The view of a member whose shard is on the write-set protocol.
+    pub fn of(context: &crate::DfsMetadataReplicaShardContext) -> Option<Self> {
+        let write_set = context.write_set.as_ref()?;
+        Some(Self {
+            epoch: context.shard.epoch,
+            generation: write_set.generation,
+            primary_node_id: context.shard.primary_node_id.clone(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataJournalBatchResponse {
     pub request_id: String,
@@ -1593,6 +1621,22 @@ pub struct DfsMetadataJournalBatchResponse {
     /// their existing encoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_view: Option<DfsMetadataMemberAckView>,
+    /// Sent only by a member of a write-set shard, with a rejection whose
+    /// code names its own record view. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_record: Option<DfsMetadataMemberRecordView>,
+}
+
+impl DfsMetadataJournalBatchResponse {
+    /// The receiver's record view when it refuses the source's epoch.
+    pub fn refusing_member_record(&self) -> Option<&DfsMetadataMemberRecordView> {
+        match &self.result {
+            DfsMetadataJournalBatchResult::Rejected { code, .. } if code.refuses_source_epoch() => {
+                self.member_record.as_ref()
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1830,6 +1874,7 @@ mod commit_outcome_unknown_wire_tests {
                 write_set: 1,
                 floor: 2,
             },
+            current_primary_node_id: None,
         };
         let encoded = serde_json::to_vec(&namespace).unwrap();
         assert_eq!(

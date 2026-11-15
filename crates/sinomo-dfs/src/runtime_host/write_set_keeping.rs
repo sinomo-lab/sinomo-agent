@@ -149,6 +149,10 @@ struct ShardKeeping {
     demanded_w: usize,
     awaited: BTreeSet<NodeId>,
     verified: BTreeSet<NodeId>,
+    /// Members a commit found fenced for a takeover candidate, with the
+    /// record generation they were first planned at: a fence counts only
+    /// until the record moves.
+    fenced: BTreeMap<NodeId, Option<u64>>,
     reduce_after_switch: bool,
     interest: BTreeSet<NodeId>,
     last_event: Option<sinomo_core::Id>,
@@ -211,6 +215,9 @@ impl Keeper {
             let shard = self.shards.entry((file_system_id, shard_id)).or_default();
             shard.demanded_w = shard.demanded_w.max(demands.raise_n);
             shard.awaited.extend(demands.unreachable);
+            for member in demands.fenced {
+                shard.fenced.entry(member).or_insert(None);
+            }
         }
         let mut primary_shards = BTreeMap::new();
         let mut member_shards = BTreeMap::new();
@@ -325,6 +332,14 @@ impl Keeper {
             return;
         };
         let configured = crate::metadata_shard_configured_node_ids(shard);
+        let fenced = {
+            let generation = state.switched().map_or(0, |write_set| write_set.generation);
+            let keeping = self.shards.entry(key.clone()).or_default();
+            keeping
+                .fenced
+                .retain(|_, seen| *seen.get_or_insert(generation) == generation);
+            keeping.fenced.keys().cloned().collect::<BTreeSet<_>>()
+        };
         let mut facts = BTreeMap::new();
         for node in members.keys().chain(configured.iter()) {
             let record = members.get(node);
@@ -345,6 +360,7 @@ impl Keeper {
                         verdicts.reach(node)
                     },
                     view,
+                    fenced: fenced.contains(node),
                 },
             );
         }
@@ -821,7 +837,12 @@ impl Keeper {
                         &member,
                         response.member_view.as_ref(),
                     );
-                    true
+                    // A member that refuses this epoch, for a takeover
+                    // candidate's promise, cannot join it until that settles.
+                    !response
+                        .result
+                        .rejection_code()
+                        .is_some_and(crate::DfsMetadataRejectionCode::refuses_source_epoch)
                 }
                 Err(_) => false,
             };
@@ -1086,6 +1107,10 @@ fn txn_cause(txn: &DfsWriteSetKeepingTxn) -> &'static str {
             cause: crate::DfsWriteSetShrinkCause::MemberDeparted,
             ..
         } => "member-departed",
+        DfsWriteSetKeepingTxn::Shrink {
+            cause: crate::DfsWriteSetShrinkCause::MemberFenced,
+            ..
+        } => "member-fenced",
         DfsWriteSetKeepingTxn::RaiseN { .. } => "commit-content-w",
         DfsWriteSetKeepingTxn::Recruit {
             admission: crate::DfsMetadataShardRecruit::BelowN,

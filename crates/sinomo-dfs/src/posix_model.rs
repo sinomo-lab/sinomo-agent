@@ -438,13 +438,14 @@ pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsName
             epoch,
             operation_id,
             cause,
-            ..
+            current_primary_node_id,
         }) => Some(DfsNamespacePosixError::CommitOutcomeUnknown {
             file_system_id: file_system_id.clone(),
             shard_id: shard_id.clone(),
             epoch: *epoch,
             operation_id: operation_id.clone(),
             cause: cause.clone(),
+            current_primary_node_id: current_primary_node_id.clone(),
         }),
         DfsPosixError::Dfs(_)
         | DfsPosixError::Metadata(_)
@@ -491,13 +492,14 @@ pub(crate) fn posix_error_for_namespace_rejection(
             epoch,
             operation_id,
             cause,
+            current_primary_node_id,
         }) => DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
             file_system_id,
             shard_id,
             epoch,
             operation_id,
             cause,
-            current_primary_node_id: None,
+            current_primary_node_id,
         }),
         None => DfsPosixError::Dfs(DfsError::Distributed { message: reason }),
     }
@@ -526,5 +528,43 @@ mod commit_outcome_unknown_tests {
             posix_error_for_namespace_rejection(unknown.to_string(), Some(wire)).to_string(),
             unknown.to_string()
         );
+    }
+
+    #[test]
+    fn routed_namespace_rejection_carries_the_current_primary_it_learned() {
+        let primary = sinomo_core::node::NodeId::from_legacy_named("node_new_primary").unwrap();
+        let unknown = DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+            file_system_id: crate::DfsFileSystemId::generate(),
+            shard_id: "root".into(),
+            epoch: 3,
+            operation_id: "namespace-request:op".into(),
+            cause: crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch: 4 },
+            current_primary_node_id: Some(primary.clone()),
+        });
+        let wire = namespace_posix_error_for(&unknown).expect("typed on the wire");
+        let encoded = serde_json::to_vec(&wire).unwrap();
+        let decoded = serde_json::from_slice::<DfsNamespacePosixError>(&encoded).unwrap();
+        assert_eq!(decoded, wire);
+        match posix_error_for_namespace_rejection(unknown.to_string(), Some(decoded)) {
+            DfsPosixError::Dfs(DfsError::MetadataCommitOutcomeUnknown {
+                current_primary_node_id,
+                ..
+            }) => assert_eq!(current_primary_node_id, Some(primary)),
+            other => panic!("{other:?}"),
+        }
+        // A decoder that predates the field ignores it.
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        #[allow(dead_code)]
+        enum PreChangeError {
+            CommitOutcomeUnknown {
+                file_system_id: crate::DfsFileSystemId,
+                shard_id: String,
+                epoch: u64,
+                operation_id: String,
+                cause: crate::DfsCommitOutcomeUnknownCause,
+            },
+        }
+        assert!(serde_json::from_slice::<PreChangeError>(&encoded).is_ok());
     }
 }

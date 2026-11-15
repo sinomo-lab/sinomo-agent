@@ -1939,6 +1939,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         verified_authority_probe_id: None,
         result: DfsMetadataJournalBatchResult::Applied,
         member_view: None,
+        member_record: None,
     };
     let journal_rpc_response = sinomo_core::network::ObjectRpcResponse::encode_body(
         DFS_METADATA_JOURNAL_BATCH_ROUTE,

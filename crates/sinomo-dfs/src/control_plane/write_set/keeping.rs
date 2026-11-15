@@ -30,6 +30,9 @@ pub(crate) struct DfsWriteSetMemberFacts {
     pub(crate) reach: DfsWriteSetMemberReach,
     /// The latest acknowledgement view this primary accepted from it.
     pub(crate) view: Option<crate::DfsMetadataMemberAckView>,
+    /// It refused this primary's epoch at the current record generation: it
+    /// promised a takeover candidate to accept nothing more at it.
+    pub(crate) fenced: bool,
 }
 
 /// Inputs for one shard the local node is primary of.
@@ -52,6 +55,8 @@ pub(crate) struct DfsWriteSetKeepingView<'a> {
 pub(crate) enum DfsWriteSetShrinkCause {
     NetworkNoPath,
     MemberDeparted,
+    /// The member stated that it will not acknowledge this epoch.
+    MemberFenced,
 }
 
 /// Why members leave the configured set.
@@ -189,7 +194,9 @@ pub(crate) fn plan_metadata_write_set_keeping(
     };
     let mut plan = DfsWriteSetKeepingPlan::default();
 
-    // A lost member stops blocking commits first, never below the floor.
+    // A lost member stops blocking commits first, never below the floor. A
+    // member that departed, or refused the epoch for a takeover candidate,
+    // said so itself; a network verdict only suggests it.
     if write_set.write_set.len() > view.bounds.w_floor {
         let lost = write_set
             .write_set
@@ -198,6 +205,8 @@ pub(crate) fn plan_metadata_write_set_keeping(
             .filter_map(|node| {
                 if departed(node) {
                     Some((0, node, DfsWriteSetShrinkCause::MemberDeparted))
+                } else if facts(node).is_some_and(|facts| facts.fenced) {
+                    Some((0, node, DfsWriteSetShrinkCause::MemberFenced))
                 } else if reach(node) == DfsWriteSetMemberReach::NoPath {
                     let rank = if facts(node).is_some_and(|facts| facts.mobile) {
                         1
@@ -380,6 +389,7 @@ mod tests {
             mobile: false,
             reach,
             view: None,
+            fenced: false,
         }
     }
 
@@ -664,6 +674,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_member_that_refuses_the_epoch_is_shrunk_above_the_floor_only() {
+        let mut case = Case::new(&["b", "c"], &["b", "c"], 1, 3);
+        case.members.get_mut(&node("b")).unwrap().fenced = true;
+        assert_eq!(
+            case.plan().txn,
+            Some(DfsWriteSetKeepingTxn::Shrink {
+                member: node("b"),
+                cause: DfsWriteSetShrinkCause::MemberFenced,
+            })
+        );
+        let mut case = Case::new(&["b", "c"], &["b"], 2, 3);
+        case.members.get_mut(&node("b")).unwrap().fenced = true;
+        assert!(
+            !matches!(case.plan().txn, Some(DfsWriteSetKeepingTxn::Shrink { .. })),
+            "at the floor, writes wait for the takeover to settle"
+        );
     }
 
     #[test]
