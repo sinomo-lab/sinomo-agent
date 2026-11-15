@@ -69,6 +69,18 @@ impl PendingHigherRaftTermGateState {
     }
 }
 
+/// How long a caller outside the resident node joins an in-flight durable
+/// higher-term close before reporting local authority unavailable.
+#[derive(Clone, Copy, Debug)]
+enum PendingHigherTermCloseWait {
+    /// Immediate admission: report the close so the caller can forward.
+    Fail,
+    /// Until the caller's own operation deadline.
+    Until(Instant),
+    /// As long as the close, like any unbounded operation admission.
+    Unbounded,
+}
+
 #[derive(Debug, Default)]
 struct PendingHigherRaftTermGate {
     state: Mutex<PendingHigherRaftTermGateState>,
@@ -7958,22 +7970,46 @@ impl ClusterKvRaftStore {
     /// admission. Performing this check first prevents newly arriving reads
     /// from queueing on the operation lock ahead of the mandatory term closer,
     /// without reversing the operation/resident -> retained-lease lock order.
+    ///
+    /// A closer that is making a higher term durable right now already owns
+    /// the resident node and holds the exclusive side only for that durable
+    /// write. A caller that holds neither joins that close on the gate, as
+    /// term-bearing requests and settled reads do, within `close_wait`, and
+    /// then sees the settled term instead of failing in that window.
     fn ensure_pending_higher_term_authority_available(
         &self,
         node_id: &NodeId,
         operation: &'static str,
+        close_wait: PendingHigherTermCloseWait,
     ) -> Result<(), KvError> {
         let gate = self.pending_higher_term_gate(node_id)?;
-        let state = gate
+        let mut state = gate
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.exclusive {
-            return Err(KvError::AuthorityUnavailable {
+        while state.exclusive {
+            let closing = || KvError::AuthorityUnavailable {
                 detail: format!(
                     "cannot {operation} while a higher Raft term is being made durable"
                 ),
-            });
+            };
+            state = match close_wait {
+                PendingHigherTermCloseWait::Fail => return Err(closing()),
+                PendingHigherTermCloseWait::Unbounded => gate
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                PendingHigherTermCloseWait::Until(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(closing());
+                    }
+                    gate.changed
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                }
+            };
         }
         if let Some(pending_term) = state.floor {
             return Err(KvError::AuthorityUnavailable {
@@ -9843,6 +9879,7 @@ impl ClusterKvRaftStore {
         self.ensure_pending_higher_term_authority_available(
             node_id,
             "append a local Raft proposal",
+            PendingHigherTermCloseWait::Unbounded,
         )?;
         let mut node = self.open_node(node_id)?;
         let preflight = (|| {
@@ -10408,6 +10445,16 @@ where
             .transpose()
     }
 
+    fn pending_higher_term_close_wait(&self) -> PendingHigherTermCloseWait {
+        if self.immediate_operation_admission {
+            PendingHigherTermCloseWait::Fail
+        } else if let Some(deadline) = self.operation_deadline {
+            PendingHigherTermCloseWait::Until(deadline)
+        } else {
+            PendingHigherTermCloseWait::Unbounded
+        }
+    }
+
     fn remaining_operation_wait(&self) -> Result<Option<Duration>, KvError> {
         if self.immediate_operation_admission {
             return Ok(Some(Duration::ZERO));
@@ -10491,6 +10538,7 @@ where
         self.store.ensure_pending_higher_term_authority_available(
             &self.node_id,
             "use local Raft authority",
+            self.pending_higher_term_close_wait(),
         )?;
         self.open_node_if_missing(discard_uncommitted_tail)?;
         let durable_term = self
@@ -13050,6 +13098,71 @@ mod pending_higher_term_gate_tests {
             None
         );
         reader.join().expect("join settled floor reader");
+    }
+
+    /// Right after an election a closer is making the new term durable. Local
+    /// authority outside the resident node joins that close and proceeds on
+    /// the settled term; a caller with its own operation deadline reports the
+    /// close only when that deadline passes first.
+    #[test]
+    fn local_authority_joins_an_in_flight_durable_term_close() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-authority-joins-term-close");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let node_id =
+            NodeId::from_legacy_named("node_local_authority_joins_term_close").expect("node id");
+        let store = ClusterKvRaftStore::new(paths, default_cluster_kv_raft_compaction_policy());
+        store.set_leader_compact(&node_id, 1).expect("local leader");
+        let key_can_defer =
+            crate::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool;
+
+        let exclusive = store
+            .acquire_pending_higher_term_exclusive_lease(&node_id)
+            .expect("claim durable close");
+        let session_store = store.clone();
+        let session_node_id = node_id.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let session = thread::spawn(move || {
+            let mut storage = ClusterKvRaftLocalCommandStorage::new(
+                session_store,
+                session_node_id,
+                key_can_defer,
+            );
+            result_tx
+                .send(storage.last_log_index())
+                .expect("report local authority");
+        });
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "local authority waits for the in-flight close instead of failing"
+        );
+        drop(exclusive);
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("local authority after the close")
+            .expect("local authority on the settled term");
+        session.join().expect("join local authority");
+
+        let exclusive = store
+            .acquire_pending_higher_term_exclusive_lease(&node_id)
+            .expect("claim a second durable close");
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let mut storage = ClusterKvRaftLocalCommandStorage::new_with_operation_deadline(
+            store.clone(),
+            node_id.clone(),
+            key_can_defer,
+            started + budget,
+        );
+        let error = storage
+            .last_log_index()
+            .expect_err("the close outlasts the caller's deadline");
+        assert!(
+            started.elapsed() >= budget,
+            "the deadline, not the gate, ended it"
+        );
+        assert!(error.to_string().contains("being made durable"), "{error}");
+        drop(storage);
+        drop(exclusive);
     }
 }
 
