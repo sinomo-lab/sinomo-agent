@@ -2792,6 +2792,29 @@ fn open_dfs_runtime_service_for_use(
     // rehydrate. Clear/bind only its exact certified physical instance;
     // ordinary mutation/hydration retains all participant recovery checks.
     service.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
+    // No request shell or maintenance owner drains this effect's committed
+    // work, so each edge is emitted as it is recorded, as a served commit's
+    // edges are after its request: the publication that carries a commit
+    // record to the followers is scheduled for the exact shard.
+    let (edge_data_dir, edge_cluster_paths) = (data_dir.clone(), cluster_paths.clone());
+    let edge_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: expected.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(expected.shard_id.clone()),
+    };
+    let edge_runtime = provider_runtime.clone();
+    service.set_committed_work_tracker(crate::DfsCommittedWorkTracker::emitting(Arc::new(
+        move |work| {
+            message_host::emit_daemon_dfs_committed_edges(
+                &edge_data_dir,
+                &edge_cluster_paths,
+                &edge_scope,
+                &edge_runtime,
+                None,
+                work,
+                &[],
+            );
+        },
+    )));
     Ok(service)
 }
 

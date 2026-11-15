@@ -801,14 +801,47 @@ const DFS_COMMITTED_WORK_SEMANTIC_CHANGES: u8 = 1 << 5;
 /// reaches durability but before the future returns. Recording each edge in
 /// this shared tracker at the mutation boundary lets the caller transfer the
 /// exact coalesced work after the backend-bearing service generation is gone.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct DfsCommittedWorkTracker {
     bits: Arc<AtomicU8>,
+    /// Hands each recorded publication edge on at once, for a service no
+    /// request shell or maintenance owner drains.
+    emit: Option<Arc<dyn Fn(DfsCommittedWork) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for DfsCommittedWorkTracker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DfsCommittedWorkTracker")
+            .field("bits", &self.bits)
+            .field("emits", &self.emit.is_some())
+            .finish()
+    }
 }
 
 impl DfsCommittedWorkTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A tracker that also hands every publication edge to `emit` as it is
+    /// recorded. Only publication is handed on: an effect's other follow-up
+    /// work keeps its own owners.
+    pub(crate) fn emitting(emit: Arc<dyn Fn(DfsCommittedWork) + Send + Sync>) -> Self {
+        Self {
+            bits: Arc::default(),
+            emit: Some(emit),
+        }
+    }
+
+    /// Hand on the publication a commit needs, when this tracker emits.
+    pub(crate) fn emit_publication(&self) {
+        if let Some(emit) = &self.emit {
+            emit(DfsCommittedWork {
+                publish_metadata: true,
+                ..DfsCommittedWork::default()
+            });
+        }
     }
 
     pub(crate) fn record(&self, work: DfsCommittedWork) {
@@ -833,6 +866,9 @@ impl DfsCommittedWorkTracker {
         }
         if bits != 0 {
             self.bits.fetch_or(bits, Ordering::Release);
+        }
+        if work.publish_metadata {
+            self.emit_publication();
         }
     }
 

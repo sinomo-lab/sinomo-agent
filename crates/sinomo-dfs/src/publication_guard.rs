@@ -1035,7 +1035,16 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             payload,
             configured_file_system,
         )?;
-        self.commit_stored_prepared_operation(&digest)
+        let publication = self.commit_stored_prepared_operation(&digest)?;
+        if publication.published
+            && let Some(tracker) = &self.committed_work_tracker
+        {
+            // The commit record reaches the followers with the next
+            // publication. A bounded effect has no request shell to request
+            // it, so its emitting tracker does.
+            tracker.emit_publication();
+        }
+        Ok(publication)
     }
 
     /// Seal an explicitly selected policy under the same existing publication

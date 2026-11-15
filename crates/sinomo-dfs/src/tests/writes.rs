@@ -2938,6 +2938,25 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
             std::thread::yield_now();
         }
     });
+    // The writer's commit schedules its own background publication, as every
+    // commit does. Hold that publication so the explicit one below is the
+    // first to deliver the commit to the paused replica.
+    let background_publication = delay_materialization.then(|| {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(owner.clone()),
+            target: Some(replica.clone()),
+            route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::PauseWriteCommitPublication {
+                gate: Arc::clone(&gate),
+                captured: Arc::new(Mutex::new(Vec::new())),
+            },
+        });
+        gate
+    });
     let outcome = writer
         .write_distributed_reader_with_candidates(
             request.clone(),
@@ -3071,6 +3090,15 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
         }
         pause.release();
         drop(pause);
+    }
+    if let Some(gate) = background_publication {
+        // Later re-sends of the background publication are not held: the
+        // rule goes before its held calls are let through.
+        runtime.remove_faults_matching(|rule| {
+            matches!(&rule.action, crate::test_runtime::FaultAction::PauseWriteCommitPublication { gate: held, .. }
+                if Arc::ptr_eq(held, &gate))
+        });
+        gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
     }
     // W2 commits the primary journal before the queued CommitVersion RPC.
     // Observe that SAME original commit's actual replica materialization before
