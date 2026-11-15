@@ -1732,6 +1732,7 @@ where
     };
     #[cfg(test)]
     pause_authoritative_barrier_after_initial_fence(&paths.root).await;
+    let mut resend = crate::raft_quorum::ReadIndexResendTimer::new();
 
     'refence: loop {
         *state = fence.projected_state.clone();
@@ -1770,6 +1771,11 @@ where
                 return Ok(read);
             }
             fence = prepare_authoritative_barrier_fence(runtime, paths, state, deadline).await?;
+            // Voters did not acknowledge this wave. While the term still holds
+            // a commit the next wave is re-sent on the timer, not back to back.
+            if fence.read_state.has_current_term_commit {
+                resend.wait_before(deadline).await;
+            }
             continue;
         }
 
@@ -1942,6 +1948,11 @@ where
                 return Ok(read);
             }
             fence = prepare_authoritative_barrier_fence(runtime, paths, state, deadline).await?;
+            // Voters did not acknowledge this wave. While the term still holds
+            // a commit the next wave is re-sent on the timer, not back to back.
+            if fence.read_state.has_current_term_commit {
+                resend.wait_before(deadline).await;
+            }
             continue;
         }
 
@@ -2015,24 +2026,20 @@ where
             let value = value?;
             Ok((applied_state, value))
         };
-        let (applied_state, value) = match projection_policy {
+        let projected = match projection_policy {
             // A bounded point/prefix projection borrows the canonical idle
             // resident view. Concurrent readers serialize only on its tiny
             // in-memory read section and never enter the Raft operation queue.
             ClusterRaftReadProjectionPolicy::DeadlineBounded => {
                 let wal_paths = final_paths.kv_paths().raft_wal_paths(&final_node_id);
-                let projected = sinomo_kv::with_cluster_kv_resident_read_projection(
+                match sinomo_kv::with_cluster_kv_resident_read_projection(
                     &wal_paths,
                     &final_node_id,
                     |storage| finish_read(storage),
-                )
-                .ok_or_else(|| NetworkError::ClusterReadOnly {
-                    detail:
-                        "resident Raft view changed after compact barrier; retry the authoritative read"
-                            .to_string(),
-                })?
-                .map_err(kv_err)?;
-                projected.value?
+                ) {
+                    Some(projected) => Some(projected.map_err(kv_err)?.value?),
+                    None => None,
+                }
             }
             // Full snapshots remain proportional to the complete keyspace and
             // retain supervised completion semantics once admitted.
@@ -2051,22 +2058,24 @@ where
                     "compact_barrier",
                     "authoritative KV compact barrier final projection",
                     "project authoritative cluster KV compact barrier",
-                    move || {
-                        let projected = sinomo_kv::with_cluster_kv_resident_read_projection(
-                            &wal_paths,
-                            &final_node_id,
-                            |storage| finish_read(storage),
-                        )
-                        .ok_or_else(|| NetworkError::ClusterReadOnly {
-                            detail: "resident Raft view changed after compact barrier; retry the authoritative snapshot"
-                                .to_string(),
-                        })?
-                        .map_err(kv_err)?;
-                        projected.value
+                    move || match sinomo_kv::with_cluster_kv_resident_read_projection(
+                        &wal_paths,
+                        &final_node_id,
+                        |storage| finish_read(storage),
+                    ) {
+                        Some(projected) => projected.map_err(kv_err)?.value.map(Some),
+                        None => Ok(None),
                     },
                 )
                 .await?
             }
+        };
+        // The barrier is committed, but a mutation owned the resident at this
+        // instant. The term now holds a commit, so ReadIndex confirms the read
+        // instead of failing it.
+        let Some((applied_state, value)) = projected else {
+            fence = prepare_authoritative_barrier_fence(runtime, paths, state, deadline).await?;
+            continue;
         };
 
         state.term = state.term.max(applied_state.current_term);
@@ -2152,6 +2161,7 @@ fn commit_cluster_kv_authoritative_barrier_sync_with_initial_fence(
         Some(fence) => fence,
         None => prepare_authoritative_barrier_fence_sync(paths, state, deadline)?,
     };
+    let mut resend = crate::raft_quorum::ReadIndexResendTimer::new();
 
     'refence: loop {
         *state = fence.projected_state.clone();
@@ -2162,6 +2172,11 @@ fn commit_cluster_kv_authoritative_barrier_sync_with_initial_fence(
                 return Ok(read);
             }
             fence = prepare_authoritative_barrier_fence_sync(paths, state, deadline)?;
+            // Voters did not acknowledge this wave. While the term still holds
+            // a commit the next wave is re-sent on the timer, not back to back.
+            if fence.read_state.has_current_term_commit {
+                resend.wait_before_blocking(deadline);
+            }
             continue;
         }
 
@@ -2302,6 +2317,9 @@ fn commit_cluster_kv_authoritative_barrier_sync_with_initial_fence(
                     return Ok(read);
                 }
                 fence = prepare_authoritative_barrier_fence_sync(paths, state, deadline)?;
+                if fence.read_state.has_current_term_commit {
+                    resend.wait_before_blocking(deadline);
+                }
             }
         }
     }
@@ -10093,6 +10111,502 @@ mod tests {
             store.known_voter_leader_id(&state).expect("elected leader"),
             Some(state.local_node_id.clone())
         );
+    }
+
+    /// How a voter answers a marked ReadIndex probe it cannot acknowledge.
+    #[derive(Clone, Copy)]
+    enum UnconfirmedProbe {
+        /// A healthy rejection, as a busy or unloaded resident answers.
+        Rejected,
+        /// An immediate transport failure, as an unreachable voter fails.
+        FailedFast,
+    }
+
+    /// Voters that durably accept every append but leave the first
+    /// `unconfirmed_probes` marked ReadIndex probes unacknowledged, as a
+    /// just-promoted voter still catching up, a busy or unloaded resident, or
+    /// an unreachable voter does. With `hold_resident_on_fanout`, its
+    /// post-commit fanout briefly owns the leader's resident writer, as a
+    /// committed fanout can, so the leader's observational view of the commit
+    /// is the older materialized one.
+    struct UnconfirmedReadIndexHost {
+        paths: ClusterPaths,
+        local: NodeId,
+        unconfirmed_probes: usize,
+        unconfirmed: UnconfirmedProbe,
+        hold_resident_on_fanout: bool,
+        probes: usize,
+        probe_waves: Vec<Instant>,
+        accepted_appends: usize,
+        holders: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl UnconfirmedReadIndexHost {
+        fn new(
+            paths: &ClusterPaths,
+            local: &NodeId,
+            unconfirmed_probes: usize,
+            unconfirmed: UnconfirmedProbe,
+            hold_resident_on_fanout: bool,
+        ) -> Self {
+            Self {
+                paths: paths.clone(),
+                local: local.clone(),
+                unconfirmed_probes,
+                unconfirmed,
+                hold_resident_on_fanout,
+                probes: 0,
+                probe_waves: Vec::new(),
+                accepted_appends: 0,
+                holders: Vec::new(),
+            }
+        }
+
+        fn answer(
+            &mut self,
+            state: &ClusterBootstrapState,
+            request: &sinomo_kv::ClusterRaftAppendRequest,
+        ) -> Result<sinomo_kv::ClusterRaftAppendResponse, NetworkError> {
+            let unconfirmed = request.read_index_probe && {
+                self.probes = self.probes.saturating_add(1);
+                self.probes <= self.unconfirmed_probes
+            };
+            if !request.read_index_probe {
+                self.accepted_appends = self.accepted_appends.saturating_add(1);
+            }
+            if unconfirmed && matches!(self.unconfirmed, UnconfirmedProbe::FailedFast) {
+                return Err(NetworkError::Io {
+                    operation: "deliver a Raft ReadIndex probe".to_string(),
+                    detail: "connection refused".to_string(),
+                });
+            }
+            Ok(sinomo_kv::ClusterRaftAppendResponse {
+                accepted: !unconfirmed,
+                detail: if unconfirmed {
+                    "Raft ReadIndex probe rejected because resident state is unavailable"
+                } else {
+                    "voter accepted the append"
+                }
+                .to_string(),
+                state: state.clone(),
+                append: sinomo_kv::RaftAppendEntriesResponse {
+                    term: request.append.term,
+                    success: !unconfirmed,
+                    match_index: if unconfirmed {
+                        0
+                    } else {
+                        request.append.prev_log_index + request.append.entries.len() as u64
+                    },
+                },
+            })
+        }
+
+        /// The gaps between consecutive ReadIndex waves.
+        fn wave_gaps(&self) -> Vec<Duration> {
+            self.probe_waves
+                .windows(2)
+                .map(|pair| pair[1].duration_since(pair[0]))
+                .collect()
+        }
+    }
+
+    impl ClusterObjectRpcAsyncHost for UnconfirmedReadIndexHost {}
+
+    impl ClusterKvQuorumAsyncHost for UnconfirmedReadIndexHost {
+        fn last_local_kv_replication_index_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+        ) -> ClusterMembershipRpcFuture<'a, u64> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_last_raft_log_index_async(&state.local_node_id)
+                    .await
+                    .map_err(NetworkError::directory)
+            })
+        }
+
+        fn build_kv_replication_request_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            next_index: u64,
+        ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendRequest> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                    .await
+                    .map_err(NetworkError::directory)
+            })
+        }
+
+        fn send_cluster_kv_replication_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            request: &'a sinomo_kv::ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendResponse> {
+            let answer = self.answer(state, request);
+            Box::pin(async move { answer })
+        }
+
+        fn send_cluster_kv_replications_to_quorum_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            attempts: crate::raft_quorum::ClusterRaftQuorumBatch,
+            required_acks: usize,
+        ) -> ClusterMembershipRpcFuture<'a, crate::raft_quorum::ClusterRaftQuorumBatchOutcomes>
+        {
+            if attempts
+                .iter()
+                .any(|(_, request, _)| request.read_index_probe)
+            {
+                self.probe_waves.push(Instant::now());
+            }
+            let mut accepted = 0_usize;
+            let mut outcomes = Vec::new();
+            for (target, request, _timeout) in attempts {
+                if accepted >= required_acks {
+                    break;
+                }
+                let result = self.answer(state, &request);
+                if result.as_ref().is_ok_and(|response| response.accepted) {
+                    accepted = accepted.saturating_add(1);
+                }
+                outcomes.push((target, request, result));
+            }
+            Box::pin(async move { Ok(outcomes) })
+        }
+
+        fn fan_out_committed_cluster_kv_command_async<'a>(
+            &'a mut self,
+            _paths: ClusterPaths,
+            _state: ClusterBootstrapState,
+            _events: std::sync::Arc<Vec<sinomo_kv::KvEvent>>,
+            _targets: Vec<NodeId>,
+        ) -> ClusterMembershipRpcFuture<'a, ()> {
+            if !self.hold_resident_on_fanout {
+                return Box::pin(async { Ok(()) });
+            }
+            let paths = self.paths.clone();
+            let local = self.local.clone();
+            let (holding, held) = std::sync::mpsc::channel();
+            self.holders.push(std::thread::spawn(move || {
+                let resident = crate::open_cluster_raft_kv_node(&paths, &local)
+                    .expect("fanout owns the leader's resident writer");
+                holding.send(()).expect("report the resident owner");
+                std::thread::sleep(Duration::from_millis(300));
+                drop(resident);
+            }));
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || held.recv())
+                    .await
+                    .expect("join the resident owner report")
+                    .expect("resident owner started");
+                Ok(())
+            })
+        }
+    }
+
+    impl ClusterStateAuthorityReachabilityAsyncHost for UnconfirmedReadIndexHost {
+        fn probe_cluster_state_authority_node_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, NetworkError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    impl ClusterKvTxnQuorumAsyncHost for UnconfirmedReadIndexHost {
+        fn request_kv_state_authority_vote_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _request: &'a ClusterKvStateAuthorityVoteRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterKvStateAuthorityVoteResponse> {
+            Box::pin(async {
+                Err(NetworkError::ClusterReadOnly {
+                    detail: "the current leader unexpectedly requested a vote".to_string(),
+                })
+            })
+        }
+    }
+
+    /// The most ReadIndex waves a voter may see over `budget`: the first, then
+    /// one per re-send interval, which starts at 250 ms and doubles, so about
+    /// log2(budget / 250 ms) + 1, plus one wave of margin.
+    fn read_index_wave_bound(budget: Duration) -> usize {
+        let intervals =
+            (budget.as_millis() / crate::raft_quorum::READ_INDEX_RESEND_FIRST.as_millis()).max(1);
+        intervals.ilog2() as usize + 1 + 1
+    }
+
+    /// A leader in a quorum whose voters accept appends; its node's
+    /// materialized view predates the write it is about to commit.
+    fn full_view_leader(
+        name: &str,
+    ) -> (
+        sinomo_testdir::TestDir,
+        ClusterPaths,
+        ClusterBootstrapState,
+        KvSnapshot,
+    ) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let state = three_voter_state();
+        crate::write_cluster_state(&paths, &state).expect("cluster state");
+        paths
+            .kv_paths()
+            .locked_set_raft_leader_compact(&state.local_node_id, state.term)
+            .expect("local leader");
+        crate::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("seed cluster raft");
+        let materialized = paths
+            .kv_paths()
+            .local_cache()
+            .current_snapshot(state.local_node_id.clone())
+            .expect("materialize the local view");
+        (root, paths, state, materialized)
+    }
+
+    async fn commit_full_view_write(
+        paths: &ClusterPaths,
+        budget: Duration,
+        host: &mut UnconfirmedReadIndexHost,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
+        let mut caller = read_cluster_state_without_kv(paths).expect("caller state");
+        let committed = crate::raft_quorum::commit_cluster_raft_command_with_quorum_async_with_host(
+            &tokio::runtime::Handle::current(),
+            paths,
+            &mut caller,
+            KvCommandRequest::generated(KvCommand::Op(sinomo_kv::KvOp::Put {
+                key: "/test/full-view".to_string(),
+                value: b"committed".to_vec(),
+                lease_id: None,
+            })),
+            ClusterKvRaftQuorumCommitOptions { timeout: budget },
+            crate::control_plane_options::ClusterControlPlaneTimeouts::default_daemon_transport()
+                .raft_append_replication_options(budget),
+            host,
+        )
+        .await;
+        for holder in host.holders.drain(..) {
+            holder.join().expect("resident owner");
+        }
+        committed
+    }
+
+    /// The current leader commits a full-view write while its observational
+    /// view is the older materialized one and its voters leave the first two
+    /// ReadIndex waves after the commit unacknowledged. The committed view is
+    /// still returned, confirmed by a later wave, rather than refused as
+    /// needing a current-term barrier the leader already has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_view_commit_confirms_its_view_after_unacknowledged_read_index_waves() {
+        let (_root, paths, state, materialized) =
+            full_view_leader("sinomo-cluster-full-view-unconfirmed-read-index");
+        let mut host = UnconfirmedReadIndexHost::new(
+            &paths,
+            &state.local_node_id,
+            4,
+            UnconfirmedProbe::Rejected,
+            true,
+        );
+        let committed = commit_full_view_write(&paths, Duration::from_secs(10), &mut host)
+            .await
+            .expect("a committed full-view write returns its view");
+
+        assert!(host.accepted_appends > 0);
+        assert!(
+            host.probes > host.unconfirmed_probes,
+            "a later wave confirmed the view: {} probes",
+            host.probes
+        );
+        assert!(committed.authority.revision > materialized.revision);
+        assert_eq!(committed.snapshot.revision, committed.authority.revision);
+        assert!(
+            committed
+                .snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.key == "/test/full-view"),
+            "the view includes the committed write"
+        );
+    }
+
+    /// Voters that fail fast never acknowledge the committed full view. Its
+    /// waves are re-sent on the re-send timer, not back to back, until the
+    /// response's budget ends the repair.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_view_repair_paces_its_waves_to_fast_failing_voters() {
+        let (_root, paths, state, _materialized) =
+            full_view_leader("sinomo-cluster-full-view-fast-failing-voters");
+        let mut host = UnconfirmedReadIndexHost::new(
+            &paths,
+            &state.local_node_id,
+            usize::MAX,
+            UnconfirmedProbe::FailedFast,
+            true,
+        );
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let error = commit_full_view_write(&paths, budget, &mut host)
+            .await
+            .expect_err("voters never confirm the view");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                &error,
+                NetworkError::ClusterReadOnly { detail }
+                    if detail.contains("did not confirm the committed full view")
+            ),
+            "the budget ends the repair: {error:?}"
+        );
+        assert!(host.accepted_appends > 0, "the write was committed");
+        assert!(elapsed >= budget, "the budget, not the timer, ended it");
+        let waves = host.probe_waves.len();
+        assert!(waves >= 2, "the repair re-sent its wave: {waves} waves");
+        assert!(
+            waves <= read_index_wave_bound(budget),
+            "{waves} waves over {budget:?}"
+        );
+        for gap in host.wave_gaps() {
+            assert!(
+                gap >= crate::raft_quorum::READ_INDEX_RESEND_FIRST,
+                "waves were re-sent back to back: {:?}",
+                host.wave_gaps()
+            );
+        }
+    }
+
+    /// A leader whose term already holds a commit re-confirms an authoritative
+    /// read that fast-failing voters never acknowledge. Its waves are re-sent
+    /// on the re-send timer, not back to back, and it never falls back to a
+    /// barrier, until the read's budget ends it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authoritative_barrier_read_paces_its_waves_to_fast_failing_voters() {
+        let fixture = cold_barrier_fixture("read_index_resend_fast_failing_voters");
+        clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+        commit_current_term_barrier(&fixture);
+        let mut host = UnconfirmedReadIndexHost::new(
+            &fixture.paths,
+            &fixture.local,
+            usize::MAX,
+            UnconfirmedProbe::FailedFast,
+            false,
+        );
+        let options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true);
+        let mut state = fixture.state.clone();
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let read =
+            commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
+                &tokio::runtime::Handle::current(),
+                &fixture.paths,
+                &mut state,
+                options,
+                started + budget,
+                None,
+                ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
+                |storage| storage.read_index_snapshot(),
+                &mut host,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+
+        assert!(read.is_err(), "voters never confirm the read");
+        assert!(elapsed >= budget, "the budget, not the timer, ended it");
+        assert_eq!(host.accepted_appends, 0, "no barrier was committed");
+        let waves = host.probe_waves.len();
+        assert!(waves >= 2, "the read re-sent its wave: {waves} waves");
+        assert!(
+            waves <= read_index_wave_bound(budget),
+            "{waves} waves over {budget:?}"
+        );
+        for gap in host.wave_gaps() {
+            assert!(
+                gap >= crate::raft_quorum::READ_INDEX_RESEND_FIRST,
+                "waves were re-sent back to back: {:?}",
+                host.wave_gaps()
+            );
+        }
+    }
+
+    /// A new leader's first authoritative read commits the compact barrier,
+    /// and the barrier's post-commit fanout briefly owns the resident, as a
+    /// committed fanout can. The read then confirms the term's commit with
+    /// ReadIndex instead of failing because the resident was busy, under both
+    /// projection policies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_barrier_read_confirms_after_its_resident_was_busy() {
+        for (name, policy) in [
+            (
+                "compact_barrier_busy_resident_bounded",
+                ClusterRaftReadProjectionPolicy::DeadlineBounded,
+            ),
+            (
+                "compact_barrier_busy_resident_complete",
+                ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
+            ),
+        ] {
+            let fixture = cold_barrier_fixture(name);
+            clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+            let mut host = UnconfirmedReadIndexHost::new(
+                &fixture.paths,
+                &fixture.local,
+                0,
+                UnconfirmedProbe::Rejected,
+                true,
+            );
+            let options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+                .kv_txn_quorum_options(true);
+            let mut state = fixture.state.clone();
+            let read =
+                commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
+                    &tokio::runtime::Handle::current(),
+                    &fixture.paths,
+                    &mut state,
+                    options,
+                    Instant::now() + Duration::from_secs(10),
+                    None,
+                    policy,
+                    |storage| storage.read_index_snapshot(),
+                    &mut host,
+                )
+                .await;
+            for holder in host.holders.drain(..) {
+                holder.join().expect("resident owner");
+            }
+            clear_authoritative_barrier_singleflight_for_root(&fixture.paths.root);
+
+            let read = read.unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(
+                host.accepted_appends > 0,
+                "{name}: the barrier was committed"
+            );
+            assert_eq!(read.value.revision, read.authority.revision, "{name}");
+            assert!(
+                read.value
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key == "/cold/a"),
+                "{name}: the read includes the committed state"
+            );
+        }
     }
 
     fn three_voter_state() -> ClusterBootstrapState {

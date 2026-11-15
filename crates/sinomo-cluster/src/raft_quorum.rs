@@ -4669,11 +4669,95 @@ where
         // conversely, a later writer can advance it beyond this commit. Repair
         // either race with one inseparable ReadIndex snapshot/proof rather than
         // attaching this commit's authority to a different KV generation.
+        confirm_committed_full_view(runtime, paths, state, options, append_options, host).await?
+    };
+    Ok(ClusterKvRaftQuorumCommitResult {
+        snapshot,
+        txn_response: compact.txn_response,
+        authority,
+        replayed_committed_request: compact.replayed_committed_request,
+    })
+}
+
+/// The first re-send of a ReadIndex wave that voters did not acknowledge;
+/// each later one doubles, up to the network's liveness interval.
+pub(crate) const READ_INDEX_RESEND_FIRST: Duration = Duration::from_millis(250);
+
+/// Paces the re-sends of a ReadIndex wave that voters did not acknowledge, so
+/// a voter that fails fast is not probed back to back. The timer only paces
+/// re-sends: it never decides, and the caller's budget still ends the read.
+pub(crate) struct ReadIndexResendTimer {
+    next: Duration,
+}
+
+impl ReadIndexResendTimer {
+    pub(crate) fn new() -> Self {
+        Self {
+            next: READ_INDEX_RESEND_FIRST,
+        }
+    }
+
+    fn next_wake_before(&mut self, deadline: Instant) -> Instant {
+        let wake = Instant::now()
+            .checked_add(self.next)
+            .map_or(deadline, |wake| wake.min(deadline));
+        self.next = self
+            .next
+            .saturating_mul(2)
+            .min(sinomo_network::DEFAULT_NETWORK_TIMEOUT);
+        wake
+    }
+
+    /// Waits for the next re-send, never past `deadline`.
+    pub(crate) async fn wait_before(&mut self, deadline: Instant) {
+        let wake = self.next_wake_before(deadline);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+    }
+
+    /// Waits for the next re-send on a blocking caller, never past `deadline`.
+    pub(crate) fn wait_before_blocking(&mut self, deadline: Instant) {
+        let wake = self.next_wake_before(deadline);
+        std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// Confirms one complete snapshot and its proof for an already committed
+/// full-view response, with a fresh budget of its own.
+///
+/// The commit is durable and is this leader's current-term commit; only the
+/// view is still owed. A ReadIndex wave that voters could not acknowledge (a
+/// just-promoted voter still catching up, a busy or unloaded resident) is
+/// re-sent on the re-send timer within that budget instead of reporting the
+/// committed request as read-only, as the authoritative barrier read
+/// re-confirms a term that already holds a commit. Only a leader that has
+/// since entered a later term without a commit of its own needs a new
+/// barrier; the exact replay of the committed request supplies it.
+async fn confirm_committed_full_view<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvRaftQuorumCommitOptions,
+    append_options: ClusterRaftAppendReplicationOptions,
+    host: &mut H,
+) -> Result<(KvSnapshot, sinomo_kv::KvAuthorityProof), NetworkError>
+where
+    H: ClusterRaftQuorumAsyncHost,
+{
+    let deadline = Instant::now() + options.timeout;
+    let mut resend = ReadIndexResendTimer::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: "a current-term voter quorum did not confirm the committed full view before its deadline"
+                    .to_string(),
+            });
+        }
         match read_cluster_raft_with_read_index_attempt_async_with_projection_policy(
             runtime,
             paths,
             state,
-            options.timeout,
+            remaining,
             append_options,
             ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
             |storage| storage.read_index_snapshot(),
@@ -4681,13 +4765,19 @@ where
         )
         .await?
         {
-            ClusterRaftReadIndexAttempt::Confirmed(read) => (read.value, read.authority),
-            ClusterRaftReadIndexAttempt::NeedsBarrier(_) => {
+            ClusterRaftReadIndexAttempt::Confirmed(read) => {
+                return Ok((read.value, read.authority));
+            }
+            ClusterRaftReadIndexAttempt::NeedsBarrier(fence)
+                if !fence.read_state.has_current_term_commit =>
+            {
                 return Err(NetworkError::ClusterReadOnly {
                     detail: "legacy full-view commit response needs a new current-term barrier"
                         .to_string(),
                 });
             }
+            // Voters did not acknowledge this wave; re-send it on the timer.
+            ClusterRaftReadIndexAttempt::NeedsBarrier(_) => {}
             ClusterRaftReadIndexAttempt::NotLeader => {
                 return Err(NetworkError::ClusterReadOnly {
                     detail: "local node lost Raft leadership while repairing a legacy full-view commit response"
@@ -4702,13 +4792,8 @@ where
                 });
             }
         }
-    };
-    Ok(ClusterKvRaftQuorumCommitResult {
-        snapshot,
-        txn_response: compact.txn_response,
-        authority,
-        replayed_committed_request: compact.replayed_committed_request,
-    })
+        resend.wait_before(deadline).await;
+    }
 }
 
 /// Canonical daemon mutation path. The result is bounded by the command delta;
