@@ -1934,6 +1934,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.clear_membership_handoff_write_freeze(handoff_id, active_shard, checked_prefix)
     }
 
+    fn clear_obsolete_metadata_shard_handoff_freeze(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        record_epoch: u64,
+        completed_handoff_id: Option<&str>,
+    ) -> Result<bool> {
+        if shard_id != &self.shard_id {
+            return Ok(false);
+        }
+        self.clear_obsolete_membership_handoff_freeze(record_epoch, completed_handoff_id)
+    }
+
     fn observe_metadata_replication_cursors(
         &self,
         shard_id: &DfsMetadataShardId,

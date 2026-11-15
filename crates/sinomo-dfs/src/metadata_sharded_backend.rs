@@ -6438,6 +6438,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
     }
 
+    fn clear_obsolete_metadata_shard_handoff_freeze(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        record_epoch: u64,
+        completed_handoff_id: Option<&str>,
+    ) -> Result<bool> {
+        self.shard_backend_mut(shard_id)?.clear_obsolete_metadata_shard_handoff_freeze(
+            shard_id,
+            record_epoch,
+            completed_handoff_id,
+        )
+    }
+
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
         if self.shards.len() != 1 {
             return Err(MetadataBackendError::Serde(

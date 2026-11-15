@@ -163,6 +163,9 @@ struct Keeper {
     events: ComponentEventClient,
     verdicts: KeeperVerdicts,
     shards: BTreeMap<ShardKey, ShardKeeping>,
+    /// The record epoch last seen for each switched shard this node holds a
+    /// copy of: a member's acceptance fence is checked only when it moves.
+    member_epochs: BTreeMap<ShardKey, u64>,
     completion_tx: tokio::sync::mpsc::UnboundedSender<Completion>,
     completions: tokio::sync::mpsc::UnboundedReceiver<Completion>,
 }
@@ -186,6 +189,7 @@ impl Keeper {
             authority,
             events,
             shards: BTreeMap::new(),
+            member_epochs: BTreeMap::new(),
             completion_tx,
             completions,
         }
@@ -209,6 +213,7 @@ impl Keeper {
             shard.awaited.extend(demands.unreachable);
         }
         let mut primary_shards = BTreeMap::new();
+        let mut member_shards = BTreeMap::new();
         for (file_system_id, shards) in
             crate::metadata_authority_projection::metadata_shard_index_from_authority_entries(
                 &entries,
@@ -221,6 +226,15 @@ impl Keeper {
                 continue;
             };
             for shard in &shards {
+                if crate::metadata_shard_configured_node_ids(shard).contains(&self.local) {
+                    member_shards.insert(
+                        (
+                            file_system_id.clone(),
+                            DfsMetadataShardId::new(shard.shard_id.clone()),
+                        ),
+                        shard.clone(),
+                    );
+                }
                 if shard.primary_node_id == self.local {
                     primary_shards.insert(
                         (
@@ -252,6 +266,7 @@ impl Keeper {
             }
             crate::write_set_member_evidence::forget_metadata_member_views(&self.local, &key.1);
         }
+        self.retire_reached_member_fences(&entries, &member_shards);
         // Network verdicts are needed only while this node is primary of a
         // switched shard: an unswitched shard is never shrunk, re-added or
         // recruited for, so it holds no reachability subscription.
@@ -601,7 +616,7 @@ impl Keeper {
                             None,
                         );
                         self.publish_event(&key, &change.write_set, "rejoin-caught-up", submitted);
-                        self.spawn_release(key, member);
+                        self.spawn_release(key, vec![member]);
                         request_prepared_change_recovery(&self.data_dir);
                     }
                     (Ok(DfsMetadataWriteSetTxnOutcome::Unknown { .. }), Some(change)) => {
@@ -875,9 +890,10 @@ impl Keeper {
         });
     }
 
-    /// Drop the pending add once the record shows it applied, so a steady
-    /// shard keeps no member-state file.
-    fn spawn_release(&self, key: ShardKey, member: NodeId) {
+    /// Drop pending adds the record has moved past (an add that applied, or
+    /// every add once the epoch advanced), so a steady shard keeps no
+    /// member-state file.
+    fn spawn_release(&self, key: ShardKey, members: Vec<NodeId>) {
         let cluster_paths = self.cluster_paths.clone();
         let data_dir = self.data_dir.clone();
         let runtime = self.runtime.clone();
@@ -886,7 +902,7 @@ impl Keeper {
                 return;
             };
             let Ok(Some(cut)) = DfsControlPlaneStore::new(client.as_mut())
-                .read_metadata_shard_record_cut(&key.0, &key.1.0, std::slice::from_ref(&member))
+                .read_metadata_shard_record_cut(&key.0, &key.1.0, &members)
             else {
                 return;
             };
@@ -897,6 +913,68 @@ impl Keeper {
                     .map(|backend| backend.release_pending_write_set_adds(&key.1, &cut))
             });
         });
+    }
+
+    /// A member's acceptance fence, left by a takeover promise, is retired
+    /// once this node's own view of the record reaches it: from then on the
+    /// record's epoch refuses older sources. A node that is no longer primary
+    /// releases the pending adds the epoch advance superseded. Both are
+    /// checked only when a switched shard's epoch moves, or at the first
+    /// publication after start, so the member-state file outlives neither.
+    fn retire_reached_member_fences(
+        &mut self,
+        entries: &[sinomo_core::kv::KvEntry],
+        member_shards: &BTreeMap<ShardKey, DfsMetadataShardConfig>,
+    ) {
+        self.member_epochs
+            .retain(|key, _| member_shards.contains_key(key));
+        for (key, shard) in member_shards {
+            let value = entries
+                .binary_search_by(|entry| {
+                    entry
+                        .key
+                        .as_str()
+                        .cmp(crate::metadata_shard_write_set_key(&key.0, &key.1.0).as_str())
+                })
+                .ok()
+                .map(|index| entries[index].value.as_slice());
+            if crate::metadata_shard_write_set_state(shard, value)
+                .switched()
+                .is_none()
+            {
+                continue;
+            }
+            if self.member_epochs.insert(key.clone(), shard.epoch) == Some(shard.epoch) {
+                continue;
+            }
+            let Some(state) = read_write_set_member_state_file(&self.data_dir, &key.1) else {
+                continue;
+            };
+            if shard.primary_node_id != self.local && !state.pending_adds.is_empty() {
+                self.spawn_release(key.clone(), Vec::new());
+            }
+            if state.promise.is_some()
+                || state.accept_from_epoch == 0
+                || shard.epoch < state.accept_from_epoch
+            {
+                continue;
+            }
+            let data_dir = self.data_dir.clone();
+            let runtime = self.runtime.clone();
+            let shard_id = key.1.clone();
+            let epoch = shard.epoch;
+            self.runtime.spawn_blocking(move || {
+                let result = with_daemon_dfs_main_maintenance_service(&data_dir, &runtime, |service| {
+                    service
+                        .metadata_backend
+                        .as_deref_mut()
+                        .map(|backend| backend.retire_write_set_member_fence(&shard_id, epoch))
+                });
+                if let Err(error) = result {
+                    tracing::debug!(target: "sinomo.dfs.write_set", %error, shard = %shard_id.0, "member fence not retired");
+                }
+            });
+        }
     }
 
     fn publish_event(
@@ -1042,10 +1120,12 @@ fn request_prepared_change_recovery(data_dir: &SinomoDataDir) {
     }
 }
 
-fn read_pending_write_set_adds(
+/// The shard's durable member state, read without the writer lock: callers
+/// only decide whether to take that lock.
+fn read_write_set_member_state_file(
     data_dir: &SinomoDataDir,
     shard_id: &DfsMetadataShardId,
-) -> BTreeSet<NodeId> {
+) -> Option<crate::DfsMetadataWriteSetMemberState> {
     let path = crate::default_dfs_metadata_shards_root(data_dir)
         .join(crate::metadata_keys::key_segment(&shard_id.0))
         .join("coordination")
@@ -1053,6 +1133,13 @@ fn read_pending_write_set_adds(
     crate::metadata_io::read_sobj_optional::<crate::DfsMetadataWriteSetMemberState>(&path)
         .ok()
         .flatten()
+}
+
+fn read_pending_write_set_adds(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> BTreeSet<NodeId> {
+    read_write_set_member_state_file(data_dir, shard_id)
         .map(|state| {
             state
                 .pending_adds

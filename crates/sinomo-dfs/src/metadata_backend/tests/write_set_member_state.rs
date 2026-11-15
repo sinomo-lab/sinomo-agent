@@ -454,3 +454,134 @@ fn shards_on_the_all_member_rule_keep_their_floor_and_reply_encoding() {
         String::from_utf8_lossy(&sinomo_core::kv::encode_kv_value(&reply).unwrap()).to_string();
     assert!(!encoded.contains("member_view"));
 }
+
+fn handoff_marker(retiring_epoch: u64, activated_epoch: Option<u64>) -> crate::DfsMetadataShardWriteFreeze {
+    crate::DfsMetadataShardWriteFreeze {
+        handoff_id: "handoff-a".into(),
+        retiring_epoch,
+        activated_epoch,
+        journal_sequence: 1,
+        state_fingerprint: proof(1, 'a').digest,
+        rebind_prefix_proof: proof(1, 'a'),
+    }
+}
+
+#[test]
+fn a_freeze_marker_the_write_set_record_moved_past_is_obsolete() {
+    // An activated marker below the record's epoch fences nothing.
+    assert!(handoff_marker(3, Some(4)).is_obsolete_for_write_set_record(5, None));
+    assert!(!handoff_marker(3, Some(4)).is_obsolete_for_write_set_record(4, None));
+    // A pending marker is obsolete once the record moved past its retiring
+    // epoch without completing its handoff.
+    assert!(handoff_marker(3, None).is_obsolete_for_write_set_record(4, None));
+    assert!(handoff_marker(3, None).is_obsolete_for_write_set_record(4, Some("handoff-b")));
+    assert!(!handoff_marker(3, None).is_obsolete_for_write_set_record(4, Some("handoff-a")));
+    assert!(!handoff_marker(3, None).is_obsolete_for_write_set_record(3, None));
+}
+
+#[test]
+fn an_obsolete_freeze_marker_is_removed_and_a_current_one_is_kept() {
+    let root = sinomo_testdir::TestDir::new("write-set-obsolete-marker");
+    let mut backend = backend(&root);
+    backend.freeze_for_membership_handoff("handoff-a", 3).unwrap();
+    assert!(matches!(
+        backend.begin_metadata_write(),
+        Err(MetadataBackendError::MembershipHandoffFrozen { .. })
+    ));
+    // Still at the retiring epoch, or completed: kept.
+    assert!(!backend.clear_obsolete_membership_handoff_freeze(3, None).unwrap());
+    assert!(
+        !backend
+            .clear_obsolete_membership_handoff_freeze(4, Some("handoff-a"))
+            .unwrap()
+    );
+    assert!(backend.membership_handoff_write_freeze().unwrap().is_some());
+    // The record moved past it without completing it: removed, and the
+    // writer is no longer fenced.
+    assert!(backend.clear_obsolete_membership_handoff_freeze(4, None).unwrap());
+    assert!(backend.membership_handoff_write_freeze().unwrap().is_none());
+    assert!(backend.begin_metadata_write().is_ok());
+    // An activated marker at the record's epoch is current; below it, it is
+    // obsolete, and the instance is unbound from the earlier epoch.
+    backend.freeze_for_membership_handoff("handoff-b", 4).unwrap();
+    assert!(
+        backend
+            .mark_membership_handoff_write_freeze_activated("handoff-b", 5)
+            .unwrap()
+    );
+    backend.instance_authority_epoch = Some(5);
+    assert!(!backend.clear_obsolete_membership_handoff_freeze(5, None).unwrap());
+    assert_eq!(backend.instance_authority_epoch, Some(5));
+    assert!(backend.clear_obsolete_membership_handoff_freeze(6, None).unwrap());
+    assert_eq!(backend.instance_authority_epoch, None);
+    assert!(backend.membership_handoff_write_freeze().unwrap().is_none());
+    // A restart finds no marker.
+    drop(backend);
+    assert!(
+        self::backend(&root)
+            .membership_handoff_write_freeze()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn an_epoch_tagged_authority_floor_may_name_sequence_zero() {
+    let root = sinomo_testdir::TestDir::new("write-set-zero-authority-floor");
+    let floor = |sequence, epoch| crate::DfsMetadataAuthorityAckFloor {
+        shard_id: shard_id(),
+        journal_sequence: sequence,
+        durable_prefix_proof: proof(sequence, 'd'),
+        authority_epoch: epoch,
+    };
+    let put = |value| metadata_cursor::put_metadata_authority_ack_floor(root.path(), &value);
+    put(floor(3, Some(3))).unwrap();
+    // Without an epoch, sequence zero names nothing acknowledged.
+    assert!(put(floor(0, None)).is_err());
+    // With one it starts a later epoch and displaces the earlier floor.
+    put(floor(0, Some(4))).unwrap();
+    assert_eq!(
+        metadata_cursor::metadata_authority_ack_floor(root.path(), &shard_id()).unwrap(),
+        Some(floor(0, Some(4)))
+    );
+}
+
+#[test]
+fn a_later_epoch_snapshot_at_sequence_zero_replaces_an_earlier_authority_floor() {
+    let source_root = sinomo_testdir::TestDir::new("write-set-zero-snapshot-source");
+    let image = LocalSobjMetadataBackend::new(shard_id(), source_root.path())
+        .unwrap()
+        .export_snapshot_image()
+        .unwrap();
+    let sequence = image.descriptor().materialized_through_sequence;
+    assert_eq!(sequence, 0, "the source is an empty epoch start");
+    let root = sinomo_testdir::TestDir::new("write-set-zero-snapshot");
+    let mut backend = backend(&root);
+    metadata_cursor::put_metadata_authority_ack_floor(
+        root.path(),
+        &crate::DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id(),
+            journal_sequence: 2,
+            durable_prefix_proof: proof(2, 'b'),
+            authority_epoch: Some(3),
+        },
+    )
+    .unwrap();
+    backend
+        .replace_with_replicated_snapshot_with_replica_permit(
+            &permit(4, Some(3)),
+            shard_id(),
+            sequence,
+            image,
+        )
+        .unwrap();
+    let floor = metadata_cursor::metadata_authority_ack_floor(root.path(), &shard_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(floor.authority_epoch, Some(4));
+    assert_eq!(floor.journal_sequence, 0);
+    // The cold-open check compares the installed head with the epoch-4
+    // floor, not the earlier one above it.
+    drop(backend);
+    self::backend(&root);
+}

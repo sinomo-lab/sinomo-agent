@@ -295,6 +295,33 @@ pub struct DfsMetadataShardWriteFreeze {
     pub rebind_prefix_proof: crate::DfsMetadataPrefixProof,
 }
 
+impl DfsMetadataShardWriteFreeze {
+    /// Whether a shard on the write-set protocol whose record is at
+    /// `record_epoch` has moved past this marker, so it fences nothing.
+    ///
+    /// An activated marker below the record's epoch belongs to an earlier
+    /// generation: authorship at the record's epoch is fenced by the
+    /// publication provider, the provider-validated initial epoch binding and
+    /// the bound epoch of each prepare. A pending marker whose handoff the
+    /// record moved past and whose completion the record does not name
+    /// (`completed_handoff_id`, from the handoff proof key) can never
+    /// activate: a takeover deleted that handoff. A marker at the record's
+    /// epoch, or one for a handoff that completed, is current and is kept.
+    pub fn is_obsolete_for_write_set_record(
+        &self,
+        record_epoch: u64,
+        completed_handoff_id: Option<&str>,
+    ) -> bool {
+        match self.activated_epoch {
+            Some(activated_epoch) => activated_epoch < record_epoch,
+            None => {
+                self.retiring_epoch < record_epoch
+                    && completed_handoff_id != Some(self.handoff_id.as_str())
+            }
+        }
+    }
+}
+
 // Markers written before repair custody was removed may carry a custody cut
 // in one of two envelopes; they still load, and the cut is dropped: an
 // authority transfer carries no repair state.
@@ -2704,6 +2731,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _handoff_id: &str,
         _active_shard: &DfsMetadataShardConfig,
         _checked_prefix: &DfsMetadataPrefixProof,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// On a shard on the write-set protocol whose record is at
+    /// `record_epoch`, remove this shard's handoff freeze marker when the
+    /// record has moved past it
+    /// ([`DfsMetadataShardWriteFreeze::is_obsolete_for_write_set_record`]),
+    /// and unbind the instance from any earlier authority epoch. Returns
+    /// whether a marker was removed.
+    fn clear_obsolete_metadata_shard_handoff_freeze(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _record_epoch: u64,
+        _completed_handoff_id: Option<&str>,
     ) -> Result<bool> {
         Ok(false)
     }

@@ -1097,7 +1097,7 @@ impl LocalSobjMetadataBackend {
             // Replace an earlier epoch's floors before the state they describe
             // is archived, so a restart in between never compares the new
             // state with them. Epoch-major merge lets the new floors replace
-            // a higher sequence. An authority floor cannot name sequence zero.
+            // a higher sequence, including an epoch that starts empty.
             metadata_cursor::put_metadata_prefix_ack_floor(
                 &self.root,
                 &DfsMetadataPrefixAckFloor {
@@ -1108,17 +1108,15 @@ impl LocalSobjMetadataBackend {
                     authority_epoch: Some(permit.source_epoch()),
                 },
             )?;
-            if replayed_through_sequence > 0 {
-                metadata_cursor::put_metadata_authority_ack_floor(
-                    &self.root,
-                    &crate::DfsMetadataAuthorityAckFloor {
-                        shard_id: source_shard_id.clone(),
-                        journal_sequence: replayed_through_sequence,
-                        durable_prefix_proof: replacement_prefix_proof.clone(),
-                        authority_epoch: Some(permit.source_epoch()),
-                    },
-                )?;
-            }
+            metadata_cursor::put_metadata_authority_ack_floor(
+                &self.root,
+                &crate::DfsMetadataAuthorityAckFloor {
+                    shard_id: source_shard_id.clone(),
+                    journal_sequence: replayed_through_sequence,
+                    durable_prefix_proof: replacement_prefix_proof.clone(),
+                    authority_epoch: Some(permit.source_epoch()),
+                },
+            )?;
         }
         // An identical snapshot is already installed when this held writer
         // still owns a fully materialized certificate for the exact physical

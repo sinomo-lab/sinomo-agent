@@ -40,6 +40,8 @@ mod keeping_native_tests;
 #[cfg(test)]
 mod native_tests;
 #[cfg(test)]
+mod takeover_native_tests;
+#[cfg(test)]
 mod tests;
 
 /// Persisted format of [`DfsMetadataShardWriteSet`]. Readers reject any other

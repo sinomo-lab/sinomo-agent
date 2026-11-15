@@ -191,6 +191,35 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    /// Remove a freeze marker the shard's write-set record has moved past and
+    /// unbind this instance from any earlier authority epoch, under the shard
+    /// writer lock. A marker in a selected original-data layout is never
+    /// removed here.
+    pub(super) fn clear_obsolete_membership_handoff_freeze(
+        &mut self,
+        record_epoch: u64,
+        completed_handoff_id: Option<&str>,
+    ) -> Result<bool> {
+        let _lock = self.metadata_write_lock()?;
+        if self
+            .instance_authority_epoch
+            .is_some_and(|epoch| epoch < record_epoch)
+        {
+            self.instance_authority_epoch = None;
+        }
+        if self.selected_original_data_layout.is_some() {
+            return Ok(false);
+        }
+        let Some(freeze) = self.membership_handoff_write_freeze()? else {
+            return Ok(false);
+        };
+        if !freeze.is_obsolete_for_write_set_record(record_epoch, completed_handoff_id) {
+            return Ok(false);
+        }
+        crate::metadata_io::remove_file_if_exists(&self.membership_handoff_write_freeze_path())?;
+        Ok(true)
+    }
+
     pub(super) fn clear_membership_handoff_write_freeze(
         &mut self,
         handoff_id: &str,

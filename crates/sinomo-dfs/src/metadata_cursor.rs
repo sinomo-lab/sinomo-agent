@@ -443,7 +443,11 @@ impl crate::metadata_ack_floor_log::AckFloor for DfsMetadataAuthorityAckFloor {
     }
     fn validate(&self) -> Result<()> {
         let floor = self;
-        if floor.journal_sequence == 0 {
+        // An authority floor at sequence zero names nothing acknowledged,
+        // except on a write-set shard, where an epoch-tagged floor at zero
+        // records that a later epoch started from the empty prefix: it
+        // displaces an earlier epoch's floors like any other epoch start.
+        if floor.journal_sequence == 0 && floor.authority_epoch.is_none() {
             return Err(MetadataBackendError::Serde(format!(
                 "metadata authority acknowledgement for shard {} has sequence zero",
                 floor.shard_id.0
