@@ -976,6 +976,12 @@ fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
 
 /// A two-member write set {P, B} with P alive and keeping: C leaves the
 /// write set first, and B, which alone judges P lost, asks nobody.
+///
+/// P's keeper sees no path to C, so the write set stays {P, B} by the
+/// keeper's own inputs: a member it cannot reach never rejoins and ranks
+/// below B, so a shrunk B is the one re-added. N stays 3; N=2 alone would not
+/// hold it, because once B is shrunk B and C tie and a per-shard hash picks
+/// which one P re-adds.
 fn two_member_write_set(name: &str) -> (DfsTestRuntime, DfsMetadataShardConfig) {
     let (runtime, config) = switched_with_kv_voters(name, Some((1, 3)));
     let p = config.primary_node_id.clone();
@@ -987,12 +993,19 @@ fn two_member_write_set(name: &str) -> (DfsTestRuntime, DfsMetadataShardConfig) 
     }
     catch_up(&runtime, &config, &b);
     shrink(&runtime, &config, &c, 1);
-    keep_with_paths(&runtime, &config, &[&p, &b]);
+    // Every verdict is set before either keeper starts.
+    keep_with_paths(&runtime, &config, &[]);
+    runtime.set_peer_verdict(&p, &c, PeerPathVerdict::NoPath, false);
+    for keeper in [&p, &b] {
+        runtime.enable_write_set_keeping(keeper);
+    }
     (runtime, config)
 }
 
 /// Once B's attempt has promised with its swap held, P, alive, writes: B
 /// refuses P's epoch and P's keeper shrinks it, leaving the epoch unchanged.
+/// P then judges B unreachable, so its keeper cannot re-add B before
+/// `released_and_re_added` lets it.
 fn shrunk_while_promised(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, name: &str) {
     let p = &config.primary_node_id;
     let b = &config.replica_node_ids[0];
@@ -1023,11 +1036,18 @@ fn shrunk_while_promised(runtime: &DfsTestRuntime, config: &DfsMetadataShardConf
             })
     );
     assert_eq!(record_from(runtime, config, p).shard.epoch, config.epoch);
+    // B refuses every join while it holds its promise, so no join of B can
+    // have succeeded before this verdict.
+    runtime.set_peer_verdict(p, b, PeerPathVerdict::NoPath, false);
 }
 
 /// B's swap settles rejected with the epoch unchanged, its promise is
 /// released and its fence is back at the epoch it promised at; P's next
 /// write catches it up and P's keeper re-adds it.
+///
+/// P's keeper sees no path to B until B judges P reachable again: re-added
+/// into the two-member write set while it still judged P lost, B would take
+/// over again, asking nobody.
 fn released_and_re_added(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, name: &str) {
     let p = &config.primary_node_id;
     let b = &config.replica_node_ids[0];
@@ -1058,8 +1078,13 @@ fn released_and_re_added(runtime: &DfsTestRuntime, config: &DfsMetadataShardConf
         "B's fence is back at the epoch: {:?}",
         member_state(runtime, b, config)
     );
-    assert!(shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    assert!(
+        shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty(),
+        "B never swaps:\n{}",
+        event_log(runtime, &[p, b])
+    );
     runtime.set_peer_verdict(b, p, PeerPathVerdict::Path, false);
+    runtime.set_peer_verdict(p, b, PeerPathVerdict::Path, false);
     // P's writes bring B back. The fenced change may still commit by the
     // recovery the shrink requests, so each write retries under a fresh
     // lookup; and a join that fails waits for the next change, so the
@@ -1350,7 +1375,6 @@ fn native_takeover_promise_of_a_candidate_shrunk_while_down_is_released() {
         !write_set_of(&runtime, &config).contains(&b)
     });
     runtime.reopen_node(b.clone()).unwrap();
-    runtime.set_peer_verdict(&p, &b, PeerPathVerdict::Path, false);
     released_and_re_added(&runtime, &config, name);
     runtime.close().unwrap();
 }
