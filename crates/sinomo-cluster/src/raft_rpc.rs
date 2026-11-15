@@ -406,6 +406,12 @@ fn handle_cluster_raft_read_index_probe_request(
         // process-local authority fence; retain the ordinary AppendEntries path
         // so hard state is advanced before any later acknowledgement.
         ClusterKvRaftReadIndexProbeOutcome::NeedsDurable => return Ok(None),
+        // The probe carries a commit index, leader or term the resident has not
+        // recorded. Rejecting it would leave this follower unable to answer
+        // every later probe of the same read, since the waiting leader sends
+        // no other append; the ordinary AppendEntries path records it and
+        // answers.
+        ClusterKvRaftReadIndexProbeOutcome::NeedsAppend => return Ok(None),
         ClusterKvRaftReadIndexProbeOutcome::Busy { metadata } => {
             let append = RaftAppendEntriesResponse {
                 term: metadata.observed_term,

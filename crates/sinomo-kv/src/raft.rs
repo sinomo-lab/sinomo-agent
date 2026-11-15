@@ -1822,7 +1822,7 @@ fn read_resident_raft_read_index_probe(
         Err(error) => return Err(error),
     };
     let Some(response) = resident.node.read_only_append_entries_response(request) else {
-        return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsDurable);
+        return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsAppend);
     };
     let metadata = read_index_probe_metadata_from_node(&resident.node)?;
     metrics::counter!(
@@ -3542,8 +3542,17 @@ pub enum ClusterKvRaftReadIndexProbeOutcome {
         metadata: ClusterKvRaftReadIndexProbeMetadata,
     },
     /// No exact resident classification is available, or the request carries a
-    /// genuinely newer term/commit which must pass through normal durable Raft.
+    /// genuinely newer term which must pass through normal durable Raft.
     NeedsDurable,
+    /// The idle resident node cannot answer from its retained state because
+    /// the probe carries leadership or commit state the node has not recorded:
+    /// a newer term, a leader it has not yet heard from, or, at a matching
+    /// anchor, a commit index above its own (a follower learns that an entry
+    /// it holds was committed only from the leader's next append). The
+    /// ordinary AppendEntries path records that state and answers; nothing
+    /// else would, since a leader whose read waits on this answer sends no
+    /// other append.
+    NeedsAppend,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

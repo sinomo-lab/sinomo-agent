@@ -8700,6 +8700,54 @@ fn higher_term_marked_probe_uses_durable_append_path() {
     assert_eq!(node.hard_state().current_term, 2);
 }
 
+/// A follower that acknowledged the leader's last entry learns that the entry
+/// was committed only from the leader's next append. A leader that is waiting
+/// to confirm a read sends no other append, only marked probes anchored at
+/// that commit, so the follower applies the probe's commit through the
+/// ordinary append path and acknowledges instead of rejecting every probe of
+/// the read.
+#[test]
+fn marked_probe_above_the_follower_commit_is_applied_and_acknowledged() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-commit-ahead");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, local_node_id, _peer_node_id, probe, peer, _resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_read_index_commit_ahead",
+            "node_read_index_commit_ahead_local",
+            "node_read_index_commit_ahead_peer",
+        );
+    // The leader replicates entry 1; the follower holds it, not yet committed.
+    let mut append = probe.clone();
+    append.read_index_probe = false;
+    append.append.entries.push(sinomo_kv::KvLogEntry {
+        index: 1,
+        term: 1,
+        request_id: sinomo_kv::KvRequestId::generate(),
+        command: KvCommand::Barrier,
+        revision: KvRevision::ZERO,
+    });
+    let appended = handle_cluster_raft_append_request(&paths, append, &peer).expect("append");
+    assert!(appended.accepted, "{}", appended.detail);
+    assert_eq!(appended.append.match_index, 1);
+
+    // Its acknowledgement commits entry 1 on the leader, whose probes are now
+    // anchored there. The first is applied through the append path; the next
+    // is answered from the resident state that append left.
+    let mut anchored = probe;
+    anchored.append.prev_log_index = 1;
+    anchored.append.prev_log_term = 1;
+    anchored.append.leader_commit = 1;
+    for attempt in 0..2 {
+        let response = handle_cluster_raft_append_request(&paths, anchored.clone(), &peer)
+            .expect("marked probe above the follower commit");
+        assert!(response.accepted, "attempt {attempt}: {}", response.detail);
+    }
+    let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("inspect hard state");
+    assert_eq!(node.hard_state().commit_index, 1);
+}
+
 #[test]
 fn marked_probe_authorization_uses_exact_committed_raft_config() {
     let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-exact-config");
