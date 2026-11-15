@@ -370,7 +370,12 @@ them.
   first, then node id. A member ranked first above the candidate gets a
   `hand-off { ranking }` request and runs the attempt itself when it still
   ranks first with its own head; it declines with `prefer` otherwise, and a
-  member already promising answers `followed`. On a decline the candidate ranks
+  member already promising answers `followed`. A member that cannot run the
+  attempt declines with `no-quorum` when its confirm read fails, or with
+  `unavailable` when its keeper cannot evaluate the shard. On such a decline
+  the candidate reads the record itself: if that read fails too it stops, and
+  if it succeeds a quorum is serving, so it asks the same member once more.
+  On any other decline, or a second availability decline, the candidate ranks
   again without that member. A write set of two asks nobody.
 - **Confirm, promise, swap.** The candidate reads the record with one
   authoritative read of the shard keys and its configured members; a failed read

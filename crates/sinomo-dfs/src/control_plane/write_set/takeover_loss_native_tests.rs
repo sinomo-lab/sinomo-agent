@@ -1,0 +1,1528 @@
+//! Takeover with real primary loss on the native test runtime: every node is
+//! a cluster-KV voter, so stopping the shard primary, which also leads
+//! cluster KV here, or cutting a node off with a partition, leaves a voter
+//! quorum that re-elects and commits.
+
+use super::commit_native_tests::{
+    catch_up, directory, fail_journal_calls, mode_change, primary, shard_root, shrink,
+    switched_with_kv_voters, write_set_of,
+};
+use super::takeover_driver_native_tests::{
+    event_log, keep_with_paths, lose, object_mode, takeover_events,
+};
+use super::takeover_native_tests::{member_state_path, prepare_unknown, shard_id_of};
+use super::*;
+use crate::DfsMetadataTakeoverEvent;
+use crate::test_runtime::{FaultAction, FaultRule, Partition, executor};
+use crate::test_support::DfsTestRuntime;
+use sinomo_core::network::{NetworkDeliveryState, NetworkError, PeerPathVerdict};
+use sinomo_core::service::ServiceError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// The cluster-KV leader `node`'s own Raft state names.
+fn kv_leader_seen_by(runtime: &DfsTestRuntime, node: &NodeId) -> Option<NodeId> {
+    use sinomo_core::cluster::ClusterKvPathsExt;
+    let paths = sinomo_core::network::ClusterPaths::new(runtime.data_dir(node));
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+    paths.kv_paths().known_raft_voter_leader_id(&state).unwrap()
+}
+
+/// Try one mode change to `path` through `node`'s own service on the shard
+/// as `shard` configures it, within `deadline` when one is given. No other
+/// shard is consulted.
+fn try_mode_at(
+    runtime: &DfsTestRuntime,
+    shard: &DfsMetadataShardConfig,
+    node: &NodeId,
+    path: &str,
+    mode: u32,
+    operation: &str,
+    deadline: Option<Duration>,
+) -> Result<crate::DfsObjectId, String> {
+    let mut service = crate::runtime_host::open_dfs_runtime_service_on_shard(
+        runtime.data_dir(node),
+        Some(executor().handle()),
+        shard,
+    )
+    .map_err(|error| error.to_string())?;
+    let current = service
+        .lookup_sifs_path(path)
+        .map_err(|error| error.to_string())?
+        .ok_or("the object does not exist")?;
+    service
+        .transport
+        .set_operation_deadline(deadline.map(|deadline| Instant::now() + deadline));
+    let committed =
+        service.publish_prepared_operation(mode_change(shard, &current, mode, operation));
+    service.transport.set_operation_deadline(None);
+    match committed {
+        Ok(committed) if committed.published => Ok(current.object_id),
+        Ok(_) => Err("the change was not published".into()),
+        Err(error) => Err(format!("{error:?}")),
+    }
+}
+
+/// Commit one mode change to `path` through `primary`'s own service, retried
+/// under fresh lookups: activation's reconciliation can still be changing the
+/// object, and an election after a loss can fail a commit transiently.
+fn commit_mode_at(
+    runtime: &DfsTestRuntime,
+    shard: &DfsMetadataShardConfig,
+    primary: &NodeId,
+    path: &str,
+    mode: u32,
+    operation: &str,
+) -> crate::DfsObjectId {
+    commit_mode_eventually(runtime, shard, primary, path, mode, operation)
+}
+
+/// Let the surviving cluster-KV voters elect a leader before the members
+/// judge the primary lost: a write from `survivor` campaigns once the old
+/// leader is unreachable. Without it the members' confirm reads can find no
+/// leader, and only a later change would start another attempt.
+fn reelect(runtime: &DfsTestRuntime, survivor: &NodeId) {
+    let cluster = runtime
+        .component_context(survivor)
+        .unwrap()
+        .cluster_access()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let request = sinomo_core::kv::KvTxnRequest::generated(sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![sinomo_core::kv::KvOp::Put {
+                key: format!("/test/takeover-loss/reelect/{survivor}"),
+                value: b"elected".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        match executor().block_on(cluster.kv_commit_compact_async(request)) {
+            Ok(_) => return,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the survivors elect no KV leader: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// The shard record as `reader` reads it. A stopped, cut-off or returning
+/// voter makes the survivors elect again, and an authoritative read during
+/// that election fails transiently, so a failed read is retried.
+fn record_from(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    reader: &NodeId,
+) -> DfsMetadataShardRecordCut {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Some(record) = try_record_from(runtime, config, reader) {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{reader} cannot read the shard record"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The shard record as `reader` reads it, or `None` while its read fails.
+fn try_record_from(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    reader: &NodeId,
+) -> Option<DfsMetadataShardRecordCut> {
+    let mut client = runtime.configuration_publisher(reader);
+    DfsControlPlaneStore::new(client.as_mut())
+        .read_metadata_shard_record_cut(
+            &config.file_system_id,
+            &config.shard_id,
+            &super::commit_native_tests::members(config),
+        )
+        .ok()
+        .flatten()
+}
+
+/// Replicate `primary`'s whole journal to `members` through the ordinary
+/// durability barrier, from the shard as `shard` configures it. A change
+/// committed through a bounded effect service reaches the followers' stores
+/// with the next replication; this is that replication.
+fn catch_up_from(
+    runtime: &DfsTestRuntime,
+    shard: &DfsMetadataShardConfig,
+    primary: &NodeId,
+    members: &[&NodeId],
+) {
+    let mut service = crate::runtime_host::open_dfs_runtime_service_on_shard(
+        runtime.data_dir(primary),
+        Some(executor().handle()),
+        shard,
+    )
+    .unwrap();
+    let shard_id = crate::DfsMetadataShardId::new(shard.shard_id.clone());
+    let head = service
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard_id)
+        .unwrap()
+        .expect("the primary has a prefix");
+    // The barrier certifies against the replicas it names: the reachable
+    // write-set members, not every configured replica.
+    let mut replica_node_ids = shard
+        .replica_node_ids
+        .iter()
+        .filter(|node| members.contains(node))
+        .cloned()
+        .collect::<Vec<_>>();
+    replica_node_ids.sort();
+    let target = crate::DfsMetadataQuorumSyncTarget {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id,
+        primary_node_id: shard.primary_node_id.clone(),
+        authority_epoch: Some(shard.epoch),
+        replica_node_ids,
+        expected_shard: Some(shard.clone()),
+        journal_sequence: head.journal_sequence,
+        barrier_id: sinomo_core::Id::generate().to_string(),
+        state_fingerprint: head.digest.clone(),
+        checkpoint_snapshot: None,
+    };
+    let members = members
+        .iter()
+        .map(|member| (*member).clone())
+        .collect::<Vec<_>>();
+    service
+        .sync_metadata_shard_to_quorum_intersecting(&target, &members, Duration::from_secs(30))
+        .expect("the members catch up");
+}
+
+/// [`commit_mode_at`], retried under fresh operation ids while the write set
+/// cannot acknowledge yet.
+fn commit_mode_eventually(
+    runtime: &DfsTestRuntime,
+    shard: &DfsMetadataShardConfig,
+    primary: &NodeId,
+    path: &str,
+    mode: u32,
+    operation: &str,
+) -> crate::DfsObjectId {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    for attempt in 0.. {
+        match try_mode_at(
+            runtime,
+            shard,
+            primary,
+            path,
+            mode,
+            &format!("{operation}-{attempt}"),
+            Some(Duration::from_secs(5)),
+        ) {
+            Ok(object) => return object,
+            Err(error) => assert!(
+                Instant::now() < deadline,
+                "{operation} never commits: {error}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    unreachable!()
+}
+
+/// `node`'s durable journal head sequence for the shard.
+fn journal_head(runtime: &DfsTestRuntime, node: &NodeId, config: &DfsMetadataShardConfig) -> u64 {
+    super::commit_native_tests::durable_prefix(runtime, node, config)
+        .unwrap()
+        .journal_sequence
+}
+
+/// `operation`'s prepared-operation status in `node`'s copy of the shard.
+fn operation_status(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+    operation: &str,
+) -> Option<crate::DfsPreparedOperationStatus> {
+    use crate::DfsMetadataBackend as _;
+    crate::LocalSobjMetadataBackend::open_for_inspection(
+        shard_id_of(config),
+        shard_root(runtime, node, config),
+    )
+    .ok()?
+    .prepared_operation_record(operation)
+    .ok()
+    .flatten()
+    .map(|record| record.status)
+}
+
+/// `node`'s durable write-set member state for the shard, if it keeps one.
+fn member_state(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+) -> Option<crate::DfsMetadataWriteSetMemberState> {
+    crate::metadata_io::read_sobj_optional(&member_state_path(runtime, node, config))
+        .ok()
+        .flatten()
+}
+
+fn promise_of(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+) -> Option<crate::DfsMetadataTakeoverPromise> {
+    member_state(runtime, node, config).and_then(|state| state.promise)
+}
+
+/// Whether `request` writes the shard's write-set record: on a member that is
+/// not the primary, only a takeover swap does.
+fn writes_the_write_set(
+    config: &DfsMetadataShardConfig,
+    request: &sinomo_core::kv::KvTxnRequest,
+) -> bool {
+    let key = crate::metadata_shard_write_set_key(&config.file_system_id, &config.shard_id);
+    request
+        .txn
+        .success
+        .iter()
+        .any(|op| matches!(op, sinomo_core::kv::KvOp::Put { key: put, .. } if *put == key))
+}
+
+/// Refuse `node`'s takeover swaps before they reach cluster KV while the
+/// registration lives; its attempt keeps the promise and re-sends.
+fn hold_swaps(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    node: &NodeId,
+) -> crate::test_support::DfsTestNativeKvHookRegistration {
+    let config = config.clone();
+    runtime
+        .native_kv_request_hook(node, move |request| {
+            if writes_the_write_set(&config, request) {
+                Err(ServiceError::Network(NetworkError::delivery_failed(
+                    "native fixture held swap",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "the test holds this takeover swap",
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap()
+}
+
+/// `node`'s takeover events named `name` for this shard only: a keeper takes
+/// over every switched shard whose primary it judges lost, and the default
+/// root and users shards switch too once every member advertises the
+/// capability.
+fn shard_events(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+    name: &str,
+) -> Vec<DfsMetadataTakeoverEvent> {
+    takeover_events(runtime, node, name)
+        .into_iter()
+        .filter(|event| event.shard_id == config.shard_id)
+        .collect()
+}
+
+fn the_other(one: &NodeId, b: &NodeId, c: &NodeId) -> NodeId {
+    if one == b { c.clone() } else { b.clone() }
+}
+
+fn sorted(mut nodes: Vec<NodeId>) -> Vec<NodeId> {
+    nodes.sort();
+    nodes
+}
+
+fn wait_until(
+    what: &str,
+    runtime: &DfsTestRuntime,
+    nodes: &[&NodeId],
+    mut done: impl FnMut() -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not happen:\n{}\nkeeping {:?}",
+            event_log(runtime, nodes),
+            nodes
+                .iter()
+                .map(|node| runtime.write_set_keeping_events(node))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Each node's mode for `object`, for a failure message.
+fn modes(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    nodes: &[&NodeId],
+    object: &crate::DfsObjectId,
+) -> Vec<(NodeId, Option<u32>)> {
+    nodes
+        .iter()
+        .map(|node| ((*node).clone(), object_mode(runtime, node, config, object)))
+        .collect()
+}
+
+/// TK1: the primary, which also leads cluster KV, stops abruptly while a
+/// change it prepared is durable on one member only. That member has the
+/// longer journal and takes over once the surviving KV voters re-elect; the
+/// reconciliation commits the prepared change at the new epoch, a new write
+/// commits on the remaining write set, and the stopped primary stays
+/// configured outside it.
+#[test]
+fn native_takeover_after_the_primary_and_kv_leader_stops() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-stop", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    assert_eq!(
+        kv_leader_seen_by(&runtime, &b).as_ref(),
+        Some(&p),
+        "P leads cluster KV"
+    );
+    let current = {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/loss")
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // X is prepared on P and C; B never sees it.
+    fail_journal_calls(&runtime, &config, &b);
+    prepare_unknown(&runtime, &config, &current, "loss-x");
+    runtime.clear_faults();
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+
+    runtime.stop_node(&p).unwrap();
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("C takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id == c
+    });
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(record.shard.epoch, config.epoch + 1);
+    assert_eq!(
+        record.write_set_state().switched().unwrap().write_set,
+        sorted(vec![b.clone(), c.clone()]),
+        "P stays configured, outside the write set"
+    );
+    assert!(record.shard.replica_node_ids.contains(&p));
+    wait_until(
+        "the prepared change commits at the new epoch",
+        &runtime,
+        &[&b, &c],
+        || object_mode(&runtime, &c, &config, &current.object_id) == Some(0o640),
+    );
+    wait_until("C activates", &runtime, &[&b, &c], || {
+        !shard_events(&runtime, &c, &config, DfsMetadataTakeoverEvent::ACTIVATED).is_empty()
+    });
+    assert!(shard_events(&runtime, &b, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    assert!(
+        shard_root(&runtime, &p, &config).exists(),
+        "P's copy is left intact"
+    );
+    // Every default shard has P as its primary here and only this one is
+    // switched, so a POSIX path, which resolves from the root shard, has no
+    // authority left. The new primary's own service commits on this shard.
+    let after = commit_mode_at(
+        &runtime,
+        &record.shard,
+        &c,
+        "/services/loss",
+        0o600,
+        "loss-after",
+    );
+    catch_up_from(&runtime, &record.shard, &c, &[&b]);
+    wait_until(
+        "a write commits on the remaining write set",
+        &runtime,
+        &[&b, &c],
+        || {
+            [&b, &c]
+                .into_iter()
+                .all(|member| object_mode(&runtime, member, &config, &after) == Some(0o600))
+        },
+    );
+    wait_until(
+        "the new primary's fence is retired",
+        &runtime,
+        &[&b, &c],
+        || !member_state_path(&runtime, &c, &config).exists(),
+    );
+    runtime.close().unwrap();
+}
+
+/// TK2: the first successor stops too, and the member left takes over again
+/// at the next epoch, asking nobody: the write set is the two of them. The
+/// old primary's return keeps a KV voter quorum without the first successor;
+/// it stays outside the write set until the new primary reaches it, which
+/// re-adds it as an ordinary member, and a change then commits on both.
+#[test]
+fn native_second_takeover_after_the_first_successor_stops() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-second", Some((1, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/second");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    runtime.stop_node(&p).unwrap();
+    reelect(&runtime, &b);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("a member takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id != p
+    });
+    let first = record_from(&runtime, &config, &b).shard.primary_node_id;
+    let second = the_other(&first, &b, &c);
+    wait_until("the first successor activates", &runtime, &[&b, &c], || {
+        !shard_events(
+            &runtime,
+            &first,
+            &config,
+            DfsMetadataTakeoverEvent::ACTIVATED,
+        )
+        .is_empty()
+    });
+
+    // The members still see P lost, so nobody re-adds it yet.
+    runtime.reopen_node(p.clone()).unwrap();
+    runtime.stop_node(&first).unwrap();
+    reelect(&runtime, &second);
+    lose(&runtime, &[&second], &first);
+    wait_until("the other member takes over", &runtime, &[&second], || {
+        record_from(&runtime, &config, &second)
+            .shard
+            .primary_node_id
+            == second
+    });
+    let record = record_from(&runtime, &config, &second);
+    assert_eq!(record.shard.epoch, config.epoch + 2);
+    assert_eq!(
+        record.write_set_state().switched().unwrap().write_set,
+        vec![second.clone()]
+    );
+    let started = shard_events(
+        &runtime,
+        &second,
+        &config,
+        DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+    );
+    let last = started
+        .last()
+        .expect("the second takeover started an attempt");
+    assert_eq!(last.epoch, config.epoch + 1, "{started:?}");
+    assert!(
+        last.node_ids.is_empty(),
+        "a two-member write set asks nobody: {last:?}"
+    );
+    wait_until(
+        "the second successor activates",
+        &runtime,
+        &[&second],
+        || {
+            !shard_events(
+                &runtime,
+                &second,
+                &config,
+                DfsMetadataTakeoverEvent::ACTIVATED,
+            )
+            .is_empty()
+        },
+    );
+
+    runtime.set_peer_verdict(&second, &p, PeerPathVerdict::Path, false);
+    wait_until("P rejoins the write set", &runtime, &[&second], || {
+        record_from(&runtime, &config, &second)
+            .write_set_state()
+            .switched()
+            .is_some_and(|write_set| write_set.contains(&p))
+    });
+    let record = record_from(&runtime, &config, &second);
+    assert_eq!(
+        record.shard.primary_node_id, second,
+        "P is not made primary again"
+    );
+    let after = commit_mode_at(
+        &runtime,
+        &record.shard,
+        &second,
+        "/services/second",
+        0o600,
+        "second-after",
+    );
+    catch_up_from(&runtime, &record.shard, &second, &[&p]);
+    wait_until("the change commits on both", &runtime, &[&second], || {
+        [&second, &p]
+            .into_iter()
+            .all(|member| object_mode(&runtime, member, &config, &after) == Some(0o600))
+    });
+    runtime.close().unwrap();
+}
+
+/// TK5: the primary stays up, but a partition cuts it off from the members on
+/// every DFS route and from cluster KV, and a member takes over. A commit the
+/// old primary attempts from then on commits nothing, at it or anywhere.
+/// Once its KV returns it reads the record that deposed it and refuses as a
+/// deposed primary. Once the network heals, the new primary aligns it, which
+/// drops that unacknowledged tail, catches it up and re-adds it; it is never
+/// made primary again.
+#[test]
+fn native_takeover_of_a_partitioned_live_primary() {
+    let (runtime, config) = switched_with_kv_voters("native-loss-partitioned", Some((2, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/partitioned");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: true,
+            dfs: true,
+        },
+    );
+    reelect(&runtime, &b);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("a member takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id != p
+    });
+    let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
+    let other = the_other(&winner, &b, &c);
+    wait_until("the new primary activates", &runtime, &[&b, &c], || {
+        !shard_events(
+            &runtime,
+            &winner,
+            &config,
+            DfsMetadataTakeoverEvent::ACTIVATED,
+        )
+        .is_empty()
+    });
+
+    // The old primary still serves and still holds its old record.
+    let late = try_mode_at(
+        &runtime,
+        &config,
+        &p,
+        "/services/partitioned",
+        0o640,
+        "partitioned-late",
+        Some(Duration::from_secs(5)),
+    );
+    assert!(
+        late.is_err(),
+        "the cut-off primary commits nothing: {late:?}"
+    );
+    assert_ne!(
+        operation_status(&runtime, &p, &config, "partitioned-late"),
+        Some(crate::DfsPreparedOperationStatus::Committed)
+    );
+    for member in [&winner, &other] {
+        assert_eq!(
+            operation_status(&runtime, member, &config, "partitioned-late"),
+            None
+        );
+    }
+
+    // Its KV returns: it reads the record that deposed it, and refuses.
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    // Cut off, P kept campaigning; its higher term makes the voters elect
+    // again before its reads succeed.
+    wait_until("P reads the new record", &runtime, &[&b, &c], || {
+        try_record_from(&runtime, &config, &p)
+            .is_some_and(|record| record.shard.primary_node_id == winner)
+    });
+    let deposed = try_mode_at(
+        &runtime,
+        &config,
+        &p,
+        "/services/partitioned",
+        0o644,
+        "partitioned-deposed",
+        Some(Duration::from_secs(5)),
+    );
+    assert!(
+        deposed.is_err(),
+        "the deposed primary commits nothing: {deposed:?}"
+    );
+    assert_ne!(
+        operation_status(&runtime, &p, &config, "partitioned-deposed"),
+        Some(crate::DfsPreparedOperationStatus::Committed)
+    );
+
+    // The network heals and the new primary reaches it.
+    runtime.partition_node(&p, Partition::default());
+    runtime.set_peer_verdict(&winner, &p, PeerPathVerdict::Path, false);
+    wait_until("P rejoins the write set", &runtime, &[&b, &c], || {
+        write_set_of(&runtime, &config).contains(&p)
+    });
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(
+        record.shard.primary_node_id, winner,
+        "P is not made primary again"
+    );
+    assert_ne!(
+        operation_status(&runtime, &p, &config, "partitioned-late"),
+        Some(crate::DfsPreparedOperationStatus::Committed),
+        "the old primary's own tail did not survive"
+    );
+    let observed = runtime.rpc_observations().len();
+    let after = commit_mode_at(
+        &runtime,
+        &record.shard,
+        &winner,
+        "/services/partitioned",
+        0o600,
+        "partitioned-after",
+    );
+    catch_up_from(&runtime, &record.shard, &winner, &[&other, &p]);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while ![&winner, &other, &p]
+        .into_iter()
+        .all(|member| object_mode(&runtime, member, &config, &after) == Some(0o600))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the change commits on every member: {:?} {:?}, record {:?}\n{}\nkeeping {:?}\nafter the commit {:?}",
+            modes(&runtime, &config, &[&winner, &other, &p], &after),
+            [&winner, &other, &p].map(|member| operation_status(
+                &runtime,
+                member,
+                &config,
+                "partitioned-after"
+            )),
+            record_from(&runtime, &config, &b).write_set_state(),
+            event_log(&runtime, &[&b, &c]),
+            runtime.write_set_keeping_events(&winner),
+            {
+                let mut routes = std::collections::BTreeMap::<String, usize>::new();
+                for event in runtime.rpc_observations().into_iter().skip(observed) {
+                    *routes
+                        .entry(format!(
+                            "{} {}->{} {:?} {:?}",
+                            event.route,
+                            event.source,
+                            event.target,
+                            event.phase,
+                            event.outcome_error
+                        ))
+                        .or_default() += 1;
+                }
+                routes
+            }
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for node in [&p, &b, &c] {
+        reelect(&runtime, node);
+    }
+    runtime.close().unwrap();
+}
+
+/// TK11: a primary every member still reaches is never deposed, however
+/// slowly it answers: its replies to one member are held 7 s once, past that
+/// member's network deadline, then 400 ms on each of 20 writes. Every write
+/// commits, and no member starts an attempt or promises.
+#[test]
+fn native_takeover_never_deposes_a_slow_primary() {
+    let (runtime, config) = switched_with_kv_voters("native-loss-slow", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    keep_with_paths(&runtime, &config, &[&p, &b, &c]);
+    // P's replies to C on its namespace and write routes wait for the gate.
+    let hold = |gate: &Arc<tokio::sync::Semaphore>, hits: usize| {
+        for route in [
+            crate::DFS_DATA_NAMESPACE_ROUTE,
+            crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+        ] {
+            runtime.install_fault(FaultRule {
+                source: Some(c.clone()),
+                target: Some(p.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: hits,
+                action: FaultAction::PauseAfterDispatch(Arc::clone(gate)),
+            });
+        }
+    };
+    let release_every = |gate: &Arc<tokio::sync::Semaphore>, period: Duration| {
+        let (gate, stop) = (
+            Arc::clone(gate),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let (stopped, opened) = (Arc::clone(&stop), Arc::clone(&gate));
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                std::thread::sleep(period);
+                gate.add_permits(1);
+            }
+        });
+        move || {
+            stop.store(true, Ordering::Release);
+            thread.join().unwrap();
+            // No reply stays held once the writes are done.
+            opened.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+        }
+    };
+
+    // A write through C's client to P, retried while it fails. A spent hold
+    // rule refuses further calls, so a failed attempt clears the holds.
+    let write = |path: &str| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let written = runtime.client(&c).unwrap().posix_write_file(
+                path,
+                path.as_bytes(),
+                crate::DfsWriteOptions::replicated_eventual(vec![p.clone()]),
+            );
+            match written {
+                Ok(_) => return,
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "{path} was not written: {error}");
+                    runtime.clear_faults();
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    };
+
+    // One reply held past C's network deadline: the write fails once and its
+    // retry commits.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    hold(&gate, 32);
+    let stop = release_every(&gate, Duration::from_secs(7));
+    write("/services/slow-held.txt");
+    stop();
+    runtime.clear_faults();
+    for index in 0..20 {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        hold(&gate, 32);
+        let stop = release_every(&gate, Duration::from_millis(400));
+        write(&format!("/services/slow-{index}.txt"));
+        stop();
+        runtime.clear_faults();
+    }
+    for node in [&b, &c] {
+        assert!(
+            runtime
+                .write_set_takeover_events(node)
+                .iter()
+                .all(|(_, event)| event.shard_id != config.shard_id),
+            "{node} started nothing:\n{}",
+            event_log(&runtime, &[&b, &c])
+        );
+        assert!(
+            promise_of(&runtime, node, &config).is_none(),
+            "{node} promised nothing"
+        );
+    }
+    let record = record_from(&runtime, &config, &p);
+    assert_eq!(
+        (record.shard.primary_node_id, record.shard.epoch),
+        (p, config.epoch)
+    );
+    runtime.close().unwrap();
+}
+
+/// TK13 (b): with the primary stopped, two members that judge each other
+/// unreachable both judge it lost, each ranks alone, and both promise from
+/// the same cut before either swap reaches cluster KV. Exactly one swap applies; the
+/// other settles rejected with the epoch advanced. Neither keeps a promise,
+/// and the winner commits with the other once they reach each other.
+#[test]
+fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-race", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/race");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    let held = [
+        hold_swaps(&runtime, &config, &b),
+        hold_swaps(&runtime, &config, &c),
+    ];
+    runtime.stop_node(&p).unwrap();
+    // Both candidates' own KV paths work again before they judge P lost.
+    reelect(&runtime, &c);
+    reelect(&runtime, &b);
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::NoPath, false);
+    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::NoPath, false);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("both promise", &runtime, &[&b, &c], || {
+        promise_of(&runtime, &b, &config).is_some() && promise_of(&runtime, &c, &config).is_some()
+    });
+    let (at_b, at_c) = (
+        promise_of(&runtime, &b, &config).unwrap(),
+        promise_of(&runtime, &c, &config).unwrap(),
+    );
+    assert_eq!(at_b.cut, at_c.cut, "both promised from the same cut");
+    assert_ne!(at_b.swap_request_id, at_c.swap_request_id);
+    // They stay unable to reach each other until the race is settled.
+    runtime.partition_node(
+        &b,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    drop(held);
+
+    wait_until(
+        "one swap applies and the other is superseded",
+        &runtime,
+        &[&b, &c],
+        || {
+            let swapped = [&b, &c]
+                .into_iter()
+                .filter(|node| {
+                    !shard_events(&runtime, node, &config, DfsMetadataTakeoverEvent::SWAPPED)
+                        .is_empty()
+                })
+                .count();
+            let superseded = [&b, &c]
+                .into_iter()
+                .filter(|node| {
+                    !shard_events(
+                        &runtime,
+                        node,
+                        &config,
+                        DfsMetadataTakeoverEvent::SWAP_SUPERSEDED,
+                    )
+                    .is_empty()
+                })
+                .count();
+            swapped == 1 && superseded == 1
+        },
+    );
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(
+        record.shard.epoch,
+        config.epoch + 1,
+        "exactly one epoch advance"
+    );
+    let winner = record.shard.primary_node_id.clone();
+    let loser = the_other(&winner, &b, &c);
+    assert_eq!(
+        shard_events(
+            &runtime,
+            &winner,
+            &config,
+            DfsMetadataTakeoverEvent::SWAPPED
+        )
+        .len(),
+        1
+    );
+    assert!(shard_events(&runtime, &loser, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    wait_until("no promise is left", &runtime, &[&b, &c], || {
+        promise_of(&runtime, &b, &config).is_none() && promise_of(&runtime, &c, &config).is_none()
+    });
+
+    runtime.partition_node(&b, Partition::default());
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::Path, false);
+    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::Path, false);
+    // The winner aligns the other once it reaches it; until then a commit
+    // that needs the other's acknowledgement ends unknown.
+    let after = commit_mode_eventually(
+        &runtime,
+        &record.shard,
+        &winner,
+        "/services/race",
+        0o600,
+        "race-after",
+    );
+    catch_up_from(&runtime, &record.shard, &winner, &[&loser]);
+    wait_until(
+        "the winner commits with the other",
+        &runtime,
+        &[&b, &c],
+        || {
+            [&b, &c]
+                .into_iter()
+                .all(|member| object_mode(&runtime, member, &config, &after) == Some(0o600))
+        },
+    );
+    runtime.close().unwrap();
+}
+
+/// A two-member write set {P, B} with P alive and keeping: C leaves the
+/// write set first, and B, which alone judges P lost, asks nobody.
+fn two_member_write_set(name: &str) -> (DfsTestRuntime, DfsMetadataShardConfig) {
+    let (runtime, config) = switched_with_kv_voters(name, Some((1, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, &format!("/services/{name}"));
+    }
+    catch_up(&runtime, &config, &b);
+    shrink(&runtime, &config, &c, 1);
+    keep_with_paths(&runtime, &config, &[&p, &b]);
+    (runtime, config)
+}
+
+/// Once B's attempt has promised with its swap held, P, alive, writes: B
+/// refuses P's epoch and P's keeper shrinks it, leaving the epoch unchanged.
+fn shrunk_while_promised(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, name: &str) {
+    let p = &config.primary_node_id;
+    let b = &config.replica_node_ids[0];
+    let fenced = try_mode_at(
+        runtime,
+        config,
+        p,
+        &format!("/services/{name}"),
+        0o640,
+        &format!("{name}-fenced"),
+        None,
+    );
+    assert!(
+        fenced.is_err(),
+        "a promised member cannot acknowledge: {fenced:?}"
+    );
+    wait_until("P's keeper shrinks B", runtime, &[p, b], || {
+        !write_set_of(runtime, config).contains(b)
+    });
+    assert!(
+        runtime
+            .write_set_keeping_events(p)
+            .iter()
+            .any(|(name, event)| {
+                name == crate::DfsMetadataWriteSetEvent::SHRUNK
+                    && event.cause == "member-fenced"
+                    && event.node_ids.contains(b)
+            })
+    );
+    assert_eq!(record_from(runtime, config, p).shard.epoch, config.epoch);
+}
+
+/// B's swap settles rejected with the epoch unchanged, its promise is
+/// released and its fence is back at the epoch it promised at; P's next
+/// write catches it up and P's keeper re-adds it.
+fn released_and_re_added(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, name: &str) {
+    let p = &config.primary_node_id;
+    let b = &config.replica_node_ids[0];
+    wait_until("B releases its promise", runtime, &[p, b], || {
+        !shard_events(
+            runtime,
+            b,
+            config,
+            DfsMetadataTakeoverEvent::PROMISE_RELEASED,
+        )
+        .is_empty()
+    });
+    assert!(
+        promise_of(runtime, b, config).is_none(),
+        "{:?}\n{}\n{:?}",
+        member_state(runtime, b, config),
+        event_log(runtime, &[p, b]),
+        shard_events(
+            runtime,
+            b,
+            config,
+            DfsMetadataTakeoverEvent::PROMISE_RELEASED
+        )
+    );
+    assert!(
+        member_state(runtime, b, config)
+            .is_none_or(|state| state.accept_from_epoch <= config.epoch),
+        "B's fence is back at the epoch: {:?}",
+        member_state(runtime, b, config)
+    );
+    assert!(shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    runtime.set_peer_verdict(b, p, PeerPathVerdict::Path, false);
+    // P's writes bring B back. The fenced change may still commit by the
+    // recovery the shrink requests, so each write retries under a fresh
+    // lookup; and a join that fails waits for the next change, so the
+    // write is repeated until B is re-added.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    for round in 0.. {
+        commit_mode_eventually(
+            runtime,
+            config,
+            p,
+            &format!("/services/{name}"),
+            0o600,
+            &format!("{name}-after-{round}"),
+        );
+        let settle = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < settle && !write_set_of(runtime, config).contains(b) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if write_set_of(runtime, config).contains(b) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "P's keeper re-adds B:\n{}\nkeeping {:?}",
+            event_log(runtime, &[p, b]),
+            runtime.write_set_keeping_events(p)
+        );
+    }
+    let record = record_from(runtime, config, p);
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (p.clone(), config.epoch)
+    );
+}
+
+/// TK14: B promises while its swap is held; P, alive, shrinks B; B's swap is
+/// then rejected with the epoch unchanged, B releases, catches up and is
+/// re-added.
+#[test]
+fn native_takeover_shrink_race_releases_the_promise() {
+    let name = "native-loss-shrink-race";
+    let (runtime, config) = two_member_write_set(name);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let held = hold_swaps(&runtime, &config, &b);
+    lose(&runtime, &[&b], &p);
+    wait_until("B promises", &runtime, &[&p, &b], || {
+        promise_of(&runtime, &b, &config).is_some()
+    });
+    shrunk_while_promised(&runtime, &config, name);
+    drop(held);
+    released_and_re_added(&runtime, &config, name);
+    runtime.close().unwrap();
+}
+
+/// TK20: B promises, and its swap is stuck unknown because a partition cuts
+/// B off from cluster KV while P still reaches it over DFS. B answers P's
+/// epoch with its fence and P's keeper shrinks it at the floor of one. Once
+/// B's KV returns, its re-sent swap settles rejected with the epoch
+/// unchanged; B releases and is re-added.
+#[test]
+fn native_takeover_stuck_swap_of_a_kv_isolated_candidate_releases() {
+    let name = "native-loss-stuck-swap";
+    let (runtime, config) = two_member_write_set(name);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let held = hold_swaps(&runtime, &config, &b);
+    lose(&runtime, &[&b], &p);
+    wait_until("B promises", &runtime, &[&p, &b], || {
+        promise_of(&runtime, &b, &config).is_some()
+    });
+    runtime.partition_node(
+        &b,
+        Partition {
+            kv: true,
+            dfs: false,
+        },
+    );
+    drop(held);
+    shrunk_while_promised(&runtime, &config, name);
+    assert!(
+        promise_of(&runtime, &b, &config).is_some(),
+        "the cut-off candidate's outcome stays unknown"
+    );
+    runtime.partition_node(&b, Partition::default());
+    released_and_re_added(&runtime, &config, name);
+    // The returned voter's higher term makes the voters elect again; let
+    // that settle before the nodes stop, so no KV call outlives the close.
+    for node in [&p, &b] {
+        reelect(&runtime, node);
+    }
+    runtime.close().unwrap();
+}
+
+/// TK15: the reply of the candidate's committed swap is lost. Its re-send of
+/// the identical request returns the committed outcome: exactly one epoch
+/// advance, one swapped event, and the record's last change is the promise.
+#[test]
+fn native_takeover_lost_swap_reply_settles_from_its_own_outcome() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-lost-reply", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    let lost = Arc::new(AtomicUsize::new(0));
+    let hooks = [&b, &c].map(|node| {
+        let (config, lost) = (config.clone(), Arc::clone(&lost));
+        runtime
+            .native_kv_reply_hook(node, move |request| {
+                if writes_the_write_set(&config, request)
+                    && lost.fetch_add(1, Ordering::AcqRel) == 0
+                {
+                    Err(ServiceError::Network(NetworkError::delivery_failed(
+                        "native fixture lost swap reply",
+                        NetworkDeliveryState::PossiblyApplied,
+                        "the committed reply was lost",
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap()
+    });
+    runtime.stop_node(&p).unwrap();
+    reelect(&runtime, &b);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("a member takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id != p
+    });
+    let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
+    wait_until("the winner reports its swap", &runtime, &[&b, &c], || {
+        !shard_events(
+            &runtime,
+            &winner,
+            &config,
+            DfsMetadataTakeoverEvent::SWAPPED,
+        )
+        .is_empty()
+    });
+    assert!(
+        lost.load(Ordering::Acquire) >= 2,
+        "the reply was lost and the swap re-sent"
+    );
+    drop(hooks);
+    let swapped = shard_events(
+        &runtime,
+        &winner,
+        &config,
+        DfsMetadataTakeoverEvent::SWAPPED,
+    );
+    assert_eq!(swapped.len(), 1, "{}", event_log(&runtime, &[&b, &c]));
+    let other = the_other(&winner, &b, &c);
+    assert!(shard_events(&runtime, &other, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(
+        record.shard.epoch,
+        config.epoch + 1,
+        "exactly one epoch advance"
+    );
+    let last = record
+        .write_set_state()
+        .switched()
+        .unwrap()
+        .last_change
+        .clone();
+    if matches!(
+        last.kind,
+        crate::DfsMetadataShardWriteSetChangeKind::Takeover { .. }
+    ) {
+        assert_eq!(Some(last.change_id), swapped[0].swap_request_id);
+    }
+    wait_until("the winner's promise ends", &runtime, &[&b, &c], || {
+        promise_of(&runtime, &winner, &config).is_none()
+    });
+    runtime.close().unwrap();
+}
+
+/// TK17: the members are on the minority side of a cluster-KV partition. One
+/// member judges the live primary lost and the other, which still reaches it,
+/// vetoes. Then the other judges it lost too and is asked to take over as the
+/// first-ranked member: it declines, because it cannot confirm the record
+/// without a KV quorum, or its keeper cannot evaluate the shard at all.
+/// Neither promises, and the record is unchanged once KV returns.
+#[test]
+fn native_takeover_on_the_kv_minority_side_promises_nothing() {
+    let (runtime, config) = switched_with_kv_voters("native-loss-minority", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    // The member ranked first by journal head, then node id, is asked.
+    let mut ranking = [&b, &c]
+        .map(|node| crate::takeover_corroboration::DfsTakeoverRank {
+            node_id: node.clone(),
+            journal_sequence: journal_head(&runtime, node, &config),
+            mobile: false,
+        })
+        .to_vec();
+    ranking.sort_by(|left, right| {
+        right
+            .journal_sequence
+            .cmp(&left.journal_sequence)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    let first = ranking[0].node_id.clone();
+    let asker = ranking[1].node_id.clone();
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    lose(&runtime, &[&asker], &p);
+    wait_until("the other member vetoes", &runtime, &[&b, &c], || {
+        shard_events(
+            &runtime,
+            &asker,
+            &config,
+            DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
+        )
+        .iter()
+        .any(|event| event.node_ids == vec![first.clone()])
+    });
+    let record = record_from(&runtime, &config, &asker);
+
+    for member in [&b, &c] {
+        runtime.partition_node(
+            member,
+            Partition {
+                kv: true,
+                dfs: false,
+            },
+        );
+    }
+    lose(&runtime, &[&first], &p);
+    let mut request = super::takeover_native_tests::corroboration_request(&config, &record, &asker);
+    request.kind = crate::takeover_corroboration::DfsTakeoverCorroborationKind::HandOff { ranking };
+    let reply = super::takeover_native_tests::ask(&runtime, &asker, &first, &request);
+    match reply.hand_off {
+        Some(crate::takeover_corroboration::DfsTakeoverHandOffOutcome::Declined {
+            reason, ..
+        }) => {
+            assert!(reason == "no-quorum" || reason == "unavailable", "{reason}")
+        }
+        other => panic!("the first-ranked member cannot take over on the minority side: {other:?}"),
+    }
+    for node in [&b, &c] {
+        assert!(
+            promise_of(&runtime, node, &config).is_none(),
+            "{node} promised nothing:\n{}",
+            event_log(&runtime, &[&b, &c])
+        );
+        assert!(
+            shard_events(&runtime, node, &config, DfsMetadataTakeoverEvent::PROMISED).is_empty()
+        );
+    }
+    // The members reach P again before KV returns, so nothing follows.
+    for member in [&b, &c] {
+        runtime.set_peer_verdict(member, &p, PeerPathVerdict::Path, false);
+    }
+    for member in [&b, &c] {
+        runtime.partition_node(member, Partition::default());
+    }
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(
+        (record.shard.primary_node_id, record.shard.epoch),
+        (p, config.epoch)
+    );
+    for node in [&b, &c] {
+        reelect(&runtime, node);
+    }
+    runtime.close().unwrap();
+}
+
+/// TK16 with the candidate shrunk while it is down: B stops between its
+/// durable promise and its swap, and P, alive, shrinks it out of the write
+/// set meanwhile. Restarted outside the write set, B still settles its
+/// promise by re-sending the identical swap, which is rejected with the
+/// epoch unchanged; B releases the promise and is re-added.
+#[test]
+fn native_takeover_promise_of_a_candidate_shrunk_while_down_is_released() {
+    let name = "native-loss-shrunk-down";
+    let (mut runtime, config) = two_member_write_set(name);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    runtime.stop_takeover_after_promise(&b, true);
+    lose(&runtime, &[&b], &p);
+    wait_until("B promises", &runtime, &[&p, &b], || {
+        promise_of(&runtime, &b, &config).is_some()
+    });
+    runtime.stop_node(&b).unwrap();
+    runtime.stop_takeover_after_promise(&b, false);
+    runtime.set_peer_verdict(&p, &b, PeerPathVerdict::NoPath, false);
+    wait_until("P's keeper shrinks B", &runtime, &[&p], || {
+        !write_set_of(&runtime, &config).contains(&b)
+    });
+    runtime.reopen_node(b.clone()).unwrap();
+    runtime.set_peer_verdict(&p, &b, PeerPathVerdict::Path, false);
+    released_and_re_added(&runtime, &config, name);
+    runtime.close().unwrap();
+}
+
+/// TK7: a member that is offline across two takeovers returns with a
+/// prefix that diverges below the current epoch start, and is repaired by
+/// snapshot. C acknowledged X, which the old primary never committed and the
+/// first successor B never received; B commits Y in X's place. P, re-added
+/// by B, takes over from B in turn and commits Z. When C returns, its journal
+/// differs from the current history where it ends, so the new primary
+/// installs a snapshot on it before re-adding it: Y and Z are intact on C
+/// and X is not committed there.
+#[test]
+fn native_takeover_member_with_a_divergent_prefix_is_repaired_by_snapshot() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-divergent", Some((1, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let current = {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/divergent")
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&p, &b]);
+    // X is prepared on P and C while B is cut off from DFS.
+    runtime.partition_node(
+        &b,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    prepare_unknown(&runtime, &config, &current, "divergent-x");
+    // C's acknowledgement of X can land after P's attempt ended.
+    wait_until("C holds X past B's head", &runtime, &[&b, &c], || {
+        journal_head(&runtime, &c, &config) > journal_head(&runtime, &b, &config)
+    });
+
+    // C goes offline; P's keeper shrinks it.
+    runtime.stop_node(&c).unwrap();
+    for observer in [&p, &b] {
+        runtime.set_peer_verdict(observer, &c, PeerPathVerdict::NoPath, false);
+    }
+    wait_until("P's keeper shrinks C", &runtime, &[&p, &b], || {
+        !write_set_of(&runtime, &config).contains(&c)
+    });
+
+    // First takeover: P is cut off from DFS before B reaches anyone again,
+    // so B never receives X, and B takes over without it.
+    runtime.partition_node(
+        &p,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    runtime.partition_node(&b, Partition::default());
+    lose(&runtime, &[&b], &p);
+    wait_until("B takes over", &runtime, &[&b], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id == b
+    });
+    let first = record_from(&runtime, &config, &b);
+    assert_eq!(first.shard.epoch, config.epoch + 1);
+    let first_start = first
+        .write_set_state()
+        .switched()
+        .and_then(|write_set| write_set.epoch_start.clone())
+        .expect("the takeover epoch names its start");
+    assert!(
+        first_start.journal_sequence < journal_head(&runtime, &c, &config),
+        "B's epoch starts below X"
+    );
+    wait_until("B activates", &runtime, &[&b], || {
+        !shard_events(&runtime, &b, &config, DfsMetadataTakeoverEvent::ACTIVATED).is_empty()
+    });
+    commit_mode_eventually(
+        &runtime,
+        &first.shard,
+        &b,
+        "/services/divergent",
+        0o600,
+        "divergent-y",
+    );
+
+    // B reaches P again and re-adds it; P drops X on alignment.
+    runtime.partition_node(&p, Partition::default());
+    runtime.set_peer_verdict(&b, &p, PeerPathVerdict::Path, false);
+    wait_until("B re-adds P", &runtime, &[&b], || {
+        write_set_of(&runtime, &config).contains(&p)
+    });
+
+    // Second takeover: B is cut off from DFS, and P takes over.
+    runtime.partition_node(
+        &b,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    lose(&runtime, &[&p], &b);
+    wait_until("P takes over", &runtime, &[&p], || {
+        record_from(&runtime, &config, &p).shard.primary_node_id == p
+    });
+    let second = record_from(&runtime, &config, &p);
+    assert_eq!(second.shard.epoch, config.epoch + 2);
+    wait_until("P activates", &runtime, &[&p], || {
+        shard_events(&runtime, &p, &config, DfsMetadataTakeoverEvent::ACTIVATED)
+            .iter()
+            .any(|event| event.epoch == config.epoch + 1)
+    });
+    commit_mode_eventually(
+        &runtime,
+        &second.shard,
+        &p,
+        "/services/divergent",
+        0o644,
+        "divergent-z",
+    );
+    let start = second
+        .write_set_state()
+        .switched()
+        .and_then(|write_set| write_set.epoch_start.clone())
+        .expect("the takeover epoch names its start");
+    let behind = super::commit_native_tests::durable_prefix(&runtime, &c, &config)
+        .expect("C holds a journal");
+    assert!(
+        behind.journal_sequence < start.journal_sequence,
+        "C's journal ends below the epoch start: {behind:?} {start:?}"
+    );
+
+    // C returns: P's keeper repairs it by snapshot and re-adds it.
+    runtime.reopen_node(c.clone()).unwrap();
+    runtime.set_peer_verdict(&p, &c, PeerPathVerdict::Path, false);
+    wait_until("P re-adds C", &runtime, &[&p], || {
+        write_set_of(&runtime, &config).contains(&c)
+    });
+    let shard_root_of_c = shard_root(&runtime, &c, &config);
+    assert!(
+        std::fs::read_dir(&shard_root_of_c)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains("archive")),
+        "a snapshot install archived C's divergent store"
+    );
+    catch_up_from(
+        &runtime,
+        &record_from(&runtime, &config, &p).shard,
+        &p,
+        &[&c],
+    );
+    assert_eq!(
+        object_mode(&runtime, &c, &config, &current.object_id),
+        Some(0o644),
+        "the committed changes are intact on C"
+    );
+    assert_eq!(
+        super::commit_native_tests::durable_prefix(&runtime, &c, &config),
+        super::commit_native_tests::durable_prefix(&runtime, &p, &config),
+        "C holds the new primary's history"
+    );
+    assert_ne!(
+        operation_status(&runtime, &c, &config, "divergent-x"),
+        Some(crate::DfsPreparedOperationStatus::Committed)
+    );
+    runtime.close().unwrap();
+}

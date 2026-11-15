@@ -82,8 +82,9 @@ pub use crate::test_runtime::{
     DfsTestControlPlaneProbe, DfsTestMaintenanceObservation, DfsTestNativeConfigurationFault,
     DfsTestNativeKvHookRegistration, DfsTestRuntime, FaultAction as DfsTestFaultAction,
     FaultRule as DfsTestFaultRule, NativeNamespaceReadCapture as DfsTestNamespaceReadCapture,
-    RpcObservation as DfsTestRpcObservation, RpcOrigin as DfsTestRpcOrigin,
-    RpcPhase as DfsTestRpcPhase, SourceAdoptionFaultPhase as DfsTestSourceAdoptionFaultPhase,
+    Partition as DfsTestPartition, RpcObservation as DfsTestRpcObservation,
+    RpcOrigin as DfsTestRpcOrigin, RpcPhase as DfsTestRpcPhase,
+    SourceAdoptionFaultPhase as DfsTestSourceAdoptionFaultPhase,
     StageExchangeCapture as DfsTestStageExchangeCapture,
 };
 use crate::*;
@@ -106,8 +107,44 @@ pub fn current_native_metadata_service(
     ),
     String,
 > {
+    current_native_metadata_service_on(name, node_count, path, false)
+}
+
+/// [`current_native_metadata_service`] with every node a cluster-KV voter,
+/// so a lost node, the KV leader included, leaves a voter quorum.
+pub fn current_native_metadata_service_with_kv_voters(
+    name: &str,
+    node_count: usize,
+    path: &str,
+) -> Result<
+    (
+        DfsTestRuntime,
+        NetworkedDfsService<DfsNodeTransport>,
+        DfsMetadataShardConfig,
+    ),
+    String,
+> {
+    current_native_metadata_service_on(name, node_count, path, true)
+}
+
+fn current_native_metadata_service_on(
+    name: &str,
+    node_count: usize,
+    path: &str,
+    kv_voters: bool,
+) -> Result<
+    (
+        DfsTestRuntime,
+        NetworkedDfsService<DfsNodeTransport>,
+        DfsMetadataShardConfig,
+    ),
+    String,
+> {
     let nodes = DfsTestRuntime::ordered_node_ids(name, node_count);
     let mut runtime = DfsTestRuntime::new(name, nodes[0].clone())?;
+    if kv_voters {
+        runtime.use_kv_voters()?;
+    }
     for node in &nodes[1..] {
         runtime.define_node(node.clone())?;
     }

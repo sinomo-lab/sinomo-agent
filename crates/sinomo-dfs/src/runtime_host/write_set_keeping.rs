@@ -72,12 +72,7 @@ pub(crate) async fn run_dfs_write_set_keeping(
         if !keeping_suspended(&keeper.data_dir) {
             keeper.evaluate();
         } else {
-            for (_, reply) in super::write_set_takeover::take_takeover_hand_offs(&keeper.local) {
-                let _ = reply.send(crate::takeover_corroboration::DfsTakeoverHandOffOutcome::Declined {
-                    reason: "keeping-suspended".into(),
-                    prefer: None,
-                });
-            }
+            super::write_set_takeover::decline_takeover_hand_offs(&keeper.local);
         }
         #[cfg(any(test, feature = "test-support"))]
         let test_wake = test_control.notified();
@@ -233,6 +228,8 @@ impl Keeper {
             .entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
             .map(<[_]>::to_vec)
         else {
+            // A hand-off asker waits without a deadline: answer it now.
+            super::write_set_takeover::decline_takeover_hand_offs(&self.local);
             return;
         };
         let mut unreachable_primaries = BTreeSet::new();
@@ -313,6 +310,11 @@ impl Keeper {
         }
         self.retire_reached_member_fences(&entries, &member_shards);
         let takeover_shards = takeover_shards(&entries, &member_shards);
+        // A hand-off needs only the record, never the member facts below, so
+        // it is answered on every evaluation.
+        for (hand_off, reply) in super::write_set_takeover::take_takeover_hand_offs(&self.local) {
+            self.takeover.hand_off(&takeover_shards, hand_off, reply);
+        }
         // Network verdicts are needed only while this node is primary of a
         // switched shard, or a write-set member that may take one over: an
         // unswitched shard is never shrunk, re-added, recruited for or taken
@@ -354,9 +356,6 @@ impl Keeper {
             if let Some(shard) = takeover_shards.iter().find(|shard| shard.key == key) {
                 self.takeover.align_members(shard, members);
             }
-        }
-        for (hand_off, reply) in super::write_set_takeover::take_takeover_hand_offs(&self.local) {
-            self.takeover.hand_off(&takeover_shards, hand_off, reply);
         }
         for (key, (shard, shards)) in primary_shards {
             self.evaluate_shard(&key, &shard, &shards, &snapshot, &entries, &members, &verdicts);

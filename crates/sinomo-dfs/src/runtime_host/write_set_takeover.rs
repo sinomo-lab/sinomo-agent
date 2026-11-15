@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 
 mod candidate;
 mod steps;
-pub(super) use candidate::{TakeoverCompletion, TakeoverRole, TakeoverShard};
+pub(super) use candidate::{HAND_OFF_UNAVAILABLE, TakeoverCompletion, TakeoverRole, TakeoverShard};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use steps::test_hooks::{
     hold_takeover_activation_for_test, stop_takeover_after_promise_for_test,
@@ -326,11 +326,11 @@ async fn run_or_decline_hand_off(
                     primary: request.primary_node_id.clone(),
                 },
             ) else {
-                return decline("no-keeper", None);
+                return decline(HAND_OFF_UNAVAILABLE, None);
             };
             outcome
                 .await
-                .unwrap_or_else(|_| decline("keeper-stopped", None))
+                .unwrap_or_else(|_| decline(HAND_OFF_UNAVAILABLE, None))
         }
     }
 }
@@ -392,12 +392,17 @@ impl Drop for TakeoverKeeperRegistration {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&self.0);
-        for (_, reply) in take_takeover_hand_offs(&self.0) {
-            let _ = reply.send(DfsTakeoverHandOffOutcome::Declined {
-                reason: "keeper-stopped".into(),
-                prefer: None,
-            });
-        }
+        decline_takeover_hand_offs(&self.0);
+    }
+}
+
+/// Answer every hand-off posted for `local`'s keeper that it cannot run now.
+pub(super) fn decline_takeover_hand_offs(local: &NodeId) {
+    for (_, reply) in take_takeover_hand_offs(local) {
+        let _ = reply.send(DfsTakeoverHandOffOutcome::Declined {
+            reason: HAND_OFF_UNAVAILABLE.into(),
+            prefer: None,
+        });
     }
 }
 

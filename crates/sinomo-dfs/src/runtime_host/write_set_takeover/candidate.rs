@@ -72,7 +72,27 @@ pub(in crate::runtime_host) enum TakeoverCompletion {
         members: Vec<NodeId>,
         result: Result<Vec<(NodeId, crate::DfsWriteSetAlignment)>, String>,
     },
+    /// This node's own confirm read after the member it handed off to could
+    /// not reach cluster KV.
+    Rechecked {
+        key: ShardKey,
+        attempt: String,
+        confirmed: bool,
+    },
 }
+
+/// A hand-off target's decline that says it could not reach cluster KV, or
+/// could not run the attempt at all, rather than that it should not take
+/// over. It may be momentary: the KV voters may still be electing.
+fn declined_for_availability(outcome: &DfsTakeoverHandOffOutcome) -> bool {
+    matches!(outcome, DfsTakeoverHandOffOutcome::Declined { reason, .. }
+        if reason == HAND_OFF_NO_QUORUM || reason == HAND_OFF_UNAVAILABLE)
+}
+
+/// The decline of a hand-off target whose confirm read failed.
+pub(in crate::runtime_host) const HAND_OFF_NO_QUORUM: &str = "no-quorum";
+/// The decline of a hand-off target whose keeper could not evaluate it.
+pub(in crate::runtime_host) const HAND_OFF_UNAVAILABLE: &str = "unavailable";
 
 struct Attempt {
     id: String,
@@ -100,6 +120,19 @@ enum Step {
         to: NodeId,
         entries: BTreeMap<NodeId, DfsTakeoverRoundEntry>,
         declined: BTreeSet<NodeId>,
+        /// The target already declined once for availability, and this node
+        /// then read the record itself: another such decline is final.
+        rechecked: bool,
+        request: DfsMetadataTakeoverCorroborationRequest,
+    },
+    /// The target declined for availability; this node reads the record
+    /// itself before asking it once more.
+    Rechecking {
+        local: DfsTakeoverRank,
+        to: NodeId,
+        entries: BTreeMap<NodeId, DfsTakeoverRoundEntry>,
+        declined: BTreeSet<NodeId>,
+        request: DfsMetadataTakeoverCorroborationRequest,
     },
     Taking,
     Unknown {
@@ -214,6 +247,14 @@ impl TakeoverRole {
             }
             if !write_set.contains(&self.local) {
                 self.drop_unless_settling(&shard.key);
+                // A promise on disk from before this process started is
+                // settled by its own swap's outcome even once the record has
+                // moved this node out of the write set: until then it accepts
+                // nothing at the promised epoch, so it could not be re-added.
+                if self.resumed.insert(shard.key.clone()) && !self.attempts.contains_key(&shard.key)
+                {
+                    self.resume_promise(shard);
+                }
                 continue;
             }
             let primary = &shard.shard.primary_node_id;
@@ -295,7 +336,7 @@ impl TakeoverRole {
         }
         if let Some(attempt) = self.attempts.get_mut(&shard.key) {
             match attempt.step {
-                Step::Corroborating { .. } | Step::HandingOff { .. } => {
+                Step::Corroborating { .. } | Step::HandingOff { .. } | Step::Rechecking { .. } => {
                     attempt.step = Step::Taking;
                     attempt.reply = Some(reply);
                     self.spawn_take(shard);
@@ -525,7 +566,7 @@ impl TakeoverRole {
                 }
                 Next::Decide
             }
-            Step::HandingOff { .. } => Next::Nothing,
+            Step::HandingOff { .. } | Step::Rechecking { .. } => Next::Nothing,
         };
         match next {
             Next::Nothing => {}
@@ -603,6 +644,8 @@ impl TakeoverRole {
                         to: to.clone(),
                         entries,
                         declined,
+                        rechecked: false,
+                        request: request.clone(),
                     };
                 }
                 let mut event = self.event(&key, None, answers);
@@ -717,6 +760,8 @@ impl TakeoverRole {
                             to,
                             entries,
                             declined,
+                            rechecked,
+                            request,
                         },
                     ..
                 }) = self.attempts.get(&key)
@@ -726,7 +771,8 @@ impl TakeoverRole {
                 if id != &attempt || to != &member {
                     return None;
                 }
-                match reply.and_then(|reply| reply.hand_off) {
+                let outcome = reply.and_then(|reply| reply.hand_off);
+                match outcome {
                     Some(
                         DfsTakeoverHandOffOutcome::Swapped | DfsTakeoverHandOffOutcome::Followed,
                     ) => {
@@ -737,7 +783,28 @@ impl TakeoverRole {
                             };
                         }
                     }
-                    // A decline or a failed call: rank again without it.
+                    // The higher-ranked member could not reach cluster KV,
+                    // which may be momentary. This node reads the record
+                    // itself first: if it cannot either, neither proceeds;
+                    // if it can, a quorum is serving and the target is asked
+                    // once more before this node takes over in its place.
+                    Some(outcome) if declined_for_availability(&outcome) && !rechecked => {
+                        let step = Step::Rechecking {
+                            local: local.clone(),
+                            to: to.clone(),
+                            entries: entries.clone(),
+                            declined: declined.clone(),
+                            request: request.clone(),
+                        };
+                        if let Some(current) = self.attempts.get_mut(&key) {
+                            current.step = step;
+                        }
+                        if let Some(shard) = shard_for(&key) {
+                            self.spawn_recheck(shard);
+                        }
+                    }
+                    // Any other decline, a second availability decline or a
+                    // failed call: rank again without it.
                     _ => {
                         let (local, entries) = (local.clone(), entries.clone());
                         let mut declined = declined.clone();
@@ -755,6 +822,47 @@ impl TakeoverRole {
             } => {
                 let epoch = shard_for(&key).map(|shard| shard.shard.epoch);
                 self.taken(key, attempt, outcome, epoch);
+            }
+            TakeoverCompletion::Rechecked {
+                key,
+                attempt,
+                confirmed,
+            } => {
+                #[cfg(any(test, feature = "test-support"))]
+                super::record_takeover_trace_for_test(
+                    &self.data_dir,
+                    format!("recheck {attempt}: confirmed={confirmed}"),
+                );
+                let current = self.attempts.get_mut(&key)?;
+                if current.id != attempt {
+                    return None;
+                }
+                let Step::Rechecking {
+                    local,
+                    to,
+                    entries,
+                    declined,
+                    request,
+                } = std::mem::replace(&mut current.step, Step::Taking)
+                else {
+                    return None;
+                };
+                if !confirmed {
+                    // Neither can reach cluster KV now: the attempt ends on
+                    // its own evidence, as a failed confirm read does.
+                    self.end_standing(&key);
+                    self.attempts.remove(&key);
+                    return None;
+                }
+                current.step = Step::HandingOff {
+                    local,
+                    to: to.clone(),
+                    entries,
+                    declined,
+                    rechecked: true,
+                    request: request.clone(),
+                };
+                self.spawn_ask(key, to, request, true);
             }
             TakeoverCompletion::Resend { key, attempt } => {
                 if let Some(current) = self.attempts.get_mut(&key)
@@ -855,7 +963,7 @@ impl TakeoverRole {
                 },
                 TakeOutcome::NotTaken { follow: true, .. } => DfsTakeoverHandOffOutcome::Followed,
                 TakeOutcome::NotTaken { .. } => DfsTakeoverHandOffOutcome::Declined {
-                    reason: "no-quorum".into(),
+                    reason: HAND_OFF_NO_QUORUM.into(),
                     prefer: None,
                 },
                 TakeOutcome::Failed { reason } => DfsTakeoverHandOffOutcome::Declined {
@@ -1163,6 +1271,41 @@ impl TakeoverRole {
                 key,
                 attempt: id,
                 outcome,
+            });
+        });
+    }
+
+    /// Read the record as the confirm step does, without promising.
+    fn spawn_recheck(&self, shard: &TakeoverShard) {
+        let Some(attempt) = self.attempts.get(&shard.key) else {
+            return;
+        };
+        let (cluster_paths, runtime, local, done) = (
+            self.cluster_paths.clone(),
+            self.runtime.clone(),
+            self.local.clone(),
+            self.done.clone(),
+        );
+        let key = shard.key.clone();
+        let (id, epoch, primary) = (attempt.id.clone(), attempt.epoch, attempt.primary.clone());
+        let members = crate::metadata_shard_configured_node_ids(&shard.shard)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.runtime.spawn_blocking(move || {
+            let confirmed = super::steps::confirm_metadata_takeover_record(
+                &cluster_paths,
+                &runtime,
+                &local,
+                &key,
+                epoch,
+                &primary,
+                &members,
+            )
+            .is_ok();
+            let _ = done.send(TakeoverCompletion::Rechecked {
+                key,
+                attempt: id,
+                confirmed,
             });
         });
     }

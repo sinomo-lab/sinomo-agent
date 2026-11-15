@@ -758,7 +758,7 @@ fn native_takeover_promise_refuses_the_primary_whose_keeper_shrinks_the_candidat
     runtime.close().unwrap();
 }
 
-fn corroboration_request(
+pub(super) fn corroboration_request(
     config: &DfsMetadataShardConfig,
     record: &DfsMetadataShardRecordCut,
     candidate: &NodeId,
@@ -776,7 +776,7 @@ fn corroboration_request(
     }
 }
 
-fn ask(
+pub(super) fn ask(
     runtime: &crate::test_support::DfsTestRuntime,
     asker: &NodeId,
     member: &NodeId,

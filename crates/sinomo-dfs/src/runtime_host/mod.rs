@@ -644,6 +644,8 @@ struct TestDfsClusterQuorumHost {
 #[derive(Default)]
 pub(crate) struct DfsTestClusterPeerBridge {
     peers: Mutex<BTreeMap<NodeId, (SinomoDataDir, Arc<std::sync::atomic::AtomicBool>)>>,
+    /// Nodes a partition cuts off from every other node's KV traffic.
+    kv_partitioned: Mutex<std::collections::BTreeSet<NodeId>>,
     fanout: Arc<tokio::sync::Mutex<()>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<Result<(), sinomo_core::network::NetworkError>>>>,
     native_effects:
@@ -664,14 +666,38 @@ impl DfsTestClusterPeerBridge {
             .insert(node, (data, available));
     }
 
+    /// Cut `node` off from every other node's KV traffic, both ways, or
+    /// restore it.
+    pub(crate) fn set_kv_partitioned(&self, node: &NodeId, partitioned: bool) {
+        let mut cut = self
+            .kv_partitioned
+            .lock()
+            .expect("native fixture KV partitions");
+        if partitioned {
+            cut.insert(node.clone());
+        } else {
+            cut.remove(node);
+        }
+    }
+
     /// The live KV store of `node`, as seen by the caller with `state`. A
     /// configured member that is not running fails as a routed call to a
-    /// dead peer does; only a node outside the membership is unknown.
+    /// dead peer does; only a node outside the membership is unknown. A
+    /// partition between the two fails the same way.
     fn paths(
         &self,
         state: &sinomo_core::ClusterBootstrapState,
         node: &NodeId,
     ) -> Result<ClusterPaths, sinomo_core::network::NetworkError> {
+        if state.local_node_id != *node {
+            let cut = self
+                .kv_partitioned
+                .lock()
+                .expect("native fixture KV partitions");
+            if cut.contains(node) || cut.contains(&state.local_node_id) {
+                return Err(partitioned_test_peer(node));
+            }
+        }
         let peers = self.peers.lock().expect("native fixture peer registry");
         match peers.get(node) {
             Some((data, available)) if available.load(Ordering::Acquire) => {
@@ -885,6 +911,18 @@ pub(crate) fn unavailable_test_kv_peer(
         sinomo_core::network::NetworkError::UnknownNode {
             node_id: node.clone(),
         }
+    }
+}
+
+/// What a caller sees for a peer a partition cuts it off from: the routed
+/// session cannot be established and nothing is sent, as for a dead peer.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn partitioned_test_peer(node: &NodeId) -> sinomo_core::network::NetworkError {
+    sinomo_core::network::NetworkError::RetryExhausted {
+        operation: format!("establish routed session to {node}"),
+        attempts: 1,
+        delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+        detail: "native fixture partition".to_string(),
     }
 }
 

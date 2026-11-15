@@ -48,6 +48,9 @@ pub(super) struct DfsPeerVerdicts {
     subscription: Option<sinomo_core::network::PeerReachabilitySubscription>,
     #[cfg(any(test, feature = "test-support"))]
     test: std::path::PathBuf,
+    /// The test verdict generation this role last read or woke for.
+    #[cfg(any(test, feature = "test-support"))]
+    test_seen: std::sync::atomic::AtomicU64,
 }
 
 impl DfsPeerVerdicts {
@@ -62,6 +65,8 @@ impl DfsPeerVerdicts {
             subscription: None,
             #[cfg(any(test, feature = "test-support"))]
             test: _data_dir.root(),
+            #[cfg(any(test, feature = "test-support"))]
+            test_seen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -84,6 +89,8 @@ impl DfsPeerVerdicts {
     pub(super) fn current(&self) -> DfsPeerVerdictSnapshot {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(snapshot) = test_seam::snapshot(&self.test) {
+            self.test_seen
+                .store(snapshot.generation, std::sync::atomic::Ordering::Release);
             return snapshot;
         }
         self.subscription
@@ -107,8 +114,22 @@ impl DfsPeerVerdicts {
     pub(super) async fn changed(&mut self) {
         #[cfg(any(test, feature = "test-support"))]
         if test_seam::installed(&self.test) {
+            // A verdict set while this role was not waiting is not lost: as
+            // with the network's watch, a generation it has not seen ends
+            // the wait at once.
             let wake = test_seam::wake(&self.test);
-            wake.notified().await;
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let generation = test_seam::generation(&self.test);
+            if self
+                .test_seen
+                .swap(generation, std::sync::atomic::Ordering::AcqRel)
+                != generation
+            {
+                return;
+            }
+            notified.await;
             return;
         }
         match self.subscription.as_mut() {
@@ -165,6 +186,10 @@ pub(super) mod test_seam {
             verification_generation: state.verification_requests.len() as u64,
             peers: state.peers.clone(),
         })
+    }
+
+    pub(super) fn generation(root: &Path) -> u64 {
+        verdicts().get(root).map_or(0, |state| state.generation)
     }
 
     pub(super) fn wake(root: &Path) -> Arc<tokio::sync::Notify> {

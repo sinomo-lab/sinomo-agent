@@ -58,6 +58,28 @@ pub(super) fn write_set_of(
 pub(super) fn switched(name: &str, rule: Option<(usize, usize)>) -> (DfsTestRuntime, DfsMetadataShardConfig) {
     let (runtime, service, config) = current_native_metadata_service(name, 3, "/services").unwrap();
     drop(service);
+    switch_services(runtime, config, rule)
+}
+
+/// [`switched`] on a cluster whose three nodes are all KV voters: stopping
+/// any one of them, the KV leader included, leaves cluster KV writable.
+pub(super) fn switched_with_kv_voters(
+    name: &str,
+    rule: Option<(usize, usize)>,
+) -> (DfsTestRuntime, DfsMetadataShardConfig) {
+    let (runtime, service, config) =
+        crate::test_support::current_native_metadata_service_with_kv_voters(name, 3, "/services")
+            .unwrap();
+    drop(service);
+    assert!(runtime.kv_voters());
+    switch_services(runtime, config, rule)
+}
+
+fn switch_services(
+    runtime: DfsTestRuntime,
+    config: DfsMetadataShardConfig,
+    rule: Option<(usize, usize)>,
+) -> (DfsTestRuntime, DfsMetadataShardConfig) {
     if let Some((w, n)) = rule {
         let policy =
             crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, w, n)

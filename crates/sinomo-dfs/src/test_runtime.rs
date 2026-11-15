@@ -605,17 +605,12 @@ impl Endpoint {
     }
 }
 
-/// The error for a target that does not admit `route`. A KV call to a
-/// configured member whose KV is not running fails as a routed call to a
-/// dead peer does; every other refusal keeps naming the target unknown.
-fn unavailable_target(
-    source_data: &SinomoDataDir,
-    target: &NodeId,
-    route: &str,
-    kv_stopped: bool,
-) -> NetworkError {
-    if kv_stopped
-        && sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&route)
+/// The error for a target that does not admit a route. A call to a
+/// configured member that is not running, on a KV or DFS route alike, fails
+/// as a routed call to a dead peer does. A running node that does not admit
+/// the route, and a node outside the membership, stay unknown.
+fn unavailable_target(source_data: &SinomoDataDir, target: &NodeId, stopped: bool) -> NetworkError {
+    if stopped
         && let Ok(state) =
             sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(source_data))
     {
@@ -659,8 +654,29 @@ struct Fabric {
     observations: Mutex<Vec<RpcObservation>>,
     observation_checkpoints: Mutex<Vec<RpcObservationCheckpoint>>,
     transfers: Mutex<Vec<Transfer>>,
+    partitions: Mutex<BTreeMap<NodeId, Partition>>,
+}
+/// The traffic a partition cuts a node off from, both ways, with every
+/// other node: its cluster-KV calls, its DFS calls, or both. A node's calls
+/// to itself are never cut.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Partition {
+    pub kv: bool,
+    pub dfs: bool,
 }
 impl Fabric {
+    fn partitioned(&self, source: &NodeId, target: &NodeId, route: &str) -> bool {
+        if source == target {
+            return false;
+        }
+        let kv = sinomo_core::kv::CLUSTER_KV_RPC_ROUTES.contains(&route);
+        let partitions = self.partitions.lock().expect("DFS test partitions");
+        [source, target].into_iter().any(|node| {
+            partitions
+                .get(node)
+                .is_some_and(|cut| if kv { cut.kv } else { cut.dfs })
+        })
+    }
     fn close_paused_faults_for_node(&self, node: &NodeId) {
         for rule in self.faults.lock().unwrap().iter() {
             if rule.target.as_ref().is_none_or(|id| id == node)
@@ -925,21 +941,22 @@ impl Carrier {
                 });
             }
             let source_data = Arc::clone(&source.data_dir);
+            if self
+                .fabric
+                .partitioned(&self.source, target, &call.request.route)
+            {
+                return Err(crate::runtime_host::partitioned_test_peer(target));
+            }
             let Some(endpoint) = nodes
                 .get(target)
                 .filter(|endpoint| endpoint.admits_route(&call.request.route))
                 .cloned()
             else {
-                let kv_stopped = nodes
+                let stopped = nodes
                     .get(target)
                     .is_none_or(|endpoint| !endpoint.kv_available.load(Ordering::Acquire));
                 drop(nodes);
-                return Err(unavailable_target(
-                    &source_data,
-                    target,
-                    &call.request.route,
-                    kv_stopped,
-                ));
+                return Err(unavailable_target(&source_data, target, stopped));
             };
             endpoint.active.fetch_add(1, Ordering::AcqRel);
             (source_data, endpoint)
@@ -952,13 +969,8 @@ impl Carrier {
             completed: false,
         };
         if !endpoint.admits_route(&call.request.route) {
-            let kv_stopped = !endpoint.kv_available.load(Ordering::Acquire);
-            return Err(unavailable_target(
-                &source_data,
-                target,
-                &call.request.route,
-                kv_stopped,
-            ));
+            let stopped = !endpoint.kv_available.load(Ordering::Acquire);
+            return Err(unavailable_target(&source_data, target, stopped));
         }
         drop(source_data);
         observation.phase = RpcPhase::BeforeDispatch;
@@ -3206,6 +3218,7 @@ impl DfsTestRuntime {
             observations: Mutex::new(Vec::new()),
             observation_checkpoints: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
+            partitions: Mutex::new(BTreeMap::new()),
         });
         let mut nodes = BTreeMap::new();
         nodes.insert(
@@ -3614,9 +3627,11 @@ impl DfsTestRuntime {
         self.join_transfers(Some(node))?;
         let catalog_changed = Arc::new(Notify::new());
         let catalog_wake = Arc::clone(&catalog_changed);
+        // Wake on the commits applied by the node the catalog is read
+        // through: a stopped bootstrap node applies none.
         let _catalog_subscription =
             sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
-                &ClusterPaths::new(self.data_dir(&self.primary)),
+                &ClusterPaths::new(self.data_dir(&self.kv_read_node())),
                 move |_| catalog_wake.notify_one(),
             );
         let reconciler = self
@@ -4186,6 +4201,18 @@ impl DfsTestRuntime {
         &self.nodes[node].data_dir
     }
 
+    /// The node whose committed KV [`Self::kv_read_authority`] reads.
+    fn kv_read_node(&self) -> NodeId {
+        if self.kv_voters {
+            let nodes = self.fabric.nodes.lock().expect("DFS test nodes");
+            if !nodes.contains_key(&self.primary)
+                && let Some(node) = nodes.keys().next()
+            {
+                return node.clone();
+            }
+        }
+        self.primary.clone()
+    }
     /// The access a fixture-level authoritative read runs through. With KV
     /// voters it is a running node's own access, so a stopped KV leader never
     /// answers; otherwise it is the sole voter's.
@@ -6234,6 +6261,20 @@ impl DfsTestRuntime {
         crate::runtime_host::takeover_trace_for_test(&self.data_dir(node).root())
     }
 
+    /// Cut `node` off from every other node, both ways, on the traffic
+    /// `partition` names, as a network partition does: a call across it
+    /// fails as a call to an unreachable peer does, with nothing sent, and
+    /// the node keeps running. An empty partition heals it.
+    pub fn partition_node(&self, node: &NodeId, partition: Partition) {
+        self.kv_peers.set_kv_partitioned(node, partition.kv);
+        let mut partitions = self.fabric.partitions.lock().expect("DFS test partitions");
+        if partition == Partition::default() {
+            partitions.remove(node);
+        } else {
+            partitions.insert(node.clone(), partition);
+        }
+    }
+
     /// Stop `node`'s takeover attempts between the durable promise and the
     /// swap, as a crash there would.
     pub fn stop_takeover_after_promise(&self, node: &NodeId, stop: bool) {
@@ -6303,10 +6344,21 @@ impl DfsTestRuntime {
     /// `node`'s actual cluster member record with the capability advertised,
     /// and its derived capability policy record with it, as the cluster
     /// member store does when a node's binary advertises a capability.
+    ///
+    /// A node owns its own member record: its local cluster state carries
+    /// what it advertises, and every local state projection keeps that copy
+    /// over the committed one. So once the committed record advertises the
+    /// capability, it goes into `node`'s local state too; that state is then
+    /// behind the commit, so no authoritative read compares the two at an
+    /// equal revision before both carry it.
     pub fn advertise_metadata_write_set_capability(&self, node: &NodeId) -> Result<(), String> {
         let member_key = sinomo_core::node::cluster_member_key(node);
         let policy_key = sinomo_core::node::cluster_capability_policy_key(node);
         let error = |error: sinomo_core::kv::KvError| error.to_string();
+        let capability = sinomo_core::CapabilityName::new(
+            sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY,
+        )
+        .map_err(|error| error.to_string())?;
         let mut client = self.configuration_publisher(node);
         for _ in 0..8 {
             let entries = client
@@ -6318,15 +6370,11 @@ impl DfsTestRuntime {
             let mut member = member_entry
                 .decode::<sinomo_core::ClusterMemberRecord>()
                 .map_err(error)?;
-            let capability = sinomo_core::CapabilityName::new(
-                sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY,
-            )
-            .map_err(|error| error.to_string())?;
             if !member.capabilities.contains(&capability) {
                 member.capabilities.push(capability.clone());
             }
             if !member.allowed_capabilities.contains(&capability) {
-                member.allowed_capabilities.push(capability);
+                member.allowed_capabilities.push(capability.clone());
             }
             let policy = sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member);
             let policy_compare = match entries[1].clone() {
@@ -6357,10 +6405,48 @@ impl DfsTestRuntime {
                 })
                 .map_err(error)?;
             if response.succeeded {
-                return Ok(());
+                return self.advertise_in_local_state(node, &capability);
             }
         }
         Err("member record kept changing while advertising the capability".into())
+    }
+
+    /// Add `capability` to `node`'s own member record in its local cluster
+    /// state, until a re-read shows it there.
+    fn advertise_in_local_state(
+        &self,
+        node: &NodeId,
+        capability: &sinomo_core::CapabilityName,
+    ) -> Result<(), String> {
+        let paths = ClusterPaths::new(self.data_dir(node));
+        let advertised = |state: &sinomo_core::ClusterBootstrapState| {
+            state.members.iter().any(|member| {
+                member.node_id == *node
+                    && member.capabilities.contains(capability)
+                    && member.allowed_capabilities.contains(capability)
+            })
+        };
+        for _ in 0..8 {
+            let mut state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+                .map_err(|error| error.to_string())?;
+            if advertised(&state) {
+                return Ok(());
+            }
+            let member = state
+                .members
+                .iter_mut()
+                .find(|member| member.node_id == *node)
+                .ok_or("native fixture node has no local member record")?;
+            if !member.capabilities.contains(capability) {
+                member.capabilities.push(capability.clone());
+            }
+            if !member.allowed_capabilities.contains(capability) {
+                member.allowed_capabilities.push(capability.clone());
+            }
+            sinomo_core::cluster::write_cluster_state(&paths, &state)
+                .map_err(|error| error.to_string())?;
+        }
+        Err("local cluster state kept changing while advertising the capability".into())
     }
 }
 
@@ -6985,6 +7071,7 @@ mod write_fault_filter_tests {
             observations: Mutex::new(Vec::new()),
             observation_checkpoints: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
+            partitions: Mutex::new(BTreeMap::new()),
         });
         let carrier = Carrier {
             host_identity: None,

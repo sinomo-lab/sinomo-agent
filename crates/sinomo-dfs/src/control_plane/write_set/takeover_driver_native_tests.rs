@@ -15,7 +15,7 @@ use sinomo_core::network::PeerPathVerdict;
 use std::time::{Duration, Instant};
 
 /// The shard's record as `reader` reads it from cluster KV.
-fn record_from(
+pub(super) fn record_from(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     reader: &NodeId,
@@ -28,7 +28,11 @@ fn record_from(
 }
 
 /// Every member sees a path to every other; `keepers` keep their shards.
-fn keep_with_paths(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, keepers: &[&NodeId]) {
+pub(super) fn keep_with_paths(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    keepers: &[&NodeId],
+) {
     let nodes = members(config);
     for observer in &nodes {
         for peer in nodes.iter().filter(|peer| *peer != observer) {
@@ -40,7 +44,7 @@ fn keep_with_paths(runtime: &DfsTestRuntime, config: &DfsMetadataShardConfig, ke
     }
 }
 
-fn event_log(runtime: &DfsTestRuntime, nodes: &[&NodeId]) -> String {
+pub(super) fn event_log(runtime: &DfsTestRuntime, nodes: &[&NodeId]) -> String {
     nodes
         .iter()
         .map(|node| {
@@ -64,13 +68,13 @@ fn event_log(runtime: &DfsTestRuntime, nodes: &[&NodeId]) -> String {
         .join("\n")
 }
 
-fn lose(runtime: &DfsTestRuntime, observers: &[&NodeId], lost: &NodeId) {
+pub(super) fn lose(runtime: &DfsTestRuntime, observers: &[&NodeId], lost: &NodeId) {
     for observer in observers {
         runtime.set_peer_verdict(observer, lost, PeerPathVerdict::NoPath, false);
     }
 }
 
-fn takeover_events(
+pub(super) fn takeover_events(
     runtime: &DfsTestRuntime,
     node: &NodeId,
     name: &str,
@@ -85,7 +89,7 @@ fn takeover_events(
 
 /// Write `path` through `node`'s client to whichever member `reader` reads
 /// as primary; retried while the record moves under it.
-fn write_via(
+pub(super) fn write_via(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     node: &NodeId,
@@ -110,7 +114,7 @@ fn write_via(
     }
 }
 
-fn object_mode(
+pub(super) fn object_mode(
     runtime: &DfsTestRuntime,
     node: &NodeId,
     config: &DfsMetadataShardConfig,

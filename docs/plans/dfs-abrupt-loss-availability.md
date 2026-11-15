@@ -210,8 +210,11 @@ A candidate is a write-set member that can commit to cluster KV.
    non-mobile before mobile, then node id. A candidate that does not rank first
    hands the attempt to the member that does; that member runs it only if it
    still ranks itself first with its own journal, and otherwise hands it back
-   once. Unreachable members are left out, so a two-member write set needs no
-   corroboration.
+   once. A member that cannot confirm the record declines; the candidate then
+   confirms it itself and, if it can, asks that member once more, so a
+   momentary loss of cluster KV at the first-ranked member does not pass the
+   attempt down the ranking. Unreachable members are left out, so a two-member
+   write set needs no corroboration.
 2. **Confirm quorum.** The candidate reads the shard record linearizably. If it
    cannot, it is not in quorum and stops.
 3. **Promise.** The candidate durably records that it accepts nothing more from

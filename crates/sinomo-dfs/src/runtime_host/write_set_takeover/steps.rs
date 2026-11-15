@@ -29,11 +29,11 @@ pub(in crate::runtime_host) enum TakeOutcome {
     },
 }
 
-/// Confirm the record with one authoritative read, promise, and submit the
-/// swap. Only a quorum member can read the record, so a node on the minority
-/// side of a partition stops here without promising.
-pub(in crate::runtime_host) fn take_metadata_shard(
-    data_dir: &SinomoDataDir,
+/// Confirm the record with one authoritative read: it must still name the
+/// primary judged lost at the attempt's epoch, with this node in the write
+/// set. Only a node that can reach a KV quorum can read it, so a node on the
+/// minority side of a partition fails here.
+pub(in crate::runtime_host) fn confirm_metadata_takeover_record(
     cluster_paths: &ClusterPaths,
     runtime: &tokio::runtime::Handle,
     local: &NodeId,
@@ -41,13 +41,13 @@ pub(in crate::runtime_host) fn take_metadata_shard(
     epoch: u64,
     primary: &NodeId,
     members: &[NodeId],
-) -> TakeOutcome {
+) -> Result<crate::DfsMetadataShardRecordCut, TakeOutcome> {
     let Some(mut client) = daemon_dfs_control_plane_client_on_runtime(cluster_paths, Some(runtime))
     else {
-        return TakeOutcome::NotTaken {
+        return Err(TakeOutcome::NotTaken {
             follow: false,
             reason: "no cluster control-plane client".into(),
-        };
+        });
     };
     let mut members = members.to_vec();
     if !members.contains(local) {
@@ -58,16 +58,16 @@ pub(in crate::runtime_host) fn take_metadata_shard(
     {
         Ok(Some(cut)) => cut,
         Ok(None) => {
-            return TakeOutcome::NotTaken {
+            return Err(TakeOutcome::NotTaken {
                 follow: true,
                 reason: "the shard no longer exists".into(),
-            };
+            });
         }
         Err(error) => {
-            return TakeOutcome::NotTaken {
+            return Err(TakeOutcome::NotTaken {
                 follow: false,
                 reason: format!("the confirm read failed: {error}"),
-            };
+            });
         }
     };
     let in_write_set = cut
@@ -75,7 +75,7 @@ pub(in crate::runtime_host) fn take_metadata_shard(
         .switched()
         .is_some_and(|write_set| write_set.contains(local));
     if cut.shard.epoch != epoch || &cut.shard.primary_node_id != primary || !in_write_set {
-        return TakeOutcome::NotTaken {
+        return Err(TakeOutcome::NotTaken {
             follow: cut.shard.epoch != epoch,
             reason: format!(
                 "the record names primary {} at epoch {}, this node {} the write set",
@@ -83,8 +83,34 @@ pub(in crate::runtime_host) fn take_metadata_shard(
                 cut.shard.epoch,
                 if in_write_set { "in" } else { "outside" }
             ),
-        };
+        });
     }
+    Ok(cut)
+}
+
+/// Confirm the record, promise, and submit the swap.
+pub(in crate::runtime_host) fn take_metadata_shard(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    local: &NodeId,
+    key: &ShardKey,
+    epoch: u64,
+    primary: &NodeId,
+    members: &[NodeId],
+) -> TakeOutcome {
+    let cut = match confirm_metadata_takeover_record(
+        cluster_paths,
+        runtime,
+        local,
+        key,
+        epoch,
+        primary,
+        members,
+    ) {
+        Ok(cut) => cut,
+        Err(outcome) => return outcome,
+    };
     let swap_request_id = KvRequestId::generate();
     let promised = with_daemon_dfs_main_maintenance_service(data_dir, runtime, |service| {
         service

@@ -202,6 +202,7 @@ impl DfsTestRuntime {
                 observations: Mutex::new(Vec::new()),
                 observation_checkpoints: Mutex::new(Vec::new()),
                 transfers: Mutex::new(Vec::new()),
+                partitions: Mutex::new(BTreeMap::new()),
             }),
             nodes,
             closed: false,
