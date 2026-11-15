@@ -107,13 +107,13 @@ pub(super) fn primary(runtime: &DfsTestRuntime) -> NativeService {
     runtime.metadata_primary_service("/services").unwrap()
 }
 
-fn directory(service: &mut NativeService, path: &str) -> DfsObjectMetadata {
+pub(super) fn directory(service: &mut NativeService, path: &str) -> DfsObjectMetadata {
     service.posix_mkdir_all(path).unwrap();
     service.lookup_sifs_path(path).unwrap().expect("directory")
 }
 
 /// One namespace change to `path`'s mode as a complete prepared body.
-fn mode_change(
+pub(super) fn mode_change(
     config: &DfsMetadataShardConfig,
     current: &DfsObjectMetadata,
     mode: u32,

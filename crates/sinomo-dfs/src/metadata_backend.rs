@@ -3291,6 +3291,7 @@ mod tests;
 
 mod replay;
 
+mod alignment;
 mod handoff;
 #[cfg(test)]
 pub(crate) mod native_prefix_history;

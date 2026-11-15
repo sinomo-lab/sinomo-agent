@@ -1946,6 +1946,27 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.clear_obsolete_membership_handoff_freeze(record_epoch, completed_handoff_id)
     }
 
+    fn align_metadata_replica_to_prefix(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        target: &DfsMetadataPrefixProof,
+        epoch_start: &DfsMetadataPrefixProof,
+    ) -> Result<crate::DfsMetadataReplicaAlignment> {
+        self.require_replication_source_shard(permit.shard_id())?;
+        self.align_replica_to_prefix_owned(permit, target, epoch_start)
+    }
+
+    fn historical_metadata_prefix_proof(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        sequence: u64,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        self.historical_prefix_proof_at(sequence)
+    }
+
     fn observe_metadata_replication_cursors(
         &self,
         shard_id: &DfsMetadataShardId,

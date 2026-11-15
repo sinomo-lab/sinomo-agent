@@ -2513,6 +2513,79 @@ pub(crate) fn journal_segment_id(sequence: u64) -> u64 {
         .saturating_add(1)
 }
 
+/// Remove every journal record after `sequence`, for a write-set member
+/// aligning with a new epoch's start. The segment holding the first later
+/// record is cut just before it, and every later segment is removed. A
+/// segment can repeat earlier records after later ones (a retried batch), so
+/// the cut is at the first record past `sequence`, never after a later
+/// duplicate. The caller holds the shard writer lock and has invalidated the
+/// journal admission certificate.
+pub(crate) fn truncate_segmented_journal_after(root: &Path, sequence: u64) -> Result<()> {
+    for (segment_id, path) in segmented_journal_paths_descending(root)? {
+        let first_sequence = segment_id
+            .saturating_sub(1)
+            .saturating_mul(JOURNAL_SEGMENT_ENTRY_LIMIT)
+            .saturating_add(1);
+        if first_sequence > sequence {
+            remove_file_if_exists(&path)?;
+            let mut cache = journal_segment_index_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            remove_cached_journal_segment(&mut cache, &path);
+            continue;
+        }
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let mut record_start = 0;
+        let mut cut = None;
+        while let Some(record) = durable_file::read_length_prefixed_record(
+            &mut file,
+            &path,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+        )
+        .map_err(metadata_durable_file_error)?
+        {
+            let frame = DfsMetadataJournalFrame::decode_exact(record.bytes).map_err(|error| {
+                MetadataBackendError::replica_diverged(format!(
+                    "complete journal frame at {} is malformed: {error}",
+                    path.display()
+                ))
+            })?;
+            if frame.entry().sequence > sequence {
+                cut = Some(record_start);
+                break;
+            }
+            record_start = record.record_end;
+        }
+        if let Some(cut) = cut {
+            file.set_len(cut).map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            file.sync_all().map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+        }
+        let mut cache = journal_segment_index_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        remove_cached_journal_segment(&mut cache, &path);
+        // Earlier segments hold only earlier sequences.
+        break;
+    }
+    Ok(())
+}
+
 /// Remove complete journal segments strictly older than an authoritative,
 /// durable materialization checkpoint.
 ///

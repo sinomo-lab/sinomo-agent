@@ -1332,6 +1332,7 @@ impl NativeImportAuthority {
             state_fingerprint: fingerprint,
             primary_handoff_id: id.clone(),
             write_set_generation: None,
+            epoch_start_alignment: None,
         };
         let barrier = probe.barrier_id.clone();
         let response = if *node == self.local_node()? {

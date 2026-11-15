@@ -607,3 +607,54 @@ fn a_later_epochs_ingest_removes_a_pending_marker_only_on_a_write_set_shard() {
     );
     assert!(backend.membership_handoff_write_freeze().unwrap().is_none());
 }
+
+#[test]
+fn alignment_confirms_a_matching_epoch_start_and_refuses_a_different_one() {
+    let root = sinomo_testdir::TestDir::new("write-set-align-decision");
+    let mut backend = backend(&root);
+    let genesis = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard_id());
+    let permit = permit(4, Some(3));
+    // A different digest at this member's head is a divergence.
+    assert!(matches!(
+        backend.align_replica_to_prefix_owned(&permit, &proof(0, 'e'), &proof(0, 'e')),
+        Err(MetadataBackendError::Rejected {
+            code: crate::DfsMetadataRejectionCode::ReplicaDiverged,
+            ..
+        })
+    ));
+    // An epoch start beyond this member's journal is for the primary to check.
+    assert!(matches!(
+        backend
+            .align_replica_to_prefix_owned(&permit, &proof(3, 'f'), &proof(3, 'f'))
+            .unwrap(),
+        crate::DfsMetadataReplicaAlignment::Behind { .. }
+    ));
+    // A matching empty epoch start writes both floors at sequence zero, and
+    // aligning again is a no-op.
+    for _ in 0..2 {
+        assert_eq!(
+            backend
+                .align_replica_to_prefix_owned(&permit, &genesis, &genesis)
+                .unwrap(),
+            crate::DfsMetadataReplicaAlignment::Aligned {
+                head: genesis.clone(),
+                dropped: 0
+            }
+        );
+    }
+    let authority = metadata_cursor::metadata_authority_ack_floor(root.path(), &shard_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (authority.journal_sequence, authority.authority_epoch),
+        (0, Some(4))
+    );
+    // An unswitched permit never aligns.
+    assert!(
+        backend
+            .align_replica_to_prefix_owned(&self::permit(4, None), &genesis, &genesis)
+            .is_err()
+    );
+    drop(backend);
+    self::backend(&root);
+}

@@ -1789,6 +1789,7 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
                 state_fingerprint: "blake3:prefix-probe-state".to_string(),
                 primary_handoff_id: None,
                 write_set_generation: None,
+                epoch_start_alignment: None,
             }),
             authority_probe: None,
             durable_replication: None,

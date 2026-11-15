@@ -70,6 +70,10 @@ pub enum DfsMetadataRejectionCode {
     /// A write-set catch-up probe named a record generation this member's
     /// own view has not reached. Nothing is repaired; the primary asks again.
     WriteSetViewBehind,
+    /// The receiver's view is at the source's epoch, but its journal has not
+    /// been aligned with that epoch's start and cannot be inline: the new
+    /// primary sends an epoch-start alignment probe first.
+    EpochAlignmentRequired,
     /// Explicitly non-repairable here. Unknown future codes fail closed and
     /// never fall back to interpreting the accompanying diagnostic text.
     #[serde(other)]

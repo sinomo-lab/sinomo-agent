@@ -2921,6 +2921,7 @@ fn write_set_probe_generation_is_omitted_unless_asked_for() {
         state_fingerprint: "fingerprint".into(),
         primary_handoff_id: None,
         write_set_generation: None,
+        epoch_start_alignment: None,
     };
     let plain = sinomo_core::kv::encode_kv_value(&probe).unwrap();
     let decoded: DfsMetadataPrefixProbe = sinomo_core::kv::decode_kv_value(&plain).unwrap();
@@ -2939,4 +2940,36 @@ fn write_set_probe_generation_is_omitted_unless_asked_for() {
     );
     assert!(!DfsMetadataRejectionCode::WriteSetViewBehind.allows_snapshot_repair());
     assert!(!DfsMetadataRejectionCode::WriteSetViewBehind.suppresses_replication());
+}
+
+#[test]
+fn epoch_start_alignment_is_omitted_unless_a_new_primary_aligns() {
+    let probe = DfsMetadataPrefixProbe {
+        barrier_id: "barrier".into(),
+        file_system_id: Some(sifs_file_system_id()),
+        authority_epoch: Some(3),
+        shard_id: DfsMetadataShardId::new("root"),
+        journal_sequence: 7,
+        state_fingerprint: "fingerprint".into(),
+        primary_handoff_id: None,
+        write_set_generation: Some(9),
+        epoch_start_alignment: None,
+    };
+    let plain = sinomo_core::kv::encode_kv_value(&probe).unwrap();
+    let aligning = DfsMetadataPrefixProbe {
+        epoch_start_alignment: Some(3),
+        ..probe.clone()
+    };
+    let encoded = sinomo_core::kv::encode_kv_value(&aligning).unwrap();
+    assert_ne!(encoded, plain);
+    let decoded: DfsMetadataPrefixProbe = sinomo_core::kv::decode_kv_value(&encoded).unwrap();
+    assert_eq!(decoded, aligning);
+    let decoded: DfsMetadataPrefixProbe = sinomo_core::kv::decode_kv_value(&plain).unwrap();
+    assert_eq!(decoded, probe);
+    assert_eq!(
+        serde_json::from_str::<DfsMetadataRejectionCode>("\"epoch-alignment-required\"").unwrap(),
+        DfsMetadataRejectionCode::EpochAlignmentRequired
+    );
+    assert!(!DfsMetadataRejectionCode::EpochAlignmentRequired.allows_snapshot_repair());
+    assert!(!DfsMetadataRejectionCode::EpochAlignmentRequired.suppresses_replication());
 }

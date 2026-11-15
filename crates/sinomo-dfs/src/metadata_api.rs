@@ -295,6 +295,23 @@ pub struct DfsMetadataShardWriteFreeze {
     pub rebind_prefix_proof: crate::DfsMetadataPrefixProof,
 }
 
+/// How a write-set member's journal relates to a prefix in a new epoch's
+/// history (see `metadata_backend::alignment`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsMetadataReplicaAlignment {
+    /// The member already acknowledged past the prefix at that epoch.
+    Following { head: crate::DfsMetadataPrefixProof },
+    /// The member now holds exactly the prefix; `dropped` records after it,
+    /// never acknowledged at the new epoch, were removed.
+    Aligned {
+        head: crate::DfsMetadataPrefixProof,
+        dropped: u64,
+    },
+    /// The member's journal ends before the prefix; the new primary checks
+    /// that head against its own journal.
+    Behind { head: crate::DfsMetadataPrefixProof },
+}
+
 impl DfsMetadataShardWriteFreeze {
     /// Whether a shard on the write-set protocol whose record is at
     /// `record_epoch` has moved past this marker, so it fences nothing.
@@ -496,6 +513,9 @@ pub struct DfsMetadataReplicaIngestPermit {
     pending_primary_handoff_id: Option<String>,
     /// Switch epoch of a write-set shard; `None` under the all-member rule.
     floor_epoch_scope: Option<u64>,
+    /// The epoch start the receiver's own write-set record names for the
+    /// source epoch, when that epoch began after the shard switched.
+    epoch_start: Option<crate::DfsMetadataPrefixProof>,
 }
 
 /// Verify the immutable original preparation independently of the current cut.
@@ -620,6 +640,7 @@ impl DfsMetadataReplicaIngestPermit {
             source_epoch,
             pending_primary_handoff_id: None,
             floor_epoch_scope: None,
+            epoch_start: None,
         }
     }
 
@@ -641,6 +662,7 @@ impl DfsMetadataReplicaIngestPermit {
             source_epoch,
             pending_primary_handoff_id: Some(handoff_id),
             floor_epoch_scope: None,
+            epoch_start: None,
         }
     }
 
@@ -653,6 +675,17 @@ impl DfsMetadataReplicaIngestPermit {
 
     pub(crate) fn floor_epoch_scope(&self) -> Option<u64> {
         self.floor_epoch_scope
+    }
+
+    /// Bind the epoch start of the receiver's own record, so the epoch's
+    /// first batch aligns the receiver's journal before it is ingested.
+    pub(crate) fn with_epoch_start(mut self, epoch_start: Option<crate::DfsMetadataPrefixProof>) -> Self {
+        self.epoch_start = epoch_start;
+        self
+    }
+
+    pub(crate) fn epoch_start(&self) -> Option<&crate::DfsMetadataPrefixProof> {
+        self.epoch_start.as_ref()
     }
 
     /// Epoch to record in a floor acknowledged under this permit: the source
@@ -2748,6 +2781,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _completed_handoff_id: Option<&str>,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Align this write-set member with `target`, a prefix of the permit
+    /// epoch's history whose start is `epoch_start`, under the shard writer
+    /// lock (see `metadata_backend::alignment`).
+    fn align_metadata_replica_to_prefix(
+        &mut self,
+        _permit: &DfsMetadataReplicaIngestPermit,
+        _target: &DfsMetadataPrefixProof,
+        _epoch_start: &DfsMetadataPrefixProof,
+    ) -> Result<DfsMetadataReplicaAlignment> {
+        Err(write_set_member_state_unsupported())
+    }
+
+    /// This store's exact prefix proof at `sequence`, from its table
+    /// checkpoint through its retained journal; `None` when it can no longer
+    /// reconstruct it.
+    fn historical_metadata_prefix_proof(
+        &self,
+        _shard_id: &DfsMetadataShardId,
+        _sequence: u64,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        Ok(None)
     }
 
     /// Read at most `max_entries` journal entries after `after_sequence`.

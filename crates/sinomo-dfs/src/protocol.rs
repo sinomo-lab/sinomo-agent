@@ -1497,6 +1497,13 @@ pub struct DfsMetadataPrefixProbe {
     /// would hold. Omitted otherwise, so other probes keep their encoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_set_generation: Option<u64>,
+    /// The epoch whose history this probe's prefix belongs to, sent only by
+    /// a new primary of a write-set shard aligning a member with its epoch
+    /// start. The receiver checks the prefix against its own record's epoch
+    /// start, drops records after it when its journal matches there, or
+    /// reports a head that ends before it. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_start_alignment: Option<u64>,
 }
 
 /// Fresh request identity bound to the complete captured current source cut.

@@ -48,6 +48,24 @@ impl DfsWriteSetSwitchEvidence {
     }
 }
 
+/// How aligning one member with the current epoch's start ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DfsWriteSetAlignment {
+    /// The epoch began before the shard switched, or at its switch: there is
+    /// no epoch start to align with.
+    NotNeeded,
+    /// The member holds a prefix of this epoch's history at `head`, checked by
+    /// itself at the epoch start or by this primary below it; replication to
+    /// it continues from `head`.
+    Aligned { head: crate::DfsMetadataPrefixProof },
+    /// The member's journal differs from this epoch's history or cannot be
+    /// checked against it: it needs snapshot repair.
+    NeedsSnapshot { reason: String },
+    /// The member did not answer as a member of this record yet (its view is
+    /// behind, or it refused), or could not be reached.
+    NotReady { reason: String },
+}
+
 /// How one member's join ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DfsWriteSetJoin {
@@ -232,6 +250,98 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(error) => Ok(DfsWriteSetJoin::NotReady {
                 reason: error.to_string(),
             }),
+        }
+    }
+
+    /// Align `member` with the epoch start `cut`'s record names, as a new
+    /// primary does after a takeover or rotation handoff.
+    ///
+    /// The member checks the epoch start against its own record and journal:
+    /// it drops records past a matching epoch start, or reports a head that
+    /// ends before it. Such a head is checked against this primary's own
+    /// journal and confirmed to the member, so a member that missed whole
+    /// epochs and diverged below the epoch start is never extended from it.
+    /// The member's sender cursor starts at the confirmed head.
+    pub(crate) fn align_write_set_member(
+        &mut self,
+        cut: &DfsMetadataShardRecordCut,
+        member: &NodeId,
+        sender: &crate::DfsMetadataJournalBatchSender,
+    ) -> Result<DfsWriteSetAlignment, DfsError> {
+        let shard = &cut.shard;
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let Some(write_set) = cut.write_set_state().switched().cloned() else {
+            return Ok(DfsWriteSetAlignment::NotNeeded);
+        };
+        let Some(epoch_start) = write_set.epoch_start.clone() else {
+            return Ok(DfsWriteSetAlignment::NotNeeded);
+        };
+        let probe = |target: &crate::DfsMetadataPrefixProof| {
+            crate::metadata_replication::dfs_metadata_epoch_alignment_probe_command(
+                &self.node_id,
+                member,
+                &shard.file_system_id,
+                &shard_id,
+                shard.epoch,
+                target,
+                write_set.generation,
+            )
+        };
+        let mut target = epoch_start.clone();
+        loop {
+            let response = match sender(member, &probe(&target), None) {
+                Ok(response) => response,
+                Err(error) => {
+                    return Ok(DfsWriteSetAlignment::NotReady {
+                        reason: error.to_string(),
+                    });
+                }
+            };
+            let head = response.member_view.as_ref().map(|view| view.durable_prefix.clone());
+            match (&response.result, head) {
+                (DfsMetadataJournalBatchResult::Applied, Some(head)) if response.verified_prefix_only => {
+                    self.metadata_backend
+                        .as_deref_mut()
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: "a write-set alignment requires the shard's durable backend".into(),
+                        })?
+                        .put_metadata_replication_cursor(member, &shard_id, head.journal_sequence)?;
+                    return Ok(DfsWriteSetAlignment::Aligned { head });
+                }
+                (DfsMetadataJournalBatchResult::Applied, Some(head))
+                    if head.journal_sequence < epoch_start.journal_sequence && target == epoch_start =>
+                {
+                    let own = self
+                        .metadata_backend
+                        .as_deref()
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: "a write-set alignment requires the shard's durable backend".into(),
+                        })?
+                        .historical_metadata_prefix_proof(&shard_id, head.journal_sequence)?;
+                    if own.as_ref() != Some(&head) {
+                        return Ok(DfsWriteSetAlignment::NeedsSnapshot {
+                            reason: format!(
+                                "{member}'s head {} is not a prefix of this primary's journal",
+                                head.journal_sequence
+                            ),
+                        });
+                    }
+                    // Confirm the checked head; the member records it at this epoch.
+                    target = head;
+                }
+                (DfsMetadataJournalBatchResult::Rejected { code, reason }, _)
+                    if code.allows_snapshot_repair() =>
+                {
+                    return Ok(DfsWriteSetAlignment::NeedsSnapshot {
+                        reason: reason.clone(),
+                    });
+                }
+                (result, _) => {
+                    return Ok(DfsWriteSetAlignment::NotReady {
+                        reason: format!("{member} did not align: {result:?}"),
+                    });
+                }
+            }
         }
     }
 

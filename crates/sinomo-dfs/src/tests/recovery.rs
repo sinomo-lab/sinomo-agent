@@ -102,6 +102,7 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
             state_fingerprint: cut.prefix_proof.digest.clone(),
             primary_handoff_id: None,
             write_set_generation: None,
+            epoch_start_alignment: None,
         }),
         authority_probe: None,
         durable_replication: None,

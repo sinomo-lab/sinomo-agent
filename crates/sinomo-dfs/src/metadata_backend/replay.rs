@@ -1,6 +1,7 @@
 //! Replay for the local metadata backend.
 
 use super::*;
+use crate::DfsMetadataReplicaAlignment;
 
 impl LocalSobjMetadataBackend {
     pub(crate) fn persist_journal_frames_with_replica_permit_report(
@@ -115,6 +116,26 @@ impl LocalSobjMetadataBackend {
 
         let lock_started = Instant::now();
         let _lock = self.begin_metadata_replica_durable_ingest(permit, &batch.shard_id)?;
+        // A write-set epoch that began at an epoch start aligns this member's
+        // journal with it before the epoch's first batch is ingested: records
+        // past the epoch start, never acknowledged at this epoch, are dropped.
+        // A journal that ends before the epoch start waits for the primary to
+        // check its head; one that differs is repaired by snapshot install.
+        if let Some(epoch_start) = permit.epoch_start().cloned()
+            && let DfsMetadataReplicaAlignment::Behind { head } =
+                self.align_replica_to_prefix_locked(permit, &epoch_start, &epoch_start, true)?
+        {
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::EpochAlignmentRequired,
+                message: format!(
+                    "metadata shard {} head {} ends before epoch {} start {}; the primary checks it first",
+                    batch.shard_id.0,
+                    head.journal_sequence,
+                    permit.source_epoch(),
+                    epoch_start.journal_sequence
+                ),
+            });
+        }
         let lock_ms = lock_started.elapsed().as_millis();
         let head_started = Instant::now();
         // `Self::new` performs the crash-only tail recovery once. While this

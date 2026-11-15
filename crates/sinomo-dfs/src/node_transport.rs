@@ -5088,6 +5088,7 @@ impl DfsNodeTransport {
                         state_fingerprint: target.state_fingerprint.clone(),
                         primary_handoff_id: None,
                         write_set_generation: None,
+                        epoch_start_alignment: None,
                     }),
                     authority_probe: None,
                     durable_replication: None,

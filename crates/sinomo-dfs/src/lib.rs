@@ -211,7 +211,7 @@ mod service_sync;
 mod service_trace;
 mod service_write;
 mod service_write_set_keeping;
-pub(crate) use service_write_set_keeping::DfsWriteSetJoin;
+pub(crate) use service_write_set_keeping::{DfsWriteSetAlignment, DfsWriteSetJoin};
 mod smoke;
 mod transfer;
 mod write_configuration_inputs;
@@ -540,8 +540,8 @@ pub(crate) use message_transport::{
 };
 pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,
-    DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
-    DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot, DfsRepairIndexPage,
+    DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaAlignment, DfsMetadataReplicaApplyReport,
+    DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot, DfsRepairIndexPage,
     DfsSelectedOriginalDataLayout, DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{

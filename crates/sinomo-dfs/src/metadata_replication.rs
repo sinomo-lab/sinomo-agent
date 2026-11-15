@@ -493,6 +493,14 @@ impl DfsMetadataReplicaShardContext {
             .map(|write_set| write_set.switched_at_epoch)
     }
 
+    /// The epoch start this member's record names for the current epoch, when
+    /// the epoch began after the shard switched to the write-set protocol.
+    pub fn epoch_start(&self) -> Option<&crate::DfsMetadataPrefixProof> {
+        self.write_set
+            .as_ref()
+            .and_then(|write_set| write_set.epoch_start.as_ref())
+    }
+
     /// Epoch to record in an acknowledgement floor written for this shard.
     /// Floors of a shard on the all-member rule keep their existing format.
     pub fn floor_authority_epoch(&self) -> Option<u64> {
@@ -6731,6 +6739,89 @@ mod durable_metadata_journal_frame_validation_tests {
 
 /// The member view for a verified prefix probe, from the floor the probe
 /// just made durable. Only a write-set shard's member sends one.
+/// Answer an epoch-start alignment probe from this member's own record: the
+/// probe's prefix must be that record's epoch start, or a head below it the
+/// primary checked. A member that aligned, or already follows the epoch,
+/// confirms its head; one whose journal ends before the prefix reports its
+/// head unconfirmed; one whose journal differs is refused as diverged, which
+/// sends the primary to snapshot repair.
+fn align_dfs_metadata_replica_to_epoch(
+    backend: &mut dyn DfsMetadataBackend,
+    context: &DfsMetadataReplicaShardContext,
+    command: DfsMetadataJournalBatchCommand,
+) -> DfsMetadataJournalBatchResponse {
+    let shard_id = command.batch.shard_id.clone();
+    let next_after_sequence = command.batch.next_after_sequence;
+    let respond = |result: DfsMetadataJournalBatchResult,
+                   verified: bool,
+                   head: Option<&crate::DfsMetadataPrefixProof>| {
+        DfsMetadataJournalBatchResponse {
+            request_id: command.request_id.clone(),
+            shard_id: shard_id.clone(),
+            next_after_sequence,
+            applied_entries: 0,
+            verified_prefix_only: verified,
+            verified_authority_probe_id: None,
+            member_view: head.and_then(|head| context.member_ack_view(Some(head))),
+            result,
+        }
+    };
+    let probe = command
+        .prefix_probe
+        .as_ref()
+        .expect("an alignment probe is a prefix probe");
+    let target = crate::DfsMetadataPrefixProof::from_digest(
+        probe.journal_sequence,
+        probe.state_fingerprint.clone(),
+    );
+    let (Some(epoch_start), Some(target)) = (context.epoch_start(), target) else {
+        return respond(
+            DfsMetadataJournalBatchResult::rejected(
+                DfsMetadataRejectionCode::Other,
+                format!(
+                    "metadata shard {} record names no epoch start to align with at epoch {}",
+                    shard_id.0, context.shard.epoch
+                ),
+            ),
+            false,
+            None,
+        );
+    };
+    if probe.epoch_start_alignment != Some(context.shard.epoch)
+        || probe.journal_sequence != next_after_sequence
+    {
+        return respond(
+            DfsMetadataJournalBatchResult::rejected(
+                DfsMetadataRejectionCode::Other,
+                format!(
+                    "metadata shard {} alignment probe does not name this member's epoch {}",
+                    shard_id.0, context.shard.epoch
+                ),
+            ),
+            false,
+            None,
+        );
+    }
+    let permit = DfsMetadataReplicaIngestPermit::new_validated(
+        context.shard.file_system_id.clone(),
+        shard_id.clone(),
+        context.shard.primary_node_id.clone(),
+        context.shard.epoch,
+    )
+    .with_floor_epoch_scope(context.floor_epoch_scope())
+    .with_epoch_start(Some(epoch_start.clone()));
+    match backend.align_metadata_replica_to_prefix(&permit, &target, epoch_start) {
+        Ok(crate::DfsMetadataReplicaAlignment::Following { head })
+        | Ok(crate::DfsMetadataReplicaAlignment::Aligned { head, .. }) => {
+            respond(DfsMetadataJournalBatchResult::Applied, true, Some(&head))
+        }
+        Ok(crate::DfsMetadataReplicaAlignment::Behind { head }) => {
+            respond(DfsMetadataJournalBatchResult::Applied, false, Some(&head))
+        }
+        Err(error) => respond(DfsMetadataJournalBatchResult::from_rejection(error), false, None),
+    }
+}
+
 fn member_ack_view_from_prefix_floor(
     backend: &dyn DfsMetadataBackend,
     context: &DfsMetadataReplicaShardContext,
@@ -6800,6 +6891,15 @@ fn process_dfs_metadata_journal_batch_inner(
     }
     let shard_id = command.batch.shard_id.clone();
     let next_after_sequence = command.batch.next_after_sequence;
+    if command.verify_prefix_only
+        && command
+            .prefix_probe
+            .as_ref()
+            .is_some_and(|probe| probe.epoch_start_alignment.is_some())
+    {
+        let context = context.expect("validated metadata prefix probe has a shard context");
+        return align_dfs_metadata_replica_to_epoch(backend, context, command);
+    }
     if command.verify_prefix_only {
         let context = context.expect("validated metadata prefix probe has a shard context");
         let source_node_id = command
@@ -6915,7 +7015,8 @@ fn process_dfs_metadata_journal_batch_inner(
         context.shard.primary_node_id.clone(),
         context.shard.epoch,
     )
-    .with_floor_epoch_scope(context.floor_epoch_scope());
+    .with_floor_epoch_scope(context.floor_epoch_scope())
+    .with_epoch_start(context.epoch_start().cloned());
     #[cfg(any(test, feature = "test-support"))]
     let mut native_trace = crate::native_shard_trace::current_boundary_interest();
     #[cfg(any(test, feature = "test-support"))]
@@ -8161,6 +8262,35 @@ pub(crate) fn dfs_metadata_write_set_member_probe_command(
     command
 }
 
+/// An epoch-start alignment probe from a write-set shard's primary at
+/// `epoch`: `target` is the record's epoch start, or a member head below it
+/// the primary checked against its own journal. Like a catch-up probe it
+/// names the record's generation, so the member answers from a view that has
+/// reached it.
+pub(crate) fn dfs_metadata_epoch_alignment_probe_command(
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    epoch: u64,
+    target: &crate::DfsMetadataPrefixProof,
+    write_set_generation: u64,
+) -> DfsMetadataJournalBatchCommand {
+    let mut command = dfs_metadata_write_set_member_probe_command(
+        local_node_id,
+        target_node_id,
+        file_system_id,
+        shard_id,
+        epoch,
+        target,
+        write_set_generation,
+    );
+    if let Some(probe) = command.prefix_probe.as_mut() {
+        probe.epoch_start_alignment = Some(epoch);
+    }
+    command
+}
+
 /// A plain prefix probe at `prefix`: the member acknowledges only when it
 /// holds exactly that journal head.
 pub(crate) fn dfs_metadata_caught_up_probe_command_for(
@@ -8210,6 +8340,7 @@ fn dfs_metadata_caught_up_probe_command(
             state_fingerprint,
             primary_handoff_id: None,
             write_set_generation: None,
+            epoch_start_alignment: None,
         }),
         authority_probe: None,
         durable_replication: None,

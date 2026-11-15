@@ -1686,6 +1686,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: &DfsMetadataJournalBatchCommand,
         context: &DfsMetadataReplicaShardContext,
     ) -> Result<std::result::Result<Option<String>, DfsMetadataRejection>, DfsError> {
+        if command
+            .prefix_probe
+            .as_ref()
+            .is_some_and(|probe| probe.epoch_start_alignment.is_some())
+        {
+            // Alignment may cut the journal and waits for this member's view;
+            // it is answered only on the direct journal-batch route.
+            return Ok(Err(DfsMetadataRejection::new(
+                crate::DfsMetadataRejectionCode::WriteSetViewBehind,
+                "an epoch-start alignment probe is answered on the direct journal-batch route",
+            )));
+        }
         let backend = self
             .metadata_backend
             .as_mut()

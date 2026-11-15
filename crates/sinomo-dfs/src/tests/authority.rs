@@ -3171,6 +3171,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
             state_fingerprint: "blake3:membership-handoff-state".to_string(),
             primary_handoff_id: None,
             write_set_generation: None,
+            epoch_start_alignment: None,
         }),
         authority_probe: None,
         durable_replication: None,

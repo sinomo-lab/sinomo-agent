@@ -1,7 +1,10 @@
 //! Takeover of a write-set shard's primary on the native test runtime: real
 //! Raft-backed cluster KV, real shard stores and the real member paths.
 
-use super::commit_native_tests::{catch_up, cut, members, primary, shard_root, shrink, switched};
+use super::commit_native_tests::{
+    catch_up, cut, directory, durable_prefix, fail_journal_calls, members, mode_change, primary,
+    shard_root, shrink, switched,
+};
 use super::*;
 use crate::DfsMetadataShardId;
 use sinomo_core::kv::KvRequestId;
@@ -261,5 +264,217 @@ fn native_takeover_clears_freeze_markers_the_record_moved_past() {
     catch_up(&runtime, &config, &p);
     assert!(!marker(&p).exists(), "P's pending marker is removed");
     assert!(holds_object(&runtime, &p, &config, &after));
+    runtime.close().unwrap();
+}
+
+/// Align `member` with the current epoch start from `primary`'s resident
+/// service, as the new primary's keeper does.
+fn align(
+    runtime: &crate::test_support::DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    primary: &NodeId,
+    member: &NodeId,
+) -> crate::DfsWriteSetAlignment {
+    let record = cut(runtime, config);
+    let data_dir = runtime.data_dir(primary).clone();
+    let handle = runtime.runtime_handle();
+    runtime
+        .with_main_maintenance_service(primary, |service| {
+            let (peer, _) = crate::runtime_host::daemon_dfs_peer_transports_on_runtime(&data_dir, &handle);
+            let sender =
+                crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
+                    &data_dir, peer,
+                );
+            service.align_write_set_member(&record, member, &sender)
+        })
+        .unwrap()
+        .unwrap()
+}
+
+/// Commit one mode change to `current` at the current primary with a short
+/// caller deadline; members whose journal routes are faulted leave it
+/// prepared.
+fn prepare_unknown(
+    runtime: &crate::test_support::DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    current: &crate::DfsObjectMetadata,
+    operation: &str,
+) {
+    let mut service = primary(runtime);
+    service
+        .transport
+        .set_operation_deadline(Some(Instant::now() + Duration::from_secs(2)));
+    let outcome = service.publish_prepared_operation(mode_change(config, current, 0o640, operation));
+    service.transport.set_operation_deadline(None);
+    match outcome {
+        Err(crate::DfsError::MetadataCommitOutcomeUnknown { .. }) => {}
+        Err(other) => panic!("{operation} stays prepared, not {other:?}"),
+        Ok(_) => panic!("{operation} stays prepared, not committed"),
+    }
+}
+
+/// After a takeover the new primary aligns the members with its epoch start.
+/// The old primary's tail past it, a change nobody else acknowledged, is
+/// dropped and its journal ends exactly at the epoch start. A member whose
+/// journal ends before the epoch start reports its head; the new primary
+/// checks it against its own journal and confirms it. Both then follow the
+/// new primary incrementally: a write commits with the behind member's
+/// acknowledgement and no snapshot is installed.
+#[test]
+fn native_takeover_aligns_members_with_the_epoch_start() {
+    let (runtime, config) = switched("native-takeover-align", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    client_write(&runtime, &config, &c, "/services/align-before.txt");
+    let (z, z2) = {
+        let mut service = primary(&runtime);
+        (
+            directory(&mut service, "/services/align-z"),
+            directory(&mut service, "/services/align-z2"),
+        )
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // Z reaches C but not B; Z2 reaches nobody.
+    fail_journal_calls(&runtime, &config, &b);
+    prepare_unknown(&runtime, &config, &z, "align-z");
+    fail_journal_calls(&runtime, &config, &c);
+    prepare_unknown(&runtime, &config, &z2, "align-z2");
+    let (_, start) = hand_takeover(&runtime, &config, &c);
+    runtime.clear_faults();
+    assert!(durable_prefix(&runtime, &p, &config).unwrap().journal_sequence > start.journal_sequence);
+    assert!(durable_prefix(&runtime, &b, &config).unwrap().journal_sequence < start.journal_sequence);
+
+    // The old primary drops its unacknowledged tail.
+    match align(&runtime, &config, &c, &p) {
+        crate::DfsWriteSetAlignment::Aligned { head } => assert_eq!(head, start),
+        other => panic!("the old primary aligns: {other:?}"),
+    }
+    assert_eq!(durable_prefix(&runtime, &p, &config).as_ref(), Some(&start));
+    // The behind member is checked and confirmed below the epoch start.
+    let behind = durable_prefix(&runtime, &b, &config).unwrap();
+    match align(&runtime, &config, &c, &b) {
+        crate::DfsWriteSetAlignment::Aligned { head } => assert_eq!(head, behind),
+        other => panic!("the behind member is confirmed: {other:?}"),
+    }
+    // Both follow incrementally; no snapshot is installed.
+    let after = client_write(&runtime, &config, &b, "/services/align-after.txt");
+    wait_for("the new primary commits with B", || {
+        holds_object(&runtime, &c, &config, &after)
+    });
+    for (node, journal) in [&p, &b].map(|node| (node.clone(), shard_root(&runtime, node, &config))) {
+        assert!(
+            !std::fs::read_dir(&journal)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("archive")),
+            "{node} kept its store: no snapshot install archived it"
+        );
+    }
+    runtime.close().unwrap();
+}
+
+/// A write-set member whose journal runs past the epoch start aligns inline
+/// on the new primary's first batch of the epoch: under the same writer lock
+/// it drops its unacknowledged tail and then ingests, so the first write of
+/// the epoch commits with it and its journal becomes the new primary's.
+#[test]
+fn native_takeover_member_aligns_inline_on_the_new_epochs_first_batch() {
+    let (runtime, config) = switched("native-takeover-inline", None);
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    client_write(&runtime, &config, &c, "/services/inline-before.txt");
+    let z = {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/inline-z")
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // Z reaches B but not C.
+    fail_journal_calls(&runtime, &config, &c);
+    prepare_unknown(&runtime, &config, &z, "inline-z");
+    let (_, start) = hand_takeover(&runtime, &config, &c);
+    runtime.clear_faults();
+    assert!(durable_prefix(&runtime, &b, &config).unwrap().journal_sequence > start.journal_sequence);
+
+    // No alignment probe is sent: the epoch's first write reaches B first.
+    let after = client_write(&runtime, &config, &b, "/services/inline-after.txt");
+    wait_for("B holds the new primary's write", || {
+        holds_object(&runtime, &b, &config, &after)
+    });
+    wait_for("B's journal is the new primary's", || {
+        durable_prefix(&runtime, &b, &config) == durable_prefix(&runtime, &c, &config)
+    });
+    assert!(
+        !std::fs::read_dir(shard_root(&runtime, &b, &config))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains("archive")),
+        "B kept its store: no snapshot install archived it"
+    );
+    runtime.close().unwrap();
+}
+
+/// Alignment writes the new epoch's floors before it cuts the journal. A
+/// crash between the two leaves floors at the epoch start below the head: the
+/// store opens, and the next alignment cuts.
+#[test]
+fn native_takeover_alignment_cuts_after_a_crash_between_its_floors_and_the_cut() {
+    let (mut runtime, config) = switched("native-takeover-align-crash", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let shard_id = shard_id_of(&config);
+    client_write(&runtime, &config, &c, "/services/crash-before.txt");
+    let tail = {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/crash-tail")
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // The tail reaches nobody but the old primary.
+    fail_journal_calls(&runtime, &config, &b);
+    fail_journal_calls(&runtime, &config, &c);
+    prepare_unknown(&runtime, &config, &tail, "crash-tail");
+    let (_, start) = hand_takeover(&runtime, &config, &c);
+    runtime.clear_faults();
+    let epoch = cut(&runtime, &config).shard.epoch;
+
+    // The crash cut: P wrote both floors at the epoch start and kept its tail.
+    runtime
+        .with_main_maintenance_service(&p, |service| {
+            let backend = service.metadata_backend_mut().unwrap();
+            backend.put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: start.journal_sequence,
+                state_fingerprint: String::new(),
+                durable_prefix_proof: start.clone(),
+                authority_epoch: Some(epoch),
+            })?;
+            backend.put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: start.journal_sequence,
+                durable_prefix_proof: start.clone(),
+                authority_epoch: Some(epoch),
+            })
+        })
+        .unwrap()
+        .unwrap();
+    runtime.stop_node(&p).unwrap();
+    runtime.reopen_node(p.clone()).unwrap();
+    assert!(
+        durable_prefix(&runtime, &p, &config).unwrap().journal_sequence > start.journal_sequence,
+        "the reopened store keeps its tail"
+    );
+
+    match align(&runtime, &config, &c, &p) {
+        crate::DfsWriteSetAlignment::Aligned { head } => assert_eq!(head, start),
+        other => panic!("the next alignment cuts: {other:?}"),
+    }
+    assert_eq!(durable_prefix(&runtime, &p, &config).as_ref(), Some(&start));
     runtime.close().unwrap();
 }

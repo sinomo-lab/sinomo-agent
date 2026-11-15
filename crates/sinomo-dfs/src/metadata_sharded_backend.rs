@@ -6645,6 +6645,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         )
     }
 
+    fn align_metadata_replica_to_prefix(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        target: &DfsMetadataPrefixProof,
+        epoch_start: &DfsMetadataPrefixProof,
+    ) -> Result<crate::DfsMetadataReplicaAlignment> {
+        self.shard_backend_mut(permit.shard_id())?
+            .align_metadata_replica_to_prefix(permit, target, epoch_start)
+    }
+
+    fn historical_metadata_prefix_proof(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        sequence: u64,
+    ) -> Result<Option<DfsMetadataPrefixProof>> {
+        self.shard_backend(shard_id)?
+            .historical_metadata_prefix_proof(shard_id, sequence)
+    }
+
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
         if self.shards.len() != 1 {
             return Err(MetadataBackendError::Serde(
