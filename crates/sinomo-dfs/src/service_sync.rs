@@ -1688,6 +1688,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &probe_barrier_id,
             timeout,
         );
+        self.replication.metadata_sync_held.clear();
+        self.replication.metadata_sync_unreachable.clear();
         self.transport.set_operation_deadline(previous_deadline);
         self.clear_pending_metadata_sync_replications_for_barrier(&probe_barrier_id);
         #[cfg(test)]
@@ -1780,9 +1782,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // a later prefix remains a valid stronger target only when a receiver
         // rejection proves the requested historical head is no longer usable.
         self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?;
+        let mut resend = MetadataSyncResend::default();
         loop {
             self.check_cancelled("metadata quorum sync")?;
             self.revalidate_metadata_quorum_sync_authority(&target, purpose)?;
+            self.replication.metadata_sync_held = resend.held(Instant::now());
             if let Some(certificate) = self.try_finalize_metadata_sync_progress(
                 &target,
                 &freshly_acknowledged,
@@ -2073,7 +2077,72 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ),
                 });
             }
-            let wait = DFS_POSIX_SYNC_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
+            // A member whose attempts this round did not take is sent to again
+            // only after its re-send interval: the timer re-sends, it never
+            // ends the barrier.
+            let now = Instant::now();
+            let mut unanswered = Vec::new();
+            for member in target
+                .replica_node_ids
+                .iter()
+                .filter(|member| **member != self.node_id)
+            {
+                let pending = pending_catchup_batches.values().any(|node| node == member)
+                    || pending_prefix_probes.values().any(|node| node == member)
+                    || pending_checkpoint_snapshots
+                        .values()
+                        .any(|attempt| &attempt.target_node_id == member);
+                if freshly_acknowledged.contains(member) || pending {
+                    resend.answered(member);
+                } else {
+                    resend.failed(member, now);
+                    unanswered.push(member.clone());
+                }
+            }
+            // The network's own verdict ends the wait: once every member not
+            // yet acknowledged has been reported definitely not reachable, no
+            // further acknowledgement can arrive.
+            // The fallback grace still runs first: within it a full proof is
+            // preferred, and after it any certificate the acknowledged members
+            // form is accepted before the barrier ends.
+            if !unanswered.is_empty()
+                && started_at.elapsed() >= full_shard_grace
+                && unanswered
+                    .iter()
+                    .all(|member| self.replication.metadata_sync_unreachable.contains(member))
+            {
+                if let Some(certificate) = self.try_finalize_metadata_sync_progress(
+                    &target,
+                    &freshly_acknowledged,
+                    required_intersection,
+                    purpose,
+                    &started_at,
+                    full_shard_grace,
+                )? {
+                    return Ok(certificate);
+                }
+                return Err(DfsError::NetworkDelivery {
+                    message: format!(
+                        "metadata shard {} durability barrier through sequence {}: the network reports {unanswered:?} unreachable",
+                        target.shard_id.0, target.journal_sequence
+                    ),
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                });
+            }
+            // With nothing in flight, the next round is due when the earliest
+            // held member is; an answer arriving sooner still wakes it.
+            let idle = if pending_catchup_batches.is_empty()
+                && pending_prefix_probes.is_empty()
+                && pending_checkpoint_snapshots.is_empty()
+            {
+                resend
+                    .next_due(now)
+                    .unwrap_or(DFS_POSIX_SYNC_IDLE_WAIT)
+                    .max(DFS_POSIX_SYNC_IDLE_WAIT)
+            } else {
+                DFS_POSIX_SYNC_IDLE_WAIT
+            };
+            let wait = idle.min(timeout.saturating_sub(elapsed));
             self.transport
                 .wait_for_incoming(wait)
                 .map_err(DfsError::from_network)?;
@@ -2258,7 +2327,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         >::new();
         let mut prepared_targets = Vec::new();
         for (target_node_id, after_sequence) in replica_cursors {
-            if target_node_id == self.node_id || after_sequence >= target.journal_sequence {
+            if target_node_id == self.node_id
+                || after_sequence >= target.journal_sequence
+                || self.replication.metadata_sync_held.contains(&target_node_id)
+            {
                 continue;
             }
             if self
@@ -2538,10 +2610,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .insert(request_id.clone(), pending);
             pending_catchup_batches.insert(request_id.clone(), target_node_id.clone());
             let sequence = command.batch.next_after_sequence;
-            let sent = self.send_best_effort_message_if_routable(
+            let outcome = self.send_best_effort_message_if_routable_outcome(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
+            let sent = outcome.sent;
+            if !sent
+                && outcome.delivery_state
+                    == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+            {
+                self.replication
+                    .metadata_sync_unreachable
+                    .insert(target_node_id.clone());
+            } else if sent {
+                self.replication.metadata_sync_unreachable.remove(&target_node_id);
+            }
             diagnostics.record(
                 &target_node_id,
                 "routed-catchup",
@@ -2604,6 +2687,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut candidates = Vec::new();
         for target_node_id in &target.replica_node_ids {
             if freshly_acknowledged.contains(target_node_id)
+                || self.replication.metadata_sync_held.contains(target_node_id)
                 || pending_prefix_probes
                     .values()
                     .any(|pending_node_id| pending_node_id == target_node_id)
@@ -2882,12 +2966,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 true,
             );
-            if outcome.result.is_ok() {
-                pending_prefix_probes.insert(request_id, expected_target_node_id);
-            } else {
-                self.replication
-                    .pending_metadata_replications
-                    .remove(&request_id);
+            match &outcome.result {
+                Ok(()) => {
+                    self.replication
+                        .metadata_sync_unreachable
+                        .remove(&expected_target_node_id);
+                    pending_prefix_probes.insert(request_id, expected_target_node_id);
+                }
+                Err(error) => {
+                    if error.delivery_state()
+                        == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                    {
+                        self.replication
+                            .metadata_sync_unreachable
+                            .insert(expected_target_node_id.clone());
+                    }
+                    self.replication
+                        .pending_metadata_replications
+                        .remove(&request_id);
+                }
             }
         }
         Ok(rejected_node_ids)
@@ -4954,5 +5051,55 @@ mod tests {
             );
         }
         fixture.finish();
+    }
+}
+
+/// Per-member re-send intervals of one durability barrier. A member whose
+/// attempts did not take waits its interval before the next send; the
+/// interval starts at the replica re-send interval and doubles to the
+/// network's liveness interval, and an answer resets it.
+#[derive(Default)]
+struct MetadataSyncResend {
+    members: BTreeMap<NodeId, (Instant, Duration)>,
+}
+
+impl MetadataSyncResend {
+    const FIRST: Duration = Duration::from_millis(250);
+
+    fn held(&self, now: Instant) -> BTreeSet<NodeId> {
+        self.members
+            .iter()
+            .filter(|(_, (due, _))| *due > now)
+            .map(|(member, _)| member.clone())
+            .collect()
+    }
+
+    fn answered(&mut self, member: &NodeId) {
+        self.members.remove(member);
+    }
+
+    fn failed(&mut self, member: &NodeId, now: Instant) {
+        match self.members.get_mut(member) {
+            // Still waiting for this member's interval.
+            Some((due, _)) if *due > now => {}
+            Some((due, interval)) => {
+                *interval = interval
+                    .saturating_mul(2)
+                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+                *due = now + *interval;
+            }
+            None => {
+                self.members
+                    .insert(member.clone(), (now + Self::FIRST, Self::FIRST));
+            }
+        }
+    }
+
+    /// How long until the earliest held member is due again.
+    fn next_due(&self, now: Instant) -> Option<Duration> {
+        self.members
+            .values()
+            .map(|(due, _)| due.saturating_duration_since(now))
+            .min()
     }
 }

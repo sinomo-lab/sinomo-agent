@@ -28,6 +28,13 @@ pub(crate) struct DfsReplicationState {
             Option<crate::DfsMetadataMemberRecordView>,
         ),
     >,
+    /// Members a running durability barrier sends nothing to this round:
+    /// their last attempt did not take, and their re-send interval has not
+    /// passed.
+    pub(crate) metadata_sync_held: BTreeSet<NodeId>,
+    /// Members whose last routed barrier send the network ended as definitely
+    /// not sent.
+    pub(crate) metadata_sync_unreachable: BTreeSet<NodeId>,
 }
 
 impl DfsReplicationState {

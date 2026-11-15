@@ -1596,6 +1596,7 @@ mod authority;
 mod bootstrap;
 mod committed_write_observation;
 mod content;
+mod durability_barrier_resend;
 mod cross_shard;
 
 mod locks;
