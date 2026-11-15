@@ -74,4 +74,7 @@ module dfs_metadata_write_set_takeover_safety {
   def witnessOldPrimaryRejoins: bool = s.kv.primary != M1 and s.kv.writeSet.contains(M1)
   def witnessDeposedPrimaryLateCommit: bool = s.commits.exists(c => c.deposed)
   def witnessFollowerDropsTail: bool = s.droppedTail
+  /// A follower dropped its unacknowledged tail on its own view of a takeover
+  /// record, before it accepted the successor's journal.
+  def witnessFollowerAligns: bool = s.last == Aligned
 }

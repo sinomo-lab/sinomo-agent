@@ -40,6 +40,47 @@ module dfs_write_set_abrupt_takeover_scenario {
   def terminalWitness: bool = all { phase == 21, W::s.kv.primary == W::M2, W::s.kv.writeSet == Set(W::M1, W::M2, W::M3), W::s.log.get(W::M1) == W::s.log.get(W::M2), C::witnessSuccessorCompletesPreparedChange, C::witnessFollowerDropsTail, C::witnessOldPrimaryRejoins }
 }
 
+/// M1 commits value 1, then prepares value 2, which only M3 acknowledges. M2
+/// takes over at epoch start 1 without M1. M3 and then M1 align on their own
+/// view of the takeover record: each drops value 2, which nobody committed,
+/// before accepting M2's journal. M2 commits value 3 with M3, and M1 rejoins.
+module dfs_write_set_align_tail_scenario {
+  import common.* from "../../lib/common"
+  import dfs_metadata_write_set_takeover as W from "../../models/dfs/metadata_write_set_takeover"
+  import dfs_metadata_write_set_takeover_safety as C from "../../checks/dfs/metadata_write_set_takeover_safety"
+  var phase: int
+  action init = all { W::initWith(W::Design), phase' = 0 }
+  action step = any {
+    all { phase == 0, W::prepare(W::M1, 1), phase' = 1 },
+    all { phase == 1, W::accept(W::M2, W::M1), phase' = 2 },
+    all { phase == 2, W::accept(W::M3, W::M1), phase' = 3 },
+    all { phase == 3, W::commit(W::M1, 1), phase' = 4 },
+    all { phase == 4, W::prepare(W::M1, 2), phase' = 5 },
+    all { phase == 5, W::accept(W::M3, W::M1), phase' = 6 },
+    all { phase == 6, W::confirmQuorum(W::M2), phase' = 7 },
+    all { phase == 7, W::promise(W::M2), phase' = 8 },
+    all { phase == 8, W::submitSwap(W::M2), phase' = 9 },
+    all { phase == 9, W::resolveAnySwap(true), phase' = 10 },
+    all { phase == 10, W::learnAnySwap, phase' = 11 },
+    all { phase == 11, W::activate(W::M2), phase' = 12 },
+    all { phase == 12, W::observe(W::M3), phase' = 13 },
+    all { phase == 13, W::align(W::M3), phase' = 14 },
+    all { phase == 14, W::accept(W::M3, W::M2), phase' = 15 },
+    all { phase == 15, W::prepare(W::M2, 3), phase' = 16 },
+    all { phase == 16, W::accept(W::M3, W::M2), phase' = 17 },
+    all { phase == 17, W::commit(W::M2, 2), phase' = 18 },
+    all { phase == 18, W::observe(W::M1), phase' = 19 },
+    all { phase == 19, W::align(W::M1), phase' = 20 },
+    all { phase == 20, W::accept(W::M1, W::M2), phase' = 21 },
+    all { phase == 21, W::submitAdd(W::M2, W::M1), phase' = 22 },
+    all { phase == 22, W::resolveAnyAdd(true), phase' = 23 },
+    all { phase == 23, W::observe(W::M2), phase' = 24 },
+    all { phase == 24, W::s' = W::s, phase' = phase },
+  }
+  def safety: bool = C::safety
+  def terminalWitness: bool = all { phase == 24, W::s.kv.primary == W::M2, W::s.kv.writeSet == Set(W::M1, W::M2, W::M3), W::s.log.get(W::M1) == W::s.log.get(W::M2), W::s.log.get(W::M3) == W::s.log.get(W::M2), W::s.commits.exists(c => c.epoch == 2 and c.entries.length() == 2), C::witnessFollowerDropsTail }
+}
+
 /// M3 reads the record and promises, but M1 removes M3 from the write set and
 /// commits at the W floor without it. M3's swap is rejected; M3 releases its
 /// promise, catches up and is added back.
@@ -287,4 +328,36 @@ module dfs_write_set_no_promise_counterexample {
   }
   def safety: bool = C::recordIsWellFormed
   def terminalWitness: bool = all { phase == 12, not(C::oldPrimaryCommitsOnlyWhatSuccessorHeld), C::writeSetHoldsEveryCommittedEntry, C::noAcknowledgedChangeIsLost, C::committedHistoriesNeverDiverge }
+}
+
+/// Counterexample: a follower that aligned to epoch start again after it had
+/// acknowledged the new primary's change past epoch start would drop a change
+/// the new primary already committed with that acknowledgement.
+module dfs_write_set_align_below_current_ack_counterexample {
+  import common.* from "../../lib/common"
+  import dfs_metadata_write_set_takeover as W from "../../models/dfs/metadata_write_set_takeover"
+  import dfs_metadata_write_set_takeover_safety as C from "../../checks/dfs/metadata_write_set_takeover_safety"
+  var phase: int
+  action init = all { W::initWith(W::AlignBelowCurrentAck), phase' = 0 }
+  action step = any {
+    all { phase == 0, W::prepare(W::M1, 1), phase' = 1 },
+    all { phase == 1, W::accept(W::M2, W::M1), phase' = 2 },
+    all { phase == 2, W::accept(W::M3, W::M1), phase' = 3 },
+    all { phase == 3, W::commit(W::M1, 1), phase' = 4 },
+    all { phase == 4, W::confirmQuorum(W::M2), phase' = 5 },
+    all { phase == 5, W::promise(W::M2), phase' = 6 },
+    all { phase == 6, W::submitSwap(W::M2), phase' = 7 },
+    all { phase == 7, W::resolveAnySwap(true), phase' = 8 },
+    all { phase == 8, W::learnAnySwap, phase' = 9 },
+    all { phase == 9, W::activate(W::M2), phase' = 10 },
+    all { phase == 10, W::observe(W::M3), phase' = 11 },
+    all { phase == 11, W::accept(W::M3, W::M2), phase' = 12 },
+    all { phase == 12, W::prepare(W::M2, 2), phase' = 13 },
+    all { phase == 13, W::accept(W::M3, W::M2), phase' = 14 },
+    all { phase == 14, W::commit(W::M2, 2), phase' = 15 },
+    all { phase == 15, W::align(W::M3), phase' = 16 },
+    all { phase == 16, W::s' = W::s, phase' = phase },
+  }
+  def safety: bool = C::recordIsWellFormed
+  def terminalWitness: bool = all { phase == 16, not(C::writeSetHoldsEveryCommittedEntry) }
 }

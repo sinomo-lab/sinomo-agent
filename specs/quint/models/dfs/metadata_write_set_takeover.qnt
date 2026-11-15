@@ -20,8 +20,11 @@
 /// A primary republishing an inherited prepared change under its new epoch is
 /// modeled as committing the inherited entry once every write-set member has
 /// acknowledged it at that epoch. A follower accepting a primary's journal
-/// replaces its own, which covers incremental catch-up, dropping an
-/// unacknowledged tail and snapshot install.
+/// replaces its own, which covers incremental catch-up and snapshot install.
+/// A follower may also align on its own view of a takeover record: when its
+/// journal matches the successor's at epoch start and it has acknowledged
+/// nothing past epoch start at that epoch, it drops the records after epoch
+/// start before it accepts the successor's journal.
 ///
 /// `Mode` selects the design or one broken variant used by the counterexample
 /// scenarios; `init` uses the design. Excludes liveness, reads, content, real
@@ -44,12 +47,13 @@ module dfs_metadata_write_set_takeover {
     | IgnorePendingAdd
     | VolatilePendingAdd
     | NoPromise
+    | AlignBelowCurrentAck
 
   type Event =
     | Initialized | Prepared | Accepted | Committed | Observed
     | QuorumConfirmed | Promised | SwapSubmitted | SwapApplied | SwapRejected
     | SwapLearned | PromiseReleased | Activated | Shrunk | AddSubmitted
-    | AddApplied | AddRejected | Recruited | Retired | Crashed
+    | AddApplied | AddRejected | Recruited | Retired | Crashed | Aligned
 
   type Entry = { epoch: int, value: int }
   type Record = {
@@ -193,6 +197,33 @@ module dfs_metadata_write_set_takeover {
         .with("acks", s.acks.union(Set({ member: f, epoch: e, gen: vf.gen, length: sent.length() })))
         .with("droppedTail", s.droppedTail or not(isPrefix(s.log.get(f), sent)))
         .with("last", Accepted),
+    }
+  }
+
+  /// A follower drops the records after the epoch start its own view of a
+  /// takeover record names. It does so only when its journal matches the
+  /// successor's journal at epoch start and it has acknowledged nothing past
+  /// epoch start at that epoch: any such acknowledgement may already count
+  /// toward a commit of the new primary.
+  action align(f: Member): bool = {
+    val vf = s.view.get(f)
+    val e = vf.epoch
+    val start = vf.epochStart
+    val held = s.log.get(f)
+    val successor = if (s.swapLogs.keys().contains(e)) s.swapLogs.get(e) else List()
+    all {
+      s.swapLogs.keys().contains(e),
+      vf.primary != f,
+      vf.members.contains(f),
+      e >= s.fence.get(f),
+      successor.length() >= start,
+      held.length() > start,
+      held.slice(0, start) == successor.slice(0, start),
+      s.mode == AlignBelowCurrentAck
+        or not(s.acks.exists(a => a.member == f and a.epoch >= e and a.length > start)),
+      s' = s.with("log", s.log.set(f, held.slice(0, start)))
+        .with("droppedTail", true)
+        .with("last", Aligned),
     }
   }
 
@@ -431,7 +462,7 @@ module dfs_metadata_write_set_takeover {
       prepare(p, v), accept(q, p), commit(p, k), observe(p),
       confirmQuorum(p), promise(p), submitSwap(p), resolveAnySwap(b),
       learnAnySwap, activate(p), shrink(p, q), submitAdd(p, q),
-      resolveAnyAdd(b), recruit(p, q), retire(p, q), crash(p),
+      resolveAnyAdd(b), recruit(p, q), retire(p, q), crash(p), align(p),
     }
   }
 
@@ -449,7 +480,7 @@ module dfs_metadata_write_set_takeover {
       observe(p), observe(p), confirmQuorum(p), promise(p), promise(p), submitSwap(p),
       submitSwap(p), resolveAnySwap(true), resolveAnySwap(b), learnAnySwap, learnAnySwap,
       activate(p), activate(p), shrink(p, q), submitAdd(p, q), submitAdd(p, q),
-      resolveAnyAdd(true), recruit(p, q), retire(p, q), crash(p),
+      resolveAnyAdd(true), recruit(p, q), retire(p, q), crash(p), align(p), align(p),
     }
   }
 }

@@ -48,7 +48,7 @@ register_case membership-kv specs/quint/checks/membership/membership_kv_safety.q
 register_case membership-raft-config specs/quint/checks/membership/raft_config_transition_safety.qnt raft_config_transition_safety "${QUINT_MEMBERSHIP_RAFT_CONFIG_VERIFY_MAX_STEPS:-4}" apalache step step fast "witnessOneToTwoLearnerPromotionCommitted witnessOneToTwoNonVotingPromotionCommitted witnessThreeToTwoShrinkCommitted witnessTwoToOneShrinkRejected witnessDirectVoterAdditionRejected witnessTwoVoterAdditionsRejected witnessHealthObservationWithoutConfigMutation witnessPartialAcknowledgementDoesNotCommit"
 register_case dfs-metadata specs/quint/checks/dfs/metadata_safety.qnt dfs_metadata_safety "$verify_steps"
 register_case dfs-whole-shard specs/quint/checks/dfs/whole_shard_safety.qnt dfs_whole_shard_safety "${QUINT_DFS_WHOLE_SHARD_VERIFY_MAX_STEPS:-8}" apalache step step deep "witnessMinorityRejected witnessPartialRejected witnessChangedRetryRejected witnessPartialActivationRejected witnessWrongDigestRejected witnessDivergentPrefixRejected witnessFrozenWriterRejected"
-register_case dfs-metadata-write-set-takeover specs/quint/checks/dfs/metadata_write_set_takeover_safety.qnt dfs_metadata_write_set_takeover_safety "${QUINT_DFS_METADATA_WRITE_SET_TAKEOVER_VERIFY_MAX_STEPS:-6}" apalache coverageStep step deep "witnessCommitAtFloor witnessPromiseReleased witnessFollowerDropsTail"
+register_case dfs-metadata-write-set-takeover specs/quint/checks/dfs/metadata_write_set_takeover_safety.qnt dfs_metadata_write_set_takeover_safety "${QUINT_DFS_METADATA_WRITE_SET_TAKEOVER_VERIFY_MAX_STEPS:-6}" apalache coverageStep step deep "witnessCommitAtFloor witnessPromiseReleased witnessFollowerDropsTail witnessFollowerAligns"
 register_case dfs-content-binding-publication specs/quint/checks/dfs/content_binding_publication_safety.qnt dfs_content_binding_publication_safety "${QUINT_DFS_CONTENT_BINDING_PUBLICATION_VERIFY_MAX_STEPS:-8}" apalache coverageStep step fast "witnessOneSyncExactPublication witnessLostReplyCrashReconstructsBinding witnessIndexLossRebuildsManifestAndRoot witnessSyncFailureCacheDoesNotAuthorizeReceipt witnessRetrySynchronizesUncertainRecord witnessTornTailReopenPreservesAcknowledgedPrefix witnessCompleteMalformedRecordFailsClosed witnessConflictingTupleRejected witnessQuotaRejectsSecondLiveTuple witnessPostCutRenewalBlocksNegativeRelease witnessForeignCutBlocksNegativeRelease witnessOlderReservationCanRelease witnessPositiveReleaseKeepsCanonicalManifest"
 register_case dfs-content-binding-lifecycle specs/quint/checks/dfs/content_binding_lifecycle_safety.qnt dfs_content_binding_lifecycle_safety "${QUINT_DFS_CONTENT_BINDING_LIFECYCLE_VERIFY_MAX_STEPS:-10}" apalache coverageStep step fast "witnessActivationWaitsForOldOperation witnessActivationCarriesDrainedLegacyBaseline witnessStaleHandleCannotWriteNewLayout witnessCompactionKeepsBindingAndReader witnessCompactionReclaimsAfterReaderRelease witnessCrashBeforeDirectorySyncCanSelectOldGeneration"
 register_case dfs-requester-prestage-binding specs/quint/checks/dfs/requester_prestage_binding_safety.qnt dfs_requester_prestage_binding_safety "${QUINT_DFS_REQUESTER_PRESTAGE_BINDING_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessUnchangedCreateUsesRequesterWithoutStage witnessVersionRebaseSuppressesLegacyCredit witnessObjectRebaseSuppressesLegacyCredit witnessExcludedRequesterNeedsSelectedReplica witnessRebasedTupleBoundBeforeCommit witnessLostReplyCrashRetainsCanonicalBinding witnessRestartNeedsNoPostReplyBinding witnessCancelledCallerCannotUndoDurableBinding witnessWAloneCannotPublish witnessRemovedParentCannotPublish witnessExclusiveRaceCannotPublish witnessChangedRetryDoesNotChangeBinding"
@@ -345,12 +345,14 @@ run_write_set_takeover_scenarios() {
     shrink_race_scenario:13 \
     pending_add_crash_scenario:23 \
     replacement_recruit_scenario:14 \
+    align_tail_scenario:24 \
     volatile_pending_add_counterexample:11 \
     epoch_only_compare_counterexample:8 \
     out_of_sync_candidate_counterexample:8 \
     add_without_catch_up_counterexample:6 \
     ignored_pending_add_counterexample:8 \
-    no_promise_counterexample:12; do
+    no_promise_counterexample:12 \
+    align_below_current_ack_counterexample:16; do
     name="${row%%:*}"
     steps="${row##*:}"
     run_scenario \
