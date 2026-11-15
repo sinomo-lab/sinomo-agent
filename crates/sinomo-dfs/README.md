@@ -163,7 +163,7 @@ An unknown outcome is neither success nor failure. The caller retries the same o
 | Surface | Form |
 |---|---|
 | Routed write reply | `DfsDistributedWriteResult::CommitOutcomeUnknown { intent_id, file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`; the requester keeps the compact pending write instead of abandoning it. A commit attempted when a completing content receipt arrives answers a pending served write the same way; the receipt stays in the durable prepare that carries it |
-| Routed namespace reply | `Rejected` carrying `DfsNamespacePosixError::CommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause }`; the request record stays `Pending`, and admission of a request whose prepare awaits recovery answers the same way. An admission whose own request-row commit is left unknown answers the same way; the same-id retry answers from that row once it commits |
+| Routed namespace reply | `Rejected` carrying `DfsNamespacePosixError::CommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`; the request record stays `Pending`, and admission of a request whose prepare awaits recovery answers the same way. An admission whose own request-row commit is left unknown answers the same way; the same-id retry answers from that row once it commits |
 | Routed namespace timeout after dispatch | `NetworkDelivery { PossiblyApplied }`; the stable-id wrapper retries the same id, and the per-attempt-id wrapper returns instead of retrying under a new id |
 | FUSE / NFS | `EAGAIN` / `NFS3ERR_JUKEBOX`, as for a pending write |
 | Browser conditional replace | `DaemonDfsBrowserReplaceFileIfVersionOutcome::Unknown { detail }`, also used for a pending write and a possibly applied dispatch |
@@ -180,7 +180,14 @@ that produced it. It names the configuration's epoch and primary; a record that 
 match them, or cannot be decoded, grants nothing and the shard keeps the
 all-member rule. The shard configuration's format is unchanged, the shard scan
 decodes only `metadata-shards/` keys, and a write-set change is an authority
-change that does not reopen metadata stores.
+change that does not reopen metadata stores. A change of a switched shard that
+keeps the shard's routing identity and a node's placement (the node holds a
+copy before and after, or neither) rebinds that node's resident store to the
+new configuration in place, as primary or follower; a node that gains or loses
+a copy opens or deletes it, and an unswitched shard reopens on any change. A
+freeze marker the record has moved past (activated below its epoch, or pending
+for a handoff that can no longer complete) is removed on rebind and when the
+store ingests from a later epoch.
 
 Every switch, shrink, add, recruit, N raise, removal and takeover swap is one
 guarded transaction built from one exact-key-set read. It compares the exact bytes of
@@ -234,6 +241,20 @@ than a timer, and a routed reply that cannot wait rejects with
 prepared-change recovery are evaluated against the record current when they
 run.
 
+On a switched shard a member answers a source that names another epoch than
+its own record with a typed code and its record view, `member_record { epoch,
+generation, primary_node_id }`: `source-epoch-superseded` for an earlier epoch,
+`write-set-view-behind` for a later one, `source-epoch-fenced` when its
+acceptance fence refuses the epoch, and `epoch-alignment-required` when it has
+not aligned with the epoch start (below). Older nodes read unknown codes as
+`other`. A commit that a required member refuses for its epoch ends unknown as
+`record-changed` without a catch-up, naming that member's primary when it is
+another node, and a fenced member is posted to the keeper, which may shrink it.
+A member that must be aligned first counts as a missing acknowledgement and is
+posted to the keeper, which aligns it. The publisher suppresses replication to
+a member that superseded its epoch; a fenced member is not suppressed, because
+a takeover that does not apply releases the fence at the same epoch.
+
 On a switched shard, file and directory sync certify the write set and pending
 adds at the retained generation instead of a configured majority: each member is
 brought to the synced prefix within the caller's sync timeout. Below the W floor
@@ -246,15 +267,18 @@ do not advertise it until they implement the whole member-side contract.
 
 #### Keeping the write set
 
-On a Main daemon, the primary of each shard runs one keeper task
-(`run_dfs_write_set_keeping`) that changes the record; nothing else does. It
-acts only on events: configuration publications (the record, cluster members,
-service providers and rules), the network layer's per-peer reachability
-verdicts, member views arriving with replies, and demands left by commits. An
-idle shard whose record already matches its plan sends nothing, and a verdict
-the network is still verifying starts nothing. The keeper holds a network
-reachability subscription only while its node is primary of a switched shard.
-For each shard it plans one step
+On a Main daemon one keeper task (`run_dfs_write_set_keeping`) changes the
+record; nothing else does. As a shard's primary it keeps the write set; as a
+write-set member other than the primary it takes over a lost primary
+([Takeover](#takeover)). It acts only on events: configuration publications
+(the record, cluster members, service providers and rules), the network layer's
+per-peer reachability verdicts, member views arriving with replies, demands
+left by commits and requesters, corroboration requests and its own
+completions. An idle shard whose record already matches its plan sends
+nothing, and a verdict the network is still verifying starts nothing. The
+keeper holds a network reachability subscription only while its node is
+primary of a switched shard or a write-set member that may take one over. For
+each shard it is primary of it plans one step
 from the record and those facts (`plan_metadata_write_set_keeping`):
 
 - switch a shard whose configured members all advertise the protocol, then
@@ -268,12 +292,15 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
   (`raised_n` at least their number; the switch event's cause says so). The
   pass and the switch submission hold the maintenance admission, so no version
   commits in between;
-- shrink a member with a settled no-path verdict, or one the cluster no longer
-  authorizes, never below the W floor;
-- re-add a returning member: it is caught up through the ordinary durability
-  barrier, confirms the head under the record's generation, and its pending add
-  is recorded under the shard writer lock before the add is submitted, all while
-  the keeper holds the maintenance admission so no change is appended between;
+- shrink a member with a settled no-path verdict, one the cluster no longer
+  authorizes, or one that refused the primary's epoch for a takeover candidate,
+  never below the W floor;
+- re-add a returning member: on an epoch that started at a takeover or handoff
+  it is first aligned with the epoch start; it is then caught up through the
+  ordinary durability barrier, confirms the head under the record's generation,
+  and its pending add is recorded under the shard writer lock before the add is
+  submitted, all while the keeper holds the maintenance admission so no change
+  is appended between;
 - recruit an eligible member, preferring non-mobile ones, when the write set is
   below the effective N, or one replacement beyond N when every configured member is in
   the write set (`DfsMetadataShardRecruit`);
@@ -283,7 +310,8 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
 
 A commit that could not reach a required member asks the network to verify
 that peer; once the verdict settles, either the member leaves or the prepared
-change is recovered. Each applied change publishes a typed
+change is recovered. A probe answered with a refusal of the epoch does not count
+as an answer, so a fenced member is not joined. Each applied change publishes a typed
 `dfs.metadata.write_set.*` event (`switched`, `shrunk`, `add_submitted`,
 `added`, `recruited`, `retired`, `n_raised`) naming the change id, generation,
 members and cause, and a shrink or N raise wakes prepared-change recovery. An
@@ -306,11 +334,91 @@ record moves past the add's read.
 
 On a write-set shard an acknowledgement floor records its authority epoch and
 binds only at that epoch; a floor without one belongs to the switch epoch.
-Floors merge by epoch, then sequence. A snapshot from a later epoch replaces an
-earlier epoch's floors before it replaces the state they describe. A member's
-durable acknowledgement carries `member_view`: its epoch, write-set generation
-and exact durable prefix. Other shards write floors and replies in their
-existing encoding.
+Floors merge by epoch, then sequence. An epoch-tagged authority floor may name
+sequence zero, an epoch that started on an empty journal. A snapshot from a
+later epoch replaces an earlier epoch's floors before it replaces the state
+they describe, and writes its epoch's authority floor even at sequence zero. A
+member's durable acknowledgement carries `member_view`: its epoch, write-set
+generation and exact durable prefix. Other shards write floors and replies in
+their existing encoding.
+
+#### Takeover
+
+A write-set member other than the primary starts an attempt when its own
+verdict for the primary settles to no path, or the cluster no longer
+authorizes the primary (which then has no verdict at all). A routed namespace
+request that cannot be delivered to the primary asks the network to verify it
+first. An attempt that ended on its own evidence (a veto, a newer record, a
+failed confirm read or promise) starts again only when the record, the
+publication or this node's verdicts move. The decisions are pure functions
+(`plan_metadata_takeover`, `decide_metadata_takeover_round`,
+`decide_metadata_takeover_hand_off`); the candidate role in the keeper runs
+them.
+
+- **Corroborate.** The candidate asks every other write-set member it does not
+  judge lost on `/dfs/metadata/takeover-corroboration`
+  (`DfsMetadataTakeoverCorroborationRequest`, format 1, exact member identity),
+  served without a shard lock, lane or admission. The member checks the request
+  against its own record (`abstain`: `not-a-member`, `newer-record`,
+  `malformed`), asks the network to verify the primary unless its verdict is
+  already a settled no path, waits for that episode to end, and answers
+  `reaches`, `lost` or `abstain { no-evidence }` with its record view and
+  durable journal head. A call ends on the reply, a network delivery failure or
+  this node's no-path verdict for that member; nothing re-sends it on a timer.
+  Any `reaches` vetoes the attempt and a `newer-record` ends it. Otherwise the
+  candidate and every `lost` member are ranked by journal head, then non-mobile
+  first, then node id. A member ranked first above the candidate gets a
+  `hand-off { ranking }` request and runs the attempt itself when it still
+  ranks first with its own head; it declines with `prefer` otherwise, and a
+  member already promising answers `followed`. On a decline the candidate ranks
+  again without that member. A write set of two asks nobody.
+- **Confirm, promise, swap.** The candidate reads the record with one
+  authoritative read of the shard keys and its configured members; a failed read
+  stops the attempt, so a node outside the KV quorum promises nothing. The
+  record must still name the judged primary at the attempt's epoch with this
+  node in the write set. The promise captures the materialized journal head as
+  epoch start and fences the read epoch under the writer lock
+  (`promise_metadata_takeover`). The swap (`build_metadata_takeover_swap`) is
+  submitted and settled by its own outcome
+  (`settle_metadata_takeover_swap`): applied or superseded keeps the fence,
+  rejected at an unchanged epoch releases it, and an unknown outcome is re-sent
+  as the identical request every 250 ms, doubling to the network timeout. That
+  timer only re-sends. A promise found on disk at start, or by a later attempt,
+  is settled the same way; a promise is never replaced.
+- **Activate.** Once this node's publication names it primary at a takeover
+  epoch and its own settlement, if any, has finished, activation rebinds its
+  store in place, ends a promise from the read epoch and retires its fence, and
+  aligns every write-set member it does not judge lost under the maintenance
+  admission. It then requests the authoritative reconciliation, which runs
+  prepared-change recovery at the new epoch (`recover:<operation>:<epoch>`)
+  and hydration. Activation runs once per epoch per process, and again after a
+  restart.
+
+Alignment uses a prefix probe that names the epoch start and
+`epoch_start_alignment = <epoch>`, answered on the direct journal-batch route
+from the member's own record. A member already holding a floor at the epoch
+past the target confirms its head. One whose journal ends before the epoch
+start reports its head; the primary checks it against its own journal
+(`historical_metadata_prefix_proof`) and confirms it, or repairs the member by
+snapshot. One whose journal matches at the epoch start writes both epoch floors
+at it, then cuts its journal and tables back to it and replays from its table
+checkpoint (`align_metadata_replica_to_prefix`). One whose journal differs
+there, or whose checkpoint is past it, rejects as `replica-diverged` and is
+repaired by snapshot. A crash between the floors and the cut leaves an openable
+store that the next alignment cuts. The epoch's first ingest on a member that
+has written no floor at the epoch makes the same decision under the same lock:
+it cuts and ingests, or rejects with `epoch-alignment-required`. The primary
+seeds its replication cursor for each member from the confirmed head.
+
+Each step publishes a `dfs.metadata.takeover.*` event (schema
+`sinomo.dfs.metadata-takeover` 1.0.0): `corroboration_started`,
+`corroboration_vetoed`, `corroboration_handed_off`, `promised`, `swapped`,
+`swap_superseded`, `promise_released`, `activated` and, from the new primary,
+`aligned` per member it confirmed. Each names the attempt, the read epoch, the
+swap request id and the epoch start; the swap request id links them to the
+record's last change. The old primary is never made primary again
+automatically; once its keeper's publication deposes it, the new primary's
+keeper aligns, catches up and re-adds it like any returning member.
 
 Normal quorum-backed DFS operation must not create conflict records. Base-version races and stale writers are serialized at the owner or metadata-shard primary and must retry, reject, remain pending, or fail fast; a conflict record in this path is a correctness bug. Conflict records are reserved for future split-cluster or disconnected-authority recovery and need an explicit reconciliation algorithm before that mode can be enabled.
 

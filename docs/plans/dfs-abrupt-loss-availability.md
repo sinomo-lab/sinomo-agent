@@ -85,14 +85,18 @@ The implementation differs from these requirements:
   replica, as set up, so one offline node of any kind stops metadata writes on
   every such shard. Only a switched shard is reduced to N members and keeps its
   write set.
-- A primary changes only through the cooperative membership handoff, whose
-  freeze, fence and prefix steps run on the retiring primary. With that primary
-  offline the handoff stays pending and nothing cancels it.
-- An epoch change also advances the store generation, which makes the metadata
-  service reopen.
+- On a shard that has not switched, a primary changes only through the
+  cooperative membership handoff, whose freeze, fence and prefix steps run on
+  the retiring primary. With that primary offline the handoff stays pending and
+  nothing cancels it.
+- On a shard that has not switched, an epoch change also advances the store
+  generation, which makes the metadata service reopen.
 - A caller whose primary is unreachable gets an unknown outcome or a not-sent
   error at the first network error. It does not yet wait for the shard record
-  to name a new primary.
+  to name a new primary. The unknown outcome names the new primary when the
+  attempt learned it, but callers do not act on that yet.
+- Only a routed namespace request that cannot be delivered to the primary asks
+  the network to verify it; a routed write does not.
 - Namespace-job resume selects jobs on every locally replicated shard rather than
   only on shards this node is primary for. Cross-shard source-adoption sessions
   exist only in memory.
@@ -198,11 +202,15 @@ A candidate is a write-set member that can commit to cluster KV.
 
 1. **Corroborate.** The candidate asks the other reachable write-set members, in
    one round, whether they still have a path to the primary and how far their
-   journal goes. Any member that still reaches the primary vetoes the attempt, so
-   one node's poor link cannot depose a healthy primary. The remaining members
-   are ranked by journal position, then non-mobile before mobile, then node id. A
-   candidate that does not rank first hands the attempt to the member that does.
-   Unreachable members are left out, so a two-member write set needs no
+   journal goes. A member asked has the network verify the primary first, unless
+   its verdict already says there is no path, so connectivity records that have
+   not yet aged out cannot veto a primary that died. Any member that still
+   reaches the primary vetoes the attempt, so one node's poor link cannot depose
+   a healthy primary. The remaining members are ranked by journal position, then
+   non-mobile before mobile, then node id. A candidate that does not rank first
+   hands the attempt to the member that does; that member runs it only if it
+   still ranks itself first with its own journal, and otherwise hands it back
+   once. Unreachable members are left out, so a two-member write set needs no
    corroboration.
 2. **Confirm quorum.** The candidate reads the shard record linearizably. If it
    cannot, it is not in quorum and stops.
@@ -216,8 +224,10 @@ A candidate is a write-set member that can commit to cluster KV.
    position. If another change won, the candidate follows it. An unknown outcome
    is settled from the transaction's own outcome before the candidate acts;
    re-reading the record cannot tell a lost swap from one that may still apply.
-   The candidate releases its promise only when its own swap was rejected and
-   the old primary is still primary.
+   The candidate re-sends the identical request until it settles; the re-send
+   is the only timer, because while the swap is unknown no primary can commit
+   and no change may arrive to prompt it. The candidate releases its promise
+   only when its own swap was rejected and the old primary is still primary.
 5. **Activate.** The candidate rebinds its existing store to the new epoch and
    republishes every prepared change it holds through prepared-change recovery,
    so changes the old primary may already have committed complete with the same
@@ -226,8 +236,12 @@ A candidate is a write-set member that can commit to cluster KV.
    rejoins.
 6. **Align followers.** A follower whose prefix matches at epoch start drops any
    records past it. Those records were never acknowledged, because the candidate
-   lacks them. A follower whose prefix differs installs a snapshot. Acknowledgement
-   floors from the old epoch block neither.
+   lacks them. A follower whose journal ends before epoch start reports its head,
+   and the new primary confirms it against its own journal. A follower whose
+   prefix differs installs a snapshot. A follower never extends its journal from
+   an unchecked head: the new epoch's first batch aligns it under the same lock
+   or is refused until it is aligned. Acknowledgement floors from the old epoch
+   block neither.
 7. **Resume work** from the tables, as listed below, then remove unreachable
    members and recruit.
 
@@ -240,9 +254,12 @@ Nothing from the old primary is needed.
 
 ### Keeping W
 
-- **Shrink.** When the network reports that a write-set member has no path, or
-  the cluster no longer authorizes it as a member, the primary removes it with a
-  guarded transaction, but never below the W floor. A dead member that would
+- **Shrink.** When the network reports that a write-set member has no path, the
+  cluster no longer authorizes it as a member, or it refuses the primary's epoch
+  because it promised a takeover candidate, the primary removes it with a
+  guarded transaction, but never below the W floor. The last case keeps a live
+  primary writing when a candidate cannot reach it and its swap is stuck; the
+  shrink changes the record, so that swap can no longer apply. A dead member that would
   take the set below the floor stays in it, and writes wait until it returns or
   a recruit replaces it. Keeping it there also keeps it eligible to take over.
 - **Re-add.** A returning member keeps its copy and catches up incrementally from
@@ -290,13 +307,21 @@ no-path verdict, never on a single failed endpoint probe.
 
 The old primary learns of its replacement from the new shard record, from a
 rejection by a write-set member or from a failed commit, and then redirects its
-callers. It follows the new primary from epoch start, dropping or replacing its
-unacknowledged tail, and rejoins the write set once caught up. It never becomes
-primary again automatically. Its late messages are harmless: anything that needs
-a metadata commit fails, and receivers apply repeats idempotently. Until it
-learns, it may answer reads from its last state.
+callers. A write-set member that refuses its epoch sends its own record, so the
+unknown outcome of the old primary's commit names the new primary even before
+the old primary's own record shows it. The old primary follows the new primary
+from epoch start, dropping or replacing its unacknowledged tail, and rejoins the
+write set once caught up. It never becomes primary again automatically: nothing
+hands primacy back. Once re-added it is an ordinary write-set member, and like
+any other member it may take over if the new primary is later lost. Its late
+messages are harmless: anything that needs a metadata commit fails, and
+receivers apply repeats idempotently. Until it learns, it may answer reads from
+its last state.
 
 ### Remaining work after takeover
+
+Activation requests the successor's authoritative reconciliation, which derives
+this work from the tables it already holds:
 
 | Work | Successor derives it from | Why repeating it is safe |
 |---|---|---|

@@ -587,8 +587,9 @@ correction does not silently relabel those older models as implemented behavior.
 ### Shard write sets and automatic takeover
 
 The `dfs-metadata-write-set-takeover` case is **target hardening** for the
-[abrupt-loss availability plan](../plans/dfs-abrupt-loss-availability.md); no
-Rust path implements it yet. State and actions live in
+[abrupt-loss availability plan](../plans/dfs-abrupt-loss-availability.md): no
+Rust conformance test replays its traces, and the plan's caller and content
+substitution steps are outside it. State and actions live in
 `models/dfs/metadata_write_set_takeover.qnt`, invariants and witnesses in
 `checks/dfs/metadata_write_set_takeover_safety.qnt`, and deterministic traces in
 `scenarios/dfs/metadata_write_set_takeover.qnt`.
@@ -607,7 +608,10 @@ enabled whenever their guards allow, independent of the network verdicts that
 trigger them in the design, so safety does not depend on failure detection.
 Journals, fences, promises and pending adds survive crashes. A follower that
 accepts a primary's journal replaces its own, which stands for incremental
-catch-up, dropping an unacknowledged tail and snapshot install.
+catch-up and snapshot install. `align` separately models a follower dropping
+its tail at the epoch start of its own record's epoch: it cuts its journal to
+the epoch start only when its journal matches the successor's there and it has
+acknowledged nothing past the start at that epoch or later.
 
 `safety` combines these properties:
 
@@ -627,20 +631,24 @@ describe a copy the member has since deleted on retirement. A submitted add
 stays a required acknowledgement, durably, until the record shows it applied or
 can no longer apply.
 
-Four deterministic traces cover the design: abrupt primary loss with a
+Five deterministic traces cover the design: abrupt primary loss with a
 successor completing a prepared change and the old primary rejoining after
-dropping its tail; a shrink racing a takeover, with the rejected candidate
-releasing its promise and being re-added; a primary restart with a pending
-add, after which the added member takes over; and, with the W floor equal to
-N, a dead member held at the floor replaced by a recruit beyond N, which joins
-before the dead member leaves and then commits with the primary at the floor. Six counterexamples each enable
-one broken variant and must reach the violation its invariant detects: a swap
-that compares only the epoch, a candidate outside the write set, an add without
-catch-up, a commit that ignores a submitted add, a pending add lost on restart,
-and a takeover without the promise. The last loses nothing, because the
-successor still holds the records, but epoch start no longer bounds the old
-history. Replaying each counterexample under the design stops at its guarded
-step. The registered random run uses `coverageStep`, which weights replication
+dropping its tail; a follower that holds the old primary's unacknowledged
+records dropping them at epoch start before the new primary commits with it; a
+shrink racing a takeover, with the rejected candidate releasing its promise and
+being re-added; a primary restart with a pending add, after which the added
+member takes over; and, with the W floor equal to N, a dead member held at the
+floor replaced by a recruit beyond N, which joins before the dead member leaves
+and then commits with the primary at the floor. Seven counterexamples each
+enable one broken variant and must reach the violation its invariant detects: a
+swap that compares only the epoch, a candidate outside the write set, an add
+without catch-up, a commit that ignores a submitted add, a pending add lost on
+restart, a takeover without the promise, and an alignment that drops records the
+follower acknowledged at its current epoch. The takeover without the promise
+loses nothing, because the successor still holds the records, but epoch start
+no longer bounds the old history. The broken alignment drops a committed entry
+from a write-set member. Replaying each counterexample under the design stops
+at its guarded step. The registered random run uses `coverageStep`, which weights replication
 and takeover actions; `step` is the unweighted transition relation for symbolic
 checks. The symbolic case is deep-tier. The model omits liveness, reads,
 content placement, storage bytes and transport.
