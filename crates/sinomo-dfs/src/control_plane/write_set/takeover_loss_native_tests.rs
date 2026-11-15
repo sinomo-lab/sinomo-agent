@@ -78,10 +78,10 @@ fn commit_mode_at(
     commit_mode_eventually(runtime, shard, primary, path, mode, operation)
 }
 
-/// Let the surviving cluster-KV voters elect a leader before the members
-/// judge the primary lost: a write from `survivor` campaigns once the old
-/// leader is unreachable. Without it the members' confirm reads can find no
-/// leader, and only a later change would start another attempt.
+/// Commit one KV write from `node`, retried until the voters have elected a
+/// leader it reaches. Tests that cut voters off from cluster KV use it before
+/// closing, so the election a returning voter's higher term forces has
+/// settled and no KV call outlives the close.
 fn reelect(runtime: &DfsTestRuntime, survivor: &NodeId) {
     let cluster = runtime
         .component_context(survivor)
@@ -484,7 +484,6 @@ fn native_second_takeover_after_the_first_successor_stops() {
     }
     keep_with_paths(&runtime, &config, &[&b, &c]);
     runtime.stop_node(&p).unwrap();
-    reelect(&runtime, &b);
     lose(&runtime, &[&b, &c], &p);
     wait_until("a member takes over", &runtime, &[&b, &c], || {
         record_from(&runtime, &config, &b).shard.primary_node_id != p
@@ -504,7 +503,6 @@ fn native_second_takeover_after_the_first_successor_stops() {
     // The members still see P lost, so nobody re-adds it yet.
     runtime.reopen_node(p.clone()).unwrap();
     runtime.stop_node(&first).unwrap();
-    reelect(&runtime, &second);
     lose(&runtime, &[&second], &first);
     wait_until("the other member takes over", &runtime, &[&second], || {
         record_from(&runtime, &config, &second)
@@ -604,7 +602,6 @@ fn native_takeover_of_a_partitioned_live_primary() {
             dfs: true,
         },
     );
-    reelect(&runtime, &b);
     lose(&runtime, &[&b, &c], &p);
     wait_until("a member takes over", &runtime, &[&b, &c], || {
         record_from(&runtime, &config, &b).shard.primary_node_id != p
@@ -878,9 +875,6 @@ fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
         hold_swaps(&runtime, &config, &c),
     ];
     runtime.stop_node(&p).unwrap();
-    // Both candidates' own KV paths work again before they judge P lost.
-    reelect(&runtime, &c);
-    reelect(&runtime, &b);
     runtime.set_peer_verdict(&b, &c, PeerPathVerdict::NoPath, false);
     runtime.set_peer_verdict(&c, &b, PeerPathVerdict::NoPath, false);
     lose(&runtime, &[&b, &c], &p);
@@ -1190,7 +1184,6 @@ fn native_takeover_lost_swap_reply_settles_from_its_own_outcome() {
             .unwrap()
     });
     runtime.stop_node(&p).unwrap();
-    reelect(&runtime, &b);
     lose(&runtime, &[&b, &c], &p);
     wait_until("a member takes over", &runtime, &[&b, &c], || {
         record_from(&runtime, &config, &b).shard.primary_node_id != p
@@ -1593,7 +1586,9 @@ fn settled_view(
     }
 }
 
-/// Every node in `nodes` holds the same history, statuses and state.
+/// Every node in `nodes` comes to hold the same history, statuses and state:
+/// a follower materializes what it acknowledged a moment later, so the views
+/// are compared until they agree.
 fn assert_one_history(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
@@ -1602,13 +1597,22 @@ fn assert_one_history(
     recovery: &str,
     object: &crate::DfsObjectId,
 ) -> SettledView {
-    let views = nodes
-        .iter()
-        .map(|node| settled_view(runtime, node, config, original, recovery, object))
-        .collect::<Vec<_>>();
-    for (node, view) in nodes.iter().zip(&views).skip(1) {
-        assert_eq!(view, &views[0], "{node} differs from {}", nodes[0]);
-    }
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let views = loop {
+        let views = nodes
+            .iter()
+            .map(|node| settled_view(runtime, node, config, original, recovery, object))
+            .collect::<Vec<_>>();
+        if views.iter().all(|view| view == &views[0]) {
+            break views;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the nodes do not converge: {:#?}",
+            nodes.iter().zip(&views).collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
         views[0].original,
         Some(crate::DfsPreparedOperationStatus::Superseded),
@@ -1702,7 +1706,6 @@ fn native_takeover_recovered_change_reaches_one_history_everywhere() {
         },
     );
     runtime.set_peer_verdict(&b, &c, PeerPathVerdict::NoPath, false);
-    reelect(&runtime, &b);
     lose(&runtime, &[&b], &p);
     wait_until("B takes over", &runtime, &[&b], || {
         record_from(&runtime, &config, &b).shard.primary_node_id == b
@@ -1816,7 +1819,6 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
     }
     runtime.stop_node(&p).unwrap();
     runtime.clear_faults();
-    reelect(&runtime, &b);
     lose(&runtime, &[&b, &c], &p);
     wait_until("a member takes over", &runtime, &[&b, &c], || {
         record_from(&runtime, &config, &b).shard.primary_node_id != p
@@ -1880,5 +1882,74 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
         &recovery,
         &object,
     );
+    runtime.close().unwrap();
+}
+
+/// TK1 in a quiet cluster with no write to prompt it: the primary, which
+/// leads cluster KV, stops while the members are cut off from cluster KV, so
+/// the first confirm reads fail. Nothing else changes once KV returns; the
+/// re-sent confirm read alone completes the takeover, and the member with the
+/// longer journal still takes over.
+#[test]
+fn native_takeover_resends_a_failed_confirm_read_in_a_quiet_cluster() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-reconfirm", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let current = {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/reconfirm")
+    };
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // X is prepared on P and C; B never sees it, so C ranks first.
+    fail_journal_calls(&runtime, &config, &b);
+    prepare_unknown(&runtime, &config, &current, "reconfirm-x");
+    runtime.clear_faults();
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    for member in [&b, &c] {
+        runtime.partition_node(
+            member,
+            Partition {
+                kv: true,
+                dfs: false,
+            },
+        );
+    }
+    runtime.stop_node(&p).unwrap();
+    lose(&runtime, &[&b, &c], &p);
+    let unconfirmed = |node: &NodeId| {
+        runtime
+            .write_set_takeover_trace(node)
+            .iter()
+            .any(|line| line.contains("unconfirmed"))
+    };
+    wait_until("a confirm read fails", &runtime, &[&b, &c], || {
+        unconfirmed(&b) || unconfirmed(&c)
+    });
+    for node in [&b, &c] {
+        assert!(
+            promise_of(&runtime, node, &config).is_none(),
+            "{node} promised nothing"
+        );
+    }
+    for member in [&b, &c] {
+        runtime.partition_node(member, Partition::default());
+    }
+    wait_until("C takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id == c
+    });
+    assert_eq!(
+        record_from(&runtime, &config, &b).shard.epoch,
+        config.epoch + 1
+    );
+    wait_until(
+        "the prepared change commits at the new epoch",
+        &runtime,
+        &[&b, &c],
+        || object_mode(&runtime, &c, &config, &current.object_id) == Some(0o640),
+    );
+    assert!(shard_events(&runtime, &b, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
     runtime.close().unwrap();
 }

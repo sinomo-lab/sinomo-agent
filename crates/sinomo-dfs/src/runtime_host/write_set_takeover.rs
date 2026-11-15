@@ -39,7 +39,9 @@ use std::collections::BTreeSet;
 
 mod candidate;
 mod steps;
-pub(super) use candidate::{HAND_OFF_UNAVAILABLE, TakeoverCompletion, TakeoverRole, TakeoverShard};
+pub(super) use candidate::{
+    HAND_OFF_UNAVAILABLE, TAKEOVER_RESEND_FIRST, TakeoverCompletion, TakeoverRole, TakeoverShard,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use steps::test_hooks::{
     hold_takeover_activation_for_test, stop_takeover_after_promise_for_test,

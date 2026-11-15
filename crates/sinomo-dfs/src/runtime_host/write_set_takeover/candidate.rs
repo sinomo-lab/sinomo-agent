@@ -25,7 +25,7 @@ use std::time::Duration;
 
 /// The first re-send of an unknown swap; each later one doubles, up to the
 /// network's own timeout. The timer only re-sends: it never decides.
-const TAKEOVER_RESEND_FIRST: Duration = Duration::from_millis(250);
+pub(in crate::runtime_host) const TAKEOVER_RESEND_FIRST: Duration = Duration::from_millis(250);
 
 /// One switched or switching shard this node is configured for.
 pub(in crate::runtime_host) struct TakeoverShard {
@@ -77,8 +77,32 @@ pub(in crate::runtime_host) enum TakeoverCompletion {
     Rechecked {
         key: ShardKey,
         attempt: String,
-        confirmed: bool,
+        outcome: Recheck,
     },
+    /// The re-send timer of a confirm read that failed.
+    Reconfirm {
+        key: ShardKey,
+        attempt: String,
+    },
+}
+
+/// How this node's own confirm read ended.
+pub(in crate::runtime_host) enum Recheck {
+    Confirmed,
+    /// The read itself failed.
+    Unconfirmed,
+    /// The record no longer names the primary at the attempt's epoch.
+    Refused,
+}
+
+/// A hand-off whose target declined for availability, kept while this node
+/// re-runs its own confirm read.
+struct PendingHandOff {
+    local: DfsTakeoverRank,
+    to: NodeId,
+    entries: BTreeMap<NodeId, DfsTakeoverRoundEntry>,
+    declined: BTreeSet<NodeId>,
+    request: DfsMetadataTakeoverCorroborationRequest,
 }
 
 /// A hand-off target's decline that says it could not reach cluster KV, or
@@ -105,6 +129,8 @@ struct Attempt {
     mobile: BTreeSet<NodeId>,
     /// The asker of a hand-off this attempt runs, answered once it settles.
     reply: Option<tokio::sync::oneshot::Sender<DfsTakeoverHandOffOutcome>>,
+    /// The next re-send interval of a confirm read that failed.
+    reconfirm: Duration,
     step: Step,
 }
 
@@ -135,6 +161,13 @@ enum Step {
         request: DfsMetadataTakeoverCorroborationRequest,
     },
     Taking,
+    /// The confirm read failed. It is re-run on the re-send timer while the
+    /// attempt's trigger holds and its record is unchanged; the re-run's own
+    /// outcome decides. `hand_off` is the declined hand-off the read rechecks.
+    Unconfirmed {
+        hand_off: Option<PendingHandOff>,
+        due: bool,
+    },
     Unknown {
         promise: DfsMetadataTakeoverPromise,
         interval: Duration,
@@ -336,7 +369,10 @@ impl TakeoverRole {
         }
         if let Some(attempt) = self.attempts.get_mut(&shard.key) {
             match attempt.step {
-                Step::Corroborating { .. } | Step::HandingOff { .. } | Step::Rechecking { .. } => {
+                Step::Corroborating { .. }
+                | Step::HandingOff { .. }
+                | Step::Rechecking { .. }
+                | Step::Unconfirmed { .. } => {
                     attempt.step = Step::Taking;
                     attempt.reply = Some(reply);
                     self.spawn_take(shard);
@@ -366,6 +402,7 @@ impl TakeoverRole {
                 promised: false,
                 mobile: BTreeSet::new(),
                 reply: Some(reply),
+                reconfirm: TAKEOVER_RESEND_FIRST,
                 step: Step::Taking,
             },
         );
@@ -413,6 +450,7 @@ impl TakeoverRole {
                 promised: true,
                 mobile: BTreeSet::new(),
                 reply: None,
+                reconfirm: TAKEOVER_RESEND_FIRST,
                 step: Step::Unknown {
                     promise: promise.clone(),
                     interval: TAKEOVER_RESEND_FIRST,
@@ -444,6 +482,7 @@ impl TakeoverRole {
                 cause: cause.as_str(),
                 promised: false,
                 reply: None,
+                reconfirm: TAKEOVER_RESEND_FIRST,
                 mobile: facts
                     .iter()
                     .filter(|(_, facts)| facts.mobile)
@@ -529,7 +568,10 @@ impl TakeoverRole {
         enum Next {
             Nothing,
             Drop,
+            /// Drop a waiting confirm read and its standing.
+            End,
             Decide,
+            Reconfirm,
         }
         let key = &shard.key;
         let Some(attempt) = self.attempts.get_mut(key) else {
@@ -539,8 +581,25 @@ impl TakeoverRole {
         let primary_reached = facts
             .get(&attempt.primary)
             .is_some_and(|facts| !facts.departed && facts.reach == DfsWriteSetMemberReach::Path);
+        // The trigger that started the attempt: a settled no-path verdict for
+        // the primary, or its departure.
+        let triggered = facts
+            .get(&attempt.primary)
+            .is_some_and(|facts| facts.departed)
+            || verdicts.reach(&attempt.primary) == DfsWriteSetMemberReach::NoPath;
         let next = match &mut attempt.step {
             Step::Taking | Step::Unknown { .. } => Next::Nothing,
+            // A failed confirm read is re-run only while nothing it depends on
+            // moved: any record or verdict change ends it.
+            Step::Unconfirmed { due, .. } => {
+                if moved || write_set.generation != attempt.generation || !triggered {
+                    Next::End
+                } else if *due {
+                    Next::Reconfirm
+                } else {
+                    Next::Nothing
+                }
+            }
             Step::Following {
                 publication_generation,
             } => {
@@ -573,8 +632,61 @@ impl TakeoverRole {
             Next::Drop => {
                 self.attempts.remove(key);
             }
+            Next::End => {
+                self.end_standing(key);
+                self.attempts.remove(key);
+            }
             Next::Decide => self.decide_if_complete(shard),
+            Next::Reconfirm => {
+                let Step::Unconfirmed { hand_off, .. } =
+                    std::mem::replace(&mut attempt.step, Step::Taking)
+                else {
+                    return;
+                };
+                match hand_off {
+                    Some(PendingHandOff {
+                        local,
+                        to,
+                        entries,
+                        declined,
+                        request,
+                    }) => {
+                        attempt.step = Step::Rechecking {
+                            local,
+                            to,
+                            entries,
+                            declined,
+                            request,
+                        };
+                        self.spawn_recheck(shard);
+                    }
+                    None => self.spawn_take(shard),
+                }
+            }
         }
+    }
+
+    /// Wait to re-run a confirm read that failed: re-sent after the attempt's
+    /// interval, which doubles to the network timeout. The timer only wakes
+    /// the attempt; `drive` re-runs the read while the trigger still holds.
+    fn wait_to_reconfirm(&mut self, key: &ShardKey, hand_off: Option<PendingHandOff>) {
+        let Some(current) = self.attempts.get_mut(key) else {
+            return;
+        };
+        let interval = current.reconfirm;
+        current.reconfirm = interval
+            .saturating_mul(2)
+            .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+        current.step = Step::Unconfirmed {
+            hand_off,
+            due: false,
+        };
+        let done = self.done.clone();
+        let (key, attempt) = (key.clone(), current.id.clone());
+        self.runtime.spawn(async move {
+            tokio::time::sleep(interval).await;
+            let _ = done.send(TakeoverCompletion::Reconfirm { key, attempt });
+        });
     }
 
     /// Decide the round once every asked member settled and the local head
@@ -826,12 +938,19 @@ impl TakeoverRole {
             TakeoverCompletion::Rechecked {
                 key,
                 attempt,
-                confirmed,
+                outcome,
             } => {
                 #[cfg(any(test, feature = "test-support"))]
                 super::record_takeover_trace_for_test(
                     &self.data_dir,
-                    format!("recheck {attempt}: confirmed={confirmed}"),
+                    format!(
+                        "recheck {attempt}: confirmed={}",
+                        match outcome {
+                            Recheck::Confirmed => "true",
+                            Recheck::Unconfirmed => "unconfirmed",
+                            Recheck::Refused => "false",
+                        }
+                    ),
                 );
                 let current = self.attempts.get_mut(&key)?;
                 if current.id != attempt {
@@ -847,12 +966,27 @@ impl TakeoverRole {
                 else {
                     return None;
                 };
-                if !confirmed {
-                    // Neither can reach cluster KV now: the attempt ends on
-                    // its own evidence, as a failed confirm read does.
-                    self.end_standing(&key);
-                    self.attempts.remove(&key);
-                    return None;
+                match outcome {
+                    Recheck::Confirmed => {}
+                    // Neither can reach cluster KV now: this node re-runs its
+                    // read on the re-send timer, and asks the target again
+                    // once it can.
+                    Recheck::Unconfirmed => {
+                        let hand_off = PendingHandOff {
+                            local,
+                            to,
+                            entries,
+                            declined,
+                            request,
+                        };
+                        self.wait_to_reconfirm(&key, Some(hand_off));
+                        return None;
+                    }
+                    Recheck::Refused => {
+                        self.end_standing(&key);
+                        self.attempts.remove(&key);
+                        return None;
+                    }
                 }
                 current.step = Step::HandingOff {
                     local,
@@ -863,6 +997,15 @@ impl TakeoverRole {
                     request: request.clone(),
                 };
                 self.spawn_ask(key, to, request, true);
+            }
+            TakeoverCompletion::Reconfirm { key, attempt } => {
+                if let Some(current) = self.attempts.get_mut(&key)
+                    && current.id == attempt
+                    && let Step::Unconfirmed { due, .. } = &mut current.step
+                {
+                    // `drive` re-runs it on the evaluation this wake causes.
+                    *due = true;
+                }
             }
             TakeoverCompletion::Resend { key, attempt } => {
                 if let Some(current) = self.attempts.get_mut(&key)
@@ -928,6 +1071,8 @@ impl TakeoverRole {
                 match &outcome {
                     TakeOutcome::NotTaken { follow, reason } =>
                         format!("not-taken follow={follow} {reason}"),
+                    TakeOutcome::Unconfirmed { reason } =>
+                        format!("not-taken unconfirmed {reason}"),
                     TakeOutcome::Failed { reason } => format!("failed {reason}"),
                     TakeOutcome::Settled { settlement, .. } => format!("settled {settlement:?}"),
                 }
@@ -940,11 +1085,12 @@ impl TakeoverRole {
         {
             return;
         }
-        if let Some(reply) = self
+        let reply = self
             .attempts
             .get_mut(&key)
-            .and_then(|current| current.reply.take())
-        {
+            .and_then(|current| current.reply.take());
+        let served = reply.is_some();
+        if let Some(reply) = reply {
             let _ = reply.send(match &outcome {
                 TakeOutcome::Settled { settlement, .. } => match settlement {
                     DfsMetadataTakeoverSettlement::Applied => DfsTakeoverHandOffOutcome::Swapped,
@@ -962,10 +1108,12 @@ impl TakeoverRole {
                     }
                 },
                 TakeOutcome::NotTaken { follow: true, .. } => DfsTakeoverHandOffOutcome::Followed,
-                TakeOutcome::NotTaken { .. } => DfsTakeoverHandOffOutcome::Declined {
-                    reason: HAND_OFF_NO_QUORUM.into(),
-                    prefer: None,
-                },
+                TakeOutcome::NotTaken { .. } | TakeOutcome::Unconfirmed { .. } => {
+                    DfsTakeoverHandOffOutcome::Declined {
+                        reason: HAND_OFF_NO_QUORUM.into(),
+                        prefer: None,
+                    }
+                }
                 TakeOutcome::Failed { reason } => DfsTakeoverHandOffOutcome::Declined {
                     reason: reason.clone(),
                     prefer: None,
@@ -973,6 +1121,19 @@ impl TakeoverRole {
             });
         }
         let (promise, settlement) = match outcome {
+            // This node's own attempt re-runs a failed confirm read. A
+            // hand-off it ran for an asker ends: the asker rechecks.
+            TakeOutcome::Unconfirmed { reason } if !served => {
+                tracing::debug!(target: "sinomo.dfs.write_set", %reason, shard = %key.1.0, "takeover confirm read failed; re-sending");
+                self.wait_to_reconfirm(&key, None);
+                return;
+            }
+            TakeOutcome::Unconfirmed { reason } => {
+                tracing::debug!(target: "sinomo.dfs.write_set", %reason, shard = %key.1.0, "takeover not confirmed");
+                self.end_standing(&key);
+                self.attempts.remove(&key);
+                return;
+            }
             TakeOutcome::NotTaken { follow, reason } => {
                 tracing::debug!(target: "sinomo.dfs.write_set", %reason, follow, shard = %key.1.0, "takeover not confirmed");
                 self.end_standing(&key);
@@ -1292,7 +1453,7 @@ impl TakeoverRole {
             .into_iter()
             .collect::<Vec<_>>();
         self.runtime.spawn_blocking(move || {
-            let confirmed = super::steps::confirm_metadata_takeover_record(
+            let outcome = match super::steps::confirm_metadata_takeover_record(
                 &cluster_paths,
                 &runtime,
                 &local,
@@ -1300,12 +1461,15 @@ impl TakeoverRole {
                 epoch,
                 &primary,
                 &members,
-            )
-            .is_ok();
+            ) {
+                Ok(_) => Recheck::Confirmed,
+                Err(TakeOutcome::Unconfirmed { .. }) => Recheck::Unconfirmed,
+                Err(_) => Recheck::Refused,
+            };
             let _ = done.send(TakeoverCompletion::Rechecked {
                 key,
                 attempt: id,
-                confirmed,
+                outcome,
             });
         });
     }

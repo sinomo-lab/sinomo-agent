@@ -124,9 +124,16 @@ enum Completion {
         change: Option<DfsMetadataWriteSetChangeRequest>,
         outcome: Result<DfsMetadataWriteSetTxnOutcome, String>,
     },
+    /// The re-send timer of a member's failed rejoin step.
+    Retry {
+        key: ShardKey,
+        member: NodeId,
+        attempt: Attempt,
+    },
 }
 
-/// Inputs a failed step saw; it is retried only once one of them changed.
+/// Inputs a failed step saw; it is retried once one of them changed, and on
+/// the re-send timer while none did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Attempt {
     /// The publication's generation: any configuration or record change,
@@ -150,6 +157,8 @@ struct ShardKeeping {
     probing: BTreeSet<NodeId>,
     joining: Option<NodeId>,
     failed: BTreeMap<NodeId, Attempt>,
+    /// The next re-send interval of each member's failed rejoin step.
+    retry: BTreeMap<NodeId, std::time::Duration>,
     /// The record generation a member's own view has reached, learned from a
     /// probe that waited for it.
     observed: BTreeMap<NodeId, u64>,
@@ -676,12 +685,13 @@ impl Keeper {
                 answered,
             } => {
                 let attempt = self.attempt(&key, &member);
-                let keeping = self.shards.entry(key).or_default();
+                let keeping = self.shards.entry(key.clone()).or_default();
                 keeping.probing.remove(&member);
                 if answered {
                     keeping.observed.insert(member, generation);
                 } else {
-                    keeping.failed.insert(member, attempt);
+                    keeping.failed.insert(member.clone(), attempt.clone());
+                    self.schedule_retry(key, member, attempt);
                 }
             }
             Completion::Join {
@@ -697,6 +707,7 @@ impl Keeper {
                 match (outcome, change) {
                     (Ok(DfsMetadataWriteSetTxnOutcome::Applied), Some(change)) => {
                         keeping.failed.remove(&member);
+                        keeping.retry.remove(&member);
                         let submitted = self.publish_event_named(
                             &key,
                             DfsMetadataWriteSetEvent::ADD_SUBMITTED,
@@ -719,11 +730,53 @@ impl Keeper {
                         let _ = attempt;
                     }
                     _ => {
-                        keeping.failed.insert(member, attempt);
+                        keeping.failed.insert(member.clone(), attempt.clone());
+                        self.schedule_retry(key, member, attempt);
                     }
                 }
             }
+            Completion::Retry {
+                key,
+                member,
+                attempt,
+            } => {
+                // The inputs the failed step saw are unchanged, so nothing
+                // else would retry it: let the planner run it again. A
+                // changed input already did, and the planner decides whether
+                // the step is still wanted at all.
+                let keeping = self.shards.entry(key).or_default();
+                if keeping.failed.get(&member) == Some(&attempt) {
+                    keeping.failed.remove(&member);
+                }
+            }
         }
+    }
+
+    /// Re-send a member's failed rejoin step after its interval, which starts
+    /// at the takeover re-send interval and doubles to the network timeout.
+    /// The timer only wakes the keeper; the step's own outcome decides.
+    fn schedule_retry(&mut self, key: ShardKey, member: NodeId, attempt: Attempt) {
+        let keeping = self.shards.entry(key.clone()).or_default();
+        let interval = keeping
+            .retry
+            .get(&member)
+            .copied()
+            .unwrap_or(super::write_set_takeover::TAKEOVER_RESEND_FIRST);
+        keeping.retry.insert(
+            member.clone(),
+            interval
+                .saturating_mul(2)
+                .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+        );
+        let done = self.completion_tx.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(interval).await;
+            let _ = done.send(Completion::Retry {
+                key,
+                member,
+                attempt,
+            });
+        });
     }
 
     fn record_generation(&self, key: &ShardKey) -> u64 {

@@ -13,10 +13,16 @@ use std::collections::BTreeSet;
 
 /// How confirm, promise and swap ended.
 pub(in crate::runtime_host) enum TakeOutcome {
-    /// Nothing was promised: the confirm read failed, or the record no longer
-    /// names the primary judged lost at the attempt's epoch.
+    /// Nothing was promised: the record no longer names the primary judged
+    /// lost at the attempt's epoch, with this node in the write set.
     NotTaken {
         follow: bool,
+        reason: String,
+    },
+    /// Nothing was promised: the confirm read itself failed. This may be
+    /// momentary, while the KV voters elect, and says nothing about the
+    /// record.
+    Unconfirmed {
         reason: String,
     },
     /// The promise is durable; the swap's own outcome is known or not.
@@ -64,8 +70,7 @@ pub(in crate::runtime_host) fn confirm_metadata_takeover_record(
             });
         }
         Err(error) => {
-            return Err(TakeOutcome::NotTaken {
-                follow: false,
+            return Err(TakeOutcome::Unconfirmed {
                 reason: format!("the confirm read failed: {error}"),
             });
         }

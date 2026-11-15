@@ -216,7 +216,10 @@ A candidate is a write-set member that can commit to cluster KV.
    attempt down the ranking. Unreachable members are left out, so a two-member
    write set needs no corroboration.
 2. **Confirm quorum.** The candidate reads the shard record linearizably. If it
-   cannot, it is not in quorum and stops.
+   cannot, it promises nothing. A failed read can be momentary while the KV
+   voters elect, so it is re-sent on the same timer as an unknown swap for as
+   long as the primary is still judged lost and the record is unchanged; any
+   change ends it, and only a read that succeeds lets the attempt continue.
 3. **Promise.** The candidate durably records that it accepts nothing more from
    the old primary at the current epoch, serialized with its acknowledgement
    path. From then on the old primary cannot commit anything this member does
@@ -228,8 +231,9 @@ A candidate is a write-set member that can commit to cluster KV.
    is settled from the transaction's own outcome before the candidate acts;
    re-reading the record cannot tell a lost swap from one that may still apply.
    The candidate re-sends the identical request until it settles; the re-send
-   is the only timer, because while the swap is unknown no primary can commit
-   and no change may arrive to prompt it. The candidate releases its promise
+   is a timer, because while the swap is unknown no primary can commit and no
+   change may arrive to prompt it. Re-sends of a failed confirm read and of a
+   failed rejoin step are the only other timers, for the same reason. The candidate releases its promise
    only when its own swap was rejected and the old primary is still primary.
 5. **Activate.** The candidate rebinds its existing store to the new epoch and
    republishes every prepared change it holds through prepared-change recovery,

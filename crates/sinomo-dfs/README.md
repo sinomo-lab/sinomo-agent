@@ -300,7 +300,9 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
   ordinary durability barrier, confirms the head under the record's generation,
   and its pending add is recorded under the shard writer lock before the add is
   submitted, all while the keeper holds the maintenance admission so no change
-  is appended between;
+  is appended between. A catch-up probe or join that fails is retried once an
+  input it saw moves, and on the same re-send timer while none does, so a
+  momentary failure in a quiet cluster does not leave the member out;
 - recruit an eligible member, preferring non-mobile ones, when the write set is
   below the effective N, or one replacement beyond N when every configured member is in
   the write set (`DfsMetadataShardRecruit`);
@@ -348,9 +350,10 @@ A write-set member other than the primary starts an attempt when its own
 verdict for the primary settles to no path, or the cluster no longer
 authorizes the primary (which then has no verdict at all). A routed namespace
 request that cannot be delivered to the primary asks the network to verify it
-first. An attempt that ended on its own evidence (a veto, a newer record, a
-failed confirm read or promise) starts again only when the record, the
-publication or this node's verdicts move. The decisions are pure functions
+first. An attempt that ended on its own evidence (a veto, a newer record or a
+failed promise) starts again only when the record, the publication or this
+node's verdicts move; a failed confirm read is re-sent instead (below). The
+decisions are pure functions
 (`plan_metadata_takeover`, `decide_metadata_takeover_round`,
 `decide_metadata_takeover_hand_off`); the candidate role in the keeper runs
 them.
@@ -373,13 +376,19 @@ them.
   member already promising answers `followed`. A member that cannot run the
   attempt declines with `no-quorum` when its confirm read fails, or with
   `unavailable` when its keeper cannot evaluate the shard. On such a decline
-  the candidate reads the record itself: if that read fails too it stops, and
-  if it succeeds a quorum is serving, so it asks the same member once more.
+  the candidate reads the record itself: if that read fails too it re-sends
+  its read as a failed confirm read is re-sent (below), and once a read
+  succeeds a quorum is serving, so it asks the same member once more.
   On any other decline, or a second availability decline, the candidate ranks
   again without that member. A write set of two asks nobody.
 - **Confirm, promise, swap.** The candidate reads the record with one
   authoritative read of the shard keys and its configured members; a failed read
-  stops the attempt, so a node outside the KV quorum promises nothing. The
+  promises nothing, so a node outside the KV quorum promises nothing. A failed
+  read can be momentary while the KV voters elect, and no other change may
+  arrive to prompt another attempt, so it is re-sent every 250 ms, doubling to
+  the network timeout, while the primary is still judged lost (a settled no-path
+  verdict, or its departure) and the record is unchanged. Any record or verdict
+  change ends it, and the re-sent read's own outcome decides. The
   record must still name the judged primary at the attempt's epoch with this
   node in the write set. The promise captures the materialized journal head as
   epoch start and fences the read epoch under the writer lock
