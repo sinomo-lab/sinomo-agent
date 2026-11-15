@@ -301,9 +301,13 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
   ordinary durability barrier, confirms the head under the record's generation,
   and its pending add is recorded under the shard writer lock before the add is
   submitted, all while the keeper holds the maintenance admission so no change
-  is appended between. A catch-up probe or join that fails is retried once an
-  input it saw moves, and on the same re-send timer while none does, so a
-  momentary failure in a quiet cluster does not leave the member out;
+  is appended between. Because the keeper waits on the member while it holds
+  that admission, its write-set probes preempt a maintenance pass on the
+  member, as a handoff probe does: a member pass that is itself waiting on this
+  primary yields instead of waiting on the keeper. A catch-up probe or join
+  that fails is retried once an input it saw moves, and on the same re-send
+  timer while none does, so a momentary failure in a quiet cluster does not
+  leave the member out;
 - recruit an eligible member, preferring non-mobile ones, when the write set is
   below the effective N, or one replacement beyond N when every configured member is in
   the write set (`DfsMetadataShardRecruit`);

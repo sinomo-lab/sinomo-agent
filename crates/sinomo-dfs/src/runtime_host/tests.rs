@@ -1883,6 +1883,87 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
     });
 }
 
+/// A write-set join holds its own node's global admission while it aligns and
+/// probes a member, so its member and alignment probes keep foreground
+/// preemption on that member: a member maintenance pass that is waiting on
+/// the joining primary yields to them instead of waiting on the join.
+#[test]
+fn write_set_prefix_probes_preempt_maintenance() {
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let runtime = daemon_test_runtime("write-set-prefix-probes-preempt-maintenance");
+    let file_system_id = DfsFileSystemId::from_legacy_named("write-set-probe-fs").unwrap();
+    let shard_id = DfsMetadataShardId::new("root");
+    let primary = NodeId::from_legacy_named("write-set-probe-primary").unwrap();
+    let member = NodeId::from_legacy_named("write-set-probe-member").unwrap();
+    let prefix = sinomo_dfs::DfsMetadataPrefixProof {
+        version: 2,
+        journal_sequence: 3,
+        digest: "blake3:write-set-probe".into(),
+    };
+    let plain = crate::metadata_replication::dfs_metadata_caught_up_probe_command_for(
+        &primary,
+        &member,
+        &file_system_id,
+        &shard_id,
+        7,
+        &prefix,
+    );
+    assert!(
+        daemon_dfs_metadata_prefix_probe_is_verification_only(&plain, &primary, &member),
+        "a plain caught-up probe still waits for maintenance"
+    );
+    let probes = [
+        crate::metadata_replication::dfs_metadata_write_set_member_probe_command(
+            &primary,
+            &member,
+            &file_system_id,
+            &shard_id,
+            7,
+            &prefix,
+            4,
+        ),
+        crate::metadata_replication::dfs_metadata_epoch_alignment_probe_command(
+            &primary,
+            &member,
+            &file_system_id,
+            &shard_id,
+            7,
+            &prefix,
+            4,
+        ),
+    ];
+    for probe in &probes {
+        assert!(!daemon_dfs_metadata_prefix_probe_is_verification_only(
+            probe, &primary, &member
+        ));
+        runtime.block_on(async {
+            let interest = scheduler.begin_maintenance_interest();
+            let maintenance = scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive)
+                .await
+                .unwrap();
+            let scope = daemon_dfs_test_execution_scope("write-set-probe-fs", "root");
+            let admission = admit_daemon_dfs_message(
+                &scheduler,
+                &scope,
+                !dfs_metadata_replication_can_wait_for_maintenance(probe, &primary, &member),
+            );
+            tokio::pin!(admission);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut admission)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                interest.is_requested(),
+                "a write-set probe preempts the member's maintenance"
+            );
+            drop(maintenance);
+            assert!(admission.await.unwrap().is_exact());
+        });
+    }
+}
+
 #[test]
 fn placement_and_promotions_wait_for_repairs_but_user_requests_still_preempt() {
     let scheduler = Arc::new(DaemonDfsMutationScheduler::new());

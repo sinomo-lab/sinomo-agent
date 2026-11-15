@@ -1942,3 +1942,74 @@ fn native_takeover_resends_a_failed_confirm_read_in_a_quiet_cluster() {
     assert!(shard_events(&runtime, &b, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
     runtime.close().unwrap();
 }
+
+/// The old primary returns while one of its own maintenance passes holds its
+/// global admission and waits on the new primary, as its reconciliation does
+/// when it routes a namespace request there. The new primary's join holds
+/// its own global admission while it aligns and probes the member, so the
+/// two would wait on each other until the member's pass gave up; the join's
+/// probes preempt that pass instead, and the member rejoins at once.
+#[test]
+fn native_rejoin_preempts_a_maintenance_pass_on_the_returning_member() {
+    let (mut runtime, config) =
+        switched_with_kv_voters("native-loss-rejoin-preempts", Some((1, 3)));
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    runtime.stop_node(&p).unwrap();
+    lose(&runtime, &[&b, &c], &p);
+    let write_set = |runtime: &DfsTestRuntime| {
+        record_from(runtime, &config, &b)
+            .write_set_state()
+            .switched()
+            .map(|state| state.write_set.clone())
+            .unwrap_or_default()
+    };
+    wait_until("a member takes over", &runtime, &[&b, &c], || {
+        record_from(&runtime, &config, &b).shard.primary_node_id != p
+    });
+    assert!(!write_set(&runtime).contains(&p));
+
+    runtime.reopen_node(p.clone()).unwrap();
+    // A maintenance pass on P that cannot finish before the new primary
+    // answers: it holds P's global admission until foreground work preempts it.
+    let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(runtime.data_dir(&p))
+        .expect("P's admission scheduler");
+    let (held, holding) = std::sync::mpsc::channel();
+    let pass = executor().spawn(async move {
+        let interest = scheduler.begin_maintenance_interest();
+        let admission = scheduler
+            .admit(&crate::DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .expect("P's maintenance admission");
+        held.send(()).unwrap();
+        interest.requested().await;
+        drop(admission);
+    });
+    holding
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the pass holds P's admission");
+
+    let started = Instant::now();
+    for observer in [&b, &c] {
+        runtime.set_peer_verdict(observer, &p, PeerPathVerdict::Path, false);
+    }
+    // A rejoin takes well under a second here; the bound only has to sit
+    // clearly below the member pass's own request budget.
+    let bound = Duration::from_secs(20);
+    while !write_set(&runtime).contains(&p) {
+        assert!(
+            started.elapsed() < bound,
+            "P was not re-added within {bound:?}:\n{}",
+            event_log(&runtime, &[&b, &c])
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pass.is_finished() {
+        assert!(Instant::now() < deadline, "the pass was preempted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    runtime.close().unwrap();
+}

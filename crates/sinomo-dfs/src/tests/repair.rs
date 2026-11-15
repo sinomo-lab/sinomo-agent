@@ -3325,8 +3325,13 @@ fn commit_version_conflicting_receipt_does_not_advance_visible_metadata() {
 #[test]
 fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() {
     let bytes = b"commit should publish missing local receipt";
-    let (runtime, mut dfs, stat, removed) =
-        native_withdrawn_local_replica_fixture("native-commit-repairs-missing-receipt", bytes);
+    // The shard primary's executor would restore the withdrawn receipt from
+    // its still-present bytes once the withdrawal is published; hold it so
+    // this commit is the one that restores it.
+    let (runtime, mut dfs, stat, removed, executor_hold) = native_withdrawn_local_replica_fixture_held(
+        "native-commit-repairs-missing-receipt",
+        bytes,
+    );
     let shard = runtime
         .metadata_shards()
         .unwrap()
@@ -3418,6 +3423,7 @@ fn commit_version_repairs_missing_local_receipt_when_backend_is_authoritative() 
         bytes
     );
     drop(dfs);
+    drop(executor_hold);
     runtime.close().unwrap();
 }
 

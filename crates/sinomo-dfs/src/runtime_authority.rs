@@ -38,6 +38,11 @@ pub(crate) fn dfs_metadata_replication_can_wait_for_maintenance(
 /// Whether a metadata prefix probe is a non-mutating verification request.
 /// Exact validation lives with DFS protocol semantics so hosts cannot disagree
 /// about which background probes may avoid foreground-maintenance preemption.
+///
+/// A write-set probe (one naming a record generation, or an epoch start to
+/// align with) is not one: a write-set join sends it while holding its own
+/// node's global admission, so a member maintenance pass waiting on that
+/// node must yield to it, as it yields to a handoff probe.
 pub(crate) fn dfs_metadata_prefix_probe_is_verification_only(
     command: &crate::DfsMetadataJournalBatchCommand,
     authenticated_source_node_id: &sinomo_core::node::NodeId,
@@ -49,6 +54,8 @@ pub(crate) fn dfs_metadata_prefix_probe_is_verification_only(
     command.verify_prefix_only
         && command.source_node_id.as_ref() == Some(authenticated_source_node_id)
         && prefix_probe.primary_handoff_id.is_none()
+        && prefix_probe.write_set_generation.is_none()
+        && prefix_probe.epoch_start_alignment.is_none()
         && !prefix_probe.barrier_id.is_empty()
         && !prefix_probe.state_fingerprint.is_empty()
         && command.file_system_id.as_ref() == prefix_probe.file_system_id.as_ref()
