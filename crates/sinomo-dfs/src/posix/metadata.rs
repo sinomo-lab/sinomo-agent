@@ -1481,6 +1481,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// service that reads the path's shard locally stats its own record; any
     /// other reads the committed head and its link count from the authorities.
     pub(super) fn committed_write_stat(&mut self, path: &str) -> Result<DfsStat> {
+        self.committed_write_stat_once(path)
+            .map_err(committed_write_observation_error)
+    }
+
+    fn committed_write_stat_once(&mut self, path: &str) -> Result<DfsStat> {
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         if self.local_metadata_answers_path_from_snapshot(path, shard_snapshot.as_deref())? {
             match self.stat_target_for_path(path) {
@@ -1856,4 +1861,20 @@ mod symlink_follow_tests {
 #[cfg(any(test, feature = "test-support"))]
 std::thread_local! {
     static POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How a write that committed reports a failed post-commit observation. The
+/// change applied, so the failure must not read as one that sent nothing: a
+/// network failure becomes a possibly applied delivery, which a caller
+/// settles by retrying the same operation id, never under a new one.
+pub(super) fn committed_write_observation_error(error: DfsPosixError) -> DfsPosixError {
+    match error {
+        DfsPosixError::Dfs(
+            crate::DfsError::NetworkDelivery { message, .. } | crate::DfsError::Network { message },
+        ) => DfsPosixError::Dfs(crate::DfsError::NetworkDelivery {
+            message: format!("the write committed; reading its result failed: {message}"),
+            delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        }),
+        other => other,
+    }
 }

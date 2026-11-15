@@ -1594,6 +1594,7 @@ fn sifs_cluster_observe_completed_assignments(
 // private transport and storage helpers without widening production APIs.
 mod authority;
 mod bootstrap;
+mod committed_write_observation;
 mod content;
 mod cross_shard;
 

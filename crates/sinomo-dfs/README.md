@@ -167,6 +167,7 @@ An unknown outcome is neither success nor failure. The caller retries the same o
 | Routed namespace timeout after dispatch | `NetworkDelivery { PossiblyApplied }`; the stable-id wrapper retries the same id, and the per-attempt-id wrapper returns instead of retrying under a new id |
 | FUSE / NFS | `EAGAIN` / `NFS3ERR_JUKEBOX`, as for a pending write |
 | Browser conditional replace | `DaemonDfsBrowserReplaceFileIfVersionOutcome::Unknown { detail }`, also used for a pending write and a possibly applied dispatch |
+| POSIX write that committed but whose post-commit stat fails | `NetworkDelivery { PossiblyApplied }`, never `DefinitelyNotSent`: the change applied, so the caller retries the same operation id rather than writing under a new one |
 | Same-shard namespace jobs and prepared-change recovery | the job stays `Running`; a recovery pass attempts every other body and reports itself incomplete so it runs again; an unknown caused by cancellation stops the pass, and `DfsError::is_cancellation` treats it as the cancellation it is |
 
 #### Shard write sets

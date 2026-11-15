@@ -3560,14 +3560,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id,
                 object_id,
                 path,
-            } => self.with_stat_deadline(|service| {
-                let authoritative = service
-                    .current_object_from_authority(&file_system_id, &object_id)?
-                    .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                service.with_stat_read_rounds(|service| {
-                    service.stat_object_from_authorities(&authoritative, &path, None)
+            } => self
+                .with_stat_deadline(|service| {
+                    let authoritative = service
+                        .current_object_from_authority(&file_system_id, &object_id)?
+                        .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                    service.with_stat_read_rounds(|service| {
+                        service.stat_object_from_authorities(&authoritative, &path, None)
+                    })
                 })
-            }),
+                .map_err(metadata::committed_write_observation_error),
         }
     }
 

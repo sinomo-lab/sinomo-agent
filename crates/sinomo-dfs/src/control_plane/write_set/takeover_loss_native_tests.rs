@@ -1521,12 +1521,15 @@ fn native_takeover_member_with_a_divergent_prefix_is_repaired_by_snapshot() {
 }
 
 /// What `node` holds for a recovered change, in a form two nodes can be
-/// compared by: each journal record's sequence, kind and operation; the
-/// settled status of the original and of its recovery body; and digests of
-/// the object and of the whole shard table state.
+/// compared by: its durable head, the settled status of the original and of
+/// its recovery body, and digests of the object and of the whole shard table
+/// state.
 #[derive(Debug, PartialEq, Eq)]
 struct SettledView {
-    journal: Vec<String>,
+    /// The durable head: its digest chains every record, so equal heads are
+    /// one history even where a snapshot install replaced a member's
+    /// retained journal.
+    head: Option<crate::DfsMetadataPrefixProof>,
     original: Option<crate::DfsPreparedOperationStatus>,
     recovery: Option<crate::DfsPreparedOperationStatus>,
     object: Option<(u32, String)>,
@@ -1556,21 +1559,7 @@ fn settled_view(
     };
     let digest = |text: String| blake3::hash(text.as_bytes()).to_hex()[..16].to_string();
     SettledView {
-        journal: backend
-            .journal_since(0)
-            .unwrap()
-            .into_iter()
-            .map(|entry| {
-                let text = format!("{:?}", entry.mutation);
-                let kind = text.split([' ', '{', '(']).next().unwrap_or("").to_string();
-                let operation = text
-                    .split("operation_id: \"")
-                    .nth(1)
-                    .and_then(|rest| rest.split('"').next())
-                    .unwrap_or("");
-                format!("{}:{kind}:{operation}", entry.sequence)
-            })
-            .collect(),
+        head: backend.metadata_prefix_proof().ok(),
         original: status(original),
         recovery: status(recovery),
         object: backend
