@@ -144,9 +144,16 @@ impl DfsMutationLaneKey {
 /// not borrow mutation admission at all. Maintenance publishes an interest
 /// generation so foreground work can preempt a pass before it monopolizes the
 /// global generation.
+///
+/// A node's answers to a peer's in-flight operation (journal batches, write-set
+/// probes and snapshot installs) are admitted on their exact shard lane past a
+/// global writer that is only waiting, and never while one holds the node. The
+/// peer's operation may be what that writer waits for, through the peer
+/// waiting on this answer; ordinary exact work still queues behind the writer.
 #[derive(Debug)]
 pub(crate) struct DfsMutationScheduler {
     global: Arc<tokio::sync::RwLock<()>>,
+    answers: Arc<DfsAnswerGate>,
     shard_gates: Mutex<BTreeMap<DfsMutationLaneKey, Arc<tokio::sync::Semaphore>>>,
     shard_gate_limit: usize,
     maintenance_interest_count: AtomicUsize,
@@ -168,6 +175,7 @@ impl DfsMutationScheduler {
     pub fn with_shard_gate_limit(shard_gate_limit: usize) -> Self {
         Self {
             global: Arc::new(tokio::sync::RwLock::new(())),
+            answers: Arc::default(),
             shard_gates: Mutex::new(BTreeMap::new()),
             shard_gate_limit,
             maintenance_interest_count: AtomicUsize::new(0),
@@ -211,13 +219,25 @@ impl DfsMutationScheduler {
     }
 
     pub fn try_admit_global(self: &Arc<Self>) -> Option<DfsMutationAdmission> {
-        Arc::clone(&self.global)
-            .try_write_owned()
-            .ok()
-            .map(|global| DfsMutationAdmission::Global {
-                _scheduler: Arc::clone(self),
-                _global: global,
-            })
+        let global = Arc::clone(&self.global).try_write_owned().ok()?;
+        let answers = self.answers.try_hold()?;
+        Some(DfsMutationAdmission::Global {
+            _scheduler: Arc::clone(self),
+            _answers: answers,
+            _global: global,
+        })
+    }
+
+    async fn admit_global(self: &Arc<Self>) -> DfsMutationAdmission {
+        let global = Arc::clone(&self.global).write_owned().await;
+        // Answers admitted while this writer waited finish before it holds the
+        // node; no new answer starts until it releases.
+        let answers = self.answers.hold().await;
+        DfsMutationAdmission::Global {
+            _scheduler: Arc::clone(self),
+            _answers: answers,
+            _global: global,
+        }
     }
 
     fn shard_gate(
@@ -249,12 +269,9 @@ impl DfsMutationScheduler {
                 });
             }
             let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
-            let global = Arc::clone(&self.global).write_owned().await;
+            let admission = self.admit_global().await;
             trace_dfs_admission_gate(self, scope, "global-write", gate_started);
-            return Ok(DfsMutationAdmission::Global {
-                _scheduler: Arc::clone(self),
-                _global: global,
-            });
+            return Ok(admission);
         };
 
         // Reserve the exact shard before joining the global read side. A
@@ -263,12 +280,9 @@ impl DfsMutationScheduler {
         // after only the currently active exact owners finish.
         let Some(shard_gate) = self.shard_gate(&key)? else {
             let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
-            let global = Arc::clone(&self.global).write_owned().await;
+            let admission = self.admit_global().await;
             trace_dfs_admission_gate(self, scope, "global-write", gate_started);
-            return Ok(DfsMutationAdmission::Global {
-                _scheduler: Arc::clone(self),
-                _global: global,
-            });
+            return Ok(admission);
         };
         let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
         let shard = shard_gate
@@ -286,10 +300,160 @@ impl DfsMutationScheduler {
         trace_dfs_admission_gate(self, scope, "global-read", gate_started);
         Ok(DfsMutationAdmission::ExactShard {
             _scheduler: Arc::clone(self),
-            _global: global,
+            _global: DfsExactGlobalAdmission::Read(global),
             _shard: shard,
         })
     }
+
+    /// Admit this node's answer to a peer's in-flight operation on `scope`'s
+    /// exact shard lane. It queues behind local work on the same shard, as any
+    /// exact admission does, and never runs while a global writer holds the
+    /// node, but it passes a global writer that is only waiting: the peer's
+    /// operation may be what that writer waits for. A scope without an exact
+    /// lane is admitted as `admit` admits it.
+    pub async fn admit_answer(
+        self: &Arc<Self>,
+        scope: &DfsMessageExecutionScope,
+    ) -> Result<DfsMutationAdmission, DfsError> {
+        let Some(key) = DfsMutationLaneKey::from_scope(scope) else {
+            return self.admit(scope).await;
+        };
+        let Some(shard_gate) = self.shard_gate(&key)? else {
+            return self.admit(scope).await;
+        };
+        let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+        let shard = shard_gate
+            .acquire_owned()
+            .await
+            .map_err(|_| DfsError::Network {
+                message: format!(
+                    "DFS mutation scheduler closed the {}:{} shard gate",
+                    key.file_system_id, key.shard_id.0
+                ),
+            })?;
+        trace_dfs_admission_gate(self, scope, "shard-semaphore", gate_started);
+        let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+        let answer = self.answers.enter().await;
+        trace_dfs_admission_gate(self, scope, "peer-answer", gate_started);
+        Ok(DfsMutationAdmission::ExactShard {
+            _scheduler: Arc::clone(self),
+            _global: DfsExactGlobalAdmission::Answer(answer),
+            _shard: shard,
+        })
+    }
+}
+
+/// Answers to peers in flight on a node, and whether a global writer holds it.
+#[derive(Debug, Default)]
+struct DfsAnswerGate {
+    state: Mutex<DfsAnswerGateState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct DfsAnswerGateState {
+    writer_holds: bool,
+    answers: usize,
+}
+
+impl DfsAnswerGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DfsAnswerGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Enter one answer once no global writer holds the node.
+    async fn enter(self: &Arc<Self>) -> DfsAnswerAdmission {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.lock();
+                if !state.writer_holds {
+                    state.answers += 1;
+                    return DfsAnswerAdmission {
+                        gate: Arc::clone(self),
+                    };
+                }
+            }
+            changed.await;
+        }
+    }
+
+    /// Close the gate to new answers for a writer that already holds the
+    /// global lock, then wait for the answers already admitted to finish.
+    async fn hold(self: &Arc<Self>) -> DfsAnswerWriterHold {
+        let hold = {
+            let mut state = self.lock();
+            state.writer_holds = true;
+            DfsAnswerWriterHold {
+                gate: Arc::clone(self),
+            }
+        };
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.lock().answers == 0 {
+                return hold;
+            }
+            changed.await;
+        }
+    }
+
+    fn try_hold(self: &Arc<Self>) -> Option<DfsAnswerWriterHold> {
+        let mut state = self.lock();
+        if state.answers > 0 {
+            return None;
+        }
+        state.writer_holds = true;
+        Some(DfsAnswerWriterHold {
+            gate: Arc::clone(self),
+        })
+    }
+}
+
+/// One admitted answer; dropping it may let a holding writer proceed.
+#[derive(Debug)]
+pub(crate) struct DfsAnswerAdmission {
+    gate: Arc<DfsAnswerGate>,
+}
+
+impl Drop for DfsAnswerAdmission {
+    fn drop(&mut self) {
+        let last = {
+            let mut state = self.gate.lock();
+            state.answers = state.answers.saturating_sub(1);
+            state.answers == 0
+        };
+        if last {
+            self.gate.changed.notify_waiters();
+        }
+    }
+}
+
+/// A global writer's exclusion of answers, from its drain until it releases.
+#[derive(Debug)]
+pub(crate) struct DfsAnswerWriterHold {
+    gate: Arc<DfsAnswerGate>,
+}
+
+impl Drop for DfsAnswerWriterHold {
+    fn drop(&mut self) {
+        self.gate.lock().writer_holds = false;
+        self.gate.changed.notify_waiters();
+    }
+}
+
+/// The global side an exact admission holds: the read side of the global
+/// lock, or, for an answer to a peer, the answer gate.
+#[derive(Debug)]
+#[allow(dead_code)] // Each variant owns its guard solely for Drop.
+pub(crate) enum DfsExactGlobalAdmission {
+    Read(tokio::sync::OwnedRwLockReadGuard<()>),
+    Answer(DfsAnswerAdmission),
 }
 
 fn trace_dfs_admission_gate(
@@ -325,11 +489,13 @@ pub(crate) enum DfsMutationAdmission {
     },
     ExactShard {
         _scheduler: Arc<DfsMutationScheduler>,
-        _global: tokio::sync::OwnedRwLockReadGuard<()>,
+        _global: DfsExactGlobalAdmission,
         _shard: tokio::sync::OwnedSemaphorePermit,
     },
     Global {
         _scheduler: Arc<DfsMutationScheduler>,
+        // Released in reverse of acquisition: the answer gate, then the lock.
+        _answers: DfsAnswerWriterHold,
         _global: tokio::sync::OwnedRwLockWriteGuard<()>,
     },
 }
@@ -480,6 +646,103 @@ mod tests {
                 .expect("test filesystem id"),
             shard_id: DfsMetadataShardId::new(shard),
         }
+    }
+
+    /// Two nodes each hold one shard's lane while a keeper there waits on
+    /// the other node, and each node has a takeover activation queued for its
+    /// global writer. Each node's answer to the other's in-flight request
+    /// needs only that request's free shard lane. As an ordinary exact
+    /// admission it would queue behind the waiting local writer, which waits
+    /// for the local keeper, which waits for the other node's answer: a
+    /// two-node cycle. Answers pass the waiting writers and break it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answers_to_peers_pass_waiting_global_writers_in_a_two_node_cycle() {
+        let x = Arc::new(DfsMutationScheduler::new());
+        let y = Arc::new(DfsMutationScheduler::new());
+        let on_x = scope("answer-cycle-fs", "x-primary");
+        let on_y = scope("answer-cycle-fs", "y-primary");
+        let keeper_x = x.admit(&on_x).await.expect("keeper on x");
+        let keeper_y = y.admit(&on_y).await.expect("keeper on y");
+        let writer_x = tokio::spawn({
+            let x = Arc::clone(&x);
+            async move { x.admit(&DfsMessageExecutionScope::GlobalExclusive).await }
+        });
+        let writer_y = tokio::spawn({
+            let y = Arc::clone(&y);
+            async move { y.admit(&DfsMessageExecutionScope::GlobalExclusive).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Ordinary exact work still queues behind a waiting writer.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), x.admit(&on_y))
+                .await
+                .is_err()
+        );
+        let (on_y_answer, on_x_answer) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(y.admit_answer(&on_x), x.admit_answer(&on_y))
+        })
+        .await
+        .expect("each answer passes its node's waiting writer");
+        drop(on_y_answer.expect("answer on y"));
+        drop(on_x_answer.expect("answer on x"));
+        // The keepers got their answers and release; the writers then hold.
+        drop(keeper_x);
+        drop(keeper_y);
+        for writer in [writer_x, writer_y] {
+            let held = tokio::time::timeout(Duration::from_secs(2), writer)
+                .await
+                .expect("the writer is admitted once the keeper releases")
+                .expect("join writer")
+                .expect("writer admission");
+            assert!(held.is_global());
+        }
+    }
+
+    /// An answer never runs while a global writer holds the node, and a
+    /// writer waits for answers admitted before it holds, which bounds its
+    /// wait by the answers already in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answers_never_overlap_a_holding_global_writer() {
+        let node = Arc::new(DfsMutationScheduler::new());
+        let lane = scope("answer-exclusion-fs", "lane");
+        let writer = node
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .expect("writer holds");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), node.admit_answer(&lane))
+                .await
+                .is_err(),
+            "no answer while a writer holds"
+        );
+        assert!(node.try_admit_global().is_none());
+        drop(writer);
+
+        let answer = node.admit_answer(&lane).await.expect("answer admitted");
+        let mut queued_writer = Box::pin(node.admit(&DfsMessageExecutionScope::GlobalExclusive));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), queued_writer.as_mut())
+                .await
+                .is_err(),
+            "the writer waits for the answer in flight"
+        );
+        assert!(node.try_admit_global().is_none());
+        drop(answer);
+        let writer = tokio::time::timeout(Duration::from_secs(1), queued_writer)
+            .await
+            .expect("the writer holds once the answer finished")
+            .expect("writer admission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), node.admit_answer(&lane))
+                .await
+                .is_err(),
+            "a new answer waits for the holding writer"
+        );
+        drop(writer);
+        node.admit_answer(&lane)
+            .await
+            .expect("answers resume after the writer releases");
     }
 
     #[test]

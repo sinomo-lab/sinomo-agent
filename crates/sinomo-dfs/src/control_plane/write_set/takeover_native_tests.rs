@@ -3,11 +3,13 @@
 
 use super::commit_native_tests::{
     catch_up, cut, directory, durable_prefix, fail_journal_calls, members, mode_change, primary,
-    shard_root, shrink, switched,
+    shard_root, shrink, switched, write_set_of,
 };
 use super::*;
 use crate::DfsMetadataShardId;
 use sinomo_core::kv::KvRequestId;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub(super) fn shard_id_of(config: &DfsMetadataShardConfig) -> DfsMetadataShardId {
@@ -145,16 +147,46 @@ fn client_write(
     node: &NodeId,
     path: &str,
 ) -> crate::DfsObjectId {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        let primary = cut(runtime, config).shard.primary_node_id;
-        let mut client = runtime.client(node).unwrap();
-        let written = client.posix_write_file(
+    write_retried(runtime, config, path, |primary| {
+        runtime.client(node).unwrap().posix_write_file(
             path,
             path.as_bytes(),
             crate::DfsWriteOptions::replicated_eventual(vec![primary]),
-        );
-        match written {
+        )
+    })
+}
+
+/// [`client_write`] through a client opened without first waiting for every
+/// node's startup pass, which a node whose lane the test holds cannot finish.
+fn client_write_beside_a_held_node(
+    runtime: &crate::test_support::DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    node: &NodeId,
+    path: &str,
+) -> crate::DfsObjectId {
+    write_retried(runtime, config, path, |primary| {
+        crate::runtime_host::open_dfs_runtime_service(
+            runtime.data_dir(node),
+            Some(crate::test_runtime::executor().handle()),
+        )
+        .unwrap()
+        .posix_write_file(
+            path,
+            path.as_bytes(),
+            crate::DfsWriteOptions::replicated_eventual(vec![primary]),
+        )
+    })
+}
+
+fn write_retried<E: std::fmt::Display>(
+    runtime: &crate::test_support::DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    path: &str,
+    mut write: impl FnMut(NodeId) -> Result<crate::DfsStat, E>,
+) -> crate::DfsObjectId {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match write(cut(runtime, config).shard.primary_node_id) {
             Ok(written) => return written.object_id,
             Err(error) => {
                 assert!(Instant::now() < deadline, "{path} was not written: {error}");
@@ -211,6 +243,57 @@ fn native_takeover_rebinds_unaffected_stores_in_place() {
             "{node} rebinds its copy in place instead of reopening it"
         );
     }
+    runtime.close().unwrap();
+}
+
+/// A member whose resident router still names a switched shard's previous
+/// epoch answers the new primary's batches while local exact work holds one of
+/// its lanes, as a keeper join or a commit holds its lane while it waits on a
+/// peer. A global writer on that member waits for the held lane, so the answer
+/// must not need one: it rebinds that one shard in place under its own lane.
+#[test]
+fn native_takeover_member_answers_the_new_epoch_while_a_local_lane_is_held() {
+    let (runtime, config) = switched("native-takeover-held-lane", None);
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    client_write(&runtime, &config, &c, "/services/held-lane-before.txt");
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    // No global writer runs on C from here until the hold ends, so nothing on
+    // C rebinds the shard to the new epoch but C's answers themselves. The
+    // hold ends when released, or after a bound past any wait below.
+    let held = runtime
+        .hold_main_exact_admission(&c, &config.file_system_id, "native-held-lane")
+        .unwrap();
+    let ended = Arc::new(AtomicBool::new(false));
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let ended = Arc::clone(&ended);
+        std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(90));
+            ended.store(true, Ordering::SeqCst);
+            drop(held);
+        })
+    };
+    hand_takeover(&runtime, &config, &b);
+    // Every member of the write set acknowledges a commit, so the write
+    // returns only once C has answered the new epoch's batches. Applying them
+    // to C's object table is C's own later work, which waits for the lane.
+    let after =
+        client_write_beside_a_held_node(&runtime, &config, &b, "/services/held-lane-after.txt");
+    let answered_under_hold = !ended.load(Ordering::SeqCst);
+    let _ = release.send(());
+    holder.join().unwrap();
+    assert!(
+        answered_under_hold,
+        "C answers the new epoch's batches while one of its lanes is held"
+    );
+    assert!(write_set_of(&runtime, &config).contains(&c));
+    wait_for("C applies the write once its lane is free", || {
+        holds_object(&runtime, &c, &config, &after)
+    });
+    assert_eq!(cut(&runtime, &config).shard.primary_node_id, b);
     runtime.close().unwrap();
 }
 

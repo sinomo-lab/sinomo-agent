@@ -466,7 +466,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
                 )?;
             entry.resident_metadata_initialized = true;
         }
-        rebind_daemon_dfs_resident_switched_shards(entry);
+        rebind_daemon_dfs_resident_switched_shards(entry, None);
         // Extraction and rejected-take restoration share the cache lock. A
         // reader must never observe an empty slot while the old service remains
         // shared; only a successful exclusive take may expose that state.
@@ -556,8 +556,12 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
 /// Run `operation` on this node's resident Main maintenance service, which
 /// holds every shard copy on the node, under the global exclusive admission,
 /// DATA owner and publication provider an ordinary maintenance tick holds.
-/// The write-set keeper's joins and switch evidence run here, so no prepare
-/// or commit record is appended while they compare a member with the head.
+/// Only work that waits on no member runs here: takeover promises and their
+/// settlement, the rebind at activation, member fence retirement and the
+/// keeper's release of superseded pending adds. Write-set work that waits on a
+/// member (joins, switch evidence, alignment) runs under its shard's exact
+/// admission instead, because a peer's answer to it must not wait for this
+/// node's global writer.
 pub(crate) fn with_daemon_dfs_main_maintenance_service<R>(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
@@ -784,11 +788,39 @@ pub(crate) async fn admit_daemon_dfs_message(
     execution_scope: &DfsMessageExecutionScope,
     preempt_maintenance: bool,
 ) -> Result<DaemonDfsMutationAdmission, DaemonError> {
+    admit_daemon_dfs_message_as(scheduler, execution_scope, preempt_maintenance, false).await
+}
+
+/// Admit this node's answer to a peer's in-flight operation: a journal batch,
+/// write-set probe or snapshot install. It passes a local global writer that
+/// is only waiting, since the peer's operation may be what that writer waits
+/// for, and still never runs while one holds the node.
+pub(crate) async fn admit_daemon_dfs_peer_answer(
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+    execution_scope: &DfsMessageExecutionScope,
+    preempt_maintenance: bool,
+) -> Result<DaemonDfsMutationAdmission, DaemonError> {
+    admit_daemon_dfs_message_as(scheduler, execution_scope, preempt_maintenance, true).await
+}
+
+async fn admit_daemon_dfs_message_as(
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+    execution_scope: &DfsMessageExecutionScope,
+    preempt_maintenance: bool,
+    answers_peer: bool,
+) -> Result<DaemonDfsMutationAdmission, DaemonError> {
+    let admit = || async {
+        if answers_peer {
+            scheduler.admit_answer(execution_scope).await
+        } else {
+            scheduler.admit(execution_scope).await
+        }
+    };
     if !preempt_maintenance || matches!(execution_scope, DfsMessageExecutionScope::ReadOnly) {
-        return scheduler.admit(execution_scope).await.map_err(Into::into);
+        return admit().await.map_err(Into::into);
     }
     scheduler.request_foreground_admission();
-    let mut admission = std::pin::pin!(scheduler.admit(execution_scope));
+    let mut admission = std::pin::pin!(admit());
     std::future::poll_fn(|cx| {
         let result = std::future::Future::poll(admission.as_mut(), cx);
         if result.is_pending() {
@@ -2290,7 +2322,7 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
         .expect("daemon DFS message cache entry inserted");
     entry.peer_node_ids.clone_from(peer_node_ids);
     if allow_generation_rollover {
-        rebind_daemon_dfs_resident_switched_shards(entry);
+        rebind_daemon_dfs_resident_switched_shards(entry, None);
     }
     Ok(entry)
 }
@@ -2298,22 +2330,61 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
 /// Bring the resident router up to the current publication for shards on the
 /// write-set protocol whose configuration changed without a storage change
 /// (a takeover, rotation handoff, recruit or removal that keeps this node's
-/// placement): their stores are rebound in place instead of reopened. Callers
-/// hold the global admission, so no exact lease is live; a slot still in use
-/// is left for the next globally admitted access.
-fn rebind_daemon_dfs_resident_switched_shards(entry: &DaemonDfsMessageServiceCacheEntry) {
+/// placement): their stores are rebound in place instead of reopened.
+///
+/// With `only` unset the caller holds the global admission, so no exact lease
+/// is live. With `only` set the caller holds that lane, the one lease that may
+/// use its shard's slot, and only that filesystem's shard is rebound; every
+/// other shard's router entry and slot are left to their own lanes. A slot
+/// still in use is left for a later access. Returns false when there is no
+/// resident publication to rebind from, a selected slot was left behind or the
+/// rebind failed.
+fn rebind_daemon_dfs_resident_switched_shards(
+    entry: &DaemonDfsMessageServiceCacheEntry,
+    only: Option<&DaemonDfsMutationLaneKey>,
+) -> bool {
     if !entry.resident_metadata_initialized {
-        return;
+        return false;
     }
     let Some(resident) = entry.resident_metadata_backend.as_ref() else {
-        return;
+        return false;
     };
     let snapshot = entry.metadata_authority_generation.configuration_snapshot();
     let Some(entries) =
         snapshot.entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
     else {
-        return;
+        return false;
     };
+    let active = daemon_dfs_switched_shards_to_rebind(entries, only);
+    match resident.rebind_switched_shards(&active) {
+        Ok(0) => true,
+        Ok(deferred) => {
+            tracing::debug!(
+                target: "sinomo.dfs",
+                deferred,
+                "resident write-set shards left for a later rebind"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "sinomo.dfs",
+                %error,
+                "resident write-set shard rebind failed"
+            );
+            false
+        }
+    }
+}
+
+/// The shards on the write-set protocol in `entries` (a publication's
+/// metadata-authority entries), each with the handoff its proof key says
+/// completed. With `only` set, just the shard of that lane: shard ids repeat
+/// across filesystems, so both the filesystem and the shard must match.
+pub(super) fn daemon_dfs_switched_shards_to_rebind(
+    entries: &[sinomo_core::kv::KvEntry],
+    only: Option<&DaemonDfsMutationLaneKey>,
+) -> Vec<(sinomo_dfs::DfsMetadataShardConfig, Option<String>)> {
     let value = |key: &str| {
         entries
             .binary_search_by(|entry| entry.key.as_str().cmp(key))
@@ -2324,11 +2395,17 @@ fn rebind_daemon_dfs_resident_switched_shards(entry: &DaemonDfsMessageServiceCac
     for (file_system_id, shards) in
         crate::metadata_authority_projection::metadata_shard_index_from_authority_entries(entries)
     {
-        let (Ok(shards), Ok(file_system_id)) = (shards, file_system_id.parse::<crate::DfsFileSystemId>())
+        let (Ok(shards), Ok(file_system_id)) =
+            (shards, file_system_id.parse::<crate::DfsFileSystemId>())
         else {
             continue;
         };
         for shard in shards {
+            if only.is_some_and(|only| {
+                only.file_system_id != file_system_id || only.shard_id.0 != shard.shard_id
+            }) {
+                continue;
+            }
             let write_set = value(&crate::metadata_shard_write_set_key(
                 &file_system_id,
                 &shard.shard_id,
@@ -2355,19 +2432,67 @@ fn rebind_daemon_dfs_resident_switched_shards(entry: &DaemonDfsMessageServiceCac
             active.push((shard, completed_handoff_id));
         }
     }
-    match resident.rebind_switched_shards(&active) {
-        Ok(0) => {}
-        Ok(deferred) => tracing::debug!(
-            target: "sinomo.dfs",
-            deferred,
-            "resident write-set shards left for the next globally admitted rebind"
-        ),
-        Err(error) => tracing::warn!(
-            target: "sinomo.dfs",
-            %error,
-            "resident write-set shard rebind failed"
-        ),
+    active
+}
+
+/// Bring `context`'s shard up to the current publication in place for a
+/// peer's answer that holds the shard's exact lane, without the global fence.
+///
+/// A takeover, rotation handoff, recruit or removal that keeps this node's
+/// placement leaves the storage lifecycle unchanged, so the resident store
+/// stays; only the router's copy of that one shard's configuration is behind.
+/// Waiting for a global writer to rebind it would queue the answer behind
+/// local exact work, which may itself be waiting on the peer this answer
+/// serves. Generation rollover, a storage change and the first resident open
+/// keep the global path: this returns false for each of them.
+pub(crate) fn rebind_daemon_dfs_resident_shard_for_answer(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    context: &sinomo_dfs::DfsMetadataReplicaShardContext,
+    runtime: &tokio::runtime::Handle,
+) -> Result<bool, sinomo_dfs::DfsError> {
+    if context.local_node_id != peer_snapshot.local_node_id {
+        return Ok(false);
     }
+    let metadata_authority_generation = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &peer_snapshot.cluster_id,
+        &peer_snapshot.local_node_id,
+        Some(runtime),
+    )?;
+    let ((observed_generation, storage_generation), context_matches) =
+        metadata_authority_generation.replica_context_lifecycle_state(context)?;
+    if !context_matches {
+        return Ok(false);
+    }
+    let Some(slot) = daemon_dfs_message_service_cache().existing_root(&data_dir.root())? else {
+        return Ok(false);
+    };
+    let cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    let Some(entry) = cache.as_ref() else {
+        return Ok(false);
+    };
+    let current_signature = DaemonDfsMessageServiceSignature {
+        cluster_id: peer_snapshot.cluster_id.clone(),
+        local_node_id: peer_snapshot.local_node_id.clone(),
+        metadata_authority_generation: observed_generation,
+        metadata_storage_generation: storage_generation,
+    };
+    if !Arc::ptr_eq(
+        &entry.metadata_authority_generation,
+        &metadata_authority_generation,
+    ) || !entry.signature.shares_metadata_storage(&current_signature)
+    {
+        return Ok(false);
+    }
+    Ok(rebind_daemon_dfs_resident_switched_shards(
+        entry,
+        Some(&DaemonDfsMutationLaneKey {
+            file_system_id: context.shard.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(context.shard.shard_id.clone()),
+        }),
+    ))
 }
 
 /// Complete or join the one bounded metadata-authority ReadIndex before an

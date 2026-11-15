@@ -211,7 +211,7 @@ where
         admission_trace.attempt = authority_refresh_retries;
         let scheduler_started = admission_trace.start();
         let admitted = tracing::Instrument::instrument(
-            admit_daemon_dfs_message(&scheduler, &exact_scope, preempt_maintenance),
+            admit_daemon_dfs_peer_answer(&scheduler, &exact_scope, preempt_maintenance),
             admission_trace.span("initial-scheduler"),
         )
         .await;
@@ -380,6 +380,43 @@ where
             Some(&admission),
         );
         let mut shard = cached?;
+        if shard.is_none() && admission.is_exact() {
+            // An epoch move or member change of this switched shard that keeps
+            // this node's placement leaves only the router's copy of the shard
+            // behind. This answer holds the shard's exact lane, the one lease
+            // that may use its slot, so it rebinds the shard in place instead
+            // of queueing for a global writer behind local exact work that may
+            // be waiting on the peer this answer serves.
+            let rebind_started = admission_trace.start();
+            let rebound = admission_trace.span("exact-rebind").in_scope(|| {
+                rebind_daemon_dfs_resident_shard_for_answer(
+                    data_dir.as_ref(),
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &expected_context,
+                    runtime,
+                )
+            });
+            admission_trace.record(
+                "exact-rebind",
+                match &rebound {
+                    Ok(true) => "rebound",
+                    Ok(false) => "ineligible",
+                    Err(_) => "error",
+                },
+                rebind_started,
+                Some(&admission),
+            );
+            if rebound? {
+                shard = daemon_dfs_message_cache_exact_admission_handle_for_replica_context(
+                    data_dir.as_ref(),
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &expected_context,
+                    runtime,
+                )?;
+            }
+        }
         if shard.is_none() {
             if !admission.is_global() {
                 drop(admission);

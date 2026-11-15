@@ -4061,6 +4061,33 @@ impl DfsTestRuntime {
     /// Negative-only hold of the SAME mounted Main scheduler admission.
     /// No queue row, authority proof, effect, readiness bit or owner is invented.
     pub fn hold_main_mutation_admission(&self, node: &NodeId) -> Result<impl Send + use<>, String> {
+        self.hold_main_admission(node, &DfsMessageExecutionScope::GlobalExclusive)
+    }
+
+    /// Hold one exact lane of the SAME mounted Main scheduler, as local work
+    /// on `shard_id` holds it while it waits on a peer: a global writer then
+    /// waits for this hold to end. Negative-only, like
+    /// [`Self::hold_main_mutation_admission`].
+    pub fn hold_main_exact_admission(
+        &self,
+        node: &NodeId,
+        file_system_id: &crate::DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<impl Send + use<>, String> {
+        self.hold_main_admission(
+            node,
+            &DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(shard_id),
+            },
+        )
+    }
+
+    fn hold_main_admission(
+        &self,
+        node: &NodeId,
+        scope: &DfsMessageExecutionScope,
+    ) -> Result<impl Send + use<>, String> {
         let context = self.component_context(node)?;
         let owner = crate::runtime_host::retain_component_data_owner(&context)
             .map_err(|error| error.to_string())?;
@@ -4070,7 +4097,7 @@ impl DfsTestRuntime {
         run_unit(Box::pin(async {
             let admission = tokio::time::timeout(
                 sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+                scheduler.admit(scope),
             )
             .await
             .map_err(|_| "actual Main admission hold reached its existing deadline".to_string())?

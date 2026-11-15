@@ -3196,6 +3196,118 @@ fn metadata_publish_schedulers_are_independent_per_shard() {
     );
 }
 
+/// Shard ids repeat across filesystems: every filesystem's root shard is
+/// "root". An answer's in-place rebind holds one filesystem's lane, so it
+/// selects only that filesystem's shard and leaves a same-named shard of
+/// another filesystem, which that lane does not cover, untouched.
+#[test]
+fn answer_rebind_leaves_a_same_named_shard_of_another_filesystem_untouched() {
+    let root = temp_root("answer-rebind-same-named-shards");
+    let primary = NodeId::from_legacy_named("node_rebind_primary").unwrap();
+    let member = NodeId::from_legacy_named("node_rebind_member").unwrap();
+    let root_shard = |file_system_id: &DfsFileSystemId, epoch: u64| DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![member.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let entry = |key: String, value: Vec<u8>| KvEntry {
+        key,
+        value,
+        create_revision: KvRevision(1),
+        modify_revision: KvRevision(1),
+        version: KvVersion(1),
+        lease_id: None,
+    };
+    let resident_file_system = sinomo_dfs::sifs_file_system_id();
+    let other_file_system = DfsFileSystemId::from_legacy_named("fs_other_root").unwrap();
+    // This node's resident router names its filesystem's root shard at epoch 1.
+    let resident = sinomo_dfs::LocalShardedMetadataBackend::new(
+        root.path().join("metadata"),
+        vec![root_shard(&resident_file_system, 1)],
+    )
+    .expect("resident metadata backend")
+    .into_resident();
+    // The publication moved both filesystems' switched root shards to epoch 2.
+    let mut entries = Vec::new();
+    for file_system_id in [&resident_file_system, &other_file_system] {
+        let shard = root_shard(file_system_id, 2);
+        let mut write_set = vec![primary.clone(), member.clone()];
+        write_set.sort();
+        let record = sinomo_dfs::DfsMetadataShardWriteSet {
+            format: sinomo_dfs::DFS_METADATA_SHARD_WRITE_SET_FORMAT,
+            file_system_id: file_system_id.clone(),
+            shard_id: shard.shard_id.clone(),
+            epoch: shard.epoch,
+            primary_node_id: shard.primary_node_id.clone(),
+            generation: 1,
+            write_set,
+            epoch_start: None,
+            switched_at_epoch: shard.epoch,
+            substitutes: Vec::new(),
+            raised_n: None,
+            last_change: sinomo_dfs::DfsMetadataShardWriteSetChange {
+                kind: sinomo_dfs::DfsMetadataShardWriteSetChangeKind::Switch,
+                change_id: "switch".to_string(),
+            },
+        };
+        entries.push(entry(
+            metadata_shard_key(file_system_id, "root"),
+            sinomo_core::kv::encode_kv_value(&shard).unwrap(),
+        ));
+        entries.push(entry(
+            sinomo_dfs::metadata_shard_write_set_key(file_system_id, "root"),
+            sinomo_core::kv::encode_kv_value(&record).unwrap(),
+        ));
+    }
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    let lane = |file_system_id: &DfsFileSystemId| DaemonDfsMutationLaneKey {
+        file_system_id: file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new("root"),
+    };
+    let selected_file_systems = |selected: &[(DfsMetadataShardConfig, Option<String>)]| {
+        selected
+            .iter()
+            .map(|(shard, _)| shard.file_system_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let root_id = DfsMetadataShardId::new("root");
+
+    // An answer holding the other filesystem's root lane.
+    let selected = daemon_dfs_switched_shards_to_rebind(&entries, Some(&lane(&other_file_system)));
+    assert_eq!(
+        selected_file_systems(&selected),
+        vec![other_file_system.clone()]
+    );
+    resident.rebind_switched_shards(&selected).unwrap();
+    assert_eq!(
+        resident.shard_config(&root_id).unwrap(),
+        root_shard(&resident_file_system, 1),
+        "the resident filesystem's root shard is not rebound without its lane"
+    );
+
+    // An answer holding the resident filesystem's root lane rebinds it.
+    let selected =
+        daemon_dfs_switched_shards_to_rebind(&entries, Some(&lane(&resident_file_system)));
+    assert_eq!(
+        selected_file_systems(&selected),
+        vec![resident_file_system.clone()]
+    );
+    assert_eq!(resident.rebind_switched_shards(&selected).unwrap(), 0);
+    assert_eq!(
+        resident.shard_config(&root_id).unwrap(),
+        root_shard(&resident_file_system, 2)
+    );
+    // The global rebind selects every switched shard.
+    assert_eq!(
+        daemon_dfs_switched_shards_to_rebind(&entries, None).len(),
+        2
+    );
+}
+
 #[test]
 fn metadata_publish_planning_does_not_hold_admission_while_shard_is_borrowed() {
     let root = temp_root("metadata-publish-admission-resident-lease-order");
