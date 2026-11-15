@@ -7055,9 +7055,14 @@ pub trait ClusterKvTxnQuorumAsyncHost: Send {
         })
     }
 
+    /// Campaign for leadership on demand. On `true` the host has advanced
+    /// `state` to the authority the election established, at least the
+    /// elected term, so the caller's following leader check and commit are
+    /// fenced with that term rather than the term projected before
+    /// campaigning.
     fn elect_cluster_raft_leader_async<'a>(
         &'a mut self,
-        state: &'a ClusterBootstrapState,
+        state: &'a mut ClusterBootstrapState,
     ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error>;
 
     fn reachable_voter_count_async<'a>(

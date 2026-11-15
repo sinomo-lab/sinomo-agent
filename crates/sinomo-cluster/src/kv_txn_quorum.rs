@@ -3287,7 +3287,7 @@ where
 
     fn elect_cluster_raft_leader_async<'a>(
         &'a mut self,
-        state: &'a ClusterBootstrapState,
+        state: &'a mut ClusterBootstrapState,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
         let runtime = self.runtime;
         let paths = self.paths;
@@ -3303,7 +3303,24 @@ where
             // Election owns an absolute deadline and must finish any admitted
             // higher-term persistence before returning. An outer timeout here
             // would cancel that mandatory safety write at the boundary.
-            elect_cluster_raft_leader_async_with_host(runtime, paths, state, options, host).await
+            if !elect_cluster_raft_leader_async_with_host(runtime, paths, state, options, host)
+                .await?
+            {
+                return Ok(false);
+            }
+            // A won campaign advanced the durable term past the caller's
+            // projection. Re-project from the resident store so the leader
+            // check and commit that follow are fenced with the elected term;
+            // a newer term observed here instead fails that check.
+            *state = project_committed_cluster_raft_authority_before_deadline(
+                runtime,
+                paths,
+                state,
+                deadline,
+                "project the elected cluster Raft authority",
+            )
+            .await?;
+            Ok(true)
         })
     }
 
@@ -9781,6 +9798,299 @@ mod tests {
             store
                 .known_voter_leader_id(&state)
                 .expect("recovered leader"),
+            Some(state.local_node_id.clone())
+        );
+    }
+
+    /// A follower voter's view after its remote leader died: forwarding to
+    /// the dead leader exhausts every path (and records the routed client's
+    /// liveness evidence), the other voter answers as a non-leader, grants
+    /// this node's vote and accepts its appends.
+    struct ElectingWriteHost {
+        dead_leader: NodeId,
+        forwarded: Vec<NodeId>,
+        vote_batches: usize,
+        accepted_appends: usize,
+    }
+
+    impl ElectingWriteHost {
+        fn dead_leader_error(&self) -> NetworkError {
+            NetworkError::RetryExhausted {
+                operation: format!("establish routed session to {}", self.dead_leader),
+                attempts: 1,
+                delivery_state: sinomo_network::NetworkDeliveryState::DefinitelyNotSent,
+                detail: "the leader is gone".to_string(),
+            }
+        }
+    }
+
+    impl ClusterObjectRpcAsyncHost for ElectingWriteHost {
+        fn call_node_object_rpc_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            target_node_id: &'a NodeId,
+            _call: sinomo_network::ObjectRpcCall,
+            _options: sinomo_network::ClusterObjectRpcOptions,
+        ) -> sinomo_network::ClusterObjectRpcFuture<'a, sinomo_network::ObjectRpcResult> {
+            self.forwarded.push(target_node_id.clone());
+            let failure = (*target_node_id == self.dead_leader).then(|| self.dead_leader_error());
+            // As the routed client does after every target-bound call; the
+            // live voter's refusal is an authenticated response.
+            sinomo_network::record_cluster_target_rpc_outcome_for_test_carrier(
+                paths,
+                state,
+                target_node_id,
+                failure.as_ref(),
+            );
+            Box::pin(async move {
+                Err(failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "{}; forwarded requests do not start elections",
+                        crate::kv_forward::FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL
+                    ),
+                }))
+            })
+        }
+    }
+
+    impl ClusterKvQuorumAsyncHost for ElectingWriteHost {
+        fn last_local_kv_replication_index_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+        ) -> ClusterMembershipRpcFuture<'a, u64> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_last_raft_log_index_async(&state.local_node_id)
+                    .await
+                    .map_err(NetworkError::directory)
+            })
+        }
+
+        fn build_kv_replication_request_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            next_index: u64,
+        ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendRequest> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                    .await
+                    .map_err(NetworkError::directory)
+            })
+        }
+
+        fn send_cluster_kv_replication_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            target_node_id: &'a NodeId,
+            request: &'a sinomo_kv::ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendResponse> {
+            let failure = (*target_node_id == self.dead_leader).then(|| self.dead_leader_error());
+            if failure.is_none() {
+                self.accepted_appends = self.accepted_appends.saturating_add(1);
+            }
+            Box::pin(async move {
+                if let Some(failure) = failure {
+                    return Err(failure);
+                }
+                Ok(sinomo_kv::ClusterRaftAppendResponse {
+                    accepted: true,
+                    detail: "live voter accepted the append".to_string(),
+                    state: state.clone(),
+                    append: sinomo_kv::RaftAppendEntriesResponse {
+                        term: request.append.term,
+                        success: true,
+                        match_index: request.append.prev_log_index
+                            + request.append.entries.len() as u64,
+                    },
+                })
+            })
+        }
+
+        fn fan_out_committed_cluster_kv_command_async<'a>(
+            &'a mut self,
+            _paths: ClusterPaths,
+            _state: ClusterBootstrapState,
+            _events: std::sync::Arc<Vec<sinomo_kv::KvEvent>>,
+            _targets: Vec<NodeId>,
+        ) -> ClusterMembershipRpcFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ClusterStateAuthorityReachabilityAsyncHost for ElectingWriteHost {
+        fn probe_cluster_state_authority_node_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, NetworkError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    impl ClusterKvTxnQuorumAsyncHost for ElectingWriteHost {
+        fn request_kv_state_authority_vote_async<'a>(
+            &'a mut self,
+            state: &'a ClusterBootstrapState,
+            target_node_id: &'a NodeId,
+            request: &'a ClusterKvStateAuthorityVoteRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterKvStateAuthorityVoteResponse> {
+            let failure = (*target_node_id == self.dead_leader).then(|| self.dead_leader_error());
+            Box::pin(async move {
+                if let Some(failure) = failure {
+                    return Err(failure);
+                }
+                Ok(ClusterKvStateAuthorityVoteResponse {
+                    accepted: true,
+                    detail: "live voter granted the vote".to_string(),
+                    state: state.clone(),
+                    vote: sinomo_kv::RaftRequestVoteResponse {
+                        term: request.vote.term,
+                        vote_granted: true,
+                    },
+                })
+            })
+        }
+
+        fn request_kv_state_authority_votes_async<'a>(
+            &'a mut self,
+            state: &'a ClusterBootstrapState,
+            targets: Vec<NodeId>,
+            request: &'a ClusterKvStateAuthorityVoteRequest,
+            timeout: Duration,
+            _required_grants: usize,
+        ) -> ClusterMembershipRpcFuture<
+            'a,
+            Vec<(
+                NodeId,
+                Result<ClusterKvStateAuthorityVoteResponse, NetworkError>,
+            )>,
+        > {
+            self.vote_batches = self.vote_batches.saturating_add(1);
+            Box::pin(async move {
+                let mut outcomes = Vec::new();
+                for target in targets {
+                    let result = self
+                        .request_kv_state_authority_vote_async(state, &target, request, timeout)
+                        .await;
+                    outcomes.push((target, result));
+                }
+                Ok(outcomes)
+            })
+        }
+    }
+
+    /// A follower voter whose remote leader died wins the on-demand election
+    /// its own write starts, and that same call commits at the elected term:
+    /// the caller's pre-election term never fences the commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follower_voter_wins_the_election_its_write_starts_and_commits_in_the_same_call() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-electing-write-commits");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let state = three_voter_state();
+        crate::write_cluster_state(&paths, &state).expect("cluster state");
+        crate::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("seed cluster raft");
+        let leader = state.members[1].node_id.clone();
+        let store = paths.kv_paths().raft_store();
+        let metadata = store
+            .local_vote_metadata(&state.local_node_id)
+            .expect("local vote metadata");
+        assert!(
+            crate::apply_cluster_raft_append(
+                &paths,
+                &state.local_node_id,
+                None,
+                sinomo_kv::RaftAppendEntriesRequest {
+                    term: metadata.current_term.saturating_add(1),
+                    leader_id: leader.clone(),
+                    prev_log_index: metadata.last_log_index,
+                    prev_log_term: metadata.last_log_term,
+                    entries: Vec::new(),
+                    leader_commit: metadata.last_log_index,
+                },
+            )
+            .expect("remote leader heartbeat")
+            .success
+        );
+        let follower_term = store
+            .local_vote_metadata(&state.local_node_id)
+            .expect("follower vote metadata")
+            .current_term;
+        assert_eq!(
+            store.known_voter_leader_id(&state).expect("leader hint"),
+            Some(leader.clone())
+        );
+
+        let mut options =
+            crate::control_plane_options::ClusterControlPlaneTimeouts::default_daemon_transport()
+                .kv_txn_quorum_options(true);
+        options.leader_election_options.campaign_jitter_max = Duration::ZERO;
+        let mut host = ElectingWriteHost {
+            dead_leader: leader.clone(),
+            forwarded: Vec::new(),
+            vote_batches: 0,
+            accepted_appends: 0,
+        };
+        // The caller's bootstrap state still carries the pre-election term.
+        let mut caller = read_cluster_state_without_kv(&paths).expect("caller state");
+        assert!(caller.term < follower_term);
+        let committed = commit_cluster_kv_txn_compact_with_quorum_response_async_with_host(
+            &tokio::runtime::Handle::current(),
+            &paths,
+            &mut caller,
+            KvTxnRequest::generated(sinomo_kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![sinomo_kv::KvOp::Put {
+                    key: "/test/electing-write".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            }),
+            options,
+            &mut host,
+        )
+        .await
+        .expect("the write that elects this node commits in the same call");
+
+        assert!(
+            committed
+                .txn_response
+                .as_ref()
+                .expect("txn response")
+                .succeeded
+        );
+        assert!(host.forwarded.contains(&leader), "{:?}", host.forwarded);
+        assert_eq!(host.vote_batches, 1, "exactly one campaign");
+        assert!(host.accepted_appends > 0);
+        let elected = store
+            .local_vote_metadata(&state.local_node_id)
+            .expect("elected vote metadata")
+            .current_term;
+        assert!(elected > follower_term);
+        assert_eq!(
+            committed.authority.term, elected,
+            "committed at the elected term"
+        );
+        assert_eq!(
+            caller.term, elected,
+            "the caller carries on at the elected term"
+        );
+        assert_eq!(
+            store.known_voter_leader_id(&state).expect("elected leader"),
             Some(state.local_node_id.clone())
         );
     }

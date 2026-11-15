@@ -8974,7 +8974,7 @@ mod tests {
 
         fn elect_cluster_raft_leader_async<'a>(
             &'a mut self,
-            _state: &'a ClusterBootstrapState,
+            _state: &'a mut ClusterBootstrapState,
         ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error> {
             Box::pin(async move {
                 self.election_calls = self.election_calls.saturating_add(1);

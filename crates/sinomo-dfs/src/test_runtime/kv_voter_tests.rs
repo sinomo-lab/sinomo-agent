@@ -46,16 +46,6 @@ fn hard_state_of(native: &DfsTestRuntime, node: &NodeId) -> sinomo_core::kv::Raf
         .clone()
 }
 
-/// The typed authority refusal inside a KV error, if it is one.
-fn authority_failure(error: &ServiceError) -> Option<sinomo_core::kv::KvAuthorityFailure> {
-    match error {
-        ServiceError::Network(NetworkError::ClusterReadOnly { detail }) => {
-            serde_json::from_str(detail).ok()
-        }
-        _ => None,
-    }
-}
-
 fn commit(
     native: &DfsTestRuntime,
     node: &NodeId,
@@ -102,35 +92,8 @@ fn native_kv_voters_reelect_and_commit_after_the_leader_stops() {
         .term;
 
     native.stop_node(&leader).unwrap();
-    // When the write's own campaign wins, the write is still refused once:
-    // the asynchronous driver's post-election leader check compares the new
-    // hard-state term with the term the write projected before campaigning.
-    // Exactly that typed refusal is allowed, after which the writer leads and
-    // the identical retry commits.
-    let after = match commit(&native, &survivors[0], "/test/kv-voters/after") {
-        Ok(after) => after,
-        Err(error) => {
-            let failure = authority_failure(&error)
-                .unwrap_or_else(|| panic!("a survivor's write re-elects and commits: {error:?}"));
-            assert_eq!(
-                (failure.reason, failure.detail.as_str()),
-                (
-                    sinomo_core::kv::KvAuthorityFailureReason::NoQuorum,
-                    "local node is not the Raft leader after election"
-                ),
-                "{error:?}"
-            );
-            let elected = hard_state_of(&native, &survivors[0]);
-            assert_eq!(
-                elected.leader_id.as_ref(),
-                Some(&survivors[0]),
-                "{elected:?}"
-            );
-            assert!(elected.current_term > initial_term, "{elected:?}");
-            commit(&native, &survivors[0], "/test/kv-voters/after")
-                .expect("the retried write commits on the elected survivor")
-        }
-    };
+    let after = commit(&native, &survivors[0], "/test/kv-voters/after")
+        .expect("the first survivor write after the stop re-elects and commits");
     assert!(after.txn_response.as_ref().unwrap().succeeded);
     assert!(after.authority.term > initial_term, "{after:?}");
     let term = after.authority.term;
