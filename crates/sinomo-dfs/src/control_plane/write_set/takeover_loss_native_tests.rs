@@ -1022,18 +1022,30 @@ fn shrunk_while_promised(runtime: &DfsTestRuntime, config: &DfsMetadataShardConf
         fenced.is_err(),
         "a promised member cannot acknowledge: {fenced:?}"
     );
-    wait_until("P's keeper shrinks B", runtime, &[p, b], || {
-        !write_set_of(runtime, config).contains(b)
-    });
-    assert!(
+    // The keeper reports a shrink after it commits, so the committed write set
+    // can show it first: wait for both, then check why B was shrunk.
+    let shrunk = || {
         runtime
             .write_set_keeping_events(p)
-            .iter()
-            .any(|(name, event)| {
+            .into_iter()
+            .filter(|(name, event)| {
                 name == crate::DfsMetadataWriteSetEvent::SHRUNK
-                    && event.cause == "member-fenced"
+                    && event.shard_id == config.shard_id
                     && event.node_ids.contains(b)
             })
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>()
+    };
+    wait_until(
+        "P's keeper shrinks B and reports it",
+        runtime,
+        &[p, b],
+        || !write_set_of(runtime, config).contains(b) && !shrunk().is_empty(),
+    );
+    let shrunk = shrunk();
+    assert!(
+        shrunk.iter().all(|event| event.cause == "member-fenced"),
+        "{shrunk:?}"
     );
     assert_eq!(record_from(runtime, config, p).shard.epoch, config.epoch);
     // B refuses every join while it holds its promise, so no join of B can

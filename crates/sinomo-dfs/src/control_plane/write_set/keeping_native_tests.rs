@@ -340,20 +340,25 @@ fn native_keeper_reduces_shrinks_recruits_and_retires() {
     });
     runtime.enable_write_set_keeping(&primary);
     // Reduction: four configured members, N = 3.
-    wait_for("the switch-time reduction", || {
-        let (shard, write_set) = record(&runtime, &config);
-        shard.replica_node_ids.len() == 2 && write_set.write_set.len() == 3
-    });
+    // The keeper reports each change after it commits, so a committed record
+    // can show a change before its event: every wait below names both.
+    wait_in(
+        &runtime,
+        &config,
+        "the switch-time reduction and its event",
+        || {
+            let (shard, write_set) = record(&runtime, &config);
+            shard.replica_node_ids.len() == 2
+                && write_set.write_set.len() == 3
+                && event_names(&runtime, &primary)
+                    .contains(&DfsMetadataWriteSetEvent::RETIRED.to_string())
+        },
+    );
     let (shard, write_set) = record(&runtime, &config);
     let spare = configured(&config)
         .into_iter()
         .find(|node| !metadata_shard_configured_node_ids(&shard).contains(node))
         .unwrap();
-    assert!(
-        event_names(&runtime, &primary).contains(&DfsMetadataWriteSetEvent::RETIRED.to_string()),
-        "{}",
-        describe(&runtime, &config)
-    );
     let _ = write_set;
     wait_for("the retired copy is deleted", || copy_deleted(&runtime, &spare, &config, &seed));
     let b = shard.replica_node_ids[0].clone();
@@ -382,16 +387,18 @@ fn native_keeper_reduces_shrinks_recruits_and_retires() {
             && !metadata_shard_configured_node_ids(&shard).contains(&spare)
     });
     wait_for("the substitute's copy is deleted", || copy_deleted(&runtime, &spare, &config, &seed));
-    let names = event_names(&runtime, &primary);
-    for name in [
-        DfsMetadataWriteSetEvent::SHRUNK,
-        DfsMetadataWriteSetEvent::RECRUITED,
-        DfsMetadataWriteSetEvent::ADD_SUBMITTED,
-        DfsMetadataWriteSetEvent::ADDED,
-        DfsMetadataWriteSetEvent::RETIRED,
-    ] {
-        assert!(names.contains(&name.to_string()), "{name} in {names:?}");
-    }
+    wait_in(&runtime, &config, "every change's event", || {
+        let names = event_names(&runtime, &primary);
+        [
+            DfsMetadataWriteSetEvent::SHRUNK,
+            DfsMetadataWriteSetEvent::RECRUITED,
+            DfsMetadataWriteSetEvent::ADD_SUBMITTED,
+            DfsMetadataWriteSetEvent::ADDED,
+            DfsMetadataWriteSetEvent::RETIRED,
+        ]
+        .into_iter()
+        .all(|name| names.contains(&name.to_string()))
+    });
     write_file(&runtime, &config, "/services/keeper-after-return.txt");
 }
 
@@ -537,7 +544,14 @@ fn native_keeper_switch_starts_raised_n_from_the_content_w_it_finds() {
     drop(service);
     advertise_all(&runtime, &config);
     runtime.enable_write_set_keeping(&primary);
-    wait_for("the keeper switches the shard", || switched_record(&runtime, &config).is_some());
+    // The keeper reports the switch after it commits: wait for both, then
+    // check the switch's cause.
+    wait_for("the keeper switches the shard and reports it", || {
+        switched_record(&runtime, &config).is_some()
+            && switch_events(&runtime, &config)
+                .iter()
+                .any(|(name, _)| name == DfsMetadataWriteSetEvent::SWITCHED)
+    });
     let (shard, write_set) = switched_record(&runtime, &config).unwrap();
     assert_eq!(write_set.raised_n, Some(3), "{write_set:?}");
     assert_eq!(
@@ -575,7 +589,14 @@ fn native_keeper_switch_keeps_every_member_for_content_of_unrecorded_w() {
     crate::service_write_set_keeping::treat_content_as_unrecorded_for_test(stat.object_id);
     advertise_all(&runtime, &config);
     runtime.enable_write_set_keeping(&primary);
-    wait_for("the keeper switches the shard", || switched_record(&runtime, &config).is_some());
+    // The keeper reports the switch after it commits: wait for both, then
+    // check the switch's cause.
+    wait_for("the keeper switches the shard and reports it", || {
+        switched_record(&runtime, &config).is_some()
+            && switch_events(&runtime, &config)
+                .iter()
+                .any(|(name, _)| name == DfsMetadataWriteSetEvent::SWITCHED)
+    });
     let (shard, write_set) = switched_record(&runtime, &config).unwrap();
     assert_eq!(write_set.raised_n, Some(3), "{write_set:?}");
     assert_eq!(
@@ -653,11 +674,19 @@ fn native_keeper_raises_n_for_a_commit_above_the_accepted_w() {
         })) => {}
         other => panic!("a write above the accepted W stays pending first: {other:?}"),
     }
-    wait_in(&runtime, &config, "N rises to 3 and a recruit joins", || {
-        let (_, write_set) = record(&runtime, &config);
-        write_set.raised_n == Some(3) && write_set.write_set.len() == 3
-    });
-    assert!(event_names(&runtime, &primary).contains(&DfsMetadataWriteSetEvent::N_RAISED.to_string()));
+    // The keeper reports the raise after it commits: wait for both.
+    wait_in(
+        &runtime,
+        &config,
+        "N rises to 3, a recruit joins and the raise is reported",
+        || {
+            let (_, write_set) = record(&runtime, &config);
+            write_set.raised_n == Some(3)
+                && write_set.write_set.len() == 3
+                && event_names(&runtime, &primary)
+                    .contains(&DfsMetadataWriteSetEvent::N_RAISED.to_string())
+        },
+    );
     let mut committed = None;
     wait_in(&runtime, &config, "the same operation commits", || {
         committed = write(&runtime).ok();

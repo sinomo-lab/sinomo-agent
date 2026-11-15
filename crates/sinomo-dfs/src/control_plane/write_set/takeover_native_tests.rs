@@ -784,16 +784,26 @@ fn native_takeover_promise_refuses_the_primary_whose_keeper_shrinks_the_candidat
     wait_for("P's keeper shrinks B", || {
         !super::commit_native_tests::write_set_of(&runtime, &config).contains(&b)
     });
-    wait_for("the shrink's event names the fence as its cause", || {
+    // The keeper reports the shrink after it commits: wait for the report,
+    // then check its cause, so a wrong cause fails instead of timing out.
+    let shrunk = || {
         runtime
             .write_set_keeping_events(&p)
-            .iter()
-            .any(|(name, event)| {
+            .into_iter()
+            .filter(|(name, event)| {
                 name == crate::DfsMetadataWriteSetEvent::SHRUNK
-                    && event.cause == "member-fenced"
+                    && event.shard_id == config.shard_id
                     && event.node_ids.contains(&b)
             })
-    });
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>()
+    };
+    wait_for("P's keeper reports the shrink", || !shrunk().is_empty());
+    let shrunk = shrunk();
+    assert!(
+        shrunk.iter().all(|event| event.cause == "member-fenced"),
+        "the shrink's event names the fence as its cause: {shrunk:?}"
+    );
     // The same body commits without B, by this retry or by the recovery pass
     // the shrink requests.
     let mut service = primary(&runtime);
