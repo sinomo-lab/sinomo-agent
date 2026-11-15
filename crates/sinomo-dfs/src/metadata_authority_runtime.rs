@@ -15,6 +15,7 @@ use sinomo_core::kv::{
     ClusterKvCommittedDelta, KvAuthorityProof, KvEntry, KvEvent, KvLocalRead, KvRevision,
     KvSnapshot,
 };
+use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -135,6 +136,11 @@ pub struct DfsMetadataAuthorityState {
     generation: u64,
     projection_generation: u64,
     storage_generation: u64,
+    /// The node whose physical stores the storage generation tracks. With it,
+    /// a change to a write-set shard that leaves this node's placement
+    /// unchanged rebinds stores in place instead of advancing the storage
+    /// generation.
+    local_node_id: Option<NodeId>,
     #[cfg(any(test, feature = "test-support"))]
     projection_rebuild_count: u64,
 }
@@ -411,6 +417,14 @@ impl DfsMetadataAuthorityRuntime {
     /// retain stores while continuing to advance the separate authority fence.
     pub fn storage_generation(&self) -> u64 {
         self.published.borrow().storage_generation
+    }
+
+    /// Track physical stores for `local_node_id`
+    /// ([`DfsMetadataAuthorityState::bind_local_node`]).
+    pub fn bind_local_node(&self, local_node_id: NodeId) {
+        if let Ok(mut writer) = self.writer.lock() {
+            writer.metadata.bind_local_node(local_node_id);
+        }
     }
 
     pub(crate) fn lifecycle_generations(&self) -> Result<(u64, u64), DfsError> {
@@ -1501,8 +1515,18 @@ impl DfsMetadataAuthorityState {
             generation: 1,
             projection_generation: 1,
             storage_generation: 1,
+            local_node_id: None,
             #[cfg(any(test, feature = "test-support"))]
             projection_rebuild_count: 0,
+        }
+    }
+
+    /// Track physical stores for `local_node_id`. Set once, before the first
+    /// projection; a runtime without it classifies every shard change by
+    /// its bytes.
+    pub fn bind_local_node(&mut self, local_node_id: NodeId) {
+        if self.local_node_id.is_none() {
+            self.local_node_id = Some(local_node_id);
         }
     }
 
@@ -1618,7 +1642,8 @@ impl DfsMetadataAuthorityState {
             if authority_changed {
                 self.generation = self.generation.saturating_add(1);
             }
-            if crate::metadata_authority_projection::metadata_storage_configuration_changed_in_projection(
+            if crate::metadata_authority_projection::metadata_storage_configuration_changed_in_projection_for_node(
+                self.local_node_id.as_ref(),
                 &self.entries,
                 &entries,
             ) {
@@ -1737,6 +1762,9 @@ impl DfsMetadataAuthorityState {
         let mut next: Option<Vec<KvEntry>> = None;
         let mut authority_changed = false;
         let mut storage_changed = false;
+        // A shard change is classified against the whole delta, because a
+        // write-set shard's configuration and write-set key change together.
+        let mut changed_shard_keys = Vec::new();
         for state in delta.final_key_states.iter() {
             if !state.key.starts_with(DFS_METADATA_AUTHORITY_PREFIX) {
                 continue;
@@ -1745,12 +1773,18 @@ impl DfsMetadataAuthorityState {
             let current = next.as_ref().unwrap_or(self.entries.as_ref());
             let position =
                 current.binary_search_by(|entry| entry.key.as_str().cmp(state.key.as_str()));
-            storage_changed |=
-                crate::metadata_authority_projection::metadata_storage_configuration_changed(
-                    &state.key,
-                    position.ok().map(|index| &current[index]),
-                    state.entry.as_ref(),
-                );
+            if crate::metadata_authority_projection::dfs_metadata_shard_config_key_is_exact(
+                &state.key,
+            ) {
+                changed_shard_keys.push(state.key.as_str());
+            } else {
+                storage_changed |=
+                    crate::metadata_authority_projection::metadata_storage_configuration_changed(
+                        &state.key,
+                        position.ok().map(|index| &current[index]),
+                        state.entry.as_ref(),
+                    );
+            }
             match (position, state.entry.as_ref()) {
                 (Ok(index), Some(entry)) => {
                     if authority_key && current[index].value != entry.value {
@@ -1796,6 +1830,17 @@ impl DfsMetadataAuthorityState {
             );
             self.invalidate_projection(delta.revision);
             return DfsMetadataAuthorityDeltaObservation::invalidated(proof_withdrawn);
+        }
+        if !changed_shard_keys.is_empty() {
+            let current = next.as_ref().unwrap_or(self.entries.as_ref());
+            storage_changed |= changed_shard_keys.iter().any(|key| {
+                crate::metadata_authority_projection::metadata_storage_configuration_changed_for_node(
+                    self.local_node_id.as_ref(),
+                    key,
+                    &self.entries,
+                    current,
+                )
+            });
         }
         if authority_changed {
             self.generation = self.generation.saturating_add(1);

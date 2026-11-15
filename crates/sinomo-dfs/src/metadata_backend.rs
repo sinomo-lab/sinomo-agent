@@ -994,6 +994,7 @@ impl LocalSobjMetadataBackend {
         let lock = backend.metadata_write_lock()?;
         if let Some(freeze) = backend.membership_handoff_write_freeze()?
             && !permit.admits_write_freeze(&freeze)
+            && !backend.clear_freeze_obsoleted_by_write_set_source(permit, &freeze)?
         {
             return Err(MetadataBackendError::MembershipHandoffFrozen {
                 shard_id: backend.shard_id.clone(),
@@ -2130,6 +2131,7 @@ impl LocalSobjMetadataBackend {
         );
         if let Some(freeze) = observed_freeze
             && !permit.admits_write_freeze(&freeze)
+            && !self.clear_freeze_obsoleted_by_write_set_source(permit, &freeze)?
         {
             return Err(MetadataBackendError::MembershipHandoffFrozen {
                 shard_id: self.shard_id.clone(),
@@ -2170,6 +2172,7 @@ impl LocalSobjMetadataBackend {
         );
         if let Some(freeze) = observed_freeze
             && !permit.admits_write_freeze(&freeze)
+            && !self.clear_freeze_obsoleted_by_write_set_source(permit, &freeze)?
         {
             return Err(MetadataBackendError::MembershipHandoffFrozen {
                 shard_id: self.shard_id.clone(),

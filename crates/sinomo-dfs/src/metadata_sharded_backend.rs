@@ -420,6 +420,19 @@ struct ResidentLocalMetadataShardSlot {
     /// global membership-handoff lease can rebind the resident router while
     /// retaining this exact shard backend instance.
     operator_status: RwLock<ResidentLocalMetadataShardOperatorStatus>,
+    /// The configuration and open mode an in-place rebind of a write-set
+    /// shard installed (see
+    /// [`ResidentLocalShardedMetadataBackend::rebind_switched_shards`]).
+    /// `None` until such a rebind: the initial descriptor then applies, so
+    /// every other shard keeps its reopen-on-change lifecycle.
+    switched_rebind: RwLock<Option<(DfsMetadataShardConfig, LocalMetadataShardOpenMode)>>,
+}
+
+/// How [`ResidentLocalMetadataShardSlot::try_checkout_if_open`] found a slot.
+enum ResidentSlotRebindAccess {
+    Unopened,
+    Busy,
+    Open(Box<LocalSobjMetadataBackend>),
 }
 
 #[derive(Debug)]
@@ -602,15 +615,79 @@ impl ResidentLocalMetadataShardSlot {
                 config,
                 snapshot: status_snapshot,
             }),
+            switched_rebind: RwLock::new(None),
         }
     }
 
     fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone()).map(Box::new)
+        let (config, open_mode) = self.effective_descriptor();
+        open_local_metadata_shard_backend(&config, &self.root, open_mode, self.selected_original_data_layout.clone()).map(Box::new)
     }
 
     fn try_checkout(self: &Arc<Self>) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
         self.try_checkout_with_open(&mut || self.open_backend())
+    }
+
+    /// The configuration and open mode this slot currently stands for: its
+    /// initial descriptor, or the one a write-set rebind installed.
+    fn effective_descriptor(&self) -> (DfsMetadataShardConfig, LocalMetadataShardOpenMode) {
+        self.switched_rebind
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .unwrap_or_else(|| (self.config.clone(), self.open_mode))
+    }
+
+    fn effective_open_mode(&self) -> LocalMetadataShardOpenMode {
+        self.switched_rebind
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or(self.open_mode, |(_, open_mode)| *open_mode)
+    }
+
+    fn install_switched_rebind(
+        &self,
+        config: &DfsMetadataShardConfig,
+        open_mode: LocalMetadataShardOpenMode,
+    ) {
+        *self
+            .switched_rebind
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some((config.clone(), open_mode));
+    }
+
+    /// Take the opened backend for an in-place rebind without opening a
+    /// deferred slot or waiting for another owner.
+    fn try_checkout_if_open(self: &Arc<Self>) -> Result<ResidentSlotRebindAccess> {
+        let mut state = self.state.lock().map_err(|error| {
+            MetadataBackendError::Serde(format!(
+                "resident metadata shard {} state lock failed: {error}",
+                self.config.shard_id
+            ))
+        })?;
+        match &*state {
+            ResidentLocalMetadataShardState::Unopened => Ok(ResidentSlotRebindAccess::Unopened),
+            ResidentLocalMetadataShardState::Opening
+            | ResidentLocalMetadataShardState::CheckedOut => Ok(ResidentSlotRebindAccess::Busy),
+            ResidentLocalMetadataShardState::Available(_) => {
+                let ResidentLocalMetadataShardState::Available(backend) =
+                    std::mem::replace(&mut *state, ResidentLocalMetadataShardState::CheckedOut)
+                else {
+                    unreachable!("resident metadata shard availability checked above")
+                };
+                Ok(ResidentSlotRebindAccess::Open(backend))
+            }
+        }
+    }
+
+    /// The configuration a deferred, unopened slot reports, after an in-place
+    /// rebind. Its backend opens with no epoch binding when first used.
+    fn rebind_unopened_status_config(&self, config: &DfsMetadataShardConfig) {
+        self.operator_status
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .config = config.clone();
     }
 
     fn try_checkout_with_open(
@@ -849,7 +926,7 @@ impl ResidentLocalMetadataShardSlot {
                 *state = ResidentLocalMetadataShardState::Unopened;
                 self.available.notify_all();
                 self.async_available.notify_waiters();
-                if self.open_mode == LocalMetadataShardOpenMode::ReplicaRepair
+                if self.effective_open_mode() == LocalMetadataShardOpenMode::ReplicaRepair
                     && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&error)
                 {
                     self.operator_status.write().unwrap_or_else(|error| error.into_inner()).snapshot = None;
@@ -1072,9 +1149,8 @@ impl ResidentLocalMetadataShardHandle {
         expected: &DfsMetadataShardConfig,
         operation_id: &str,
     ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
-        if self.slot.config != *expected
-            || self.slot.open_mode != LocalMetadataShardOpenMode::Strict
-        {
+        let (slot_config, slot_open_mode) = self.slot.effective_descriptor();
+        if slot_config != *expected || slot_open_mode != LocalMetadataShardOpenMode::Strict {
             return Err(MetadataBackendError::Serde(
                 "genesis ingress preparation requires its exact strict primary slot".into(),
             ));
@@ -1203,7 +1279,7 @@ impl ResidentLocalMetadataShardHandle {
         let mut open = || {
             match self.slot.open_backend() {
                 Ok(backend) => Ok(backend),
-                Err(error) if self.slot.open_mode == LocalMetadataShardOpenMode::ReplicaRepair
+                Err(error) if self.slot.effective_open_mode() == LocalMetadataShardOpenMode::ReplicaRepair
                     && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&error) => {
                     let image = command.image()?.clone();
                     let (backend, archived_existing) = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
@@ -1414,9 +1490,10 @@ impl ResidentLocalShardedMetadataBackend {
                     } else {
                         LocalMetadataShardOpenMode::ReplicaRepair
                     };
-                    if slot.config != *config
+                    let (slot_config, slot_open_mode) = slot.effective_descriptor();
+                    if slot_config != *config
                         || slot.root != root.join(key_segment(&shard_id.0))
-                        || slot.open_mode != open_mode
+                        || slot_open_mode != open_mode
                     {
                         continue;
                     }
@@ -1484,7 +1561,7 @@ impl ResidentLocalShardedMetadataBackend {
                 ))
             })?;
             if current_configs.get(&shard_id.0) != Some(&status.config)
-                || slot.config != status.config
+                || slot.effective_descriptor().0 != status.config
             {
                 return Err(MetadataBackendError::Serde(format!(
                     "resident metadata shard {} changed during router reconstruction",
@@ -1511,6 +1588,99 @@ impl ResidentLocalShardedMetadataBackend {
             slot.initialize_deferred_bounded_status_snapshot()?;
         }
         Ok(())
+    }
+
+    /// Rebind shards on the write-set protocol to the configurations of a
+    /// current publication, in place, instead of reopening their stores.
+    ///
+    /// `active` names each switched shard's current configuration and the
+    /// handoff its proof key says completed, if any. A shard is rebound only
+    /// when its routing identity is unchanged and the local node holds a copy
+    /// in both configurations or in neither: the storage generation then did
+    /// not advance, so no reopen would ever bring the router up to date.
+    ///
+    /// For a held shard the opened backend is taken under its exclusive slot
+    /// state: a handoff marker the record moved past is removed and the
+    /// instance is unbound from any earlier authority epoch, then the router
+    /// and the slot's status configuration move to `active` together. A
+    /// deferred slot that never opened needs no backend change. Returns the
+    /// number of shards left for a later admission because their slot was in
+    /// use.
+    pub(crate) fn rebind_switched_shards(
+        &self,
+        active: &[(DfsMetadataShardConfig, Option<String>)],
+    ) -> Result<usize> {
+        let local = self.with_router(|router| router.local_node_id.clone())?;
+        let holds = |shard: &DfsMetadataShardConfig| {
+            local.as_ref().is_some_and(|local| {
+                shard.primary_node_id == *local || shard.replica_node_ids.contains(local)
+            })
+        };
+        let mut deferred = 0;
+        for (config, completed_handoff_id) in active {
+            let Some(previous) =
+                self.with_router(|router| router.shard_configs.get(&config.shard_id).cloned())?
+            else {
+                continue;
+            };
+            if previous == *config
+                || previous.file_system_id != config.file_system_id
+                || previous.assignment != config.assignment
+                || previous.default_policy != config.default_policy
+                || holds(&previous) != holds(config)
+            {
+                continue;
+            }
+            let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+            let open_mode = if local.as_ref() == Some(&config.primary_node_id) {
+                LocalMetadataShardOpenMode::Strict
+            } else {
+                LocalMetadataShardOpenMode::ReplicaRepair
+            };
+            let install = |backend: &Self| {
+                let mut router = backend.inner.router.lock().map_err(|error| {
+                    MetadataBackendError::Serde(format!(
+                        "resident DFS metadata router lock failed: {error}"
+                    ))
+                })?;
+                router
+                    .shard_configs
+                    .insert(config.shard_id.clone(), config.clone());
+                Ok::<_, MetadataBackendError>(())
+            };
+            match self.inner.shards.get(&shard_id) {
+                None => install(self)?,
+                Some(slot) => match slot.try_checkout_if_open()? {
+                    ResidentSlotRebindAccess::Busy => deferred += 1,
+                    ResidentSlotRebindAccess::Unopened => {
+                        install(self)?;
+                        slot.install_switched_rebind(config, open_mode);
+                        slot.rebind_unopened_status_config(config);
+                    }
+                    ResidentSlotRebindAccess::Open(mut backend) => {
+                        let cleared = backend.clear_obsolete_metadata_shard_handoff_freeze(
+                            &shard_id,
+                            config.epoch,
+                            completed_handoff_id.as_deref(),
+                        );
+                        let installed = match &cleared {
+                            Ok(_) => install(self),
+                            Err(_) => Ok(()),
+                        };
+                        if cleared.is_ok() && installed.is_ok() {
+                            slot.install_switched_rebind(config, open_mode);
+                        }
+                        slot.restore_with_status_config(
+                            backend,
+                            (cleared.is_ok() && installed.is_ok()).then_some(config),
+                        );
+                        cleared?;
+                        installed?;
+                    }
+                },
+            }
+        }
+        Ok(deferred)
     }
 
     pub fn shard_config(&self, shard_id: &DfsMetadataShardId) -> Result<DfsMetadataShardConfig> {
@@ -1765,7 +1935,7 @@ impl ResidentLocalShardedMetadataBackend {
             let local_slot = LocalMetadataShardSlot {
                 config,
                 root: slot.root.clone(),
-                open_mode: slot.open_mode,
+                open_mode: slot.effective_open_mode(),
                 selected_original_data_layout: slot.selected_original_data_layout.clone(),
                 initialization: Mutex::new(()),
                 backend: OnceLock::new(),
@@ -1950,12 +2120,36 @@ impl LocalMetadataShardSlot {
     }
 }
 
+/// Test support: how often each shard root's backend was opened, across
+/// threads, so tests can tell a rebind in place from a reopen.
+#[cfg(any(test, feature = "test-support"))]
+static METADATA_SHARD_BACKEND_OPENS: std::sync::LazyLock<Mutex<BTreeMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn metadata_shard_backend_opens_for_test(root: &Path) -> usize {
+    METADATA_SHARD_BACKEND_OPENS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(root)
+        .copied()
+        .unwrap_or_default()
+}
+
 fn open_local_metadata_shard_backend(
     config: &DfsMetadataShardConfig,
     root: &Path,
     open_mode: LocalMetadataShardOpenMode,
     selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
 ) -> Result<LocalSobjMetadataBackend> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        *METADATA_SHARD_BACKEND_OPENS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(root.to_path_buf())
+            .or_default() += 1;
+    }
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
     if let Some(layout) = selected_layout {
         if open_mode == LocalMetadataShardOpenMode::Inspection {

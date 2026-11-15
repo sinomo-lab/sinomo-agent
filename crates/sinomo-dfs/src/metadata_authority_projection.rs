@@ -106,6 +106,105 @@ pub(crate) fn metadata_storage_configuration_changed_in_projection(
     })
 }
 
+/// Whether a change of one shard configuration, together with its write-set
+/// key before and after, is a rebind for `local` rather than a storage change.
+///
+/// On a shard that is on the write-set protocol both before and after, a
+/// takeover, a rotation handoff, a recruit or a removal that leaves `local`'s
+/// placement unchanged (it holds a copy in both or in neither) and keeps the
+/// shard's routing identity reuses the same physical store: the resident slot
+/// is rebound to the new configuration instead of reopened. Every other change
+/// keeps the byte rule, so unswitched shards reopen as before.
+pub(crate) fn metadata_shard_change_rebinds_in_place(
+    local: &NodeId,
+    previous: &sinomo_core::kv::KvEntry,
+    previous_write_set: Option<&sinomo_core::kv::KvEntry>,
+    current: &sinomo_core::kv::KvEntry,
+    current_write_set: Option<&sinomo_core::kv::KvEntry>,
+) -> bool {
+    let (Ok(previous), Ok(current)) = (
+        previous.decode::<DfsMetadataShardConfig>(),
+        current.decode::<DfsMetadataShardConfig>(),
+    ) else {
+        return false;
+    };
+    let switched = |shard: &DfsMetadataShardConfig, entry: Option<&sinomo_core::kv::KvEntry>| {
+        crate::metadata_shard_write_set_state(shard, entry.map(|entry| entry.value.as_slice()))
+            .switched()
+            .is_some()
+    };
+    let holds = |shard: &DfsMetadataShardConfig| {
+        shard.primary_node_id == *local || shard.replica_node_ids.contains(local)
+    };
+    switched(&previous, previous_write_set)
+        && switched(&current, current_write_set)
+        && previous.file_system_id == current.file_system_id
+        && previous.shard_id == current.shard_id
+        && previous.assignment == current.assignment
+        && previous.default_policy == current.default_policy
+        && holds(&previous) == holds(&current)
+}
+
+/// [`metadata_storage_configuration_changed`] for one key of a projection
+/// moving from `previous_entries` to `current_entries`, relative to `local`:
+/// a shard change that rebinds in place
+/// ([`metadata_shard_change_rebinds_in_place`]) is not a storage change. With
+/// no local node every shard change keeps the byte rule.
+pub(crate) fn metadata_storage_configuration_changed_for_node(
+    local: Option<&NodeId>,
+    key: &str,
+    previous_entries: &[sinomo_core::kv::KvEntry],
+    current_entries: &[sinomo_core::kv::KvEntry],
+) -> bool {
+    fn find<'a>(
+        entries: &'a [sinomo_core::kv::KvEntry],
+        key: &str,
+    ) -> Option<&'a sinomo_core::kv::KvEntry> {
+        entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key))
+            .ok()
+            .map(|index| &entries[index])
+    }
+    let previous = find(previous_entries, key);
+    let current = find(current_entries, key);
+    if !metadata_storage_configuration_changed(key, previous, current) {
+        return false;
+    }
+    let (Some(local), Some(previous), Some(current), Some((file_system_id, shard_id))) =
+        (local, previous, current, dfs_metadata_shard_config_key_parts(key))
+    else {
+        return true;
+    };
+    let Ok(file_system_id) = file_system_id.parse::<DfsFileSystemId>() else {
+        return true;
+    };
+    let write_set_key = crate::metadata_shard_write_set_key(&file_system_id, shard_id);
+    !metadata_shard_change_rebinds_in_place(
+        local,
+        previous,
+        find(previous_entries, &write_set_key),
+        current,
+        find(current_entries, &write_set_key),
+    )
+}
+
+/// Whether moving from `previous` to `current` changes the physical stores
+/// `local` must own (see [`metadata_storage_configuration_changed_for_node`]).
+pub(crate) fn metadata_storage_configuration_changed_in_projection_for_node(
+    local: Option<&NodeId>,
+    previous: &[sinomo_core::kv::KvEntry],
+    current: &[sinomo_core::kv::KvEntry],
+) -> bool {
+    let keys = previous
+        .iter()
+        .chain(current.iter())
+        .map(|entry| entry.key.as_str())
+        .collect::<BTreeSet<_>>();
+    keys.into_iter().any(|key| {
+        metadata_storage_configuration_changed_for_node(local, key, previous, current)
+    })
+}
+
 pub fn dfs_metadata_shard_config_key_parts(key: &str) -> Option<(&str, &str)> {
     let mut segments = key.split('/');
     match (

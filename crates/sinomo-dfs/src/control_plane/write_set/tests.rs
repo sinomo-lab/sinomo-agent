@@ -914,3 +914,85 @@ fn raise_n_only_grows_and_lifts_the_effective_n() {
     );
     assert!(recruit.is_ok());
 }
+
+/// The two authority entries of a cut, as a projection holds them.
+fn record_entries(cut: &DfsMetadataShardRecordCut) -> Vec<KvEntry> {
+    let entry = |key: String, value: &[u8]| KvEntry {
+        key,
+        value: value.to_vec(),
+        create_revision: KvRevision(1),
+        modify_revision: KvRevision(1),
+        version: sinomo_core::kv::KvVersion(1),
+        lease_id: None,
+    };
+    let mut entries = vec![entry(metadata_shard_key(&fs(), "root"), &cut.shard_value)];
+    if let Some(value) = cut.write_set_value.as_ref() {
+        entries.push(entry(metadata_shard_write_set_key(&fs(), "root"), value));
+    }
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    entries
+}
+
+fn reopens_for(
+    local: &NodeId,
+    before: &DfsMetadataShardRecordCut,
+    after: &DfsMetadataShardRecordCut,
+) -> bool {
+    crate::metadata_authority_projection::metadata_storage_configuration_changed_for_node(
+        Some(local),
+        &metadata_shard_key(&fs(), "root"),
+        &record_entries(before),
+        &record_entries(after),
+    )
+}
+
+#[test]
+fn a_write_set_shard_change_that_keeps_a_nodes_placement_rebinds_instead_of_reopening() {
+    let mut fixture = Fixture::new();
+    let [a, b, c, d] = [0, 1, 2, 3].map(|index| fixture.nodes[index].clone());
+    // Unswitched: any shard byte change reopens stores on every node.
+    let unswitched = fixture.cut();
+    let mut rotated = unswitched.clone();
+    rotated.shard = metadata_shard_primary_handoff_target(&unswitched.shard, &b).unwrap();
+    rotated.shard_value = sinomo_core::kv::encode_kv_value(&rotated.shard).unwrap();
+    for node in [&a, &b, &d] {
+        assert!(reopens_for(node, &unswitched, &rotated));
+    }
+    // A takeover keeps every holder's placement, and no non-holder gains one.
+    fixture.switch_all();
+    let before = fixture.cut();
+    let swap = build_metadata_takeover_swap(&before, &b, &proof(4, 'b'), &KvRequestId::generate())
+        .unwrap();
+    assert!(fixture.apply(&swap));
+    let after = fixture.cut();
+    for node in [&a, &b, &c, &d] {
+        assert!(!reopens_for(node, &before, &after), "{node} rebinds");
+    }
+    // Shrinking C in the new epoch writes only the write-set key.
+    let shrink = build_metadata_write_set_shrink(&after, &c, &bounds(1, 3)).unwrap();
+    assert!(fixture.apply(&shrink));
+    let shrunk = fixture.cut();
+    // A recruit opens a copy on the recruit only.
+    let recruit = build_metadata_write_set_recruit(&shrunk, &d, &bounds(1, 3), DfsMetadataShardRecruit::BelowN)
+        .unwrap();
+    assert!(fixture.apply(&recruit));
+    let recruited = fixture.cut();
+    assert!(reopens_for(&d, &shrunk, &recruited));
+    for node in [&a, &b, &c] {
+        assert!(!reopens_for(node, &shrunk, &recruited), "{node} rebinds");
+    }
+    // A removal reopens, and so discards, only on the removed node.
+    let removed = [c.clone()].into_iter().collect();
+    let remove = build_metadata_write_set_remove(&recruited, &removed, &bounds(1, 3), 3, true).unwrap();
+    assert!(fixture.apply(&remove));
+    let after_remove = fixture.cut();
+    assert!(reopens_for(&c, &recruited, &after_remove));
+    for node in [&a, &b, &d] {
+        assert!(!reopens_for(node, &recruited, &after_remove), "{node} rebinds");
+    }
+    // A shard the write-set record no longer binds keeps the byte rule.
+    let mut stale = after_remove.clone();
+    stale.shard.epoch += 1;
+    stale.shard_value = sinomo_core::kv::encode_kv_value(&stale.shard).unwrap();
+    assert!(reopens_for(&a, &after_remove, &stale));
+}

@@ -466,6 +466,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
                 )?;
             entry.resident_metadata_initialized = true;
         }
+        rebind_daemon_dfs_resident_switched_shards(entry);
         // Extraction and rejected-take restoration share the cache lock. A
         // reader must never observe an empty slot while the old service remains
         // shared; only a successful exclusive take may expose that state.
@@ -1179,6 +1180,11 @@ pub(crate) fn daemon_dfs_metadata_authority_generation_for_identity(
         local_node_id: local_node_id.to_string(),
     };
     let (generation, created) = daemon_dfs_metadata_authority_generations().runtime(key)?;
+    if created {
+        // Store lifecycle is tracked for this node, so a write-set shard
+        // change that keeps its placement rebinds stores instead of reopening.
+        generation.bind_local_node(local_node_id.clone());
+    }
     if let Some(host) = daemon_dfs_metadata_authority_host(cluster_paths, runtime) {
         let _ = generation.attach_host(host);
     }
@@ -2283,7 +2289,85 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
         .as_mut()
         .expect("daemon DFS message cache entry inserted");
     entry.peer_node_ids.clone_from(peer_node_ids);
+    if allow_generation_rollover {
+        rebind_daemon_dfs_resident_switched_shards(entry);
+    }
     Ok(entry)
+}
+
+/// Bring the resident router up to the current publication for shards on the
+/// write-set protocol whose configuration changed without a storage change
+/// (a takeover, rotation handoff, recruit or removal that keeps this node's
+/// placement): their stores are rebound in place instead of reopened. Callers
+/// hold the global admission, so no exact lease is live; a slot still in use
+/// is left for the next globally admitted access.
+fn rebind_daemon_dfs_resident_switched_shards(entry: &DaemonDfsMessageServiceCacheEntry) {
+    if !entry.resident_metadata_initialized {
+        return;
+    }
+    let Some(resident) = entry.resident_metadata_backend.as_ref() else {
+        return;
+    };
+    let snapshot = entry.metadata_authority_generation.configuration_snapshot();
+    let Some(entries) =
+        snapshot.entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)
+    else {
+        return;
+    };
+    let value = |key: &str| {
+        entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key))
+            .ok()
+            .map(|index| &entries[index])
+    };
+    let mut active = Vec::new();
+    for (file_system_id, shards) in
+        crate::metadata_authority_projection::metadata_shard_index_from_authority_entries(entries)
+    {
+        let (Ok(shards), Ok(file_system_id)) = (shards, file_system_id.parse::<crate::DfsFileSystemId>())
+        else {
+            continue;
+        };
+        for shard in shards {
+            let write_set = value(&crate::metadata_shard_write_set_key(
+                &file_system_id,
+                &shard.shard_id,
+            ));
+            if crate::metadata_shard_write_set_state(
+                &shard,
+                write_set.map(|entry| entry.value.as_slice()),
+            )
+            .switched()
+            .is_none()
+            {
+                continue;
+            }
+            let completed_handoff_id = value(&crate::metadata_shard_membership_handoff_proof_key(
+                &file_system_id,
+                &shard.shard_id,
+            ))
+            .and_then(|entry| {
+                entry
+                    .decode::<crate::DfsMetadataShardMembershipHandoffProof>()
+                    .ok()
+            })
+            .map(|proof| proof.handoff_id);
+            active.push((shard, completed_handoff_id));
+        }
+    }
+    match resident.rebind_switched_shards(&active) {
+        Ok(0) => {}
+        Ok(deferred) => tracing::debug!(
+            target: "sinomo.dfs",
+            deferred,
+            "resident write-set shards left for the next globally admitted rebind"
+        ),
+        Err(error) => tracing::warn!(
+            target: "sinomo.dfs",
+            %error,
+            "resident write-set shard rebind failed"
+        ),
+    }
 }
 
 /// Complete or join the one bounded metadata-authority ReadIndex before an

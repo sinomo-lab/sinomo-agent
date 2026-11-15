@@ -585,3 +585,25 @@ fn a_later_epoch_snapshot_at_sequence_zero_replaces_an_earlier_authority_floor()
     drop(backend);
     self::backend(&root);
 }
+
+#[test]
+fn a_later_epochs_ingest_removes_a_pending_marker_only_on_a_write_set_shard() {
+    let root = sinomo_testdir::TestDir::new("write-set-ingest-clears-marker");
+    let mut backend = backend(&root);
+    backend.freeze_for_membership_handoff("abandoned", 3).unwrap();
+    let frozen = |result: Result<MetadataWriteLock>| {
+        matches!(result, Err(MetadataBackendError::MembershipHandoffFrozen { .. }))
+    };
+    // The all-member rule keeps refusing, and so does the retiring epoch.
+    assert!(frozen(backend.begin_metadata_replica_ingest(&permit(4, None), &shard_id())));
+    assert!(frozen(backend.begin_metadata_replica_ingest(&permit(3, Some(3)), &shard_id())));
+    assert!(backend.membership_handoff_write_freeze().unwrap().is_some());
+    // A later epoch's primary on a write-set shard: the handoff can no longer
+    // complete, so the marker goes and the ingest proceeds.
+    assert!(
+        backend
+            .begin_metadata_replica_ingest(&permit(4, Some(3)), &shard_id())
+            .is_ok()
+    );
+    assert!(backend.membership_handoff_write_freeze().unwrap().is_none());
+}

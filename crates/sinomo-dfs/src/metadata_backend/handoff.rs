@@ -220,6 +220,27 @@ impl LocalSobjMetadataBackend {
         Ok(true)
     }
 
+    /// On a shard on the write-set protocol, an ingest from a later epoch's
+    /// primary removes a pending freeze marker that epoch moved past: its
+    /// handoff can no longer complete, and this follower authors nothing at
+    /// that epoch. The caller holds the shard writer lock and found that the
+    /// marker refuses `permit`. Returns whether the marker was removed.
+    pub(super) fn clear_freeze_obsoleted_by_write_set_source(
+        &self,
+        permit: &crate::DfsMetadataReplicaIngestPermit,
+        freeze: &DfsMetadataShardWriteFreeze,
+    ) -> Result<bool> {
+        if permit.floor_epoch_scope().is_none()
+            || self.selected_original_data_layout.is_some()
+            || freeze.activated_epoch.is_some()
+            || !freeze.is_obsolete_for_write_set_record(permit.source_epoch(), None)
+        {
+            return Ok(false);
+        }
+        crate::metadata_io::remove_file_if_exists(&self.membership_handoff_write_freeze_path())?;
+        Ok(true)
+    }
+
     pub(super) fn clear_membership_handoff_write_freeze(
         &mut self,
         handoff_id: &str,
