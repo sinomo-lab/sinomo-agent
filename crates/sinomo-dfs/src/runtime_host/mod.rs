@@ -2572,6 +2572,41 @@ pub fn open_dfs_runtime_service_on_shard(
     )
 }
 
+/// Run `operation` on this node's own primary copy of `shard`, under the
+/// shard's exact mutation admission: the admission a commit on the shard
+/// holds. No prepare or commit lands on the shard while it runs, and work on
+/// every other shard, a member's answer to another primary's probe included,
+/// is admitted beside it. Write-set work that waits on a member runs here, so
+/// two primaries probing each other's members never wait on each other.
+pub(crate) fn with_daemon_dfs_exact_shard_service<R>(
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    shard: &crate::DfsMetadataShardConfig,
+    purpose: &str,
+    operation: impl FnOnce(&mut NetworkedDfsService<DfsNodeTransport>) -> R,
+) -> Result<R, crate::DfsError> {
+    let mut service = open_dfs_runtime_service_on_shard(data_dir, Some(runtime), shard)
+        .map_err(|error| crate::DfsError::Metadata {
+            message: error.to_string(),
+        })?;
+    let execution = service
+        .acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+            owner_epoch: shard.epoch,
+            operation_id: purpose.to_string(),
+        })?
+        .ok_or_else(|| crate::DfsError::Metadata {
+            message: format!(
+                "metadata shard {} has no exact mutation admission here",
+                shard.shard_id
+            ),
+        })?;
+    let result = operation(&mut service);
+    drop(execution);
+    Ok(result)
+}
+
 /// Open this node's own copy of `shard` for selected local recovery. The node
 /// holds the shard as a replica and need not be its primary; the service
 /// writes only that copy and does not delegate to Main.
@@ -3822,6 +3857,8 @@ pub(crate) use write_set_takeover::{
 };
 #[cfg(test)]
 pub(crate) use write_set_takeover::ask_dfs_takeover_corroboration_for_test;
+#[cfg(test)]
+pub(crate) use write_set_keeping::{JoinRendezvousGuard, hold_joins_until_all_admitted_for_test};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use write_set_keeping::{
     keeping_events_for_test, keeping_failures_for_test, keeping_reachability_interest_for_test,

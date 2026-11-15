@@ -842,3 +842,123 @@ fn native_write_set_sync_certifies_against_the_write_set() {
         other => panic!("directory sync below the floor is pending: {other:?}"),
     }
 }
+
+/// Two primaries each re-add the other. A is primary of the services shard;
+/// B took the users shard over from A, so A is out of its write set; and B is
+/// out of the services write set. Both return at once: A re-adds B to
+/// services while B re-adds A to users, and both joins hold their admission
+/// before either probes its member. A join holds only its own shard's
+/// admission, so each node answers the other primary's probe beside its own
+/// join, and both re-adds complete.
+#[test]
+fn native_cross_joins_of_two_primaries_both_complete() {
+    let (runtime, service, users) =
+        current_native_metadata_service("native-cross-join", 3, "/users").unwrap();
+    drop(service);
+    let services = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let a = users.primary_node_id.clone();
+    assert_eq!(services.primary_node_id, a);
+    assert_eq!(configured(&services), configured(&users));
+    let policy =
+        crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 3)
+            .unwrap();
+    for path in ["/users", "/services"] {
+        runtime
+            .apply_placement_policy(&a, path, crate::DfsPlacementScope::Subtree, policy.clone())
+            .unwrap();
+    }
+    for node in configured(&users) {
+        runtime.advertise_metadata_write_set_capability(&node).unwrap();
+    }
+    let switch_to = |config: &DfsMetadataShardConfig, write_set: &BTreeSet<NodeId>| {
+        let switch = build_metadata_write_set_switch(&cut(&runtime, config), write_set).unwrap();
+        let mut client = runtime.configuration_publisher(&config.primary_node_id);
+        assert_eq!(
+            DfsControlPlaneStore::new(client.as_mut()).submit_metadata_write_set_change(&switch),
+            DfsMetadataWriteSetTxnOutcome::Applied
+        );
+    };
+
+    // Only users is switched: the other members judge A lost and one of them
+    // takes users over. A is left configured outside its write set.
+    switch_to(&users, &configured(&users).into_iter().collect());
+    for node in configured(&users) {
+        runtime.wait_published_configuration_current(&node).unwrap();
+    }
+    let members = configured(&users)
+        .into_iter()
+        .filter(|node| node != &a)
+        .collect::<Vec<_>>();
+    super::takeover_driver_native_tests::keep_with_paths(
+        &runtime,
+        &users,
+        &members.iter().collect::<Vec<_>>(),
+    );
+    super::takeover_driver_native_tests::lose(
+        &runtime,
+        &members.iter().collect::<Vec<_>>(),
+        &a,
+    );
+    let users_record = |reader: &NodeId| {
+        super::takeover_driver_native_tests::record_from(&runtime, &users, reader)
+    };
+    wait_for("a member takes users over", || {
+        users_record(&members[0]).shard.primary_node_id != a
+    });
+    let b = users_record(&members[0]).shard.primary_node_id.clone();
+    let c = members.iter().find(|node| **node != b).unwrap().clone();
+    assert!(
+        !users_record(&b)
+            .write_set_state()
+            .switched()
+            .unwrap()
+            .write_set
+            .contains(&a)
+    );
+
+    // From here each primary's first join is held, once admitted, until the
+    // other's is admitted too, so each probes the other while both hold.
+    let overlap = runtime.hold_write_set_joins_until_all_admitted(&[&a, &b]);
+    let started = Instant::now();
+    // A returns to users: B's join re-adding A is admitted and held.
+    for member in [&b, &c] {
+        runtime.set_peer_verdict(member, &a, PeerPathVerdict::Path, false);
+    }
+    // Services is switched without B, so A re-adds B: A's join is admitted,
+    // and both proceed.
+    switch_to(&services, &[a.clone(), c.clone()].into_iter().collect());
+    for peer in [&b, &c] {
+        runtime.set_peer_verdict(&a, peer, PeerPathVerdict::Path, false);
+    }
+    runtime.enable_write_set_keeping(&a);
+    // A re-add takes well under a second here; the bound only has to sit
+    // clearly below anything that could end a wait on its own.
+    let bound = Duration::from_secs(30);
+    let in_write_set = |record: DfsMetadataShardRecordCut, member: &NodeId| {
+        record
+            .write_set_state()
+            .switched()
+            .is_some_and(|state| state.write_set.contains(member))
+    };
+    while !(in_write_set(users_record(&b), &a)
+        && in_write_set(super::takeover_driver_native_tests::record_from(&runtime, &services, &a), &b))
+    {
+        assert!(
+            started.elapsed() < bound,
+            "both re-adds within {bound:?}: users {:?}\nservices {:?}\nA {:?}\nB {:?}",
+            users_record(&b).write_set_state(),
+            super::takeover_driver_native_tests::record_from(&runtime, &services, &a).write_set_state(),
+            runtime.write_set_keeping_failures(&a),
+            runtime.write_set_keeping_failures(&b),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(overlap.all_admitted(), "both joins were held together");
+    drop(overlap);
+    runtime.close().unwrap();
+}

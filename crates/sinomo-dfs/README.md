@@ -291,8 +291,8 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
   highest `content_durability.policy.min_commit_replicas` among them, and a
   version with content but no recorded policy keeps every configured member
   (`raised_n` at least their number; the switch event's cause says so). The
-  pass and the switch submission hold the maintenance admission, so no version
-  commits in between;
+  pass and the switch submission hold the shard's mutation admission, so no
+  version commits in between;
 - shrink a member with a settled no-path verdict, one the cluster no longer
   authorizes, or one that refused the primary's epoch for a takeover candidate,
   never below the W floor;
@@ -300,14 +300,18 @@ from the record and those facts (`plan_metadata_write_set_keeping`):
   it is first aligned with the epoch start; it is then caught up through the
   ordinary durability barrier, confirms the head under the record's generation,
   and its pending add is recorded under the shard writer lock before the add is
-  submitted, all while the keeper holds the maintenance admission so no change
-  is appended between. Because the keeper waits on the member while it holds
-  that admission, its write-set probes preempt a maintenance pass on the
-  member, as a handoff probe does: a member pass that is itself waiting on this
-  primary yields instead of waiting on the keeper. A catch-up probe or join
-  that fails is retried once an input it saw moves, and on the same re-send
-  timer while none does, so a momentary failure in a quiet cluster does not
-  leave the member out;
+  submitted, all while the keeper holds the shard's mutation admission, the
+  admission a commit holds, so no change is appended between. Work on every
+  other shard is admitted beside it, the member answering another primary's
+  probe included, so two primaries re-adding each other's members do not wait
+  on each other. The join yields to nothing: a join that gave way to commits
+  would not converge under sustained writes. Because the keeper waits on the
+  member while it holds that admission, its write-set probes preempt a
+  maintenance pass on the member, as a handoff probe does: a member pass that
+  is itself waiting on this primary yields instead of waiting on the keeper. A
+  catch-up probe or join that fails is retried once an input it saw moves, and
+  on the same re-send timer while none does, so a momentary failure in a quiet
+  cluster does not leave the member out;
 - recruit an eligible member, preferring non-mobile ones, when the write set is
   below the effective N, or one replacement beyond N when every configured member is in
   the write set (`DfsMetadataShardRecruit`);
@@ -407,8 +411,8 @@ them.
 - **Activate.** Once this node's publication names it primary at a takeover
   epoch and its own settlement, if any, has finished, activation rebinds its
   store in place, ends a promise from the read epoch and retires its fence, and
-  aligns every write-set member it does not judge lost under the maintenance
-  admission. It then requests the authoritative reconciliation, which runs
+  aligns every write-set member it does not judge lost under the shard's
+  mutation admission. It then requests the authoritative reconciliation, which runs
   prepared-change recovery at the new epoch (`recover:<operation>:<epoch>`)
   and hydration. Activation runs once per epoch per process, and again after a
   restart.

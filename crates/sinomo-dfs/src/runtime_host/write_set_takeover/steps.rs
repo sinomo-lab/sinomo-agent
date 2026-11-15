@@ -266,6 +266,10 @@ pub(in crate::runtime_host) fn activate_metadata_takeover(
         .map_err(|error| error.to_string())?;
     }
     retire_takeover_fence(data_dir, runtime, &key.1, cut.shard.epoch)?;
+    // The maintenance checkout alone rebinds the store in place. It waits on
+    // no member, so it may hold the node's global admission.
+    with_daemon_dfs_main_maintenance_service(data_dir, runtime, |_| ())
+        .map_err(|error| error.to_string())?;
     let write_set_members = cut
         .write_set_state()
         .switched()
@@ -334,9 +338,10 @@ fn read_cut(
         .ok_or_else(|| "the shard no longer exists".to_string())
 }
 
-/// One alignment probe per member under the maintenance admission, so no
-/// commit races a member that still holds an old tail. A member whose
-/// journal differs from the epoch's history is repaired through the ordinary
+/// One alignment probe per member under the shard's admission, so no commit
+/// races a member that still holds an old tail, while the members' answers
+/// to other primaries' probes are admitted beside it. A member whose journal
+/// differs from the epoch's history is repaired through the ordinary
 /// durability barrier, which installs a snapshot.
 fn align_members(
     data_dir: &SinomoDataDir,
@@ -346,15 +351,13 @@ fn align_members(
     targets: &BTreeSet<NodeId>,
 ) -> Result<Vec<(NodeId, crate::DfsWriteSetAlignment)>, String> {
     if targets.is_empty() {
-        // The maintenance checkout alone rebinds the store.
-        return with_daemon_dfs_main_maintenance_service(data_dir, runtime, |_| Vec::new())
-            .map_err(|error| error.to_string());
+        return Ok(Vec::new());
     }
     let (peer, _) = daemon_dfs_peer_transports_on_runtime(data_dir, runtime);
     let sender = crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
         data_dir, peer,
     );
-    with_daemon_dfs_main_maintenance_service(data_dir, runtime, |service| {
+    with_daemon_dfs_exact_shard_service(data_dir, runtime, &cut.shard, "write-set-alignment", |service| {
         let mut aligned = Vec::new();
         for member in targets {
             let alignment = service

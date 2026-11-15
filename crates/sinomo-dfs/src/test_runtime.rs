@@ -6284,6 +6284,19 @@ impl DfsTestRuntime {
         );
     }
 
+    /// Hold the first write-set join each of `nodes` admits until every one
+    /// of them has admitted one, so their joins overlap. Dropping the guard
+    /// lets a join still held go.
+    #[cfg(test)]
+    pub(crate) fn hold_write_set_joins_until_all_admitted(
+        &self,
+        nodes: &[&NodeId],
+    ) -> crate::runtime_host::JoinRendezvousGuard {
+        crate::runtime_host::hold_joins_until_all_admitted_for_test(
+            nodes.iter().map(|node| self.data_dir(node).root()).collect(),
+        )
+    }
+
     /// Hold `node`'s activation as a new primary until released.
     pub fn hold_takeover_activation(&self, node: &NodeId, hold: bool) {
         crate::runtime_host::hold_takeover_activation_for_test(self.data_dir(node).root(), hold);

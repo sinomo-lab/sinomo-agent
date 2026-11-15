@@ -830,11 +830,11 @@ impl Keeper {
                     .ok_or_else(|| "the shard has no configuration".to_string())?;
                 if matches!(txn, DfsWriteSetKeepingTxn::Switch) {
                     // The evidence is read and the switch submitted under the
-                    // same admission, so no version is committed in between
+                    // shard's admission, so no version is committed in between
                     // whose W the initial raised N would miss.
                     let (peer, _) = daemon_dfs_peer_transports_on_runtime(&data_dir, &runtime);
                     let sender = crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(&data_dir, peer);
-                    return with_daemon_dfs_main_maintenance_service(&data_dir, &runtime, |service| -> Result<_, String> {
+                    return with_daemon_dfs_exact_shard_service(&data_dir, &runtime, &cut.shard, "write-set-switch", |service| -> Result<_, String> {
                         let evidence = service
                             .write_set_switch_evidence(&cut, &sender)
                             .map_err(|error| error.to_string())?;
@@ -1006,9 +1006,21 @@ impl Keeper {
                     .map_err(|error| error.to_string())?;
                 let (peer, _) = daemon_dfs_peer_transports_on_runtime(&data_dir, &runtime);
                 let sender = crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(&data_dir, peer);
-                let joined = with_daemon_dfs_main_maintenance_service(&data_dir, &runtime, |service| {
-                    service.join_write_set_member(&cut, &member, &sender)
-                })
+                // The join holds only this shard's admission, as a commit
+                // does: no prepare lands between the member's evidence and
+                // its pending add, and the member's answers to other
+                // primaries' probes are admitted beside it.
+                let joined = with_daemon_dfs_exact_shard_service(
+                    &data_dir,
+                    &runtime,
+                    &cut.shard,
+                    &format!("write-set-join:{member}"),
+                    |service| {
+                        #[cfg(test)]
+                        join_admitted_for_test(&data_dir);
+                        service.join_write_set_member(&cut, &member, &sender)
+                    },
+                )
                 .and_then(|joined| joined)
                 .map_err(|error| error.to_string())?;
                 match joined {
@@ -1550,6 +1562,115 @@ mod test_control {
 
     pub(crate) fn keeping_failures_for_test(root: &PathBuf) -> Vec<String> {
         control().failures.get(root).cloned().unwrap_or_default()
+    }
+
+    /// Joins held at their admission until every node of a rendezvous has
+    /// admitted one, so the joins overlap.
+    #[cfg(test)]
+    struct JoinRendezvous {
+        roots: BTreeSet<PathBuf>,
+        admitted: Mutex<BTreeSet<PathBuf>>,
+        all_admitted: std::sync::Condvar,
+    }
+
+    #[cfg(test)]
+    static JOIN_RENDEZVOUS: LazyLock<Mutex<BTreeMap<PathBuf, Arc<JoinRendezvous>>>> =
+        LazyLock::new(Default::default);
+
+    /// Ends the rendezvous when dropped; a join still held is let go.
+    #[cfg(test)]
+    pub(crate) struct JoinRendezvousGuard(Arc<JoinRendezvous>);
+
+    #[cfg(test)]
+    impl JoinRendezvousGuard {
+        /// Whether every node of the rendezvous admitted a join while it
+        /// was held.
+        pub(crate) fn all_admitted(&self) -> bool {
+            self.0.roots.is_subset(
+                &self
+                    .0
+                    .admitted
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for JoinRendezvousGuard {
+        fn drop(&mut self) {
+            let mut registered = JOIN_RENDEZVOUS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for root in &self.0.roots {
+                registered.remove(root);
+            }
+            drop(registered);
+            self.0
+                .admitted
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend(self.0.roots.iter().cloned());
+            self.0.all_admitted.notify_all();
+        }
+    }
+
+    /// Hold the first join each node of `roots` admits until all of them
+    /// have admitted one.
+    #[cfg(test)]
+    pub(crate) fn hold_joins_until_all_admitted_for_test(roots: Vec<PathBuf>) -> JoinRendezvousGuard {
+        let rendezvous = Arc::new(JoinRendezvous {
+            roots: roots.iter().cloned().collect(),
+            admitted: Mutex::default(),
+            all_admitted: std::sync::Condvar::new(),
+        });
+        let mut registered = JOIN_RENDEZVOUS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for root in roots {
+            registered.insert(root, Arc::clone(&rendezvous));
+        }
+        JoinRendezvousGuard(rendezvous)
+    }
+
+    /// A join on `data_dir` holds its admission: wait for the rest of its
+    /// rendezvous, if a test set one.
+    #[cfg(test)]
+    pub(super) fn join_admitted_for_test(data_dir: &SinomoDataDir) {
+        let root = data_dir.root();
+        let Some(rendezvous) = JOIN_RENDEZVOUS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&root)
+            .cloned()
+        else {
+            return;
+        };
+        let mut admitted = rendezvous
+            .admitted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admitted.insert(root);
+        rendezvous.all_admitted.notify_all();
+        while !rendezvous.roots.is_subset(&admitted) {
+            admitted = rendezvous
+                .all_admitted
+                .wait(admitted)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        drop(admitted);
+        // Later joins on these nodes are not held.
+        let mut registered = JOIN_RENDEZVOUS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for root in &rendezvous.roots {
+            if registered
+                .get(root)
+                .is_some_and(|current| Arc::ptr_eq(current, &rendezvous))
+            {
+                registered.remove(root);
+            }
+        }
     }
 }
 #[cfg(any(test, feature = "test-support"))]
