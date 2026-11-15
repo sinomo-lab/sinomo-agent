@@ -200,7 +200,11 @@ takeover candidate settles an unknown swap by resubmitting the identical
 request, which returns the committed reply or commits once, and the resulting
 record names that request. A cooperative handoff compares the write-set key;
 on a switched shard it admits only a primary rotation, and its completion moves
-the write set to the new primary with the frozen prefix as epoch start. Recruit
+the write set to the new primary with the frozen prefix as epoch start. Default
+setup never hands a shard with a write-set record to another layout or primary,
+whether the record is bound to the configuration or not: a record that no
+longer matches means an older writer changed the configuration or the binding
+broke, and only a re-switch rebinds it. Recruit
 and removal change the replica list within an epoch, so a lane rebinds a
 completed handoff's activated marker on a switched shard when the proof's
 successor matches the current assignment in everything but its replica list.

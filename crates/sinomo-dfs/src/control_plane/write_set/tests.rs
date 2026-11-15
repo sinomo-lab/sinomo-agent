@@ -996,3 +996,34 @@ fn a_write_set_shard_change_that_keeps_a_nodes_placement_rebinds_instead_of_reop
     stale.shard_value = sinomo_core::kv::encode_kv_value(&stale.shard).unwrap();
     assert!(reopens_for(&a, &after_remove, &stale));
 }
+
+/// Default setup follows its defaults only for a shard without a write-set
+/// record: a bound, stale or unreadable record leaves the shard to the
+/// write-set protocol.
+#[test]
+fn default_setup_leaves_every_shard_that_has_a_write_set_record() {
+    let mut fixture = Fixture::new();
+    let cut = fixture.cut();
+    assert!(!crate::default_cluster::default_setup_leaves_shard(&cut.shard, None));
+    fixture.switch_all();
+    let cut = fixture.cut();
+    let entry = |value: Vec<u8>| KvEntry {
+        key: metadata_shard_write_set_key(&fs(), "root"),
+        value,
+        create_revision: KvRevision(1),
+        modify_revision: KvRevision(1),
+        version: sinomo_core::kv::KvVersion(1),
+        lease_id: None,
+    };
+    let bound = entry(cut.write_set_value.clone().unwrap());
+    assert!(crate::default_cluster::default_setup_leaves_shard(&cut.shard, Some(&bound)));
+    // The same record against a shard an older writer moved on: stale.
+    let advanced = shard(&fixture.nodes[1], &[&fixture.nodes[2], &fixture.nodes[0]], 4);
+    assert!(matches!(
+        metadata_shard_write_set_state(&advanced, Some(&bound.value)),
+        DfsMetadataShardWriteSetState::Stale { .. }
+    ));
+    assert!(crate::default_cluster::default_setup_leaves_shard(&advanced, Some(&bound)));
+    let unreadable = entry(b"not a write set".to_vec());
+    assert!(crate::default_cluster::default_setup_leaves_shard(&cut.shard, Some(&unreadable)));
+}

@@ -4571,6 +4571,56 @@ impl DfsTestRuntime {
         Ok(actual)
     }
 
+    /// Run default setup's reconciliation of one shard toward `desired` on
+    /// `node`, under the global admission a setup pass holds, as a pass whose
+    /// discovery computed `desired` would.
+    #[cfg(test)]
+    pub(crate) fn reconcile_default_metadata_shard(
+        &self,
+        node: &NodeId,
+        desired: DfsMetadataShardConfig,
+    ) -> Result<(), String> {
+        let data_dir = self.data_dir(node).clone();
+        let paths = ClusterPaths::new(&data_dir);
+        let control = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+            &paths,
+            executor().handle(),
+        );
+        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+            &crate::runtime_host::DfsRuntimePaths::new(&data_dir),
+        )
+        .map_err(|e| e.to_string())?;
+        let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(&data_dir)
+            .map_err(|e| e.to_string())?;
+        let node = node.clone();
+        run_unit(Box::pin(async move {
+            tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async move {
+                let scope = DfsMessageExecutionScope::GlobalExclusive;
+                let admission = scheduler.admit(&scope).await.map_err(|e| e.to_string())?;
+                let owners = crate::DfsPublicationExecutionOwners::from_runtime(
+                    data_dir.root(),
+                    scope,
+                    admission,
+                    owner,
+                );
+                let mut host =
+                    DfsControlPlaneDefaultClusterAsyncBootstrapHost::new_with_resident_metadata_backend(
+                        data_dir,
+                        paths,
+                        node,
+                        Box::new(control),
+                        None,
+                        owners,
+                    );
+                host.put_metadata_shard_async(desired)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|_| "default setup reconciliation reached its network deadline".to_string())?
+        }))
+    }
+
     /// Use the unchanged supported singleton bootstrap, but return only after
     /// its actual prepare/CAS owner has deferred completion and released locks.
     #[cfg(test)]

@@ -962,3 +962,165 @@ fn native_cross_joins_of_two_primaries_both_complete() {
     drop(overlap);
     runtime.close().unwrap();
 }
+
+/// The users shard switched with every member, with default setup's own
+/// shard-reconciliation calls captured on every node.
+fn switched_users_with_setup_captures(
+    name: &str,
+) -> (
+    DfsTestRuntime,
+    DfsMetadataShardConfig,
+    Vec<crate::default_cluster::bootstrap_observation::CaptureGuard>,
+) {
+    let (runtime, service, users) = current_native_metadata_service(name, 3, "/users").unwrap();
+    drop(service);
+    for node in configured(&users) {
+        runtime.advertise_metadata_write_set_capability(&node).unwrap();
+    }
+    let all = configured(&users).into_iter().collect();
+    let switch = build_metadata_write_set_switch(&cut(&runtime, &users), &all).unwrap();
+    let mut client = runtime.configuration_publisher(&users.primary_node_id);
+    assert_eq!(
+        DfsControlPlaneStore::new(client.as_mut()).submit_metadata_write_set_change(&switch),
+        DfsMetadataWriteSetTxnOutcome::Applied
+    );
+    drop(client);
+    for node in configured(&users) {
+        runtime.wait_published_configuration_current(&node).unwrap();
+    }
+    let captures = configured(&users)
+        .into_iter()
+        .map(|node| {
+            crate::default_cluster::bootstrap_observation::CaptureGuard::start(
+                runtime.data_dir(&node).root(),
+                node,
+            )
+        })
+        .collect();
+    (runtime, users, captures)
+}
+
+/// Whether `capture` holds a default-setup pass that read `shard` as the
+/// current assignment.
+fn setup_saw(
+    capture: &crate::default_cluster::bootstrap_observation::CaptureGuard,
+    shard: &DfsMetadataShardConfig,
+) -> bool {
+    let snapshot = capture.snapshot();
+    let expected = serde_json::to_value(shard).unwrap();
+    snapshot["events"].as_array().is_some_and(|events| {
+        events.iter().any(|event| {
+            event["stage"] == "shard-current" && event["value"]["current"] == expected
+        })
+    })
+}
+
+fn assert_no_pending_handoff(runtime: &DfsTestRuntime, shard: &DfsMetadataShardConfig) {
+    let control = runtime.shared_control_plane().unwrap();
+    let pending = control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .get_metadata_shard_membership_handoff(&shard.file_system_id, &shard.shard_id)
+            .unwrap()
+    });
+    assert!(pending.is_none(), "default setup began a handoff: {pending:?}");
+}
+
+/// A cooperative primary rotation of a switched shard leaves its write-set
+/// record bound to the new primary, epoch and epoch start. Default setup
+/// then leaves the rotated shard alone: the pass the rotation itself prompts,
+/// and a pass that asks for the former primary back.
+#[test]
+fn native_switched_shard_rotation_stays_with_its_new_primary() {
+    let (runtime, users, captures) = switched_users_with_setup_captures("native-rotation-kept");
+    let a = users.primary_node_id.clone();
+    let b = users.replica_node_ids[0].clone();
+    let c = users.replica_node_ids[1].clone();
+    let rotated = runtime
+        .reassign_metadata_shard(&users.file_system_id, "users", b.clone(), vec![a.clone(), c.clone()])
+        .unwrap();
+    assert_eq!(rotated.primary_node_id, b);
+    assert_eq!(rotated.epoch, users.epoch + 1);
+    let assert_bound = |runtime: &DfsTestRuntime| {
+        for reader in [&a, &b, &c] {
+            let cut = super::takeover_driver_native_tests::record_from(runtime, &users, reader);
+            assert_eq!(cut.shard, rotated, "{reader} reads the rotated shard");
+            let state = cut
+                .write_set_state()
+                .switched()
+                .cloned()
+                .unwrap_or_else(|| panic!("the record stays bound: {:?}", cut.write_set_state()));
+            assert_eq!(state.primary_node_id, b);
+            assert_eq!(state.epoch, rotated.epoch);
+            assert!(state.epoch_start.is_some());
+        }
+    };
+    assert_bound(&runtime);
+    // The rotation is an input of default setup: a pass reads the rotated
+    // shard and keeps it.
+    wait_for("default setup reads the rotated shard", || {
+        captures.iter().any(|capture| setup_saw(capture, &rotated))
+    });
+    assert_bound(&runtime);
+    // A pass asking for the former primary back changes nothing either.
+    let mut former = rotated.clone();
+    former.primary_node_id = a.clone();
+    former.replica_node_ids = sorted(&[&b, &c]);
+    former.epoch = rotated.epoch + 1;
+    runtime.reconcile_default_metadata_shard(&a, former).unwrap();
+    for node in configured(&users) {
+        runtime.wait_published_configuration_current(&node).unwrap();
+    }
+    assert_no_pending_handoff(&runtime, &users);
+    assert_bound(&runtime);
+    runtime.close().unwrap();
+}
+
+/// A write-set record no longer bound to its shard never lets default setup
+/// change the shard's primary: the binding broke, so setup leaves the shard
+/// on the all-member rule for a re-switch to rebind, rather than handing it
+/// to another layout.
+#[test]
+fn native_default_setup_never_moves_a_shard_with_a_stale_record() {
+    let (runtime, users, _captures) = switched_users_with_setup_captures("native-stale-record-kept");
+    let a = users.primary_node_id.clone();
+    let b = users.replica_node_ids[0].clone();
+    let c = users.replica_node_ids[1].clone();
+    let mut stale = cut(&runtime, &users)
+        .write_set_state()
+        .switched()
+        .cloned()
+        .unwrap();
+    stale.epoch = users.epoch - 1;
+    let mut client = runtime.configuration_publisher(&a);
+    client
+        .put(
+            crate::metadata_shard_write_set_key(&users.file_system_id, &users.shard_id),
+            sinomo_core::kv::encode_kv_value(&stale).unwrap(),
+        )
+        .unwrap();
+    drop(client);
+    for node in configured(&users) {
+        runtime.wait_published_configuration_current(&node).unwrap();
+    }
+    assert!(matches!(
+        cut(&runtime, &users).write_set_state(),
+        DfsMetadataShardWriteSetState::Stale { .. }
+    ));
+    // Setup asks for the shard's primary to move to C.
+    let mut moved = users.clone();
+    moved.primary_node_id = c.clone();
+    moved.replica_node_ids = sorted(&[&a, &b]);
+    moved.epoch = users.epoch + 1;
+    assert_eq!(runtime.reconcile_default_metadata_shard(&a, moved), Ok(()));
+    for node in configured(&users) {
+        runtime.wait_published_configuration_current(&node).unwrap();
+    }
+    assert_no_pending_handoff(&runtime, &users);
+    let current = cut(&runtime, &users);
+    assert_eq!(current.shard, users, "the primary and epoch stay");
+    assert!(matches!(
+        current.write_set_state(),
+        DfsMetadataShardWriteSetState::Stale { .. }
+    ));
+    runtime.close().unwrap();
+}

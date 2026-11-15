@@ -421,7 +421,12 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         }
         if let Some(current) = current.as_ref() {
             // A write-set shard changes its members only through recruit and
-            // remove; default setup never expands it through a handoff.
+            // remove, and its primary only through rotation or takeover;
+            // default setup never hands it to another layout. That holds for
+            // a record that no longer matches the shard too: a stale record
+            // means an older writer changed the configuration or the binding
+            // broke, the shard stays on the all-member rule, and only a
+            // re-switch rebinds it.
             let write_set = self
                 .control_plane
                 .get_async(&crate::metadata_shard_write_set_key(
@@ -429,14 +434,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                     &current.shard_id,
                 ))
                 .await?;
-            if !matches!(
-                crate::metadata_shard_write_set_state(
-                    current,
-                    write_set.as_ref().map(|entry| entry.value.as_slice()),
-                ),
-                crate::DfsMetadataShardWriteSetState::Unswitched
-                    | crate::DfsMetadataShardWriteSetState::Stale { .. }
-            ) {
+            if default_setup_leaves_shard(current, write_set.as_ref()) {
                 return Ok(());
             }
             let pending = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
@@ -1536,6 +1534,23 @@ async fn default_cluster_metadata_shard_with_service_nodes(
     }
     desired.epoch = current.epoch.saturating_add(1);
     Ok(desired)
+}
+
+/// Whether default setup leaves `current` as it is: any write-set record,
+/// bound, stale or unreadable, puts the shard under the write-set protocol,
+/// and setup never changes the layout or primary of such a shard. Only a
+/// shard without a record follows setup's defaults.
+pub(crate) fn default_setup_leaves_shard(
+    current: &DfsMetadataShardConfig,
+    write_set: Option<&sinomo_core::kv::KvEntry>,
+) -> bool {
+    !matches!(
+        crate::metadata_shard_write_set_state(
+            current,
+            write_set.map(|entry| entry.value.as_slice()),
+        ),
+        crate::DfsMetadataShardWriteSetState::Unswitched
+    )
 }
 
 pub fn default_metadata_shard_primary_node_id(
