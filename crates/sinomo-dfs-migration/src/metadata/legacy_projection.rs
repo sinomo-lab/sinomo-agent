@@ -977,6 +977,18 @@ impl LegacyProjection {
         self.store_verified_v7(row)
     }
     fn store_verified_v7(&mut self, row: Value) -> Result<()> {
+        // Keep actual original protocol evidence separate from the normalized
+        // DATA projection. Only an unchanged current digest can become a
+        // current compact terminal; legacy digests are never rehashed here.
+        let original_digest = field(&row, "digest")?;
+        let exact_record = serde_json::from_value::<DfsPreparedOperationRecord>(row.clone()).ok()
+            .filter(|record| record.validate().is_ok());
+        let exact_digest = serde_json::from_value::<DfsPreparedOperationDigest>(original_digest.clone())
+            .ok().filter(|digest| digest.protocol_version == sinomo_dfs::DFS_PREPARED_OPERATION_PROTOCOL_VERSION);
+        let exact_commit = exact_digest.as_ref().map(|digest| {
+            row.get("committed_entry").filter(|entry| !entry.is_null())
+                .map(|entry| wire::normalize_prepared_commit_reference(entry.clone(), digest)).transpose()
+        }).transpose()?.flatten();
         let digest = wire::normalize_source_leaf(field(&row, "digest")?)?;
         let typed_digest: DfsPreparedOperationDigest = decode(digest.clone())?;
         let commit_reference = row
@@ -1087,7 +1099,10 @@ impl LegacyProjection {
             .transpose()?
             .and_then(|entry| entry.get("created_at").cloned())
             .unwrap_or(Value::Null);
-        self.operations.insert(id,json!({"payload":payload,"status":source_status,"terminal_at":terminal_at,"source_operation_digest":field(&digest,"payload_digest")?,"source_prepare_sequence":field(&digest,"prepare_sequence")?}));
+        let exact_payload = exact_record.as_ref().is_some_and(|record| record.payload.as_ref() == &payload);
+        let original_terminal = exact_record.as_ref().filter(|record| record.status != DfsPreparedOperationStatus::Prepared)
+            .map(DfsPreparedOperationEviction::from_terminal_record).transpose()?;
+        self.operations.insert(id,json!({"payload":payload,"status":source_status,"terminal_at":terminal_at,"source_operation_digest":field(&digest,"payload_digest")?,"source_prepare_sequence":field(&digest,"prepare_sequence")?,"source_protocol_family":"prepared-operation-v7","source_original_digest":original_digest,"source_v7_exact_digest":exact_digest,"source_v7_commit_reference":exact_commit,"source_v7_payload_exact":exact_payload,"source_v7_terminal":original_terminal}));
         Ok(())
     }
     fn store_terminal_receipt(&mut self, mut row: Value) -> Result<()> {
@@ -1323,6 +1338,13 @@ impl LegacyProjection {
                 })?;
         }
         let terminal_record = self.operations.get_mut(&id).expect("captured operation");
+        if let Some(raw_digest) = terminal_record.get("source_v7_exact_digest").filter(|value| !value.is_null()) {
+            let exact: DfsPreparedOperationDigest = serde_json::from_value(raw_digest.clone()).map_err(invalid)?;
+            if let Some(reference) = marker.get("committed_entry").filter(|value| !value.is_null()) {
+                let reference = wire::normalize_prepared_commit_reference(reference.clone(), &exact)?;
+                terminal_record["source_v7_commit_reference"] = serde_json::to_value(reference).map_err(invalid)?;
+            }
+        }
         terminal_record["status"] = json!("committed");
         if terminal_record.get("source_adoption_requests").is_some() {
             terminal_record["retired_reservation"] = Value::Bool(false);
@@ -1509,7 +1531,10 @@ impl LegacyProjection {
                 self.store_v7(field(&mutation, "record")?)?;
             }
             "commit-prepared-operation-v7" => {
-                self.commit_v7(&mutation)?;
+                let mut marker = mutation.clone();
+                marker["committed_entry"] = json!({"shard_id":field(&entry,"shard_id")?,
+                    "sequence":sequence,"created_at":field(&entry,"created_at")?,"digest":field(&mutation,"digest")?});
+                self.commit_v7(&marker)?;
             }
             "commit-namespace-prepare" => {
                 self.commit_namespace(&mutation)?;
@@ -2080,6 +2105,7 @@ mod tests {
             file_system_id: fs().file_system_id,
             path: "/docs/file".into(),
             kind: DfsObjectKind::File,
+            namespace_link_count: None,
             tombstone_provenance: None,
             owner_node_id: NodeId::from_legacy_named("projection-owner").unwrap(),
             current_locations: Vec::new(),

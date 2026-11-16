@@ -221,7 +221,7 @@ fn run_live(
                 .unwrap(),
             ),
             artifact_id: None,
-            expected_interface_version: Some("sinomo.app-use.os.v2".into()),
+            expected_interface_version: Some("sinomo.app-use.os.v3".into()),
             cache_key: Some(sinomo_runtime::device::desktop::protocol::APP_USE_OS_CACHE_KEY.into()),
             library_name: None,
             source: "desktop-e2e verified local artifact".into(),

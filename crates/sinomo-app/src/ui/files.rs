@@ -26012,6 +26012,7 @@ mod tests {
                 object_id: object_id.clone(),
                 file_system_id: file_system_id.clone(),
                 path: "/documents/report.txt".to_string(),
+                namespace_link_count: (sinomo_runtime::dfs::DfsObjectKind::File).initial_namespace_link_count(),
                 kind: sinomo_runtime::dfs::DfsObjectKind::File,
                 tombstone_provenance: None,
                 owner_node_id: node_a.clone(),
@@ -28275,6 +28276,8 @@ mod tests {
             adaptive_budget: None,
             processed_content_bytes: 0,
             accepted_config: sinomo_runtime::dfs::DfsFileSystemConfig {
+                catalog_generation: 0,
+                metadata_storage: None,
                 file_system_id: sinomo_runtime::dfs::DfsFileSystemId::from_legacy_named("sifs")
                     .expect("filesystem"),
                 display_name: "SIFS".to_string(),
@@ -29482,6 +29485,8 @@ mod tests {
         policy.required_node_ids = vec![required];
         policy.min_distinct_zones = 2;
         let config = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),

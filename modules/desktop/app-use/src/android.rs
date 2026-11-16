@@ -36,7 +36,9 @@ impl Bridge {
             )
         } != 0
         {
-            return Err(DesktopError::Unsupported("enable Sinomo App Use in Android Accessibility settings and start screen sharing from its local consent activity".into()));
+            return Err(DesktopError::Unsupported(
+                "enable Sinomo Accessibility or start screen sharing in local settings".into(),
+            ));
         }
         let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of_val(&peer) as libc::socklen_t;
@@ -97,16 +99,18 @@ impl Bridge {
     }
 }
 pub fn capabilities() -> DesktopCapabilities {
-    let mut caps = DesktopCapabilities { capture_formats: vec![], platform: "android".into(), capture: false, keyboard_mouse: false, background_window_input: false, gamepad: "unsupported".into(), limitations: vec![
+    let mut caps = DesktopCapabilities { frame_rate_ceiling: false, accessibility: false, capture_formats: vec![], platform: "android".into(), capture: false, keyboard_mouse: false, background_window_input: false, gamepad: "unsupported".into(), limitations: vec![
         "Raw mode only: Android does not provide background window message injection".into(),
-        "Screen capture requires a local MediaProjection grant; input requires a user-enabled AccessibilityService".into(),
+        "Prefer persistent Accessibility observation and input. Screen video uses a separate MediaProjection grant".into(),
         "Left-button down/move/up submits a finite touch gesture on release; release_all discards an unfinished gesture".into(),
         "Text edits the focused accessible editor; raw key support is Escape/Back, Backspace and Enter; protected surfaces remain protected".into(),
     ] };
     match Bridge::connect().and_then(|mut b| b.call(json!({"op":"capabilities"}))) {
         Ok(value) => {
+            caps.frame_rate_ceiling = value["frame_rate_ceiling"].as_bool().unwrap_or(false);
+            caps.accessibility = value["accessibility"].as_bool().unwrap_or(false);
             caps.capture = value["capture"].as_bool().unwrap_or(false)
-                && value["capture_protocol"].as_u64() == Some(2);
+                && value["capture_protocol"].as_u64() == Some(3);
             caps.capture_formats =
                 serde_json::from_value(value["capture_formats"].clone()).unwrap_or_default();
             caps.keyboard_mouse = value["input"].as_bool().unwrap_or(false);
@@ -174,9 +178,9 @@ pub fn capture(
     ready: mpsc::SyncSender<DesktopResult<()>>,
 ) -> DesktopResult<()> {
     let opened = Bridge::connect().and_then(|mut bridge| {
-        let negotiated=bridge.call(json!({"op":"open_capture", "capture_protocol":2, "target":config.target,
+        let negotiated=bridge.call(json!({"op":"open_capture", "capture_protocol":3, "target":config.target,
             "include_cursor":config.include_cursor,"resolution":config.resolution,"pixel_format":config.pixel_format,"fps":config.frames_per_second}))?;
-        if negotiated["capture_protocol"].as_u64()!=Some(2) { return Err(platform("Android capture bridge v2 required; update the application")); }
+        if negotiated["capture_protocol"].as_u64()!=Some(3) { return Err(platform("Android capture bridge v3 required; update the application")); }
         Ok(bridge)
     });
     let mut bridge = match opened {
@@ -192,18 +196,15 @@ pub fn capture(
     let deadline = started + Duration::from_millis(config.lease_ms.min(300_000));
     let mut after = 0;
     while Instant::now() < deadline {
-        if config.pixel_format == Some(NativeVideoSampleFormat::H264)
-            && !mailbox.wait_for_request(Duration::from_millis(100))
-        {
+        if !mailbox.wait_for_request(Duration::from_millis(100)) {
             if stop.try_recv() != Err(mpsc::TryRecvError::Empty) {
                 return Ok(());
             }
             continue;
         }
-        let next_capture = Instant::now() + cadence;
         authorize(&permissions, &config.target, "capture")?;
         let value = bridge.call(json!({"op":"frame", "target":config.target, "after":after,
-            "wait_ms":cadence.as_millis().clamp(1, 100)}))?;
+            "wait_ms":100}))?;
         if value["available"].as_bool() == Some(true) {
             let format: NativeVideoSampleFormat =
                 serde_json::from_value(value["format"].clone()).map_err(platform)?;
@@ -288,16 +289,10 @@ pub fn capture(
                     "publish_us":publish_started.elapsed().as_micros()}));
             }
         }
-        // Capture/transfer work consumes this interval; do not add a second
-        // full-frame sleep after receiving a frame. The OS bridge wakes us when
-        // the requested image becomes available, or within 100 ms on timeout.
-        match stop.recv_timeout(
-            next_capture
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100)),
-        ) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        // The OS bridge wakes on frame availability or its single FPS ceiling.
+        // Timeouts above only bound cancellation/authority checks, never pacing.
+        if stop.try_recv() != Err(mpsc::TryRecvError::Empty) {
+            return Ok(());
         }
     }
     Ok(())
@@ -326,4 +321,30 @@ pub(crate) fn trace_frame(value: serde_json::Value) {
             __android_log_write(2, c"SinomoMediaStage".as_ptr(), message.as_ptr());
         }
     }
+}
+
+pub fn accessibility_observe(
+    target: &DesktopTarget,
+    max_nodes: u32,
+) -> DesktopResult<accessibility::AccessibilitySnapshot> {
+    let response =
+        Bridge::connect()?.call(json!({"op":"observe", "target":target,"max_nodes":max_nodes}))?;
+    serde_json::from_value(response["snapshot"].clone()).map_err(platform)
+}
+pub fn accessibility_act(
+    target: &DesktopTarget,
+    snapshot_id: &str,
+    node_id: &str,
+    action: &accessibility::AccessibilityAction,
+) -> DesktopResult<()> {
+    Bridge::connect()?.call(json!({"op":"act","target":target,"snapshot_id":snapshot_id,"node_id":node_id,"action":action})).map(|_| ())
+}
+pub fn video_targets() -> DesktopResult<Vec<DesktopTargetInfo>> {
+    let response = Bridge::connect()?.call(json!({"op":"video_targets"}))?;
+    serde_json::from_value(response["targets"].clone()).map_err(platform)
+}
+pub fn stop_video(target: &DesktopTarget) -> DesktopResult<()> {
+    Bridge::connect()?
+        .call(json!({"op":"stop_video","target":target}))
+        .map(|_| ())
 }

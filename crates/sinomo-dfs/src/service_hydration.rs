@@ -837,10 +837,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .unwrap_or(false);
             let missing_visible_object = self.metadata.object(&intent_record.object_id).is_none();
             if missing_visible_object
-                && (!matches!(
+                && !matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-                ) || !commit_ready)
+                )
             {
                 continue;
             }
@@ -882,16 +882,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &intent_record.target_version,
                     &content_hash,
                 )?;
-                if missing_visible_object && size_hint.is_none() {
+                if missing_visible_object && commit_ready && size_hint.is_none() {
                     continue;
                 }
-                if missing_visible_object {
+                if missing_visible_object && commit_ready {
                     let Some(object) = authority_object else {
                         continue;
                     };
-                    // A create intent is durable before its first visible object.
-                    // Expose its base metadata only once durable receipts prove the
-                    // write commit-ready, immediately before finalizing it.
+                    // Only a commit-ready create enters the namespace commit
+                    // view. Pre-W transfer reads its original durable descriptor
+                    // through the write-only lookup without exposing an object.
                     self.add_transient_object_metadata(object)?;
                 }
                 if let Some(pending) = self.writes.pending_writes.get(&intent_record.intent_id) {
@@ -1475,6 +1475,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .contains_key(&object.file_system_id)
         {
             self.metadata.add_file_system(DfsFileSystem {
+                catalog_generation: 0,
+                metadata_storage: None,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),

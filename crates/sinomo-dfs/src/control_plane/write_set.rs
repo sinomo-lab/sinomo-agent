@@ -594,6 +594,12 @@ fn change_request(
     shard: Option<DfsMetadataShardConfig>,
     extra_success: Vec<KvOp>,
 ) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+    let config = cut.file_system_config()?.ok_or_else(||
+        refuse(cut, "write-set change requires the captured filesystem configuration"))?;
+    if config.file_system_id != cut.shard.file_system_id {
+        return Err(refuse(cut, "write-set change has a foreign filesystem configuration"));
+    }
+    super::catalog::validate_catalog_transition(&config, None)?;
     if let Some(shard) = shard.as_ref() {
         write_set
             .validate_against(shard)
@@ -604,6 +610,7 @@ fn change_request(
             .map_err(|reason| refuse(cut, reason))?;
     }
     let mut all = cut.record_compares();
+    all.push(cut.file_system_config_compare());
     all.append(&mut compares);
     let mut success = vec![KvOp::put_serde(
         cut.key(metadata_shard_write_set_key),
@@ -612,6 +619,11 @@ fn change_request(
     )?];
     if let Some(shard) = shard.as_ref() {
         success.push(KvOp::put_serde(cut.key(metadata_shard_key), shard, None)?);
+        if shard != &cut.shard {
+            let successor = metadata_catalog_generation_successor(&config)?;
+            success.push(KvOp::put_serde(file_system_config_key(&config.file_system_id), &successor, None)?);
+        }
+
     }
     success.extend(extra_success);
     Ok(DfsMetadataWriteSetChangeRequest {

@@ -339,9 +339,8 @@ impl DfsMetadataShardWriteFreeze {
     }
 }
 
-// Markers written before repair custody was removed may carry a custody cut
-// in one of two envelopes; they still load, and the cut is dropped: an
-// authority transfer carries no repair state.
+// The current producer emits the unwrapped cooperative marker. Historical
+// repair-custody envelopes are decoded only by the migration owner.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum DfsMetadataShardWriteFreezeWire {
@@ -354,10 +353,7 @@ enum DfsMetadataShardWriteFreezeWire {
     SelectedOriginalDataV2 {
         selected_original_data_v2: DfsMetadataShardWriteFreezePayload,
     },
-    CustodyV1 {
-        repair_custody_v1: DfsMetadataShardWriteFreezePayload,
-    },
-    Legacy(DfsMetadataShardWriteFreezePayload),
+    Current(DfsMetadataShardWriteFreezePayload),
 }
 
 struct LocalRecoveryFenceTag;
@@ -383,30 +379,17 @@ struct DfsMetadataShardWriteFreezePayload {
     journal_sequence: u64,
     state_fingerprint: String,
     rebind_prefix_proof: crate::DfsMetadataPrefixProof,
-    #[serde(default, skip_serializing, rename = "repair_custody")]
-    _repair_custody: Option<LegacyRepairCustody>,
-}
-
-/// A removed repair custody cut in a marker written before its removal:
-/// accepted and dropped, never written.
-struct LegacyRepairCustody;
-impl<'de> serde::Deserialize<'de> for LegacyRepairCustody {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let _ = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self)
-    }
 }
 
 impl From<DfsMetadataShardWriteFreeze> for DfsMetadataShardWriteFreezeWire {
     fn from(value: DfsMetadataShardWriteFreeze) -> Self {
-        Self::Legacy(DfsMetadataShardWriteFreezePayload {
+        Self::Current(DfsMetadataShardWriteFreezePayload {
             handoff_id: value.handoff_id,
             retiring_epoch: value.retiring_epoch,
             activated_epoch: value.activated_epoch,
             journal_sequence: value.journal_sequence,
             state_fingerprint: value.state_fingerprint,
             rebind_prefix_proof: value.rebind_prefix_proof,
-            _repair_custody: None,
         })
     }
 }
@@ -478,10 +461,7 @@ impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
             DfsMetadataShardWriteFreezeWire::SelectedOriginalDataV2 {
                 selected_original_data_v2: payload,
             }
-            | DfsMetadataShardWriteFreezeWire::CustodyV1 {
-                repair_custody_v1: payload,
-            }
-            | DfsMetadataShardWriteFreezeWire::Legacy(payload) => payload,
+            | DfsMetadataShardWriteFreezeWire::Current(payload) => payload,
         };
         Ok(Self {
             handoff_id: payload.handoff_id,
@@ -506,6 +486,7 @@ impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
 /// that source-validation boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataReplicaIngestPermit {
+    namespace_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     file_system_id: DfsFileSystemId,
     shard_id: DfsMetadataShardId,
     source_node_id: NodeId,
@@ -638,6 +619,7 @@ impl DfsMetadataReplicaIngestPermit {
             shard_id,
             source_node_id,
             source_epoch,
+            namespace_catalog: None,
             pending_primary_handoff_id: None,
             floor_epoch_scope: None,
             epoch_start: None,
@@ -660,6 +642,7 @@ impl DfsMetadataReplicaIngestPermit {
             shard_id,
             source_node_id,
             source_epoch,
+            namespace_catalog: None,
             pending_primary_handoff_id: Some(handoff_id),
             floor_epoch_scope: None,
             epoch_start: None,
@@ -668,6 +651,37 @@ impl DfsMetadataReplicaIngestPermit {
 
     /// Scope acknowledgement floors to epochs for a write-set shard. The
     /// value is the switch epoch from the same validated shard record.
+    pub(crate) fn with_namespace_catalog(mut self, catalog: crate::DfsMetadataNamespaceCatalog) -> Self {
+        self.namespace_catalog = Some(catalog);
+        self
+    }
+    pub(crate) fn validate_counted_snapshot(&self, tables: &crate::metadata_tables::DfsMetadataTables, generation: Option<&crate::DfsMetadataGenerationIdentity>) -> Result<()> {
+        let catalog = self.namespace_catalog.as_ref().filter(|catalog|
+            catalog.matches_ingress_scope(&self.file_system_id, &self.shard_id, &self.source_node_id, self.source_epoch))
+            .ok_or_else(|| MetadataBackendError::Serde(
+                "snapshot admission lacks its exact captured complete namespace catalog".into(),
+            ))?;
+        let generation = generation.ok_or_else(|| MetadataBackendError::Serde("current snapshot lacks mandatory generation identity".into()))?;
+        if generation.shard_id != self.shard_id {
+            return Err(MetadataBackendError::Serde("current snapshot generation belongs to another physical shard".into()));
+        }
+        catalog.validate_generation(generation)?;
+        crate::storage_generation::validate_native_genesis_snapshot(generation, tables)?;
+        catalog.validate_snapshot(&self.shard_id, tables)
+    }
+    pub(crate) fn snapshot_generation_envelope(&self, identity: &crate::DfsMetadataGenerationIdentity, tables: &crate::metadata_tables::DfsMetadataTables) -> Result<crate::storage_generation::GenerationEnvelope> {
+        self.validate_counted_snapshot(tables, Some(identity))?;
+        let catalog = self.namespace_catalog.as_ref().expect("validated complete catalog");
+        Ok(crate::storage_generation::GenerationEnvelope {
+            format_version: crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            identity: identity.clone(),
+            state: crate::storage_generation::GenerationState::Active {
+                activation_digest: catalog.generation_activation_digest(identity, tables)?,
+                standalone_seal: None,
+            },
+        })
+    }
+
     pub(crate) fn with_floor_epoch_scope(mut self, scope: Option<u64>) -> Self {
         self.floor_epoch_scope = scope;
         self
@@ -686,6 +700,16 @@ impl DfsMetadataReplicaIngestPermit {
 
     pub(crate) fn epoch_start(&self) -> Option<&crate::DfsMetadataPrefixProof> {
         self.epoch_start.as_ref()
+    }
+
+    pub(crate) fn snapshot_replaces_imported_prefix(
+        &self, original: &DfsMetadataPrefixProof, snapshot: &crate::DfsMetadataSnapshotImageDescriptor,
+    ) -> bool {
+        snapshot.generation.shard_id == self.shard_id
+            && self.namespace_catalog.as_ref().is_some_and(|catalog|
+                catalog.matches_ingress_scope(&self.file_system_id, &self.shard_id,
+                    &self.source_node_id, self.source_epoch)
+                    && catalog.snapshot_replaces_imported_prefix(original, snapshot))
     }
 
     /// Epoch to record in a floor acknowledged under this permit: the source
@@ -884,6 +908,11 @@ pub struct DfsRepairIndexPage {
 }
 
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
+    /// Complete current representation admission only after the original
+    /// native genesis committed. This creates no publication permission.
+    fn activate_native_genesis_storage_generation(&mut self, _shard: &crate::DfsMetadataShardConfig) -> Result<()> {
+        Err(MetadataBackendError::Serde("backend does not own native genesis generation activation".into()))
+    }
     #[cfg(test)]
     fn retain_native_prefix_history(
         &mut self, _round:&crate::node_transport::OwnedNativeMetadataPrefixRound,
@@ -924,6 +953,22 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         transfer_id: Option<&str>,
         target_shard_id: &DfsMetadataShardId,
     ) -> Result<DfsForeignShardSourceEvictionPlan>;
+    /// Bounded lookup in the existing operation-ID index; no journal recovery.
+    fn prepared_operation_family_page(
+        &self, shard_id: &DfsMetadataShardId, prefix: &str, after: Option<&str>, max_entries: usize,
+    ) -> Result<(Vec<crate::DfsPreparedOperationRecord>, Option<String>)> {
+        let _ = (shard_id, prefix, after, max_entries);
+        Err(MetadataBackendError::Serde("backend has no bounded prepared-family index".into()))
+    }
+    /// Observe the immutable record only at the supplied exact current cut.
+    /// None means the cut cannot be corroborated; Some(None) is proven absence.
+    fn prepared_operation_record_at_prefix(
+        &self, shard_id: &DfsMetadataShardId, prefix: &DfsMetadataPrefixProof, operation_id: &str,
+    ) -> Result<Option<Option<crate::DfsPreparedOperationRecord>>> {
+        let _ = (shard_id, prefix, operation_id);
+        Ok(None)
+    }
+
     fn prepared_operation_record(
         &self,
         operation_id: &str,
@@ -2539,6 +2584,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsPendingNamespaceRequestPage>;
 
     /// Fetch a namespace maintenance job by id.
+    /// Exact active parent-write participants on the physical owner. This is
+    /// an indexed view of existing namespace job rows, not new authority.
+    fn parent_count_reservations(
+        &self, shard_id: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsNamespaceJobRecord>> {
+        let _ = (shard_id, file_system_id, object_id);
+        Err(MetadataBackendError::Serde("backend has no indexed parent participant view".into()))
+    }
+
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>>;
 
     /// Fetch compact terminal namespace-job evidence by durable job id.
@@ -3200,9 +3254,11 @@ mod selected_native_layout_tests {
     #[test]
     fn selected_native_v1_freeze_default_readers_and_writers_reject_before_mutation() {
         let (_root, data, _owner, layout) = layout("selected-native-default-v1-freeze");
-        let fs = DfsFileSystemId::from_legacy_named("selected-native-physical-fs").unwrap();
+        let fs = crate::sifs_file_system_id();
         let shard = crate::DfsMetadataShardId::new("selected-native-shard");
         let root = crate::local_dfs_metadata_shard_path(&data, &shard);
+        layout.admit_stage(&fs, &shard, &root).unwrap();
+        crate::test_runtime::copy_native_genesis_data_into_selected(&root, &shard.0, &fs, &layout);
         let mut backend = crate::LocalSobjMetadataBackend::new_with_selected_layout(
             fs.clone(), shard.clone(), root.clone(), Arc::clone(&layout)).unwrap();
         let freeze = backend.freeze_metadata_shard_for_membership_handoff(&shard, "selected-native-v1", 7).unwrap().unwrap();
@@ -3325,9 +3381,10 @@ mod removed_repair_custody_marker_tests {
     }
 
     #[test]
-    fn a_marker_written_with_a_custody_cut_still_loads_and_drops_the_cut() {
+    fn historical_custody_markers_require_migration_and_remain_unchanged() {
         let root = sinomo_testdir::TestDir::new("removed-custody-freeze-marker");
         for (name, bytes) in [
+            ("unwrapped", crate::metadata_io::encode_sobj(&old_payload()).unwrap()),
             (
                 "custody-v1",
                 crate::metadata_io::encode_sobj(&CustodyV1 {
@@ -3348,19 +3405,9 @@ mod removed_repair_custody_marker_tests {
                 .join(name)
                 .join("journal/membership-handoff-write-freeze.sobj");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-            let freeze = read_handoff_freeze_with_layout(&path, None)
-                .unwrap()
-                .expect("the old marker loads");
-            assert_eq!(freeze.handoff_id, "handoff-before-removal", "{name}");
-            assert_eq!(freeze.journal_sequence, 17);
-            // Rewriting it carries no custody: an authority transfer holds no
-            // repair state.
-            write_handoff_freeze_with_layout(&path, &freeze, None).unwrap();
-            assert_eq!(
-                read_handoff_freeze_with_layout(&path, None).unwrap(),
-                Some(freeze)
-            );
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(read_handoff_freeze_with_layout(&path, None).is_err(), "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "retained historical marker is not rewritten");
         }
     }
 }

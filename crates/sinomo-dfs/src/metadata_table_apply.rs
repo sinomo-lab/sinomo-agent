@@ -3101,6 +3101,7 @@ mod tests {
     #[test]
     fn crash_resumed_checkpoint_generation_is_admitted_immediately_and_reopens() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-checkpoint-resume");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "shard_table_checkpoint_resume");
         let shard_id = DfsMetadataShardId::new("shard_table_checkpoint_resume");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
@@ -3301,6 +3302,7 @@ mod tests {
     #[test]
     fn reopen_preserves_unjournaled_history_across_snapshot_install_crash_window() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-snapshot-prefix-crash-window");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "shard_table_snapshot_crash");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
 
@@ -3473,6 +3475,7 @@ mod tests {
             shard_id: &DfsMetadataShardId,
             transaction_id: &str,
         ) -> (DfsMetadataTables, u64) {
+            crate::metadata_candidate::stage_current_test_generation(root, &shard_id.0);
             let mut tables = DfsMetadataTables::default();
             let mut table_log_offset = 0;
 
@@ -3560,6 +3563,7 @@ mod tests {
     #[test]
     fn checkpoint_install_preserves_records_appended_after_captured_boundary() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-checkpoint-suffix");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "shard_table_suffix");
         let shard_id = DfsMetadataShardId::new("shard_table_suffix");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;

@@ -31,6 +31,10 @@ public final class SinomoLifecycleCallbacks implements
         return new SinomoVideoEncoder(width, height, fps);
     }
 
+    public SinomoVideoDecoder openVideoDecoder(int width, int height) throws Exception {
+        return new SinomoVideoDecoder(width, height);
+    }
+
     private final Activity activity;
     private boolean registered;
     private boolean observingOperatingConditions;

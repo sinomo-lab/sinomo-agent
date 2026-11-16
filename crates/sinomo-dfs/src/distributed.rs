@@ -775,6 +775,18 @@ impl DistributedEventualCoordinator {
             .is_some_and(|intent_ids| !intent_ids.is_empty())
     }
 
+    pub(crate) fn pending_current_create_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Option<&DistributedWriteIntent> {
+        self.awaiting_intent_ids_by_object_id
+            .get(object_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.intents.get(id))
+            .find(|intent| intent.publication.is_current() && intent.base_version.is_none())
+    }
+
     pub fn restore_intent(
         &mut self,
         intent: DistributedWriteIntent,

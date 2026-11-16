@@ -1,352 +1,224 @@
 package net.sinomo.app.use;
 
 import android.accessibilityservice.AccessibilityService;
-import android.accessibilityservice.GestureDescription;
-import android.graphics.Path;
-import android.net.LocalServerSocket;
-import android.net.LocalSocket;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.Process;
+import android.os.SystemClock;
+import android.view.Display;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
+import java.util.ArrayDeque;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
-import org.json.JSONException;
 import org.json.JSONObject;
 
-/** An OS adapter reachable only by this application's UID. Never opens a TCP port. */
+/** Persistent, user-enabled observation/control. Projection is an independent service. */
 public final class AppUseAccessibilityService extends AccessibilityService {
-    private final Handler main = new Handler(Looper.getMainLooper());
-    private final Set<LocalSocket> connections = ConcurrentHashMap.newKeySet();
-    private final Semaphore capacity = new Semaphore(24);
-    private LocalServerSocket server;
-    private volatile boolean stopped = true;
-    @Override public void onAccessibilityEvent(AccessibilityEvent event) {}
-    @Override public void onInterrupt() { closeBridge(); }
-    @Override public void onDestroy() { closeBridge(); super.onDestroy(); }
+    static final String TARGET="android:accessibility:display:0";
+    static volatile AppUseAccessibilityService current;
+    private final Handler main=new Handler(Looper.getMainLooper());
+    private final LinkedHashMap<String,Snapshot> snapshots=new LinkedHashMap<>();
+    private long nextScreenshot, sequence;
+    private final java.util.concurrent.ExecutorService screenshotWorker=java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    static boolean canScreenshot() {
+        AppUseAccessibilityService service=current;
+        if(Build.VERSION.SDK_INT<30||service==null)return false;
+        android.accessibilityservice.AccessibilityServiceInfo info=service.getServiceInfo();
+        return info!=null && (info.getCapabilities() & android.accessibilityservice.AccessibilityServiceInfo.CAPABILITY_CAN_TAKE_SCREENSHOT)!=0;
+    }
     @Override protected void onServiceConnected() {
-        if (!stopped) return;
+        current=this;
+        try { AppUseBridge.start(this); }
+        catch(Exception error) { android.util.Log.e("SinomoAppUse","Accessibility bridge unavailable",error); }
+    }
+    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        // An observation is tied to its window; app switches cannot retarget a
+        // pending semantic action. Content is also refreshed at the effect edge.
+        if(event.getEventType()==AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || event.getEventType()==AccessibilityEvent.TYPE_WINDOWS_CHANGED) clearSnapshots();
+    }
+    @Override public void onInterrupt() { clearSnapshots(); }
+    @Override public void onDestroy() {
+        if(current==this)current=null;
+        clearSnapshots();screenshotWorker.shutdown();AppUseBridge.stopIfUnused();super.onDestroy();
+    }
+    private void clearSnapshots() { for(Snapshot snapshot:snapshots.values())snapshot.close();snapshots.clear(); }
+    private <T> T onMain(java.util.concurrent.Callable<T> action) throws Exception {
+        FutureTask<T> task=new FutureTask<>(() -> {
+            if(current!=this)throw new AppUseBridge.Failure("permission_denied","Accessibility is disabled");
+            return action.call();
+        });
+        main.post(task);
+        try { return task.get(1500,TimeUnit.MILLISECONDS); }
+        finally { main.removeCallbacks(task);task.cancel(false); }
+    }
+    private static String text(CharSequence value) {
+        String text=value==null?"":value.toString();return text.substring(0,Math.min(256,text.length()));
+    }
+    private static String fingerprint(AccessibilityNodeInfo node) {
+        Rect bounds=new Rect();node.getBoundsInScreen(bounds);
         try {
-            server = new LocalServerSocket("sinomo-app-use:" + Process.myUid());
-            stopped = false;
-            new Thread(() -> accept(), "app-use-local").start();
-        } catch (IOException error) {
-            android.util.Log.e("SinomoAppUse", "Unable to open local OS bridge", error);
-            closeBridge();
-        }
+            java.security.MessageDigest digest=java.security.MessageDigest.getInstance("SHA-256");
+            String state=node.getWindowId()+":"+node.isEnabled()+":"+node.isVisibleToUser()+":"+node.isEditable()+":"+node.isClickable()+":"+bounds;
+            for(CharSequence value:new CharSequence[]{state,node.getPackageName(),node.getViewIdResourceName(),node.getClassName(),
+                    node.isPassword()?"":node.getText(),node.isPassword()?"":node.getContentDescription()}) {
+                byte[] bytes=(value==null?"":value.toString()).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                digest.update(java.nio.ByteBuffer.allocate(4).putInt(bytes.length).array());digest.update(bytes);
+            }
+            return java.util.Base64.getEncoder().encodeToString(digest.digest());
+        } catch(java.security.NoSuchAlgorithmException impossible){throw new IllegalStateException(impossible);}
     }
-    private void closeBridge() {
-        stopped = true;
-        try { if (server != null) server.close(); } catch (IOException ignored) {}
-        for (LocalSocket socket : connections) try { socket.close(); } catch (IOException ignored) {}
-        connections.clear();
-        synchronized (AppUseProjectionService.LOCK) {
-            if (AppUseProjectionService.current != null) AppUseProjectionService.current.stopSelf();
-        }
+    private static final class Snapshot {
+        final long expires=SystemClock.uptimeMillis()+30_000;
+        final Map<String,AccessibilityNodeInfo> nodes=new LinkedHashMap<>();
+        final Map<String,String> fingerprints=new LinkedHashMap<>();
+        void close(){for(AccessibilityNodeInfo node:nodes.values())node.recycle();nodes.clear();}
     }
-    private void accept() {
-        while (!stopped) {
+    private static final class Pending {
+        final AccessibilityNodeInfo node;final String parent;final int depth;
+        Pending(AccessibilityNodeInfo node,String parent,int depth){this.node=node;this.parent=parent;this.depth=depth;}
+    }
+    JSONObject observe(int maxNodes) throws Exception {
+        if(maxNodes<1||maxNodes>128)throw new AppUseBridge.Failure("invalid","max_nodes must be 1..128");
+        return onMain(() -> {
+            AccessibilityNodeInfo root=getRootInActiveWindow();
+            if(root==null)throw new AppUseBridge.Failure("target_unavailable","no accessible foreground window");
+            Snapshot snapshot=new Snapshot();JSONArray nodes=new JSONArray();
+            ArrayDeque<Pending> pending=new ArrayDeque<>();pending.add(new Pending(root,null,0));
+            boolean truncated=false;int bytes=0;
             try {
-                LocalSocket socket = server.accept();
-                int peer = socket.getPeerCredentials().getUid();
-                if (peer != Process.myUid() || !capacity.tryAcquire()) {
-                    android.util.Log.w("SinomoAppUse", "Rejected local OS bridge peer or capacity: uid=" + peer);
-                    socket.close(); continue;
-                }
-                socket.setSoTimeout(5000);
-                connections.add(socket);
-                new Thread(() -> serve(socket), "app-use-client").start();
-            } catch (IOException error) {
-                if (!stopped) {
-                    android.util.Log.e("SinomoAppUse", "Local OS bridge listener failed", error);
-                    closeBridge();
-                }
-            }
-        }
-    }
-    private static final class Failure extends Exception {
-        final String code;
-        Failure(String code, String message) { super(message); this.code = code; }
-    }
-    private static Failure unavailable() { return new Failure("target_unavailable", "screen share ended or display geometry changed; obtain local consent and enumerate again"); }
-    private void validate(JSONObject target) throws Exception {
-        if (stopped) throw new Failure("permission_denied", "accessibility service is disabled");
-        synchronized (AppUseProjectionService.LOCK) {
-            if (!"monitor".equals(target.optString("kind"))) throw new Failure("unsupported", "Android requires explicit raw mode");
-            if (AppUseProjectionService.target == null || !AppUseProjectionService.target.equals(target.optString("device_name"))) throw unavailable();
-            android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
-            android.view.Display display = getSystemService(android.view.WindowManager.class).getDefaultDisplay();
-            display.getRealMetrics(metrics);
-            if (metrics.widthPixels != AppUseProjectionService.width || metrics.heightPixels != AppUseProjectionService.height
-                    || display.getRotation() != AppUseProjectionService.rotation) {
-                AppUseProjectionService.target = null;
-                if (AppUseProjectionService.current != null) AppUseProjectionService.current.stopSelf();
-                throw unavailable();
-            }
-        }
-    }
-    private static void respond(DataOutputStream output, JSONObject value) throws IOException {
-        byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > 65536) throw new IOException("oversized response");
-        output.writeInt(bytes.length); output.write(bytes); output.flush();
-    }
-    private void serve(LocalSocket socket) {
-        boolean capture = false;
-        AppUseGpuCapture.Client captureClient = null;
-        AppUseProjectionService captureOwner = null;
-        Input input = null;
-        try (LocalSocket connection = socket;
-             DataInputStream in = new DataInputStream(connection.getInputStream());
-             DataOutputStream out = new DataOutputStream(connection.getOutputStream())) {
-            while (!stopped) {
-                int length = in.readInt();
-                if (length <= 0 || length > 65536) break;
-                byte[] bytes = new byte[length]; in.readFully(bytes);
-                try {
-                    JSONObject request = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-                    String op = request.getString("op");
-                    JSONObject response = new JSONObject();
-                    switch (op) {
-                        case "capabilities":
-                            synchronized (AppUseProjectionService.LOCK) { response.put("capture", AppUseProjectionService.target != null); }
-                            response.put("input", !stopped).put("capture_protocol",2)
-                                .put("capture_formats",new JSONArray(AppUseProjectionService.hasEncoder()?new String[]{"rgba8","bgra8","h264"}:new String[]{"rgba8","bgra8"})); break;
-                        case "targets": {
-                            JSONArray targets = new JSONArray();
-                            synchronized (AppUseProjectionService.LOCK) {
-                                String name = AppUseProjectionService.target;
-                                if (name != null) targets.put(new JSONObject()
-                                        .put("target", new JSONObject().put("kind", "monitor").put("device_name", name))
-                                        .put("resource_id", "display:" + name).put("title", "Android shared display")
-                                        .put("bounds", new JSONArray(new int[]{0, 0, AppUseProjectionService.width, AppUseProjectionService.height}))
-                                        .put("client_bounds", JSONObject.NULL).put("minimized", false));
-                            }
-                            response.put("targets", targets); break;
-                        }
-                        case "validate": validate(request.getJSONObject("target")); break;
-                        case "open_input":
-                            if (input != null) throw new Failure("invalid", "input already open");
-                            validate(request.getJSONObject("target")); input = new Input(request.getJSONObject("target"));
-                            // The native input worker owns a 30-second idle lease.
-                            // The short pre-handshake timeout must not end a valid
-                            // session between actions or while a touch is held.
-                            connection.setSoTimeout(35_000);
-                            break;
-                        case "input":
-                            if (input == null) throw new Failure("invalid", "input is not open");
-                            validate(input.target);
-                            input.send(request.getJSONObject("event")); break;
-                        case "release": if (input != null) input.release(); break;
-                        case "open_capture":
-                            if (capture) throw new Failure("invalid", "capture already open");
-                            if(request.optInt("capture_protocol")!=2)throw new Failure("unsupported","capture protocol v2 required");
-                            validate(request.getJSONObject("target"));
-                            synchronized (AppUseProjectionService.LOCK) {
-                                validate(request.getJSONObject("target"));
-                                captureOwner = AppUseProjectionService.current;
-                                AppUseProjectionService.clients++; capture = true;
-                            }
-                            captureClient=captureOwner.openCapture(request);
-                            response.put("capture_protocol",2).put("width",captureClient.width).put("height",captureClient.height)
-                                .put("format",captureClient.format).put("native_width",AppUseProjectionService.width).put("native_height",AppUseProjectionService.height);
-                            break;
-                        case "frame": {
-                            if (!capture) throw new Failure("invalid", "capture is not open");
-                            validate(request.getJSONObject("target"));
-                            AppUseProjectionService.Frame frame;
-                            long after = request.getLong("after");
-                            long waitMs = Math.max(0, Math.min(100, request.optLong("wait_ms", 0)));
-                            long deadline = android.os.SystemClock.elapsedRealtime() + waitMs;
-                            frame=captureOwner.frame(captureClient,after);
-                            while(frame==null && android.os.SystemClock.elapsedRealtime()<deadline) {
-                                synchronized(AppUseProjectionService.LOCK) {
-                                    validate(request.getJSONObject("target"));
-                                    AppUseProjectionService.LOCK.wait(Math.max(1,Math.min(10,deadline-android.os.SystemClock.elapsedRealtime())));
-                                }
-                                frame=captureOwner.frame(captureClient,after);
-                            }
-                            validate(request.getJSONObject("target"));
-                            if (frame == null || frame.sequence <= after) { response.put("available", false); break; }
-                            response.put("available", true).put("format", frame.format).put("width", frame.width).put("height", frame.height)
-                                    .put("native_width",frame.nativeWidth).put("native_height",frame.nativeHeight)
-                                    .put("sequence", frame.sequence).put("timestamp_ns", frame.timestamp)
-                                    .put("captured_at_unix_ms", frame.capturedAt).put("bytes", frame.bytes.length);
-                            long writeStartedNs = android.os.SystemClock.elapsedRealtimeNanos();
-                            respond(out, response); out.write(frame.bytes); out.flush();
-                            if (android.util.Log.isLoggable("SinomoMediaStage", android.util.Log.VERBOSE)) {
-                                long completedNs = android.os.SystemClock.elapsedRealtimeNanos();
-                                android.util.Log.v("SinomoMediaStage", new JSONObject()
-                                    .put("sequence", frame.sequence).put("captured_at_unix_ms", frame.capturedAt)
-                                    .put("copy_us", frame.copyUs)
-                                    .put("java_queue_us", (writeStartedNs - frame.publishedAtNs) / 1000)
-                                    .put("socket_write_us", (completedNs - writeStartedNs) / 1000)
-                                    .put("completed_unix_ms", System.currentTimeMillis())
-                                    .put("bytes", frame.bytes.length).toString());
-                            }
-                            continue;
-                        }
-                        default: throw new Failure("unsupported", "unknown app-use operation");
+                while(!pending.isEmpty()) {
+                    Pending item=pending.removeFirst();AccessibilityNodeInfo node=item.node;
+                    if(nodes.length()>=maxNodes||item.depth>32){node.recycle();truncated=true;continue;}
+                    if(!node.refresh()){node.recycle();truncated=true;continue;}
+                    String id=Integer.toString(nodes.length()+1);Rect bounds=new Rect();node.getBoundsInScreen(bounds);
+                    boolean password=node.isPassword();
+                    JSONObject value=new JSONObject().put("id",id).put("parent",item.parent==null?JSONObject.NULL:item.parent)
+                        .put("window_id",node.getWindowId()).put("package",text(node.getPackageName()))
+                        .put("class_name",text(node.getClassName())).put("view_id",text(node.getViewIdResourceName()))
+                        .put("text",password?"":text(node.getText())).put("description",password?"":text(node.getContentDescription()))
+                        .put("bounds",new JSONArray(new int[]{bounds.left,bounds.top,bounds.right,bounds.bottom}))
+                        .put("enabled",node.isEnabled()).put("clickable",node.isClickable()).put("editable",node.isEditable())
+                        .put("scrollable",node.isScrollable()).put("password",password);
+                    int size=value.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                    if(bytes+size>48_000){node.recycle();truncated=true;continue;}
+                    bytes+=size;nodes.put(value);snapshot.nodes.put(id,node);snapshot.fingerprints.put(id,fingerprint(node));
+                    if(!password)for(int i=0;i<node.getChildCount();i++) {
+                        if(pending.size()+nodes.length()>=maxNodes){truncated=true;break;}
+                        AccessibilityNodeInfo child=node.getChild(i);if(child!=null)pending.add(new Pending(child,id,item.depth+1));
                     }
-                    respond(out, response);
-                } catch (Exception error) {
-                    if (input != null) input.release();
-                    Throwable cause = error;
-                    if (error instanceof java.util.concurrent.ExecutionException && error.getCause() != null) cause = error.getCause();
-                    respond(out, new JSONObject().put("code", cause instanceof Failure ? ((Failure) cause).code : "platform")
-                            .put("error", cause.getMessage() == null ? cause.toString() : cause.getMessage()));
                 }
+                while(snapshots.size()>=8){String first=snapshots.keySet().iterator().next();snapshots.remove(first).close();}
+                String id=UUID.randomUUID().toString();snapshots.put(id,snapshot);
+                int[] size=geometry();
+                return new JSONObject().put("snapshot_id",id).put("captured_at_unix_ms",System.currentTimeMillis())
+                    .put("width",size[0]).put("height",size[1]).put("nodes",nodes).put("truncated",truncated);
+            } catch(Exception error){snapshot.close();throw error;}
+            finally {for(Pending item:pending)item.node.recycle();}
+        });
+    }
+    void act(String snapshotId,String nodeId,JSONObject action) throws Exception {
+        onMain(() -> {
+            if(AppUseConsentActivity.protectsLocalConsent())throw new AppUseBridge.Failure("permission_denied","App Use cannot operate its own local consent controls");
+            Snapshot snapshot=snapshots.get(snapshotId);
+            if(snapshot==null||SystemClock.uptimeMillis()>=snapshot.expires)throw new AppUseBridge.Failure("target_unavailable","observation expired; observe again");
+            AccessibilityNodeInfo node=snapshot.nodes.get(nodeId);
+            if(node==null||!node.refresh()||!fingerprint(node).equals(snapshot.fingerprints.get(nodeId)))
+                throw new AppUseBridge.Failure("target_unavailable","observed node changed; observe again");
+            if(node.isPassword()||!node.isEnabled()||!node.isVisibleToUser())throw new AppUseBridge.Failure("permission_denied","protected, disabled or hidden node");
+            int operation;Bundle arguments=new Bundle();
+            switch(action.getString("kind")) {
+                case "click":operation=AccessibilityNodeInfo.ACTION_CLICK;break;
+                case "long_click":operation=AccessibilityNodeInfo.ACTION_LONG_CLICK;break;
+                case "focus":operation=AccessibilityNodeInfo.ACTION_FOCUS;break;
+                case "scroll_forward":operation=AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;break;
+                case "scroll_backward":operation=AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD;break;
+                case "set_text":
+                    if(!node.isEditable())throw new AppUseBridge.Failure("unsupported","node is not editable");
+                    String value=action.getString("text");if(value.length()>4096)throw new AppUseBridge.Failure("invalid","text exceeds 4096 UTF-16 units");
+                    operation=AccessibilityNodeInfo.ACTION_SET_TEXT;arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,value);break;
+                default:throw new AppUseBridge.Failure("unsupported","unknown accessibility action");
             }
-        } catch (java.io.EOFException | java.net.SocketTimeoutException ignored) {
-            // Connection loss ends this OS lease; requests are never retried.
-        } catch (Exception error) {
-            android.util.Log.w("SinomoAppUse", "Local OS bridge session failed", error);
-        } finally {
-            if (input != null) { input.release(); AppUseProjectionService.releaseInput(input.owner); }
-            if (capture) { captureOwner.closeCapture(captureClient);AppUseProjectionService.releaseCapture(captureOwner); }
-            connections.remove(socket); capacity.release();
+            // Consume before effect: an ambiguous timeout must never replay it.
+            snapshots.remove(snapshotId);
+            try {if(!node.performAction(operation,arguments))throw new AppUseBridge.Failure("platform","action rejected; observe before retrying");}
+            finally {snapshot.close();}
+            return null;
+        });
+    }
+    private int[] geometry() {
+        android.util.DisplayMetrics metrics=new android.util.DisplayMetrics();
+        getSystemService(WindowManager.class).getDefaultDisplay().getRealMetrics(metrics);
+        return new int[]{metrics.widthPixels,metrics.heightPixels};
+    }
+    final class ScreenshotCapture {
+        final String format;final int boundWidth,boundHeight;
+        private final FrameRateCeiling ceiling;
+        ScreenshotCapture(JSONObject request) throws Exception {
+            ceiling=new FrameRateCeiling(request.getInt("fps"));
+            if(!canScreenshot())throw new AppUseBridge.Failure("unsupported","Accessibility screenshots require Android 11 and the screenshot capability in the enabled service");
+            format=request.optString("pixel_format","rgba8").equals("bgra8")?"bgra8":"rgba8";
+            if(request.optString("pixel_format").equals("h264"))throw new AppUseBridge.Failure("unsupported","Accessibility provides pixels; use generic screen video for encoder surfaces");
+            JSONObject bounds=request.optJSONObject("resolution");int[] size=geometry();
+            boundWidth=bounds==null?size[0]:bounds.getInt("width");boundHeight=bounds==null?size[1]:bounds.getInt("height");
+            if(boundWidth<1||boundHeight<1||boundWidth>8192||boundHeight>8192||(long)boundWidth*boundHeight>32*1024*1024)
+                throw new AppUseBridge.Failure("invalid","invalid screenshot bounds");
+        }
+        long readyDelayMillis(long maximum) {
+            synchronized(AppUseAccessibilityService.this) {
+                long delay=Math.max(ceiling.delayNanos(System.nanoTime()),Math.max(0,nextScreenshot-SystemClock.uptimeMillis())*1_000_000L);
+                return Math.min(maximum,(delay+999_999)/1_000_000);
+            }
+        }
+        AppUseProjectionService.Frame frame(long after) throws Exception {
+            if(current!=AppUseAccessibilityService.this)throw new AppUseBridge.Failure("permission_denied","Accessibility is disabled");
+            synchronized(AppUseAccessibilityService.this) {
+                long now=SystemClock.uptimeMillis();long nanos=System.nanoTime();
+                if(now<nextScreenshot||ceiling.delayNanos(nanos)>0)return null;
+                nextScreenshot=now+350;ceiling.admit(nanos);
+            }
+            CompletableFuture<AppUseProjectionService.Frame> result=new CompletableFuture<>();
+            long started=System.nanoTime();
+            takeScreenshot(Display.DEFAULT_DISPLAY,command -> {
+                try { screenshotWorker.execute(command); }
+                catch(java.util.concurrent.RejectedExecutionException stopped){command.run();}
+            },new TakeScreenshotCallback() {
+                @Override public void onFailure(int error) {
+                    if(error==ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT)result.complete(null);
+                    else result.completeExceptionally(new AppUseBridge.Failure("target_unavailable","Accessibility screenshot failed: "+error));
+                }
+                @Override public void onSuccess(ScreenshotResult shot) {
+                    Bitmap hardware=null,pixels=null,scaled=null;
+                    try {
+                        if(current!=AppUseAccessibilityService.this)throw new AppUseBridge.Failure("permission_denied","Accessibility was disabled");
+                        hardware=Bitmap.wrapHardwareBuffer(shot.getHardwareBuffer(),shot.getColorSpace());
+                        if(hardware==null||(long)hardware.getWidth()*hardware.getHeight()>32*1024*1024)throw new IllegalStateException("invalid screenshot size");
+                        int nativeWidth=hardware.getWidth(),nativeHeight=hardware.getHeight();
+                        double scale=Math.min(1,Math.min((double)boundWidth/nativeWidth,(double)boundHeight/nativeHeight));
+                        int width=Math.max(1,(int)(nativeWidth*scale)),height=Math.max(1,(int)(nativeHeight*scale));
+                        pixels=hardware.copy(Bitmap.Config.ARGB_8888,false);scaled=Bitmap.createScaledBitmap(pixels,width,height,true);
+                        int[] colors=new int[width*height];scaled.getPixels(colors,0,width,0,0,width,height);
+                        byte[] bytes=new byte[width*height*4];boolean bgra=format.equals("bgra8");
+                        for(int i=0;i<colors.length;i++){int color=colors[i];bytes[i*4]=(byte)(bgra?color:color>>16);bytes[i*4+1]=(byte)(color>>8);bytes[i*4+2]=(byte)(bgra?color>>16:color);bytes[i*4+3]=(byte)(color>>24);}
+                        long next; synchronized(AppUseAccessibilityService.this){next=++sequence;}
+                        result.complete(new AppUseProjectionService.Frame(bytes,width,height,nativeWidth,nativeHeight,format,next,SystemClock.elapsedRealtimeNanos(),System.currentTimeMillis(),(System.nanoTime()-started)/1000));
+                    } catch(Exception error){result.completeExceptionally(error);}
+                    finally {if(scaled!=null&&scaled!=pixels)scaled.recycle();if(pixels!=null)pixels.recycle();if(hardware!=null)hardware.recycle();shot.getHardwareBuffer().close();}
+                }
+            });
+            try { return result.get(2,TimeUnit.SECONDS); }
+            finally { result.cancel(false); }
         }
     }
-    private final class Input {
-        final JSONObject target;
-        final AppUseProjectionService owner;
-        float x, y;
-        Path path;
-        long downAt;
-        int points;
-        Input(JSONObject target) throws Exception {
-            this.target = target;
-            synchronized (AppUseProjectionService.LOCK) {
-                validate(target);
-                owner = AppUseProjectionService.current;
-                AppUseProjectionService.inputClients++;
-            }
-        }
-        void release() { path = null; points = 0; }
-        void point(float px, float py) throws Exception {
-            synchronized (AppUseProjectionService.LOCK) {
-                if (px < 0 || py < 0 || px >= AppUseProjectionService.width || py >= AppUseProjectionService.height) throw new Failure("invalid", "touch point is outside the shared display");
-            }
-            x = px; y = py;
-            if (path != null) {
-                if (++points > 256) throw new Failure("invalid", "touch path exceeds 256 points");
-                path.lineTo(x, y);
-            }
-        }
-        void send(JSONObject event) throws Exception {
-            switch (event.getString("kind")) {
-                case "move": point(event.getInt("x"), event.getInt("y")); break;
-                case "relative_move": point(x + event.getInt("dx"), y + event.getInt("dy")); break;
-                case "button":
-                    if (!"left".equals(event.getString("button"))) throw new Failure("unsupported", "Android supports left-button touch gestures only");
-                    if (event.getBoolean("down")) {
-                        if (path != null) throw new Failure("invalid", "touch is already down");
-                        point(x, y); path = new Path(); path.moveTo(x, y); points = 1; downAt = android.os.SystemClock.uptimeMillis();
-                    } else if (path != null) {
-                        Path submitted = path;
-                        long duration = Math.max(50, Math.min(1000, android.os.SystemClock.uptimeMillis() - downAt));
-                        release(); gesture(submitted, duration);
-                    }
-                    break;
-                case "wheel": {
-                    int delta = event.getInt("delta");
-                    if (delta == 0) break;
-                    if (path != null) throw new Failure("invalid", "finish touch before scrolling");
-                    boolean horizontal = event.optBoolean("horizontal");
-                    int w, h;
-                    synchronized (AppUseProjectionService.LOCK) { w = AppUseProjectionService.width; h = AppUseProjectionService.height; }
-                    float cx = x, cy = y;
-                    float distance = Math.copySign(Math.min(Math.abs((long) delta) * 0.5f, (horizontal ? w : h) / 3f), delta);
-                    Path swipe = new Path(); swipe.moveTo(cx, cy);
-                    swipe.lineTo(horizontal ? Math.max(0, Math.min(w - 1, cx + distance)) : cx,
-                            horizontal ? cy : Math.max(0, Math.min(h - 1, cy + distance)));
-                    gesture(swipe, 250); break;
-                }
-                case "text": edit(event.getString("text"), false); break;
-                case "key":
-                    int code = event.getInt("code");
-                    if (event.optBoolean("extended") || (code != 1 && code != 14 && code != 28)) throw new Failure("unsupported", "Android raw keys support Escape/Back, Backspace and Enter only");
-                    if (!event.getBoolean("down")) break;
-                    if (code == 1) onMain(() -> { if (!performGlobalAction(GLOBAL_ACTION_BACK)) throw new Failure("platform", "Android rejected Back"); });
-                    else if (code == 14) edit("", true);
-                    else onMain(() -> {
-                        AccessibilityNodeInfo node = focused();
-                        try {
-                            if (Build.VERSION.SDK_INT < 30 || !node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId())) throw new Failure("unsupported", "focused editor does not support IME Enter");
-                        } finally { node.recycle(); }
-                    });
-                    break;
-                case "release_all": release(); break;
-                default: throw new Failure("unsupported", "Android does not support this input kind");
-            }
-        }
-        void gesture(Path path, long duration) throws Exception {
-            CountDownLatch done = new CountDownLatch(1);
-            AtomicBoolean completed = new AtomicBoolean();
-            onMain(() -> {
-                GestureDescription gesture = new GestureDescription.Builder()
-                        .addStroke(new GestureDescription.StrokeDescription(path, 0, duration)).build();
-                if (!dispatchGesture(gesture, new GestureResultCallback() {
-                    @Override public void onCompleted(GestureDescription g) { completed.set(true); done.countDown(); }
-                    @Override public void onCancelled(GestureDescription g) { done.countDown(); }
-                }, main)) throw new Failure("platform", "Android rejected the touch gesture");
-            });
-            if (!done.await(1500, TimeUnit.MILLISECONDS) || !completed.get()) throw new Failure("platform", "touch gesture cancelled or completion unknown; do not replay");
-        }
-        void edit(String text, boolean backspace) throws Exception {
-            if (text.length() > 4096) throw new Failure("invalid", "text exceeds 4096 UTF-16 units");
-            onMain(() -> {
-                AccessibilityNodeInfo node = focused();
-                try {
-                    if (!node.isEditable() || node.isPassword()) throw new Failure("unsupported", "focused node must be a non-password accessible editor");
-                    // Empty EditText nodes may expose their hint as text and
-                    // omit selection entirely. A hint is not editable content.
-                    String old = node.isShowingHintText() || node.getText() == null ? "" : node.getText().toString();
-                    if (old.length() > 1_048_576) throw new Failure("unsupported", "focused editor is too large");
-                    int start = node.getTextSelectionStart(), end = node.getTextSelectionEnd();
-                    if (old.isEmpty() && start == -1 && end == -1) { start = 0; end = 0; }
-                    if (start < 0 || end < start || end > old.length()) throw new Failure("unsupported", "focused editor has no valid selection");
-                    if (backspace && start == end && start > 0) start = old.offsetByCodePoints(start, -1);
-                    Bundle args = new Bundle();
-                    args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, old.substring(0, start) + text + old.substring(end));
-                    if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) throw new Failure("platform", "editor rejected text; do not replay");
-                    Bundle selection = new Bundle();
-                    selection.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, start + text.length());
-                    selection.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, start + text.length());
-                    node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection);
-                } finally { node.recycle(); }
-            });
-        }
-        AccessibilityNodeInfo focused() throws Failure {
-            AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root == null) throw new Failure("target_unavailable", "no accessible foreground window");
-            try {
-                AccessibilityNodeInfo node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-                if (node == null) throw new Failure("unsupported", "no focused accessible editor");
-                // Focus/selection can change without a window-state event. Read
-                // the live node before editing rather than reusing cached text.
-                if (!node.refresh()) { node.recycle(); throw new Failure("target_unavailable", "focused editor disappeared"); }
-                return node;
-            } finally { root.recycle(); }
-        }
-        void onMain(Action action) throws Exception {
-            FutureTask<Void> task = new FutureTask<>(() -> { validate(target); action.run(); return null; });
-            main.post(task);
-            try { task.get(750, TimeUnit.MILLISECONDS); }
-            finally { main.removeCallbacks(task); task.cancel(false); }
-        }
-    }
-    private interface Action { void run() throws Exception; }
 }

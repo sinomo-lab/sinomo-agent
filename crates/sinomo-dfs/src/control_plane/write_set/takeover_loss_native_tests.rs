@@ -10,7 +10,9 @@ use super::commit_native_tests::{
 use super::takeover_driver_native_tests::{
     event_log, keep_with_paths, lose, object_mode, takeover_events,
 };
-use super::takeover_native_tests::{member_state_path, prepare_unknown, shard_id_of};
+use super::takeover_native_tests::{
+    member_state_path, prepare_unknown, shard_id_of, store_archives,
+};
 use super::*;
 use crate::DfsMetadataTakeoverEvent;
 use crate::test_runtime::{FaultAction, FaultRule, Partition, executor};
@@ -1520,17 +1522,17 @@ fn native_takeover_member_with_a_divergent_prefix_is_repaired_by_snapshot() {
     );
 
     // C returns: P's keeper repairs it by snapshot and re-adds it.
+    let archived = store_archives(&runtime, &c, &config);
     runtime.reopen_node(c.clone()).unwrap();
     runtime.set_peer_verdict(&p, &c, PeerPathVerdict::Path, false);
     wait_until("P re-adds C", &runtime, &[&p], || {
         write_set_of(&runtime, &config).contains(&c)
     });
-    let shard_root_of_c = shard_root(&runtime, &c, &config);
     assert!(
-        std::fs::read_dir(&shard_root_of_c)
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains("archive")),
+        store_archives(&runtime, &c, &config)
+            .difference(&archived)
+            .next()
+            .is_some(),
         "a snapshot install archived C's divergent store"
     );
     catch_up_from(

@@ -370,6 +370,8 @@ pub struct DesktopCapture {
     permissions: DeviceAuthority,
     mailbox: Arc<CaptureMailbox>,
     stop: Option<mpsc::Sender<()>>,
+    #[cfg(target_os = "linux")]
+    wake: Option<std::os::unix::net::UnixStream>,
     worker: Option<JoinHandle<()>>,
 }
 impl DesktopCapture {
@@ -408,13 +410,34 @@ impl DesktopCapture {
         let authority = permissions.clone();
         let target = config.target.clone();
         let (stop, stopping) = mpsc::channel();
+        #[cfg(target_os = "linux")]
+        let (wake, wake_receiver) = {
+            let pair = std::os::unix::net::UnixStream::pair()
+                .map_err(|e| DesktopError::Platform(e.to_string()))?;
+            pair.0
+                .set_nonblocking(true)
+                .map_err(|e| DesktopError::Platform(e.to_string()))?;
+            pair.1
+                .set_nonblocking(true)
+                .map_err(|e| DesktopError::Platform(e.to_string()))?;
+            pair
+        };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("desktop-capture".into())
             .spawn(move || {
                 #[cfg(windows)]
                 let result = platform::capture(config, authority, &output, stopping, ready_tx);
-                #[cfg(not(windows))]
+                #[cfg(target_os = "linux")]
+                let result = platform::capture(
+                    config,
+                    authority.store,
+                    &output,
+                    stopping,
+                    ready_tx,
+                    wake_receiver,
+                );
+                #[cfg(not(any(windows, target_os = "linux")))]
                 let result =
                     platform::capture(config, authority.store, &output, stopping, ready_tx);
                 output.close(result.err());
@@ -425,6 +448,8 @@ impl DesktopCapture {
             permissions,
             mailbox,
             stop: Some(stop),
+            #[cfg(target_os = "linux")]
+            wake: Some(wake),
             worker: Some(worker),
         };
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
@@ -487,6 +512,11 @@ impl DesktopCapture {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+        #[cfg(target_os = "linux")]
+        if let Some(mut wake) = self.wake.take() {
+            use std::io::Write;
+            let _ = wake.write(&[1]);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -498,5 +528,60 @@ impl Drop for DesktopCapture {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub(super) use platform::{frame_trace_enabled, trace_frame};
+
+/// Semantic observations and projection controls use the same native authority
+/// boundary as capture/input; unsupported platforms never silently fall back.
+pub fn accessibility_observe(
+    store: &LocalNodePermissionStore,
+    target: &DesktopTarget,
+    max_nodes: u32,
+) -> DesktopResult<accessibility::AccessibilitySnapshot> {
+    authorize(store, target, "capture")?;
+    if !(1..=128).contains(&max_nodes) {
+        return Err(DesktopError::Invalid("max_nodes must be 1..128".into()));
+    }
+    #[cfg(target_os = "android")]
+    return platform::accessibility_observe(target, max_nodes);
+    #[cfg(not(target_os = "android"))]
+    Err(DesktopError::Unsupported(
+        "semantic accessibility observation is unavailable on this platform".into(),
+    ))
+}
+pub fn accessibility_act(
+    store: &LocalNodePermissionStore,
+    target: &DesktopTarget,
+    snapshot_id: &str,
+    node_id: &str,
+    action: &accessibility::AccessibilityAction,
+) -> DesktopResult<()> {
+    authorize(store, target, "input")?;
+    #[cfg(target_os = "android")]
+    return platform::accessibility_act(target, snapshot_id, node_id, action);
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (snapshot_id, node_id, action);
+        Err(DesktopError::Unsupported(
+            "semantic accessibility actions are unavailable on this platform".into(),
+        ))
+    }
+}
+pub fn video_targets(store: &LocalNodePermissionStore) -> DesktopResult<Vec<DesktopTargetInfo>> {
+    authorize_host(store)?;
+    #[cfg(target_os = "android")]
+    return platform::video_targets();
+    #[cfg(target_os = "linux")]
+    return platform::video_targets(store);
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    enumerate_targets(store, false)
+}
+pub fn stop_video(store: &LocalNodePermissionStore, target: &DesktopTarget) -> DesktopResult<()> {
+    authorize(store, target, "stop")?;
+    #[cfg(target_os = "android")]
+    return platform::stop_video(target);
+    #[cfg(not(target_os = "android"))]
+    Err(DesktopError::Unsupported(
+        "this platform has no persistent projection to stop".into(),
+    ))
+}

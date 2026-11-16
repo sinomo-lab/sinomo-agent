@@ -463,7 +463,7 @@ impl NativeImportAuthority {
                     "historic topology DATA lost its original desired configuration",
                 ));
             };
-            if !matches!(source.source_format_version, Some(8 | 9))
+            if !matches!(source.source_format_version, Some(8 | 9 | 10))
                 || current_proof.retiring_shard.file_system_id
                     != original.desired_shard.file_system_id
                 || current_proof.retiring_shard.shard_id != original.desired_shard.shard_id

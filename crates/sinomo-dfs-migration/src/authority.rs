@@ -25,9 +25,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 mod configuration;
+mod command_preimage;
+mod activation_data;
 pub(crate) mod content_work;
 mod handoff;
 mod namespace_work;
+mod owner;
+use owner::MigrationOwner;
+mod namespace_counts;
 pub(crate) mod placement_job_source;
 mod placement_work;
 mod plan_file;
@@ -141,6 +146,7 @@ struct NativeImportAuthority {
     namespace_work: Arc<Mutex<BTreeMap<String, namespace_work::JobOutcome>>>,
     content_plan_contexts: Arc<Mutex<content_work::verification_context::PlanContexts>>,
     retained_plan_file: Arc<plan_file::RetainedPlanFile>,
+    count_stages: Arc<Mutex<BTreeMap<String, Arc<handoff::StagedCountSource>>>>,
     source_verifiers:
         Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<staged_service::SourceTransferVerifier>>>>>,
 }
@@ -178,19 +184,81 @@ impl NativeImportAuthority {
         Ok(())
     }
     fn read_exact(
-        &self,
-        keys: &[String],
+        &self, keys: &[String],
     ) -> Result<(Vec<MetadataCapturedKvEntry>, KvAuthorityProof)> {
-        let read = block_native(
-            &self.runtime,
-            self.cluster()?
-                .kv_get_authoritative_exact_set_async(keys.to_vec()),
-        )?;
+        self.read_exact_evaluated(keys).map_err(|failure| match failure {
+            NativeEvaluationError::Native(native) => self.native_read_error(native),
+            NativeEvaluationError::Domain(domain) => domain,
+        })
+    }
+    /// Native read admission can be temporarily unavailable during startup or
+    /// membership convergence. Keep that typed absence of authority pending;
+    /// malformed data and failed proof validation still reject the unit.
+    fn native_read_error(&self, failure: sinomo_core::service::ServiceError) -> MetadataBackendError {
+        use sinomo_core::network::NetworkError as Network;
+        let retryable = match &failure {
+            ServiceError::Network(network) => matches!(network,
+                Network::ClusterReadOnly { .. } | Network::VerifiedClusterNonLeader { .. }
+                | Network::Timeout { .. } | Network::RetryExhausted { .. }
+                | Network::DeliveryFailed { .. } | Network::OutcomeUnknown { .. }
+                | Network::Io { .. } | Network::MailboxFull { .. }
+                | Network::UnknownNode { .. } | Network::UnknownRoute { .. }
+                | Network::ObjectRpcRouteSaturated { .. } | Network::ObjectFrameMemoryUnavailable { .. }),
+            ServiceError::Kv(kv) => matches!(kv, KvError::Busy { .. } | KvError::AuthorityUnavailable { .. }
+                | KvError::LeaderOffline { .. } | KvError::QuorumUnavailable { .. }
+                | KvError::StaleLeadershipTerm { .. }),
+            _ => false,
+        };
+        if retryable {
+            tracing::debug!(root=%self.metadata_root.display(), error=%failure,
+                "migration awaits native read authority");
+            MetadataBackendError::StoragePreparationPending {
+                root: self.metadata_root.clone(), processed_records: 0,
+            }
+        } else { error(failure) }
+    }
+    fn read_native<T>(&self, future: impl Future<Output = std::result::Result<T, sinomo_core::service::ServiceError>>) -> Result<T> {
+        block_native(&self.runtime, async { Ok::<_, MetadataBackendError>(future.await) })?
+            .map_err(|failure| self.native_read_error(failure))
+    }
+    // Read-only probes and idempotent DATA enrollment retain typed transport
+    // failures until the owner chooses a retry. This does not infer an effect.
+    fn read_peer<T>(&self, future: impl Future<Output = std::result::Result<T, sinomo_core::network::NetworkError>>) -> Result<T> {
+        let result = block_native(&self.runtime, async { Ok::<_, MetadataBackendError>(future.await) })?;
+        match result {
+            // These callers already selected an exact admitted participant.
+            // Its transport/route can be absent while its component mounts.
+            Err(failure @ (sinomo_core::network::NetworkError::UnknownNode { .. }
+                | sinomo_core::network::NetworkError::UnknownRoute { .. })) => {
+                tracing::debug!(error=%failure, "migration awaits its admitted peer transport");
+                Err(MetadataBackendError::StoragePreparationPending {
+                    root: self.metadata_root.clone(), processed_records: 0,
+                })
+            }
+            result => result.map_err(|failure| self.native_read_error(ServiceError::Network(failure))),
+        }
+    }
+    fn native_observation_error(&self, failure: NativeEvaluationError) -> MetadataBackendError {
+        match failure {
+            NativeEvaluationError::Native(native) => self.native_read_error(native),
+            NativeEvaluationError::Domain(domain) => domain,
+        }
+    }
+    pub(super) fn read_exact_evaluated(
+        &self, keys: &[String],
+    ) -> std::result::Result<(Vec<MetadataCapturedKvEntry>, KvAuthorityProof), NativeEvaluationError> {
+        let read = block_native(&self.runtime, async {
+            Ok::<_, MetadataBackendError>(self.cluster()?.kv_get_authoritative_exact_set_async(keys.to_vec()).await)
+        })?.map_err(NativeEvaluationError::Native)?;
         current_authority(&read.authority)?;
         if read.value.len() != keys.len() {
             return Err(error(
                 "native exact-set response changed its key cardinality",
-            ));
+            ).into());
+        }
+        if keys.iter().zip(&read.value).any(|(expected, actual)|
+            actual.as_ref().is_some_and(|entry| &entry.key != expected)) {
+            return Err(error("native exact-set response changed its requested key scope").into());
         }
         let entries = keys
             .iter()
@@ -201,10 +269,15 @@ impl NativeImportAuthority {
         Ok((entries, read.authority))
     }
     fn commit(&self, request: KvTxnRequest) -> Result<DfsNativeTxnCommit> {
-        let result = block_native(
-            &self.runtime,
-            self.cluster()?.kv_commit_compact_async(request.clone()),
-        )?;
+        self.commit_evaluated(request).map_err(NativeEvaluationError::into_metadata)
+    }
+    /// Preserve native availability separately from invalid command/outcome DATA.
+    /// Callers retain the same exact request while its outcome is uncertain.
+    pub(super) fn commit_evaluated(&self, request: KvTxnRequest)
+        -> std::result::Result<DfsNativeTxnCommit, NativeEvaluationError> {
+        let result = block_native(&self.runtime, async {
+            Ok::<_, MetadataBackendError>(self.cluster()?.kv_commit_compact_async(request.clone()).await)
+        })?.map_err(NativeEvaluationError::Native)?;
         let submitted = sinomo_core::kv::kv_command_digest(&KvCommand::Txn(request.txn.clone()))
             .map_err(error)?;
         if result.request_id != request.request_id
@@ -212,7 +285,7 @@ impl NativeImportAuthority {
         {
             return Err(error(
                 "native commit receipt differs from the exact submitted import request",
-            ));
+            ).into());
         }
         let response = result
             .txn_response
@@ -221,7 +294,7 @@ impl NativeImportAuthority {
         if response.revision != result.authority.revision {
             return Err(error(
                 "native import CAS did not commit against its captured control-plane state",
-            ));
+            ).into());
         }
         Ok(DfsNativeTxnCommit { request, result })
     }
@@ -434,6 +507,9 @@ impl NativeImportAuthority {
 }
 
 impl MetadataImportAuthority for NativeImportAuthority {
+    fn namespace_count_cohort_ready(&self, source: &MetadataSourceCut) -> Result<bool> {
+        self.count_cohort_ready(source)
+    }
     fn queue_original_topology_after_install(
         &self,
         source: &MetadataSourceCut,
@@ -506,7 +582,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         let mut client = self.control_client(&self.receiver_root)?;
         let view = DfsControlPlaneStore::new(&mut client)
             .cluster_view()
-            .map_err(error)?;
+            .map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?;
         let eligible = view
             .eligible_content_node_ids()
             .into_iter()
@@ -533,7 +609,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         }
         let mut client = self.control_client(&self.receiver_root)?;
         let store = DfsControlPlaneStore::new(&mut client);
-        let view = store.cluster_view().map_err(error)?;
+        let view = store.cluster_view().map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?;
         let candidates = view
             .content_nodes
             .into_iter()
@@ -607,9 +683,6 @@ impl MetadataImportAuthority for NativeImportAuthority {
                 continue;
             }
             let root = directory.path();
-            if !root.join("native-activation-request.json").is_file() {
-                continue;
-            }
             let path = root.join("native-import-plan.json");
             if !path.is_file() {
                 continue;
@@ -704,7 +777,8 @@ impl MetadataImportAuthority for NativeImportAuthority {
             ));
         }
         let local = self.local_node()?;
-        if !proof.acknowledged_node_ids.contains(&local) {
+        if local == proof.retiring_shard.primary_node_id
+            || !proof.desired_shard.replica_node_ids.contains(&local) {
             return Ok(None);
         }
         let root = self.receiver_root_for(
@@ -752,7 +826,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         {
             return Err(error("received native image changed after its durable ACK"));
         }
-        let request = self.find_native_request(&root, &plan.expected_handoff, true)?;
+        let request = self.original_receiver_activation_request(&root, &plan, &actual)?;
         let request_proof = Self::activation_proof(&request)?
             .ok_or_else(|| error("received activation request omits its proof"))?;
         self.validate_activation_request(&request, &plan, &request_proof)?;
@@ -771,6 +845,10 @@ impl MetadataImportAuthority for NativeImportAuthority {
                 "native import moved while exact receipts were recovered",
             ));
         }
+        // Retain only the original body whose actual native outcome was just
+        // reobserved. Lookup responses and local files alone grant no authority.
+        Self::save_blueprint(&root, "native-activation-request.json", &request)?;
+        Self::save_blueprint(&root, &format!("native-request-{}.json", request.request_id), &request)?;
         let proposal = MetadataImportProposal {
             facts: MetadataImportProposalFacts {
                 source_root: source.source_root.clone(),
@@ -810,18 +888,21 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &activation_commit,
             &actual,
         )?;
-        let legacy_local_source =
-            legacy_local.map(
-                |(format, prefix)| crate::metadata::VerifiedLegacyReceiverSource {
+        let format = match legacy_local {
+            Some((format, _)) => format,
+            None => crate::metadata::original_native_root_format(&source.source_root)?
+                .ok_or_else(|| error("receiver source has no supported physical codec"))?,
+        };
+        let receiver_source = Some(crate::metadata::VerifiedReceiverSource {
                     original_root: source.source_root.clone(),
                     actual_root: source.source_root.clone(),
                     source_identity: source.source_identity.clone(),
                     snapshot_fingerprint: source.source_snapshot_fingerprint.clone(),
                     source_format_version: format,
-                    source_prefix: prefix,
+                    source_prefix: source_exact_prefix.cloned()
+                        .ok_or_else(|| error("receiver source has no exact local prefix"))?,
                     source_fences,
-                },
-            );
+                });
         let certificate = MetadataImportCertificate {
             facts: MetadataImportCertificateFacts {
                 proposal_fingerprint: digest(&ImportProposal::Native(proposal.clone()))?,
@@ -833,7 +914,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             joint_handoff_proof: actual,
             source_retirements,
             data_reservation_retirements,
-            legacy_local_source,
+            receiver_source,
         };
         Ok(Some((
             ImportProposal::Native(proposal),
@@ -847,8 +928,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         let cluster = self.cluster()?;
         let mut initial = BTreeMap::new();
         for fs in file_system_ids {
-            let read = block_native(
-                &self.runtime,
+            let read = self.read_native(
                 cluster.kv_range_prefix_authoritative_async(format!(
                     "{}/",
                     sinomo_dfs::metadata_shards_prefix(fs)
@@ -873,9 +953,12 @@ impl MetadataImportAuthority for NativeImportAuthority {
                 error("assignment disappeared during exact native partition planning")
             })?;
             if initial.get(&capture.key) != Some(&entry) {
-                return Err(error(
-                    "assignment changed while partitioning the source cut",
-                ));
+                // This two-read observation has not captured a source cut yet.
+                // A sibling activation can advance the catalogue between the
+                // reads; retry observation without replacing any stored cut.
+                return Err(MetadataBackendError::StoragePreparationPending {
+                    root: self.metadata_root.clone(), processed_records: 0,
+                });
             }
             let mut value: serde_json::Value = entry.decode().map_err(error)?;
             let fields = value
@@ -1022,8 +1105,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         let cluster = self.cluster()?;
         let mut shard_entries = Vec::new();
         for fs in &source.file_system_ids {
-            let read = block_native(
-                &self.runtime,
+            let read = self.read_native(
                 cluster.kv_range_prefix_authoritative_async(sinomo_dfs::metadata_shards_prefix(fs)),
             )?;
             current_authority(&read.authority)?;
@@ -1227,7 +1309,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             // never pathname equality or missing files, selects this role.
             return Ok(None);
         }
-        if !proof.acknowledged_node_ids.contains(&local) {
+        if !proof.desired_shard.replica_node_ids.contains(&local) {
             return Ok(None);
         }
         let legacy_local = crate::metadata::legacy_receiver_prefix(
@@ -1288,18 +1370,21 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &activation_commit,
             &proof,
         )?;
-        let legacy_local_source =
-            legacy_local.map(
-                |(format, prefix)| crate::metadata::VerifiedLegacyReceiverSource {
+        let format = match legacy_local {
+            Some((format, _)) => format,
+            None => crate::metadata::original_native_root_format(actual_source_root)?
+                .ok_or_else(|| error("recovered receiver source has no supported physical codec"))?,
+        };
+        let receiver_source = Some(crate::metadata::VerifiedReceiverSource {
                     original_root: proposal.source_root.clone(),
                     actual_root: actual_source_root.to_owned(),
                     source_identity: proposal.source_identity.clone(),
                     snapshot_fingerprint: proposal.source_snapshot_fingerprint.clone(),
                     source_format_version: format,
-                    source_prefix: prefix,
+                    source_prefix: proposal.source_exact_prefix.clone()
+                        .ok_or_else(|| error("recovered receiver source has no exact local prefix"))?,
                     source_fences,
-                },
-            );
+                });
         Ok(Some(ImportCertificate::Native(MetadataImportCertificate {
             facts: MetadataImportCertificateFacts {
                 proposal_fingerprint: digest(&ImportProposal::Native(proposal.clone()))?,
@@ -1311,7 +1396,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             joint_handoff_proof: proof,
             source_retirements,
             data_reservation_retirements,
-            legacy_local_source,
+            receiver_source,
         })))
     }
 
@@ -1373,7 +1458,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             joint_handoff_proof: proof,
             source_retirements,
             data_reservation_retirements,
-            legacy_local_source: None,
+            receiver_source: None,
         }))
     }
 }
@@ -1384,6 +1469,14 @@ struct NativeImportKv<'a> {
     root: &'a Path,
     last_commit: Option<DfsNativeTxnCommit>,
     original_handoff: Option<KvEntry>,
+}
+fn native_read_to_kv(failure: MetadataBackendError) -> KvError {
+    match failure {
+        MetadataBackendError::StoragePreparationPending { .. } => KvError::AuthorityUnavailable {
+            detail: failure.to_string(),
+        },
+        failure => KvError::Serialization { detail: failure.to_string() },
+    }
 }
 impl std::fmt::Debug for NativeImportKv<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1427,9 +1520,7 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
             .owner
             .read_exact(&[key.into()])
             .map(|(mut entries, _)| entries.remove(0).entry)
-            .map_err(|e| KvError::Serialization {
-                detail: e.to_string(),
-            })?;
+            .map_err(native_read_to_kv)?;
         if let Some(original) = self
             .original_handoff
             .as_ref()
@@ -1449,9 +1540,7 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
         self.owner
             .read_exact(keys)
             .map(|(entries, _)| entries.into_iter().map(|entry| entry.entry).collect())
-            .map_err(|e| KvError::Serialization {
-                detail: e.to_string(),
-            })
+            .map_err(native_read_to_kv)
     }
     fn get_authoritative_consistent(
         &mut self,
@@ -1466,17 +1555,14 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
         let cluster = self.owner.cluster().map_err(|e| KvError::Serialization {
             detail: e.to_string(),
         })?;
-        let read = block_native(
-            &self.owner.runtime,
+        let read = self.owner.read_native(
             if matches!(prefix, "/" | "/dfs/filesystems/") {
                 cluster.kv_range_prefix_complete_authoritative_async(prefix.into())
             } else {
                 cluster.kv_range_prefix_authoritative_async(prefix.into())
             },
         )
-        .map_err(|e| KvError::Serialization {
-            detail: e.to_string(),
-        })?;
+        .map_err(native_read_to_kv)?;
         current_authority(&read.authority).map_err(|e| KvError::Serialization {
             detail: e.to_string(),
         })?;
@@ -1612,9 +1698,7 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
         let commit = self
             .owner
             .blueprint_commit(self.root, request)
-            .map_err(|e| KvError::Serialization {
-                detail: e.to_string(),
-            })?;
+            .map_err(native_read_to_kv)?;
         self.last_commit = Some(commit.clone());
         Ok((
             commit
@@ -1627,105 +1711,25 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
     }
 }
 
-struct MigrationRuntime {
-    authority: Arc<NativeImportAuthority>,
-    metadata: Arc<MetadataConverter>,
-    content: Arc<crate::content::ContentConverter>,
-    local_state: crate::local_state::LocalStateConverter,
-    _owner: Arc<sinomo_dfs::runtime_host::DfsDataOwnerLock>,
-    metadata_root: PathBuf,
-    // A representation-readiness fact for this actual factory/owner lifetime.
-    // Publication still consumes current native configuration/guard evidence.
-    configuration_ready: std::sync::atomic::AtomicBool,
-    routing_cache_lock: Mutex<()>,
-    placement_retirement_cursor: Mutex<placement_work::PlacementRetirementCursor>,
-    lifecycle: tokio::sync::watch::Receiver<bool>,
-}
-impl MigrationRuntime {
-    /// Advance already captured original placement DATA through the SAME bounded
-    /// native source/image/import and retirement continuation. This does not
-    /// reset configuration readiness or discover legacy KV on current calls.
-    fn prepare_captured_placement_goals(
-        &self,
-        goals: &[placement_work::OriginalPlacementGoal],
-        budget: usize,
-    ) -> Result<sinomo_dfs::DfsStoragePreparation> {
-        if *self.lifecycle.borrow() || self.lifecycle.has_changed().is_err() {
-            return Err(error("storage provider component lifecycle closed"));
-        }
-        let required = self.authority.required_original_placement_sources(goals)?;
-        if let Some(required) = required.first() {
-            let dfs_root = self
-                .metadata_root
-                .parent()
-                .ok_or_else(|| error("metadata owner has no DFS storage root"))?;
-            let content = self.content.prepare(&dfs_root.join("content"), budget)?;
-            if matches!(content, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-                return Ok(content);
-            }
-            let shard = &required.assignment.shard_id;
-            if Path::new(shard).components().count() != 1
-                || !matches!(
-                    Path::new(shard).components().next(),
-                    Some(std::path::Component::Normal(_))
-                )
-            {
-                return Err(error(
-                    "captured original placement scope is not an owned path segment",
-                ));
-            }
-            let destination = self.metadata_root.join(shard);
-            let combined = self.metadata_root.join("root");
-            let source = if !destination.exists() && combined.exists() {
-                combined.as_path()
-            } else {
-                destination.as_path()
-            };
-            let prepared = self.metadata.prepare_metadata_data_reservations(
-                &destination,
-                source,
-                &sinomo_dfs::DfsMetadataShardId::new(shard),
-                &required.capsules,
-                budget,
-            )?;
-            return Ok(match prepared {
-                sinomo_dfs::DfsStoragePreparation::Pending { processed_records } => {
-                    sinomo_dfs::DfsStoragePreparation::Pending { processed_records }
-                }
-                sinomo_dfs::DfsStoragePreparation::Ready => {
-                    sinomo_dfs::DfsStoragePreparation::Pending {
-                        processed_records: 0,
-                    }
-                }
-            });
-        }
-        let retired = {
-            let mut cursor = self
-                .placement_retirement_cursor
-                .lock()
-                .map_err(|_| error("placement retirement continuation poisoned"))?;
-            self.authority
-                .retire_and_queue_placement_goals(goals, budget, &mut cursor)?
-        };
-        if !retired {
-            return Ok(sinomo_dfs::DfsStoragePreparation::Pending {
-                processed_records: budget,
-            });
-        }
-        Ok(sinomo_dfs::DfsStoragePreparation::Ready)
-    }
-}
-static RUNTIMES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<MigrationRuntime>>>> = OnceLock::new();
+static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<MigrationOwner>>>> = OnceLock::new();
 fn source_effect_host(context: &sinomo_module::ComponentContext) -> bool {
     matches!(
         context.host_role(),
         sinomo_module::ComponentHostRole::Main | sinomo_module::ComponentHostRole::Embedded
     )
 }
-fn shared_runtime(
+fn shared_owner(
     context: &sinomo_module::ComponentContext,
     lifecycle: tokio::sync::watch::Receiver<bool>,
-) -> std::result::Result<Arc<MigrationRuntime>, sinomo_module::ComponentError> {
+) -> std::result::Result<Arc<MigrationOwner>, sinomo_module::ComponentError> {
+    shared_owner_with_source_authority(context, lifecycle, None)
+}
+fn shared_owner_with_source_authority(
+    context: &sinomo_module::ComponentContext,
+    lifecycle: tokio::sync::watch::Receiver<bool>,
+    source_authority: Option<Arc<dyn MetadataImportAuthority>>,
+) -> std::result::Result<Arc<MigrationOwner>, sinomo_module::ComponentError> {
+    let source_kind = source_authority.as_ref().map_or(crate::metadata::MetadataImportAuthorityKind::Native, |authority| authority.kind());
     if !source_effect_host(context) {
         return Err(sinomo_module::ComponentError::component(
             "dfs-migration",
@@ -1744,7 +1748,7 @@ fn shared_runtime(
             "storage provider component lifecycle is closed",
         ));
     }
-    let mut roots = RUNTIMES
+    let mut roots = OWNERS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1753,6 +1757,9 @@ fn shared_runtime(
             && !*runtime.lifecycle.borrow()
             && runtime.lifecycle.has_changed().is_ok()
         {
+            if runtime.source_kind != source_kind {
+                return Err(sinomo_module::ComponentError::component("dfs-migration", "actual data owner already selected another source authority mode"));
+            }
             if !runtime.lifecycle.same_channel(&lifecycle) {
                 return Err(sinomo_module::ComponentError::component(
                     "dfs-migration",
@@ -1786,12 +1793,17 @@ fn shared_runtime(
         namespace_work: Arc::new(Mutex::new(BTreeMap::new())),
         content_plan_contexts: Arc::new(Mutex::new(Default::default())),
         retained_plan_file: Arc::new(Default::default()),
+        count_stages: Arc::new(Mutex::new(BTreeMap::new())),
         source_verifiers: Arc::new(Mutex::new(BTreeMap::new())),
     });
-    let value = Arc::new(MigrationRuntime {
-        metadata: Arc::new(MetadataConverter::with_authority(authority.clone())),
+    let metadata_authority: Arc<dyn MetadataImportAuthority> = source_authority.unwrap_or_else(|| authority.clone());
+    let value = Arc::new(MigrationOwner {
+        source_kind,
+        work: owner::new_owner_work(&authority.data_root).map_err(|error| sinomo_module::ComponentError::component("dfs-migration", error))?,
+        metadata: Arc::new(MetadataConverter::with_authority(metadata_authority)),
         authority,
         content: Arc::new(crate::content::ContentConverter::default()),
+        content_v3: Mutex::new(Default::default()),
         local_state: crate::local_state::LocalStateConverter::default(),
         _owner: owner,
         metadata_root: context.data_dir().dfs_dir().join("metadata"),
@@ -1815,215 +1827,51 @@ pub fn staged_import_component_factory()
 /// Built after the component factory has retained its real data-owner lease.
 pub fn storage_preparation_provider(
     context: &sinomo_module::ComponentContext,
+    scope: &mut sinomo_module::ComponentScope,
     lifecycle: tokio::sync::watch::Receiver<bool>,
-) -> std::result::Result<DfsStoragePreparationProvider, sinomo_module::ComponentError> {
+) -> std::result::Result<sinomo_dfs::DfsStoragePreparationProviderBinding, sinomo_module::ComponentError> {
     if !source_effect_host(context) {
-        let owner = sinomo_dfs::runtime_host::retain_component_data_owner(context)
-            .map_err(|e| sinomo_module::ComponentError::component("dfs-migration", e))?;
-        return Ok(Arc::new(move |root, scope, _budget| {
-            let _owner = &owner;
-            if *lifecycle.borrow() || lifecycle.has_changed().is_err() {
-                return Err(error("read-only storage provider lifecycle closed"));
-            }
-            let current = match scope {
-                DfsStoragePreparationScope::Metadata(_) => crate::metadata::current_root(root)?,
-                DfsStoragePreparationScope::MetadataRouting => routing_cache::current(root)?,
-                DfsStoragePreparationScope::Content => crate::content::current(root)?,
-                DfsStoragePreparationScope::LocalState => {
-                    !root.join("mounted-mutation-outbox").exists()
-                        || std::fs::read(root.join("local-state-converted-v8"))
-                            .ok()
-                            .as_deref()
-                            == Some(b"dfs-local-state-converted-v8\n")
+        let held_owner = sinomo_dfs::runtime_host::retain_component_data_owner(context)
+            .map_err(|failure| sinomo_module::ComponentError::component("dfs-migration", failure))?;
+        let data_root = context.data_dir_root().canonicalize()
+            .map_err(|failure| sinomo_module::ComponentError::component("dfs-migration", failure))?;
+        let (changed, readiness) = tokio::sync::watch::channel(0);
+        return Ok(sinomo_dfs::DfsStoragePreparationProviderBinding {
+            provider: Arc::new(move |root, unit, _budget| {
+                let _actual_owner = &held_owner;
+                let _readiness_lifetime = &changed;
+                if *lifecycle.borrow() || lifecycle.has_changed().is_err() {
+                    return Err(error("read-only migration observation lifecycle is closed"));
                 }
-            };
-            Ok(if current {
-                sinomo_dfs::DfsStoragePreparation::Ready
-            } else {
-                sinomo_dfs::DfsStoragePreparation::Pending {
-                    processed_records: 0,
-                }
-            })
-        }));
+                owner::validate_managed_unit(&data_root, root, unit)?;
+                owner::inspect_current_unit(root, unit)
+            }),
+            readiness,
+        });
     }
-    let runtime = shared_runtime(context, lifecycle)?;
-    Ok(Arc::new(move |root, scope, budget| {
-        if *runtime.lifecycle.borrow() || runtime.lifecycle.has_changed().is_err() {
-            return Err(error("storage provider component lifecycle closed"));
-        }
-        if matches!(scope, DfsStoragePreparationScope::LocalState) {
-            // Preparation supplies the physical root, while the original
-            // component context remains the registered runtime identity.
-            let actual =
-                sinomo_core::local::SinomoDataDir::new(&runtime.authority.data_root).dfs_dir();
-            if root != actual {
-                return Err(error(
-                    "local-state preparation changed its actual owner root",
-                ));
-            }
-            return runtime.local_state.prepare(&actual, budget);
-        }
-        if matches!(scope, DfsStoragePreparationScope::MetadataRouting) {
-            let _routing = runtime
-                .routing_cache_lock
-                .lock()
-                .map_err(|_| error("routing cache preparation lock poisoned"))?;
-            runtime.authority.validate_routing_cache_root(root)?;
-            // A current routing representation cannot certify the native
-            // configuration schema consumed before the physical-shard hooks.
-            let configuration = runtime.authority.prepare_configuration_records(budget)?;
-            if matches!(
-                configuration,
-                sinomo_dfs::DfsStoragePreparation::Pending { .. }
-            ) {
-                return Ok(configuration);
-            }
-            if routing_cache::current(root)? {
-                return Ok(sinomo_dfs::DfsStoragePreparation::Ready);
-            }
-            return runtime
-                .authority
-                .prepare_routing_topology_cache(root, budget);
-        }
-        if matches!(scope, DfsStoragePreparationScope::Content) {
-            let actual_dfs_root =
-                sinomo_core::local::SinomoDataDir::new(&runtime.authority.data_root).dfs_dir();
-            if root != actual_dfs_root.join("content") {
-                return Err(error("content preparation changed its actual owner root"));
-            }
-            let local = runtime.local_state.prepare(&actual_dfs_root, budget)?;
-            if matches!(local, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-                return Ok(local);
-            }
-            // Content is a dependency of native metadata import. Its cold-open
-            // cannot re-enter that unfinished metadata/placement controller.
-            // Ready here certifies only the actual content representation.
-            return runtime.content.prepare(root, budget);
-        }
-        if !runtime
-            .configuration_ready
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            let configuration = runtime.authority.prepare_configuration_records(budget)?;
-            if matches!(
-                configuration,
-                sinomo_dfs::DfsStoragePreparation::Pending { .. }
-            ) {
-                return Ok(configuration);
-            }
-            let Some(goals) = runtime.authority.capture_original_placement_goals(budget)? else {
-                return Ok(sinomo_dfs::DfsStoragePreparation::Pending {
-                    processed_records: budget,
-                });
-            };
-            let prepared = runtime.prepare_captured_placement_goals(&goals, budget)?;
-            if matches!(prepared, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-                return Ok(prepared);
-            }
-            let original_sources = match runtime.authority.required_original_metadata_sources() {
-                Ok(sources) => sources,
-                Err(MetadataBackendError::StoragePreparationPending {
-                    processed_records, ..
-                }) => {
-                    return Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records });
-                }
-                Err(error) => return Err(error),
-            };
-            if let Some(original) = original_sources.first() {
-                let dfs_root = runtime
-                    .metadata_root
-                    .parent()
-                    .ok_or_else(|| error("metadata owner has no DFS storage root"))?;
-                let content = runtime.content.prepare(&dfs_root.join("content"), budget)?;
-                if matches!(content, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-                    return Ok(content);
-                }
-                let shard = &original.retiring_shard.shard_id;
-                if Path::new(shard).components().count() != 1
-                    || !matches!(
-                        Path::new(shard).components().next(),
-                        Some(std::path::Component::Normal(_))
-                    )
-                {
-                    return Err(error(
-                        "original configured shard is not an owned path segment",
-                    ));
-                }
-                let destination = runtime.metadata_root.join(shard);
-                let combined = runtime.metadata_root.join("root");
-                let source = if !destination.exists() && combined.exists() {
-                    combined.as_path()
-                } else {
-                    destination.as_path()
-                };
-                return match runtime.metadata.prepare_original_reservation(
-                    &destination,
-                    source,
-                    original,
-                    budget,
-                )? {
-                    sinomo_dfs::DfsStoragePreparation::Pending { processed_records } => {
-                        Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records })
-                    }
-                    sinomo_dfs::DfsStoragePreparation::Ready =>
-                    // Re-read the native reservation set on the next bounded
-                    // call; completion of one scope cannot certify another.
-                    {
-                        Ok(sinomo_dfs::DfsStoragePreparation::Pending {
-                            processed_records: 0,
-                        })
-                    }
-                };
-            }
-            runtime
-                .configuration_ready
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        let dfs_root = runtime
-            .metadata_root
-            .parent()
-            .ok_or_else(|| error("metadata owner has no DFS storage root"))?;
-        let local = runtime.local_state.prepare(dfs_root, budget)?;
-        if matches!(local, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-            return Ok(local);
-        }
-        match scope {
-            DfsStoragePreparationScope::Metadata(shard) => {
-                let content = runtime.content.prepare(&dfs_root.join("content"), budget)?;
-                if matches!(content, sinomo_dfs::DfsStoragePreparation::Pending { .. }) {
-                    return Ok(content);
-                }
-                let combined = runtime.metadata_root.join("root");
-                let source = if root != combined && !root.exists() && combined.exists() {
-                    combined.as_path()
-                } else {
-                    root
-                };
-                // prepare_with_source owns format discovery and verifies the retained
-                // source. A missing destination never proves that history is empty.
-                runtime
-                    .metadata
-                    .prepare_with_source(root, source, shard, budget)
-            }
-            DfsStoragePreparationScope::Content => {
-                unreachable!("handled before metadata preparation")
-            }
-            DfsStoragePreparationScope::MetadataRouting => {
-                unreachable!("handled before physical-shard preparation")
-            }
-            DfsStoragePreparationScope::LocalState => {
-                unreachable!("handled by actual local-state owner")
-            }
-        }
-    }))
+    let owner = shared_owner(context, lifecycle)?;
+    owner.attach(scope).map_err(|error| sinomo_module::ComponentError::component("dfs-migration", error))?;
+    Ok(owner.binding())
 }
 
 /// Explicit epoch-zero local-source conversion. Native one-member runtimes
 /// continue to use `storage_preparation_provider` and real native authority.
 pub fn standalone_storage_preparation_provider(
     context: &sinomo_module::ComponentContext,
-) -> std::result::Result<DfsStoragePreparationProvider, sinomo_module::ComponentError> {
-    standalone::storage_preparation_provider(context)
+    scope: &mut sinomo_module::ComponentScope,
+    lifecycle: tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<sinomo_dfs::DfsStoragePreparationProviderBinding, sinomo_module::ComponentError> {
+    standalone::storage_preparation_provider(context, scope, lifecycle)
+}
+fn storage_preparation_with_source_authority(
+    context: &sinomo_module::ComponentContext,
+    scope: &mut sinomo_module::ComponentScope,
+    lifecycle: tokio::sync::watch::Receiver<bool>,
+    source_authority: Arc<dyn MetadataImportAuthority>,
+) -> std::result::Result<sinomo_dfs::DfsStoragePreparationProviderBinding, sinomo_module::ComponentError> {
+    let owner = shared_owner_with_source_authority(context, lifecycle, Some(source_authority))?;
+    owner.attach(scope).map_err(|failure| sinomo_module::ComponentError::component("dfs-migration", failure))?;
+    Ok(owner.binding())
 }
 
 #[cfg(test)]
@@ -2042,7 +1890,7 @@ mod provider_lifecycle_tests {
         let mount_inject = Arc::clone(&inject);
         let mount_capture = Arc::clone(&captured);
         let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder =
-            Arc::new(move |context, lifecycle| {
+            Arc::new(move |context, component_scope, lifecycle| {
                 // Seed actual original native rows before the cold DFS host exists.
                 // Normal live refresh cannot consume it before its source is captured.
                 if mount_inject.swap(false, Ordering::SeqCst) {
@@ -2157,7 +2005,7 @@ mod provider_lifecycle_tests {
                     assert!(original[1].decode::<DfsFileSystemConfig>().is_err());
                     *mount_capture.lock().unwrap() = Some((original, expected_fs));
                 }
-                storage_preparation_provider(context, lifecycle)
+                storage_preparation_provider(context, component_scope, lifecycle)
             });
         native
             .configure_component_factories(vec![
@@ -2321,6 +2169,20 @@ mod provider_lifecycle_tests {
     }
 
     #[test]
+    fn native_unfinished_v7_candidate_restart_preserves_exact_recovery_evidence() {
+        native_released_namespace_source_reopens_with_browser_budget(
+            true, true, true, false, 0, Some("source-cut.json"), None, false,
+        );
+    }
+
+    #[test]
+    fn native_unfinished_v7_proposal_restart_preserves_exact_recovery_evidence() {
+        native_released_namespace_source_reopens_with_browser_budget(
+            true, true, true, false, 0, Some("import-proposal.json"), None, false,
+        );
+    }
+
+    #[test]
     fn native_certified_root_exchange_fences_retained_bound_backend_and_recovers_cold() {
         native_released_namespace_source_reopens(false, false, false, true);
     }
@@ -2434,6 +2296,71 @@ mod provider_lifecycle_tests {
         );
     }
 
+    /// Mount normally and observe admission of the exact physical unit within
+    /// the same caller deadline. Startup completion can park unrelated work.
+    fn reopen_prepared_metadata_root(
+        native: &mut sinomo_dfs::test_support::DfsTestRuntime,
+        node: sinomo_core::node::NodeId,
+        root: &Path,
+        shard: &sinomo_dfs::DfsMetadataShardId,
+        budget: Option<std::time::Duration>,
+    ) -> std::result::Result<(), String> {
+        if let Some(budget) = budget {
+            let deadline = tokio::time::Instant::now() + budget;
+            native.reopen_node_with_startup_deadline(node.clone(), deadline)?;
+            return wait_prepared_metadata_root(native, &node, root, shard, deadline);
+        }
+        let runtime_root = sinomo_dfs::runtime_host::DfsRuntimePaths::for_host_role(
+            native.data_dir(&node), sinomo_module::ComponentHostRole::Embedded,
+        ).root;
+        // Ordinary reopen starts its five-second completion window after host
+        // setup. Use that existing action boundary, sharing its same deadline
+        // with exact-unit admission and the normal startup-completion check.
+        native.reopen_node_with_startup_action(node, Box::new(move |remaining| {
+            let owner = OWNERS.get().and_then(|owners|
+                owners.lock().ok()?.get(&runtime_root)?.upgrade())
+                .ok_or_else(|| "mounted component has no actual migration owner".to_owned())?;
+            wait_prepared_metadata_owner(&owner, root, shard, tokio::time::Instant::now() + remaining)
+        }))
+    }
+
+    fn wait_prepared_metadata_root(
+        native: &sinomo_dfs::test_support::DfsTestRuntime,
+        node: &sinomo_core::node::NodeId,
+        root: &Path,
+        shard: &sinomo_dfs::DfsMetadataShardId,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), String> {
+        let context = native.component_context(node)?;
+        let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+        wait_prepared_metadata_owner(&owner, root, shard, deadline)
+    }
+
+    fn wait_prepared_metadata_owner(
+        owner: &Arc<MigrationOwner>,
+        root: &Path,
+        shard: &sinomo_dfs::DfsMetadataShardId,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<(), String> {
+        let binding = owner.binding();
+        let mut changed = binding.readiness;
+        block_native(&owner.authority.runtime, async {
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error(format!("exact metadata admission reached original deadline: {}", root.display())));
+                }
+                match (binding.provider)(root, &sinomo_dfs::DfsStoragePreparationScope::Metadata(shard.clone()),
+                    sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET)? {
+                    sinomo_dfs::DfsStoragePreparation::Ready => return Ok::<_, MetadataBackendError>(()),
+                    sinomo_dfs::DfsStoragePreparation::Pending { .. } => {}
+                }
+                tokio::time::timeout_at(deadline, changed.changed()).await
+                    .map_err(|_| error(format!("exact metadata admission reached original deadline: {}", root.display())))?
+                    .map_err(error)?;
+            }
+        }).map_err(|failure| failure.to_string())
+    }
+
     fn native_released_namespace_source_reopens_with_browser_budget(
         omit_source_durability: bool,
         same_version_placement: bool,
@@ -2450,7 +2377,11 @@ mod provider_lifecycle_tests {
             DfsNamespacePathOccupantExpectation, DfsNamespaceTransaction,
             DfsPreparedOperationStatus, test_support::DfsTestRuntime,
         };
-        let name = if lose_lookup_hints && pause_finalization == Some("import-proposal.json") {
+        let name = if interrupt_metadata_confirmation && pause_finalization == Some("source-cut.json") {
+            "native-unfinished-v7-candidate-restart"
+        } else if interrupt_metadata_confirmation && pause_finalization.is_some() {
+            "native-unfinished-v7-proposal-restart"
+        } else if lose_lookup_hints && pause_finalization == Some("import-proposal.json") {
             "native-source-hint-loss-proposal-restart"
         } else if lose_lookup_hints {
             "native-source-hint-loss-candidate-restart"
@@ -2493,70 +2424,47 @@ mod provider_lifecycle_tests {
         let provider_hold = Arc::clone(&hold_checkpoint);
         let provider_checkpoint = Arc::clone(&checkpoint);
         let builder: sinomo_dfs::DfsStoragePreparationProviderBuilder = Arc::new(
-            move |context, lifecycle| {
-                let provider = storage_preparation_provider(context, lifecycle)?;
+            move |context, component_scope, lifecycle| {
+                let binding = storage_preparation_provider(context, component_scope, lifecycle.clone())?;
+                let owner = shared_owner(context, lifecycle)?;
                 let pending = Arc::clone(&observe_pending);
                 let hold = Arc::clone(&provider_hold);
                 let observed = Arc::clone(&provider_checkpoint);
-                Ok(Arc::new(move |root, scope, budget| {
-                    if hold.load(std::sync::atomic::Ordering::SeqCst)
-                        && observed
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .is_some_and(|(actual, _, _)| actual == root)
-                    {
-                        // Negative admission only, after the real provider has
-                        // completed and acknowledged its actual checkpoint.
-                        return Ok(sinomo_dfs::DfsStoragePreparation::Pending {
-                            processed_records: 0,
-                        });
-                    }
-                    let hints_before = if lose_lookup_hints {
-                        match scope {
-                            sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) => Some((
-                                shard,
-                                crate::metadata::source_hint_count_for_test(root, shard)?,
-                            )),
-                            _ => None,
+                let before_hints = Mutex::new(None);
+                owner.metadata.observe_steps_for_test(Arc::new(move |root, shard, budget, progress| {
+                    assert_eq!(budget, sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET);
+                    if progress.is_none() {
+                        if hold.load(std::sync::atomic::Ordering::SeqCst)
+                            && shard.0 == "root"
+                            && let Some(name) = pause_finalization
+                            && let Some(path) = crate::metadata::finalization_checkpoint_for_test(root, shard, name)?
+                        {
+                            let bytes = std::fs::read(&path).unwrap();
+                            *observed.lock().unwrap() = Some((root.to_owned(), path, bytes));
+                            return Err(MetadataBackendError::StoragePreparationPending {
+                                root: root.to_owned(), processed_records: 0,
+                            });
+                        }
+                        if lose_lookup_hints {
+                            *before_hints.lock().unwrap() = Some(crate::metadata::source_hint_count_for_test(root, shard)?);
                         }
                     } else {
-                        None
-                    };
-                    let result = provider(root, scope, budget)?;
-                    if let Some((shard, before)) = hints_before {
-                        let after = crate::metadata::source_hint_count_for_test(root, shard)?;
-                        assert!(
-                            after <= before + budget,
-                            "one preparation call exceeded its hint record budget: {before} -> {after}, budget {budget}"
-                        );
-                    }
-                    if matches!(scope, sinomo_dfs::DfsStoragePreparationScope::Metadata(_)) {
-                        if let sinomo_dfs::DfsStoragePreparation::Pending { processed_records } =
-                            result
-                        {
-                            assert_eq!(budget, sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET);
+                        if lose_lookup_hints {
+                            let before = before_hints.lock().unwrap().take().unwrap();
+                            let after = crate::metadata::source_hint_count_for_test(root, shard)?;
+                            assert!(after <= before + budget,
+                                "one worker step exceeded its hint record budget: {before} -> {after}, budget {budget}");
+                        }
+                        if let Some(sinomo_dfs::DfsStoragePreparation::Pending { processed_records }) = progress {
                             assert!(processed_records <= budget);
                             if processed_records > 0 {
                                 pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                if hold.load(std::sync::atomic::Ordering::SeqCst)
-                                    && let Some(name) = pause_finalization
-                                    && let sinomo_dfs::DfsStoragePreparationScope::Metadata(shard) =
-                                        scope
-                                    && let Some(path) =
-                                        crate::metadata::finalization_checkpoint_for_test(
-                                            root, shard, name,
-                                        )?
-                                {
-                                    let bytes = std::fs::read(&path).unwrap();
-                                    *observed.lock().unwrap() =
-                                        Some((root.to_owned(), path, bytes));
-                                }
                             }
                         }
                     }
-                    Ok(result)
-                }))
+                    Ok(())
+                }));
+                Ok(binding)
             },
         );
         native
@@ -2763,7 +2671,7 @@ mod provider_lifecycle_tests {
             &root,
         )
         .unwrap();
-        let snapshot = observed.export_table_snapshot();
+        let snapshot = observed.export_table_snapshot().unwrap();
         if additional_source_files > 0 {
             assert!(snapshot.tables.objects.len() >= additional_source_files);
             assert!(snapshot.tables.versions.len() >= additional_source_files);
@@ -3261,7 +3169,7 @@ mod provider_lifecycle_tests {
         });
         if retained_root_exchange {
             assert!(
-                native.reopen_node(node.clone()).is_err(),
+                reopen_prepared_metadata_root(&mut native, node.clone(), &root, &DfsMetadataShardId::new("root"), None).is_err(),
                 "unfinished genuine installation cannot be Ready"
             );
             assert!(exchange_facts.lock().unwrap().published_seen);
@@ -3286,8 +3194,9 @@ mod provider_lifecycle_tests {
             eprintln!("PRODUCTION_SHAPE_SOURCE records={records} files={additional_source_files}");
         }
         let mut lost_hints = None;
+        let mut retained_v7_evidence = Vec::new();
         let retained_checkpoint = if pause_finalization.is_some() {
-            let blocked = native.reopen_node(node.clone());
+            let blocked = reopen_prepared_metadata_root(&mut native, node.clone(), &root, &DfsMetadataShardId::new("root"), None);
             assert!(
                 blocked.is_err(),
                 "a checkpoint alone cannot make native storage ready"
@@ -3298,6 +3207,19 @@ mod provider_lifecycle_tests {
                 .clone()
                 .expect("real provider reached the selected durable checkpoint");
             assert_eq!(actual_root, root);
+            if let Some(original) = &interrupted_record {
+                for name in ["captured-unit.json", "captured-v7-recovery.json"] {
+                    let file = path.parent().unwrap().join(name);
+                    retained_v7_evidence.push((file.clone(), std::fs::read(file).unwrap()));
+                }
+                let (base_path, base_bytes) = &retained_v7_evidence[0];
+                let mut captured: crate::metadata::canonical_generation::CapturedMetadataUnit =
+                    serde_json::from_slice(base_bytes).unwrap();
+                assert!(captured.has_unresolved_work(), "old capture stays an explicit unresolved source");
+                captured.load_recovery_evidence(base_path).unwrap();
+                assert_eq!(captured.recovery_preparations(), std::slice::from_ref(original));
+                assert!(!captured.has_unresolved_work());
+            }
             assert!(!crate::metadata::current_root(&root).unwrap());
             let competing = std::fs::OpenOptions::new()
                 .read(true)
@@ -3314,6 +3236,12 @@ mod provider_lifecycle_tests {
             drop(competing);
             native.stop_node(&node).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            if interrupt_metadata_confirmation && pause_finalization == Some("source-cut.json") {
+                let recovery = path.parent().unwrap().join("captured-v7-recovery.json");
+                std::fs::rename(&recovery, path.parent().unwrap().join("retained-v7-recovery-loss-copy.json")).unwrap();
+                assert!(!recovery.exists(), "cold replay must re-earn evidence from the original source");
+            }
+
             if lose_lookup_hints {
                 let hints = path.parent().unwrap().join("source-version-evidence");
                 let saved = path
@@ -3342,15 +3270,11 @@ mod provider_lifecycle_tests {
         } else {
             None
         };
+        let recovery_capture = (additional_source_files > 0).then(||
+            sinomo_dfs::test_support::capture_metadata_operation_boundaries(native.data_dir(&node).root()));
         let recovery_started = std::time::Instant::now();
-        let recovered = if let Some(budget) = production_browser_budget {
-            native.reopen_node_with_startup_deadline(
-                node.clone(),
-                tokio::time::Instant::now() + budget,
-            )
-        } else {
-            native.reopen_node(node.clone())
-        };
+        let recovered = reopen_prepared_metadata_root(&mut native, node.clone(), &root,
+            &DfsMetadataShardId::new("root"), production_browser_budget);
         eprintln!(
             "NATIVE_METADATA_RECOVERY files={additional_source_files} elapsed_ms={} result={recovered:?}",
             recovery_started.elapsed().as_millis()
@@ -3366,6 +3290,10 @@ mod provider_lifecycle_tests {
                 "original browser completion deadline"
             );
         }
+        if recovered.is_err() && let Some(capture) = &recovery_capture {
+            capture.checkpoint("metadata-recovery-deadline");
+        }
+        drop(recovery_capture);
         recovered.expect("normal cold Main and real MIG provider must admit the released source");
         if let Some((hints, original)) = lost_hints {
             for (name, bytes) in original {
@@ -3382,6 +3310,9 @@ mod provider_lifecycle_tests {
                 original,
                 "restart must preserve the exact checkpoint and original native request identities"
             );
+        }
+        for (file, bytes) in &retained_v7_evidence {
+            assert_eq!(&std::fs::read(file).unwrap(), bytes, "restart changes original V7 recovery evidence");
         }
         assert!(crate::metadata::current_root(&root).unwrap());
         let current = native.root_shard().unwrap();
@@ -3441,17 +3372,21 @@ mod provider_lifecycle_tests {
                 }
             }
         }
-        let imported = owner
-            .metadata_backend()
-            .unwrap()
-            .prepared_operation_record(operation)
-            .unwrap()
-            .unwrap();
-        assert_eq!(imported.status, DfsPreparedOperationStatus::Aborted);
-        assert_eq!(imported.payload.expected_object_versions, expected_objects);
-        assert_eq!(imported.payload.expected_path_occupants, expected_paths);
-        assert!(imported.payload.completed_request.is_none());
-        assert!(imported.payload.completed_request_completion.is_none());
+        // The original seven-field body remains opaque source DATA. It must
+        // not become an executable current prepare or a relabelled V7 receipt.
+        let captured: crate::metadata::canonical_generation::CapturedMetadataUnit =
+            serde_json::from_slice(&std::fs::read(
+                crate::metadata::namespace_count_plan_root(&root, &DfsMetadataShardId::new("root"))
+                    .unwrap().parent().unwrap().join("captured-unit.json")
+            ).unwrap()).unwrap();
+        captured.verify_retained_source_at(&retained).unwrap();
+        assert!(captured.original_outcomes.iter().any(|outcome|
+            outcome.original_id == operation
+                && outcome.original_digest.as_deref() == Some(original_digest.as_str())
+                && outcome.original_status == "aborted"));
+        assert!(owner.metadata_backend().unwrap().prepared_operation_record(operation).unwrap().is_none());
+        assert!(!captured.proven_v7_terminals.iter().any(|record| record.digest.operation_id == operation));
+        assert!(marker["source_cut"]["pending_operations"].as_array().unwrap().is_empty());
         if omit_source_durability {
             let snapshot = owner
                 .metadata_backend()
@@ -3462,45 +3397,11 @@ mod provider_lifecycle_tests {
                 assert_eq!(snapshot.tables.intents, original_intents);
                 assert_eq!(snapshot.tables.intent_receipts, original_intent_receipts);
                 for original in &original_fenced {
-                    let current = snapshot
-                        .tables
-                        .prepared_operations_v7
-                        .iter()
-                        .find(|row| row.digest.operation_id == original.digest.operation_id)
-                        .unwrap();
-                    current.validate().unwrap();
-                    assert_eq!(
-                        current.payload.expected_journal_sequence.unwrap() + 1,
-                        current.digest.prepare_sequence
-                    );
-                    assert_ne!(
-                        current.payload.expected_journal_sequence,
-                        original.payload.expected_journal_sequence
-                    );
-                    let mapping = marker["source_cut"]["pending_operations"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|row| {
-                            row["source_operation_digest"] == original.digest.payload_digest
-                        })
-                        .unwrap();
-                    assert_eq!(
-                        mapping["source_prepare_sequence"],
-                        original.digest.prepare_sequence
-                    );
-                    assert_eq!(
-                        mapping["source_payload"],
-                        serde_json::to_value(original.payload.as_ref()).unwrap()
-                    );
-                    assert_eq!(
-                        mapping["payload"],
-                        serde_json::to_value(current.payload.as_ref()).unwrap()
-                    );
-                    assert_eq!(
-                        mapping["current_digest"],
-                        serde_json::to_value(&current.digest).unwrap()
-                    );
+                    assert!(!snapshot.tables.prepared_operations_v7.iter()
+                        .any(|row| row.digest.operation_id == original.digest.operation_id));
+                    let terminal = snapshot.tables.prepared_operation_evictions.iter()
+                        .find(|row| row.digest.operation_id == original.digest.operation_id).unwrap();
+                    assert_eq!(terminal, &sinomo_dfs::DfsPreparedOperationEviction::from_terminal_record(original).unwrap());
                 }
             }
             let version = snapshot
@@ -3630,7 +3531,7 @@ mod provider_lifecycle_tests {
             drop(actual);
         }
         if let Some(original) = &interrupted_record {
-            let recovered = native.metadata_primary_service(path).unwrap();
+            let mut recovered = native.metadata_primary_service(path).unwrap();
             let actual = recovered
                 .metadata_backend()
                 .unwrap()
@@ -3639,6 +3540,7 @@ mod provider_lifecycle_tests {
                 .unwrap();
             assert_eq!(actual.status, DfsPreparedOperationStatus::Superseded);
             assert_eq!(actual.payload, original.payload);
+            assert_eq!(actual.digest, original.digest);
             let recovery_id = format!("recover:{}:{}", original.digest.operation_id, current.epoch);
             let replacement = recovered
                 .metadata_backend()
@@ -3651,6 +3553,18 @@ mod provider_lifecycle_tests {
                 matches!(effect, sinomo_dfs::DfsPreparedMetadataEffect::ResolvePreparedOperation {digest,status}
                     if digest == &actual.digest && *status == DfsPreparedOperationStatus::Superseded)));
             assert_eq!(replacement.status, DfsPreparedOperationStatus::Committed);
+            assert!(replacement.committed_entry.is_some(), "actual guarded native successor commit");
+            let backend = recovered.metadata_backend_mut().unwrap();
+            let shard = DfsMetadataShardId::new(&current.shard_id);
+            let held = backend.native_held_snapshot_for_scope(&current.file_system_id, &shard).unwrap();
+            assert_eq!(held.backend_instance_authority_epoch, Some(current.epoch));
+            let before = backend.metadata_prefix_proof(&shard).unwrap();
+            assert!(backend.prepare_operation((*original.payload).clone(), None).is_err(),
+                "old epoch cannot author its inherited body");
+            assert!(backend.publication_writer_session(&current.file_system_id, &shard,
+                &original.digest, None, None, None, None).is_err(),
+                "old epoch cannot acquire publication custody for the inherited digest");
+            assert_eq!(backend.metadata_prefix_proof(&shard).unwrap(), before);
         }
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), after);
         drop(client);
@@ -3899,15 +3813,17 @@ mod provider_lifecycle_tests {
             })
             .unwrap();
         let forwarding_start = native.rpc_observations().len();
-        // First earn a real ROOT import/archive marker using the existing plain
-        // released-source fixture contract. No marker or native receipt is made.
-        native.stop_node(&primary).unwrap();
+        // Model the complete stopped source set before its single filesystem
+        // transition. Each original physical clock and native tree is retained.
+        for node in &nodes {
+            native.stop_node(node).unwrap();
+        }
         let runtime = native.runtime_handle();
         let entered = runtime.enter();
         let backend =
             sinomo_dfs::LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root_path)
                 .unwrap();
-        let root_snapshot = backend.export_table_snapshot();
+        let root_snapshot = backend.export_table_snapshot().unwrap();
         assert_eq!(
             backend.journal_last_sequence(),
             root_snapshot.materialized_through_sequence
@@ -3991,92 +3907,14 @@ mod provider_lifecycle_tests {
             &original_root_floors,
         )
         .unwrap();
-        native.reopen_node(primary.clone()).unwrap();
-        let root_marker: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root_path.join("metadata-import-v7.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(root_marker["installation_complete"].as_bool().unwrap());
-        let retained_root = PathBuf::from(root_marker["retained_source_root"].as_str().unwrap());
-        drop(request_observer);
-        let original_request = submitted_stage
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("actual ordinary stage submission");
-        let (root_plan, _) = crate::metadata::retained_native_import_plan(
-            &root_path,
-            &fs,
-            &DfsMetadataShardId::new("root"),
-            root_marker["authority_binding"].as_str().unwrap(),
-        )
-        .unwrap()
-        .expect("qualified installed original ROOT plan");
-        assert_eq!(root_plan.stage_request, original_request);
-        let observe_stage = |native: &sinomo_dfs::test_support::DfsTestRuntime| {
-            let context = native.component_context(&primary).unwrap();
-            let actual = placement_work::native_tests::canonical_migration_runtime(&context);
-            let outcome = block_native(
-                &actual.authority.runtime,
-                actual
-                    .authority
-                    .cluster()
-                    .unwrap()
-                    .kv_request_outcome_authoritative_async(original_request.request_id.clone()),
-            )
-            .unwrap();
-            sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
-            current_authority(&outcome.authority).unwrap();
-            let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
-                panic!("ordinary forwarded stage must retain its actual native receipt")
-            };
-            NativeImportAuthority::validate_original_command_preimage(
-                &original_request,
-                &primary,
-                &root_plan.captured_entries,
-                &record.command_digest,
-            )
-            .unwrap();
-            record
-        };
-        let original_record = observe_stage(&native);
-        assert_ne!(
-            original_record.command_digest,
-            sinomo_core::kv::kv_command_digest(&KvCommand::Txn(original_request.txn.clone()))
-                .unwrap(),
-            "normal Remote ingress must preserve its exact physical authorization suffix"
-        );
-        assert!(
-            native.rpc_observations()[forwarding_start..]
-                .iter()
-                .any(|call| call.source == primary
-                    && call.target == nodes[0]
-                    && call.route == sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
-                    && call.phase == sinomo_dfs::test_support::DfsTestRpcPhase::Completed),
-            "actual existing Hosted route must carry the ordinary forwarded stage"
-        );
-        assert_eq!(
-            std::fs::read(retained_root.join("records/tables/snapshot.sobj")).unwrap(),
-            root_source_bytes
-        );
-        assert!(native.root_shard().unwrap().epoch > root_assignment.epoch);
 
         // Model released3 DATA on the actual USERS primary and one genuine
         // receiving replica. The primary keeps every actual ACK anchor/absence;
         // the receiver models the released height-only authority representation.
         // All original current trees remain intact in separate baselines.
-        let users = native
-            .metadata_shards()
-            .unwrap()
-            .into_iter()
-            .find(|cfg| cfg.shard_id == scope)
-            .unwrap();
         let source_primary = users.primary_node_id.clone();
         assert_ne!(source_primary, primary);
         assert!(users.replica_node_ids.contains(&primary));
-        for node in &nodes {
-            native.stop_node(node).unwrap();
-        }
         let mut modeled = Vec::new();
         let mut receiver_checkpoint = None;
         for node in [&source_primary, &primary] {
@@ -4087,7 +3925,7 @@ mod provider_lifecycle_tests {
                 &users_path,
             )
             .unwrap();
-            let snapshot = backend.export_table_snapshot();
+            let snapshot = backend.export_table_snapshot().unwrap();
             let image = backend.export_snapshot_image().unwrap();
             assert_eq!(
                 backend.journal_last_sequence(),
@@ -4236,8 +4074,8 @@ mod provider_lifecycle_tests {
             })
             .collect::<Vec<_>>();
         if miss_peer_stage {
-            // Model the retained two-member activation proof using only a
-            // negative fault in the actual third participant's stage RPC.
+            // Withhold one real participant's stage. The native two-of-three
+            // proof remains valid; that replica must later catch up normally.
             native.install_fault(sinomo_dfs::test_support::DfsTestFaultRule {
                 source: Some(source_primary.clone()),
                 target: Some(nodes[2].clone()),
@@ -4250,7 +4088,91 @@ mod provider_lifecycle_tests {
         }
         // The existing public whole-roster start mounts every stopped component
         // before normal preparation; its KV bootstrap is already complete.
-        native.start_nodes().unwrap();
+        let admission_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        native.start_nodes().unwrap_or_else(|failure| {
+            let states = nodes.iter().map(|node| {
+                let context = native.component_context(node).unwrap();
+                let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+                format!("{node}: {}", owner.diagnostic_scheduler())
+            }).collect::<Vec<_>>();
+            panic!("{failure}; migration states: {states:?}");
+        });
+        for node in &nodes {
+            for shard in ["root", "services", "users"] {
+                wait_prepared_metadata_root(&native, node,
+                    &native.data_dir(node).dfs_dir().join("metadata").join(shard),
+                    &DfsMetadataShardId::new(shard), admission_deadline).unwrap();
+            }
+        }
+        let root_marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root_path.join("metadata-import-v7.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(root_marker["installation_complete"].as_bool().unwrap());
+        let retained_root = PathBuf::from(root_marker["retained_source_root"].as_str().unwrap());
+        drop(request_observer);
+        let original_request = submitted_stage
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actual ordinary stage submission");
+        let (root_plan, _) = crate::metadata::retained_native_import_plan(
+            &root_path,
+            &fs,
+            &DfsMetadataShardId::new("root"),
+            root_marker["authority_binding"].as_str().unwrap(),
+        )
+        .unwrap()
+        .expect("qualified installed original ROOT plan");
+        assert_eq!(root_plan.stage_request, original_request);
+        let observe_stage = |native: &sinomo_dfs::test_support::DfsTestRuntime| {
+            let context = native.component_context(&primary).unwrap();
+            let actual = placement_work::native_tests::canonical_migration_runtime(&context);
+            let outcome = block_native(
+                &actual.authority.runtime,
+                actual
+                    .authority
+                    .cluster()
+                    .unwrap()
+                    .kv_request_outcome_authoritative_async(original_request.request_id.clone()),
+            )
+            .unwrap();
+            sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome).unwrap();
+            current_authority(&outcome.authority).unwrap();
+            let sinomo_core::kv::KvRequestOutcome::Committed(record) = outcome.outcome else {
+                panic!("ordinary forwarded stage must retain its actual native receipt")
+            };
+            NativeImportAuthority::validate_original_command_preimage(
+                &original_request,
+                &primary,
+                &root_plan.captured_entries,
+                &record.command_digest,
+            )
+            .unwrap();
+            record
+        };
+        let original_record = observe_stage(&native);
+        assert_ne!(
+            original_record.command_digest,
+            sinomo_core::kv::kv_command_digest(&KvCommand::Txn(original_request.txn.clone()))
+                .unwrap(),
+            "normal Remote ingress must preserve its exact physical authorization suffix"
+        );
+        assert!(
+            native.rpc_observations()[forwarding_start..]
+                .iter()
+                .any(|call| call.source == primary
+                    && call.target == nodes[0]
+                    && call.route == sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
+                    && call.phase == sinomo_dfs::test_support::DfsTestRpcPhase::Completed),
+            "actual existing Hosted route must carry the ordinary forwarded stage"
+        );
+        assert_eq!(
+            std::fs::read(retained_root.join("records/tables/snapshot.sobj")).unwrap(),
+            root_source_bytes
+        );
+        assert!(native.root_shard().unwrap().epoch > root_assignment.epoch);
+
         if miss_peer_stage {
             native.clear_faults();
             let context = native.component_context(&source_primary).unwrap();
@@ -4261,6 +4183,10 @@ mod provider_lifecycle_tests {
                 entries[0].entry.as_ref().unwrap().decode().unwrap();
             assert_eq!(proof.acknowledged_node_ids.len(), 2);
             assert!(!proof.acknowledged_node_ids.contains(&nodes[2]));
+            assert!(native.rpc_observations().iter().any(|call|
+                call.source == source_primary && call.target == nodes[2]
+                    && call.route == staged_service::SNAPSHOT_ROUTE
+                    && call.outcome_error.is_some()), "the third participant actually missed a stage");
             sinomo_dfs::test_support::record_metadata_operation_boundary(
                 &native.data_dir(&source_primary).root(),
                 "controlled-missed-stage-activation",
@@ -4600,13 +4526,14 @@ mod provider_lifecycle_tests {
                 .unwrap();
         native.start_nodes().unwrap();
         let context = native.component_context(&node).unwrap();
-        let scope = sinomo_module::ComponentScope::new(sinomo_module::ComponentDescriptor::new(
+        let mut scope = sinomo_module::ComponentScope::new(sinomo_module::ComponentDescriptor::new(
             "migration-aliased-provider",
             "1",
         ));
-        let runtime = shared_runtime(&context, scope.shutdown_receiver()).unwrap();
+        let runtime = shared_owner(&context, scope.shutdown_receiver()).unwrap();
         assert_ne!(runtime.authority.data_root, context.data_dir_root());
-        let provider = storage_preparation_provider(&context, scope.shutdown_receiver()).unwrap();
+        let lifecycle = scope.shutdown_receiver();
+        let provider = storage_preparation_provider(&context, &mut scope, lifecycle).unwrap().provider;
         let physical = context.data_dir().dfs_dir().canonicalize().unwrap();
         for _ in 0..4096 {
             if provider(&physical, &DfsStoragePreparationScope::LocalState, 4).unwrap()
@@ -4676,7 +4603,7 @@ mod provider_lifecycle_tests {
             "malformed-permit-source-control",
             "1",
         ));
-        let runtime = shared_runtime(&context, scope.shutdown_receiver()).unwrap();
+        let runtime = shared_owner(&context, scope.shutdown_receiver()).unwrap();
         let cluster = sinomo_core::cluster::read_cluster_state_without_kv(
             &sinomo_core::network::ClusterPaths::new(&data_dir),
         )
@@ -4773,7 +4700,7 @@ mod provider_lifecycle_tests {
         let first_scope = sinomo_module::ComponentScope::new(
             sinomo_module::ComponentDescriptor::new("native-terminal-placement-source", "1"),
         );
-        let first = shared_runtime(&context, first_scope.shutdown_receiver()).unwrap();
+        let first = shared_owner(&context, first_scope.shutdown_receiver()).unwrap();
         let fs = sinomo_dfs::sifs_file_system_id();
         let keys = (0..COUNT)
             .map(|index| {
@@ -4867,7 +4794,7 @@ mod provider_lifecycle_tests {
         let second_scope = sinomo_module::ComponentScope::new(
             sinomo_module::ComponentDescriptor::new("native-terminal-placement-source", "1"),
         );
-        let second = shared_runtime(&context, second_scope.shutdown_receiver()).unwrap();
+        let second = shared_owner(&context, second_scope.shutdown_receiver()).unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(
             Arc::ptr_eq(&actual_owner, &second._owner),
@@ -4989,29 +4916,30 @@ mod provider_lifecycle_tests {
             sinomo_dfs::test_support::DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
         native.start_nodes().unwrap();
         let data_dir = native.data_dir(&nodes[0]).clone();
-        let context = sinomo_module::ComponentContext::new(Arc::new(data_dir.clone()))
-            .with_host_role(sinomo_module::ComponentHostRole::Embedded)
-            .with_runtime(native.runtime_handle());
-        let first_scope = sinomo_module::ComponentScope::new(
+        let context = native.component_context(&nodes[0]).unwrap();
+        let mut first_scope = sinomo_module::ComponentScope::new(
             sinomo_module::ComponentDescriptor::new("native-provider-lifecycle-control", "1"),
         );
         let first_watch = first_scope.shutdown_receiver();
-        let first = shared_runtime(&context, first_watch.clone()).unwrap();
-        let provider = storage_preparation_provider(&context, first_watch.clone()).unwrap();
+        let first = shared_owner(&context, first_watch.clone()).unwrap();
+        assert!(!first.configuration_ready.load(std::sync::atomic::Ordering::Acquire));
+        let binding = storage_preparation_provider(&context, &mut first_scope, first_watch.clone()).unwrap();
+        let provider = binding.provider;
+        let mut changed = binding.readiness;
         assert!(Arc::ptr_eq(
             &first,
-            &shared_runtime(&context, first_watch.clone()).unwrap()
+            &shared_owner(&context, first_watch.clone()).unwrap()
         ));
         let unrelated_scope = sinomo_module::ComponentScope::new(
             sinomo_module::ComponentDescriptor::new("unrelated-provider-lifecycle", "1"),
         );
         assert!(
-            shared_runtime(&context, unrelated_scope.shutdown_receiver()).is_err(),
+            shared_owner(&context, unrelated_scope.shutdown_receiver()).is_err(),
             "another open scope must not replace the actual owner's live controller"
         );
         assert!(Arc::ptr_eq(
             &first,
-            &shared_runtime(&context, first_watch.clone()).unwrap()
+            &shared_owner(&context, first_watch.clone()).unwrap()
         ));
         drop(unrelated_scope);
         let content_deadline =
@@ -5031,21 +4959,25 @@ mod provider_lifecycle_tests {
                 sinomo_dfs::DfsStoragePreparation::Ready => break,
                 sinomo_dfs::DfsStoragePreparation::Pending { processed_records } => {
                     assert!(processed_records <= 256);
-                    assert!(
-                        !first
-                            .configuration_ready
-                            .load(std::sync::atomic::Ordering::Acquire),
-                        "bounded actual Content continuation does not certify metadata"
-                    );
+
                 }
             }
         }
-        assert!(
-            !first
-                .configuration_ready
-                .load(std::sync::atomic::Ordering::Acquire),
-            "actual Content readiness does not certify metadata/configuration",
-        );
+        // The independent owner may have normalized configuration while
+        // content was requested. Only its routing continuation certifies that
+        // readiness, and a new component lifetime must qualify it again.
+        block_native(&native.runtime_handle(), async {
+            let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            loop {
+                if provider(&data_dir.dfs_dir().join("metadata"),
+                    &DfsStoragePreparationScope::MetadataRouting, 256)?
+                    == sinomo_dfs::DfsStoragePreparation::Ready { break; }
+                tokio::time::timeout_at(deadline, changed.changed()).await
+                    .map_err(|_| error("owned routing configuration did not become ready"))?
+                    .map_err(error)?;
+            }
+            Ok::<_, MetadataBackendError>(())
+        }).unwrap();
         assert_eq!(
             provider(
                 &data_dir.dfs_dir().join("metadata/root"),
@@ -5074,7 +5006,7 @@ mod provider_lifecycle_tests {
         let second_scope = sinomo_module::ComponentScope::new(
             sinomo_module::ComponentDescriptor::new("native-provider-lifecycle-control", "1"),
         );
-        let second = shared_runtime(&context, second_scope.shutdown_receiver()).unwrap();
+        let second = shared_owner(&context, second_scope.shutdown_receiver()).unwrap();
         assert!(
             Arc::ptr_eq(&actual_owner, &second._owner),
             "the control retains the SAME real native owner FD"
@@ -5086,7 +5018,7 @@ mod provider_lifecycle_tests {
                 .configuration_ready
                 .load(std::sync::atomic::Ordering::Acquire)
         );
-        assert!(shared_runtime(&context, first_watch).is_err());
+        assert!(shared_owner(&context, first_watch).is_err());
         drop(second_scope);
         drop(provider);
         drop(second);

@@ -1098,17 +1098,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(NamespaceTransactionApplyError::from)
     }
 
-    pub fn add_file_system(&mut self, file_system: DfsFileSystem) -> Result<(), DfsError> {
+    pub fn add_file_system(&mut self, mut file_system: DfsFileSystem) -> Result<(), DfsError> {
         let mut scopes = Vec::new();
         if let Some(kv) = self.control_plane.as_mut() {
             let mut store = DfsControlPlaneStore::new(kv.as_mut());
+            let current = store.get_file_system_config(&file_system.file_system_id)?;
+            let activation = current.as_ref().and_then(|config| config.metadata_storage.clone());
+            if file_system.metadata_storage.as_ref().is_some_and(|claimed| Some(claimed) != activation.as_ref()) {
+                return Err(DfsError::Metadata { message: "ordinary filesystem publication cannot author metadata storage generation".into() });
+            }
+            file_system.metadata_storage = activation;
+            file_system.catalog_generation = current.as_ref().map_or(0, |config| config.catalog_generation);
             let config = DfsFileSystemConfig::from(&file_system);
-            if store
-                .get_file_system_config(&file_system.file_system_id)?
-                .as_ref()
-                .is_none_or(|current| {
-                    !crate::placement::dfs_file_system_config_semantically_eq(current, &config)
-                })
+            if current.as_ref().is_none_or(|current| {
+                !crate::placement::dfs_file_system_config_semantically_eq(current, &config)
+            })
             {
                 store.put_file_system_config(&config)?;
             }
@@ -1123,6 +1127,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         } else {
+            let activation = self.metadata.filesystems.get(&file_system.file_system_id)
+                .and_then(|current| current.metadata_storage.clone());
+            if file_system.metadata_storage.as_ref().is_some_and(|claimed| Some(claimed) != activation.as_ref()) {
+                return Err(DfsError::Metadata { message: "ordinary filesystem publication cannot author metadata storage generation".into() });
+            }
+            file_system.metadata_storage = activation;
+            file_system.catalog_generation = self.metadata.filesystems.get(&file_system.file_system_id)
+                .map_or(0, |current| current.catalog_generation);
             scopes.push(DfsPreparedOperationScope {
                 file_system_id: file_system.file_system_id.clone(),
                 shard_id: self.local_prepared_operation_shard()?,
@@ -2983,6 +2995,9 @@ mod filesystem_preparation_recovery_tests {
         // Hold the actual producer admission while arranging the receiver cut;
         // the normal replica sender and receiver still establish every ACK.
         let execution = source.acquire_prepared_execution(&scope).unwrap();
+        let receiver_head = crate::DfsMetadataBackend::metadata_prefix_proof(
+            &native.node_metadata(&receiver).unwrap(), &shard_id,
+        ).unwrap().unwrap().journal_sequence;
         native.stop_node(&receiver).unwrap();
         let mut originals = Vec::new();
         for index in 0..2 {
@@ -3036,7 +3051,7 @@ mod filesystem_preparation_recovery_tests {
             &shard.file_system_id,
             shard.epoch,
             &shard_id,
-            0,
+            receiver_head,
             &mut replication,
             crate::DfsMetadataJournalReplicationOptions::default(),
         )
@@ -3121,6 +3136,13 @@ mod filesystem_preparation_recovery_tests {
             .unwrap();
         drop(initial);
         let mut requested = original.clone();
+        let control = native.shared_control_plane().unwrap();
+        let current = control.with_client(|client| {
+            crate::DfsControlPlaneStore::new(client.as_mut())
+                .get_file_system_config(&shard.file_system_id).unwrap().unwrap()
+        });
+        requested.catalog_generation = current.catalog_generation;
+        requested.metadata_storage = current.metadata_storage;
         requested.display_name = "actual independent filesystem requests".into();
         // Filesystem publication belongs to the store-backed owning service.
         let mut requester = native.metadata_primary_service("/").unwrap();

@@ -2256,6 +2256,9 @@ fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
         ),
         updated_at_unix_nanos: dfs_now_unix_nanos(),
     };
+    let suppressed_root = root.join("suppressed/root");
+    std::fs::create_dir_all(&suppressed_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&suppressed_root, "root");
     let mut host = RecordingMetadataJournalPublisherHost::new(root.join("suppressed"));
 
     let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
@@ -2286,6 +2289,13 @@ fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
         ]
     );
 
+    let changed_root = root.join("epoch-changed/root");
+    std::fs::create_dir_all(&changed_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&changed_root, "root");
+    let mut caught_up = LocalSobjMetadataBackend::new(shard_id.clone(), &changed_root).unwrap();
+    let caught_up_sequence = caught_up.metadata_prefix_proof().unwrap().journal_sequence;
+    caught_up.put_metadata_replication_cursor(&replica, &shard_id, caught_up_sequence).unwrap();
+    drop(caught_up);
     let mut host = RecordingMetadataJournalPublisherHost::new(root.join("epoch-changed"));
     let mut changed_epoch_shard = shard;
     changed_epoch_shard.epoch = 8;
@@ -2310,7 +2320,7 @@ fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
         vec![DfsMetadataJournalReplicationOutcome::NoChanges {
             target_node_id: replica,
             shard_id,
-            after_sequence: 0,
+            after_sequence: caught_up_sequence,
         }]
     );
 
@@ -2323,6 +2333,7 @@ fn clustered_metadata_journal_batch_requires_exact_authority_identity() {
     let replica = NodeId::from_legacy_named("node_meta_identity_replica").expect("replica node id");
     let file_system = file_system(primary.clone());
     let context = DfsMetadataReplicaShardContext {
+        namespace_catalog: None,
         local_node_id: replica.clone(),
         pending_membership_handoff: None,
         write_set: None,
@@ -2424,7 +2435,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
     // Synchronize the existing real prefix before introducing two new hidden
     // operations. Automatic traffic remains paused; explicit calls still use
     // the authenticated native registry and persisted receiver.
-    let mut base_head = 0;
+    let mut base_head = receiver.metadata_prefix_proof().unwrap().journal_sequence;
     loop {
         let backend = source.metadata_backend.as_ref().unwrap();
         let Some(batch) = backend
@@ -2967,7 +2978,7 @@ fn metadata_authority_empty_probe_confirms_only_exact_snapshot_covered_prepare()
             LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &receiver_root)
                 .unwrap();
         receiver.begin_inspection_snapshot().unwrap();
-        let tables = receiver.export_table_snapshot();
+        let tables = receiver.export_table_snapshot().unwrap();
         let authority_floor = receiver.metadata_authority_ack_floor(&shard_id).unwrap();
         let prefix_floor = receiver.metadata_prefix_ack_floor(&shard_id).unwrap();
         let frames = receiver
@@ -3143,6 +3154,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let context = DfsMetadataReplicaShardContext {
+        namespace_catalog: None,
         local_node_id: desired_replica,
         write_set: None,
         shard: retiring_shard.clone(),
@@ -3967,7 +3979,7 @@ fn captured_native_publication_prefix(
     let object = source.get_object(&published.object_id).unwrap().unwrap();
     assert_eq!(object.version, published.version);
     assert_eq!(object.content_hash, published.content_hash);
-    let snapshot = source.export_table_snapshot();
+    let snapshot = source.export_table_snapshot().unwrap();
     assert!(snapshot.prefix_proof.is_well_formed());
     assert_eq!(
         snapshot.prefix_proof.journal_sequence,
@@ -4714,7 +4726,7 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
             &root,
         )
         .unwrap()
-        .export_table_snapshot()
+        .export_table_snapshot().unwrap()
     };
     let before = inspect();
     let openings = before
@@ -5401,4 +5413,229 @@ fn exact_retry_resumes_original_intent_opening_after_restart() {
 #[test]
 fn configured_write_filesystem_retry_preserves_original_publication() {
     check_recovered_original_write(true, true);
+}
+
+#[test]
+fn native_zero_receipt_create_restarts_without_publishing_before_w() {
+    use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule};
+    fn cut(
+        native: &DfsTestRuntime,
+        owner: &NodeId,
+        shard: &DfsMetadataShardConfig,
+    ) -> DfsMetadataTableSnapshot {
+        let root = default_dfs_metadata_shards_root(native.data_dir(owner))
+            .join(crate::metadata_keys::key_segment(&shard.shard_id));
+        let mut backend = LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(&shard.shard_id),
+            root,
+        )
+        .unwrap();
+        backend.begin_inspection_snapshot().unwrap();
+        let result = backend.export_table_snapshot().unwrap();
+        backend.end_inspection_snapshot();
+        result
+    }
+
+    let (mut native, initial, shard) = crate::test_support::current_native_metadata_service(
+        "native-zero-receipt-create-restart",
+        3,
+        "/services",
+    )
+    .unwrap();
+    drop(initial);
+    let primary = shard.primary_node_id.clone();
+    let source = shard.replica_node_ids[0].clone();
+    let destination = shard.replica_node_ids[1].clone();
+    let path = "/services/zero-receipt-create-restart.bin";
+    let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
+    placement.required_node_ids = vec![destination.clone()];
+    placement.forbidden_node_ids = vec![primary.clone(), source.clone()];
+    native
+        .apply_placement_policy(&primary, path, DfsPlacementScope::SelfOnly, placement)
+        .unwrap();
+    native
+        .wait_published_configuration_current(&primary)
+        .unwrap();
+    native
+        .wait_published_configuration_current(&source)
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    gate.close();
+    for route in [
+        crate::DFS_DATA_STAGE_BLOB_ROUTE,
+        crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+    ] {
+        native.install_fault(FaultRule {
+            source: Some(primary.clone()),
+            target: Some(destination.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: FaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
+        });
+    }
+    let mut caller = native.client(&source).unwrap();
+    let (_, _, policy) = caller
+        .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    let bytes = b"the original source is outside W and must survive restart";
+    let original_result = caller.posix_write_file_with_operation_id(
+        path,
+        bytes,
+        DfsWriteOptions {
+            policy,
+            replica_candidates: vec![destination.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: false,
+        },
+        "original-zero-receipt-create",
+    );
+    let before = cut(&native, &primary, &shard);
+    let original = before
+        .tables
+        .intents
+        .iter()
+        .find(|row| {
+            row.object_metadata
+                .as_ref()
+                .is_some_and(|object| object.path == path)
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("native producer omitted its intent: {original_result:?}"));
+    assert_eq!(original.status, DfsWriteIntentStatus::ReceiptsPending);
+    assert!(original.base_version.is_none());
+    assert!(
+        !before
+            .tables
+            .objects
+            .iter()
+            .any(|object| object.object_id == original.object_id)
+    );
+    assert!(
+        !before
+            .tables
+            .receipts
+            .iter()
+            .any(|receipt| receipt.receipt.object_id == original.object_id)
+    );
+    assert_eq!(
+        native
+            .client(&primary)
+            .unwrap()
+            .content()
+            .read_object_version(
+                original.object_id.as_str(),
+                original.target_version.as_str()
+            )
+            .unwrap()
+            .1,
+        bytes
+    );
+    let stage_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    while !native.rpc_observations().iter().any(|call| {
+        call.source == primary
+            && call.target == destination
+            && call.route == crate::DFS_DATA_STAGE_BLOB_ROUTE
+    }) {
+        assert!(
+            Instant::now() < stage_deadline,
+            "the actual pending upload must attempt its selected replica stage: {original_result:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(caller);
+    native.stop_node(&primary).unwrap();
+    native.reopen_node(primary.clone()).unwrap();
+    let mut recovered = native.metadata_primary_service(path).unwrap();
+    recovered.hydrate_from_metadata_backend().unwrap();
+    let restored = recovered
+        .writes
+        .pending_writes
+        .contains_key(&original.intent_id);
+    assert_eq!(
+        recovered
+            .current_object_for_write(&original.object_id)
+            .unwrap()
+            .object_id,
+        original.object_id,
+    );
+    assert!(recovered.metadata().object(&original.object_id).is_none());
+    let cold = cut(&native, &primary, &shard);
+    assert!(
+        !cold
+            .tables
+            .objects
+            .iter()
+            .any(|object| object.object_id == original.object_id)
+    );
+    assert!(
+        !cold
+            .tables
+            .receipts
+            .iter()
+            .any(|receipt| receipt.receipt.object_id == original.object_id)
+    );
+    drop(recovered);
+    let mut replica = native
+        .local_shard_copy_service(&destination, &shard)
+        .unwrap();
+    replica.hydrate_from_metadata_backend().unwrap();
+    assert!(
+        replica
+            .current_object_for_write(&original.object_id)
+            .is_err(),
+        "a replica's matching intent is not write authority"
+    );
+    assert!(replica.metadata().object(&original.object_id).is_none());
+    drop(replica);
+    let mut reader = native.client(&source).unwrap();
+    assert!(
+        reader.posix_stat(path).is_err(),
+        "native clients must not observe the private transfer anchor"
+    );
+    assert!(
+        reader.posix_read_file_distributed(path).is_err(),
+        "zero-receipt create stays invisible"
+    );
+    drop(reader);
+    native.remove_faults_matching(|rule| matches!(&rule.action, FaultAction::PauseBeforeDispatch(actual) if Arc::ptr_eq(actual, &gate)));
+    if !restored {
+        native.close().unwrap();
+        panic!("native hydration dropped the original zero-receipt create before it could fetch W");
+    }
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let state = cut(&native, &primary, &shard);
+        if let Some(object) = state
+            .tables
+            .objects
+            .iter()
+            .find(|object| object.object_id == original.object_id)
+        {
+            assert_eq!(object.version, original.target_version);
+            assert_eq!(object.content_hash, original.content_hash);
+            assert_eq!(object.current_locations, vec![destination.clone()]);
+            let terminal = state
+                .tables
+                .intents
+                .iter()
+                .find(|row| row.intent_id == original.intent_id)
+                .unwrap();
+            assert_eq!(terminal.status, DfsWriteIntentStatus::Committed);
+            assert_eq!(terminal.operation_id, original.operation_id);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original create did not recover after the selected replica became available"
+        );
+        native
+            .maintenance_tick(&primary, deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+    }
+    let mut reader = native.client(&source).unwrap();
+    assert_eq!(reader.posix_read_file_distributed(path).unwrap(), bytes);
+    drop(reader);
+    native.close().unwrap();
 }

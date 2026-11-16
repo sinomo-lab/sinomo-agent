@@ -89,23 +89,52 @@ codec for bounded SOBJ records.
 
 Retained older DFS formats are converted by `sinomo-dfs-migration`, the R1
 component that alone decodes older snapshot, journal, content, and local-state
-representations. Main and Embedded hosts register it as the DFS
-storage-preparation provider before DFS storage opens; Shadow hosts do not
-convert or publish. Each cold open of a metadata shard, the metadata-routing
-representation, the content store, or local state asks the provider to advance
-at most `DFS_STORAGE_PREPARATION_RECORD_BUDGET` (256) records. Unfinished work
-returns `StoragePreparationPending`; the component's initial startup recovery
-resumes it under the same data owner instead of failing the mount.
+representations. Its component-scoped owner runs independently of ordinary DFS
+readiness. Main and Embedded hosts register that owner before DFS storage opens;
+Shadow hosts do not convert or publish.
 
-A contended metadata destination returns `Pending { processed_records: 0 }`
-without waiting on its active preparation session. Physical aliases share one
-stable slot. The current owner retains its source lock, validated cursor and
-checkpoint; another caller cannot replace or advance them. After that turn
-releases the session, callers resume through the same bounded preparation entry
-and must still obtain actual `Ready` before opening storage. Cancellation of a
-waiting caller does not cancel the owner or release source custody. A poisoned
-session is discarded under the same slot before the source can be reacquired;
-reconstruction still validates the last durable checkpoint.
+Background discovery visits every managed storage unit, including cold data.
+An ordinary DFS access to an unavailable unit schedules that same owner's job
+with demand priority and returns `StoragePreparationPending`. Content conversion
+carries one absolute work deadline through enrollment, setup, inspection and
+payload work; it does not restart that deadline with the framework's optional
+`after_preparation` API. Qualified warm state avoids repeating unchanged setup
+barriers, while restart performs the full cold qualification. The callback does
+not perform conversion while a DFS caller holds its storage slot. Background
+and demand work share the original converter checkpoint and source custody;
+they do not maintain separate conversion cursors. Readiness notifications only
+wake callers to recheck their exact unit and generation. A caller's cancellation
+does not cancel the component owner or release its retained source.
+
+The current DFS runtime decodes only current representations. A current content
+root can expose imported immutable versions while its inventory remains pending.
+Already available versions remain readable; unknown versions require the owner
+to establish their presence or absence. Imports preserve newer current bindings
+and tombstones. Garbage collection and reservation reconciliation require
+completed inventory in addition to their existing native catalog and retention
+proofs. Inventory completion alone never authorizes deletion.
+
+Metadata generations bind their exact filesystem, shard, and native origin.
+A private staged generation cannot serve ordinary operations merely because a
+provider reports readiness. Native genesis or certified storage-import
+publication must establish its activation. Shards created after conversion bind
+the active filesystem generation through their original native genesis;
+compacting that prepare body must retain the exact activation evidence. A
+retired pre-conversion root cannot qualify by adopting a newer header.
+A filesystem-wide conversion captures
+the complete authoritative catalog and its monotonic generation before fencing
+writers. Every participant must stage and activate count-aware storage before
+the filesystem releases the transition. Catalog changes cannot race that release;
+partial failure retains the fences and resumes the same transition. Unrelated
+ready storage remains available, and a previously active current-format source
+can remain readable under its retained authority while its writes are fenced.
+
+A contended destination remains pending without waiting on its active
+preparation session. Physical aliases share one stable slot. The owner retains
+its source lock, validated cursor and checkpoint; another caller cannot replace
+them. Poisoned warm state is discarded under that same slot, and reconstruction
+validates the durable checkpoint before resuming. Missing, corrupt, or uncertain
+original work blocks its unit rather than being counted as completed coverage.
 
 Source replay checkpoints one bounded lifecycle batch at a time. Each record
 keeps its original bytes, source point and chained stream digest. The private
@@ -196,12 +225,27 @@ eventual native readiness, unchanged source data and exact checkpoint replay.
 
 The converter retains original source bytes and digests, synchronizes output
 before progress, and discards only an uncheckpointed staging suffix on restart.
-It stages a hidden current candidate. Installation binds the captured source
-cut, current configuration, physical storage ownership, and exact KV
+Its hidden canonical candidate contains current rows and proven compact terminal
+outcomes. Native conversion may also retain exact current V7 preparations for
+count-neutral metadata updates to existing canonical objects that leave their
+content and placement unchanged. These reservations
+keep their original body, digest, slot and epoch. Separately bound recovery
+evidence leaves the original capture unchanged and can be reconstructed only
+from its fenced replay. Native activation must fence the original epoch; the
+existing recovery owner publishes the actual successor and atomically supersedes
+the original. Unsupported namespace, parent, count, content and completion work
+remains a migration blocker. Standalone conversion requires settled originals.
+Original bytes and historical journal frames remain in the source archive;
+conversion never relabels an old protocol body or invents a terminal outcome.
+Installation binds the captured source cut, current configuration, physical
+storage ownership, and exact KV
 comparisons through native authority; standalone stores use explicit local
-ownership evidence. Old reservations, jobs, and proofs remain conversion data
-until current authority establishes their replacements; they never grant
-publication authority.
+ownership evidence. Standalone count initialization also requires complete local
+source coverage under the retained data owner and unique canonical ownership.
+The migration owner must recheck that coverage and the original source identities
+before publication; ambiguous roots cannot supply counts. Old reservations,
+jobs, and proofs remain conversion data until current authority establishes their
+replacements; they never grant publication authority.
 
 The current DFS reader accepts only the current representation, and there is no
 mixed-version writer path: an incompatible daemon must be upgraded before it

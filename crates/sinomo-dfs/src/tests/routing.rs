@@ -356,7 +356,7 @@ fn authoritative_stat_partial_catalog_keeps_its_existing_exact_physical_scope() 
         assert!(!command.include_metadata_journal_batches);
         assert!(command.metadata_journal_after_sequences.is_empty());
         match query.selection {
-            DfsMetadataSelection::StatAtPathV1 { request } if request.path == path => {
+            DfsMetadataSelection::StatAtPathV2 { path: requested } if requested == path => {
                 assert_eq!(query.shard_id, users);
                 exact_scope_reentries += 1;
             }
@@ -370,10 +370,7 @@ fn authoritative_stat_partial_catalog_keeps_its_existing_exact_physical_scope() 
         exact_scope_reentries, 0,
         "a partial catalog must not force an existing exact-shard source back through Main"
     );
-    assert!(
-        foreign_scope_reads > 0,
-        "the same node's different physical root must still use registered Main dispatch"
-    );
+    assert_eq!(foreign_scope_reads, 0, "maintained counts do not open unrelated physical scopes");
     assert!(core.pending_routed_namespace_ops.is_empty());
     assert!(core.transport.operation_deadline().is_none());
     drop(capture);
@@ -382,237 +379,7 @@ fn authoritative_stat_partial_catalog_keeps_its_existing_exact_physical_scope() 
 }
 
 #[test]
-fn authoritative_stat_restarts_changed_cross_owner_view_within_existing_read_budget() {
-    assert_stat_generation_race("canonical-generation", StatGenerationChange::Link, 1, true);
-}
-
-#[test]
-fn authoritative_stat_restarts_only_after_typed_forward_prefix_refusal() {
-    assert_stat_generation_race(
-        "prefix-generation",
-        StatGenerationChange::UnrelatedFile,
-        1,
-        true,
-    );
-}
-
-#[test]
-fn authoritative_stat_continuous_generation_changes_exhaust_original_read_rounds() {
-    assert_stat_generation_race(
-        "generation-round-limit",
-        StatGenerationChange::Mode,
-        crate::posix::POSIX_ROUTED_SYNC_RETRY_ROUNDS,
-        false,
-    );
-}
-
-#[derive(Clone, Copy)]
-enum StatGenerationChange {
-    Link,
-    UnrelatedFile,
-    Mode,
-}
-
-fn assert_stat_generation_race(
-    name: &str,
-    change: StatGenerationChange,
-    changes: usize,
-    ready: bool,
-) {
-    use crate::test_runtime::{FaultAction, FaultRule};
-    use std::sync::Arc;
-
-    let mut cluster = sifs_two_primary_cluster(name);
-    let path = "/users/stat-generation-target";
-    let original = cluster
-        .replica
-        .posix_write_file(
-            path,
-            b"generation-bound stat",
-            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
-        )
-        .unwrap();
-    assert_eq!(original.link_count, 1);
-    let capture = cluster
-        ._runtime
-        .capture_served_work(&cluster.services_primary_node, 32)
-        .unwrap();
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let rounds = crate::posix::POSIX_ROUTED_SYNC_RETRY_ROUNDS;
-    struct Release(Arc<tokio::sync::Semaphore>, usize);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            self.0.add_permits(self.1);
-        }
-    }
-    cluster._runtime.install_fault(FaultRule {
-        source: Some(cluster.replica_node.clone()),
-        target: Some(cluster.services_primary_node.clone()),
-        route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
-        call_id: None,
-        origin: None,
-        remaining_hits: rounds * 2,
-        action: FaultAction::PauseAfterDispatch(Arc::clone(&gate)),
-    });
-    let requester = cluster.replica_node.clone();
-    let mut pages = 0;
-    let mut publications = 0;
-    let result = std::thread::scope(|scope| {
-        // Release on unwind before joining the real blocked read. All fixture
-        // changes use another authenticated client; no reply data is fabricated.
-        let release = Release(Arc::clone(&gate), rounds * 2);
-        let reader = &mut cluster.replica;
-        let read = scope.spawn(move || reader.posix_stat_distributed(path));
-        let mut writer = cluster
-            ._runtime
-            .client(&cluster.users_primary_node)
-            .unwrap();
-        let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-        let mut seen = BTreeSet::new();
-        loop {
-            for record in capture.records() {
-                let DfsNetworkMessage::NamespaceRequest(command) =
-                    record.command.routed_message.message
-                else {
-                    continue;
-                };
-                if command.requesting_node_id != requester
-                    || !seen.insert(command.request_id.clone())
-                {
-                    continue;
-                }
-                assert!(record.succeeded);
-                let DfsNamespaceOperation::MetadataQuery { query } = command.operation else {
-                    panic!("the paused operation must be an actual stat page or fence")
-                };
-                let DfsMetadataSelection::StatProjectionV1 { request } = query.selection else {
-                    panic!("only services-shard projection responses may be paused")
-                };
-                assert_eq!(request.object_id, original.object_id);
-                assert_eq!(request.limit, crate::file_history_query::HISTORY_PAGE_LIMIT);
-                if !request.fence_only {
-                    assert!(request.expected_prefix.is_none() && request.after.is_none());
-                    pages += 1;
-                    assert!(
-                        pages <= rounds,
-                        "stat increased its existing read-round budget"
-                    );
-                    if publications < changes {
-                        let changed_path =
-                            format!("/services/stat-generation-change-{publications}");
-                        match change {
-                            StatGenerationChange::Link => {
-                                writer.posix_hardlink(path, &changed_path).unwrap();
-                            }
-                            StatGenerationChange::Mode => {
-                                // Real canonical publications, with the original
-                                // 32-report observation cap across all four rounds.
-                                writer
-                                    .posix_set_mode(
-                                        path,
-                                        if publications % 2 == 0 { 0o600 } else { 0o640 },
-                                    )
-                                    .unwrap();
-                            }
-                            StatGenerationChange::UnrelatedFile => {
-                                writer
-                                    .posix_write_file(
-                                        &changed_path,
-                                        b"independent publication advances this physical prefix",
-                                        DfsWriteOptions::replicated_eventual(vec![
-                                            cluster.users_primary_node.clone(),
-                                        ]),
-                                    )
-                                    .unwrap();
-                            }
-                        }
-                        publications += 1;
-                    }
-                } else {
-                    assert!(request.expected_prefix.is_some() && request.after.is_none());
-                }
-                gate.add_permits(1);
-            }
-            if read.is_finished() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "native stat collection did not finish"
-            );
-            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
-        }
-        drop(writer);
-        drop(release);
-        read.join().unwrap()
-    });
-    cluster._runtime.assert_fault_budgets().unwrap();
-    cluster._runtime.clear_faults();
-    assert_eq!(publications, changes);
-    assert!(cluster.replica.transport.operation_deadline().is_none());
-    assert!(cluster.replica.pending_routed_namespace_ops.is_empty());
-    assert_eq!(cluster.replica.routed_namespace_settle_depth, 0);
-    let expected_links = 1 + if matches!(change, StatGenerationChange::Link) {
-        changes as u64
-    } else {
-        0
-    };
-    if ready {
-        let stat = result.expect("fresh collection after the native generation changed");
-        assert_eq!(stat.object_id, original.object_id);
-        assert_eq!(stat.content_hash, original.content_hash);
-        assert_eq!(
-            stat.link_count, expected_links,
-            "stale pages never supply the count"
-        );
-        assert!(pages >= 2, "the old collection must be discarded");
-    } else {
-        assert!(
-            matches!(
-                result,
-                Err(DfsPosixError::Dfs(DfsError::MetadataRejection {
-                    code: DfsMetadataRejectionCode::PrefixMismatch,
-                    ..
-                }))
-            ),
-            "continuous changes must fail closed, without a partial stat: {result:?}"
-        );
-        assert_eq!(
-            pages, rounds,
-            "the original four-round bound must be observable"
-        );
-    }
-    assert_eq!(
-        cluster
-            .replica
-            .posix_stat_distributed(path)
-            .unwrap()
-            .link_count,
-        expected_links
-    );
-    if matches!(change, StatGenerationChange::Mode) {
-        cluster.replica.posix_set_mode(path, original.mode).unwrap();
-    } else {
-        for index in 0..changes {
-            cluster
-                .replica
-                .posix_unlink(&format!("/services/stat-generation-change-{index}"))
-                .unwrap();
-        }
-    }
-    assert_eq!(
-        cluster
-            .replica
-            .posix_stat_distributed(path)
-            .unwrap()
-            .link_count,
-        1
-    );
-    cluster.close();
-}
-
-#[test]
-fn authoritative_stat_rejects_same_version_hash_change_on_actual_canonical_page() {
+fn authoritative_no_links_stat_rejects_same_version_hash_change_on_canonical_read() {
     use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
     let mut cluster = sifs_two_primary_cluster("stat-same-version-hash");
     let path = "/users/stat-immutable-content";
@@ -637,7 +404,7 @@ fn authoritative_stat_rejects_same_version_hash_change_on_actual_canonical_page(
             captured: captured.clone(),
         },
     });
-    let result = cluster.replica.posix_stat_distributed(path);
+    let result = cluster.replica.posix_open_beneath_no_links_distributed("/", path);
     let Err(DfsPosixError::Dfs(error)) = result else {
         panic!("same-version hash corruption must not become a fresh-read retry: {result:?}")
     };
@@ -659,10 +426,9 @@ fn authoritative_stat_rejects_same_version_hash_change_on_actual_canonical_page(
     else {
         panic!("missing captured native query")
     };
-    let DfsMetadataQueryResult::StatProjectionV1 { page } = &response.result else {
-        panic!("fault must leave the initial path view intact")
+    let DfsMetadataQueryResult::StatObjectV1 { object: Some(object), .. } = &response.result else {
+        panic!("fault must alter the canonical metadata read after the capability walk")
     };
-    let object = page.object.as_ref().unwrap();
     assert_eq!(object.object_id, original.object_id);
     assert_eq!(object.version, original.version);
     assert_eq!(object.content_hash, original.content_hash);
@@ -792,13 +558,12 @@ fn authoritative_stat_rejects_actual_corrupted_replies_and_restores_deadline() {
         .unwrap();
     for change in [
         StatReplyFault::Unsupported,
-        StatReplyFault::Incomplete,
-        StatReplyFault::WrongRequest,
+        StatReplyFault::MissingCount,
+        StatReplyFault::WrongObjectPath,
         StatReplyFault::WrongEpoch,
         StatReplyFault::WrongSource,
         StatReplyFault::WrongTarget,
-        StatReplyFault::MalformedPrefix,
-        StatReplyFault::StalePrefix,
+        StatReplyFault::InvalidCount,
     ] {
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         cluster._runtime.install_fault(FaultRule {
@@ -1295,7 +1060,7 @@ fn browser_exact_parent_hint_without_replica_cannot_recreate_a_deleted_parent() 
 }
 
 #[test]
-fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
+fn authoritative_stat_counts_cross_shard_alias_without_unrelated_owner_availability() {
     let mut cluster = sifs_two_primary_cluster("stat-cross-shard-outage");
     let path = "/users/stat-cross-target";
     let alias = "/services/stat-cross-alias";
@@ -1308,26 +1073,39 @@ fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
         )
         .unwrap();
     cluster.replica.posix_hardlink(path, alias).unwrap();
-    let before = cluster
-        ._runtime
-        .node_metadata(&cluster.replica_node)
-        .unwrap()
-        .metadata_shard_statuses()
-        .unwrap();
+    // This caller is a real replica, so an earlier hardlink's terminal request
+    // commit may arrive while stat runs. Attribute effects to the actual read
+    // invocations rather than requiring background replication to be quiet.
+    let captures = [&cluster.users_primary_node, &cluster.services_primary_node]
+        .into_iter()
+        .map(|node| cluster._runtime.capture_served_work(node, 32).unwrap())
+        .collect::<Vec<_>>();
     let canonical = cluster.replica.posix_stat_distributed(path).unwrap();
     assert_eq!(canonical.link_count, 2);
     let link = cluster.replica.posix_lstat_distributed(alias).unwrap();
     assert_eq!(link.object_id, canonical.object_id);
     assert_eq!(link.link_count, 2);
-    assert_eq!(
-        before,
-        cluster
-            ._runtime
-            .node_metadata(&cluster.replica_node)
-            .unwrap()
-            .metadata_shard_statuses()
-            .unwrap()
-    );
+    let mut terminal_reads = 0;
+    for capture in &captures {
+        for work in capture.records() {
+            let DfsNetworkMessage::NamespaceRequest(request) =
+                &work.command.routed_message.message else { continue; };
+            if request.requesting_node_id != cluster.replica_node { continue; }
+            let DfsNamespaceOperation::MetadataQuery { query } = &request.operation
+                else { continue; };
+            assert!(work.succeeded);
+            assert!(!work.committed_work.publish_metadata);
+            assert!(!work.committed_work.semantic_changes);
+            assert!(!request.include_metadata_journal_batches);
+            assert!(request.metadata_journal_after_sequences.is_empty());
+            if matches!(&query.selection, DfsMetadataSelection::StatAtPathV2 { path: selected }
+                if selected == path || selected == alias) {
+                terminal_reads += 1;
+            }
+        }
+    }
+    assert!(terminal_reads >= 2, "both actual terminal stat reads were captured");
+    drop(captures);
     cluster.replica.posix_unlink(alias).unwrap();
     assert_eq!(
         cluster
@@ -1345,9 +1123,10 @@ fn authoritative_stat_counts_cross_shard_alias_and_fails_closed_on_outage() {
     cluster
         .replica
         .set_transport_operation_deadline(Some(deadline));
-    assert!(
-        cluster.replica.posix_stat_distributed(path).is_err(),
-        "missing alias authority must not be treated as an empty shard or stale local count"
+    assert_eq!(
+        cluster.replica.posix_stat_distributed(path).unwrap().link_count,
+        1,
+        "canonical maintained count does not depend on the unrelated alias owner",
     );
     assert_eq!(
         cluster.replica.transport.operation_deadline(),
@@ -1953,6 +1732,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     );
 
     let snapshot_root = temp_root("rpc_helper_snapshot");
+    crate::test_runtime::copy_native_genesis_data(&snapshot_root, &shard_id.0);
     let snapshot = LocalSobjMetadataBackend::new(shard_id.clone(), &snapshot_root)
         .expect("metadata backend")
         .export_snapshot_image()

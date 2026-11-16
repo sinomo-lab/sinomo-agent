@@ -51,64 +51,53 @@ fn repair_background_hint_is_required_and_explicit_priorities_round_trip() {
 
 #[test]
 fn detached_message_worker_finishes_every_lane_local_parent_touch() {
-    let root = temp_root("detached-worker-drains-parent-touches");
-    let node = NodeId::from_legacy_named("node_detached_parent_touches").expect("node id");
-    let sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
-        Err(DfsPeerTransportError::new(format!(
-            "unexpected send to {target_node_id} for {}",
-            command.request_id
-        )))
-    });
-    let transport = DfsNodeTransport::new_with_message_sender(
-        node,
-        Vec::new(),
-        sender,
-        Duration::from_millis(1),
-    );
-    let content = LocalContentStore::new(root.join("content")).expect("content store");
-    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
-    let mut service = NetworkedDfsService::new(transport, content)
-        .with_metadata_backend(metadata)
-        .expect("attach metadata backend");
-    service
-        .bootstrap_distributed_sifs()
-        .expect("bootstrap distributed SIFS");
-    let mut parent_versions = Vec::new();
-    for index in 0..(DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT + 3) {
-        let parent = format!("/services/deferred-parent-{index}");
-        service.posix_mkdir_all(&parent).expect("create parent");
-        service
-            .posix_set_times(&parent, Some(12_345), Some(67_890))
-            .expect("set old parent times");
-        let before = service.posix_stat(&parent).expect("parent before touch");
-        let child = format!("{parent}/created.txt");
-        service
-            .writes
-            .deferred_routed_create_parent_touches
-            .insert(child);
-        parent_versions.push((parent, before.version));
-    }
+    let (native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+        "detached-worker-drains-parent-touches",
+        1,
+    )
+    .unwrap();
+    native
+        .with_main_maintenance_service(&nodes[0], |service| {
+            let mut parent_versions = Vec::new();
+            for index in 0..(DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT + 3) {
+                let parent = format!("/services/deferred-parent-{index}");
+                service.posix_mkdir_all(&parent).expect("create parent");
+                service
+                    .posix_set_times(&parent, Some(12_345), Some(67_890))
+                    .expect("set old parent times");
+                let before = service.posix_stat(&parent).expect("parent before touch");
+                let child = format!("{parent}/created.txt");
+                service
+                    .writes
+                    .deferred_routed_create_parent_touches
+                    .insert(child);
+                parent_versions.push((parent, before.version));
+            }
 
-    let worker = service.detach_message_deferred_work();
+            let worker = service.detach_message_deferred_work();
 
-    assert!(
-        service
-            .writes
-            .deferred_routed_create_parent_touches
-            .is_empty()
-    );
-    assert!(!worker.has_pending().expect("detached outbox state"));
-    for (parent, version_before) in parent_versions {
-        let after = service.posix_stat(&parent).expect("parent after touch");
-        assert_ne!(
-            after.version, version_before,
-            "detaching must apply the queued metadata touch for {parent}"
-        );
-        assert!(
-            after.modified_at_unix_nanos > 67_890,
-            "detaching must refresh the queued parent mtime for {parent}"
-        );
-    }
+            assert!(
+                service
+                    .writes
+                    .deferred_routed_create_parent_touches
+                    .is_empty()
+            );
+            assert!(!worker.has_pending().expect("detached outbox state"));
+            for (parent, version_before) in parent_versions {
+                let after = service.posix_stat(&parent).expect("parent after touch");
+                assert_ne!(
+                    after.version, version_before,
+                    "detaching must apply the queued metadata touch for {parent}"
+                );
+                assert!(
+                    after.modified_at_unix_nanos > 67_890,
+                    "detaching must refresh the queued parent mtime for {parent}"
+                );
+            }
+            drop(worker);
+        })
+        .unwrap();
+    native.close().unwrap();
 }
 
 #[test]
@@ -1371,6 +1360,8 @@ fn dfs_message_command_processor_rejects_wrong_target_node() {
         },
     };
     let content = LocalContentStore::new(root.join("content")).expect("content");
+    std::fs::create_dir_all(root.join("metadata")).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&root.join("metadata"), "root");
     let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
 
     let error = process_dfs_message_command_for_test(

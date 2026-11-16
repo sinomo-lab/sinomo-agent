@@ -1,6 +1,6 @@
 ---
 name: app-use
-description: Observe and control apps through background window messages, with explicit raw desktop input when background control is unsuitable.
+description: Observe and control apps through available accessibility semantics, background window messages, and explicitly selected raw input or video.
 ---
 
 # App Use
@@ -14,11 +14,33 @@ Linux X11 supports background and raw control. Wayland uses explicit raw mode
 through desktop portals, including when Xwayland is present. The first raw
 target request starts a local chooser and returns an empty list; repeat discovery
 after user approval, then request local grants for that exact target. A
-ScreenCast-only portal offers capture without input. Android supports explicit
-raw mode only, after the user enables
-accessibility, screen sharing and exact-display grants locally. Query raw
-targets directly when capabilities report no background input. Never request
-or infer a silent mode change from a failed input batch.
+ScreenCast-only portal offers capture without input. Query raw targets directly
+when capabilities report no background input. Never infer a silent mode change
+from a failed input batch.
+
+On Android, prefer persistent Accessibility when `capabilities.accessibility`
+is true. Enumerate raw targets and select `android:accessibility:display:0`.
+`observe` takes that `target` and optional `max_nodes` (1..128), returning a bounded
+snapshot with opaque node IDs. `act` takes `target`, `snapshot_id`, `node_id`, and
+`operation`: `{"kind":"click"}`, `long_click`, `focus`, `scroll_forward`,
+`scroll_backward`, or `{"kind":"set_text","text":"..."}`. An action consumes
+its snapshot; expired or changed nodes require a fresh observation. Passwords
+are redacted. Verify effects by observing again; never replay an uncertain action.
+
+The Accessibility target also offers rate-limited screenshots through the capture
+route without screen-sharing consent. Select observations explicitly: semantic
+state is preferred, but screenshots and generic video can supplement it. You may
+combine these sources. `{"action":"video_sources"}` discovers camera and
+screen sources through the same media-owned checks as `/media/video/devices`.
+Each device includes a typed `source` descriptor; `/media/video/capture` takes a selected source, cadence, encoding
+and transport. Use `lease_ms` for a screen source and `duration_ms` for a camera;
+this prevents older camera-only peers from misinterpreting a screen request. An omitted source retains default-camera behavior.
+Screen video requires a locally approved MediaProjection share. It is independent
+of Accessibility and persists without consumers. Closing a stream does not stop
+sharing. An authorized explicit `/media/video/control` stop request ends that
+screen share; the agent tool's `{"action":"stop_video","source":SOURCE}`
+uses the same media-owned operation and local stop grant. Neither path can
+disable Accessibility or approve a new projection.
 
 For a Windows app with multiple windows, check `capabilities.surfaces` and use
 an application session. `applications` returns process-instance identities and
@@ -144,8 +166,12 @@ On Android, `move` sets a virtual touch point. Left-button down/move/up submits
 a finite tap/drag on release; `release_all` or close discards an unfinished
 gesture. Wheel events submit swipes. Text requires a focused accessible
 non-password editor. Only raw key codes 1 (Escape/Back), 14 (Backspace) and 28
-(Enter) are supported; gamepads and other keys are unavailable. Screen-share
-stop or rotation invalidates the target and requires fresh local consent.
+(Enter) are supported; gamepads and other keys are unavailable. Input uses the
+persistent Accessibility target even when grounded in screen video. Rotation
+invalidates old coordinate input leases; observe and reopen input. It does not
+end projection. Video frames carry native dimensions, `content_bounds` for
+letterboxing, and `media.video.geometry.changed` notifications. Map coordinates
+through the current content rectangle, never through a stale frame.
 On X11, text is limited to the current keyboard map and wheel deltas must
 be multiples of 120. Wayland text uses Unicode keysyms, and its
 wheel deltas must also be multiples of 120. Wayland `move` coordinates are

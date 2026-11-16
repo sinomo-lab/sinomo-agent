@@ -20,6 +20,15 @@ pub fn capabilities() -> DesktopCapabilities {
         x11::capabilities()
     }
 }
+pub fn video_targets(
+    permissions: &LocalNodePermissionStore,
+) -> DesktopResult<Vec<DesktopTargetInfo>> {
+    if is_wayland() {
+        wayland::video_targets(permissions)
+    } else {
+        x11::enumerate_targets(false)
+    }
+}
 pub fn enumerate_targets(
     permissions: &LocalNodePermissionStore,
     windows: bool,
@@ -94,13 +103,23 @@ pub fn capture(
     mailbox: &CaptureMailbox,
     stop: mpsc::Receiver<()>,
     ready: mpsc::SyncSender<DesktopResult<()>>,
+    wake: std::os::unix::net::UnixStream,
 ) -> DesktopResult<()> {
     if portal_target(&config.target) {
         wayland::capture(config, permissions, mailbox, stop, ready)
     } else {
-        x11::capture(config, permissions, mailbox, stop, ready)
+        x11::capture(config, permissions, mailbox, stop, ready, &wake)
     }
 }
 pub fn shutdown() {
     wayland::shutdown();
+}
+
+/// Opt-in native diagnostics; kept separate from normal capture work.
+pub(crate) fn frame_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SINOMO_MEDIA_STAGE_TRACE").is_some_and(|v| v == "1"))
+}
+pub(crate) fn trace_frame(value: serde_json::Value) {
+    eprintln!("{value}");
 }

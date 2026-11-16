@@ -13,3 +13,6 @@ ring = "application"
 sinomo-runtime = { path = "../sinomo-runtime" }
 rfd.workspace = true
 tar.workspace = true
+
+[build-dependencies]
+winresource.workspace = true

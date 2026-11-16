@@ -138,7 +138,7 @@ pub(super) fn initialize_input_thread() -> DesktopResult<InputThread> {
 
 pub fn capabilities() -> DesktopCapabilities {
     let _apartment = Apartment::new();
-    DesktopCapabilities { capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8], platform: "windows".into(), capture: capture_supported().unwrap_or(false), keyboard_mouse: true, background_window_input: true,
+    DesktopCapabilities { frame_rate_ceiling: false, accessibility: false, capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8], platform: "windows".into(), capture: capture_supported().unwrap_or(false), keyboard_mouse: true, background_window_input: true,
         gamepad: "conditional: Windows InputInjector requires inputInjectionBrokered; availability is checked on first gamepad input".into(),
         limitations: vec!["Input is subject to UIPI, interactive-session and secure-desktop boundaries.".into(), "Window messages are best effort: raw-input/DirectInput apps, focus checks and held modifier polling may ignore them.".into(), "Occluded windows can be captured; minimized, protected or suspended windows may stop producing frames. Capture never restores or focuses a window.".into()] }
 }

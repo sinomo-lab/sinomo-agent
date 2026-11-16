@@ -9,6 +9,9 @@ use crate::{
 };
 use sinomo_core::kv::KvRequestId;
 
+#[path = "write_set_member_state/native_snapshots.rs"]
+mod native_snapshots;
+
 fn node(name: &str) -> NodeId {
     NodeId::from_legacy_named(name).unwrap()
 }
@@ -72,6 +75,7 @@ fn permit(epoch: u64, scope: Option<u64>) -> DfsMetadataReplicaIngestPermit {
 }
 
 fn backend(root: &sinomo_testdir::TestDir) -> LocalSobjMetadataBackend {
+    crate::test_runtime::copy_native_genesis_data(root.path(), &shard_id().0);
     LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap()
 }
 
@@ -228,44 +232,107 @@ fn an_applied_swap_or_a_later_epoch_keeps_the_fence_until_the_record_reaches_it(
 
 #[test]
 fn the_member_state_survives_snapshot_install_and_fences_an_old_epoch_snapshot() {
+    let native = native_snapshots::NativeSnapshots::new("native-member-state-snapshot");
     let root = sinomo_testdir::TestDir::new("write-set-promise-snapshot");
-    let source_root = sinomo_testdir::TestDir::new("write-set-promise-snapshot-source");
-    let image = || {
-        LocalSobjMetadataBackend::new(shard_id(), source_root.path())
-            .unwrap()
-            .export_snapshot_image()
-            .unwrap()
-    };
     let mut backend = backend(&root);
+    // Backend/owner validation with real native captured epochs, original cut,
+    // source image and complete catalog; not a general takeover availability test.
     backend
-        .promise_metadata_takeover_owned(&cut(3, 1), &KvRequestId::generate())
+        .promise_metadata_takeover_owned(&native.before_cut, &KvRequestId::generate())
         .unwrap();
-    let image_for_old_epoch = image();
-    let sequence = image_for_old_epoch
-        .descriptor()
-        .materialized_through_sequence;
+    let old_permit = native.permit(&native.before_context, &native.before_image);
     assert!(matches!(
         backend.replace_with_replicated_snapshot_with_replica_permit(
-            &permit(3, Some(3)),
+            &old_permit,
             shard_id(),
-            sequence,
-            image_for_old_epoch,
+            native.before_image.materialized_through_sequence,
+            native.before_image.clone()
         ),
         Err(MetadataBackendError::SourceEpochFenced { .. })
     ));
+    let current_permit = native.permit(&native.current_context, &native.current_image);
     backend
         .replace_with_replicated_snapshot_with_replica_permit(
-            &permit(4, Some(3)),
+            &current_permit,
             shard_id(),
-            sequence,
-            image(),
+            native.current_image.materialized_through_sequence,
+            native.current_image.clone(),
         )
         .unwrap();
     assert!(backend.write_set_member_state_path().exists());
-    assert!(fenced(backend.begin_metadata_replica_ingest(
-        &permit(3, Some(3)),
-        &shard_id()
-    )));
+    assert!(fenced(
+        backend.begin_metadata_replica_ingest(&old_permit, &shard_id())
+    ));
+    drop(backend);
+    native.runtime.close().unwrap();
+}
+
+#[test]
+fn interrupted_snapshot_install_reopens_for_authenticated_repair_with_its_member_fence() {
+    let native = native_snapshots::NativeSnapshots::new("native-snapshot-install-interruption");
+    let current = native.permit(&native.current_context, &native.current_image);
+    let old = native.permit(&native.before_context, &native.before_image);
+    for point in ["after-archive", "after-snapshot"] {
+        let root = sinomo_testdir::TestDir::new("snapshot-install-interrupted-root");
+        let mut replica = backend(&root);
+        replica.promise_metadata_takeover_owned(&native.before_cut, &KvRequestId::generate()).unwrap();
+        METADATA_SNAPSHOT_INSTALL_FAULT.set(Some(point));
+        assert!(matches!(replica.replace_with_replicated_snapshot_with_replica_permit(
+            &current, shard_id(), native.current_image.materialized_through_sequence, native.current_image.clone()),
+            Err(MetadataBackendError::Io { source, .. }) if source.kind() == std::io::ErrorKind::Interrupted));
+        drop(replica);
+        let open_error = LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap_err();
+        assert!(crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&open_error),
+            "interrupted snapshot at {point} must be repairable, not mistaken for unfinished migration: {open_error}");
+        assert!(matches!(LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+            &old, shard_id(), root.path(), shard_id(), native.before_image.materialized_through_sequence, native.before_image.clone()),
+            Err(MetadataBackendError::SourceEpochFenced { .. })));
+        let (repaired, _) = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+            &current, shard_id(), root.path(), shard_id(), native.current_image.materialized_through_sequence, native.current_image.clone()).unwrap();
+        assert_eq!(repaired.metadata_prefix_proof().unwrap(), native.current_image.prefix_proof);
+        drop(repaired);
+        let reopened = LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap();
+        assert_eq!(reopened.metadata_prefix_proof().unwrap(), native.current_image.prefix_proof);
+        drop(reopened);
+    }
+    native.runtime.close().unwrap();
+}
+
+#[test]
+fn unsealed_snapshot_repair_requires_its_exact_native_generation() {
+    let native = native_snapshots::NativeSnapshots::new("native-unsealed-snapshot-repair");
+    let root = sinomo_testdir::TestDir::new("retained-unsealed-snapshot");
+    let mut replica = backend(&root);
+    let permit = native.permit(&native.current_context, &native.current_image);
+    replica.replace_with_replicated_snapshot_with_replica_permit(
+        &permit, shard_id(), native.current_image.materialized_through_sequence, native.current_image.clone()).unwrap();
+    drop(replica);
+    let active = crate::storage_generation::read_generation(root.path()).unwrap();
+    // The earlier snapshot producer wrote exactly this unsealed header before
+    // activation. It is unreadable DATA, never a fixture-created serving permit.
+    let mut pending = active.clone();
+    pending.state = crate::storage_generation::GenerationState::Staged { seal: None };
+    crate::storage_generation::write_generation(root.path(), &pending).unwrap();
+    let open_error = LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap_err();
+    assert!(!crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&open_error));
+    assert!(crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+        &open_error, root.path(), &permit, &native.current_image).unwrap());
+    pending.identity.generation.push_str("-foreign");
+    crate::storage_generation::write_generation(root.path(), &pending).unwrap();
+    assert!(!crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+        &open_error, root.path(), &permit, &native.current_image).unwrap());
+    pending.identity = active.identity;
+    pending.state = crate::storage_generation::GenerationState::Staged {
+        seal: Some(crate::DfsMetadataGenerationSeal {
+            prefix_proof: native.current_image.prefix_proof.clone(),
+            state_fingerprint: native.current_image.semantic_state_fingerprint.clone(),
+            file_fingerprint: native.current_image.stream_digest.clone(),
+        }),
+    };
+    crate::storage_generation::write_generation(root.path(), &pending).unwrap();
+    assert!(!crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+        &open_error, root.path(), &permit, &native.current_image).unwrap());
+    native.runtime.close().unwrap();
 }
 
 #[test]
@@ -364,65 +431,66 @@ fn floors_bind_only_at_their_own_epoch_on_a_write_set_shard() {
 
 #[test]
 fn an_earlier_epoch_floor_does_not_block_a_new_epochs_snapshot_and_is_replaced_before_it() {
-    let source_root = sinomo_testdir::TestDir::new("write-set-floor-snapshot-source");
-    let image = || {
-        LocalSobjMetadataBackend::new(shard_id(), source_root.path())
-            .unwrap()
-            .export_snapshot_image()
-            .unwrap()
-    };
-    let sequence = image().descriptor().materialized_through_sequence;
+    let native = native_snapshots::NativeSnapshots::new("native-member-floor-snapshot");
+    let sequence = native.current_image.materialized_through_sequence;
+    // Deliberately high stale floor DATA is the negative component input. Its
+    // epoch is captured from a real earlier assignment; current snapshot
+    // permission and image come from the real later native owner.
     let stale_floor = DfsMetadataPrefixAckFloor {
         shard_id: shard_id(),
         journal_sequence: sequence + 5,
         state_fingerprint: String::new(),
         durable_prefix_proof: proof(sequence + 5, 'b'),
-        authority_epoch: Some(3),
+        authority_epoch: Some(native.before_context.shard.epoch),
     };
-    // Under the all-member rule the floor still binds.
     let legacy_root = sinomo_testdir::TestDir::new("write-set-floor-snapshot-legacy");
     let mut legacy = backend(&legacy_root);
     metadata_cursor::put_metadata_prefix_ack_floor(legacy_root.path(), &stale_floor).unwrap();
+    let legacy_permit = native.permit(&native.legacy_context, &native.before_image);
     assert!(
         legacy
             .replace_with_replicated_snapshot_with_replica_permit(
-                &permit(4, None),
+                &legacy_permit,
                 shard_id(),
-                sequence,
-                image()
+                native.before_image.materialized_through_sequence,
+                native.before_image.clone()
             )
             .is_err()
     );
-    // On a write-set shard an epoch-3 floor does not bind an epoch-4 source,
-    // and an epoch-2 source is refused as stale.
     let root = sinomo_testdir::TestDir::new("write-set-floor-snapshot");
     let mut backend = backend(&root);
     metadata_cursor::put_metadata_prefix_ack_floor(root.path(), &stale_floor).unwrap();
+    let oldest_permit = native.permit(&native.oldest_context, &native.before_image);
     assert!(matches!(
         backend.replace_with_replicated_snapshot_with_replica_permit(
-            &permit(2, Some(2)),
+            &oldest_permit,
             shard_id(),
-            sequence,
-            image()
+            native.before_image.materialized_through_sequence,
+            native.before_image.clone()
         ),
         Err(MetadataBackendError::SourceEpochFenced { .. })
     ));
+    let current_permit = native.permit(&native.current_context, &native.current_image);
     backend
         .replace_with_replicated_snapshot_with_replica_permit(
-            &permit(4, Some(3)),
+            &current_permit,
             shard_id(),
             sequence,
-            image(),
+            native.current_image.clone(),
         )
         .unwrap();
     let floor = metadata_cursor::metadata_prefix_ack_floor(root.path(), &shard_id())
         .unwrap()
         .unwrap();
-    assert_eq!(floor.authority_epoch, Some(4));
+    assert_eq!(
+        floor.authority_epoch,
+        Some(native.current_context.shard.epoch)
+    );
     assert_eq!(floor.journal_sequence, sequence);
-    // A restart finds floors consistent with the installed state.
     drop(backend);
     self::backend(&root);
+    drop(legacy);
+    native.runtime.close().unwrap();
 }
 
 #[test]
@@ -548,29 +616,31 @@ fn an_epoch_tagged_authority_floor_may_name_sequence_zero() {
 }
 
 #[test]
-fn a_later_epoch_snapshot_at_sequence_zero_replaces_an_earlier_authority_floor() {
-    let source_root = sinomo_testdir::TestDir::new("write-set-zero-snapshot-source");
-    let image = LocalSobjMetadataBackend::new(shard_id(), source_root.path())
-        .unwrap()
-        .export_snapshot_image()
-        .unwrap();
+fn a_later_epoch_snapshot_below_an_earlier_authority_floor_replaces_it() {
+    // A native store is never empty, so the snapshot is the current epoch's
+    // actual image; the earlier epoch's floor lies above its sequence, as an
+    // empty epoch start lies below any earlier floor.
+    let native = native_snapshots::NativeSnapshots::new("native-later-epoch-floor");
+    let image = native.current_image.clone();
     let sequence = image.descriptor().materialized_through_sequence;
-    assert_eq!(sequence, 0, "the source is an empty epoch start");
-    let root = sinomo_testdir::TestDir::new("write-set-zero-snapshot");
+    let earlier = native.before_context.shard.epoch;
+    let current = native.current_context.shard.epoch;
+    assert!(earlier < current);
+    let root = sinomo_testdir::TestDir::new("write-set-later-epoch-snapshot");
     let mut backend = backend(&root);
     metadata_cursor::put_metadata_authority_ack_floor(
         root.path(),
         &crate::DfsMetadataAuthorityAckFloor {
             shard_id: shard_id(),
-            journal_sequence: 2,
-            durable_prefix_proof: proof(2, 'b'),
-            authority_epoch: Some(3),
+            journal_sequence: sequence + 2,
+            durable_prefix_proof: proof(sequence + 2, 'b'),
+            authority_epoch: Some(earlier),
         },
     )
     .unwrap();
     backend
         .replace_with_replicated_snapshot_with_replica_permit(
-            &permit(4, Some(3)),
+            &native.permit(&native.current_context, &image),
             shard_id(),
             sequence,
             image,
@@ -579,12 +649,13 @@ fn a_later_epoch_snapshot_at_sequence_zero_replaces_an_earlier_authority_floor()
     let floor = metadata_cursor::metadata_authority_ack_floor(root.path(), &shard_id())
         .unwrap()
         .unwrap();
-    assert_eq!(floor.authority_epoch, Some(4));
-    assert_eq!(floor.journal_sequence, 0);
-    // The cold-open check compares the installed head with the epoch-4
-    // floor, not the earlier one above it.
+    assert_eq!(floor.authority_epoch, Some(current));
+    assert_eq!(floor.journal_sequence, sequence);
+    // The cold-open check compares the installed head with the current
+    // epoch's floor, not the earlier one above it.
     drop(backend);
-    self::backend(&root);
+    LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap();
+    native.runtime.close().unwrap();
 }
 
 #[test]
@@ -613,11 +684,13 @@ fn a_later_epochs_ingest_removes_a_pending_marker_only_on_a_write_set_shard() {
 fn alignment_confirms_a_matching_epoch_start_and_refuses_a_different_one() {
     let root = sinomo_testdir::TestDir::new("write-set-align-decision");
     let mut backend = backend(&root);
-    let genesis = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard_id());
+    // A native store starts at its genesis head, not at sequence zero.
+    let start = backend.metadata_prefix_proof().unwrap();
+    let at = start.journal_sequence;
     let permit = permit(4, Some(3));
     // A different digest at this member's head is a divergence.
     assert!(matches!(
-        backend.align_replica_to_prefix_owned(&permit, &proof(0, 'e'), &proof(0, 'e')),
+        backend.align_replica_to_prefix_owned(&permit, &proof(at, 'e'), &proof(at, 'e')),
         Err(MetadataBackendError::Rejected {
             code: crate::DfsMetadataRejectionCode::ReplicaDiverged,
             ..
@@ -626,19 +699,19 @@ fn alignment_confirms_a_matching_epoch_start_and_refuses_a_different_one() {
     // An epoch start beyond this member's journal is for the primary to check.
     assert!(matches!(
         backend
-            .align_replica_to_prefix_owned(&permit, &proof(3, 'f'), &proof(3, 'f'))
+            .align_replica_to_prefix_owned(&permit, &proof(at + 3, 'f'), &proof(at + 3, 'f'))
             .unwrap(),
         crate::DfsMetadataReplicaAlignment::Behind { .. }
     ));
-    // A matching empty epoch start writes both floors at sequence zero, and
-    // aligning again is a no-op.
+    // A matching epoch start at this member's head writes both floors there,
+    // and aligning again is a no-op.
     for _ in 0..2 {
         assert_eq!(
             backend
-                .align_replica_to_prefix_owned(&permit, &genesis, &genesis)
+                .align_replica_to_prefix_owned(&permit, &start, &start)
                 .unwrap(),
             crate::DfsMetadataReplicaAlignment::Aligned {
-                head: genesis.clone(),
+                head: start.clone(),
                 dropped: 0
             }
         );
@@ -648,12 +721,12 @@ fn alignment_confirms_a_matching_epoch_start_and_refuses_a_different_one() {
         .unwrap();
     assert_eq!(
         (authority.journal_sequence, authority.authority_epoch),
-        (0, Some(4))
+        (at, Some(4))
     );
     // An unswitched permit never aligns.
     assert!(
         backend
-            .align_replica_to_prefix_owned(&self::permit(4, None), &genesis, &genesis)
+            .align_replica_to_prefix_owned(&self::permit(4, None), &start, &start)
             .is_err()
     );
     drop(backend);

@@ -13,7 +13,7 @@ import org.json.JSONObject;
 
 /** One projection texture, with demand-driven per-consumer GPU outputs. */
 final class AppUseGpuCapture implements AutoCloseable {
-    private final int nativeWidth, nativeHeight;
+    private int nativeWidth, nativeHeight;
     private EGLDisplay display=EGL14.EGL_NO_DISPLAY;
     private EGLContext context=EGL14.EGL_NO_CONTEXT;
     private EGLSurface idle=EGL14.EGL_NO_SURFACE;
@@ -25,11 +25,14 @@ final class AppUseGpuCapture implements AutoCloseable {
     private final FloatBuffer vertices=ByteBuffer.allocateDirect(16*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
     private final float[] transform=new float[16];
     private long generation, capturedAt, timestamp;
-    private long sourceEpoch=-1;
-    private boolean closed;
+    private long sourceEpoch=-1, timestampBase;
+    private boolean closed, frameReady;
+    private final Handler handler;
+    private final Runnable onFrame, onFatal;
 
-    AppUseGpuCapture(int width,int height,Handler handler,Runnable onFrame) throws Exception {
+    AppUseGpuCapture(int width,int height,Handler handler,Runnable onFrame,Runnable onFatal) throws Exception {
         nativeWidth=width;nativeHeight=height;
+        this.handler=handler;this.onFrame=onFrame;this.onFatal=onFatal;
         try {
             display=EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
             int[] versions=new int[2];check(EGL14.eglInitialize(display,versions,0,versions,1),"eglInitialize");
@@ -45,22 +48,37 @@ final class AppUseGpuCapture implements AutoCloseable {
             program=GLES20.glCreateProgram();GLES20.glAttachShader(program,vs);GLES20.glAttachShader(program,fs);GLES20.glLinkProgram(program);
             int[] ok=new int[1];GLES20.glGetProgramiv(program,GLES20.GL_LINK_STATUS,ok,0);check(ok[0]!=0,"shader link");
             GLES20.glDeleteShader(vs);GLES20.glDeleteShader(fs);
+            createSource(width,height);
+        } catch(Exception error) {close();throw error;}
+    }
+    private void createSource(int width,int height) throws Exception {
             int[] ids=new int[1];GLES20.glGenTextures(1,ids,0);texture=ids[0];GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,texture);
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_LINEAR);
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR);
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_CLAMP_TO_EDGE);
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_T,GLES20.GL_CLAMP_TO_EDGE);
             source=new SurfaceTexture(texture);source.setDefaultBufferSize(width,height);surface=new Surface(source);
-            source.setOnFrameAvailableListener(ignored -> {
-                if(closed)return;
+            source.setOnFrameAvailableListener(incoming -> {
+                if(closed || incoming!=source)return;
                 try {
                     current(idle);source.updateTexImage();source.getTransformMatrix(transform);
                     long sourceTime=source.getTimestamp();if(sourceEpoch<0)sourceEpoch=sourceTime;
-                    timestamp=Math.max(0,sourceTime-sourceEpoch);capturedAt=System.currentTimeMillis();generation++;
+                    timestamp=Math.max(timestamp+1,timestampBase+Math.max(0,sourceTime-sourceEpoch));
+                    capturedAt=System.currentTimeMillis();generation++;frameReady=true;
                     onFrame.run();
-                } catch(Exception error) { android.util.Log.e("SinomoAppUse","Projection texture failed",error);close();onFrame.run(); }
+                } catch(Exception error) { android.util.Log.e("SinomoAppUse","Projection texture failed",error);close();onFatal.run();onFrame.run(); }
             },handler);
-        } catch(Exception error) {close();throw error;}
+    }
+    void resize(int width,int height) throws Exception {
+        check(!closed,"projection closed");current(idle);
+        // The owner detaches the virtual display first. A fresh input queue
+        // cannot deliver old-size buffers after the geometry notification.
+        frameReady=false;
+        if(source!=null){source.setOnFrameAvailableListener(null);source.release();source=null;}
+        if(surface!=null){surface.release();surface=null;}
+        GLES20.glDeleteTextures(1,new int[]{texture},0);texture=0;
+        nativeWidth=width;nativeHeight=height;sourceEpoch=-1;timestampBase=timestamp+1;
+        createSource(width,height);
     }
     Client open(JSONObject request,Function<String,Object> factory) throws Exception {
         check(!closed,"projection closed");
@@ -77,7 +95,7 @@ final class AppUseGpuCapture implements AutoCloseable {
         if(format.equals("h264")){w=w/2*2;h=h/2*2;}
         check(w>0&&h>0,"resolution too small for source aspect ratio");
         int fps=request.getInt("fps");check(fps>0&&fps<=120,"invalid frame rate");
-        Client client=new Client(w,h,format);
+        Client client=new Client(w,h,format,fps);
         try {
             if(format.equals("h264")) {
                 check(factory!=null,"surface encoder unavailable");
@@ -93,15 +111,28 @@ final class AppUseGpuCapture implements AutoCloseable {
         private EGLSurface output=EGL14.EGL_NO_SURFACE;
         private Object encoder;private ByteBuffer pixels;
         private boolean ended;
-        Client(int w,int h,String f){width=w;height=h;format=f;}
+        private final FrameRateCeiling ceiling;
+        Client(int w,int h,String f,int fps){width=w;height=h;format=f;ceiling=new FrameRateCeiling(fps);}
+        long readyDelayMillis(long after,long maximum) {
+            if(!frameReady||generation==0||generation<=after)return maximum;
+            long nanos=ceiling.delayNanos(System.nanoTime());
+            return Math.min(maximum,(nanos+999_999)/1_000_000);
+        }
         AppUseProjectionService.Frame frame(long after) throws Exception {
             check(!closed&&!ended,"capture closed");
-            if(generation==0||generation<=after)return null;
-            long start=System.nanoTime();current(output);
+            if(!frameReady||generation==0||generation<=after)return null;
+            long start=System.nanoTime();
+            if(ceiling.delayNanos(start)>0)return null;
+            ceiling.admit(start);current(output);
             // Readback is top-down; encoder surfaces use the normal GL origin.
             boolean raw=encoder==null;float bottom=raw?1:0,top=raw?0:1;
             vertices.position(0);vertices.put(new float[]{-1,-1,0,bottom,1,-1,1,bottom,-1,1,0,top,1,1,1,top}).position(0);
-            GLES20.glViewport(0,0,width,height);GLES20.glUseProgram(program);
+            // Keep the negotiated stream geometry through rotation/resizing.
+            // Native dimensions travel with each frame for coordinate mapping.
+            GLES20.glViewport(0,0,width,height);GLES20.glClearColor(0,0,0,1);GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+            double scale=Math.min((double)width/nativeWidth,(double)height/nativeHeight);
+            int viewWidth=Math.max(1,(int)(nativeWidth*scale)),viewHeight=Math.max(1,(int)(nativeHeight*scale));
+            GLES20.glViewport((width-viewWidth)/2,(height-viewHeight)/2,viewWidth,viewHeight);GLES20.glUseProgram(program);
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,texture);
             GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"tex"),0);
             GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"bgra"),format.equals("bgra8")?1:0);

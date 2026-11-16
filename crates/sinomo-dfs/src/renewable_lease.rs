@@ -748,55 +748,30 @@ fn best_effort_release_grant<T: DfsMessageTransport>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use sinomo_core::node::NodeId;
-
     use super::*;
-    use crate::{
-        DfsReplicationPolicy, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-        open_root_local_metadata_backend,
-    };
-
-    fn open_service(
-        root: &Path,
-        node_id: NodeId,
-        content_name: &str,
-    ) -> NetworkedDfsService<crate::DfsNodeTransport> {
-        NetworkedDfsService::new(
-            crate::test_runtime::DfsTestRuntime::local_transport(node_id),
-            LocalContentStore::new(root.join(content_name)).expect("lease test content store"),
-        )
-        .with_metadata_backend(
-            open_root_local_metadata_backend(root.join("metadata"))
-                .expect("lease test metadata backend"),
-        )
-        .expect("attach lease test metadata backend")
-    }
+    use crate::{DfsReplicationPolicy, DfsWriteOptions, NetworkedDfsService};
 
     fn two_services(
         name: &str,
     ) -> (
-        sinomo_testdir::TestDir,
+        crate::test_runtime::DfsTestRuntime,
         Arc<Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
         Arc<Mutex<NetworkedDfsService<crate::DfsNodeTransport>>>,
         DfsRenewableLeaseAnchor,
     ) {
-        let root = sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"));
-        let node_id = NodeId::from_legacy_named(format!("node_{name}").replace('-', "_"))
-            .expect("lease test node id");
-        let mut first = open_service(&root, node_id.clone(), "content-a");
-        first
-            .bootstrap_distributed_sifs()
-            .expect("bootstrap lease test SIFS");
+        let (native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(name, 1).unwrap();
+        let node_id = nodes[0].clone();
         let path = "/users/renewable-lease-anchor.lock";
+        // Both handles use the same actual native shard and publication owner;
+        // the retained runtime outlives every lease worker and service handle.
+        let mut first = native.metadata_primary_service(path).unwrap();
         first
             .posix_write_file(
                 path,
                 b"sinomo-renewable-lease-v1\n",
                 DfsWriteOptions {
                     policy: DfsReplicationPolicy::new(1, 1).expect("lease test policy"),
-                    replica_candidates: vec![node_id.clone()],
+                    replica_candidates: vec![node_id],
                     wait_for_commit: true,
                     foreground_replica_repair: true,
                 },
@@ -806,9 +781,9 @@ mod tests {
             .posix_stat(path)
             .expect("stat stable lease anchor")
             .object_id;
-        let second = open_service(&root, node_id, "content-b");
+        let second = native.metadata_primary_service(path).unwrap();
         (
-            root,
+            native,
             Arc::new(Mutex::new(first)),
             Arc::new(Mutex::new(second)),
             DfsRenewableLeaseAnchor::new(path, object_id),
@@ -843,7 +818,7 @@ mod tests {
 
     #[test]
     fn release_wakes_a_long_waiting_renewer_promptly() {
-        let (_root, first, _second, anchor) = two_services("renewable-lease-release-wake");
+        let (_native, first, _second, anchor) = two_services("renewable-lease-release-wake");
         let lease = DfsRenewableExclusiveLease::try_acquire(
             first,
             anchor,
@@ -863,7 +838,7 @@ mod tests {
 
     #[test]
     fn two_services_exclude_renew_and_release_an_exclusive_lease() {
-        let (_root, first, second, anchor) = two_services("renewable-lease-exclusion");
+        let (_native, first, second, anchor) = two_services("renewable-lease-exclusion");
         let first_session = DfsAdvisoryLockSessionId::new("lease-holder-a");
         let lease = DfsRenewableExclusiveLease::try_acquire(
             Arc::clone(&first),
@@ -916,7 +891,7 @@ mod tests {
 
     #[test]
     fn opened_lock_handle_uses_the_current_cut_for_an_external_close() {
-        let (_root, first, second, anchor) = two_services("advisory-current-cut");
+        let (_native, first, second, anchor) = two_services("advisory-current-cut");
         let stale_cut = second
             .lock()
             .unwrap()
@@ -994,7 +969,7 @@ mod tests {
 
     #[test]
     fn remote_session_close_marks_the_guard_lost_and_fences_use() {
-        let (_root, first, second, anchor) = two_services("renewable-lease-loss");
+        let (_native, first, second, anchor) = two_services("renewable-lease-loss");
         let session_id = DfsAdvisoryLockSessionId::new("lease-holder-lost");
         let lease = DfsRenewableExclusiveLease::try_acquire(
             first,
@@ -1061,7 +1036,7 @@ mod tests {
 
     #[test]
     fn elapsed_monotonic_deadline_is_sticky_until_release() {
-        let (_root, first, second, anchor) = two_services("renewable-lease-deadline");
+        let (_native, first, second, anchor) = two_services("renewable-lease-deadline");
         let lease = DfsRenewableExclusiveLease::try_acquire(
             first,
             anchor.clone(),
@@ -1103,7 +1078,7 @@ mod tests {
 
     #[test]
     fn stalled_unlock_and_close_share_one_release_deadline() {
-        let (_root, first, _second, anchor) = two_services("renewable-lease-release-budget");
+        let (_native, first, _second, anchor) = two_services("renewable-lease-release-budget");
         let config = DfsRenewableLeaseConfig {
             renew_interval: Duration::from_secs(60),
             command_timeout: Duration::from_millis(300),

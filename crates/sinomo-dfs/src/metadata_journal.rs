@@ -3113,6 +3113,7 @@ mod tests {
     fn install_preceding_rollover_checkpoint(root: &Path) {
         let sequence = JOURNAL_SEGMENT_ENTRY_LIMIT - 1;
         let shard = test_journal_entry(JOURNAL_SEGMENT_ENTRY_LIMIT).shard_id;
+        crate::metadata_candidate::stage_current_test_generation(root, &shard.0);
         let tables = crate::metadata_tables::DfsMetadataTables::default();
         let mut prefix = crate::metadata_records::dfs_metadata_prefix_proof_genesis(&shard);
         for journal_sequence in 1..=sequence {

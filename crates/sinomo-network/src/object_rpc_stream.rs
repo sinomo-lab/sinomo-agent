@@ -3337,6 +3337,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandoned_forwarded_response_cancels_upstream_before_and_after_read() {
+        for read_first in [false, true] {
+            let aborts = Arc::new(AtomicUsize::new(0));
+            let request_id =
+                Id::from_legacy_named(&format!("forwarded-cancel-{read_first}")).unwrap();
+            let (body, _body_completion, receive_completion) = make_incoming_body(
+                PendingAbortRecordReader {
+                    aborts: Arc::clone(&aborts),
+                },
+                ObjectFrameIoOptions::default(),
+                IncomingBodySpec {
+                    direction: IncomingDirection::Response,
+                    request_id,
+                    last_progress_nonce: 0,
+                    descriptor: BodyDescriptor::Deferred,
+                    inline_body: None,
+                },
+                false,
+            );
+            let result = crate::ObjectRpcResult::new(
+                crate::ObjectRpcResponse::encode_body("/test/forwarded-body", &()).unwrap(),
+                body.into_application_body(),
+            );
+            let forwarded = result.into_forwarded_response().unwrap();
+            if read_first {
+                let mut producer = forwarded.body.producer(64 * 1024).unwrap();
+                let allocator = crate::owned_chunk::ChunkAllocator::default();
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(20),
+                        producer.next_owned(&allocator)
+                    )
+                    .await
+                    .is_err()
+                );
+                drop(producer);
+            }
+            drop(forwarded);
+            let error = tokio::time::timeout(Duration::from_secs(1), receive_completion.join())
+                .await
+                .expect("forwarder abandonment did not cancel upstream")
+                .expect_err("abandoned forwarding reported success");
+            assert!(
+                error.to_string().contains("application cancelled"),
+                "{error}"
+            );
+            assert_eq!(aborts.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn cancel_on_drop_aborts_indefinite_body_before_first_read() {
         let aborts = Arc::new(AtomicUsize::new(0));
         let request_id =

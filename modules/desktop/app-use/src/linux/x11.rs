@@ -2,10 +2,14 @@
 //! focus changes, keyboard-map edits, shell helpers, or implicit raw fallback.
 use super::*;
 use sinomo_device::{NativeVideoPlane, NativeVideoSampleFormat};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use x11rb::connection::Connection;
-use x11rb::protocol::{Event, composite, damage, res, xfixes, xproto::*, xtest};
+use x11rb::protocol::{Event, composite, damage, res, xfixes, xinput, xproto::*, xtest};
 use x11rb::rust_connection::RustConnection;
+
+#[path = "x11_readback.rs"]
+mod readback;
 
 fn platform(error: impl std::fmt::Display) -> DesktopError {
     DesktopError::Platform(error.to_string())
@@ -175,11 +179,12 @@ fn process_start(stat: &str) -> DesktopResult<u64> {
 }
 
 pub fn capabilities() -> DesktopCapabilities {
-    let mut caps = DesktopCapabilities { capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8],
+    let mut caps = DesktopCapabilities { frame_rate_ceiling: true, accessibility: false, capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8],
         platform: "linux".into(), capture: false, keyboard_mouse: false,
         background_window_input: false, gamepad: "unsupported".into(),
         limitations: vec![
             "X11 backend selected; Wayland sessions use the portal backend".into(),
+            "Cursor capture requires XInput2 motion and XFixes cursor notifications".into(),
             "Background events require application support for synthetic X11 events; minimized windows cannot be captured".into(),
             "Text is limited to characters in the current X keyboard map; gamepad injection is unavailable".into(),
         ],
@@ -619,6 +624,7 @@ pub fn capture(
     mailbox: &CaptureMailbox,
     stop: mpsc::Receiver<()>,
     ready: mpsc::SyncSender<DesktopResult<()>>,
+    wake: &std::os::unix::net::UnixStream,
 ) -> DesktopResult<()> {
     let result = Capture::new(&config);
     let mut capture = match result {
@@ -634,58 +640,141 @@ pub fn capture(
     let deadline = started + Duration::from_millis(config.lease_ms.min(300_000));
     let mut sequence = 0;
     let mut dirty = true;
+    let mut ceiling = FrameRateCeiling::new(Some(config.frames_per_second));
     loop {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || stop.try_recv() != Err(mpsc::TryRecvError::Empty) {
             return Ok(());
         }
         authorize(&permissions, &config.target, "capture")?;
-        capture.x.resolve(&config.target)?;
+        let mut drained = 0;
         while let Some(event) = capture.x.conn.poll_for_event().map_err(platform)? {
+            drained += 1;
             match event {
-                Event::DamageNotify(_)
-                | Event::ConfigureNotify(_)
-                | Event::XfixesCursorNotify(_) => dirty = true,
-                Event::DestroyNotify(_) | Event::UnmapNotify(_) => {
-                    return Err(unavailable("captured window is no longer visible"));
+                Event::DamageNotify(_) | Event::ConfigureNotify(_) => dirty = true,
+                Event::XfixesCursorNotify(_)
+                | Event::XinputRawMotion(_)
+                | Event::MotionNotify(_)
+                | Event::EnterNotify(_)
+                | Event::LeaveNotify(_)
+                    if config.include_cursor =>
+                {
+                    dirty = true
+                }
+                Event::DestroyNotify(event) => {
+                    if event.window == capture.window {
+                        return Err(unavailable("captured window was destroyed"));
+                    }
+                    capture.cursor_windows.remove(&event.window);
+                    dirty = true;
+                }
+                Event::UnmapNotify(event) => {
+                    if event.window == capture.window {
+                        return Err(unavailable("captured window is no longer visible"));
+                    }
+                    dirty = true;
+                }
+                Event::CreateNotify(event)
+                    if config.include_cursor && capture.cursor_windows.contains(&event.parent) =>
+                {
+                    capture.watch_cursor_tree(event.window)?;
+                    dirty = true;
+                }
+                Event::ReparentNotify(event) if config.include_cursor => {
+                    if event.window != capture.window {
+                        if capture.cursor_windows.contains(&event.parent) {
+                            capture.watch_cursor_tree(event.window)?;
+                        } else {
+                            capture.unwatch_cursor_tree(event.window)?;
+                        }
+                    }
+                    dirty = true;
                 }
                 _ => {}
             }
+            if drained == 256 {
+                break;
+            }
         }
-        // Cursor position changes do not produce Damage events.
-        if config.include_cursor {
-            dirty = true;
-        }
-        if dirty {
-            // Reset before reading: damage after GetImage must remain queued
-            // for the next frame, rather than being cleared without delivery.
+        let delay = ceiling.delay(Instant::now());
+        if dirty && delay.is_zero() {
+            capture.x.resolve(&config.target)?;
             damage::subtract(&capture.x.conn, capture.damage, x11rb::NONE, x11rb::NONE)
                 .map_err(platform)?
                 .check()
                 .map_err(platform)?;
             sequence += 1;
-            let mut sample = capture.frame(config.include_cursor)?;
-            sample.sequence = sequence;
-            sample.timestamp_ns = started.elapsed().as_nanos() as u64;
+            let timestamp = started.elapsed().as_nanos() as u64;
+            ceiling.admit(Instant::now());
+            let mut sample = capture.frame(config.include_cursor, sequence)?;
+            sample.timestamp_ns = timestamp;
             sample.duration_ns = cadence.as_nanos() as u64;
-            sample.captured_at_unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
             authorize(&permissions, &config.target, "capture")?;
+            if Instant::now() >= deadline || stop.try_recv() != Err(mpsc::TryRecvError::Empty) {
+                return Ok(());
+            }
             mailbox.publish(sample);
             dirty = false;
+            // Replies during capture may have queued Damage/cursor events in
+            // x11rb already. Drain them before waiting on the socket again.
+            continue;
         }
-        match stop.recv_timeout(cadence.min(Duration::from_millis(100))) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        if drained == 256 {
+            continue;
+        }
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        let timeout = if dirty { timeout.min(delay) } else { timeout };
+        if !wait_for_x_event(&capture.x.conn, wake, timeout)? {
+            return Ok(());
         }
     }
 }
+
+fn wait_for_x_event(
+    connection: &RustConnection,
+    wake: &std::os::unix::net::UnixStream,
+    timeout: Duration,
+) -> DesktopResult<bool> {
+    let mut fds = [
+        libc::pollfd {
+            fd: connection.stream().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // Readable X events and cancellation both wake immediately. The timeout
+    // only bounds authority/lease checks; it never paces available frames.
+    let millis = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(platform(error));
+        }
+    }
+    if fds[1].revents != 0 {
+        return Ok(false);
+    }
+    if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(unavailable("X11 capture connection closed"));
+    }
+    Ok(true)
+}
+
 struct Capture {
     x: X11,
     window: Window,
     damage: u32,
     redirected: bool,
+    resolution: Option<CaptureResolution>,
+    readback: readback::Readback,
+    cursor_windows: std::collections::BTreeSet<Window>,
 }
 impl Capture {
     fn new(config: &DesktopCaptureConfig) -> DesktopResult<Self> {
@@ -704,11 +793,15 @@ impl Capture {
             .reply()
             .map_err(platform)?;
         let damage = x.conn.generate_id().map_err(platform)?;
+        let readback = readback::Readback::new(&x.conn);
         let mut capture = Self {
             x,
             window,
             damage,
             redirected: false,
+            resolution: config.resolution,
+            readback,
+            cursor_windows: std::collections::BTreeSet::new(),
         };
         if config.target.is_window() {
             composite::redirect_window(&capture.x.conn, window, composite::Redirect::AUTOMATIC)
@@ -736,11 +829,129 @@ impl Capture {
         .map_err(platform)?
         .check()
         .map_err(platform)?;
+        if config.include_cursor {
+            capture.watch_cursor_tree(window)?;
+            // XFixes reports shape changes; XI2 raw motion covers pointer moves
+            // over child windows even when another client consumes core events.
+            xinput::xi_query_version(&capture.x.conn, 2, 0)
+                .map_err(platform)?
+                .reply()
+                .map_err(|e| {
+                    DesktopError::Unsupported(format!("cursor notifications require XInput2: {e}"))
+                })?;
+            xinput::xi_select_events(
+                &capture.x.conn,
+                capture.x.root(),
+                &[xinput::EventMask {
+                    deviceid: xinput::Device::ALL_MASTER.into(),
+                    mask: vec![xinput::XIEventMask::RAW_MOTION],
+                }],
+            )
+            .map_err(platform)?
+            .check()
+            .map_err(platform)?;
+            xfixes::select_cursor_input(
+                &capture.x.conn,
+                capture.x.root(),
+                xfixes::CursorNotifyMask::DISPLAY_CURSOR,
+            )
+            .map_err(platform)?
+            .check()
+            .map_err(platform)?;
+        }
         // Fail opening instead of claiming capture support before a first image.
-        capture.frame(config.include_cursor)?;
+        capture.frame(config.include_cursor, 0)?;
         Ok(capture)
     }
-    fn frame(&mut self, cursor: bool) -> DesktopResult<NativeVideoSample> {
+    fn watch_cursor_tree(&mut self, window: Window) -> DesktopResult<()> {
+        let mut pending = vec![window];
+        while let Some(window) = pending.pop() {
+            if self.cursor_windows.contains(&window) {
+                continue;
+            }
+            if self.cursor_windows.len() >= 16_384 {
+                return Err(DesktopError::Unsupported(
+                    "X11 cursor notification tree exceeds 16384 windows".into(),
+                ));
+            }
+            // Core events cover warps, which do not generate XI2 RawMotion.
+            // Watch descendants too: another client's selection on a child can
+            // stop propagation to our target. Masks affect this connection only.
+            let mask = EventMask::STRUCTURE_NOTIFY
+                | EventMask::SUBSTRUCTURE_NOTIFY
+                | EventMask::POINTER_MOTION
+                | EventMask::ENTER_WINDOW
+                | EventMask::LEAVE_WINDOW;
+            match self
+                .x
+                .conn
+                .change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new().event_mask(mask),
+                )
+                .map_err(platform)?
+                .check()
+            {
+                Ok(()) => {}
+                Err(error) if vanished_window(&error) && window != self.window => continue,
+                Err(error) => return Err(unavailable(error)),
+            }
+            self.cursor_windows.insert(window);
+            match self.x.conn.query_tree(window).map_err(platform)?.reply() {
+                Ok(tree) => {
+                    if pending.len() + tree.children.len() + self.cursor_windows.len() > 16_384 {
+                        return Err(DesktopError::Unsupported(
+                            "X11 cursor notification tree exceeds 16384 windows".into(),
+                        ));
+                    }
+                    pending.extend(tree.children);
+                }
+                Err(error) if vanished_window(&error) && window != self.window => {
+                    self.cursor_windows.remove(&window);
+                }
+                Err(error) => return Err(unavailable(error)),
+            }
+        }
+        Ok(())
+    }
+    fn unwatch_cursor_tree(&mut self, window: Window) -> DesktopResult<()> {
+        let mut pending = vec![window];
+        while let Some(window) = pending.pop() {
+            if !self.cursor_windows.remove(&window) {
+                continue;
+            }
+            match self.x.conn.query_tree(window).map_err(platform)?.reply() {
+                Ok(tree) => pending.extend(
+                    tree.children
+                        .into_iter()
+                        .filter(|child| self.cursor_windows.contains(child)),
+                ),
+                Err(error) if vanished_window(&error) => {}
+                Err(error) => return Err(unavailable(error)),
+            }
+            match self
+                .x
+                .conn
+                .change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+                )
+                .map_err(platform)?
+                .check()
+            {
+                Ok(()) => {}
+                Err(error) if vanished_window(&error) => {}
+                Err(error) => return Err(unavailable(error)),
+            }
+        }
+        Ok(())
+    }
+    fn frame(&mut self, cursor: bool, sequence: u64) -> DesktopResult<NativeVideoSample> {
+        let start = Instant::now();
+        let captured_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         let attr = self
             .x
             .conn
@@ -783,30 +994,27 @@ impl Capture {
         } else {
             0
         };
+        let geometry_us = start.elapsed().as_micros();
+        let readback = Instant::now();
         let image = self
-            .x
-            .conn
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                pixmap.unwrap_or(self.window),
-                border,
-                border,
-                geo.width,
-                geo.height,
-                u32::MAX,
-            )
-            .map_err(platform)?
-            .reply()
-            .map_err(unavailable);
+            .readback
+            .image(&self.x.conn, pixmap.unwrap_or(self.window), border, &geo);
         if let Some(id) = pixmap {
             let _ = self.x.conn.free_pixmap(id);
         }
-        let image = image?;
+        let (depth, storage) = image?;
+        let readback_backend = if matches!(storage, readback::Pixels::Shared(_)) {
+            "mit-shm"
+        } else {
+            "get-image"
+        };
+        let readback_us = readback.elapsed().as_micros();
+        let normalize = Instant::now();
         let setup = self.x.conn.setup();
         let format = setup
             .pixmap_formats
             .iter()
-            .find(|f| f.depth == image.depth)
+            .find(|f| f.depth == depth)
             .ok_or_else(|| platform("unknown X image depth"))?;
         let visual = setup
             .roots
@@ -815,15 +1023,41 @@ impl Capture {
             .flat_map(|d| &d.visuals)
             .find(|v| v.visual_id == attr.visual)
             .ok_or_else(|| platform("unknown X visual"))?;
-        let mut pixels = decode_pixels(
-            &image.data,
-            width,
-            height,
-            format.bits_per_pixel,
-            format.scanline_pad,
-            setup.image_byte_order == ImageOrder::LSB_FIRST,
-            [visual.red_mask, visual.green_mask, visual.blue_mask],
-        )?;
+        let masks = [visual.red_mask, visual.green_mask, visual.blue_mask];
+        let little = setup.image_byte_order == ImageOrder::LSB_FIRST;
+        let mut pixels = match storage {
+            readback::Pixels::Shared(data)
+                if format.bits_per_pixel == 32 && little && masks == [0xff0000, 0xff00, 0xff] =>
+            {
+                if data.len() != width as usize * height as usize * 4 {
+                    return Err(platform("invalid shared XRGB image length"));
+                }
+                for pixel in data.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
+                readback::Pixels::Shared(data)
+            }
+            readback::Pixels::Shared(data) => readback::Pixels::Owned(decode_pixels(
+                data,
+                width,
+                height,
+                format.bits_per_pixel,
+                format.scanline_pad,
+                little,
+                masks,
+            )?),
+            readback::Pixels::Owned(data) => readback::Pixels::Owned(decode_pixels_owned(
+                data,
+                width,
+                height,
+                format.bits_per_pixel,
+                format.scanline_pad,
+                little,
+                masks,
+            )?),
+        };
+        let normalize_us = normalize.elapsed().as_micros();
+        let cursor_started = Instant::now();
         if cursor {
             let cursor = xfixes::get_cursor_image(&self.x.conn)
                 .map_err(platform)?
@@ -842,36 +1076,67 @@ impl Capture {
                     let offset = ((y as u32 * width + x as u32) * 4) as usize;
                     for channel in 0..3 {
                         let source = (argb >> (channel * 8)) & 255;
-                        pixels[offset + channel] = (source
-                            + (u32::from(pixels[offset + channel]) * (255 - alpha) + 127) / 255)
-                            .min(255) as u8;
+                        pixels.as_mut()[offset + channel] = (source
+                            + (u32::from(pixels.as_ref()[offset + channel]) * (255 - alpha) + 127)
+                                / 255)
+                            .min(255)
+                            as u8;
                     }
                 }
             }
         }
-        let len = pixels.len();
-        Ok(NativeVideoSample {
-            native_dimensions: None,
-            sequence: 0,
-            format: NativeVideoSampleFormat::Bgra8,
-            width,
-            height,
-            timestamp_ns: 0,
-            duration_ns: 0,
-            captured_at_unix_ms: 0,
-            data: pixels.into(),
-            planes: Arc::from([NativeVideoPlane {
-                offset: 0,
-                len,
+        let cursor_us = cursor_started.elapsed().as_micros();
+        let resize = Instant::now();
+        let [output_width, output_height] = self
+            .resolution
+            .map(|bounds| bounds.fit(width, height, 1))
+            .transpose()?
+            .unwrap_or([width, height]);
+        let scaled = [output_width, output_height] != [width, height];
+        let data: Arc<[u8]> = if scaled {
+            // Resample directly from the X reply buffer into final shared output;
+            // no full-resolution Arc and no temporary resized Vec are needed.
+            resize_capture_pixels(
+                pixels.as_ref(),
                 width,
                 height,
-                stride: width * 4,
+                width as usize * 4,
+                output_width,
+                output_height,
+            )?
+        } else {
+            pixels.into_arc()
+        };
+        let resize_us = resize.elapsed().as_micros();
+        if super::frame_trace_enabled() {
+            super::trace_frame(serde_json::json!({"kind":"x11","sequence":sequence,
+            "captured_at_unix_ms":captured_at_unix_ms,"geometry_us":geometry_us,"readback_us":readback_us,
+            "readback_backend":readback_backend,"normalize_us":normalize_us,"cursor_us":cursor_us,"resize_us":resize_us,"total_us":start.elapsed().as_micros(),
+            "source_width":width,"source_height":height,"width":output_width,"height":output_height}));
+        }
+        Ok(NativeVideoSample {
+            native_dimensions: scaled.then_some([width, height]),
+            sequence,
+            format: NativeVideoSampleFormat::Bgra8,
+            width: output_width,
+            height: output_height,
+            timestamp_ns: 0,
+            duration_ns: 0,
+            captured_at_unix_ms,
+            planes: Arc::from([NativeVideoPlane {
+                offset: 0,
+                len: data.len(),
+                width: output_width,
+                height: output_height,
+                stride: output_width * 4,
             }]),
+            data,
         })
     }
 }
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.readback.detach(&self.x.conn);
         let _ = damage::destroy(&self.x.conn, self.damage);
         if self.redirected {
             let _ = composite::unredirect_window(
@@ -882,6 +1147,32 @@ impl Drop for Capture {
         }
         let _ = self.x.conn.flush();
     }
+}
+fn vanished_window(error: &x11rb::errors::ReplyError) -> bool {
+    matches!(error,x11rb::errors::ReplyError::X11Error(e) if e.error_kind==x11rb::protocol::ErrorKind::Window)
+}
+fn decode_pixels_owned(
+    mut data: Vec<u8>,
+    width: u32,
+    height: u32,
+    bpp: u8,
+    pad: u8,
+    little: bool,
+    masks: [u32; 3],
+) -> DesktopResult<Vec<u8>> {
+    if bpp == 32 && [8, 16, 32].contains(&pad) && little && masks == [0xff0000, 0xff00, 0xff] {
+        let len = u64::from(width) * u64::from(height) * 4;
+        if len > MAX_FRAME_BYTES as u64 || data.len() != len as usize {
+            return Err(platform("invalid X11 image length"));
+        }
+        // XRGB's unused byte is not alpha. Normalize it while reusing the
+        // connection's reply allocation rather than decoding/copying every channel.
+        for pixel in data.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        return Ok(data);
+    }
+    decode_pixels(&data, width, height, bpp, pad, little, masks)
 }
 fn decode_pixels(
     data: &[u8],

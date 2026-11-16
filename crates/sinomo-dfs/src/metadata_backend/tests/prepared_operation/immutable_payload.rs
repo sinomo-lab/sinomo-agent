@@ -57,7 +57,7 @@ fn native_replica_validation_restores_all_rows_after_success_and_late_rejection(
     for _ in 0..2 {
         assert_eq!(
             earlier
-                .validate_replica_journal_suffix(&suffix, Some(&operation))
+                .validate_replica_journal_suffix(&suffix, Some(&operation), config.epoch)
                 .unwrap(),
             Some(digest.clone())
         );
@@ -70,7 +70,7 @@ fn native_replica_validation_restores_all_rows_after_success_and_late_rejection(
     *owner_epoch += 1;
     assert!(
         earlier
-            .validate_replica_journal_suffix(&suffix, Some(&wrong_operation))
+            .validate_replica_journal_suffix(&suffix, Some(&wrong_operation), config.epoch)
             .is_err()
     );
     assert_restored(&earlier);
@@ -78,7 +78,7 @@ fn native_replica_validation_restores_all_rows_after_success_and_late_rejection(
     missing_prepare.remove(prepare_index);
     assert!(
         earlier
-            .validate_replica_journal_suffix(&missing_prepare, None)
+            .validate_replica_journal_suffix(&missing_prepare, None, config.epoch)
             .is_err()
     );
     assert_restored(&earlier);
@@ -91,16 +91,31 @@ fn native_replica_validation_restores_all_rows_after_success_and_late_rejection(
     digest.payload_digest.push_str("-corrupt");
     assert!(
         earlier
-            .validate_replica_journal_suffix(&changed_commit, None)
+            .validate_replica_journal_suffix(&changed_commit, None, config.epoch)
             .is_err()
     );
     assert_restored(&earlier);
     assert_eq!(
         earlier
-            .validate_replica_journal_suffix(&suffix, None)
+            .validate_replica_journal_suffix(&suffix, None, config.epoch)
             .unwrap(),
         None
     );
+    assert_restored(&earlier);
+    // An old-style current-epoch producer omits counts. Its immutable body
+    // remains structurally decodable, but fresh native ingress cannot accept
+    // that body and erase the actual count-bearing predecessor.
+    let mut missing_count = suffix.clone();
+    let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &mut missing_count[prepare_index].mutation else { unreachable!() };
+    let mut payload = (*record.payload).clone();
+    payload.transaction.objects[0].namespace_link_count = None;
+    record.payload = std::sync::Arc::new(payload);
+    record.digest = crate::DfsPreparedOperationDigest::at_sequence(&record.payload, record.digest.prepare_sequence).unwrap();
+    record.validate().unwrap();
+    let changed_digest = record.digest.clone();
+    let DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } = &mut missing_count.last_mut().unwrap().mutation else { unreachable!() };
+    *digest = changed_digest;
+    assert!(earlier.validate_replica_journal_suffix(&missing_count, None, config.epoch).is_err());
     assert_restored(&earlier);
     // Neither failed nor successful validation alters the actual producer.
     assert_eq!(

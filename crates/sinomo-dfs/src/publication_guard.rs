@@ -545,11 +545,13 @@ impl DfsPublicationExecutionOwners {
     /// Open through the same physical owner retained by this admission.
     /// Representation admission does not grant metadata publication authority.
     pub(crate) fn open_native_content(&self) -> Result<crate::LocalContentStore> {
-        self._data_owner.open_native_content().map_err(|error| {
-            MetadataBackendError::Rejected {
+        self._data_owner.open_native_content().map_err(|error| match error {
+            crate::runtime_host::DfsRuntimeError::StoragePreparationPending { root, processed_records } =>
+                MetadataBackendError::StoragePreparationPending { root, processed_records },
+            error => MetadataBackendError::Rejected {
                 code: crate::DfsMetadataRejectionCode::Other,
                 message: error.to_string(),
-            }
+            },
         })
     }
     pub(crate) fn from_runtime(
@@ -728,7 +730,7 @@ impl DfsSourceAdoptionContextSlot {
             previous: Some(previous),
         }
     }
-    fn offer(&self) -> Option<crate::DfsSourceAdoptionOffer> {
+    pub(crate) fn offer(&self) -> Option<crate::DfsSourceAdoptionOffer> {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1597,7 +1599,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 message: "publication names no exact durable prepare".into(),
             });
         }
-        let payload = record.payload;
+        let payload = Arc::clone(&record.payload);
         let scope = backend.publication_owner_scope(&digest.file_system_id, &digest.shard_id)?;
         let execution = self.publication_execution.current();
         let runtime_owner =
@@ -1641,6 +1643,18 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 .ok_or_else(|| crate::DfsError::Metadata {
                     message: "publication requires the host's coherent shard configuration".into(),
                 })?;
+            if digest.owner_epoch == 1 && digest.operation_id == crate::default_cluster::genesis::genesis_operation_id(&context.shard) {
+                context.namespace_catalog.as_ref().ok_or_else(|| crate::DfsError::Metadata {
+                    message: "native genesis requires its actual complete configuration catalog".into(),
+                })?.validate_native_genesis_preparation(&record)?;
+                let generation = crate::storage_generation::read_generation(scope.root())?;
+                let original = crate::default_cluster::genesis::original_genesis_file_system(&record, &context.shard)?;
+                if generation.identity.file_system_id != digest.file_system_id
+                    || generation.identity.shard_id != digest.shard_id
+                    || !generation.identity.matches_native_file_system_storage(original.metadata_storage.as_ref()) {
+                    return Err(crate::DfsError::Metadata { message: "native genesis header differs from its original storage binding".into() });
+                }
+            }
             let requirement = self.metadata_commit_requirement(&context, &payload)?;
             let shard = context.shard;
             let batch = self

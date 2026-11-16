@@ -1328,6 +1328,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
         path: "/services/dfs-scale/network-blob.bin".to_string(),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
@@ -2594,6 +2595,7 @@ fn tree_file_metadata(
             "{}/file-{index:08}.bin",
             tree_dir_path(root_path, index % dirs)
         ),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],
@@ -2667,6 +2669,7 @@ fn file_metadata(
         object_id: DfsObjectId::from_legacy_named(format!("dfsbenchobj{index:016x}"))?,
         file_system_id: sifs_id(),
         path: format!("{}/file-{index:08}.bin", bench_dir(index % dirs)),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         owner_node_id: owner.clone(),
         current_locations: vec![owner.clone()],

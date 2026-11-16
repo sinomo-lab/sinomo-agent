@@ -2907,15 +2907,9 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
             DfsWriteOptions::replicated_eventual(vec![services_primary.clone()]),
         )
         .unwrap();
-    runtime.install_fault(crate::test_support::DfsTestFaultRule {
-        source: Some(root_primary.clone()),
-        target: Some(users_primary.clone()),
-        route: Some(crate::DFS_DATA_NAMESPACE_ROUTE.into()),
-        call_id: None,
-        origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
-        remaining_hits: 32,
-        action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-    });
+    let root_carrier_fault = super::cross_shard::fail_native_adoption_carrier(
+        &runtime, &root_primary, &users_primary, root_path, root_target,
+    );
     let root_operation = sinomo_core::Id::generate().to_string();
     assert!(
         root.posix_rename_with_operation_id(root_path, root_target, &root_operation)
@@ -2959,6 +2953,8 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
     // Keep the older Root read image without suppressing any assigned
     // participant's journal or snapshot route. Full native completion still
     // requires all three real metadata replicas.
+    root_carrier_fault.assert_observed_job(&root_job.job_id);
+    drop(root_carrier_fault);
     runtime.clear_faults();
     let completed = root
         .posix_resume_namespace_job_bounded(&root_job.job_id, 512)
@@ -2986,15 +2982,9 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         "the original Root request must not remain for background replay: {root_requests:?}"
     );
 
-    runtime.install_fault(crate::test_support::DfsTestFaultRule {
-        source: Some(services_primary.clone()),
-        target: Some(users_primary.clone()),
-        route: Some(crate::DFS_DATA_NAMESPACE_ROUTE.into()),
-        call_id: None,
-        origin: Some(crate::test_support::DfsTestRpcOrigin::RegisteredHost),
-        remaining_hits: 32,
-        action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-    });
+    let services_carrier_fault = super::cross_shard::fail_native_adoption_carrier(
+        &runtime, &services_primary, &users_primary, services_path, services_target,
+    );
     let services_operation = sinomo_core::Id::generate().to_string();
     assert!(
         services
@@ -3139,6 +3129,8 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         ),
         "the real exact Root snapshot cannot erase another shard's live guard"
     );
+    services_carrier_fault.assert_observed_job(&services_job.job_id);
+    drop(services_carrier_fault);
     runtime.clear_faults();
     services
         .posix_resume_namespace_job_bounded(&services_job.job_id, 512)

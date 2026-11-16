@@ -139,7 +139,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // deriving counts through the existing native authority queries.
             // A private replica aggregate would decode every shard again.
             return self.with_stat_deadline(|service| {
-                service.with_stat_read_rounds(|service| {
+                service.with_stat_read(|service| {
                     service.stat_object_from_authorities(&object, &path, shard_snapshot.as_deref())
                 })
             });
@@ -348,6 +348,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let requested = self.resolve_posix_dot_components_distributed(path)?;
         // Keep a trailing slash: it requires the target to be a directory.
         let lookup = path_after_dot_resolution(path, &requested);
+        let requires_directory =
+            crate::posix_path::normalize_posix_path_with_trailing_directory(&lookup)?.1;
         let (path, snapshot) =
             self.with_local_primary_stat_read_snapshot(&requested, |service, shard_snapshot| {
                 service.with_metadata_lookup_cache_mut(|service| {
@@ -364,9 +366,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Ok((path, shard_snapshot.map(<[_]>::to_vec)))
                 })
             })?;
-        // Release lookup snapshots before collecting and fencing authority
-        // views, so a local authority revalidation cannot reuse a pinned past.
-        self.stat_path_from_authorities(&path, snapshot.as_deref())
+        // The owner read may see a replacement after path resolution. Do not
+        // turn a newly installed symlink into lstat or lose a trailing slash.
+        let stat = self.stat_path_from_authorities(&path, snapshot.as_deref())?;
+        if stat.kind == DfsObjectKind::Symlink {
+            return Err(DfsPosixError::Conflict {
+                path,
+                reason: "resolved stat target changed to a symbolic link".into(),
+            });
+        }
+        if requires_directory && stat.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory { path });
+        }
+        Ok(stat)
     }
 
     pub(crate) fn file_history_capture_object(
@@ -428,6 +440,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn posix_lstat_authoritative(&mut self, path: &str) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
+        let requires_directory =
+            crate::posix_path::normalize_posix_path_with_trailing_directory(path)?.1;
         let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_distributed_read_path_not_in_cross_shard_flight(
             &sifs_file_system_id(),
@@ -439,7 +453,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         let snapshot = self.refresh_sifs_metadata_shards()?;
         self.ensure_distributed_read_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
-        self.stat_path_from_authorities(&path, snapshot.as_deref())
+        let stat = self.stat_path_from_authorities(&path, snapshot.as_deref())?;
+        if requires_directory && stat.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory { path });
+        }
+        Ok(stat)
     }
 
     /// Inspect the final DFS namespace record without resolving either a
@@ -492,7 +510,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if object.kind == DfsObjectKind::Tombstone {
                     return Err(DfsPosixError::NotFound { path });
                 }
-                service.with_stat_read_rounds(|service| {
+                service.with_stat_read(|service| {
                     let stat = service.stat_object_from_authorities(
                         &object,
                         &path,
@@ -548,7 +566,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // An object read from its authority takes its link count there too.
         let path = object.path.clone();
         self.with_stat_deadline(|service| {
-            service.with_stat_read_rounds(|service| {
+            service.with_stat_read(|service| {
                 service.stat_object_from_authorities(&object, &path, None)
             })
         })

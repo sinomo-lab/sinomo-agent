@@ -203,7 +203,7 @@ impl Core {
                 .unwrap();
                 read.begin_inspection_snapshot().unwrap();
                 let prefix = crate::DfsMetadataBackend::metadata_prefix_proof(&read, &id).unwrap();
-                let tables = read.export_table_snapshot();
+                let tables = read.export_table_snapshot().unwrap();
                 read.end_inspection_snapshot();
                 serde_json::json!({"shard":id,"prefix":prefix,"tables":tables})
             })

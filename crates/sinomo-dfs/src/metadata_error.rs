@@ -25,6 +25,8 @@ pub enum MetadataBackendError {
         root: PathBuf,
         processed_records: usize,
     },
+    #[error("storage preparation caller budget exhausted during {work}")]
+    PreparationBudgetExhausted { work: &'static str },
     #[error("original {family} {identity} has no immutable source custody for {requirement}")]
     MissingOriginalSourceCustody {
         family: String,

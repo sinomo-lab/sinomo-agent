@@ -157,6 +157,8 @@ fn response_delivery_rejects_one_oversized_journal_without_consuming_custody() {
         Vec::new(),
         vec![crate::DfsPreparedMetadataEffect::PutFileSystem {
             file_system: crate::DfsFileSystem {
+                catalog_generation: 0,
+                metadata_storage: None,
                 file_system_id: crate::sifs_file_system_id(),
                 owner_node_id: NodeId::from_legacy_named("delivery-primary").unwrap(),
                 display_name: "x".repeat(payload_bytes),

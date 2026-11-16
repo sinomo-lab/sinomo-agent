@@ -1148,6 +1148,7 @@ mod tests {
             object_id: id(object_id),
             file_system_id: id("namespace-feed-filesystem"),
             path: path.to_string(),
+            namespace_link_count: (kind).initial_namespace_link_count(),
             kind,
             tombstone_provenance: None,
             owner_node_id: node("namespace-feed-owner"),

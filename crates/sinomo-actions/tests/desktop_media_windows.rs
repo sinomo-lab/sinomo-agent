@@ -223,7 +223,7 @@ async fn app_component_streams_live_video_over_the_shared_rpc_media_path() {
     let header: serde_json::Value = result.response.decode_body().unwrap();
     assert_eq!(
         header["version"],
-        sinomo_video::stream::VIDEO_STREAM_VERSION
+        sinomo_video::stream::GEOMETRY_STREAM_VERSION
     );
     let mut body = result.body.cancel_on_drop();
     let (first, first_frame) = tokio::time::timeout(

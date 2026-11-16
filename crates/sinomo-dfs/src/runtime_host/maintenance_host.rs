@@ -86,6 +86,28 @@ pub fn queue_namespace_reconciliation_work(
     Ok(())
 }
 
+/// Drop idle callbacks belonging to this retired component. Their durable
+/// source jobs/requests remain the restart authority. Running callbacks retain
+/// the lease until the existing runtime task drain actually joins them.
+pub(crate) fn release_idle_namespace_reconciliation_work(
+    data_dir: &SinomoDataDir,
+    owner: &Arc<DfsDataOwnerLock>,
+) {
+    let mut retired = Vec::new();
+    if let Some(requests) = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS.get() {
+        let mut requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(request) = requests.get_mut(&data_dir.root()) {
+            request.namespace_work.retain(|_, work| {
+                if Arc::ptr_eq(&work.owner, owner) && !work.running.load(Ordering::Acquire) {
+                    retired.push(Arc::clone(work));
+                    false
+                } else { true }
+            });
+        }
+    }
+    drop(retired);
+}
+
 /// Wake ordinary namespace maintenance after current durable job publication.
 /// A wake grants no effect permission and retains no fabricated task or vote.
 pub fn wake_namespace_reconciliation(

@@ -155,6 +155,7 @@ struct NativeTargetTerminal {
     commit: crate::DfsPreparedOperationCommitReference,
 }
 struct SourceSession {
+    original_job: Arc<crate::DfsNamespaceJobRecord>,
     capture: Arc<crate::DfsSourceAdoptionSourceCapture>,
     generation: u64,
     offer: DfsSourceAdoptionOffer,
@@ -170,6 +171,7 @@ struct SourceSession {
 }
 #[derive(Clone)]
 struct CompletedSource {
+    original_job: Arc<crate::DfsNamespaceJobRecord>,
     offer: DfsSourceAdoptionOffer,
     family: DfsCrossShardSourceFamily,
     scope: DfsPreparedOperationScope,
@@ -376,7 +378,7 @@ impl DfsSourceAdoptionActor {
             destination,
         };
         self.require_current(&offer)?;
-        self.verify_original_job(&offer, &capture.family().source_object.path)?;
+        let original_job = Arc::new(self.bound_original_job(&offer, &capture.family().source_object.path)?);
         if !capture.scope().root().starts_with(&self.data_root)
             || capture.scope().file_system_id() != &offer.source_config.file_system_id
             || capture.scope().shard_id().0 != offer.source_config.shard_id
@@ -396,6 +398,7 @@ impl DfsSourceAdoptionActor {
             .insert(
                 offer.session_id.clone(),
                 Arc::new(SourceSession {
+                    original_job,
                     capture,
                     generation: generation.0,
                     offer: offer.clone(),
@@ -414,6 +417,14 @@ impl DfsSourceAdoptionActor {
     }
 
     fn verify_original_job(&self, offer: &DfsSourceAdoptionOffer, source_path: &str) -> Result<()> {
+        self.bound_original_job(offer, source_path).map(drop)
+    }
+
+    pub(crate) fn bound_original_job(
+        &self,
+        offer: &DfsSourceAdoptionOffer,
+        source_path: &str,
+    ) -> Result<crate::DfsNamespaceJobRecord> {
         let reply = if offer.job_offer.coordinator_node_id == self.node {
             self.inspect_original_job(&self.node, &offer.job_offer)?
         } else {
@@ -435,7 +446,7 @@ impl DfsSourceAdoptionActor {
                 "actual original job does not bind this source family destination",
             ));
         }
-        Ok(())
+        Ok(reply.job)
     }
     pub(crate) fn wake_reconciliation(self: &Arc<Self>) {
         if !self.has_pending_custody().unwrap_or(true)
@@ -629,6 +640,7 @@ impl DfsSourceAdoptionActor {
                         .insert(
                             session.offer.session_id.clone(),
                             CompletedSource {
+                                original_job: Arc::clone(&session.original_job),
                                 offer: session.offer.clone(),
                                 family: session.capture.family().clone(),
                                 scope: scope.clone(),
@@ -680,6 +692,17 @@ impl DfsSourceAdoptionActor {
             }
         }
         Ok(false)
+    }
+
+    fn cancel_undispatched_local_offer(&self, offer: &DfsSourceAdoptionOffer) -> Result<bool> {
+        if offer.source_node_id != self.node || offer.job_offer.coordinator_node_id != self.node {
+            return Ok(false);
+        }
+        // Presence and complete offer equality come from the actual retained
+        // owner. Missing custody is not evidence authorizing a different release.
+        drop(self.source_session(offer, false)?);
+        self.cancel_unclaimed(offer)?;
+        Ok(true)
     }
 
     pub(crate) fn cancel_unclaimed(&self, offer: &DfsSourceAdoptionOffer) -> Result<()> {
@@ -900,6 +923,7 @@ impl DfsSourceAdoptionActor {
                 .insert(
                     offer.session_id.clone(),
                     CompletedSource {
+                        original_job: Arc::clone(&session.original_job),
                         offer: offer.clone(),
                         family: session.capture.family().clone(),
                         scope: response.target_scope.clone(),
@@ -1130,6 +1154,12 @@ impl DfsSourceAdoptionActor {
             bound_digest: OnceLock::new(),
         });
         target.witness = Some(Arc::downgrade(&witness));
+        #[cfg(test)]
+        {
+            drop(target_claims);
+            let observer = CLAIM_OBSERVERS.lock().unwrap_or_else(|error| error.into_inner()).remove(&self.data_root);
+            if let Some(observer) = observer { observer(self, offer); }
+        }
         Ok(witness)
     }
 
@@ -1433,6 +1463,84 @@ impl DfsSourceAdoptionActor {
         })
     }
 }
+/// Count-changing promotion is authorized by the same retained original job
+/// as the source family. Its selected destination alias remains an atomic
+/// prepare predicate, so a vanished/replaced alias cannot become an ordinary
+/// move with an incorrectly decremented canonical count.
+fn validate_adoption_namespace_count(
+    job: &crate::DfsNamespaceJobRecord,
+    source: &crate::DfsObjectMetadata,
+    destination: &crate::DfsObjectMetadata,
+    payload: &DfsPreparedOperationPayload,
+) -> Result<()> {
+    if let Some(plan) = job.directory_move_counts()?.and_then(|counts| counts.parent_participants.as_ref()) {
+        plan.validate_for_job(job)?;
+        if plan.phase != crate::DfsParentCountPhase::Issued {
+            return Err(error("parent-bound namespace effects have no durable issuance decision"));
+        }
+    }
+    let mut promotion = None;
+    for frame in &job.pending_frames {
+        if let crate::DfsNamespaceJobFrame::CrossShardAdopt {
+            moved_object, old_path, promotion_alias: Some(alias), ..
+        } = frame {
+            if moved_object == destination
+                && crate::namespace::metadata_path(old_path) == crate::namespace::metadata_path(&source.path)
+            {
+                if promotion.as_ref().is_some_and(|prior| *prior != alias) {
+                    return Err(error("original promotion job changes its selected alias"));
+                }
+                promotion = Some(alias);
+            }
+        }
+    }
+    if source.object_id != destination.object_id || source.file_system_id != destination.file_system_id
+        || source.kind != destination.kind
+        || (promotion.is_some() && source.kind == crate::DfsObjectKind::Directory)
+    {
+        return Err(error("counted adoption changed its canonical identity or kind"));
+    }
+    if source.kind == crate::DfsObjectKind::Hardlink {
+        if promotion.is_some() || destination.kind != source.kind
+            || source.namespace_link_count.is_some() || destination.namespace_link_count.is_some()
+        {
+            return Err(error("alias adoption cannot author a canonical namespace count"));
+        }
+        return Ok(());
+    }
+    let expected_count = crate::posix::updated_namespace_link_count(
+        source, if promotion.is_some() { -1 } else { 0 },
+    ).map_err(error)?;
+    if destination.namespace_link_count != Some(expected_count) {
+        return Err(error("adoption changes the original canonical namespace count"));
+    }
+    if let Some(alias) = promotion {
+        let changes_namespace = !payload.transaction.objects.is_empty()
+            || payload.metadata_effects.iter().any(|effect| matches!(effect,
+                crate::DfsPreparedMetadataEffect::PutObject { .. }
+                | crate::DfsPreparedMetadataEffect::FinalizeCrossShardSourceEviction { .. }));
+        // Exact replay may reconcile retained content without rewriting any
+        // namespace row. It must not restore or decrement the canonical head.
+        if !changes_namespace {
+            return Ok(());
+        }
+        if !payload.transaction.objects.iter().any(|object|
+            object.object_id == destination.object_id
+                && object.namespace_link_count == destination.namespace_link_count)
+            || !payload.expected_object_versions.iter().any(|expected|
+                expected.object_id == alias.object_id
+                    && expected.expected_version.as_ref() == Some(&alias.version))
+            || !payload.expected_path_occupants.iter().any(|expected|
+                crate::namespace::metadata_path(&expected.path)
+                    == crate::namespace::metadata_path(&destination.path)
+                    && expected.expected_object_id.as_ref() == Some(&alias.object_id))
+        {
+            return Err(error("promotion prepare omits the original selected alias predicate"));
+        }
+    }
+    Ok(())
+}
+
 /// Live, private source authorization; serialized source rows create none.
 pub struct DfsSourceAdoptionWitness {
     actor: Arc<DfsSourceAdoptionActor>,
@@ -1537,6 +1645,14 @@ impl DfsSourceAdoptionWitness {
                 return Err(error("job writer lease lost its actual custody"));
             }
             return Ok(None);
+        }
+        if let DfsSourceAdoptionPurpose::Adoption(family) = &self.purpose {
+            let original_job = self.actor.bound_original_job(
+                &self.offer, &family.source_object.path,
+            )?;
+            validate_adoption_namespace_count(
+                &original_job, &family.source_object, &self.offer.destination, payload,
+            )?;
         }
         let reply = self.actor.call(
             &self.offer.source_node_id,
@@ -1723,6 +1839,18 @@ pub(crate) struct CompletedRemoteTargetNamespacePhase {
     pub(crate) target: NodeId,
 }
 impl RemoteNamespacePhase {
+    /// The host has not returned this phase for dispatch. Release only an
+    /// exact local source/job offer that the real actor still proves unclaimed.
+    pub(crate) fn cancel_local_before_failed_restore(&self) -> Result<bool> {
+        match self {
+            Self::PublishTarget(phase) => match phase.source_offer()? {
+                Some(offer) => phase.actor.cancel_undispatched_local_offer(offer),
+                None => Ok(false),
+            },
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn cancel_before_dispatch(&self) -> Result<()> {
         match self {
             Self::PrepareSource { .. } | Self::AwaitRepairProgress(_) => Ok(()),
@@ -1775,6 +1903,27 @@ impl RemoteNamespacePhase {
         }
     }
 }
+#[cfg(test)]
+impl RemoteNamespacePhase {
+    pub(crate) fn trace_undispatched_custody(&self) {
+        let Self::PublishTarget(phase) = self else { return; };
+        let Ok(Some(offer)) = phase.source_offer() else {
+            tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "undispatched-namespace-custody", source_offer = false, operation = ?phase.command.operation);
+            return;
+        };
+        let observation = std::iter::once(phase.actor.as_ref()).chain(phase.actor.predecessors.iter().map(Arc::as_ref))
+            .find_map(|actor| actor.sessions.lock().ok().and_then(|sessions| sessions.get(&offer.session_id).map(|session| (
+                session.offer == *offer,
+                session.claim.try_lock().ok().map(|claim| claim.is_some()),
+                format!("{:?}", session.capture.scope()),
+                Arc::strong_count(&session.capture),
+            ))));
+        tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "undispatched-namespace-custody", source_offer = true,
+            source_session = %offer.session_id, source_node = %offer.source_node_id, job = %offer.job_id,
+            actor_node = %phase.actor.node, target = %phase.pending.primary_node_id, held_source = ?observation);
+    }
+}
+
 impl RemoteTargetNamespacePhase {
     fn source_offer(&self) -> Result<Option<&DfsSourceAdoptionOffer>> {
         match &self.command.operation {
@@ -1784,6 +1933,7 @@ impl RemoteTargetNamespacePhase {
             crate::DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
             | crate::DfsNamespaceOperation::AdoptHardlinkAlias { .. }
             | crate::DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+            | crate::DfsNamespaceOperation::ParentCountParticipant { .. }
             | crate::DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => Ok(None),
             _ => Err(error(
                 "owned target phase contains another namespace operation",
@@ -1792,8 +1942,22 @@ impl RemoteTargetNamespacePhase {
     }
     fn dispatch(self) -> std::result::Result<CompletedRemoteTargetNamespacePhase, crate::DfsError> {
         let actor = self.actor.clone();
+        let local_offer = self.source_offer()?.filter(|offer|
+            offer.source_node_id == actor.node && offer.job_offer.coordinator_node_id == actor.node).cloned();
         let outcome = self.dispatch_inner();
         if outcome.is_err() {
+            // Delivery uncertainty says nothing about current source custody.
+            // The existing guarded cancellation can revoke only an exact,
+            // still-unclaimed offer and excludes every later claim atomically.
+            // A claimed effect keeps its writers and original recovery owner.
+            // Restrict this cleanup to local custody: no fresh RPC deadline is
+            // added after the original carrier budget has expired.
+            if let Some(offer) = local_offer {
+                if let Err(failure) = actor.cancel_unclaimed(&offer) {
+                    tracing::debug!(source_session=%offer.session_id, job=%offer.job_id,
+                        error=%failure, "failed carrier retains claimed or unresolved source custody");
+                }
+            }
             actor.wake_reconciliation();
         }
         outcome
@@ -1982,9 +2146,49 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
 }
 
 #[cfg(test)]
+type ClaimObserver = Box<dyn FnOnce(&DfsSourceAdoptionActor, &DfsSourceAdoptionOffer) + Send>;
+#[cfg(test)]
+static CLAIM_OBSERVERS: Mutex<BTreeMap<PathBuf, ClaimObserver>> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
 mod guarded_kernel_terminal_tests {
     use super::*;
     use crate::{DfsNamespaceOperation, DfsNetworkMessage, DfsWriteOptions};
+
+    #[test]
+    fn undispatched_restore_cleanup_rejects_changed_or_claimed_native_custody() {
+        let node = NodeId::generate();
+        let mut native = crate::test_runtime::DfsTestRuntime::new("native-undispatched-claimed-custody", node.clone()).unwrap();
+        native.start_nodes().unwrap();
+        let root = native.data_dir(&node).root().to_owned();
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&observed);
+        CLAIM_OBSERVERS.lock().unwrap().insert(root.clone(), Box::new(move |actor, offer| {
+            let physical = {
+                let session = actor.source_session(offer, false).unwrap();
+                assert!(session.claim.lock().unwrap().is_some(), "actual production target owns the claim");
+                session.capture.scope().root().to_owned()
+            };
+            let mut changed = offer.clone();
+            changed.transfer_id.push_str("-changed");
+            assert!(actor.cancel_undispatched_local_offer(&changed).is_err());
+            let mut foreign = offer.clone();
+            foreign.source_node_id = NodeId::generate();
+            assert!(!actor.cancel_undispatched_local_offer(&foreign).unwrap());
+            assert!(actor.cancel_undispatched_local_offer(offer).is_err(), "claimed actual effect must retain custody");
+            assert!(actor.source_session(offer, false).unwrap().claim.lock().unwrap().is_some());
+            assert!(crate::metadata_lock::try_metadata_inspection_lock(physical.clone(), crate::metadata_cursor::journal_write_lock_path(&physical)).unwrap().is_none(), "the real source writer remains held");
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let mut client = native.client(&node).unwrap();
+        client.posix_write_file("/services/claimed-restore-source", b"claimed bytes", DfsWriteOptions::replicated_eventual(vec![node.clone()])).unwrap();
+        client.posix_rename("/services/claimed-restore-source", "/users/claimed-restore-target").unwrap();
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(client.posix_read_file_distributed("/users/claimed-restore-target").unwrap(), b"claimed bytes");
+        CLAIM_OBSERVERS.lock().unwrap().remove(&root);
+        drop(client);
+        native.close().unwrap();
+    }
 
     #[test]
     fn actual_native_terminal_cut_survives_a_busy_writer_without_authoring_or_missing_proof() {

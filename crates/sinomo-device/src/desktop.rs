@@ -1,5 +1,9 @@
 //! Platform-neutral app-use contracts. Native OS integration lives in the
 //! independently loaded modules/desktop/app-use provider.
+pub mod accessibility;
+mod frame_rate;
+pub use frame_rate::FrameRateCeiling;
+
 use crate::NativeVideoSample;
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::LocalNodePermissionStore;
@@ -97,6 +101,12 @@ pub struct DesktopTargetInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopCapabilities {
+    /// Native capture owns an availability-driven admission ceiling.
+    #[serde(default)]
+    pub frame_rate_ceiling: bool,
+    /// Semantic observation/control independent of video capture.
+    #[serde(default)]
+    pub accessibility: bool,
     #[serde(default)]
     pub capture_formats: Vec<crate::NativeVideoSampleFormat>,
     pub platform: String,
@@ -363,6 +373,11 @@ fn default_cursor() -> bool {
 
 /// Continuous native samples consumed by the shared media encoder.
 pub trait DesktopFrameSource: Send {
+    /// An enforced native ceiling lets consumers avoid a second rate limiter.
+    fn frame_rate_ceiling(&self) -> Option<u32> {
+        None
+    }
+
     /// Recheck authority even while the consumer is backpressured.
     fn check_active(&self) -> DesktopResult<()> {
         Ok(())
@@ -381,6 +396,9 @@ pub trait DesktopFrameSource: Send {
     ) -> DesktopResult<Option<NativeVideoSample>>;
 }
 impl<T: DesktopFrameSource + ?Sized> DesktopFrameSource for Box<T> {
+    fn frame_rate_ceiling(&self) -> Option<u32> {
+        (**self).frame_rate_ceiling()
+    }
     fn check_active(&self) -> DesktopResult<()> {
         (**self).check_active()
     }
@@ -514,4 +532,4 @@ mod tests {
 }
 
 mod capture;
-pub use capture::{CaptureResolution, fit_capture_sample};
+pub use capture::{CaptureResolution, fit_capture_sample, resize_capture_pixels};

@@ -529,6 +529,8 @@ mod tests {
         store_anchor(&stage, &head).unwrap();
         let inventory = super::super::source::discover(&root).unwrap();
         let cut = MetadataSourceCut {
+            retained_placement_reservations: Vec::new(),
+            namespace_count_cohort: None,
             source_root: root,
             source_identity: inventory.fingerprint.clone(),
             scope_shard: DfsMetadataShardId::new("target"),

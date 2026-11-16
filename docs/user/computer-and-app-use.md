@@ -1,6 +1,9 @@
 # App Use
 
-App Use provides one skill and one control tool with two explicit modes.
+App Use provides one skill and one control tool. Prefer semantic Accessibility
+observation and actions when the platform advertises them. The agent explicitly
+chooses observations and can combine them with screenshots or video. Coordinate
+input retains two explicit modes.
 Background OS window messages are preferred: they do not move the user's pointer,
 take keyboard focus, or require the app to be foreground. The agent can select
 raw desktop input when background control is unsuitable or unavailable on the
@@ -20,7 +23,7 @@ Native capture and input are implemented in the independently built
 | Windows | Background and raw modes using Windows Graphics Capture/D3D11, PostMessageW, SendInput and conditional InputInjector |
 | Linux X11 | Background client-window capture and synthetic events; raw virtual-desktop capture and XTest input; no gamepads |
 | Linux Wayland | Explicit raw mode with locally approved portal capture/input; ScreenCast-only backends provide capture without input |
-| Android | Explicit raw display mode, MediaProjection capture, accessibility touch/text input; no background mode or gamepads |
+| Android | Persistent Accessibility observations, screenshots and semantic actions; explicit raw touch/text input; independent MediaProjection screen video |
 | Other systems | Explicitly unsupported |
 
 Common actions, events, media encoding and transmission remain in the host
@@ -32,7 +35,7 @@ Build and activate the OS provider with the ordinary native-module lifecycle:
 
 ```powershell
 cargo build -p sinomo-app-use-module
-sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v2 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
+sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v3 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
 ```
 
 Upgrade the app/daemon and provider together; their capture interface versions
@@ -46,9 +49,19 @@ for build dependencies and portal prerequisites.
 See the provider's [Android setup](../../modules/desktop/app-use/README.md#android)
 for APK packaging and native artifact activation. On Android, open Sinomo and
 enable Remote Management locally, then use the **Sinomo App Use** launcher entry
-to enable accessibility, share the display, and grant capture with optional
-input for that exact share. Each new share needs a fresh grant. Android OS consent
-does not turn on Remote Management automatically.
+to enable Accessibility and allow persistent observation with optional control.
+These grants survive agent sessions and app switches. Disabling Accessibility in
+Android Settings or revoking App Use access locally removes access; neither
+changes a separate screen-sharing session. Android OS consent does not enable
+Remote Management automatically. App Use input and semantic actions cannot
+operate Sinomo's own consent controls or approve its screen-sharing dialog.
+
+For continuous screen video, start screen sharing separately and grant viewing
+and stop access to that share. The OS dialog authorizes the whole default display.
+Sharing continues with no viewers, after agent disconnects, and while other apps
+are foreground. Only an explicit user/authorized-agent stop, Android interruption,
+or fatal capture error ends it. Android requires a fresh OS grant after a
+projection ends; Sinomo never caches or replays that token.
 
 The linked `module.app-use` host service exposes the shared tools and media
 routes. Its existing Settings/CLI enablement controls apply:
@@ -78,12 +91,65 @@ boundary. Revocation stops video and releases held inputs. Neither tool changes
 permissions. Windows identities contain handle, PID, thread ID and process
 creation time; re-enumerate after recreation.
 Linux identities use the X11 window ID, the server-reported local owner PID and
-process start time. Android display identities change on each screen share;
-rotation ends the old share to prevent input using stale coordinates.
+process start time. Android Accessibility uses a persistent display resource;
+projection identities belong to one explicitly approved share. Rotation updates
+projection geometry without changing its identity or ending sharing. Coordinate
+input leases reject stale geometry: observe again and open a new input lease.
 Wayland identities belong to one approved portal session. Request raw targets,
 approve the local chooser, then repeat discovery to obtain the exact resource
 to expose. Discovery initially returns an empty list while approval is pending.
 Closing the final lease or stopping sharing invalidates the target.
+
+## Android observation and screen video
+
+When `capabilities.accessibility` is true, enumerate raw targets and prefer
+`android:accessibility:display:0`. Obtain bounded UI nodes with:
+
+```json
+{"action":"observe","target":{"kind":"monitor","device_name":"android:accessibility:display:0"},"max_nodes":64}
+```
+
+Use the returned `snapshot_id` and node `id` in `act`, with `operation.kind`
+`click`, `long_click`, `focus`, `scroll_forward`, `scroll_backward`, or `set_text`
+(the latter includes `text`). Snapshots expire, are consumed by an action, and
+cannot retarget a changed node. Observe after an action to verify its result;
+never replay an uncertain effect. Password text is redacted and protected nodes
+cannot be edited. Screenshot capture on this target requires Android 11 or newer
+and respects Android's screenshot rate limit. It needs no MediaProjection grant.
+
+The generic media API lists cameras and active screen shares through
+`/media/video/devices`; the agent tool's `video_sources` action uses the same
+discovery. Each entry carries a typed `source`. Pass it unchanged to
+`/media/video/capture`, for example:
+
+```json
+{"source":{"kind":"screen","target":{"kind":"monitor","device_name":"TARGET_FROM_VIDEO_DEVICES"}},"lease_ms":60000,"frames_per_second":10,"resolution":{"width":640,"height":640},"transport":"auto","encoding":{"frame_format":"jpeg","max_frame_rate_hz":10,"encoding_quality":85}}
+```
+
+An omitted source retains default-camera capture; `{"kind":"camera"}` selects
+it explicitly. Camera requests retain `duration_ms`; screen requests use
+`lease_ms` so older camera-only servers reject them before accessing a device.
+Both sources share transport negotiation, framing, decoding and stream
+cancellation. Closing a reader ends only its finite capture lease.
+`/media/video/control` accepts `{"action":"stop","source":SOURCE}` for a screen
+share with a separate local `stop` grant. The agent tool's `stop_video` action
+accepts the same `source` and uses that media-owned operation. Neither path
+starts an OS consent dialog.
+The agent can keep semantic observations, screenshots and video open together;
+video is an optional visual source, not a prerequisite for Android control.
+
+Screen and App Use streams advertise version 3. Consumers must understand
+geometry notifications and content bounds; older consumers must reject this
+version. Camera image/H.264 streams retain versions 1/2.
+
+Projection streams preserve their negotiated output dimensions through source
+resizing. Each frame reports native source dimensions and `content_bounds`
+(`[left,top,right,bottom]`) for its letterboxed content. Map positions within that
+rectangle to native coordinates. `notifications` carries
+`media.video.geometry.changed` on the initial frame and subsequent geometry
+changes. Latest-frame consumers coalesce pending changes while retaining the
+original source sequence and timestamp. Do not use a cached image or old input
+lease after a geometry change.
 
 ## Unified agent tools
 
@@ -222,7 +288,7 @@ Attach in category `media` using:
 bounded latest-frame slot and supplies timestamped raw BGRA samples through the
 native ABI output callback as bounded SOBJ byte blobs. Sinomo's shared media path
 performs resizing/encoding and network transmission. Use
-`sinomo_video::stream::read_frame`, `RemoteVideoSource` or
+`sinomo_video::stream::VideoStreamReader`, `RemoteVideoSource` or
 `forward_to_realtime`; consumers cancel abandoned bodies with `cancel_on_drop()`.
 The legacy voice `--computer-stream` option remains a capture-session alias on
 this same route; it does not create another skill, tool or OS provider.

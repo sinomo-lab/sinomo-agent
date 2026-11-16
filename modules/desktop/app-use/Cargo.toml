@@ -12,7 +12,7 @@ ring = "r1"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.app-use.os"
-interface-version = "sinomo.app-use.os.v2"
+interface-version = "sinomo.app-use.os.v3"
 cache-key = "module/desktop/app-use"
 source = "rollout:modules/desktop/app-use"
 
@@ -26,6 +26,8 @@ sinomo-device.workspace = true
 sinomo-module-api.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+serde_json.workspace = true
 x11rb.workspace = true
 zbus.workspace = true
 pipewire.workspace = true

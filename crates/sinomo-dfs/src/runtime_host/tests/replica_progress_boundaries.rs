@@ -158,6 +158,8 @@ fn routed_authority_ingress_preserves_source_target_and_epoch_checks() {
     let primary = shard.primary_node_id.clone();
     let replica = shard.replica_node_ids[0].clone();
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    let receiver_head = native.node_metadata(&replica).unwrap()
+        .metadata_prefix_proof(&shard_id).unwrap().unwrap().journal_sequence;
     let mut source = native.metadata_primary_service(path).unwrap();
     let file_system = native.file_system();
     let prepared = source
@@ -185,7 +187,7 @@ fn routed_authority_ingress_preserves_source_target_and_epoch_checks() {
     let batch = backend
         .journal_batch_for_shard_since_limited(
             &shard_id,
-            0,
+            receiver_head,
             crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
             crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )

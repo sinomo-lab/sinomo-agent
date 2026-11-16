@@ -4,7 +4,7 @@ use super::*;
 use serde_json::Value;
 use sinomo_dfs::{DfsFileSystemConfig, DfsPlacementScope};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OriginalPlacementJob {
     pub(super) entry: KvEntry,

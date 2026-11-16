@@ -41,6 +41,23 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
     Ok(())
 }
 
+/// The current native journal-to-table projection, shared by ordinary replay
+/// and explicit hidden-candidate conversion. It confers no writer admission.
+pub(crate) fn table_op_for_native_journal_entry(
+    entry: &DfsMetadataJournalEntry,
+) -> Result<crate::metadata_records::DfsMetadataTableOp> {
+    require_journal_entry_replay_payloads(entry)?;
+    Ok(match &entry.mutation {
+        DfsMetadataMutation::PrepareOperationV7 { record, .. } =>
+            crate::metadata_records::DfsMetadataTableOp::PutPreparedOperationV7 { record: record.clone() },
+        DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } =>
+            crate::metadata_records::DfsMetadataTableOp::CommitPreparedOperationV7 {
+                digest: digest.clone(),
+                committed_entry: Box::new(crate::DfsPreparedOperationCommitReference::from_journal_entry(entry)?),
+            },
+    })
+}
+
 pub(crate) fn require_replica_journal_entry_file_system(
     entry: &DfsMetadataJournalEntry,
     expected: &DfsFileSystemId,

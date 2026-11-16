@@ -29,6 +29,8 @@ fn shard(primary: &NodeId, replicas: &[&NodeId], epoch: u64) -> DfsMetadataShard
 
 fn file_system_config(rules: Vec<DfsSubtreePolicy>) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        catalog_generation: 0,
+        metadata_storage: None,
         file_system_id: fs(),
         display_name: "sifs".into(),
         owner_node_id: node("node_ws_a"),
@@ -1026,4 +1028,111 @@ fn default_setup_leaves_every_shard_that_has_a_write_set_record() {
     assert!(crate::default_cluster::default_setup_leaves_shard(&advanced, Some(&bound)));
     let unreadable = entry(b"not a write set".to_vec());
     assert!(crate::default_cluster::default_setup_leaves_shard(&cut.shard, Some(&unreadable)));
+}
+
+#[test]
+fn pending_storage_transition_blocks_write_set_changes_and_prebuilt_requests() {
+    // Structural transaction model; native filesystem transition admission is
+    // exercised separately against the registered cluster owner.
+    let mut fixture = Fixture::new();
+    let cut = fixture.cut();
+    let initial = fixture.nodes[..3].iter().cloned().collect();
+    let prebuilt = build_metadata_write_set_switch(&cut, &initial).unwrap();
+    let mut config = cut.file_system_config().unwrap().unwrap();
+    config.metadata_storage = Some(crate::DfsMetadataStorageState::PendingTransition {
+        source_activation: None,
+        transition_id: "write-set-transition".into(), source_catalog_generation: config.catalog_generation,
+        target_generation: "next-generation".into(), target_format: 12,
+        expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
+    });
+    put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    assert!(!fixture.apply(&prebuilt), "a request built before Pending cannot cross its exact config compare");
+    assert!(matches!(build_metadata_write_set_switch(&fixture.cut(), &initial),
+        Err(KvError::Serialization { detail }) if detail.contains("reserved")));
+    config.metadata_storage = None;
+    put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    fixture.switch_all();
+    config.metadata_storage = Some(crate::DfsMetadataStorageState::PendingTransition {
+        source_activation: None,
+        transition_id: "write-set-transition".into(), source_catalog_generation: config.catalog_generation,
+        target_generation: "next-generation".into(), target_format: 12,
+        expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
+    });
+    put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    let cut = fixture.cut();
+    assert!(matches!(build_metadata_write_set_shrink(&cut, &fixture.nodes[2], &bounds(2, 3)),
+        Err(KvError::Serialization { detail }) if detail.contains("reserved")));
+}
+
+/// Every write-set and takeover builder, including the recruit, N raise and
+/// swap forms, passes the same storage reservation: none is built while the
+/// filesystem's storage transition is pending. A change that rewrites the
+/// shard configuration also advances the catalog generation that fences a
+/// complete-filesystem capture; a record-only change leaves it.
+#[test]
+fn pending_storage_transition_blocks_every_write_set_and_takeover_builder() {
+    fn set_pending(fixture: &mut Fixture, pending: bool) {
+        let mut config = fixture.cut().file_system_config().unwrap().unwrap();
+        config.metadata_storage = pending.then(|| crate::DfsMetadataStorageState::PendingTransition {
+            source_activation: None,
+            transition_id: "write-set-builders-transition".into(),
+            source_catalog_generation: config.catalog_generation,
+            target_generation: "next-generation".into(),
+            target_format: 12,
+            expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
+        });
+        put(&mut fixture.kv, file_system_config_key(&fs()), &config);
+    }
+    fn reserved(result: Result<DfsMetadataWriteSetChangeRequest, KvError>) -> bool {
+        matches!(result, Err(KvError::Serialization { detail }) if detail.contains("reserved"))
+    }
+    let generation = |fixture: &mut Fixture| {
+        fixture.cut().file_system_config().unwrap().unwrap().catalog_generation
+    };
+    let mut fixture = Fixture::new();
+    fixture.switch_all();
+    let before = generation(&mut fixture);
+    let raise = build_metadata_write_set_raise_n(&fixture.cut(), 3).unwrap();
+    assert!(fixture.apply(&raise));
+    assert_eq!(generation(&mut fixture), before, "a record-only change keeps the catalog");
+
+    set_pending(&mut fixture, true);
+    let cut = fixture.cut();
+    let (b, c, d) = (&fixture.nodes[1], &fixture.nodes[2], &fixture.nodes[3]);
+    assert!(reserved(build_metadata_write_set_raise_n(&cut, 4)));
+    assert!(reserved(build_metadata_write_set_recruit(
+        &cut, d, &bounds(1, 4), DfsMetadataShardRecruit::BelowN
+    )));
+    assert!(reserved(build_metadata_write_set_recruit(
+        &cut, d, &bounds(3, 3), DfsMetadataShardRecruit::Replacement
+    )));
+    assert!(reserved(build_metadata_write_set_shrink(&cut, c, &bounds(1, 3))));
+    let removed = [c.clone()].into_iter().collect();
+    assert!(reserved(build_metadata_write_set_remove(&cut, &removed, &bounds(1, 3), 1, false)));
+    assert!(reserved(build_metadata_takeover_swap(
+        &cut, b, &proof(5, 'b'), &KvRequestId::generate()
+    )));
+
+    // An add needs a configured member outside the write set.
+    set_pending(&mut fixture, false);
+    let shrink = build_metadata_write_set_shrink(&fixture.cut(), &fixture.nodes[2], &bounds(1, 3)).unwrap();
+    assert!(fixture.apply(&shrink));
+    set_pending(&mut fixture, true);
+    assert!(reserved(build_metadata_write_set_add(&fixture.cut(), &fixture.nodes[2])));
+
+    // Rewriting the shard configuration advances the catalog generation.
+    set_pending(&mut fixture, false);
+    let before = generation(&mut fixture);
+    let recruit = build_metadata_write_set_recruit(
+        &fixture.cut(), &fixture.nodes[3], &bounds(1, 3), DfsMetadataShardRecruit::BelowN,
+    )
+    .unwrap();
+    assert!(fixture.apply(&recruit));
+    assert_eq!(generation(&mut fixture), before + 1);
+    let swap = build_metadata_takeover_swap(
+        &fixture.cut(), &fixture.nodes[1], &proof(5, 'b'), &KvRequestId::generate(),
+    )
+    .unwrap();
+    assert!(fixture.apply(&swap));
+    assert_eq!(generation(&mut fixture), before + 2);
 }

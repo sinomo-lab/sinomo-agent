@@ -148,10 +148,14 @@ fn lifecycle_maintenance_reports_skipped_tombstones_without_backend() {
 #[test]
 fn lifecycle_shared_gc_runs_once_without_file_system_records() {
     let root = temp_root("lifecycle-shared-gc-without-file-systems");
-    let node_id = NodeId::from_legacy_named("node_lifecycle_empty_catalog").expect("node");
-    let metadata =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
-            .expect("metadata backend");
+    let (runtime, source, shard) = crate::test_support::current_native_metadata_service(
+        "lifecycle-empty-replica-catalog", 2, "/").unwrap();
+    drop(source);
+    let node_id = shard.replica_node_ids[0].clone();
+    // An unhydrated replica has a real repair-only view with no filesystem
+    // rows. It cannot acquire metadata-authoring permission from an empty store.
+    let metadata = LocalShardedMetadataBackend::new_with_replica_repair(
+        root.join("metadata"), vec![shard], &node_id).expect("unhydrated replica router");
     assert!(
         metadata
             .list_file_systems()
@@ -201,6 +205,8 @@ fn lifecycle_shared_gc_runs_once_without_file_system_records() {
     assert!(host.stored.is_empty());
     assert!(host.cleared.is_empty());
 
+    drop(dfs);
+    runtime.close().unwrap();
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -222,6 +228,7 @@ fn stat_prefers_backend_tombstone_over_stale_memory_file() {
     tombstone.object_id = object_id.clone();
     tombstone.path = path.to_string();
     tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.namespace_link_count = Some(0);
     tombstone.version = DfsVersion::from_legacy_named("version_2").expect("version");
     tombstone.content_hash = None;
     tombstone.content_size_bytes = None;
@@ -231,6 +238,7 @@ fn stat_prefers_backend_tombstone_over_stale_memory_file() {
 
     let mut stale_memory = tombstone.clone();
     stale_memory.kind = DfsObjectKind::File;
+    stale_memory.namespace_link_count = Some(1);
     stale_memory.version = DfsVersion::from_legacy_named("version_3").expect("version");
     stale_memory.content_hash = Some("blake3:stale-memory-file".to_string());
     stale_memory.content_size_bytes = Some(12);

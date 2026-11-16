@@ -599,6 +599,28 @@ fn align(
         .unwrap()
 }
 
+/// The snapshot-install archives in `node`'s store of the shard. A native
+/// replica's first snapshot already archives its initial store, so a test
+/// that no later snapshot replaced the store compares this set.
+pub(super) fn store_archives(
+    runtime: &crate::test_support::DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let root = shard_root(runtime, node, config);
+    let mut archives = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&root).unwrap().flatten() {
+        if !entry.file_name().to_string_lossy().contains("archive") {
+            continue;
+        }
+        archives.insert(entry.path());
+        if let Ok(inner) = std::fs::read_dir(entry.path()) {
+            archives.extend(inner.flatten().map(|entry| entry.path()));
+        }
+    }
+    archives
+}
+
 /// Commit one mode change to `current` at the current primary with a short
 /// caller deadline; members whose journal routes are faulted leave it
 /// prepared.
@@ -664,6 +686,7 @@ fn native_takeover_aligns_members_with_the_epoch_start() {
     );
     let behind = durable_prefix(&runtime, &b, &config).unwrap();
     assert!(behind.journal_sequence < candidate);
+    let archived = [&p, &b].map(|node| store_archives(&runtime, node, &config));
     let (_, start) = hand_takeover(&runtime, &config, &c);
     assert_eq!(start.journal_sequence, candidate);
     runtime.clear_faults();
@@ -684,13 +707,10 @@ fn native_takeover_aligns_members_with_the_epoch_start() {
     wait_for("the new primary commits with B", || {
         holds_object(&runtime, &c, &config, &after)
     });
-    for (node, journal) in [&p, &b].map(|node| (node.clone(), shard_root(&runtime, node, &config)))
-    {
-        assert!(
-            !std::fs::read_dir(&journal)
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains("archive")),
+    for (node, archived) in [&p, &b].into_iter().zip(archived) {
+        assert_eq!(
+            store_archives(&runtime, node, &config),
+            archived,
             "{node} kept its store: no snapshot install archived it"
         );
     }
@@ -726,6 +746,7 @@ fn native_takeover_member_aligns_inline_on_the_new_epochs_first_batch() {
             .journal_sequence
             > candidate
     );
+    let archived = store_archives(&runtime, &b, &config);
     hand_takeover(&runtime, &config, &c);
     runtime.clear_faults();
 
@@ -737,11 +758,9 @@ fn native_takeover_member_aligns_inline_on_the_new_epochs_first_batch() {
     wait_for("B's journal is the new primary's", || {
         durable_prefix(&runtime, &b, &config) == durable_prefix(&runtime, &c, &config)
     });
-    assert!(
-        !std::fs::read_dir(shard_root(&runtime, &b, &config))
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains("archive")),
+    assert_eq!(
+        store_archives(&runtime, &b, &config),
+        archived,
         "B kept its store: no snapshot install archived it"
     );
     runtime.close().unwrap();

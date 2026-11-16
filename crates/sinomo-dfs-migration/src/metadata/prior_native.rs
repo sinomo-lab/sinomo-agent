@@ -1,4 +1,4 @@
-//! Read-only inspection of original native generation-8 and generation-9 images.
+//! Read-only inspection of original native generation-8 through generation-11 images.
 //! Its hashes describe retained DATA; native recovery separately replays the
 //! exact saved plan and committed activation request. DFS never opens this image.
 use super::{Result, error, source_proof};
@@ -39,6 +39,9 @@ enum Record {
     Prepared {
         record: Value,
     },
+    ReceiptWithdrawal {
+        record: DfsReplicaReceiptWithdrawalRecord,
+    },
     Eviction {
         record: DfsPreparedOperationEviction,
     },
@@ -70,6 +73,9 @@ pub(super) fn payload_data(mut value: Value) -> Result<DfsPreparedOperationPaylo
     {
         for effect in effects {
             match effect.get("type").and_then(Value::as_str) {
+                Some("put-file-system") if effect["file_system"].get("namespace_count_activation").is_some() => {
+                    effect["file_system"] = serde_json::to_value(legacy_wire::native11_file_system_data(effect["file_system"].clone())?).map_err(error)?;
+                }
                 Some("put-namespace-job") => {
                     effect["job"] = serde_json::to_value(legacy_wire::normalize_namespace_job(
                         effect["job"].clone(),
@@ -157,7 +163,10 @@ impl Serialize for Prepares<'_> {
         use serde::ser::SerializeSeq;
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for row in self.0 {
-            seq.serialize_element(&legacy_wire::Native8Prepare(row))?;
+            if let Ok(record) = serde_json::from_value::<DfsPreparedOperationRecord>(row.clone())
+                && serde_json::to_value(&record).map_err(serde::ser::Error::custom)? == *row {
+                seq.serialize_element(&record)?;
+            } else { seq.serialize_element(&legacy_wire::Native8Prepare(row))?; }
         }
         seq.end()
     }
@@ -168,6 +177,9 @@ struct Tables<'a> {
     current_data: &'a DfsMetadataTableSnapshotTables,
     jobs: &'a [Value],
     prepares: &'a [Value],
+    generation: u16,
+    original_file_systems: &'a [Value],
+    owned_snapshot_order: bool,
 }
 impl Serialize for Tables<'_> {
     fn serialize<S: serde::Serializer>(
@@ -184,11 +196,21 @@ impl Serialize for Tables<'_> {
                 }
             };
         }
-        map.serialize_entry(
-            "prepared_operation_evictions",
-            &t.prepared_operation_evictions,
-        )?;
-        rows!(file_systems);
+        if !self.owned_snapshot_order {
+            map.serialize_entry("prepared_operation_evictions", &t.prepared_operation_evictions)?;
+        }
+        if self.generation == 11 && !self.original_file_systems.is_empty() {
+            struct OriginalFs<'a>(&'a [Value]);
+            impl Serialize for OriginalFs<'_> {
+                fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                    use serde::ser::SerializeSeq;
+                    let mut out = serializer.serialize_seq(Some(self.0.len()))?;
+                    for row in self.0 { out.serialize_element(&legacy_wire::Native11FileSystem(row))?; }
+                    out.end()
+                }
+            }
+            map.serialize_entry("file_systems", &OriginalFs(self.original_file_systems))?;
+        } else { rows!(file_systems); }
         rows!(objects);
         rows!(file_system_objects);
         rows!(paths);
@@ -201,6 +223,9 @@ impl Serialize for Tables<'_> {
         rows!(version_pins);
         rows!(cross_shard_pin_transfers);
         rows!(receipts);
+        if self.generation >= 10 {
+            rows!(receipt_withdrawals);
+        }
         rows!(intents);
         rows!(intent_receipts);
         if t.intent_receipt_retention != DfsWriteIntentReceiptRetentionState::default() {
@@ -208,10 +233,15 @@ impl Serialize for Tables<'_> {
         }
         rows!(advisory_lock_states);
         rows!(namespace_transaction_receipts);
-        if !self.prepares.is_empty() {
+        if self.generation >= 10 {
+            if self.generation == 11 && !self.prepares.is_empty() { map.serialize_entry("prepared_operations_v7", &Prepares(self.prepares))?; }
+            else { rows!(prepared_operations_v7); }
+            if self.owned_snapshot_order { map.serialize_entry("prepared_operation_evictions", &t.prepared_operation_evictions)?; }
+            rows!(namespace_jobs);
+        } else if !self.prepares.is_empty() {
             map.serialize_entry("prepared_operations_v7", &Prepares(self.prepares))?;
         }
-        if !self.jobs.is_empty() {
+        if self.generation < 10 && !self.jobs.is_empty() {
             map.serialize_entry("namespace_jobs", &Jobs(self.jobs))?;
         }
         rows!(namespace_job_receipts);
@@ -230,13 +260,18 @@ impl Serialize for Tables<'_> {
 }
 
 pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
+    Ok(read_snapshot(root)?.0)
+}
+pub(super) fn read_snapshot(
+    root: &Path,
+) -> Result<(DfsMetadataCandidateIdentity, DfsMetadataTableSnapshot)> {
     let path = root.join("records/tables/snapshot.sobj");
     let mut file = File::open(&path).map_err(error)?;
     let mut reader =
         MigrationStreamReader::from_file(file.try_clone().map_err(error)?).map_err(error)?;
     let header: Header = serde_ext::from_bytes(&reader.header).map_err(error)?;
     let generation = header.format_version;
-    if !matches!(generation, 8 | 9) {
+    if !matches!(generation, 8 | 9 | 10 | 11) {
         return Err(error("unknown original native image generation"));
     }
     native_document(&reader.header, generation)?;
@@ -249,6 +284,7 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
     let mut tables = DfsMetadataTableSnapshotTables::default();
     let mut jobs = BTreeMap::new();
     let mut prepares = BTreeMap::new();
+    let mut original_file_systems = BTreeMap::new();
     while let Some(bytes) = reader
         .next_record(MAX_RECORD_BYTES as usize)
         .map_err(error)?
@@ -260,6 +296,14 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
                 // Deserialize the complete current row after the one owned old
                 // job-stage adaptation. Unknown operation fields remain errors.
                 let mut current_op = op.clone();
+                if generation == 11 && op["type"].as_str() == Some("put-file-system") {
+                    let original = op["file_system"].clone();
+                    let projected = legacy_wire::native11_file_system_data(original.clone())?;
+                    if original_file_systems.insert(projected.file_system_id.clone(), original).is_some() {
+                        return Err(error("native11 snapshot repeats a filesystem"));
+                    }
+                    current_op["file_system"] = serde_json::to_value(projected).map_err(error)?;
+                }
                 if op["type"].as_str() == Some("put-namespace-job") {
                     let original = op["job"].clone();
                     legacy_wire::validate_original_source_job(&original)?;
@@ -323,7 +367,7 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
             }
             Record::Prepared { record } => {
                 let id = validate_prepare(&record)?;
-                if generation == 9 {
+                if generation >= 9 && generation != 11 {
                     let original: DfsPreparedOperationRecord =
                         serde_json::from_value(record.clone()).map_err(error)?;
                     original.validate()?;
@@ -335,6 +379,14 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
                 if prepares.insert(id, record).is_some() {
                     return Err(error("prior native image repeats a preparation identity"));
                 }
+            }
+            Record::ReceiptWithdrawal { record } => {
+                if generation < 10 {
+                    return Err(error(
+                        "receipt withdrawals require original native generation 10",
+                    ));
+                }
+                tables.receipt_withdrawals.push(record);
             }
             Record::Eviction { record } => {
                 record.validate()?;
@@ -363,7 +415,8 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
         tables: T,
     }
     let mut semantic = blake3::Hasher::new();
-    if generation == 8 {
+    let original_file_systems = original_file_systems.into_values().collect::<Vec<_>>();
+    if generation == 8 || generation >= 10 {
         serde_json::to_writer(
             &mut semantic,
             &Semantic {
@@ -373,6 +426,9 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
                     current_data: &tables,
                     jobs: &jobs,
                     prepares: &prepares,
+                    generation,
+                    original_file_systems: &original_file_systems,
+                    owned_snapshot_order: false,
                 },
             },
         )
@@ -390,7 +446,21 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
         )
         .map_err(error)?;
     }
-    let fingerprint = format!("blake3:{}", semantic.finalize().to_hex());
+    let mut fingerprint = format!("blake3:{}", semantic.finalize().to_hex());
+    if fingerprint != header.semantic_state_fingerprint && generation >= 10 {
+        // The original native writer used BorrowedMetadataTableSnapshotTables;
+        // original converter snapshots used the owned DTO field ordering. Both
+        // are exact historical checksums, not a normalized replacement hash.
+        let mut owned_hash = blake3::Hasher::new();
+        serde_json::to_writer(&mut owned_hash, &Semantic {
+            format_version: generation,
+            materialized_through_sequence: header.materialized_through_sequence,
+            tables: Tables { current_data: &tables, jobs: &jobs, prepares: &prepares,
+                generation, original_file_systems: &original_file_systems,
+                owned_snapshot_order: true },
+        }).map_err(error)?;
+        fingerprint = format!("blake3:{}", owned_hash.finalize().to_hex());
+    }
     if fingerprint != header.semantic_state_fingerprint {
         return Err(error("prior native image semantic checksum mismatch"));
     }
@@ -404,11 +474,21 @@ pub(super) fn inspect(root: &Path) -> Result<DfsMetadataCandidateIdentity> {
         }
         digest.update(&buffer[..count]);
     }
-    Ok(DfsMetadataCandidateIdentity {
-        state_fingerprint: fingerprint,
-        file_fingerprint: format!("blake3:{}", digest.finalize().to_hex()),
-        prefix_proof: header.prefix_proof,
-    })
+    let snapshot = DfsMetadataTableSnapshot {
+        format_version: generation,
+        materialized_through_sequence: header.materialized_through_sequence,
+        semantic_state_fingerprint: fingerprint.clone(),
+        tables: Box::new(tables),
+        prefix_proof: header.prefix_proof.clone(),
+    };
+    Ok((
+        DfsMetadataCandidateIdentity {
+            state_fingerprint: fingerprint,
+            file_fingerprint: format!("blake3:{}", digest.finalize().to_hex()),
+            prefix_proof: header.prefix_proof,
+        },
+        snapshot,
+    ))
 }
 
 /// Historic desired topology is retained DATA under the new source cut. A9
@@ -759,5 +839,161 @@ mod tests {
             "actual R125 normal producer must retain copy state without the new stage"
         );
         inventory.verify(dir.path()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod count_native10_tests {
+    use super::*;
+    use sinomo_core::object::LengthMode;
+    use sinomo_core::storage::migration::stream::{MigrationStreamWriter, StreamCursor};
+
+    #[test]
+    fn native10_count_unknown_snapshot_is_verified_without_rewriting_source() {
+        let temp = sinomo_testdir::TestDir::new("count-original-native10-codec");
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("old-count-root").unwrap(),
+            file_system_id: sifs_file_system_id(),
+            path: "/".into(),
+            kind: DfsObjectKind::Directory,
+            namespace_link_count: None,
+            tombstone_provenance: None,
+            owner_node_id: sinomo_core::node::NodeId::from_legacy_named("old-count-owner").unwrap(),
+            current_locations: Vec::new(),
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: DfsVersion::from_legacy_named("old-count-version").unwrap(),
+            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let mut state = DfsMetadataCandidateState::new(Default::default()).unwrap();
+        state
+            .apply(DfsPreparedMetadataEffect::PutObject { object })
+            .unwrap();
+        let tables = state.snapshot();
+        let proof =
+            source_proof::conversion_base(0, "original-native10-codec", "original-unknown-count");
+        let current_root = temp.join("current-data");
+        let writer = DfsMetadataCandidateWriter::open_generation(&current_root,
+            DfsMetadataGenerationIdentity {
+                file_system_id: sifs_file_system_id(),
+                shard_id: DfsMetadataShardId::new("root"),
+                generation: "original-native10-codec-data".into(),
+                origin: DfsMetadataGenerationOrigin::StorageTransition {
+                    transition_id: "original-native10-codec-data".into(),
+                },
+            }).unwrap();
+        writer.write(tables.clone(), proof.clone()).unwrap();
+        drop(writer);
+        #[derive(Serialize)]
+        struct Semantic<T: Serialize> {
+            format_version: u16,
+            materialized_through_sequence: u64,
+            tables: T,
+        }
+        let mut hash = blake3::Hasher::new();
+        serde_json::to_writer(
+            &mut hash,
+            &Semantic {
+                format_version: 10,
+                materialized_through_sequence: 0,
+                tables: Tables {
+                    current_data: &tables,
+                    jobs: &[],
+                    prepares: &[],
+                    original_file_systems: &[],
+                    owned_snapshot_order: false,
+                    generation: 10,
+                },
+            },
+        )
+        .unwrap();
+        let fingerprint = format!("blake3:{}", hash.finalize().to_hex());
+        let header = serde_json::json!({"format_version":10,"materialized_through_sequence":0,
+            "prefix_proof":proof,"semantic_state_fingerprint":fingerprint});
+        let source = temp.join("original-native10");
+        std::fs::create_dir_all(source.join("records/tables")).unwrap();
+        let path = source.join("records/tables/snapshot.sobj");
+        let mut output = MigrationStreamWriter::resume(
+            &path,
+            &serde_ext::to_bytes(&header, 10, LengthMode::U32).unwrap(),
+            &StreamCursor::default(),
+        )
+        .unwrap();
+        let mut input =
+            MigrationStreamReader::open(&current_root.join("records/tables/snapshot.sobj"))
+                .unwrap();
+        while let Some(bytes) = input.next_record(MAX_RECORD_BYTES as usize).unwrap() {
+            let record: Value = serde_ext::from_bytes(&bytes).unwrap();
+            output
+                .append(&serde_ext::to_bytes(&record, 10, LengthMode::U32).unwrap())
+                .unwrap();
+        }
+        output.finish().unwrap();
+        drop(output);
+        let original_bytes = std::fs::read(&path).unwrap();
+        let (identity, captured) = read_snapshot(&source).unwrap();
+        assert_eq!(identity.prefix_proof, proof);
+        assert_eq!(identity.state_fingerprint, fingerprint);
+        assert_eq!(*captured.tables, tables);
+        assert!(
+            captured
+                .tables
+                .objects
+                .iter()
+                .all(|row| row.namespace_link_count.is_none())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        let mut changed = original_bytes.clone();
+        let index = changed.len() / 2;
+        changed[index] ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert!(read_snapshot(&source).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_native11_tests {
+    #[test]
+    #[ignore = "requires an immutable original native11 DATA directory"]
+    fn inspect_original_native11_without_rewriting_source() {
+        let root = std::path::PathBuf::from(std::env::var_os("SINOMO_ORIGINAL_NATIVE11_ROOT").expect("original source root"));
+        let snapshot = root.join("records/tables/snapshot.sobj");
+        let before = std::fs::read(&snapshot).unwrap();
+        let (identity, captured) = super::read_snapshot(&root).unwrap();
+        assert_eq!(captured.format_version, 11);
+        assert_eq!(identity.prefix_proof, captured.prefix_proof);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+        eprintln!("verified original native11 checkpoint sequence={} objects={} filesystem_rows={}", captured.materialized_through_sequence, captured.tables.objects.len(), captured.tables.file_systems.len());
+        let inventory = super::super::source::discover(&root).unwrap();
+        let mut cursor = super::super::source::SourceCursor::new(inventory.clone());
+        let mut preparations = 0usize;
+        while let Some(record) = super::super::source::next(&root, &mut cursor).unwrap() {
+            match record {
+                super::super::source::SourceRecord::JournalFrame { entry, .. }
+                    if entry["mutation"]["type"] == "prepare-operation-v7" => {
+                    crate::legacy_wire::validate_original_v7_record(&entry["mutation"]["record"]).unwrap();
+                    preparations += 1;
+                }
+                super::super::source::SourceRecord::SnapshotRow { table, row, .. }
+                    if table == "prepared_operations_v7" => {
+                    crate::legacy_wire::validate_original_v7_record(&row).unwrap();
+                    preparations += 1;
+                }
+                _ => {}
+            }
+        }
+        inventory.verify(&root).unwrap();
+        assert!(preparations > 0, "fixture must exercise original native journal preparations");
+        eprintln!("validated {preparations} original journal preparations without rewriting source");
     }
 }

@@ -3224,6 +3224,10 @@ fn answer_rebind_leaves_a_same_named_shard_of_another_filesystem_untouched() {
     };
     let resident_file_system = sinomo_dfs::sifs_file_system_id();
     let other_file_system = DfsFileSystemId::from_legacy_named("fs_other_root").unwrap();
+    // A store opens only from native DATA; it grants this router nothing.
+    let physical = root.path().join("metadata").join("root");
+    std::fs::create_dir_all(&physical).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&physical, "root");
     // This node's resident router names its filesystem's root shard at epoch 1.
     let resident = sinomo_dfs::LocalShardedMetadataBackend::new(
         root.path().join("metadata"),
@@ -3326,8 +3330,11 @@ fn metadata_publish_planning_does_not_hold_admission_while_shard_is_borrowed() {
         .unwrap();
     let file_system_id = shard_config.file_system_id.clone();
     let shard_id = DfsMetadataShardId::new(shard_config.shard_id.clone());
-    // This empty, unpublished pool models only checkout/admission ordering;
-    // no rows, writer authority or healthy replica proof are installed in it.
+    // Exact native DATA models checkout/admission ordering; copying it grants
+    // no live writer authority or healthy replica proof to this separate pool.
+    let physical = root.path().join("metadata").join(&shard_id.0);
+    std::fs::create_dir_all(&physical).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&physical, &shard_id.0);
     let resident = sinomo_dfs::LocalShardedMetadataBackend::new(
         root.path().join("metadata"),
         vec![shard_config],
@@ -4141,6 +4148,7 @@ fn test_dfs_write_routed_message(
         object_id: object_id.clone(),
         file_system_id: sinomo_dfs::sifs_file_system_id(),
         path: path.to_string(),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         owner_node_id: target_node_id.clone(),
         current_locations: vec![source_node_id.clone()],
@@ -4259,6 +4267,8 @@ fn install_test_metadata_replica_shard(
 
 fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
+        catalog_generation: 0,
+        metadata_storage: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),
@@ -5957,7 +5967,7 @@ fn daemon_dfs_metadata_journal_batch_uses_path_safe_shard_directory() {
             actual_root.join(crate::metadata_keys::key_segment(&shard_id.0)),
         )
         .unwrap()
-        .export_table_snapshot()
+        .export_table_snapshot().unwrap()
     };
     let before = inspect();
     for hostile_name in ["root/frag", "../escaped-native-shard"] {
@@ -6632,6 +6642,9 @@ fn daemon_dfs_non_offline_replica_backlog_still_triggers() {
 fn daemon_dfs_missing_orphan_does_not_hide_valid_repair_trigger() {
     let root = temp_root("pending-missing-orphan-valid-repair");
     let data_dir = SinomoDataDir::new(root.path());
+    let physical = root.path().join("metadata");
+    std::fs::create_dir_all(&physical).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&physical, "root");
     let metadata = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.path().join("metadata"),
@@ -9177,7 +9190,6 @@ fn daemon_dfs_peer_membership_refresh_reuses_resident_lane() {
     assert!(withdrawn.peer_node_ids.contains(&remote));
     assert!(!withdrawn.peer_node_ids.contains(&added));
     assert!(evict_daemon_dfs_message_service_cache(&data_dir).unwrap());
-    let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
     let lookup =
         |native: &crate::test_runtime::DfsTestRuntime, request_id: &str, frame_id, path: &str| {
             let command = test_dfs_message_command(
@@ -9257,11 +9269,9 @@ fn daemon_dfs_peer_membership_refresh_reuses_resident_lane() {
     );
     let current_peers = actual_peers();
     assert!(current_peers.peer_node_ids.contains(&added));
-    assert_eq!(
-        daemon_dfs_test_message_service_lane_open_count(&data_dir) - opens_before,
-        1,
-        "peer membership changes must keep the one open metadata backend"
-    );
+    // The retained Arc above identifies the exact read lane across the
+    // provider change. A root-wide open counter also includes independent
+    // maintenance/mutation lanes and cannot establish read-lane replacement.
     assert!(
         evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
         "test cleanup must release the cached lane"
@@ -12586,6 +12596,12 @@ fn daemon_dfs_prepared_deferred_worker_does_not_retain_service_lane() {
     let root = temp_root("daemon_dfs_detached_worker_releases_lane");
     let data_root = root.join("data");
     let data_dir = SinomoDataDir::new(&data_root);
+    let paths = DaemonPaths::new(&data_dir);
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).unwrap());
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).unwrap();
+    let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir).join("root");
+    std::fs::create_dir_all(&metadata_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&metadata_root, "root");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let local = NodeId::from_legacy_named("node_dfs_detached_worker_local").expect("local");
     write_test_cluster_state(&data_root, &local);
@@ -12632,6 +12648,12 @@ fn daemon_dfs_deferred_worker_notifies_after_each_replacement_publication() {
     let root = temp_root("daemon_dfs_detached_worker_policy_notifications");
     let data_root = root.join("data");
     let data_dir = SinomoDataDir::new(&data_root);
+    let paths = DaemonPaths::new(&data_dir);
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).unwrap());
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).unwrap();
+    let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir).join("root");
+    std::fs::create_dir_all(&metadata_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&metadata_root, "root");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let local = NodeId::from_legacy_named("node_dfs_detached_policy_local").expect("local");
     let offline = NodeId::from_legacy_named("node_dfs_detached_policy_offline").expect("offline");
@@ -12713,6 +12735,12 @@ fn daemon_dfs_deferred_runtime_is_shared_across_service_lanes() {
     let root = temp_root("daemon_dfs_deferred_runtime_coalesces_lanes");
     let data_root = root.join("data");
     let data_dir = SinomoDataDir::new(&data_root);
+    let paths = DaemonPaths::new(&data_dir);
+    let data_owner = Arc::new(DaemonDataOwnerLock::acquire(&paths).unwrap());
+    register_daemon_dfs_data_owner_lock(&paths, &data_owner).unwrap();
+    let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir).join("root");
+    std::fs::create_dir_all(&metadata_root).unwrap();
+    crate::test_runtime::copy_native_genesis_data(&metadata_root, "root");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let local = NodeId::from_legacy_named("node_dfs_deferred_coalesce_local").expect("local");
     write_test_cluster_state(&data_root, &local);
@@ -13461,15 +13489,12 @@ fn default_dfs_reactor_defers_recovery_failure_on_non_voter() {
         "failed best-effort recovery must leave placement fenced"
     );
 
-    let backend = LocalSobjMetadataBackend::new(
-        DfsMetadataShardId::new("root"),
-        data_dir.dfs_dir().join("metadata").join("root"),
-    )
-    .expect("metadata backend");
+    let physical = data_dir.dfs_dir().join("metadata").join("root");
+    assert!(!physical.join("metadata-generation.sobj").exists(),
+        "non-primary bootstrap must not initialize a root generation");
     assert!(
-        backend
-            .journal_since_limited(0, 1)
-            .expect("metadata journal")
+        crate::metadata_journal::durable_journal_entries_since_limited(&physical, 0, 1)
+            .expect("read metadata journal without initializing storage")
             .is_empty(),
         "non-primary bootstrap must not create root-shard journal entries"
     );
@@ -14689,6 +14714,16 @@ fn native_retained_shard_slot_keeps_the_actual_queued_checkout() {
     };
     let configs = native.metadata_shards().unwrap();
     let root = native.root_shard().unwrap();
+    let paths = ClusterPaths::new(data_dir);
+    let peer = read_daemon_dfs_message_peer_snapshot(&paths).unwrap().unwrap();
+    let preflight = native.runtime_handle().block_on(
+        warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+            &paths, &peer, &native.runtime_handle(),
+        ),
+    ).unwrap();
+    let projection = preflight.authority
+        .load_complete_prefix_for_generation(preflight.generation).unwrap();
+    let catalog = crate::DfsMetadataNamespaceCatalog::capture(&projection, &root.file_system_id).unwrap();
     let scheduler = daemon_dfs_mutation_scheduler(data_dir).unwrap();
     let admission = native
         .runtime_handle()
@@ -14698,11 +14733,12 @@ fn native_retained_shard_slot_keeps_the_actual_queued_checkout() {
     let old = before.scope_shard(&root.file_system_id, &root_id).unwrap();
     let held = old.checkout().unwrap();
     let current = before
-        .into_reconfigured_for_replica_repair(
+        .into_reconfigured_for_replica_repair_and_catalog(
             crate::default_dfs_metadata_shards_root(data_dir),
             configs,
             &local,
             &BTreeSet::new(),
+            Some(catalog),
         )
         .unwrap();
     let next = current.scope_shard(&root.file_system_id, &root_id).unwrap();
@@ -17176,4 +17212,17 @@ fn an_unrelated_nodes_expiring_evidence_runs_no_executor_turn_for_a_parked_need(
         executor_turns_around_an_exclusion_expiry("dfs-parked-need-own-expiry", true) >= 1,
         "the parked target's own evidence expiring runs the executor's turn"
     );
+}
+
+#[test]
+fn managed_content_open_without_native_owner_cannot_initialize_an_absent_live_root() {
+    let root = sinomo_testdir::TestDir::new("managed-content-absent-owner");
+    let data = SinomoDataDir::new(root.path());
+    let retained = data.dfs_dir().join("retained-original-content");
+    std::fs::create_dir_all(&retained).unwrap();
+    let original = retained.join("opaque-original");
+    std::fs::write(&original, b"retained bytes are not a fresh empty store").unwrap();
+    assert!(super::open_dfs_runtime_content_store(&data).is_err());
+    assert!(!data.dfs_dir().join("content").exists());
+    assert_eq!(std::fs::read(original).unwrap(), b"retained bytes are not a fresh empty store");
 }

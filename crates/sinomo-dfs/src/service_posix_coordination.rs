@@ -89,6 +89,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             _ => None,
         };
         match operation {
+            DfsNamespaceOperation::ParentCountParticipant { coordinator_job, participant, action } => {
+                let outcome = self.execute_parent_count_participant(coordinator_job, participant, action)?;
+                Ok(Some(DfsPosixCoordinationResult::ParentCountParticipant { participant_id: participant.participant_id.clone(), outcome }))
+            }
             DfsNamespaceOperation::BeginContentCopy {
                 path,
                 request,

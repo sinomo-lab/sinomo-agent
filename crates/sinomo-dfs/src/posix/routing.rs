@@ -1184,6 +1184,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // through the exact target fence they own. Ordinary lookup and
         // mutation traffic still reaches the guard below and returns Busy.
         match operation {
+            DfsNamespaceOperation::ParentCountParticipant { coordinator_job, participant, action } => {
+                return self.execute_parent_count_participant(coordinator_job, participant, action).map(drop);
+            }
             DfsNamespaceOperation::InstallHardlinkTargetFence { fence, source_path } => {
                 return self.install_hardlink_target_fence_local(fence, source_path);
             }
@@ -1275,6 +1278,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .posix_hardlink_local(existing_path, link_path)
                 .map(drop),
             DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+            | DfsNamespaceOperation::ParentCountParticipant { .. }
             | DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => {
                 unreachable!("hardlink target fence phases return before generic path guards")
             }

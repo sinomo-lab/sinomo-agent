@@ -1,13 +1,13 @@
 # App Use OS provider
 
 `sinomo-app-use-module` is an independently built native dylib under the generic
-Sinomo module ABI. It provides `module.app-use.os` / `sinomo.app-use.os.v2`, with
+Sinomo module ABI. It provides `module.app-use.os` / `sinomo.app-use.os.v3`, with
 the typed `sinomo.app-use.os` service interface version `2.0.0`.
 
 The module owns native target enumeration, identity checks, capture and input.
 Windows uses WGC/D3D11, background window messages, SendInput and conditional
-gamepad injection. Linux uses local X11 with XRes, Composite, Damage, XFixes and
-XTest, or Wayland portals with PipeWire capture and approved raw input. Android
+gamepad injection. Linux uses local X11 with XRes, Composite, Damage, XFixes,
+XInput2 cursor notifications and XTest, or Wayland portals with PipeWire capture and approved raw input. Android
 uses a same-UID local OS adapter with MediaProjection and a
 user-enabled AccessibilityService. Other platforms report unsupported capabilities.
 It does not own an encoder, network stack, agent runtime or alternate toolset.
@@ -21,7 +21,7 @@ Build explicitly (native modules are not default workspace members):
 
 ```powershell
 cargo build -p sinomo-app-use-module
-sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v2 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
+sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v3 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
 ```
 
 Installation does not grant input or capture consent. The provider requires a
@@ -127,15 +127,54 @@ map; the provider never rewrites that map. Raw Set-1 keys assume Xorg's evdev
 keycode mapping. Gamepads and remote X servers are unsupported. Wayland sessions,
 including those with an Xwayland `DISPLAY`, select the portal backend below.
 
+X11 capture wakes on Damage, geometry and cursor notifications. Its FPS setting
+is an admission ceiling in a rolling second, not a periodic frame clock. Pending
+changes coalesce until budget becomes available, including the final update of a
+screen that becomes static. Cursor capture requires XInput2 and XFixes; core
+motion/crossing notifications on the target and its descendants cover pointer
+warps, while raw motion covers ordinary movement and grabs. Descendant watches
+are bounded and removed when windows leave the captured subtree. An idle cursor
+does not cause repeated screenshots. Socket waits wake directly for frame events and cancellation; timeouts only
+bound authority and lease checks.
+
+Local servers supporting MIT-SHM 1.2 can provide an FD-backed image buffer owned
+by the capture lease. Each readback completes before normalization/resizing;
+returned frames own their storage and never retain that shared mapping. Buffers
+are reused, replaced on growth and detached on teardown. Servers without usable
+shared-memory readback retain the ordinary GetImage path. Common XRGB buffers
+are normalized in place, then resized directly into final shared output storage.
+The shared bilinear resampler precomputes fixed-point weights and preserves
+channel order and native geometry; rounding differs from floating-point
+interpolation by at most one channel value.
+
+`SINOMO_MEDIA_STAGE_TRACE=1` enables opt-in JSON stage diagnostics on stderr for
+X11 readback, normalization, cursor overlay, resizing and module handoff.
+Capture timestamps mark the start of acquisition, before image readback. For
+interaction latency, also measure the screen change through to the received
+frame; timestamps alone do not include time before capture is admitted.
+
 ```sh
 cargo build -p sinomo-app-use-module
-sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v2 --cache-key module/desktop/app-use target/debug/libsinomo_app_use_module.so
+sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v3 --cache-key module/desktop/app-use target/debug/libsinomo_app_use_module.so
 cargo test -p sinomo-actions --test app_use_native_provider -- --ignored
 xvfb-run cargo test -p sinomo-app-use-module x11_background_pixels_input_revocation_and_cleanup -- --ignored
 ```
 
-Use an isolated X server for the native test. It creates and destroys its own
-window, checks pixels and input delivery, and checks revocation and cleanup.
+Use an isolated X server for the native tests. They create and destroy their own
+windows and check pixels, input delivery, cursor motion/shape/warps, child-window
+changes, idle behavior, FPS ceilings, revocation and cleanup. Run the same tests
+with MIT-SHM disabled to exercise the readback fallback:
+
+```sh
+xvfb-run -s '-screen 0 1280x720x24 -nolisten tcp' cargo test -p sinomo-app-use-module --profile android-debug x11_ -- --ignored --test-threads=1
+xvfb-run -s '-screen 0 1280x720x24 -nolisten tcp -extension MIT-SHM' cargo test -p sinomo-app-use-module --profile android-debug x11_ -- --ignored --test-threads=1
+```
+
+`x11_capture_change_latency` accepts `SINOMO_X11_CAPTURE_RESULTS` for its JSON
+samples; `capture_resize_cost` accepts `SINOMO_X11_RESIZE_RESULTS` to compare
+floating-point reference and fixed-point resampling at the same optimization
+level. The Android debug profile optimizes both the provider and device helper;
+keep build profiles explicit when interpreting measurements.
 
 ## Linux Wayland
 
@@ -210,25 +249,44 @@ uses the Android media optimization settings. Activate its `.so` through the ord
 node. The Android embedded profile exposes the same App Use tools as desktop;
 there is no linked provider fallback.
 
-On the device, open Sinomo once and enable Remote Management in local Settings.
-Open the **Sinomo App Use** launcher entry, enable its accessibility service,
-request screen sharing, then grant capture and optionally touch/text input to
-that share. The Android OS dialog must authorize the whole default display.
-The service is non-sticky and does not restore grants or capture after process
-death. An unattached projection expires after 30 seconds; closing the last
-input/capture session ends sharing. Stop sharing or disable accessibility to revoke
-access. A new share or rotation requires re-enumeration and a fresh exact-display
-grant. Protected content remains subject to Android's capture restrictions.
+On the device, open Sinomo and enable Remote Management in local Settings.
+The **Sinomo App Use** launcher entry separates persistent Accessibility access
+from screen sharing. Enable Accessibility in Android Settings, then allow
+observation and optional control for its persistent display resource. App switches
+and agent disconnects do not revoke that grant. Disable Accessibility or revoke
+the local resource grant to remove access.
 
-Android supports **explicit raw mode only**. `move` sets a virtual touch point;
-left-button down/move/up submits a finite touch gesture on release. Closing or
-releasing the lease discards an unfinished gesture. Wheel events submit bounded
-swipes. Text inserts at the selection of a focused accessible non-password
-editor. Supported raw keys are Escape/Back (1), Backspace (14) and Enter (28);
-other keys, background input and gamepads fail explicitly. Android does not add
-a synthetic pointer to captured frames; `include_cursor` has no effect there.
-MediaProjection pushes BGRA samples into a bounded latest-frame slot; encoding
-and routed video remain in the existing host path.
+Accessibility supplies bounded semantic observations, observation-bound actions,
+and screenshots (Android 11+). Password content is redacted; disabled/protected
+nodes and stale observations fail explicitly. Screenshots obey Android's rate
+limit and are not a high-frame-rate video source. Raw touch/text input also uses
+the Accessibility target, independently of projection. `move` positions a virtual
+touch point; left-button down/move/up submits a finite gesture on release.
+Closing or releasing an input lease discards an unfinished gesture. Wheel events
+submit bounded swipes; text edits a focused non-password editor. Supported raw
+keys are Escape/Back (1), Backspace (14) and Enter (28). Background input,
+gamepads and unsupported keys fail explicitly. A coordinate lease is invalidated
+by display geometry changes; it does not stop screen sharing.
+
+MediaProjection belongs to screen video. The local sharing activity requests the
+whole default display and grants viewing/stop access to that share. The generic
+`/media/video/devices`, `/media/video/capture` and `/media/video/control` routes
+expose it alongside cameras. OS permission and Sinomo resource exposure remain
+separate. The same-UID OS bridge remains available when either Accessibility or
+projection is active; disabling Accessibility does not terminate projection.
+
+An approved projection remains active without subscribers, across consumer
+reconnections and while other apps are foreground. It ends only on an explicit
+user/authorized-agent stop, Android interruption, or fatal error. It is non-sticky
+and cannot resume an invalidated OS token after process death. Geometry changes
+resize the existing virtual display and notify consumers. Existing encoder
+surfaces retain their dimensions and letterbox the resized source; frame metadata
+reports native dimensions and the content rectangle. Protected content remains
+subject to Android capture restrictions.
+
+The private Android socket capture protocol is version 3; upgrade the APK and
+native provider together. It keeps the existing bounded native frame delivery
+contract, and never opens a separate network path.
 
 For device validation, check local consent denial, capture of a moving fixture,
 touch/text effects, screen-share stop, accessibility revocation, rotation,

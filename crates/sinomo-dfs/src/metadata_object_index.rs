@@ -291,6 +291,7 @@ mod tests {
             object_id: object_id("obj_object_index"),
             file_system_id: file_system_id(),
             path: path.to_string(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: node("node_owner"),

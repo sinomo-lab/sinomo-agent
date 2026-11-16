@@ -64,7 +64,7 @@ pub(crate) async fn open_desktop_video_source(
         .map_err(|e| media_network_error(node_id, e))?;
     if !matches!(
         metadata.get("version").and_then(serde_json::Value::as_u64),
-        Some(1 | 2)
+        Some(1 | 2 | 3)
     ) {
         return Err(media_network_error(
             node_id,

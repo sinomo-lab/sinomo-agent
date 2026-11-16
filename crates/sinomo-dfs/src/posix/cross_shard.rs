@@ -32,6 +32,96 @@ use crate::{
 };
 use sinomo_core::node::NodeId;
 
+mod parent_counts;
+#[cfg(test)]
+pub(crate) use parent_counts::{
+    ParentCountTestPoint, hold_parent_apply_commit, install_parent_count_test_hook,
+    parent_apply_commit_is_held,
+};
+
+#[derive(Clone, Debug)]
+enum CrossShardRenameKind {
+    Rename,
+    UnlinkPromotion {
+        expected_alias: DfsNamespaceObjectPrecondition,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HardlinkAliasMutation {
+    Unlink,
+    Rename,
+}
+
+impl HardlinkAliasMutation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unlink => "unlink",
+            Self::Rename => "rename",
+        }
+    }
+    fn count_delta(self) -> i64 {
+        match self {
+            Self::Unlink => -1,
+            Self::Rename => 0,
+        }
+    }
+}
+
+fn source_eviction_operation_id(
+    moved: &DfsObjectMetadata,
+    old_path: &str,
+    source_parent_delta: i64,
+) -> Result<String> {
+    // Completion retains this immutable move even after its physical source
+    // row is retired. Source CAS and pin predicates remain sealed in the body.
+    let identity =
+        serde_json::to_vec(&(moved, old_path, source_parent_delta)).map_err(|error| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: error.to_string(),
+            })
+        })?;
+    Ok(format!(
+        "source-eviction:{}",
+        blake3::hash(&identity).to_hex()
+    ))
+}
+
+fn hardlink_target_fence(
+    source_job_id: &str,
+    source_path: &str,
+    expected_target: &DfsNamespaceObjectPrecondition,
+    committed_target: &DfsObjectMetadata,
+    origin: Option<DfsNamespaceJobOrigin>,
+    now: time::OffsetDateTime,
+) -> DfsNamespaceJobRecord {
+    DfsNamespaceJobRecord {
+        job_id: namespace_job_id(
+            "hardlink-target-fence",
+            &committed_target.file_system_id,
+            &format!("{source_job_id}:{source_path}->{}", committed_target.path),
+            &expected_target.object_id,
+            &expected_target.version,
+        ),
+        file_system_id: committed_target.file_system_id.clone(),
+        origin,
+        kind: DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary,
+        status: DfsNamespaceJobStatus::Running,
+        root_path: committed_target.path.clone(),
+        target_path: None,
+        pending_frames: vec![DfsNamespaceJobFrame::HardlinkTargetFenceReservation {
+            source_path: source_path.into(),
+            expected_target: expected_target.clone(),
+            committed_target: committed_target.clone(),
+        }],
+        processed_object_count: 0,
+        created_at: now,
+        updated_at: now,
+        completed_at: None,
+        failure_reason: None,
+    }
+}
+
 #[cfg(test)]
 type HardlinkAliasAfterCommitTestHook = Box<dyn FnOnce() -> Result<()> + Send>;
 
@@ -73,6 +163,64 @@ pub(crate) fn install_hardlink_alias_after_commit_test_hook(
 fn run_hardlink_alias_after_commit_test_hook(source_path: &str) -> Result<()> {
     let hook = {
         let mut slot = HARDLINK_ALIAS_AFTER_COMMIT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|(expected_path, _)| expected_path == source_path)
+        {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    match hook {
+        Some(hook) => hook(),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+type HardlinkCountAfterCommitTestHook = Box<dyn FnOnce() -> Result<()> + Send>;
+
+#[cfg(test)]
+static HARDLINK_COUNT_AFTER_COMMIT_TEST_HOOK: std::sync::Mutex<
+    Option<(String, HardlinkCountAfterCommitTestHook)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct HardlinkCountAfterCommitTestHookGuard;
+
+#[cfg(test)]
+impl Drop for HardlinkCountAfterCommitTestHookGuard {
+    fn drop(&mut self) {
+        HARDLINK_COUNT_AFTER_COMMIT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_hardlink_count_after_commit_test_hook(
+    source_path: impl Into<String>,
+    hook: impl FnOnce() -> Result<()> + Send + 'static,
+) -> HardlinkCountAfterCommitTestHookGuard {
+    let previous = HARDLINK_COUNT_AFTER_COMMIT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace((source_path.into(), Box::new(hook)));
+    assert!(
+        previous.is_none(),
+        "hardlink-count after-commit test hook is already installed"
+    );
+    HardlinkCountAfterCommitTestHookGuard
+}
+
+#[cfg(test)]
+fn run_hardlink_count_after_commit_test_hook(source_path: &str) -> Result<()> {
+    let hook = {
+        let mut slot = HARDLINK_COUNT_AFTER_COMMIT_TEST_HOOK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if slot
@@ -159,6 +307,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         destination_primary: NodeId,
     ) -> Result<()> {
+        self.coordinate_cross_shard_rename_kind(
+            from,
+            to,
+            destination_primary,
+            CrossShardRenameKind::Rename,
+        )
+    }
+
+    pub(crate) fn coordinate_cross_shard_unlink_promotion(
+        &mut self,
+        from: &str,
+        to: &str,
+        destination_primary: NodeId,
+        expected_alias: DfsNamespaceObjectPrecondition,
+    ) -> Result<()> {
+        self.coordinate_cross_shard_rename_kind(
+            from,
+            to,
+            destination_primary,
+            CrossShardRenameKind::UnlinkPromotion { expected_alias },
+        )
+    }
+
+    fn coordinate_cross_shard_rename_kind(
+        &mut self,
+        from: &str,
+        to: &str,
+        destination_primary: NodeId,
+        kind: CrossShardRenameKind,
+    ) -> Result<()> {
+        let promotion_alias = match kind {
+            CrossShardRenameKind::Rename => None,
+            CrossShardRenameKind::UnlinkPromotion { expected_alias } => Some(expected_alias),
+        };
         let (from, from_requires_directory) = normalize_posix_path_with_trailing_directory(from)?;
         let (to, to_requires_directory) = normalize_posix_path_with_trailing_directory(to)?;
         let from = self.resolve_posix_path_distributed(&from, false)?;
@@ -179,6 +361,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsPosixError::NotFound { path: from.clone() })?;
         if source.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: from });
+        }
+        if source.kind == DfsObjectKind::Directory && promotion_alias.is_some() {
+            return Err(DfsPosixError::IsDirectory { path: from });
         }
         if source.kind == DfsObjectKind::Directory {
             // Directory renames migrate the whole subtree between shard
@@ -207,8 +392,51 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if to_requires_directory {
             return Err(DfsPosixError::NotDirectory { path: to });
         }
+        let destination = self.lookup_sifs_path_direct_distributed_synced(&to)?;
+        if let Some(expected_alias) = promotion_alias.as_ref() {
+            if source.kind == DfsObjectKind::Hardlink
+                || destination.as_ref().is_none_or(|alias| {
+                    alias.kind != DfsObjectKind::Hardlink
+                        || alias.object_id != expected_alias.object_id
+                        || alias.version != expected_alias.version
+                        || alias.link_target_object_id.as_ref() != Some(&source.object_id)
+                })
+            {
+                return Err(DfsPosixError::Conflict {
+                    path: to.clone(),
+                    reason: "selected canonical-promotion alias changed before planning".into(),
+                });
+            }
+        } else if let Some(destination) = destination
+            .as_ref()
+            .filter(|row| row.kind != DfsObjectKind::Tombstone)
+        {
+            let source_id = if source.kind == DfsObjectKind::Hardlink {
+                source
+                    .link_target_object_id
+                    .as_ref()
+                    .ok_or_else(|| DfsPosixError::InvalidPath { path: from.clone() })?
+            } else {
+                &source.object_id
+            };
+            let destination_id = if destination.kind == DfsObjectKind::Hardlink {
+                destination
+                    .link_target_object_id
+                    .as_ref()
+                    .ok_or_else(|| DfsPosixError::InvalidPath { path: to.clone() })?
+            } else {
+                &destination.object_id
+            };
+            if source_id == destination_id {
+                return Ok(());
+            }
+        }
         let job_id = namespace_job_id(
-            "rename-cross-shard",
+            if promotion_alias.is_some() {
+                "unlink-promotion-cross-shard"
+            } else {
+                "rename-cross-shard"
+            },
             &source.file_system_id,
             &format!("{from}->{to}"),
             &source.object_id,
@@ -227,6 +455,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.ensure_no_open_write_state_for_object(&source, &from)?;
 
         let mut moved = source.clone();
+        if source.kind != DfsObjectKind::Hardlink {
+            moved.namespace_link_count = Some(super::metadata::updated_namespace_link_count(
+                &source,
+                if promotion_alias.is_some() { -1 } else { 0 },
+            )?);
+        }
         moved.path = to.clone();
         moved.changed_at_unix_nanos =
             now_unix_nanos().max(source.changed_at_unix_nanos.saturating_add(1));
@@ -254,6 +488,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         DfsNamespaceJobFrame::CrossShardAdopt {
                             moved_object: moved,
                             old_path: from.clone(),
+                            promotion_alias: promotion_alias.clone(),
                             destination_primary_node_id: destination_primary,
                         },
                     ],
@@ -269,6 +504,109 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.drive_cross_shard_namespace_job(job)
     }
 
+    fn require_count_parent_coowned(&mut self, child_path: &str) -> Result<()> {
+        let Some(parent) = crate::posix_path::parent_posix_path(child_path) else {
+            return Ok(());
+        };
+        if self.control_plane.is_some() {
+            let scopes = self.namespace_shards_for_exact_paths(
+                &sifs_file_system_id(),
+                [child_path, parent.as_str()],
+            )?;
+            if scopes.len() != 1 {
+                return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "foreign-parent directory counts require declared original-job participants before effects".into(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn counted_parent_successor(
+        &mut self,
+        child_path: &str,
+        delta: i64,
+    ) -> Result<Option<(DfsObjectMetadata, DfsObjectMetadata)>> {
+        let Some(parent_path) = crate::posix_path::parent_posix_path(child_path) else {
+            return Ok(None);
+        };
+        self.require_count_parent_coowned(child_path)?;
+        let before = self
+            .lookup_sifs_path(&parent_path)?
+            .filter(|object| object.kind != DfsObjectKind::Tombstone)
+            .ok_or_else(|| DfsPosixError::MissingParent {
+                path: parent_path.clone(),
+            })?;
+        if before.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory { path: parent_path });
+        }
+        let mut successor = before.clone();
+        successor.namespace_link_count = Some(super::metadata::updated_namespace_link_count(
+            &before, delta,
+        )?);
+        let now = now_unix_nanos()
+            .max(before.modified_at_unix_nanos.saturating_add(1))
+            .max(before.changed_at_unix_nanos.saturating_add(1));
+        successor.modified_at_unix_nanos = now;
+        successor.changed_at_unix_nanos = now;
+        successor.version = next_version(&before.version);
+        Ok(Some((before, successor)))
+    }
+
+    fn recorded_adoption_parent_successor(
+        &self,
+        transaction_id: &str,
+        destination: &DfsObjectMetadata,
+        parent_path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let backend = self.metadata_backend.as_ref().ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: "counted adoption has no actual backend".into(),
+            })
+        })?;
+        let mut ids = Vec::new();
+        if let Some(request) = self.namespace_execution.request() {
+            ids.push(format!(
+                "namespace-request:{}:{transaction_id}",
+                request.operation_id
+            ));
+        }
+        ids.push(format!("namespace:{transaction_id}"));
+        for id in ids {
+            if let Some(record) = backend.prepared_operation_record(&id)? {
+                record.validate()?;
+                if record.payload.transaction.transaction_id != transaction_id
+                    || !record
+                        .payload
+                        .transaction
+                        .objects
+                        .iter()
+                        .any(|object| object == destination)
+                {
+                    return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "counted adoption retry changed its original destination".into(),
+                    }));
+                }
+                return record
+                    .payload
+                    .transaction
+                    .objects
+                    .iter()
+                    .find(|object| {
+                        object.path == parent_path && object.kind == DfsObjectKind::Directory
+                    })
+                    .cloned()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        DfsPosixError::Dfs(DfsError::Metadata {
+                            message: "original adoption omitted its exact counted parent".into(),
+                        })
+                    });
+            }
+        }
+        Ok(None)
+    }
+
     /// Coordinates a directory rename whose destination lives in a metadata
     /// shard owned by another primary: the root record moves first (the
     /// destination primary validates and adopts it atomically, like a local
@@ -282,17 +620,66 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         source: DfsObjectMetadata,
     ) -> Result<()> {
+        // Existing in-flight work remains the original operation, including
+        // older job IDs. A settled abort, however, must not occupy the identity
+        // of a genuinely distinct later caller request on the unchanged source.
+        if self.resume_running_cross_shard_namespace_job_for_paths(
+            &source.file_system_id,
+            from,
+            to,
+            &[DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries],
+        )? {
+            return Ok(());
+        }
+        let operation_path = match self.namespace_execution.request() {
+            Some(request) => format!(
+                "{from}->{to}\0{}\0{}",
+                request.requester_node_id, request.request_id
+            ),
+            None => format!("{from}->{to}"),
+        };
         let job_id = namespace_job_id(
             "rename-dir-cross-shard",
             &source.file_system_id,
-            &format!("{from}->{to}"),
+            &operation_path,
             &source.object_id,
             &source.version,
         );
         let job = match self.namespace_job(&job_id)? {
             Some(job) => job,
             None => {
+                super::metadata::updated_namespace_link_count(&source, 0)?;
+                let destination = self.lookup_sifs_path_direct_distributed_synced(to)?;
+                let expected_destination = match destination
+                    .as_ref()
+                    .filter(|row| row.kind != DfsObjectKind::Tombstone)
+                {
+                    Some(row) if row.kind == DfsObjectKind::Directory => {
+                        crate::DfsNamespaceDestinationPrecondition::Exact(
+                            DfsNamespaceObjectPrecondition {
+                                object_id: row.object_id.clone(),
+                                version: row.version.clone(),
+                            },
+                        )
+                    }
+                    Some(_) => return Err(DfsPosixError::NotDirectory { path: to.into() }),
+                    None => crate::DfsNamespaceDestinationPrecondition::Absent,
+                };
+                let same_parent = crate::posix_path::parent_posix_path(from)
+                    == crate::posix_path::parent_posix_path(to);
+                let replaces = matches!(
+                    expected_destination,
+                    crate::DfsNamespaceDestinationPrecondition::Exact(_)
+                );
                 let now = time::OffsetDateTime::now_utc();
+                let mut count_plan = crate::metadata_records::DfsDirectoryMoveCounts {
+                    parent_participants: None,
+                    expected_destination,
+                    source_parent_delta: if same_parent && !replaces { 0 } else { -1 },
+                    target_parent_delta: if same_parent || replaces { 0 } else { 1 },
+                };
+                count_plan.parent_participants =
+                    self.plan_foreign_parent_counts(&job_id, from, to, &source, &count_plan, now)?;
                 DfsNamespaceJobRecord {
                     job_id,
                     file_system_id: source.file_system_id.clone(),
@@ -307,6 +694,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     pending_frames: vec![
                         DfsNamespaceJobFrame::CrossShardDirFinish {
                             source_root: from.to_string(),
+                            count_plan: Some(count_plan),
                         },
                         DfsNamespaceJobFrame::CrossShardDirScan {
                             source_path: from.to_string(),
@@ -553,6 +941,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         job.pending_frames
             .push(DfsNamespaceJobFrame::CrossShardAdopt {
+                promotion_alias: None,
                 moved_object: moved,
                 old_path: old_path.to_owned(),
                 destination_primary_node_id: destination.primary_node_id,
@@ -660,6 +1049,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             )
         });
+        // The native target phase may already have retired the physical source.
+        // Consume its exact correlated receipt before attempting a new source
+        // read; the original frame still owns the transfer identity.
+        if let Some(key) = phase_key.as_ref()
+            && let Some(outcome) = self.completed_remote_namespace_phases.remove(key)
+        {
+            let transfer_id =
+                crate::protocol::cross_shard_pin_transfer_id(frame_object, &old_path)?;
+            return self.finish_completed_source_adoption_phase(
+                frame_object,
+                &old_path,
+                job,
+                &transfer_id,
+                outcome,
+            );
+        }
         let prepared_source = phase_key
             .as_ref()
             .and_then(|key| self.prepared_remote_sources.get(key))
@@ -1218,6 +1623,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 source_path,
                 source_family,
                 pin_transfer_installed.then_some(pin_transfer_id.as_str()),
+                if moved.kind == DfsObjectKind::Directory {
+                    match job.filter(|job| {
+                        crate::namespace::metadata_path(&job.root_path)
+                            == crate::namespace::metadata_path(source_path)
+                    }) {
+                        Some(job) => job
+                            .directory_move_counts()?
+                            .map_or(0, |plan| plan.source_effect_delta(source_path)),
+                        None => 0,
+                    }
+                } else {
+                    0
+                },
             )?;
         }
         if pin_transfer_installed {
@@ -1414,6 +1832,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: target.file_system_id.clone(),
             path: link_path.clone(),
             kind: DfsObjectKind::Hardlink,
+            namespace_link_count: None,
             tombstone_provenance: None,
             owner_node_id: self.node_id.clone(),
             current_locations: Vec::new(),
@@ -1442,6 +1861,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(job) = self.namespace_job(&job_id)? {
             return self.drive_cross_shard_namespace_job(job);
         }
+        let active_request = self.namespace_execution.request().cloned().ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Distributed {
+                message: "cross-shard hardlink has no durable outer namespace admission".into(),
+            })
+        })?;
+        let expected_target = DfsNamespaceObjectPrecondition {
+            object_id: target.object_id.clone(),
+            version: target.version.clone(),
+        };
+        let mut committed_target = target.clone();
+        committed_target.namespace_link_count =
+            Some(super::metadata::updated_namespace_link_count(&target, 1)?);
+        committed_target.changed_at_unix_nanos =
+            now_unix_nanos().max(target.changed_at_unix_nanos.saturating_add(1));
+        committed_target.version = next_version(&target.version);
+        let origin = Some(DfsNamespaceJobOrigin::from_request(&active_request));
+        self.publish_namespace_request_record(&active_request)?;
         let file_system_id = sifs_file_system_id();
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &existing_path)?;
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &link_path)?;
@@ -1449,25 +1885,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(job) => job,
             None => {
                 let now = time::OffsetDateTime::now_utc();
+                let fence = hardlink_target_fence(
+                    &job_id,
+                    &link_path,
+                    &expected_target,
+                    &committed_target,
+                    origin.clone(),
+                    now,
+                );
                 DfsNamespaceJobRecord {
                     job_id,
                     file_system_id: target.file_system_id.clone(),
-                    origin: self
-                        .namespace_execution
-                        .request()
-                        .map(DfsNamespaceJobOrigin::from_request),
+                    origin,
                     kind: DfsNamespaceJobKind::HardlinkAcrossShardPrimaries,
                     status: DfsNamespaceJobStatus::Running,
                     root_path: existing_path.clone(),
                     target_path: Some(link_path.clone()),
                     pending_frames: vec![
-                        DfsNamespaceJobFrame::CrossShardHardlinkComplete {
-                            target_object_id: target.object_id.clone(),
+                        DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit {
+                            fence_job_id: fence.job_id.clone(),
+                            source_path: link_path.clone(),
+                            expected_target,
+                            committed_target,
                         },
                         DfsNamespaceJobFrame::CrossShardHardlinkAdopt {
                             alias,
                             target_object_id: target.object_id.clone(),
                             destination_primary_node_id: destination_primary,
+                        },
+                        DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall {
+                            fence: Box::new(
+                                crate::metadata_records::DfsHardlinkTargetFence::from_job(fence)?,
+                            ),
+                            source_path: link_path.clone(),
                         },
                     ],
                     processed_object_count: 0,
@@ -1565,6 +2015,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
                 | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
                 | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+                | DfsNamespaceOperation::ParentCountParticipant { .. }
                 | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
         ) {
             let job = job.ok_or_else(|| {
@@ -1581,6 +2032,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
                     | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
                     | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+                    | DfsNamespaceOperation::ParentCountParticipant { .. }
                     | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
             ) && let Some(outcome) = self.completed_remote_namespace_phases.remove(&request)
             {
@@ -1653,8 +2105,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         alias: &DfsObjectMetadata,
         result_path: &str,
         transaction: DfsNamespaceTransaction,
-        reason: &str,
+        mutation: HardlinkAliasMutation,
     ) -> Result<()> {
+        let reason = mutation.label();
         let source_path = normalize_posix_path(&alias.path)?;
         let result_path = normalize_posix_path(result_path)?;
         let job_id = namespace_job_id(
@@ -1689,13 +2142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| DfsPosixError::NotFound {
                     path: source_path.clone(),
                 })?;
-        let target = self.object_by_id(target_object_id)?.ok_or_else(|| {
-            DfsPosixError::Dfs(DfsError::Distributed {
-                message: format!(
-                    "hardlink alias {source_path} cannot locate canonical target {target_object_id}"
-                ),
-            })
-        })?;
+        let target = self.resolve_hardlink_target_distributed(alias, None)?;
         if target.kind == DfsObjectKind::Tombstone
             || target.kind == DfsObjectKind::Hardlink
             || target.object_id != *target_object_id
@@ -1755,37 +2202,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             version: target.version.clone(),
         };
         let mut committed_target = target.clone();
+        committed_target.namespace_link_count = Some(
+            super::metadata::updated_namespace_link_count(&target, mutation.count_delta())?,
+        );
         committed_target.changed_at_unix_nanos =
             now_unix_nanos().max(target.changed_at_unix_nanos.saturating_add(1));
         committed_target.version = next_version(&target.version);
         let now = time::OffsetDateTime::now_utc();
         let origin = Some(DfsNamespaceJobOrigin::from_request(&active_request));
-        let fence_job_id = namespace_job_id(
-            "hardlink-target-fence",
-            &target.file_system_id,
-            &format!("{job_id}:{source_path}->{target_path}"),
-            &target.object_id,
-            &target.version,
+        let fence = hardlink_target_fence(
+            &job_id,
+            &source_path,
+            &expected_target,
+            &committed_target,
+            origin.clone(),
+            now,
         );
-        let fence = DfsNamespaceJobRecord {
-            job_id: fence_job_id.clone(),
-            file_system_id: target.file_system_id.clone(),
-            origin: origin.clone(),
-            kind: DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary,
-            status: DfsNamespaceJobStatus::Running,
-            root_path: target_path,
-            target_path: None,
-            pending_frames: vec![DfsNamespaceJobFrame::HardlinkTargetFenceReservation {
-                source_path: source_path.clone(),
-                expected_target: expected_target.clone(),
-                committed_target: committed_target.clone(),
-            }],
-            processed_object_count: 0,
-            created_at: now,
-            updated_at: now,
-            completed_at: None,
-            failure_reason: None,
-        };
+        let fence_job_id = fence.job_id.clone();
         let job = DfsNamespaceJobRecord {
             job_id,
             file_system_id,
@@ -1995,6 +2428,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             }));
         }
+        let scope = self.metadata_effect_scope_for_object(
+            committed_target,
+            format!("install-target-fence:{}", fence.job_id),
+        )?;
+        let _execution = self.acquire_prepared_execution(&scope)?;
         if let Some(existing) = self.namespace_job(&fence.job_id)? {
             if existing == *fence {
                 self.apply_cross_shard_namespace_job_guard(&existing)?;
@@ -2026,6 +2464,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // after the exact pre-minted generation committed. Full metadata
             // equality is an immutable completion proof for the source frame.
             return Ok(());
+        }
+        // Two alias owners must not reserve the same canonical generation.
+        // The only overlapping source job allowed here is the real producer
+        // whose immutable pending frame contains this exact reservation.
+        for job_id in self
+            .cross_shard_namespace_locks
+            .overlapping_job_ids(&fence.file_system_id, &target_path)
+        {
+            let mut original_producer = false;
+            if let Some(job) = self.namespace_job(&job_id)?
+                && job.status == DfsNamespaceJobStatus::Running
+                && job.file_system_id == fence.file_system_id
+                && matches!(
+                    job.kind,
+                    DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                        | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                )
+                && hardlink_target_fence(
+                    &job.job_id,
+                    source_path,
+                    expected_target,
+                    committed_target,
+                    job.origin.clone(),
+                    job.created_at,
+                ) == *fence
+            {
+                for frame in &job.pending_frames {
+                    if let DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall {
+                        fence: recorded,
+                        source_path: recorded_source,
+                    } = frame
+                        && normalize_posix_path(recorded_source)?
+                            == normalize_posix_path(source_path)?
+                        && recorded.as_ref().clone().into_job()? == *fence
+                    {
+                        original_producer = true;
+                    }
+                }
+            }
+            if !original_producer {
+                return Err(DfsPosixError::Dfs(DfsError::Busy { path: target_path }));
+            }
         }
         if current.as_ref().is_none_or(|target| {
             target.kind == DfsObjectKind::Tombstone
@@ -2155,6 +2635,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceJobStatus::Completed => return Ok(()),
                 DfsNamespaceJobStatus::Running => continue,
                 DfsNamespaceJobStatus::Failed => {
+                    if job.processed_object_count == 0
+                        && job.directory_move_counts()?.and_then(|counts| counts.parent_participants.as_ref()).is_some_and(|plan|
+                            plan.phase == crate::DfsParentCountPhase::Aborting
+                                && plan.confirmed == plan.participants.len()
+                                && matches!(plan.rejection, Some(crate::DfsParentCountRejection::ParentChanged
+                                    | crate::DfsParentCountRejection::Contended | crate::DfsParentCountRejection::AssignmentChanged))) {
+                        // This is a definite rejected attempt: every reservation
+                        // is withdrawn and no namespace effect was issued. Keep
+                        // its terminal identity while letting a fresh caller
+                        // replan from the changed parent/assignment.
+                        return Err(DfsPosixError::Conflict {
+                            path: job.root_path.clone(),
+                            reason: "directory parent changed before namespace effects; retry with a fresh operation".into(),
+                        });
+                    }
                     let reason = job
                         .failure_reason
                         .unwrap_or_else(|| format!("cross-shard job {} failed", job.job_id));
@@ -2182,6 +2677,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if job.status != DfsNamespaceJobStatus::Running {
             return Ok(job);
         }
+        if job.pending_frames.iter().any(|frame| {
+            matches!(
+                frame,
+                DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. }
+            )
+        }) {
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: "legacy hardlink job has no sealed count successor; explicit migration is required".into(),
+            }));
+        }
         let file_system_id = job.file_system_id.clone();
         // Snapshot-copied or stale jobs must not run on a node that is no
         // longer the source-side authority.
@@ -2205,16 +2710,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.apply_cross_shard_namespace_job_guard(&job)?;
         let mut steps = 0usize;
-        while let Some(frame) = job.pending_frames.pop() {
+        while !job.pending_frames.is_empty() {
             if steps >= max_steps {
-                // Budget exhausted: persist progress and yield. The job stays
-                // running (and the path locked) for the caller or maintenance
-                // to continue.
-                job.pending_frames.push(frame);
                 job.updated_at = time::OffsetDateTime::now_utc();
                 self.persist_namespace_job(&job)?;
                 return Ok(job);
             }
+            let owns_parent_plan = job.directory_move_counts()?.is_some_and(|counts| counts.parent_participants.is_some());
+            let parent_progress = self.advance_parent_count_plan(&mut job);
+            if owns_parent_plan {
+                // Phase replies can fail without appending another job row.
+                // Preserve the caller's Pending ownership from the actual
+                // durable Running job, or observe its terminal abort status.
+                let actual = self.namespace_job(&job.job_id)?.ok_or_else(|| DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "parent phase lost its original durable coordinator".into(),
+                }))?;
+                self.namespace_execution.observe_coordinator_job(&actual);
+                job = actual;
+                if job.status != DfsNamespaceJobStatus::Running {
+                    return Ok(job);
+                }
+            }
+            if !parent_progress? { return Ok(job); }
+            let frame = job.pending_frames.pop().expect("nonempty job frames");
             steps = steps.saturating_add(1);
             let hardlink_alias_coordination_frame = matches!(
                 &frame,
@@ -2263,7 +2781,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             | DfsPosixError::Conflict { .. }
                             | DfsPosixError::DirectoryNotEmpty { .. }
                     );
-                    if structured && let Some(execution) = self.publication_execution.current() {
+                    let parent_effects_issued = job
+                        .directory_move_counts()?
+                        .and_then(|counts| counts.parent_participants.as_ref())
+                        .is_some_and(|plan| {
+                            matches!(
+                                plan.phase,
+                                crate::DfsParentCountPhase::Issued
+                                    | crate::DfsParentCountPhase::Settling
+                            )
+                        });
+                    if structured
+                        && (!parent_effects_issued
+                            || (job.kind == DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                                && job.root_path == *old_path && job.processed_object_count == 1))
+                        && let Some(execution) = self.publication_execution.current()
+                    {
                         let actor = crate::source_adoption::actor_for_root(execution.data_root())?;
                         let retained = self.namespace_job(&job.job_id)?.ok_or_else(|| {
                             DfsPosixError::Dfs(DfsError::Metadata {
@@ -2287,7 +2820,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     &retained.file_system_id,
                                     &crate::DfsMetadataShardId::new(&source.shard_id),
                                 )?;
-                            let failed = retained.clone();
+                            let rejected_root = retained.initial_directory_root_adoption().is_some();
+                            let mut failed = retained.clone();
                             if actor.finish_locally_cancelled_adoption(
                                 &phase,
                                 &retained,
@@ -2296,10 +2830,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &physical,
                                 &execution,
                                 || {
-                                    self.fail_namespace_job(failed, error.to_string())
-                                        .map(|_| ())
+                                    if rejected_root {
+                                        // The existing source cancellation owner excludes
+                                        // all late claims while this exact decision commits.
+                                        self.begin_parent_count_abort(&mut failed, crate::DfsParentCountRejection::RootAdoptionRejected)
+                                    } else {
+                                        self.fail_namespace_job(failed, error.to_string()).map(|_| ())
+                                    }
                                 },
                             )? {
+                                if rejected_root {
+                                    self.namespace_execution.record_job();
+                                    job = self.namespace_job(&job.job_id)?.ok_or_else(|| DfsPosixError::Dfs(DfsError::Metadata {
+                                        message: "root withdrawal lost its original coordinator".into(),
+                                    }))?;
+                                    continue;
+                                }
                                 return Err(error);
                             }
                         }
@@ -2318,6 +2864,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     moved_object,
                     old_path,
                     destination_primary_node_id,
+                    ..
                 } => {
                     let _ = destination_primary_node_id;
                     self.run_cross_shard_adopt_for_job(&moved_object, &old_path, Some(&job))
@@ -2329,6 +2876,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &moved_object,
                     &old_path,
                     job.kind != DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                    if job.kind == DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                        && job.root_path == old_path
+                    {
+                        job.directory_move_counts()?
+                            .map_or(0, |plan| plan.source_effect_delta(&old_path))
+                    } else {
+                        0
+                    },
                 ),
                 DfsNamespaceJobFrame::CrossShardDirStart {
                     source_object_id,
@@ -2350,8 +2905,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &target_path,
                     cursor.as_ref(),
                 ),
-                DfsNamespaceJobFrame::CrossShardDirFinish { source_root } => {
-                    self.touch_parent_directory_if_local_primary(&source_root)
+                DfsNamespaceJobFrame::CrossShardDirFinish {
+                    source_root,
+                    count_plan,
+                } => {
+                    if count_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.parent_is_participant(&source_root))
+                    {
+                        Ok(())
+                    } else {
+                        self.touch_parent_directory_if_local_primary(&source_root)
+                    }
                 }
                 DfsNamespaceJobFrame::CrossShardHardlinkAdopt {
                     alias,
@@ -2451,9 +3016,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             match outcome {
                 Ok(()) => {
+                    #[cfg(test)]
+                    if job.kind == DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                        && matches!(
+                            &frame,
+                            DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
+                        )
+                    {
+                        // The target successor is durable, but this source
+                        // frame is still pending in the actual original job.
+                        run_hardlink_count_after_commit_test_hook(&job.root_path)?;
+                    }
                     job.processed_object_count = job.processed_object_count.saturating_add(1);
                     job.updated_at = time::OffsetDateTime::now_utc();
-                    self.persist_namespace_job(&job)?;
+                    // Parent declarations remain durable until the final
+                    // coordinator terminal commit, never a Running empty job.
+                    let finishing_parent_plan = matches!(&frame, DfsNamespaceJobFrame::CrossShardDirFinish { count_plan: Some(counts), .. } if counts.parent_participants.is_some());
+                    if !finishing_parent_plan {
+                        self.persist_namespace_job(&job)?;
+                    }
                     #[cfg(test)]
                     if hardlink_alias_commit_frame {
                         run_hardlink_alias_after_commit_test_hook(&job.root_path)?;
@@ -2467,7 +3048,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.persist_namespace_job(&job)?;
                     return Err(error);
                 }
-                Err(error) if hardlink_alias_coordination_frame => {
+                Err(error)
+                    if hardlink_alias_coordination_frame
+                        || job
+                            .directory_move_counts()?
+                            .and_then(|counts| counts.parent_participants.as_ref())
+                            .is_some_and(|plan| {
+                                matches!(
+                                    plan.phase,
+                                    crate::DfsParentCountPhase::Issued
+                                        | crate::DfsParentCountPhase::Settling
+                                )
+                            }) =>
+                {
                     // Once a target fence may exist, failure is forward-only:
                     // retain both durable reservations and let exact retry or
                     // authority recovery settle the same generation.
@@ -2506,9 +3099,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         moved_object: &DfsObjectMetadata,
         old_path: &str,
         touch_parent: bool,
+        source_parent_delta: i64,
     ) -> Result<()> {
         self.clear_metadata_lookup_cache();
         let old_path = normalize_posix_path(old_path)?;
+        // Native adoption retires the original source before this frame runs.
+        // Observe that exact committed effect on its known physical shard before
+        // attempting to recapture a family whose live authority row is gone.
+        let sources = self.namespace_shards_for_exact_paths(
+            &moved_object.file_system_id,
+            std::iter::once(old_path.as_str()),
+        )?;
+        if let [source] = sources.as_slice()
+            && source.primary_node_id == self.node_id
+            && let Some(backend) = self.metadata_backend.as_ref()
+        {
+            let shard_id = DfsMetadataShardId::new(source.shard_id.clone());
+            let operation_id =
+                source_eviction_operation_id(moved_object, &old_path, source_parent_delta)?;
+            if let (_, Some(original)) = backend.prepared_operation_read_context(
+                &shard_id,
+                &moved_object.file_system_id,
+                &operation_id,
+            )? {
+                original.validate()?;
+                let payload = &original.payload;
+                let exact_eviction = payload.shard_id == shard_id
+                    && payload.file_system_id == moved_object.file_system_id
+                    && payload.operation_id == operation_id
+                    && payload.metadata_effects.iter().any(|effect| matches!(effect,
+                        crate::DfsPreparedMetadataEffect::FinalizeCrossShardSourceEviction { tombstone, .. }
+                            if tombstone.object_id == moved_object.object_id
+                                && tombstone.file_system_id == moved_object.file_system_id
+                                && crate::namespace::metadata_path(&tombstone.path) == crate::namespace::metadata_path(&old_path)
+                                && matches!(&tombstone.tombstone_provenance,
+                                    Some(crate::DfsTombstoneProvenance::SourceEviction { source_shard_id, .. })
+                                        if *source_shard_id == shard_id)
+                    ));
+                if !exact_eviction {
+                    return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "recorded source retirement differs from its original move".into(),
+                    }));
+                }
+                if backend
+                    .committed_prepared_operation(&original.digest)?
+                    .is_some()
+                {
+                    // Retirement was admitted only after the original target
+                    // proof. A later destination generation cannot invalidate it.
+                    self.apply_metadata_object_to_service_state(moved_object.clone())?;
+                    self.clear_metadata_lookup_cache();
+                    if touch_parent {
+                        self.touch_parent_directory_if_local_primary(&old_path)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         // A parked saga may resume after the adoption advanced the record
         // beyond the frame snapshot; complete against the adopted state when
         // it is visible.
@@ -2620,7 +3267,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_mut() {
             let family =
                 backend.capture_cross_shard_source_family(&moved_object.object_id, &old_path)?;
-            self.publish_cross_shard_source_eviction(moved_object, &old_path, &family, None)?;
+            self.publish_cross_shard_source_eviction(
+                moved_object,
+                &old_path,
+                &family,
+                None,
+                source_parent_delta,
+            )?;
         }
         self.clear_metadata_lookup_cache();
         self.apply_metadata_object_to_service_state(moved_object.clone())?;
@@ -2631,23 +3284,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// The target-side half of a cross-shard hardlink: record the link-count
-    /// change as a ctime bump on the target object.
+    /// An old target-id-only frame cannot establish an exact count successor.
+    /// Retain its original job for explicit migration rather than re-increment.
     fn complete_cross_shard_hardlink_locally(
         &mut self,
-        target_object_id: &DfsObjectId,
+        _target_object_id: &DfsObjectId,
     ) -> Result<()> {
-        let _namespace_plan = self.namespace_execution.begin_planning();
-        let Some(mut target) = self.object_by_id(target_object_id)? else {
-            return Ok(());
-        };
-        if target.kind == DfsObjectKind::Tombstone {
-            return Ok(());
-        }
-        target.changed_at_unix_nanos = now_unix_nanos();
-        target.version = next_version(&target.version);
-        self.add_object_metadata(target)?;
-        Ok(())
+        Err(DfsPosixError::Dfs(DfsError::Metadata {
+            message: "legacy hardlink completion has no exact count successor".into(),
+        }))
     }
 
     /// Atomically installs an object record moved here from another primary's
@@ -2659,16 +3304,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         old_path: &str,
         family: &crate::DfsCrossShardSourceFamily,
         transfer_id: Option<&str>,
+        source_parent_delta: i64,
     ) -> Result<()> {
         let source_scope = self.metadata_effect_scope_for_object(
             &family.source_object,
-            format!(
-                "source-eviction:{}:{}",
-                transfer_id.unwrap_or("unpinned"),
-                sinomo_core::Id::generate()
-            ),
+            source_eviction_operation_id(moved, old_path, source_parent_delta)?,
         )?;
         let _execution = self.acquire_prepared_execution(&source_scope)?;
+        if let Some(original) = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "source retirement has no backend".into(),
+                })
+            })?
+            .prepared_operation_record(&source_scope.operation_id)?
+        {
+            original.validate()?;
+            self.publish_metadata_effect_payload(original.payload.as_ref().clone())?;
+            return Ok(());
+        }
         let target_shard = match self.select_metadata_shard_for_object(moved)? {
             Some(shard) => crate::DfsMetadataShardId::new(shard.shard_id),
             None if self.control_plane.is_none() => self.local_prepared_operation_shard()?,
@@ -2708,6 +3364,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             plan.effects,
             time::OffsetDateTime::now_utc(),
         )?;
+        if source_parent_delta != 0 && family.source_object.kind == DfsObjectKind::Directory {
+            if let Some((before, successor)) =
+                self.counted_parent_successor(old_path, source_parent_delta)?
+            {
+                payload
+                    .expected_object_versions
+                    .push(DfsNamespaceObjectVersionExpectation {
+                        object_id: before.object_id.clone(),
+                        expected_version: Some(before.version),
+                    });
+                payload
+                    .expected_path_occupants
+                    .push(DfsNamespacePathOccupantExpectation {
+                        path: before.path,
+                        expected_object_id: Some(before.object_id),
+                    });
+                payload.transaction.objects.push(successor);
+                payload.normalize();
+            }
+        }
         payload.expected_journal_sequence = Some(plan.expected_journal_sequence);
         self.publish_metadata_effect_payload(payload)?;
         Ok(())
@@ -2735,6 +3411,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(&object.path)?;
+        let directory_root_plan = if object.kind == DfsObjectKind::Directory {
+            let offer = self.source_adoption.offer().ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "counted directory adoption has no original source offer".into(),
+                })
+            })?;
+            let owners = self.publication_execution.current().ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "counted directory adoption has no actual execution owner".into(),
+                })
+            })?;
+            let actor = crate::source_adoption::actor_for_root(owners.data_root())?;
+            let job = actor.bound_original_job(&offer, source_path)?;
+            let target_root = job.target_path.as_ref().ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "original directory job omitted its target root".into(),
+                })
+            })?;
+            if job.kind != DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                || !posix_path_is_at_or_under_prefix(&path, target_root)
+            {
+                return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "directory count adoption has no original tree-move scope".into(),
+                }));
+            }
+            // Descendants materialize an already-counted transported subtree.
+            // Only its root changes membership of an external parent.
+            let plan = job
+                .directory_move_counts()?
+                .ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "directory adoption omitted original count plan".into(),
+                    })
+                })?
+                .clone();
+            if let Some(participants) = &plan.parent_participants {
+                participants.validate_for_job(&job)?;
+                if participants.phase != crate::DfsParentCountPhase::Issued {
+                    return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: "directory parent reservation has no bound issuance decision".into(),
+                    }));
+                }
+            }
+            (path == *target_root).then_some(plan)
+        } else {
+            None
+        };
+        let target_parent_delta = directory_root_plan
+            .as_ref()
+            .map_or(0, |plan| plan.target_effect_delta(&path));
         if self.metadata_backend.is_some() {
             let destination_shards = self.namespace_shards_for_exact_paths(
                 &object.file_system_id,
@@ -2841,8 +3567,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut family_effects = transfer.effects;
         let mut transaction_objects = Vec::new();
         let mut already_adopted = false;
-        if let Some(destination) = self.lookup_sifs_path(&path)? {
+        let destination_before = self.lookup_sifs_path(&path)?;
+        if let Some(destination) = destination_before.clone() {
             if destination.object_id == object.object_id && destination.kind == object.kind {
+                if destination.kind == DfsObjectKind::Hardlink {
+                    if destination.namespace_link_count.is_some() {
+                        return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                            message: "adopted alias owns an invalid canonical count".into(),
+                        }));
+                    }
+                } else {
+                    super::metadata::updated_namespace_link_count(&destination, 0)?;
+                    if destination.version == object.version
+                        && destination.namespace_link_count != object.namespace_link_count
+                    {
+                        return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                            message:
+                                "same adopted generation changed its canonical namespace count"
+                                    .into(),
+                        }));
+                    }
+                }
                 let adopted_version_is_ancestor = if destination.version == object.version {
                     true
                 } else if let Some(backend) = self.metadata_backend.as_ref() {
@@ -2900,7 +3645,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         });
                     }
                     _ => {
-                        if self.hardlink_count_to_object(&destination.object_id)? > 0 {
+                        if super::metadata::updated_namespace_link_count(&destination, 0)? > 1 {
                             return Err(DfsPosixError::InvalidPath {
                                 path: format!(
                                     "{path} has hardlink aliases; cross-shard replace is not supported"
@@ -3055,8 +3800,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if !already_adopted {
-            self.ensure_parent_directory(&path)?;
+            if let Some(plan) = &directory_root_plan {
+                let matches = match &plan.expected_destination {
+                    crate::DfsNamespaceDestinationPrecondition::Absent => destination_before
+                        .as_ref()
+                        .is_none_or(|row| row.kind == DfsObjectKind::Tombstone),
+                    crate::DfsNamespaceDestinationPrecondition::Exact(expected) => {
+                        destination_before.as_ref().is_some_and(|row| {
+                            row.kind == DfsObjectKind::Directory
+                                && row.object_id == expected.object_id
+                                && row.version == expected.version
+                        })
+                    }
+                };
+                if !matches {
+                    return Err(DfsPosixError::Conflict {
+                        path: path.clone(),
+                        reason: "directory adoption destination changed its original count plan"
+                            .into(),
+                    });
+                }
+            }
+            if !directory_root_plan.as_ref().is_some_and(|plan| plan.parent_is_participant(&path)) {
+                self.ensure_parent_directory(&path)?;
+            }
+            // Otherwise the actual bound Issued job proves its exact parent
+            // was reserved before any adoption. Its write reservation cannot
+            // abort after issuance or apply until these child effects finish.
+            // Do not fabricate a target-local parent row or read-set entry.
             transaction_objects.push(object.clone());
+            if target_parent_delta != 0 {
+                let parent_path = crate::posix_path::parent_posix_path(&path)
+                    .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
+                let transaction_id = namespace_transaction_id_for_versioned_path(
+                    "adopt-cross-shard",
+                    &object.object_id,
+                    &object.version,
+                    &path,
+                );
+                let parent = match self.recorded_adoption_parent_successor(
+                    &transaction_id,
+                    object,
+                    &parent_path,
+                )? {
+                    Some(parent) => parent,
+                    None => {
+                        self.counted_parent_successor(&path, target_parent_delta)?
+                            .ok_or_else(|| DfsPosixError::MissingParent {
+                                path: parent_path.clone(),
+                            })?
+                            .1
+                    }
+                };
+                transaction_objects.push(parent);
+            }
             let mut visible_version = cross_shard_object_version_record(object);
             visible_version.content_durability = versions
                 .iter()
@@ -3097,7 +3894,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             self.publish_captured_object_metadata_effects(object, scope, family_effects)?;
         }
-        if !already_adopted {
+        if !already_adopted
+            && target_parent_delta == 0
+            && !directory_root_plan
+                .as_ref()
+                .is_some_and(|plan| plan.parent_is_participant(&path))
+        {
             self.touch_parent_directory_if_local_primary(&path)?;
         }
         Ok(pin_transfer_active)

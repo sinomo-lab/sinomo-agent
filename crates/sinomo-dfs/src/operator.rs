@@ -1658,7 +1658,7 @@ mod tests {
             .get_object_by_path(&runtime.file_system().file_system_id, "/")
             .unwrap()
             .unwrap();
-        let mut effects = Vec::new();
+        let mut objects = Vec::new();
         let mut versions = Vec::new();
         let mut paths = Vec::new();
         for index in 0..OPERATOR_OBJECT_SCAN_PAGE_SIZE {
@@ -1666,6 +1666,7 @@ mod tests {
             directory.path = format!("/operator-fill-{index:05}");
             directory.object_id = crate::object_id_for_path(&directory.path);
             directory.version = DfsVersion::generate();
+            directory.namespace_link_count = Some(2);
             versions.push(crate::DfsNamespaceObjectVersionExpectation {
                 object_id: directory.object_id.clone(),
                 expected_version: None,
@@ -1674,22 +1675,44 @@ mod tests {
                 path: directory.path.clone(),
                 expected_object_id: None,
             });
-            effects.push(crate::DfsPreparedMetadataEffect::PutObject { object: directory });
+            objects.push(directory);
         }
+        let mut parent = template.clone();
+        parent.namespace_link_count = Some(parent.namespace_link_count.unwrap()
+            .checked_add(OPERATOR_OBJECT_SCAN_PAGE_SIZE as u64).unwrap());
+        parent.version = crate::namespace::next_version(&parent.version);
+        parent.modified_at_unix_nanos = crate::dfs_now_unix_nanos();
+        parent.changed_at_unix_nanos = parent.modified_at_unix_nanos;
+        versions.push(crate::DfsNamespaceObjectVersionExpectation {
+            object_id: parent.object_id.clone(), expected_version: Some(template.version.clone()),
+        });
+        paths.push(crate::DfsNamespacePathOccupantExpectation {
+            path: parent.path.clone(), expected_object_id: Some(parent.object_id.clone()),
+        });
+        objects.push(parent);
         let shard = runtime.root_shard().unwrap();
-        let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
+        let payload = crate::DfsPreparedOperationPayload::for_namespace_transaction(
             crate::DfsPreparedOperationScope {
                 file_system_id: shard.file_system_id.clone(),
                 shard_id: crate::DfsMetadataShardId::new(shard.shard_id),
                 owner_epoch: shard.epoch,
                 operation_id: "operator-paging-directories".into(),
             },
-            versions,
-            paths,
-            effects,
-            OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            versions, paths,
+            crate::DfsNamespaceTransaction {
+                transaction_id: "operator-paging-directories".into(),
+                file_system_id: shard.file_system_id,
+                versions: objects.iter().map(|object| crate::object_version_record(object, None)).collect(),
+                objects,
+                file_version_pins: None,
+                advisory_lock_states: Vec::new(),
+                content_reference_identity: None,
+                contribution_digest: None,
+                extension_expectations: Vec::new(),
+                created_at: OffsetDateTime::now_utc(),
+            },
+            Vec::new(), None, None, Vec::new(), None, None,
+        ).unwrap();
         // The custom corpus is authored by the actual Root Core, rather than
         // by the browser used for ordinary writes.
         let mut writer = runtime.metadata_primary_service(path).unwrap();

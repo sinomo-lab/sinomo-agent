@@ -262,6 +262,7 @@ impl DfsSourceAdoptionActor {
                 ));
             }
             let fresh = Arc::new(SourceSession {
+                original_job: Arc::clone(&session.original_job),
                 capture: session.capture.clone(),
                 generation: generation.0,
                 offer: offer.clone(),

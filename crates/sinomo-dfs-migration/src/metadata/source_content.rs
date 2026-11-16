@@ -222,6 +222,10 @@ fn operation_rows<'a>(op: &'a Value, prefix: &str, found: &mut Vec<(String, bool
         Some("put-object" | "put-compacted-tombstone") => &["object"],
         Some("put-version") => &["version_record", "version"],
         Some("apply-namespace-transaction") => &["transaction"],
+        // Native prepared records carry the real typed row bodies. Final
+        // source membership below still decides whether a row is current;
+        // presence in a Prepare alone never makes it an applied object.
+        Some("prepare-operation-v7") => &["record"],
         Some("commit-visible-version") => &["visible_version", "committed_object"],
         _ => &[],
     };
@@ -236,7 +240,7 @@ fn record_rows(record: &source::SourceRecord) -> Vec<(String, bool, &Value)> {
     match record {
         source::SourceRecord::SnapshotRow { table, row, .. } => {
             match table.replace('-', "_").as_str() {
-                "versions" | "objects" | "compacted_tombstones" => {
+                "versions" | "objects" | "compacted_tombstones" | "prepared_operations_v7" => {
                     rows(row, "/SnapshotRow/row".into(), &mut found)
                 }
                 "$ops" => operation_rows(row, "/SnapshotRow/row", &mut found),

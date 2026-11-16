@@ -264,11 +264,7 @@ fn native_conditional_kernel_seals_original_guard_and_preserves_committed_replay
         .prepared_operations_v7
         .get(&original.operation_id)
         .unwrap();
-    let eviction = crate::DfsPreparedOperationEviction {
-        digest: committed.digest.clone(),
-        status: committed.status,
-        committed_entry: committed.committed_entry.clone(),
-    };
+    let eviction = crate::DfsPreparedOperationEviction::from_terminal_record(committed).unwrap();
     eviction.validate().unwrap();
     let mut evicted = before.clone();
     evicted

@@ -59,6 +59,7 @@ fn resident_snapshot_yields_to_local_source_fence_and_recovers_exact_view() {
     use crate::DfsMetadataBackend;
     let root = sinomo_testdir::TestDir::new("resident-local-source-fence");
     let shard = DfsMetadataShardId::new("root");
+    crate::test_runtime::copy_native_genesis_data(root.path(), &shard.0);
     let backend = LocalSobjMetadataBackend::new(shard.clone(), root.path()).unwrap();
     let original = backend.prefix_proof.clone();
     let lock_path = root.path().join("journal/write.lock");
@@ -85,6 +86,7 @@ fn resident_snapshot_preserves_external_fence_nested_cut_and_corruption_errors()
     use std::io::Write;
     let root = sinomo_testdir::TestDir::new("resident-physical-source-fence");
     let shard = DfsMetadataShardId::new("root");
+    crate::test_runtime::copy_native_genesis_data(root.path(), &shard.0);
     let backend = LocalSobjMetadataBackend::new(shard.clone(), root.path()).unwrap();
     let lock_path = root.path().join("journal/write.lock");
     let fence = std::fs::OpenOptions::new()
@@ -132,6 +134,7 @@ fn resident_checkpoint_read_image(
     name: &str,
 ) -> (sinomo_testdir::TestDir, LocalSobjMetadataBackend) {
     let root = sinomo_testdir::TestDir::new(name);
+    crate::test_runtime::copy_native_genesis_data(root.path(), "root");
     let backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.path()).unwrap();
     let path = metadata_table_snapshot_path(root.path());
@@ -202,8 +205,9 @@ fn resident_read_image_cannot_cover_changed_physical_checkpoint() {
 fn resident_read_image_different_prefix_requires_fresh_source_reload() {
     let (root, mut backend) = resident_checkpoint_read_image("resident-read-image-foreign-prefix");
     let foreign = sinomo_testdir::TestDir::new("resident-read-image-foreign-source");
+    crate::test_runtime::copy_native_genesis_data(foreign.path(), "root");
     let other =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("foreign-shard"), foreign.path())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), foreign.path())
             .unwrap();
     assert_ne!(backend.prefix_proof, other.prefix_proof);
     let replacement = root.path().join("foreign-checkpoint.sobj");
@@ -226,4 +230,15 @@ fn resident_read_image_different_prefix_requires_fresh_source_reload() {
     assert_eq!(backend.try_materialize_resident_journal().unwrap(), Some(0));
     assert_eq!(metadata_durable_table_reloads(), 1);
     assert_eq!(backend.prefix_proof, other.prefix_proof);
+}
+
+#[test]
+fn inspection_without_certified_prefix_cannot_export_current_snapshot() {
+    let root = sinomo_testdir::TestDir::new("inspection-no-certified-snapshot");
+    let backend = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new("root"), root.path(),
+    ).unwrap();
+    assert!(backend.export_table_snapshot().is_err());
+    assert!(!root.join("metadata-generation.sobj").exists());
+    assert!(!root.join("records").exists());
 }

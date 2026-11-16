@@ -788,11 +788,7 @@ where
                         ) > 0
                         && budget.reserve(1) == 1
                     {
-                        self.request_stage_blob_from_alternate_async(
-                            &intent,
-                            &pending,
-                            execution_exclusions,
-                        )
+                        self.request_stage_blob_from_alternate_async(&intent, &pending)
                         .await?;
                     }
                     break;
@@ -834,11 +830,7 @@ where
                 }
                 if self.open_pending_write_blob_stream(&pending).is_err() {
                     let fetch_requested = self
-                        .request_stage_blob_from_alternate_async(
-                            &intent,
-                            &pending,
-                            execution_exclusions,
-                        )
+                        .request_stage_blob_from_alternate_async(&intent, &pending)
                         .await?;
                     if !fetch_requested {
                         for (replica_node_id, _) in full_stage_targets {
@@ -920,15 +912,14 @@ where
         &mut self,
         intent: &DistributedWriteIntent,
         pending: &PendingNetworkedWrite,
-        execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<bool, DfsError> {
         let mut skipped_failed_source = false;
-        let authority_object = self.current_read_object_metadata(&pending.object_id).ok();
-        let authority_shard = self.command_authority_shard_for_object(authority_object.as_ref())?;
+        let authority_object = self.current_object_for_write(&pending.object_id)?;
+        let authority_shard = self.command_authority_shard_for_object(Some(&authority_object))?;
         for source_node_id in self.stage_blob_sources(&intent.intent_id) {
-            if execution_exclusions.contains(&source_node_id) {
-                continue;
-            }
+            // The caller already admitted a destination. Reading this intent's
+            // source is required to stage it; destination exclusions cannot
+            // replace normal authenticated routing to that source.
             if pending.fetch_inflight_from.contains(&source_node_id) {
                 continue;
             }
@@ -1542,8 +1533,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         pending: &PendingNetworkedWrite,
     ) -> Result<bool, DfsError> {
         let mut skipped_failed_source = false;
-        let authority_object = self.current_read_object_metadata(&pending.object_id).ok();
-        let authority_shard = self.command_authority_shard_for_object(authority_object.as_ref())?;
+        let authority_object = self.current_object_for_write(&pending.object_id)?;
+        let authority_shard = self.command_authority_shard_for_object(Some(&authority_object))?;
         for source_node_id in self.stage_blob_sources(&intent.intent_id) {
             if pending.fetch_inflight_from.contains(&source_node_id) {
                 continue;

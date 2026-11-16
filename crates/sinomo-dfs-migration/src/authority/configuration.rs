@@ -470,8 +470,7 @@ impl NativeImportAuthority {
     pub(crate) fn required_original_metadata_sources(
         &self,
     ) -> Result<Vec<crate::metadata::OriginalMetadataHandoffReservation>> {
-        let read = block_native(
-            &self.runtime,
+        let read = self.read_native(
             self.cluster()?
                 .kv_range_prefix_complete_authoritative_async(PREFIX.into()),
         )?;
@@ -565,8 +564,7 @@ impl NativeImportAuthority {
         let client = self.control_client(&archive)?;
         // One actual native ReadIndex binds configuration and member inputs.
         // This does not wait for this factory's later v7 service advertisement.
-        let native = block_native(
-            &self.runtime,
+        let native = self.read_native(
             self.cluster()?
                 .kv_range_prefix_complete_authoritative_async("/".into()),
         )?;

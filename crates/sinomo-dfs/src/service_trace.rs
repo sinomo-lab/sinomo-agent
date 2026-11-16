@@ -141,6 +141,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::ResumeNamespaceJobBounded { .. } => "resume-namespace-job-bounded",
         DfsNamespaceOperation::Hardlink { .. } => "hardlink",
         DfsNamespaceOperation::InstallHardlinkTargetFence { .. } => "install-hardlink-target-fence",
+        DfsNamespaceOperation::ParentCountParticipant { .. } => "parent-count-participant",
         DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => "commit-hardlink-target-fence",
         DfsNamespaceOperation::SetMode { .. } => "set-mode",
         DfsNamespaceOperation::SetOwner { .. } => "set-owner",

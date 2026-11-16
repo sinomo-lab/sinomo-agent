@@ -1,6 +1,6 @@
 use super::actual_docker_fixture::ORIGINAL;
 use super::*;
-use crate::authority::{shared_runtime, storage_preparation_provider};
+use crate::authority::placement_work::native_tests::{native_migration_cluster, canonical_migration_runtime};
 use sinomo_dfs::DfsStoragePreparationScope;
 
 fn archive(authority: &NativeImportAuthority, bytes: &[u8]) -> PathBuf {
@@ -98,12 +98,9 @@ fn source_conversion_rejects_unknown_codec_fields_duplicate_scopes_and_source_ch
 #[test]
 fn actual_docker_cache_conversion_requires_real_native_configuration_and_archives_source() {
     let name = "routing-cache-actual-docker-native-authority";
-    let (mut native, nodes) =
-        sinomo_dfs::test_support::DfsTestRuntime::start_cluster(name, 2).unwrap();
+    let (mut native, nodes) = native_migration_cluster(name, 2);
     let context = native.component_context(&nodes[0]).unwrap();
-    let scope =
-        sinomo_module::ComponentScope::new(sinomo_module::ComponentDescriptor::new(name, "1"));
-    let runtime = shared_runtime(&context, scope.shutdown_receiver()).unwrap();
+    let runtime = canonical_migration_runtime(&context);
     let root = runtime.metadata_root.clone();
     let expected = convert(ORIGINAL).unwrap();
     assert!(
@@ -111,10 +108,11 @@ fn actual_docker_cache_conversion_requires_real_native_configuration_and_archive
             .records()
             .all(|config| config.file_system_id == sinomo_dfs::sifs_file_system_id())
     );
-    let provider = storage_preparation_provider(&context, scope.shutdown_receiver()).unwrap();
+    let binding = runtime.binding();
+    let provider = &binding.provider;
     install(&root, ORIGINAL);
     assert_eq!(
-        provider(&root, &DfsStoragePreparationScope::MetadataRouting, 256).unwrap(),
+        await_routing(&runtime, &binding, &root).unwrap(),
         DfsStoragePreparation::Ready
     );
     let bytes = read(&root).unwrap().unwrap();
@@ -136,7 +134,7 @@ fn actual_docker_cache_conversion_requires_real_native_configuration_and_archive
             .any(|name| name.starts_with("native-publication-"))
     );
     assert_eq!(
-        provider(&root, &DfsStoragePreparationScope::MetadataRouting, 256).unwrap(),
+        await_routing(&runtime, &binding, &root).unwrap(),
         DfsStoragePreparation::Ready
     );
     assert_eq!(
@@ -163,9 +161,8 @@ fn actual_docker_cache_conversion_requires_real_native_configuration_and_archive
                 .all(|node| nodes.contains(node))
         );
     }
-    drop(provider);
+    drop(binding);
     drop(runtime);
-    drop(scope);
     drop(context);
     native.close().unwrap();
 }
@@ -173,12 +170,9 @@ fn actual_docker_cache_conversion_requires_real_native_configuration_and_archive
 #[test]
 fn absent_native_filesystem_configuration_preserves_original_and_never_becomes_ready() {
     let name = "routing-cache-missing-native-configuration";
-    let (mut native, nodes) =
-        sinomo_dfs::test_support::DfsTestRuntime::start_cluster(name, 2).unwrap();
+    let (mut native, nodes) = native_migration_cluster(name, 2);
     let context = native.component_context(&nodes[0]).unwrap();
-    let scope =
-        sinomo_module::ComponentScope::new(sinomo_module::ComponentDescriptor::new(name, "1"));
-    let runtime = shared_runtime(&context, scope.shutdown_receiver()).unwrap();
+    let runtime = canonical_migration_runtime(&context);
     let root = runtime.metadata_root.clone();
     let mut foreign = original();
     let fs = sinomo_core::Id::generate().to_string();
@@ -192,19 +186,41 @@ fn absent_native_filesystem_configuration_preserves_original_and_never_becomes_r
     }
     let original = source(&foreign);
     install(&root, &original);
-    let provider = storage_preparation_provider(&context, scope.shutdown_receiver()).unwrap();
-    assert!(provider(&root, &DfsStoragePreparationScope::MetadataRouting, 256).is_err());
+    let binding = runtime.binding();
+    let provider = &binding.provider;
+    assert!(await_routing(&runtime, &binding, &root).is_err());
     assert_eq!(read(&root).unwrap().unwrap(), original);
     assert_eq!(
         std::fs::read(archive(&runtime.authority, &original).join("original.sobj")).unwrap(),
         original
     );
     assert!(!current(&root).unwrap());
-    drop(scope);
+    native.stop_node(&nodes[0]).unwrap();
     assert!(provider(&root, &DfsStoragePreparationScope::MetadataRouting, 256).is_err());
     assert_eq!(read(&root).unwrap().unwrap(), original);
-    drop(provider);
+    drop(binding);
     drop(runtime);
     drop(context);
     native.close().unwrap();
+}
+
+// Demand only schedules the actual scoped owner. Await its existing progress
+// watch; neither this helper nor the request thread advances a converter.
+fn await_routing(
+    owner: &crate::authority::MigrationOwner,
+    binding: &sinomo_dfs::DfsStoragePreparationProviderBinding,
+    root: &Path,
+) -> Result<sinomo_dfs::DfsStoragePreparation> {
+    let mut changed = binding.readiness.clone();
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        changed.borrow_and_update();
+        let state = (binding.provider)(root, &DfsStoragePreparationScope::MetadataRouting, 256)?;
+        if state == sinomo_dfs::DfsStoragePreparation::Ready { return Ok(state); }
+        owner.authority.runtime.block_on(async {
+            tokio::time::timeout_at(deadline, changed.changed()).await
+                .map_err(|_| error("actual routing migration exceeded existing network deadline"))?
+                .map_err(error)
+        })?;
+    }
 }
