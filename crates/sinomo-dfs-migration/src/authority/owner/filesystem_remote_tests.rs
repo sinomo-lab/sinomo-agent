@@ -5,27 +5,70 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
 fn native_two_owner_filesystem_stages_complete_catalog_before_activation() {
-    two_owner_filesystem(false, false, false, false);
+    two_owner_filesystem(false, false, false, false, false);
 }
 #[test]
 fn native_two_owner_placement_evidence_requires_complete_activation() {
-    two_owner_filesystem(true, false, false, false);
+    two_owner_filesystem(true, false, false, false, false);
 }
 #[test]
 fn native_two_owner_placement_retirement_observes_a_remote_issuer() {
-    two_owner_filesystem(true, true, false, false);
+    two_owner_filesystem(true, true, false, false, false);
 }
 #[test]
 fn native_receiver_restart_completes_original_incomplete_source_binding() {
-    two_owner_filesystem(false, false, true, false);
+    two_owner_filesystem(false, false, true, false, false);
 }
 #[test]
 fn native_staged_replica_catches_up_without_changing_original_activation_quorum() {
-    two_owner_filesystem(false, false, false, true);
+    two_owner_filesystem(false, false, false, true, false);
 }
-fn two_owner_filesystem(placement: bool, remote_issuer: bool, receiver_restart: bool, late_receiver: bool) {
+/// A takeover of the lagging receiver's shard after the import completed
+/// leaves the receiver's staged copy activatable: the import proof binds the
+/// shard's storage identity, not its serving configuration.
+#[test]
+fn native_staged_replica_activates_after_a_later_takeover() {
+    two_owner_filesystem(false, false, false, true, true);
+}
+/// Switch `shard_id` to the write-set protocol and take it over by
+/// `candidate` through the actual swap transaction, as a member whose primary
+/// was lost does; `candidate_root` is the candidate's copy, whose head starts
+/// the new epoch. Returns the shard's configuration after the swap.
+fn take_over_for_test(
+    native: &sinomo_dfs::test_support::DfsTestRuntime,
+    fs: &sinomo_dfs::DfsFileSystemId,
+    shard_id: &str,
+    candidate: &sinomo_core::node::NodeId,
+    nodes: &[sinomo_core::node::NodeId],
+    candidate_root: &Path,
+) -> DfsMetadataShardConfig {
+    use sinomo_dfs::DfsMetadataBackend as _;
+    for node in nodes {
+        native.advertise_metadata_write_set_capability(node).unwrap();
+    }
+    let mut control = native.configuration_publisher(candidate);
+    let mut store = sinomo_dfs::DfsControlPlaneStore::new(control.as_mut());
+    let cut = store.read_metadata_shard_record_cut(fs, shard_id, nodes).unwrap().unwrap();
+    let members = std::iter::once(cut.shard.primary_node_id.clone())
+        .chain(cut.shard.replica_node_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let switch = sinomo_dfs::build_metadata_write_set_switch(&cut, &members).unwrap();
+    assert_eq!(store.submit_metadata_write_set_change(&switch), sinomo_dfs::DfsMetadataWriteSetTxnOutcome::Applied);
+    let cut = store.read_metadata_shard_record_cut(fs, shard_id, nodes).unwrap().unwrap();
+    let shard = sinomo_dfs::DfsMetadataShardId::new(shard_id);
+    let epoch_start = sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), candidate_root)
+        .unwrap().metadata_prefix_proof(&shard).unwrap().expect("the candidate's copy has a head");
+    let swap = sinomo_dfs::build_metadata_takeover_swap(
+        &cut, candidate, &epoch_start, &sinomo_core::kv::KvRequestId::generate(),
+    ).unwrap();
+    assert_eq!(store.submit_metadata_write_set_change(&swap), sinomo_dfs::DfsMetadataWriteSetTxnOutcome::Applied);
+    store.read_metadata_shard_record_cut(fs, shard_id, nodes).unwrap().unwrap().shard
+}
+
+fn two_owner_filesystem(placement: bool, remote_issuer: bool, receiver_restart: bool, late_receiver: bool, later_takeover: bool) {
     use sinomo_dfs::test_support::DfsTestRuntime;
-    let name = if late_receiver { "native-staged-receiver-lost-prefix-reply" }
+    let name = if later_takeover { "native-staged-receiver-later-takeover" }
+        else if late_receiver { "native-staged-receiver-lost-prefix-reply" }
         else if receiver_restart { "native-receiver-incomplete-binding-restart" }
         else if remote_issuer { "native-two-owner-remote-placement-issuer" }
         else if placement { "native-two-owner-placement" } else { "native-two-owner-filesystem" };
@@ -514,11 +557,35 @@ fn two_owner_filesystem(placement: bool, remote_issuer: bool, receiver_restart: 
         assert_eq!(marker["installation_complete"], true);
         assert!(marker["receiver_local_source"].is_object());
     }
+    // While the receiver's copies are still staged, a takeover moves the
+    // services shard to another member. It rewrites the shard's serving
+    // configuration, not its storage identity, so the receiver's staged copy
+    // still activates under the original import proof.
+    if later_takeover {
+        let services = catalog.iter().find(|shard| shard.shard_id == "services").unwrap();
+        let taken_over = take_over_for_test(&native, &fs, &services.shard_id, &nodes[0], &nodes,
+            &owners[0].metadata_root.join(&services.shard_id));
+        assert_ne!(taken_over.primary_node_id, services.primary_node_id);
+        assert!(taken_over.replica_node_ids.contains(&nodes[2]));
+    }
     held.store(false, Ordering::Release);
     for owner in &owners {
         owner.work.notify();
     }
     native.wait_startup_completion().unwrap();
+    if later_takeover {
+        for shard in ["services", "users"] {
+            let root = owners[2].metadata_root.join(shard);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !matches!(sinomo_dfs::inspect_metadata_storage_generation(&root).map(|header| header.state),
+                Ok(sinomo_dfs::DfsMetadataGenerationState::Active { .. }))
+            {
+                assert!(std::time::Instant::now() < deadline,
+                    "the lagging receiver activates its staged {shard} copy after the services takeover");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
     if let Some(goal) = placement_goal {
         assert!(waiting_predecessor.load(Ordering::Acquire), "a real later owner must wait for its actual catalog predecessor before constructing activation");
         let key = goal.current_job_key().unwrap();

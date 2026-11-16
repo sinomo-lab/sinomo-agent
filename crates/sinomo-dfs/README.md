@@ -192,11 +192,14 @@ store ingests from a later epoch.
 
 Every switch, shrink, add, recruit, N raise, removal and takeover swap is one
 guarded transaction built from one exact-key-set read. It compares the exact bytes of
-both keys, the pending handoff, the filesystem configuration, and the member
-and capability-policy records of each member it admits. No change is built
-while the filesystem configuration reserves the catalog for a pending storage
-transition, and a change that rewrites the shard configuration (recruit,
-removal, takeover swap) also advances the filesystem's catalog generation.
+both keys, the pending handoff, and the member and capability-policy records of
+each member it admits. A shrink, recruit or removal also compares the
+filesystem configuration, whose placement rules give the W floor and N it
+checks, and a switch compares it so that it cannot commit after a storage
+transition has reserved the catalog: a switched shard refuses its storage
+import. No change is built while that reservation holds. No change advances
+the filesystem's catalog generation, which guards path assignment only, so
+changes of different shards never reject each other.
 Each change advances the generation, so a transaction built from an
 earlier record can never apply. Transactions carry a stable request id: a
 takeover candidate settles an unknown swap by resubmitting the identical
@@ -409,7 +412,11 @@ them.
   verdict, or its departure) and the record is unchanged. Any record or verdict
   change ends it, and the re-sent read's own outcome decides. The
   record must still name the judged primary at the attempt's epoch with this
-  node in the write set. The promise captures the materialized journal head as
+  node in the write set, and must admit this node's swap
+  (`check_metadata_takeover_swap`): the swap is built from the same record only
+  after the promise, so a record that cannot build it, such as one whose
+  filesystem configuration reserves the catalog for a pending storage
+  transition, promises nothing. The promise captures the materialized journal head as
   epoch start and fences the read epoch under the writer lock
   (`promise_metadata_takeover`). The swap (`build_metadata_takeover_swap`) is
   submitted and settled by its own outcome
@@ -417,7 +424,9 @@ them.
   rejected at an unchanged epoch releases it, and an unknown outcome is re-sent
   as the identical request every 250 ms, doubling to the network timeout. That
   timer only re-sends. A promise found on disk at start, or by a later attempt,
-  is settled the same way; a promise is never replaced.
+  is settled the same way; a promise is never replaced. A promise whose swap
+  can no longer be built from its record is kept, since its identical request
+  may already be in flight, and is not re-sent.
 - **Activate.** Once this node's publication names it primary at a takeover
   epoch and its own settlement, if any, has finished, activation rebinds its
   store in place, ends a promise from the read epoch and retires its fence, and

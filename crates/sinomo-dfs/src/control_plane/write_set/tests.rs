@@ -1030,6 +1030,10 @@ fn default_setup_leaves_every_shard_that_has_a_write_set_record() {
     assert!(crate::default_cluster::default_setup_leaves_shard(&cut.shard, Some(&unreadable)));
 }
 
+/// No write-set change is built while a storage transition reserves the
+/// catalog. A switch built before the reservation compares the filesystem
+/// configuration, so it cannot commit after it: a switched shard refuses its
+/// storage import, which would leave the transition unfinishable.
 #[test]
 fn pending_storage_transition_blocks_write_set_changes_and_prebuilt_requests() {
     // Structural transaction model; native filesystem transition admission is
@@ -1046,7 +1050,7 @@ fn pending_storage_transition_blocks_write_set_changes_and_prebuilt_requests() {
         expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
     });
     put(&mut fixture.kv, file_system_config_key(&fs()), &config);
-    assert!(!fixture.apply(&prebuilt), "a request built before Pending cannot cross its exact config compare");
+    assert!(!fixture.apply(&prebuilt), "a switch built before Pending cannot cross its config compare");
     assert!(matches!(build_metadata_write_set_switch(&fixture.cut(), &initial),
         Err(KvError::Serialization { detail }) if detail.contains("reserved")));
     config.metadata_storage = None;
@@ -1066,9 +1070,10 @@ fn pending_storage_transition_blocks_write_set_changes_and_prebuilt_requests() {
 
 /// Every write-set and takeover builder, including the recruit, N raise and
 /// swap forms, passes the same storage reservation: none is built while the
-/// filesystem's storage transition is pending. A change that rewrites the
-/// shard configuration also advances the catalog generation that fences a
-/// complete-filesystem capture; a record-only change leaves it.
+/// filesystem's storage transition is pending, and a takeover candidate
+/// learns it before it promises. No write-set change advances the catalog
+/// generation, which guards path assignment only: neither a record-only
+/// change nor one that rewrites the shard's serving configuration.
 #[test]
 fn pending_storage_transition_blocks_every_write_set_and_takeover_builder() {
     fn set_pending(fixture: &mut Fixture, pending: bool) {
@@ -1112,6 +1117,8 @@ fn pending_storage_transition_blocks_every_write_set_and_takeover_builder() {
     assert!(reserved(build_metadata_takeover_swap(
         &cut, b, &proof(5, 'b'), &KvRequestId::generate()
     )));
+    assert!(matches!(check_metadata_takeover_swap(&cut, b),
+        Err(KvError::Serialization { detail }) if detail.contains("reserved")));
 
     // An add needs a configured member outside the write set.
     set_pending(&mut fixture, false);
@@ -1120,7 +1127,8 @@ fn pending_storage_transition_blocks_every_write_set_and_takeover_builder() {
     set_pending(&mut fixture, true);
     assert!(reserved(build_metadata_write_set_add(&fixture.cut(), &fixture.nodes[2])));
 
-    // Rewriting the shard configuration advances the catalog generation.
+    // Rewriting the shard's serving configuration leaves the catalog
+    // generation, and so every other shard's change, alone.
     set_pending(&mut fixture, false);
     let before = generation(&mut fixture);
     let recruit = build_metadata_write_set_recruit(
@@ -1128,11 +1136,74 @@ fn pending_storage_transition_blocks_every_write_set_and_takeover_builder() {
     )
     .unwrap();
     assert!(fixture.apply(&recruit));
-    assert_eq!(generation(&mut fixture), before + 1);
+    assert_eq!(generation(&mut fixture), before);
+    assert!(check_metadata_takeover_swap(&fixture.cut(), &fixture.nodes[1]).is_ok());
     let swap = build_metadata_takeover_swap(
         &fixture.cut(), &fixture.nodes[1], &proof(5, 'b'), &KvRequestId::generate(),
     )
     .unwrap();
     assert!(fixture.apply(&swap));
-    assert_eq!(generation(&mut fixture), before + 2);
+    assert_eq!(generation(&mut fixture), before);
+}
+
+/// Two shards of one filesystem change their write sets concurrently: each
+/// change is built from a cut read before the other commits, and neither
+/// rejects the other. A takeover swap of one shard and a recruit, shrink or
+/// removal of the other compare their own records, not the filesystem's
+/// catalog, and leave the catalog generation unchanged.
+#[test]
+fn write_set_changes_of_two_shards_of_one_filesystem_do_not_reject_each_other() {
+    let mut fixture = Fixture::new();
+    fixture.switch_all();
+    let (a, b, c, d) = (
+        fixture.nodes[0].clone(),
+        fixture.nodes[1].clone(),
+        fixture.nodes[2].clone(),
+        fixture.nodes[3].clone(),
+    );
+    let mut users = shard(&b, &[&a, &c], 3);
+    users.shard_id = "users".into();
+    users.assignment = DfsMetadataShardAssignment::PathPrefix {
+        prefix: "/users".into(),
+    };
+    put(&mut fixture.kv, metadata_shard_key(&fs(), "users"), &users);
+    let nodes = fixture.nodes.clone();
+    let users_cut = |fixture: &mut Fixture| {
+        DfsControlPlaneStore::new(&mut fixture.kv)
+            .read_metadata_shard_record_cut(&fs(), "users", &nodes)
+            .unwrap()
+            .expect("users shard exists")
+    };
+    let users_members = [a.clone(), b.clone(), c.clone()].into_iter().collect();
+    let switch = build_metadata_write_set_switch(&users_cut(&mut fixture), &users_members).unwrap();
+    assert!(fixture.apply(&switch));
+    let generation = |fixture: &mut Fixture| {
+        fixture.cut().file_system_config().unwrap().unwrap().catalog_generation
+    };
+    let before = generation(&mut fixture);
+
+    // A takeover of users and a recruit of root, both read first.
+    let (root_cut, users_before) = (fixture.cut(), users_cut(&mut fixture));
+    let recruit =
+        build_metadata_write_set_recruit(&root_cut, &d, &bounds(1, 4), DfsMetadataShardRecruit::BelowN)
+            .unwrap();
+    let swap =
+        build_metadata_takeover_swap(&users_before, &a, &proof(7, 'e'), &KvRequestId::generate())
+            .unwrap();
+    assert!(fixture.apply(&swap), "the users takeover applies");
+    assert!(fixture.apply(&recruit), "root's recruit, read before the takeover, still applies");
+
+    // A shrink of users and a removal of root, both read first.
+    let (root_cut, users_after) = (fixture.cut(), users_cut(&mut fixture));
+    assert_eq!(users_after.shard.primary_node_id, a);
+    let shrink = build_metadata_write_set_shrink(&users_after, &c, &bounds(1, 3)).unwrap();
+    let removed = [d.clone()].into_iter().collect();
+    let remove = build_metadata_write_set_remove(&root_cut, &removed, &bounds(1, 4), 1, false).unwrap();
+    assert!(fixture.apply(&remove), "root's removal applies");
+    assert!(fixture.apply(&shrink), "users' shrink, read before the removal, still applies");
+    assert_eq!(generation(&mut fixture), before);
+
+    // A change of the same shard built from an earlier record never applies.
+    let stale = build_metadata_write_set_shrink(&users_before, &c, &bounds(1, 3));
+    assert!(stale.is_err() || !fixture.apply(&stale.unwrap()));
 }

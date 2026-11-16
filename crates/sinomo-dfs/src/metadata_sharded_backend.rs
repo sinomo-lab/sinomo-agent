@@ -1170,7 +1170,7 @@ impl ResidentLocalMetadataShardHandle {
                     && generation.identity.is_native_genesis()
                     && matches!(generation.state, crate::DfsMetadataGenerationState::Staged { .. })
                     && let Some(catalog) = self.slot.native_catalog.as_ref() {
-                    if !catalog.binds(expected) { return Err(failure); }
+                    if !catalog.admits_storage_of(expected) { return Err(failure); }
                     catalog.validate_generation(&generation.identity)?;
                     let mut original = LocalSobjMetadataBackend::open_staged_native_genesis(
                         expected, self.slot.root.clone(), self.slot.selected_original_data_layout.clone(),
@@ -2198,8 +2198,9 @@ fn open_local_metadata_shard_backend(
     }
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
     if let Some(catalog) = native_catalog {
-        if !catalog.binds(config) {
-            return Err(MetadataBackendError::Serde("physical slot configuration differs from its captured catalog".into()));
+        // Storage admission: a serving change rebound in place keeps it.
+        if !catalog.admits_storage_of(config) {
+            return Err(MetadataBackendError::Serde("physical slot shard is not in its captured storage catalog".into()));
         }
         if let Err(failure) = crate::storage_preparation::prepare_storage_root_before_open(root,
             &crate::DfsStoragePreparationScope::Metadata(shard_id.clone())) {
@@ -3325,6 +3326,58 @@ mod lazy_replica_slot_tests {
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ]
+    }
+
+    /// A takeover rebinds a deferred replica slot in place: the new primary and
+    /// epoch change the slot's serving configuration, not its storage
+    /// identity. The slot then opens under the catalog it was admitted with,
+    /// through the global checkout and its own, serves its store, and a later
+    /// reconfiguration from the takeover's publication retains it.
+    #[test]
+    fn a_rebound_slot_opens_and_serves_under_its_storage_admission_after_a_takeover() {
+        let root = sinomo_testdir::TestDir::new("dfs-rebound-slot-storage-admission");
+        let metadata_root = native_metadata_data(root.path());
+        let local = node("rebound-slot-local");
+        let shards = configs(&local);
+        let fs = crate::sifs_file_system_id();
+        let services_id = DfsMetadataShardId::new("services");
+        let admitted = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone(), None);
+        let resident = LocalShardedMetadataBackend::open_with_native_catalog(
+            metadata_root.clone(), shards.clone(), &local, None, &admitted,
+        )
+        .unwrap()
+        .into_resident();
+        let handle = resident.scope_shard(&fs, &services_id).unwrap();
+        assert!(matches!(
+            *handle.slot.state.lock().unwrap(),
+            ResidentLocalMetadataShardState::Unopened
+        ));
+        // The local replica takes the services shard over.
+        let mut taken_over = shards[1].clone();
+        taken_over.epoch += 1;
+        taken_over.replica_node_ids = vec![taken_over.primary_node_id.clone()];
+        taken_over.primary_node_id = local.clone();
+        assert_eq!(resident.rebind_switched_shards(&[(taken_over.clone(), None)]).unwrap(), 0);
+        assert_eq!(resident.shard_config(&services_id).unwrap(), taken_over);
+        // The global checkout opens every slot, the rebound one included.
+        drop(resident.checkout_global().unwrap());
+        let lease = handle.checkout().unwrap();
+        let head = lease.metadata_prefix_proof().unwrap();
+        drop(lease);
+        let mut current_shards = shards.clone();
+        current_shards[1] = taken_over.clone();
+        let current =
+            crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), current_shards.clone(), None);
+        let slot = Arc::clone(&handle.slot);
+        drop(handle);
+        let reconfigured = resident
+            .into_reconfigured_for_replica_repair_and_catalog(
+                metadata_root, current_shards, &local, &BTreeSet::new(), Some(current),
+            )
+            .unwrap();
+        let after = reconfigured.scope_shard(&fs, &services_id).unwrap();
+        assert!(Arc::ptr_eq(&after.slot, &slot), "the rebound slot is retained, not reopened");
+        assert_eq!(after.checkout().unwrap().metadata_prefix_proof().unwrap(), head);
     }
 
     #[test]
