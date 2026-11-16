@@ -349,6 +349,9 @@ pub struct DfsMetadataShardRecordCut {
     pub operation_floor_value: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_system_config_value: Option<Vec<u8>>,
+    /// The shard's storage record ([`crate::DfsMetadataShardStorage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_value: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<DfsMetadataMemberCapabilityCut>,
 }
@@ -367,6 +370,7 @@ impl DfsMetadataShardRecordCut {
             metadata_shard_head_watermark_key(file_system_id, shard_id),
             metadata_shard_operation_floor_key(file_system_id, shard_id),
             file_system_config_key(file_system_id),
+            crate::metadata_shard_storage_key(file_system_id, shard_id),
         ];
         for node in members {
             keys.push(cluster_member_key(node));
@@ -412,6 +416,7 @@ impl DfsMetadataShardRecordCut {
         let watermark_value = next();
         let operation_floor_value = next();
         let file_system_config_value = next();
+        let storage_value = next();
         let members = members
             .iter()
             .map(|node_id| DfsMetadataMemberCapabilityCut {
@@ -428,6 +433,7 @@ impl DfsMetadataShardRecordCut {
             watermark_value,
             operation_floor_value,
             file_system_config_value,
+            storage_value,
             members,
         }))
     }
@@ -513,15 +519,21 @@ pub fn metadata_write_set_member_capability_compares(
     if record.node_id != member.node_id || !record.state.is_authorized() {
         return Err(refuse("not an authorized cluster member"));
     }
-    let advertises = |capabilities: &[sinomo_core::CapabilityName]| {
-        capabilities
-            .iter()
-            .any(|capability| capability.as_str() == DFS_METADATA_WRITE_SET_V1_CAPABILITY)
+    let has = |capabilities: &[sinomo_core::CapabilityName], wanted: &str| {
+        capabilities.iter().any(|capability| capability.as_str() == wanted)
     };
+    let advertises =
+        |capabilities: &[sinomo_core::CapabilityName]| has(capabilities, DFS_METADATA_WRITE_SET_V1_CAPABILITY);
     if !advertises(&record.capabilities) {
         return Err(refuse(
             "the member does not advertise the write-set capability",
         ));
+    }
+    // Every member of a shard holds its storage under the per-shard storage
+    // record, so a member that cannot read that record is never admitted.
+    let storage = sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY;
+    if !has(&record.capabilities, storage) {
+        return Err(refuse("the member does not advertise the storage generation capability"));
     }
     if let Some(policy_value) = member.policy_value.as_ref() {
         let policy =
@@ -533,6 +545,9 @@ pub fn metadata_write_set_member_capability_compares(
             return Err(refuse(
                 "the capability policy does not allow the write-set capability",
             ));
+        }
+        if !has(&policy.capabilities, storage) {
+            return Err(refuse("the capability policy does not allow the storage generation capability"));
         }
     }
     if cluster_id
@@ -720,14 +735,25 @@ pub fn build_metadata_write_set_switch_with_raised_n(
             "the initial write set must be configured members including the primary",
         ));
     }
-    // A switched shard refuses its storage import, so a switch built before
-    // a storage transition reserved the catalog must not commit after it.
+    // A shard switches only while its storage record is Active: a converting
+    // shard is closed, and its conversion's install rule must not change
+    // under it. The exact record is compared, so a conversion that starts
+    // after the read cannot meet a switch that commits after it. A shard with
+    // no record still has the filesystem-level storage state, whose pending
+    // transition the configuration compare fences.
+    if let Some(value) = cut.storage_value.as_deref() {
+        let record = sinomo_core::kv::decode_kv_value::<crate::DfsMetadataShardStorage>(value)?;
+        if !record.is_active() {
+            return Err(refuse(cut, "the shard's storage is converting"));
+        }
+    }
     let mut compares = vec![
         handoff_missing(cut)?,
         KvCompare::Missing {
             key: cut.key(metadata_shard_operation_floor_key),
         },
         cut.file_system_config_compare(),
+        exact_compare(cut.key(crate::metadata_shard_storage_key), cut.storage_value.as_ref()),
     ];
     let mut cluster_id = None;
     for node in &configured {

@@ -1414,7 +1414,8 @@ pub(super) fn cluster_member_facts(
                 let eligible = !departed
                     && providers.contains(&record.node_id)
                     && has(&record, sinomo_core::node::DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY)
-                    && has(&record, sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY);
+                    && has(&record, sinomo_core::node::DFS_METADATA_WRITE_SET_V1_CAPABILITY)
+                    && has(&record, sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY);
                 facts.insert(
                     record.node_id.clone(),
                     MemberRecord {

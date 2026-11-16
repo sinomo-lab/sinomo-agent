@@ -34,6 +34,7 @@ pub fn dfs_metadata_authority_key_is_exact(key: &str) -> bool {
             Some(
                 "metadata-shards"
                     | "metadata-write-sets"
+                    | "metadata-storage"
                     | "metadata-head-watermarks"
                     | "metadata-membership-handoffs"
                     | "metadata-membership-handoff-proofs"
@@ -42,6 +43,18 @@ pub fn dfs_metadata_authority_key_is_exact(key: &str) -> bool {
             None,
         ) if !file_system_id.is_empty() && !shard_id.is_empty()
     ) || dfs_metadata_file_system_config_key_is_exact(key)
+}
+
+/// `/dfs/filesystems/<fs>/metadata-storage/<shard>`, a shard's storage record.
+pub(crate) fn dfs_metadata_shard_storage_key_is_exact(key: &str) -> bool {
+    key.strip_prefix("/dfs/filesystems/")
+        .and_then(|suffix| suffix.split_once("/metadata-storage/"))
+        .is_some_and(|(file_system_id, shard_id)| {
+            !file_system_id.is_empty()
+                && !file_system_id.contains('/')
+                && !shard_id.is_empty()
+                && !shard_id.contains('/')
+        })
 }
 
 pub(crate) fn dfs_metadata_file_system_config_key_is_exact(key: &str) -> bool {
@@ -59,7 +72,7 @@ pub(crate) fn metadata_storage_configuration_changed(
     previous: Option<&sinomo_core::kv::KvEntry>,
     current: Option<&sinomo_core::kv::KvEntry>,
 ) -> bool {
-    if dfs_metadata_shard_config_key_is_exact(key) {
+    if dfs_metadata_shard_config_key_is_exact(key) || dfs_metadata_shard_storage_key_is_exact(key) {
         return previous.map(|entry| &entry.value) != current.map(|entry| &entry.value);
     }
     if !dfs_metadata_file_system_config_key_is_exact(key) {

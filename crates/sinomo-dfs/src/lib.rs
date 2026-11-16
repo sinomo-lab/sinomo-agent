@@ -62,6 +62,17 @@ mod storage_preparation;
 mod storage_generation;
 pub use storage_generation::{DfsMetadataGenerationIdentity, DfsMetadataGenerationOrigin, DfsMetadataGenerationSeal};
 pub use storage_generation::{DfsMetadataGenerationHeader, DfsMetadataGenerationState, inspect_metadata_storage_generation};
+pub use storage_generation::{
+    DFS_METADATA_SHARD_STORAGE_FORMAT, DfsMetadataConversionSource, DfsMetadataShardActivation,
+    DfsMetadataShardConversion, DfsMetadataShardStorage, DfsMetadataShardStorageState,
+    metadata_shard_conversion_attempt_id, metadata_shard_converted_generation,
+    metadata_shard_storage_activation_digest,
+};
+#[cfg(feature = "storage-conversion")]
+pub use storage_generation::{
+    DfsMetadataShardStorageCut, build_metadata_shard_storage_activate,
+    build_metadata_shard_storage_converting,
+};
 #[cfg(feature = "storage-conversion")]
 pub use storage_generation::activate_metadata_storage_generation;
 #[cfg(feature = "storage-conversion")]
@@ -389,7 +400,8 @@ pub use control_plane::{
     DfsWriteConfigurationReadiness, SharedDfsControlPlaneKvClient, file_system_config_key,
     metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
     metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    metadata_shard_operation_floor_key, metadata_shards_prefix, placement_authority_permit_key,
+    metadata_shard_operation_floor_key, metadata_shard_storage_key, metadata_shards_prefix,
+    placement_authority_permit_key,
     placement_reconciliation_activity_index_key, placement_reconciliation_key,
     placement_reconciliations_prefix,
     select_metadata_shard_config_for_path_strict_default_sifs_split,

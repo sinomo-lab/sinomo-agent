@@ -1207,3 +1207,41 @@ fn write_set_changes_of_two_shards_of_one_filesystem_do_not_reject_each_other() 
     let stale = build_metadata_write_set_shrink(&users_before, &c, &bounds(1, 3));
     assert!(stale.is_err() || !fixture.apply(&stale.unwrap()));
 }
+
+#[test]
+fn a_converting_shard_is_not_switched_and_a_switch_compares_the_storage_record() {
+    let mut fixture = Fixture::new();
+    let config = shard(&fixture.nodes[0], &[&fixture.nodes[1], &fixture.nodes[2]], 3);
+    let storage_key = crate::metadata_shard_storage_key(&fs(), "root");
+    let active = crate::DfsMetadataShardStorage::native_genesis(
+        &config,
+        crate::storage_generation::native_genesis_generation_identity(&config, None),
+    );
+    put(&mut fixture.kv, storage_key.clone(), &active);
+    let initial: BTreeSet<NodeId> = fixture.nodes[..3].iter().cloned().collect();
+    let change = build_metadata_write_set_switch(&fixture.cut(), &initial).unwrap();
+    assert!(change.request.txn.compares.contains(&KvCompare::ValueEquals {
+        key: storage_key.clone(),
+        value: sinomo_core::kv::encode_kv_value(&active).unwrap(),
+    }));
+    // A conversion that starts after the read makes the switch fail.
+    let converting = crate::DfsMetadataShardStorage::converting_for_test(&config, 4);
+    put(&mut fixture.kv, storage_key, &converting);
+    assert!(!fixture.apply(&change));
+    // A converting shard is not switched at all.
+    let refused = build_metadata_write_set_switch(&fixture.cut(), &initial).unwrap_err();
+    assert!(refused.to_string().contains("storage is converting"), "{refused}");
+}
+
+#[test]
+fn write_set_admission_requires_the_storage_generation_capability() {
+    let mut fixture = Fixture::new();
+    let mut record = member(&fixture.nodes[1], true);
+    record.capabilities.retain(|capability| {
+        capability.as_str() != sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY
+    });
+    put(&mut fixture.kv, cluster_member_key(&fixture.nodes[1]), &record);
+    let initial: BTreeSet<NodeId> = fixture.nodes[..3].iter().cloned().collect();
+    let refused = build_metadata_write_set_switch(&fixture.cut(), &initial).unwrap_err();
+    assert!(refused.to_string().contains("storage generation capability"), "{refused}");
+}

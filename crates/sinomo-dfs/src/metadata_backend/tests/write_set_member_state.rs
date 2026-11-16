@@ -60,6 +60,7 @@ fn cut(epoch: u64, generation: u64) -> DfsMetadataShardRecordCut {
         watermark_value: None,
         operation_floor_value: None,
         file_system_config_value: None,
+        storage_value: None,
         members: Vec::new(),
     }
 }

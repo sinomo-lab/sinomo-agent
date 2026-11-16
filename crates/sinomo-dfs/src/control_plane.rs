@@ -1005,6 +1005,18 @@ pub fn metadata_shard_membership_handoff_key(
     )
 }
 
+/// The storage record of one metadata shard: the current storage generation it
+/// serves and the evidence that activated it ([`crate::DfsMetadataShardStorage`]).
+///
+/// It sits outside `metadata-shards/` so shard-prefix scans continue to decode
+/// only shard configurations. Serving changes never write it.
+pub fn metadata_shard_storage_key(file_system_id: &DfsFileSystemId, shard_id: &str) -> String {
+    format!(
+        "{DFS_KV_PREFIX}/filesystems/{file_system_id}/metadata-storage/{}",
+        normalize_segment(shard_id)
+    )
+}
+
 /// Last completed membership-handoff proof for one shard.
 ///
 /// This is bounded audit/failover evidence. A later handoff overwrites it; DFS
@@ -3493,6 +3505,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
                 let actual: DfsFileSystemConfig = entry.decode()?;
                 if actual.metadata_storage.as_ref() != captured { return Ok(false); }
+                append_native_genesis_shard_storage(desired, captured, &mut compares, &mut success)?;
             }
             append_catalog_generation_update(
                 filesystem_entry, &desired.file_system_id, &mut compares, &mut success,
@@ -3956,7 +3969,13 @@ impl<'a> DfsControlPlaneStore<'a> {
             self.kv.get(&file_system_config_key(&retiring.file_system_id))?, self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?, retiring, desired, &handoff.cause,
         )?;
         compares.extend(catalog_compares);
-        success.push(catalog_handoff_successor(&catalog_config)?);
+        // A membership handoff changes serving authority, not path
+        // assignment, so it does not advance the catalog generation. Only
+        // the filesystem-wide storage import still counts its activations
+        // in that generation, until that mechanism is removed.
+        if matches!(handoff.cause, DfsMetadataShardHandoffCause::StorageImport { .. }) {
+            success.push(catalog_handoff_successor(&catalog_config)?);
+        }
         Ok(self
             .kv
             .txn(KvTxn {
@@ -4908,6 +4927,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
                 let actual: DfsFileSystemConfig = entry.decode()?;
                 if actual.metadata_storage.as_ref() != captured { return Ok(false); }
+                append_native_genesis_shard_storage(desired, captured, &mut compares, &mut success)?;
             }
             append_catalog_generation_update(
                 filesystem_entry, &desired.file_system_id, &mut compares, &mut success,
@@ -5315,7 +5335,13 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             self.kv.get_async(&file_system_config_key(&retiring.file_system_id)).await?, self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?, retiring, desired, &handoff.cause,
         )?;
         compares.extend(catalog_compares);
-        success.push(catalog_handoff_successor(&catalog_config)?);
+        // A membership handoff changes serving authority, not path
+        // assignment, so it does not advance the catalog generation. Only
+        // the filesystem-wide storage import still counts its activations
+        // in that generation, until that mechanism is removed.
+        if matches!(handoff.cause, DfsMetadataShardHandoffCause::StorageImport { .. }) {
+            success.push(catalog_handoff_successor(&catalog_config)?);
+        }
         Ok(self
             .kv
             .txn_async(KvTxn {
@@ -5623,6 +5649,30 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         };
         entry.decode().map(Some)
     }
+}
+
+/// A native birth records the shard's storage at the same time as its
+/// assignment: the generation genesis stages, Active through its own committed
+/// genesis. The record must be absent, so a retained record is never replaced
+/// by a birth.
+fn append_native_genesis_shard_storage(
+    desired: &DfsMetadataShardConfig,
+    captured: Option<&crate::DfsMetadataStorageState>,
+    compares: &mut Vec<KvCompare>,
+    success: &mut Vec<KvOp>,
+) -> Result<(), KvError> {
+    let key = metadata_shard_storage_key(&desired.file_system_id, &desired.shard_id);
+    let activation = captured.and_then(|storage| storage.active_descriptor());
+    let record = crate::DfsMetadataShardStorage::native_genesis(
+        desired,
+        crate::storage_generation::native_genesis_generation_identity(desired, activation.as_ref()),
+    );
+    record
+        .validate_against(desired)
+        .map_err(|error| KvError::Serialization { detail: error.to_string() })?;
+    compares.push(KvCompare::Missing { key: key.clone() });
+    success.push(KvOp::put_serde(key, &record, None)?);
+    Ok(())
 }
 
 fn validate_metadata_shard_cas_identity(
