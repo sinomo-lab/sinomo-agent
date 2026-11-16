@@ -71,6 +71,28 @@ pub(crate) fn metadata_backend_open_error_allows_snapshot_repair(
     matches!(error, crate::MetadataBackendError::Serde(_))
 }
 
+/// An older interrupted snapshot writer could leave an unsealed header. Only
+/// an authenticated image of that exact generation may recover it; ordinary
+/// Pending admission and sealed migration candidates remain excluded.
+pub(crate) fn metadata_snapshot_open_error_allows_repair(
+    error: &crate::MetadataBackendError,
+    root: &std::path::Path,
+    permit: &crate::DfsMetadataReplicaIngestPermit,
+    image: &crate::DfsMetadataSnapshotImage,
+) -> std::result::Result<bool, crate::MetadataBackendError> {
+    if metadata_backend_open_error_allows_snapshot_repair(error) { return Ok(true); }
+    if !matches!(error, crate::MetadataBackendError::StoragePreparationPending { root: pending, .. } if pending == root) {
+        return Ok(false);
+    }
+    let header = crate::storage_generation::read_generation(root)?;
+    if !matches!(header.state, crate::storage_generation::GenerationState::Staged { seal: None }) {
+        return Ok(false);
+    }
+    let state = image.state()?;
+    let admitted = permit.snapshot_generation_envelope(&image.generation, &state.tables)?;
+    Ok(header.identity == admitted.identity)
+}
+
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DEFAULT_DFS_METADATA_REPLICATION_MAX_CONCURRENT_TARGET_NODES: usize = 8;
 
@@ -8079,22 +8101,21 @@ pub(crate) fn process_cluster_dfs_metadata_snapshot_install_with_context(
             message: source.to_string(),
         })?;
     let root = local_dfs_metadata_shard_path(data_dir, &command.shard_id);
+    let admitted_context = context.as_ref().expect("validated snapshot has its native context");
+    let permit = metadata_snapshot_install_permit(admitted_context, &command)
+        .map_err(|message| DfsError::Metadata { message })?;
+    let snapshot_image = command.image().cloned().map_err(DfsError::from)?;
     match LocalSobjMetadataBackend::new(command.shard_id.clone(), &root) {
         Ok(mut backend) => Ok(process_dfs_metadata_snapshot_install(
             &mut backend,
             context.as_ref(),
             command,
         )),
-        Err(open_error) if metadata_backend_open_error_allows_snapshot_repair(&open_error) => {
+        Err(open_error) if metadata_snapshot_open_error_allows_repair(
+            &open_error, &root, &permit, &snapshot_image).map_err(DfsError::from)? => {
             let request_id = command.request_id.clone();
             let shard_id = command.shard_id.clone();
             let next_after_sequence = command.next_after_sequence;
-            let context = context
-                .as_ref()
-                .expect("validated metadata snapshot ingest has a shard context");
-            let permit = metadata_snapshot_install_permit(context, &command)
-                .map_err(|message| DfsError::Metadata { message })?;
-            let snapshot_image = command.image().cloned().map_err(DfsError::from)?;
             let result = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
                 &permit,
                 shard_id.clone(),

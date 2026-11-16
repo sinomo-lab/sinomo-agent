@@ -148,10 +148,14 @@ fn lifecycle_maintenance_reports_skipped_tombstones_without_backend() {
 #[test]
 fn lifecycle_shared_gc_runs_once_without_file_system_records() {
     let root = temp_root("lifecycle-shared-gc-without-file-systems");
-    let node_id = NodeId::from_legacy_named("node_lifecycle_empty_catalog").expect("node");
-    let metadata =
-        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
-            .expect("metadata backend");
+    let (runtime, source, shard) = crate::test_support::current_native_metadata_service(
+        "lifecycle-empty-replica-catalog", 2, "/").unwrap();
+    drop(source);
+    let node_id = shard.replica_node_ids[0].clone();
+    // An unhydrated replica has a real repair-only view with no filesystem
+    // rows. It cannot acquire metadata-authoring permission from an empty store.
+    let metadata = LocalShardedMetadataBackend::new_with_replica_repair(
+        root.join("metadata"), vec![shard], &node_id).expect("unhydrated replica router");
     assert!(
         metadata
             .list_file_systems()
@@ -201,6 +205,8 @@ fn lifecycle_shared_gc_runs_once_without_file_system_records() {
     assert!(host.stored.is_empty());
     assert!(host.cleared.is_empty());
 
+    drop(dfs);
+    runtime.close().unwrap();
     std::fs::remove_dir_all(root).ok();
 }
 

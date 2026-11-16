@@ -31,7 +31,9 @@ pub struct NamespaceCountMaintenanceSource {
 pub struct NamespaceCountMaintenanceLimits {
     pub max_objects: usize,
     pub max_encoded_bytes: usize,
-    pub deadline: Instant,
+    /// Explicit caller budget. An already-owned background census uses its
+    /// record/byte bounds and retained source checkpoints, not an RPC timeout.
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -57,10 +59,8 @@ fn invalid(message: impl Into<String>) -> MetadataBackendError {
     MetadataBackendError::Serde(message.into())
 }
 fn check_deadline(limits: NamespaceCountMaintenanceLimits) -> Result<()> {
-    if Instant::now() >= limits.deadline {
-        return Err(invalid(
-            "namespace-count maintenance reached its original deadline",
-        ));
+    if limits.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(MetadataBackendError::PreparationBudgetExhausted { work: "namespace-count census" });
     }
     Ok(())
 }
@@ -111,14 +111,19 @@ fn catalog_by_scope(
 
 struct EncodedBudget {
     remaining: usize,
-    deadline: Instant,
+    deadline: Option<Instant>,
+    deadline_exhausted: bool,
 }
 impl Write for EncodedBudget {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.remaining || Instant::now() >= self.deadline {
+        if bytes.len() > self.remaining {
             return Err(std::io::Error::other(
                 "namespace-count maintenance encoded-data budget exhausted",
             ));
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.deadline_exhausted = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "namespace-count caller budget exhausted"));
         }
         self.remaining -= bytes.len();
         Ok(bytes.len())
@@ -173,6 +178,7 @@ fn plan_count_census(
     let mut budget = EncodedBudget {
         remaining: limits.max_encoded_bytes,
         deadline: limits.deadline,
+        deadline_exhausted: false,
     };
     for source in sources {
         check_deadline(limits)?;
@@ -180,7 +186,9 @@ fn plan_count_census(
             &mut budget,
             source.captured.as_ref(),
         )
-        .map_err(|error| invalid(error.to_string()))?;
+        .map_err(|error| if budget.deadline_exhausted {
+            MetadataBackendError::PreparationBudgetExhausted { work: "namespace-count input validation" }
+        } else { invalid(error.to_string()) })?;
     }
     let scopes = native_catalog.map(catalog_by_scope).transpose()?;
     let mut standalone_filesystems = BTreeSet::new();
@@ -558,8 +566,23 @@ mod tests {
         NamespaceCountMaintenanceLimits {
             max_objects: 100,
             max_encoded_bytes: 4 * 1024 * 1024,
-            deadline: Instant::now() + Duration::from_secs(10),
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
         }
+    }
+
+    #[test]
+    fn explicit_census_deadline_is_a_budget_result_not_corrupt_data() {
+        let (_root, catalog, sources) = fixture();
+        let mut bounded = limits();
+        bounded.deadline = Some(Instant::now());
+        let error = plan_namespace_count_maintenance(&catalog, &sources, bounded).err().unwrap();
+        assert!(matches!(error, MetadataBackendError::PreparationBudgetExhausted { .. }), "{error}");
+        bounded.deadline = None;
+        let background = plan_namespace_count_maintenance(&catalog, &sources, bounded).unwrap();
+        assert_eq!(background.updates, plan_namespace_count_maintenance(&catalog, &sources, limits()).unwrap().updates);
+        bounded.max_encoded_bytes = 1;
+        assert!(matches!(plan_namespace_count_maintenance(&catalog, &sources, bounded), Err(MetadataBackendError::Serde(_))),
+            "owned background work retains its hard input-size bound");
     }
     fn catalog() -> Vec<DfsMetadataShardConfig> {
         ["root", "services", "users"]
@@ -1095,7 +1118,7 @@ mod tests {
                 &catalog,
                 &sources,
                 NamespaceCountMaintenanceLimits {
-                    deadline: Instant::now(),
+                    deadline: Some(Instant::now()),
                     ..limits()
                 }
             )

@@ -307,6 +307,10 @@ impl ContentConverter {
     /// current staging creation is owned by that same checkpoint/session.
     pub(crate) fn enroll(&self, root: &Path) -> Result<Option<super::LegacyContentJobReference>> {
         if !root.exists() { return Ok(None); }
+        if !root.join(CONVERSION).join("progress.sobj").try_exists().map_err(|e| io(root, e))?
+            && LocalContentStore::has_current_initialization(root).map_err(error)? {
+            return Ok(None);
+        }
         let key=fs::canonicalize(root).map_err(|e|io(root,e))?;
         let warm=self.sessions.lock().map_err(error)?.get(&key).cloned();
         if let Some(session)=warm {

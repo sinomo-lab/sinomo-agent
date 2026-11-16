@@ -81,6 +81,87 @@ pub(super) fn native_filesystem_owner_fixture(
     (native, node, hold)
 }
 
+#[test]
+fn native_count_capability_publication_wakes_the_original_waiting_unit() {
+    let (native, node, held) = native_filesystem_owner_fixture("native-count-capability-publication");
+    let context = native.component_context(&node).unwrap();
+    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let fs = native.file_system().file_system_id;
+    let member_key = sinomo_core::node::cluster_member_key(&node);
+    let policy_key = sinomo_core::node::cluster_capability_policy_key(&node);
+    let (rows, _) = owner.authority.read_exact(&[member_key.clone(), policy_key.clone()]).unwrap();
+    let member_entry = rows[0].entry.as_ref().unwrap();
+    let policy_entry = rows[1].entry.as_ref().unwrap();
+    let mut member: sinomo_core::ClusterMemberRecord = member_entry.decode().unwrap();
+    let mut policy: sinomo_core::node::ClusterCapabilityPolicyRecord = policy_entry.decode().unwrap();
+    let feature = sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY;
+    member.capabilities.retain(|capability| capability.as_str() != feature);
+    policy.capabilities.retain(|capability| capability.as_str() != feature);
+    let member_missing = sinomo_core::kv::encode_kv_value(&member).unwrap();
+    let policy_missing = sinomo_core::kv::encode_kv_value(&policy).unwrap();
+    let put = |key: &String, before: &[u8], value: &[u8]| {
+        let committed = owner.authority.commit(KvTxnRequest::new(KvRequestId::generate(), KvTxn {
+            compares: vec![KvCompare::ValueEquals { key: key.clone(), value: before.to_vec() }],
+            success: vec![KvOp::Put { key: key.clone(), value: value.to_vec(),
+                lease_id: if key == &member_key { member_entry.lease_id } else { policy_entry.lease_id } }],
+            failure: Vec::new(),
+        })).unwrap();
+        NativeImportAuthority::require_committed(&committed).unwrap();
+    };
+    put(&member_key, &member_entry.value, &member_missing);
+    put(&policy_key, &policy_entry.value, &policy_missing);
+    let (rows, _) = owner.authority.read_exact(&[sinomo_dfs::file_system_config_key(&fs)]).unwrap();
+    let original: sinomo_dfs::DfsFileSystemConfig = rows[0].entry.as_ref().unwrap().decode().unwrap();
+    let catalog = owner.authority.assignments(std::slice::from_ref(&fs)).unwrap();
+    let mut changes = owner.binding().readiness;
+    let unit = owner.enqueue_filesystem(&original).unwrap();
+    block_native(&native.runtime_handle(), async {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            let state = owner.work.scheduler.lock().unwrap().state(&unit)?.cloned();
+            match state {
+                Some(inventory::ObservedState::Waiting { .. }) => break,
+                Some(inventory::ObservedState::Blocked { evidence }) => return Err(error(format!("capability publication became a permanent block: {evidence}"))),
+                _ => {}
+            }
+            // Discovered -> Waiting deliberately does not advertise readiness.
+            // Observe the worker state without enqueueing or waking its work.
+            if tokio::time::Instant::now() >= deadline { return Err(error("owner never parked for capability publication")); }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok::<_, MetadataBackendError>(())
+    }).unwrap();
+    assert!(owner.work.inventory.read(&unit).unwrap().unwrap().job.is_none());
+    assert!(owner.work.scheduler.lock().unwrap().next_retry().is_none(), "an advertisement dependency needs its real publication edge, not polling");
+    put(&member_key, &member_missing, &member_entry.value);
+    assert!(owner.authority.require_count_capabilities(&catalog).is_err(), "binary support cannot grant the missing permission");
+    assert!(owner.work.inventory.read(&unit).unwrap().unwrap().job.is_none());
+    put(&policy_key, &policy_missing, &policy_entry.value);
+    // Only actual native capability publications wake the existing unit.
+    // No owner restart, extra enqueue, made-up readiness or new invocation.
+    block_native(&native.runtime_handle(), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match owner.work.scheduler.lock().unwrap().state(&unit)?.cloned() {
+                Some(inventory::ObservedState::VerifiedCurrent) => break,
+                Some(inventory::ObservedState::Blocked { evidence }) => return Err(error(evidence)),
+                _ => {}
+            }
+            tokio::time::timeout_at(deadline, changes.changed()).await.map_err(error)?.map_err(error)?;
+        }
+        Ok::<_, MetadataBackendError>(())
+    }).unwrap();
+    held.store(false, Ordering::Release);
+    owner.work.notify();
+    native.wait_startup_completion().unwrap();
+    let mut client = native.client(&node).unwrap();
+    assert_eq!(client.posix_stat_distributed("/services/owner-retained-alias").unwrap().link_count, 2);
+    drop(client);
+    drop(owner);
+    drop(context);
+    native.close().unwrap();
+}
+
 pub(super) fn complete_filesystem_owner(
     native: &sinomo_dfs::test_support::DfsTestRuntime,
     node: &sinomo_core::node::NodeId,
@@ -225,6 +306,8 @@ fn native_filesystem_owner_resumes_after_one_real_activation() {
     let observed = Arc::new(Mutex::new(None::<sinomo_dfs::DfsMetadataShardConfig>));
     let fault_paused = Arc::clone(&paused);
     let fault_observed = Arc::clone(&observed);
+    let first_activation = Arc::new(tokio::sync::Notify::new());
+    let activation_observed = Arc::clone(&first_activation);
     let hook = filesystem::install_scope_hook(
         &root,
         Arc::new(move |owner, source, point| {
@@ -262,6 +345,7 @@ fn native_filesystem_owner_resumes_after_one_real_activation() {
                     );
                     *fault_observed.lock().unwrap() = Some(current);
                     fault_paused.store(true, Ordering::Release);
+                    activation_observed.notify_one();
                 }
             }
             Ok(())
@@ -277,10 +361,9 @@ fn native_filesystem_owner_resumes_after_one_real_activation() {
             {
                 return Err(error(evidence));
             }
-            tokio::time::timeout_at(deadline, changed.changed())
+            tokio::time::timeout_at(deadline, first_activation.notified())
                 .await
-                .map_err(|_| error("no actual first scope activation"))?
-                .map_err(error)?;
+                .map_err(|_| error("no actual first scope activation"))?;
         }
         Ok::<_, MetadataBackendError>(())
     })
@@ -369,7 +452,7 @@ fn native_filesystem_owner_resumes_after_one_real_activation() {
     );
     drop(hook);
     paused.store(false, Ordering::Release);
-    resumed.work.wake.notify_one();
+    resumed.work.notify();
     let mut changed = resumed.binding().readiness;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     block_native(&native.runtime_handle(), async {
@@ -494,6 +577,8 @@ fn native_owner_enrollment_restart_preserves_original_cut_and_source_authority()
         .collect::<BTreeMap<_, _>>();
     let captured = Arc::new(Mutex::new(None::<PathBuf>));
     let observed = Arc::clone(&captured);
+    let enrolled = Arc::new(tokio::sync::Notify::new());
+    let enrollment_observed = Arc::clone(&enrolled);
     let hook = filesystem::install_scope_hook(
         &root,
         Arc::new(move |owner, shard, point| {
@@ -524,6 +609,7 @@ fn native_owner_enrollment_restart_preserves_original_cut_and_source_authority()
                     .unwrap()
                     .join("namespace-count-source-cut.json"),
             );
+            enrollment_observed.notify_one();
             Err(MetadataBackendError::StoragePreparationPending {
                 root: stage,
                 processed_records: 0,
@@ -545,10 +631,9 @@ fn native_owner_enrollment_restart_preserves_original_cut_and_source_authority()
             {
                 return Err(error(evidence));
             }
-            tokio::time::timeout_at(deadline, changed.changed())
+            tokio::time::timeout_at(deadline, enrolled.notified())
                 .await
-                .map_err(|_| error("original enrollment did not reach actual checkpoint"))?
-                .map_err(error)?;
+                .map_err(|_| error("original enrollment did not reach actual checkpoint"))?;
         }
         Ok::<_, MetadataBackendError>(())
     })
@@ -617,4 +702,171 @@ fn optional_fixture_bytes(path: &Path) -> Option<Vec<u8>> {
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => None,
         Err(failure) => panic!("{}: {failure}", path.display()),
     }
+}
+
+#[test]
+fn native_pending_transition_loses_to_an_already_started_handoff() {
+    let (native, nodes) = placement_work::native_tests::native_migration_cluster("pending-handoff-admission-race", 2);
+    let node = nodes[0].clone();
+    let context = native.component_context(&node).unwrap();
+    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let fs = native.file_system().file_system_id;
+    let key = sinomo_dfs::file_system_config_key(&fs);
+    let original = owner.authority.read_exact(std::slice::from_ref(&key)).unwrap().0[0].entry.clone().unwrap();
+    let config: sinomo_dfs::DfsFileSystemConfig = original.decode().unwrap();
+    let shared = sinomo_dfs::SharedDfsControlPlaneKvClient::new(native.configuration_publisher(&node));
+    let observed = Arc::new(Mutex::new(None));
+    let retained = Arc::clone(&observed);
+    let evaluated = Arc::new(tokio::sync::Notify::new());
+    let attempted = Arc::clone(&evaluated);
+    let hook = filesystem::install_scope_hook(&owner.authority.data_root, Arc::new(move |_, source, point| {
+        if point == "before-pending" && retained.lock().unwrap().is_none() {
+            let mut desired = source.clone();
+            desired.epoch += 1;
+            if desired.replica_node_ids.is_empty() { desired.replica_node_ids.push(nodes[1].clone()); }
+            else { desired.replica_node_ids.pop(); }
+            let handoff = shared.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .begin_metadata_shard_membership_handoff(source, &desired)).map_err(error)?
+                .ok_or_else(|| error("real membership handoff did not begin"))?;
+            *retained.lock().unwrap() = Some(handoff);
+        }
+        if point == "pending-evaluated" { attempted.notify_one(); }
+        Ok(())
+    }));
+    owner.enqueue_filesystem(&config).unwrap();
+    block_native(&native.runtime_handle(), async {
+        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, evaluated.notified())
+            .await.map_err(error)
+    }).unwrap_or_else(|failure| panic!("{failure}; owner: {}", owner.diagnostic_scheduler()));
+    let handoff = observed.lock().unwrap().clone().unwrap();
+    let handoff_key = sinomo_dfs::metadata_shard_membership_handoff_key(&fs, &handoff.retiring_shard.shard_id);
+    let (rows, proof) = owner.authority.read_exact(&[key, handoff_key]).unwrap();
+    current_authority(&proof).unwrap();
+    assert_eq!(rows[0].entry.as_ref().unwrap().value, original.value,
+        "Pending must not reserve a filesystem with an already admitted membership handoff");
+    assert_eq!(rows[1].entry.as_ref().unwrap().decode::<sinomo_dfs::DfsMetadataShardMembershipHandoff>().unwrap(), handoff);
+    drop(hook); drop(owner); drop(context);
+    native.close().unwrap();
+}
+
+#[test]
+fn native_invocation_restart_recovers_before_inventory_linkage() {
+    let (mut native, node, held) = native_filesystem_owner_fixture("native-invocation-linkage-restart");
+    let context = native.component_context(&node).unwrap();
+    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let root = owner.authority.data_root.clone();
+    let fs = native.file_system().file_system_id;
+    let config: sinomo_dfs::DfsFileSystemConfig = owner.authority.read_exact(&[
+        sinomo_dfs::file_system_config_key(&fs)]).unwrap().0[0].entry.as_ref().unwrap().decode().unwrap();
+    let retained = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::clone(&retained);
+    let once = AtomicBool::new(false);
+    let hook = filesystem::install_scope_hook(&root, Arc::new(move |_, _, point| {
+        if point == "invocation-retained" && !once.swap(true, Ordering::AcqRel) {
+            observed.notify_one();
+            return Err(error("interrupted after the real immutable invocation, before inventory linkage"));
+        }
+        Ok(())
+    }));
+    let unit = owner.enqueue_filesystem(&config).unwrap();
+    block_native(&native.runtime_handle(), async {
+        tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, retained.notified())
+            .await.map_err(error)
+    }).unwrap();
+    let path = root.join("dfs/migration-owner/filesystems").join(unit.id().unwrap()).join("invocation.json");
+    let original = std::fs::read(&path).unwrap();
+    assert!(owner.work.inventory.read(&unit).unwrap().unwrap().job.is_none());
+    drop(hook); drop(owner); drop(context);
+    native.stop_node(&node).unwrap();
+    assert!(native.reopen_node(node.clone()).is_err(), "ordinary-open hold remains in force");
+    let context = native.component_context(&node).unwrap();
+    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let mut changed = owner.binding().readiness;
+    block_native(&native.runtime_handle(), async {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            match owner.work.scheduler.lock().unwrap().state(&unit)?.cloned() {
+                Some(inventory::ObservedState::VerifiedCurrent) => break,
+                Some(inventory::ObservedState::Blocked { evidence }) => return Err(error(evidence)),
+                _ => {},
+            }
+            tokio::time::timeout_at(deadline, changed.changed()).await.map_err(error)?.map_err(error)?;
+        }
+        Ok::<_, MetadataBackendError>(())
+    }).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), original, "restart must not mint another invocation identity");
+    assert!(owner.work.inventory.read(&unit).unwrap().unwrap().job.is_some());
+    held.store(false, Ordering::Release);
+    owner.work.notify();
+    native.wait_startup_completion().unwrap();
+    assert_eq!(native.client(&node).unwrap().posix_stat_distributed("/services/owner-retained-file").unwrap().link_count, 2);
+    drop(changed); drop(owner); drop(context);
+    native.close().unwrap();
+}
+
+#[test]
+fn native_cohort_pending_retries_original_proposal_without_another_dependency_event() {
+    let (native, node, ordinary_hold) = native_filesystem_owner_fixture("native-cohort-owned-pending-retry");
+    let context = native.component_context(&node).unwrap();
+    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let fs = native.file_system().file_system_id;
+    let config: sinomo_dfs::DfsFileSystemConfig = owner.authority.read_exact(&[
+        sinomo_dfs::file_system_config_key(&fs)]).unwrap().0[0].entry.as_ref().unwrap().decode().unwrap();
+    let pending = Arc::new(AtomicBool::new(true));
+    let injected = Arc::clone(&pending);
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::clone(&seen);
+    let hook = filesystem::install_scope_hook(&owner.authority.data_root, Arc::new(move |owner, shard, point| {
+        if point == "cohort-qualified" && shard.shard_id == "root" && injected.load(Ordering::Acquire) {
+            observed.notify_one();
+            return Err(MetadataBackendError::StoragePreparationPending {
+                root: owner.metadata_root.join("root"), processed_records: 0,
+            });
+        }
+        Ok(())
+    }));
+    let mut changed = owner.binding().readiness;
+    let unit = owner.enqueue_filesystem(&config).unwrap();
+    block_native(&native.runtime_handle(), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), seen.notified()).await.map_err(error)?;
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            let scheduler = owner.work.scheduler.lock().unwrap();
+            let waiting = matches!(scheduler.state(&unit)?, Some(inventory::ObservedState::Waiting { .. }));
+            let retry = scheduler.next_retry();
+            drop(scheduler);
+            if waiting && retry.is_some() { break; }
+            // A concurrently running turn can still expose its prior Waiting
+            // state. Observe the actual parked retry under the existing bound.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(error("native certification Pending lost its owned retry"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok::<_, MetadataBackendError>(())
+    }).unwrap();
+    let proposal = crate::metadata::finalization_checkpoint_for_test(&owner.metadata_root.join("root"),
+        &sinomo_dfs::DfsMetadataShardId::new("root"), "import-proposal.json").unwrap().unwrap();
+    let original = std::fs::read(&proposal).unwrap();
+    pending.store(false, Ordering::Release);
+    // No wake, KV write or replacement request: the same owner must retry.
+    block_native(&native.runtime_handle(), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match owner.work.scheduler.lock().unwrap().state(&unit)?.cloned() {
+                Some(inventory::ObservedState::VerifiedCurrent) => break,
+                Some(inventory::ObservedState::Blocked { evidence }) => return Err(error(evidence)),
+                _ => {},
+            }
+            tokio::time::timeout_at(deadline, changed.changed()).await.map_err(error)?.map_err(error)?;
+        }
+        Ok::<_, MetadataBackendError>(())
+    }).unwrap();
+    assert_eq!(std::fs::read(&proposal).unwrap(), original);
+    ordinary_hold.store(false, Ordering::Release);
+    owner.work.notify();
+    native.wait_startup_completion().unwrap();
+    assert_eq!(native.client(&node).unwrap().posix_stat_distributed("/services/owner-retained-file").unwrap().link_count, 2);
+    drop(hook); drop(changed); drop(owner); drop(context);
+    native.close().unwrap();
 }

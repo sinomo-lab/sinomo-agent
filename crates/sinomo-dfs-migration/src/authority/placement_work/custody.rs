@@ -248,7 +248,7 @@ impl NativeImportAuthority {
         captured_rows: &[MetadataCapturedKvEntry],
     ) -> Result<Option<bool>> {
         self.placement_outcome_evaluated(request, permission_subject, captured_rows)
-            .map_err(NativeEvaluationError::into_metadata)
+            .map_err(|failure| self.native_observation_error(failure))
     }
     fn placement_outcome_evaluated(
         &self,
@@ -426,7 +426,7 @@ impl NativeImportAuthority {
         envelope: &PlacementCustodyEnvelope,
     ) -> Result<bool> {
         self.evaluate_received_placement_custody(goal, envelope)
-            .map_err(NativeEvaluationError::into_metadata)
+            .map_err(|failure| self.native_observation_error(failure))
     }
     pub(in crate::authority) fn evaluate_received_placement_custody(
         &self,

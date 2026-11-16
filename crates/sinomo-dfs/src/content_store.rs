@@ -1306,6 +1306,27 @@ impl LocalContentStore {
         initialization::pending(root)
     }
 
+    /// Stop the real current initializer at a durable boundary for owner/restart
+    /// tests. No marker, incarnation or authority is supplied by the fixture.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn interrupt_current_initialization_for_test(root: &Path, phase: u8) -> Result<String> {
+        assert!((1..=5).contains(&phase));
+        create_dir_all(root.to_owned())?;
+        let _initialization = initialization::InitializationGuard::acquire(root)?;
+        initialization::begin(root)?;
+        let expected = initialization::marker(root)?.expect("real initialization intent");
+        if phase >= 2 {
+            let mut store = Self::open_for_inspection(root);
+            let _owner = inline_bindings::ContentMutationGuard::acquire(root, true)?;
+            create_dir_all(root.join("blobs/00"))?;
+            if phase >= 3 { store.initialize_content_reservation_writer_state()?; }
+            if phase >= 4 { store.initialize_inline_bindings()?; }
+            if phase >= 5 { inline_bindings::initialize_file_reclamation_lock(root)?; }
+        }
+        Ok(expected.store_incarnation)
+    }
+
     /// Opens a read-only view without initializing the content-store layout.
     ///
     /// This constructor is intended for advisory inspection of an existing

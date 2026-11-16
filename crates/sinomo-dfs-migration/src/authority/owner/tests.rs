@@ -15,20 +15,33 @@ fn native_read_admission_unavailable_preserves_pending_and_real_recovery() {
     let (original, _) = owner.authority.read_exact(&keys).unwrap();
     // Inject only a failed read. No test-supplied success, proof, or effect can
     // make the next actual native observation current.
-    let unavailable = owner.authority.read_native::<()>(async {
-        Err(ServiceError::Network(NetworkError::ClusterReadOnly {
-            detail: "injected unavailable native read admission".into(),
-        }))
-    }).unwrap_err();
-    assert!(matches!(unavailable, MetadataBackendError::StoragePreparationPending {
-        root, processed_records: 0,
-    } if root == owner.metadata_root));
+    for failure in [
+        NetworkError::ClusterReadOnly { detail: "injected unavailable native read admission".into() },
+        NetworkError::VerifiedClusterNonLeader { node_id: nodes[0].clone(), detail: "leader changed".into() },
+        NetworkError::UnknownNode { node_id: nodes[0].clone() },
+        NetworkError::timeout("native read", sinomo_core::network::NetworkTimeoutPhase::FirstByte,
+            std::time::Duration::from_millis(1), sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+        NetworkError::ObjectRpcRouteSaturated { route: "/kv/read".into(), concurrency_limit: 1 },
+    ] {
+        let unavailable = owner.authority.read_native::<()>(async {
+            Err(ServiceError::Network(failure))
+        }).unwrap_err();
+        assert!(matches!(unavailable, MetadataBackendError::StoragePreparationPending {
+            root, processed_records: 0,
+        } if root == owner.metadata_root));
+    }
     let malformed = owner.authority.read_native::<()>(async {
         Err(ServiceError::Network(NetworkError::Serialization {
             detail: "invalid native response".into(),
         }))
     }).unwrap_err();
     assert!(matches!(malformed, MetadataBackendError::Serde(_)));
+    let mounting = owner.authority.read_peer::<()>(async {
+        Err(NetworkError::UnknownNode { node_id: nodes[0].clone() })
+    }).unwrap_err();
+    assert!(matches!(mounting, MetadataBackendError::StoragePreparationPending { .. }));
+    let denied = owner.authority.read_peer::<()>(async { Err(NetworkError::AuthDenied) }).unwrap_err();
+    assert!(matches!(denied, MetadataBackendError::Serde(_)));
     let (recovered, proof) = owner.authority.read_exact(&keys).unwrap();
     crate::authority::current_authority(&proof).unwrap();
     assert_eq!(recovered, original);

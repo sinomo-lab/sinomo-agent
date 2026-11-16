@@ -1942,8 +1942,22 @@ impl RemoteTargetNamespacePhase {
     }
     fn dispatch(self) -> std::result::Result<CompletedRemoteTargetNamespacePhase, crate::DfsError> {
         let actor = self.actor.clone();
+        let local_offer = self.source_offer()?.filter(|offer|
+            offer.source_node_id == actor.node && offer.job_offer.coordinator_node_id == actor.node).cloned();
         let outcome = self.dispatch_inner();
         if outcome.is_err() {
+            // Delivery uncertainty says nothing about current source custody.
+            // The existing guarded cancellation can revoke only an exact,
+            // still-unclaimed offer and excludes every later claim atomically.
+            // A claimed effect keeps its writers and original recovery owner.
+            // Restrict this cleanup to local custody: no fresh RPC deadline is
+            // added after the original carrier budget has expired.
+            if let Some(offer) = local_offer {
+                if let Err(failure) = actor.cancel_unclaimed(&offer) {
+                    tracing::debug!(source_session=%offer.session_id, job=%offer.job_id,
+                        error=%failure, "failed carrier retains claimed or unresolved source custody");
+                }
+            }
             actor.wake_reconciliation();
         }
         outcome

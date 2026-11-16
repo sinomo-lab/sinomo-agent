@@ -5,7 +5,44 @@ use sinomo_dfs::{
     DfsMetadataStorageImportCut,
 };
 
+/// A derived observation of this owner's actual qualified stage. It carries
+/// no installation authority and is never reconstructed from serialized DATA.
+/// Only successful native qualification below creates it; restart discards it.
+pub(super) struct StagedCountSource {
+    plan_digest: String,
+    proof: DfsMetadataShardMembershipHandoffProof,
+    inspection: sinomo_dfs::DfsMetadataCandidateInspection,
+}
+
+fn count_stage_key(plan: &MetadataImportPlan) -> String {
+    let shard = &plan.expected_handoff.retiring_shard;
+    sinomo_dfs::metadata_shard_key(&shard.file_system_id, &shard.shard_id)
+}
+
 impl NativeImportAuthority {
+    pub(super) fn observed_count_stage(
+        &self, plan: &MetadataImportPlan, root: &Path,
+    ) -> Result<Option<DfsMetadataShardMembershipHandoffProof>> {
+        let retained = self.count_stages.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&count_stage_key(plan)).cloned();
+        let plan_digest = digest(plan)?;
+        let Some(retained) = retained.filter(|stage| stage.plan_digest == plan_digest)
+        else { return Ok(None); };
+        // Never hold the observation mutex across I/O. This private full-decoder
+        // result still checks current generation, framing, EOF and every byte.
+        retained.inspection.verify(root)?;
+        Ok(Some(retained.proof.clone()))
+    }
+
+    pub(super) fn forget_count_stage(&self, plan: &MetadataImportPlan) {
+        let key = count_stage_key(plan);
+        let mut stages = self.count_stages.lock().unwrap_or_else(|e| e.into_inner());
+        if stages.get(&key).is_some_and(|stage|
+            stage.proof.handoff_id == plan.expected_handoff.handoff_id) {
+            stages.remove(&key);
+        }
+    }
+
     pub(super) fn local_node(&self) -> Result<sinomo_core::node::NodeId> {
         Ok(sinomo_core::cluster::read_cluster_state_without_kv(
             &sinomo_core::network::ClusterPaths::new(&sinomo_core::local::SinomoDataDir::new(
@@ -142,7 +179,7 @@ impl NativeImportAuthority {
         }
         let pending = DfsControlPlaneStore::new(&mut client)
             .begin_metadata_shard_handoff_with_cause(retiring, &desired, cause)
-            .map_err(error)?
+            .map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?
             .ok_or_else(|| error("native assignment changed before staging the import cut"))?;
         let stage_commit = client.last_commit.clone();
         let stage_request = if let Some(commit) = stage_commit {
@@ -638,11 +675,12 @@ impl NativeImportAuthority {
             )
             .into());
         }
-        Self::validate_original_command_preimage(
+        self.verify_original_command_preimage(
             &request,
             owner,
             captured_issuer_rows,
             &record.command_digest,
+            record.revision,
         )?;
         let result = sinomo_core::kv::ClusterKvTxnCompactCommitResult {
             request_id: record.request_id,
@@ -1063,12 +1101,10 @@ impl NativeImportAuthority {
                     &envelope,
                 )
                 .map_err(error)?;
-                let result = block_native(
-                    &self.runtime,
+                let result = self.read_peer(
                     transport.call_async(node, call, source_effect_rpc_options(), true),
                 )?;
-                let response = block_native(
-                    &self.runtime,
+                let response = self.read_peer(
                     result.into_materialized_value_response(64 * 1024),
                 )?;
                 response
@@ -1159,7 +1195,7 @@ impl NativeImportAuthority {
         client.last_commit = None;
         if !DfsControlPlaneStore::new(&mut client)
             .complete_metadata_shard_membership_handoff(&h.retiring_shard, &h.desired_shard, &proof)
-            .map_err(error)?
+            .map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?
         {
             return Err(error("native joint import activation did not commit"));
         }
@@ -1216,7 +1252,7 @@ impl NativeImportAuthority {
         };
         let pending = DfsControlPlaneStore::new(&mut client)
             .acknowledge_metadata_shard_membership_handoff_fence(h, &fence)
-            .map_err(error)?
+            .map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?
             .ok_or_else(|| error("native source fence changed before import confirmation"))?;
         let image = sinomo_dfs::read_metadata_candidate_image(resolved_image_root)?;
         if image.prefix_proof != plan.target_exact_prefix
@@ -1290,6 +1326,23 @@ impl NativeImportAuthority {
             }
             return Err(error(format!("{reason}; stage failures: {}", failures.join("; "))));
         }
+        if let Some(cohort) = &plan.source_cut.namespace_count_cohort {
+            let member = cohort.member(&plan.source_cut.scope_shard)?;
+            let inspection = sinomo_dfs::DfsMetadataCandidateInspection::capture(resolved_image_root)?;
+            let actual = inspection.identity();
+            if actual.prefix_proof != member.initialized_prefix
+                || actual.state_fingerprint != member.initialized_state_fingerprint
+                || actual.file_fingerprint != member.initialized_seal.file_fingerprint {
+                return Err(error("qualified count stage changed its exact initialized image"));
+            }
+            let observation = StagedCountSource {
+                plan_digest: digest(plan)?, proof: proof.clone(), inspection,
+            };
+            // One compact observation per owned scope; source effects
+            // still belong exclusively to the existing background owner.
+            self.count_stages.lock().unwrap_or_else(|e| e.into_inner())
+                .insert(count_stage_key(plan), Arc::new(observation));
+        }
         Ok((stage, proof))
     }
     fn stage_rpc_value<T: serde::de::DeserializeOwned>(
@@ -1308,14 +1361,10 @@ impl NativeImportAuthority {
             body,
         )
         .map_err(error)?;
-        let result = block_native(
-            &self.runtime,
+        let result = self.read_peer(
             transport.call_async(node, call, source_effect_rpc_options(), true),
         )?;
-        let response = block_native(
-            &self.runtime,
-            result.into_materialized_value_response(64 * 1024),
-        )?;
+        let response = self.read_peer(result.into_materialized_value_response(64 * 1024))?;
         response.decode_body().map_err(error)
     }
     pub(super) fn confirm_stage_node(
@@ -1409,21 +1458,23 @@ impl NativeImportAuthority {
             let head = sinomo_core::network::ObjectRpcRequest::encode_body(
                 staged_service::SNAPSHOT_ROUTE,
                 "dfs-migration",
-                &envelope,
+                &staged_service::StageSnapshotHead {
+                    command: envelope.command.clone(),
+                    ancestry_request_id: envelope.ancestry_request_id.clone(),
+                },
             )
             .map_err(error)?;
+            #[cfg(test)]
+            assert!(head.body.len() < 16 * 1024,
+                "migration attachment head must fit the native frame limit; got {} bytes", head.body.len());
             let call = sinomo_core::network::ObjectRpcCall::new(
                 head,
                 image.attachment_source().map_err(error)?,
             );
-            let result = block_native(
-                &self.runtime,
+            let result = self.read_peer(
                 transport.call_async(node, call, source_effect_rpc_options(), true),
             )?;
-            let response = block_native(
-                &self.runtime,
-                result.into_materialized_value_response(64 * 1024),
-            )?;
+            let response = self.read_peer(result.into_materialized_value_response(64 * 1024))?;
             sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
                 .map_err(error)?
         };
@@ -1453,14 +1504,10 @@ impl NativeImportAuthority {
                 &probe,
             )
             .map_err(error)?;
-            let result = block_native(
-                &self.runtime,
+            let result = self.read_peer(
                 transport.call_async(node, call, source_effect_rpc_options(), true),
             )?;
-            let response = block_native(
-                &self.runtime,
-                result.into_materialized_value_response(64 * 1024),
-            )?;
+            let response = self.read_peer(result.into_materialized_value_response(64 * 1024))?;
             sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(&response).map_err(error)?
         };
         if response.request_id != barrier

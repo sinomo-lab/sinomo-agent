@@ -267,6 +267,74 @@ fn the_member_state_survives_snapshot_install_and_fences_an_old_epoch_snapshot()
 }
 
 #[test]
+fn interrupted_snapshot_install_reopens_for_authenticated_repair_with_its_member_fence() {
+    let native = native_snapshots::NativeSnapshots::new("native-snapshot-install-interruption");
+    let current = native.permit(&native.current_context, &native.current_image);
+    let old = native.permit(&native.before_context, &native.before_image);
+    for point in ["after-archive", "after-snapshot"] {
+        let root = sinomo_testdir::TestDir::new("snapshot-install-interrupted-root");
+        let mut replica = backend(&root);
+        replica.promise_metadata_takeover_owned(&native.before_cut, &KvRequestId::generate()).unwrap();
+        METADATA_SNAPSHOT_INSTALL_FAULT.set(Some(point));
+        assert!(matches!(replica.replace_with_replicated_snapshot_with_replica_permit(
+            &current, shard_id(), native.current_image.materialized_through_sequence, native.current_image.clone()),
+            Err(MetadataBackendError::Io { source, .. }) if source.kind() == std::io::ErrorKind::Interrupted));
+        drop(replica);
+        let open_error = LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap_err();
+        assert!(crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&open_error),
+            "interrupted snapshot at {point} must be repairable, not mistaken for unfinished migration: {open_error}");
+        assert!(matches!(LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+            &old, shard_id(), root.path(), shard_id(), native.before_image.materialized_through_sequence, native.before_image.clone()),
+            Err(MetadataBackendError::SourceEpochFenced { .. })));
+        let (repaired, _) = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+            &current, shard_id(), root.path(), shard_id(), native.current_image.materialized_through_sequence, native.current_image.clone()).unwrap();
+        assert_eq!(repaired.metadata_prefix_proof().unwrap(), native.current_image.prefix_proof);
+        drop(repaired);
+        let reopened = LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap();
+        assert_eq!(reopened.metadata_prefix_proof().unwrap(), native.current_image.prefix_proof);
+        drop(reopened);
+    }
+    native.runtime.close().unwrap();
+}
+
+#[test]
+fn unsealed_snapshot_repair_requires_its_exact_native_generation() {
+    let native = native_snapshots::NativeSnapshots::new("native-unsealed-snapshot-repair");
+    let root = sinomo_testdir::TestDir::new("retained-unsealed-snapshot");
+    let mut replica = backend(&root);
+    let permit = native.permit(&native.current_context, &native.current_image);
+    replica.replace_with_replicated_snapshot_with_replica_permit(
+        &permit, shard_id(), native.current_image.materialized_through_sequence, native.current_image.clone()).unwrap();
+    drop(replica);
+    let active = crate::storage_generation::read_generation(root.path()).unwrap();
+    // The earlier snapshot producer wrote exactly this unsealed header before
+    // activation. It is unreadable DATA, never a fixture-created serving permit.
+    let mut pending = active.clone();
+    pending.state = crate::storage_generation::GenerationState::Staged { seal: None };
+    crate::storage_generation::write_generation(root.path(), &pending).unwrap();
+    let open_error = LocalSobjMetadataBackend::new(shard_id(), root.path()).unwrap_err();
+    assert!(!crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&open_error));
+    assert!(crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+        &open_error, root.path(), &permit, &native.current_image).unwrap());
+    pending.identity.generation.push_str("-foreign");
+    crate::storage_generation::write_generation(root.path(), &pending).unwrap();
+    assert!(!crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+        &open_error, root.path(), &permit, &native.current_image).unwrap());
+    pending.identity = active.identity;
+    pending.state = crate::storage_generation::GenerationState::Staged {
+        seal: Some(crate::DfsMetadataGenerationSeal {
+            prefix_proof: native.current_image.prefix_proof.clone(),
+            state_fingerprint: native.current_image.semantic_state_fingerprint.clone(),
+            file_fingerprint: native.current_image.stream_digest.clone(),
+        }),
+    };
+    crate::storage_generation::write_generation(root.path(), &pending).unwrap();
+    assert!(!crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+        &open_error, root.path(), &permit, &native.current_image).unwrap());
+    native.runtime.close().unwrap();
+}
+
+#[test]
 fn a_pending_add_needs_whole_journal_evidence_and_ends_when_the_record_moves() {
     let root = sinomo_testdir::TestDir::new("write-set-pending-add");
     let mut backend = backend(&root);

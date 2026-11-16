@@ -212,20 +212,37 @@ impl MigrationOwner {
     fn retain_filesystem_invocation(&self, invocation: &Invocation) -> Result<PathBuf> {
         let root = self.filesystem_job_root(invocation)?;
         write_replay_compatible(&root.join("invocation.json"), invocation)?;
+        #[cfg(test)]
+        observe_scope_step(self, &invocation.catalog[0], "invocation-retained")?;
         let unit = invocation.unit()?;
         let mut reference = self
             .work
             .inventory
             .read(&unit)?
             .unwrap_or_else(|| inventory::UnitReference::discovered(unit.clone()));
-        reference.job = Some(inventory::JobReference {
+        let job = inventory::JobReference {
             checkpoint: root
                 .join("invocation.json")
                 .strip_prefix(&self.authority.data_root)
                 .map_err(error)?
                 .to_owned(),
             identity: invocation.transition_id.clone(),
-        });
+        };
+        if let Some(original) = &reference.job {
+            if original != &job {
+                return Err(error("filesystem invocation cannot replace its original inventory job"));
+            }
+            // Replaying immutable DATA is not a changed dependency. A first
+            // in-memory recovery still registers its retained continuation.
+            let mut scheduler = self.work.scheduler.lock().map_err(error)?;
+            if scheduler.state(&unit)?.is_none() {
+                scheduler.recovered(reference)?;
+                drop(scheduler);
+                self.work.wake.notify_one();
+            }
+            return Ok(root);
+        }
+        reference.job = Some(job);
         self.work.inventory.record(&reference)?;
         let mut scheduler = self.work.scheduler.lock().map_err(error)?;
         scheduler.recovered(reference)?;
@@ -320,9 +337,25 @@ impl MigrationOwner {
         }
         // Immutable inbox DATA is durable before acknowledgement. Conversion,
         // census and native writes only run in the already-owned worker.
+        #[cfg(test)]
+        if matches!(request, Request::Status { .. }) {
+            observe_scope_step(self, &invocation.catalog[0], "enrollment-status")?;
+        }
         let root = self.retain_filesystem_invocation(invocation)?;
         if matches!(request, Request::Enroll { .. }) {
-            write_replay_compatible(&root.join("enroll.json"), &request)?;
+            let inbox = root.join("enroll.json");
+            let newly_enrolled = !inbox.try_exists().map_err(error)?;
+            write_replay_compatible(&inbox, &request)?;
+            #[cfg(test)]
+            if !newly_enrolled && root.join("cohort.json").is_file() {
+                observe_scope_step(self, &invocation.catalog[0], "qualified-enrollment-replayed")?;
+            }
+            if newly_enrolled {
+                // Publish the actual dependency only after durable enrollment;
+                // a worker may have parked after receiving the earlier capture.
+                self.work.scheduler.lock().map_err(error)?.enqueue(invocation.unit()?, false)?;
+                self.work.wake.notify_one();
+            }
         }
         if completed {
             return Ok(Response::Activated);
@@ -333,7 +366,7 @@ impl MigrationOwner {
                 cohort_id: seal.cohort_id,
             });
         }
-        if root.join("captured.json").is_file() {
+        if matches!(request, Request::Capture { .. }) && root.join("captured.json").is_file() {
             return Ok(Response::Captured {
                 sources: self.filesystem_sources(&root)?,
             });
@@ -356,22 +389,10 @@ impl MigrationOwner {
             &request,
         )
         .map_err(|failure| error(format!("filesystem work RPC encoding failed: {failure}")))?;
-        let response = match block_native(
-            &self.authority.runtime,
+        let response = self.authority.read_peer(
             transport.call_async(target, call, source_effect_rpc_options(), true),
-        ) {
-            Ok(response) => response,
-            Err(failure) => {
-                // No acknowledged DATA or effect is inferred from transport
-                // failure. The same immutable request remains owned for retry.
-                tracing::debug!(target=%target, error=%failure, "filesystem source peer remains unavailable");
-                return Ok(Response::Pending);
-            }
-        };
-        block_native(
-            &self.authority.runtime,
-            response.into_materialized_value_response(MAX_WIRE_BYTES),
-        )?
+        )?;
+        self.authority.read_peer(response.into_materialized_value_response(MAX_WIRE_BYTES))?
         .decode_body()
         .map_err(error)
     }
@@ -514,8 +535,7 @@ impl MigrationOwner {
                 NamespaceCountMaintenanceLimits {
                     max_objects: MAX_SOURCE_RECORDS,
                     max_encoded_bytes: MAX_WIRE_BYTES,
-                    deadline: std::time::Instant::now()
-                        + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    deadline: None,
                 },
             )?;
             let generation = digest(&(
@@ -542,6 +562,13 @@ impl MigrationOwner {
                     value: entry.value.clone(),
                 });
             }
+            // Beginning a handoff leaves the catalog assignment unchanged.
+            // Reserve its absence in the same Pending transaction so neither
+            // ordering can strand the other operation behind this barrier.
+            compares.extend(invocation.catalog.iter().map(|shard| KvCompare::Missing {
+                key: sinomo_dfs::metadata_shard_membership_handoff_key(
+                    &shard.file_system_id, &shard.shard_id),
+            }));
             for goal in &invocation.placement_goals { compares.extend(goal.source_compares()); }
             let request = KvTxnRequest::new(
                 KvRequestId::derived(
@@ -557,14 +584,18 @@ impl MigrationOwner {
             write_immutable(&pending_path, &request)?;
             request
         };
+        #[cfg(test)]
+        observe_scope_step(self, &invocation.catalog[0], "before-pending")?;
         let committed = match self.authority.commit_evaluated(request) {
             Ok(committed) => committed,
             Err(NativeEvaluationError::Native(failure)) => {
                 tracing::warn!(error=%failure, "filesystem Pending retains its exact uncertain original request");
-                return Ok(None);
+                return Err(self.authority.native_read_error(failure));
             }
             Err(NativeEvaluationError::Domain(failure)) => return Err(failure),
         };
+        #[cfg(test)]
+        observe_scope_step(self, &invocation.catalog[0], "pending-evaluated")?;
         NativeImportAuthority::require_committed(&committed)?;
         let (entries, _) = self
             .authority
@@ -656,7 +687,7 @@ impl MigrationOwner {
         self.work.wake.notify_one();
         Ok(unit)
     }
-    fn start_filesystem_invocation(&self, unit: &inventory::UnitKey) -> Result<Invocation> {
+    fn start_filesystem_invocation(&self, unit: &inventory::UnitKey) -> Result<Option<Invocation>> {
         let inventory::UnitRole::FileSystem {
             file_system_id,
             source_catalog_generation,
@@ -693,7 +724,10 @@ impl MigrationOwner {
                 "only deterministic retiring coordinator may create an invocation",
             ));
         }
-        self.authority.require_count_capabilities(&catalog)?;
+        // Subscribe before the authoritative read, so a publication during the
+        // step cannot be lost when this same unit subsequently parks.
+        self.watch_filesystem_members(unit, &catalog)?;
+        if !self.authority.count_capabilities_ready(&catalog)? { return Ok(None); }
         let Some(goals) = self.authority.capture_original_placement_goals(sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET)? else {
             return Err(MetadataBackendError::StoragePreparationPending { root: self.metadata_root.clone(), processed_records: 0 });
         };
@@ -712,7 +746,15 @@ impl MigrationOwner {
         invocation.transition_id = invocation.expected_transition_id()?;
         invocation.file_system()?;
         self.retain_filesystem_invocation(&invocation)?;
-        Ok(invocation)
+        Ok(Some(invocation))
+    }
+    fn watch_filesystem_members(&self, unit: &inventory::UnitKey, catalog: &[DfsMetadataShardConfig]) -> Result<()> {
+        let keys = catalog.iter().flat_map(|shard|
+            std::iter::once(&shard.primary_node_id).chain(&shard.replica_node_ids))
+            .flat_map(|node| [sinomo_core::node::cluster_member_key(node),
+                sinomo_core::node::cluster_capability_policy_key(node)])
+            .collect::<BTreeSet<_>>();
+        self.work.scheduler.lock().map_err(error)?.watch_native_keys(unit, keys)
     }
 }
 
@@ -720,7 +762,7 @@ impl MigrationOwner {
     fn filesystem_invocation_for(
         &self,
         reference: &mut inventory::UnitReference,
-    ) -> Result<(Invocation, PathBuf)> {
+    ) -> Result<Option<(Invocation, PathBuf)>> {
         if let Some(job) = &reference.job {
             let path = self.authority.data_root.join(&job.checkpoint);
             let invocation: Invocation = read_bounded(&path)?;
@@ -735,9 +777,24 @@ impl MigrationOwner {
                     "filesystem inventory points at a foreign original job",
                 ));
             }
-            return Ok((invocation, root));
+            return Ok(Some((invocation, root)));
         }
-        let invocation = self.start_filesystem_invocation(&reference.unit)?;
+        // The immutable invocation is durable before its inventory link. A
+        // restart in that window must attach that original identity, never
+        // derive another transition from a fresh initialization timestamp.
+        let retained_path = self.authority.data_root.join("dfs/migration-owner/filesystems")
+            .join(reference.unit.id()?).join("invocation.json");
+        let invocation = if retained_path.try_exists().map_err(error)? {
+            let original: Invocation = read_bounded(&retained_path)?;
+            if original.unit()? != reference.unit {
+                return Err(error("unlinked filesystem invocation belongs to another unit"));
+            }
+            self.retain_filesystem_invocation(&original)?;
+            original
+        } else {
+            let Some(invocation) = self.start_filesystem_invocation(&reference.unit)? else { return Ok(None); };
+            invocation
+        };
         let root = self.filesystem_job_root(&invocation)?;
         reference.job = Some(inventory::JobReference {
             checkpoint: root
@@ -748,7 +805,7 @@ impl MigrationOwner {
             identity: invocation.transition_id.clone(),
         });
         self.work.inventory.record(reference)?;
-        Ok((invocation, root))
+        Ok(Some((invocation, root)))
     }
     pub(super) fn advance_filesystem(
         &self,
@@ -757,7 +814,10 @@ impl MigrationOwner {
         let pending = || sinomo_dfs::DfsStoragePreparation::Pending {
             processed_records: 0,
         };
-        let (invocation, root) = self.filesystem_invocation_for(reference)?;
+        let Some((invocation, root)) = self.filesystem_invocation_for(reference)? else {
+            return Ok(pending());
+        };
+        self.watch_filesystem_members(&reference.unit, &invocation.catalog)?;
         let local = self.authority.local_node()?;
         if let progress @ sinomo_dfs::DfsStoragePreparation::Pending { .. } =
             self.capture_filesystem_sources(&invocation, &root)? {
@@ -801,6 +861,18 @@ impl MigrationOwner {
             qualified_sources = Some(sources);
         }
         if !inbox.is_file() {
+            // Capture completion is a dependency edge even though this peer is
+            // not yet enrolled. Wake the original coordinator instead of
+            // requiring either owner to poll the other's checkpoint. A lost
+            // response retries this same idempotent wake through the owner.
+            if invocation.coordinator != local {
+                let shard = invocation.catalog.iter().find(|shard| shard.primary_node_id == local)
+                    .ok_or_else(|| error("captured filesystem has no local source"))?;
+                self.filesystem_peer(&invocation.coordinator, Request::Wake {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: DfsMetadataShardId::new(&shard.shard_id),
+                })?;
+            }
             return Ok(pending());
         }
         let cohort_path = root.join("cohort.json");
@@ -808,11 +880,26 @@ impl MigrationOwner {
             invocation.catalog.iter().map(|shard| shard.primary_node_id.clone())
                 .filter(|peer| *peer != local).collect::<BTreeSet<_>>()
         } else { BTreeSet::new() };
-        // Once enrollment has a qualified immutable seal, its original source
-        // and native install owners recheck publication. Re-decoding every
-        // source row on each publication turn would repeat the completed census.
+        // The peer's existing status response names its qualified cohort.
+        // Once it has enrolled, replaying the full source set only repeats
+        // serialization and inbox validation; it cannot advance native work.
+        let mut needs_enrollment = Vec::new();
+        if cohort_path.is_file() {
+            let retained: NamespaceCountCohortSeal = read_bounded(&cohort_path)?;
+            retained.validate()?;
+            for peer in &peers {
+                match self.filesystem_peer(peer, Request::Status { invocation: invocation.clone() })? {
+                    Response::Enrolled { cohort_id } if cohort_id == retained.cohort_id => {},
+                    Response::Activated => {},
+                    Response::Enrolled { .. } => return Err(error("remote owner derived a different complete cohort")),
+                    _ => needs_enrollment.push(peer.clone()),
+                }
+            }
+        } else {
+            needs_enrollment.extend(peers.iter().cloned());
+        }
         // Keep the full inbox only while staging or sending original peer DATA.
-        let enrollment = if !cohort_path.is_file() || !peers.is_empty() {
+        let enrollment = if !cohort_path.is_file() || !needs_enrollment.is_empty() {
             let enrollment = match fresh_enrollment.take() {
                 Some(enrollment) => enrollment,
                 None => read_bounded::<Request>(&inbox)?,
@@ -883,8 +970,7 @@ impl MigrationOwner {
                     NamespaceCountMaintenanceLimits {
                         max_objects: MAX_SOURCE_RECORDS,
                         max_encoded_bytes: MAX_WIRE_BYTES,
-                        deadline: std::time::Instant::now()
-                            + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                        deadline: None,
                     },
                     &owned_roots,
                     seal.as_ref(),
@@ -906,7 +992,7 @@ impl MigrationOwner {
             write_immutable(&cohort_path, &seal)?;
             seal
         };
-        for peer in &peers {
+        for peer in &needs_enrollment {
             let (config, wires) = enrollment.as_ref().expect("peer enrollment retains its original DATA");
             match self.filesystem_peer(
                 peer,
@@ -923,6 +1009,7 @@ impl MigrationOwner {
             }
         }
         let mut processed_records = 0usize;
+        let mut retryable = None;
         for shard in &owned {
             #[cfg(test)]
             match observe_scope_step(self, shard, "before") {
@@ -940,18 +1027,26 @@ impl MigrationOwner {
                 Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records: count }) => {
                     processed_records = processed_records.saturating_add(count);
                 }
-                Ok(sinomo_dfs::DfsStoragePreparation::Ready)
-                | Err(MetadataBackendError::StoragePreparationPending { .. }) => {}
+                Ok(sinomo_dfs::DfsStoragePreparation::Ready) => {}
+                Err(failure @ MetadataBackendError::StoragePreparationPending { processed_records: count, .. }) => {
+                    // Keep advancing siblings that may own this dependency.
+                    processed_records = processed_records.saturating_add(count);
+                    retryable.get_or_insert(failure);
+                }
                 Err(failure) => return Err(failure),
             }
             #[cfg(test)]
             observe_scope_step(self, shard, "after")?;
         }
+        let pending_after_sources = |processed_records, retryable| match retryable {
+            Some(failure) if processed_records == 0 => Err(failure),
+            _ => Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records }),
+        };
         if invocation.coordinator == local && !self.authority.release_count_cohort(&seal, &root)? {
-            return Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records });
+            return pending_after_sources(processed_records, retryable);
         }
         if !self.authority.published_count_cohort(&seal)? {
-            return Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records });
+            return pending_after_sources(processed_records, retryable);
         }
         let mut complete = true;
         for shard in owned {
@@ -997,11 +1092,11 @@ impl MigrationOwner {
                 self.record_completed_metadata_archives(&self.metadata_root.join(&shard.shard_id))?;
             }
         }
-        Ok(if complete {
-            sinomo_dfs::DfsStoragePreparation::Ready
+        if complete {
+            Ok(sinomo_dfs::DfsStoragePreparation::Ready)
         } else {
-            sinomo_dfs::DfsStoragePreparation::Pending { processed_records }
-        })
+            pending_after_sources(processed_records, retryable)
+        }
     }
 }
 
@@ -1057,6 +1152,10 @@ impl MigrationOwner {
             if let sinomo_dfs::DfsMetadataGenerationState::Staged { seal: Some(seal) } =
                 header.state
             {
+                let _ = self.metadata.prepare_received_metadata_unit(
+                    &physical_root, shard, &header.identity.file_system_id,
+                    sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET,
+                )?;
                 if crate::metadata::installed_metadata_source_cut(&physical_root, shard)?.is_none() {
                     return self.metadata.prepare_with_source(&physical_root, &physical_root,
                         shard, sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET);
@@ -1314,6 +1413,44 @@ mod timestamp_tests {
         at: time::OffsetDateTime,
     }
     #[test]
+    fn replaying_retained_invocation_does_not_wake_parked_work() {
+        let (mut native, node, hold) = super::super::filesystem_tests::native_filesystem_owner_fixture(
+            "native-filesystem-idempotent-invocation-wake");
+        super::super::filesystem_tests::complete_filesystem_owner(&native, &node, &hold);
+        let context = native.component_context(&node).unwrap();
+        let owner = crate::authority::placement_work::native_tests::canonical_migration_runtime(&context);
+        let directory = owner.authority.data_root.join("dfs/migration-owner/filesystems");
+        let path = std::fs::read_dir(&directory).unwrap().map(|entry|
+            entry.unwrap().path().join("invocation.json")).find(|path| path.is_file()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let invocation: Invocation = read_bounded(&path).unwrap();
+        let unit = invocation.unit().unwrap();
+        let reference = owner.work.inventory.read(&unit).unwrap().unwrap();
+        // Drain the real component before inspecting advisory queue state; no
+        // concurrently running worker can consume and hide a spurious wake.
+        drop(context);
+        native.stop_node(&node).unwrap();
+        {
+            let mut scheduler = owner.work.scheduler.lock().unwrap();
+            *scheduler = super::super::scheduler::Scheduler::new();
+            scheduler.recovered(reference.clone()).unwrap();
+            let (id, mut selected) = scheduler.next().unwrap();
+            selected.state = inventory::ObservedState::Waiting { evidence: "unchanged native dependency".into() };
+            scheduler.finish(&id, selected);
+            assert!(scheduler.next().is_none());
+        }
+        for _ in 0..3 {
+            owner.retain_filesystem_invocation(&invocation).unwrap();
+            assert!(owner.work.scheduler.lock().unwrap().next().is_none(),
+                "identical retained invocation must not manufacture a dependency change");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(owner.work.inventory.read(&unit).unwrap().unwrap(), reference);
+        drop(owner);
+        native.close().unwrap();
+    }
+
+    #[test]
     fn filesystem_timestamp_wire_preserves_original_checkpoint_bytes() {
         let value = Timestamp {
             at: time::OffsetDateTime::from_unix_timestamp(1_794_656_070)
@@ -1422,7 +1559,10 @@ impl MigrationOwner {
             None
         } else {
             Some(
-                crate::metadata::installed_metadata_source_cut(root, &identity.shard_id)?
+                match crate::metadata::interrupted_receiver_source_cut(root, &identity.shard_id, &path)? {
+                    Some(source) => Some(source),
+                    None => crate::metadata::installed_metadata_source_cut(root, &identity.shard_id)?,
+                }
                     .ok_or_else(|| {
                         error("missing receiver plan has no verified installed original source cut")
                     })?,

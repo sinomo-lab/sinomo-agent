@@ -101,6 +101,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(memory_object) = memory_object {
             return Ok(memory_object);
         }
+        // An unfinished create has no namespace head. Its current native owner
+        // may still fetch/stage the original write from its durable descriptor.
+        // Do not add that descriptor to the namespace or committed-version view.
+        if self.control_plane.is_some()
+            && let Some(intent) = self
+                .coordinator
+                .pending_current_create_for_object(object_id)
+                .cloned()
+            && let Some(record) = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| backend.get_intent(object_id, &intent.intent_id))
+                .transpose()?
+                .flatten()
+        {
+            if !distributed_intent_matches_record(&intent, &record) {
+                return Err(DfsError::Metadata {
+                    message: "pending create differs from its original durable intent".into(),
+                });
+            }
+            if self.local_pending_write_authority_shard(&record)?.is_some()
+                && let Some(object) = record.object_metadata
+            {
+                self.ensure_object_not_in_cross_shard_flight(&object)?;
+                return Ok(object);
+            }
+        }
         self.metadata
             .object(object_id)
             .cloned()

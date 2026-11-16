@@ -592,6 +592,7 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
             .unwrap()
             .materialized_through_sequence
     };
+    let mut last_materialization = None;
     let materialized = crate::runtime_host::materialization_test::wait_for_existing_materialization(
         runtime.data_dir(&writer_node),
         &sifs_file_system_id(),
@@ -599,10 +600,10 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
         &runtime.runtime_handle(),
         published_sequence,
         deadline,
-        |_| {},
+        |observed| last_materialization = Some(observed.clone()),
     );
     eprintln!(
-        "HELD_MOUNTED_SYMLINK writer={writer_node} primary={primary_node} unlink_request={} initial_sequence={initial_sequence} captured={captured:?} pending={pending:?} recreate={recreated:?} dispatch={actual_dispatch:?} local_after={local_after:?} publication_sequence={published_sequence} materialized={materialized:?} omitted={}",
+        "HELD_MOUNTED_SYMLINK writer={writer_node} primary={primary_node} unlink_request={} initial_sequence={initial_sequence} captured={captured:?} pending={pending:?} recreate={recreated:?} dispatch={actual_dispatch:?} local_after={local_after:?} publication_sequence={published_sequence} materialized={materialized:?} last_materialization={last_materialization:?} omitted={}",
         request.request_id,
         runtime.observation_dropped_count()
     );

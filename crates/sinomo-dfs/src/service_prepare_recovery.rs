@@ -298,7 +298,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A current create can durably admit its intent/receipt before the
         // sealed content body or first visible object exists. Its saved object
         // is an identity anchor only; the same certified shard check below
-        // still owns adoption, and hydration exposes it only after W is ready.
+        // still owns adoption. Transient transfer recovery grants neither a
+        // content receipt nor a visible namespace entry.
         let object = match self.current_read_object_metadata(&intent.object_id) {
             Ok(object) => object,
             Err(DfsError::UnknownObject { object_id })

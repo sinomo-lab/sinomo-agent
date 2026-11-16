@@ -2,6 +2,7 @@
 //! This driver owns no queue, runtime, or publication authority. Its caller
 //! owns the inventory job, source/target paths, cancellation and target exposure.
 use super::*;
+use std::collections::BTreeMap;
 use sinomo_core::storage::checksummed_frame::{FrameLimits, FrameRead, read_frame};
 use sinomo_dfs::{ContentStoreStagingRow, ContentStoreStagingWriter};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -326,10 +327,6 @@ enum Warm {
         index: usize,
         verifier: sinomo_dfs::ContentImportBlobVerifier,
     },
-    Blob {
-        hash: String,
-        verifier: sinomo_dfs::ContentImportBlobVerifier,
-    },
 }
 #[derive(Eq, PartialEq)]
 struct WarmDirectory {
@@ -359,6 +356,10 @@ fn directory_identity(path: &Path) -> Result<WarmDirectory> {
 pub(crate) struct OriginalV3Converter {
     job: Option<String>,
     warm: Option<Warm>,
+    // Incomplete hash passes belong to their admitted blob. Keep a bounded set
+    // so a small demanded blob can preempt a background verification without
+    // resetting it or retaining an unbounded number of file handles.
+    blob_verifiers: BTreeMap<String, sinomo_dfs::ContentImportBlobVerifier>,
     loose_reader: Option<(u16, fs::ReadDir)>,
     directories: Option<Vec<WarmDirectory>>,
     checkpoint_bytes: Option<Vec<u8>>,
@@ -496,9 +497,241 @@ fn reservation_value(record: Reservation, incarnation: &str) -> Result<(Key, Val
     ))
 }
 
-// A derived per-record key log makes the eventual All scan resumable without a
-// directory walk. Duplicate entries after source replay are harmless: only the
-// final indexed row is imported and the target arbitrates current state.
+// Independent files in one source record need no ordering between their syncs.
+// Join every bounded group before publishing names or advancing the source
+// cursor. No worker, writable handle, or queued task outlives this call.
+fn sync_index_group<T: Send, R: Send>(
+    items: impl IntoIterator<Item = T>,
+    sync: impl Fn(T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let mut items = items.into_iter().peekable();
+    let span = tracing::Span::current();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    std::thread::scope(|scope| {
+        let mut result = Vec::new();
+        while items.peek().is_some() {
+            let mut workers = Vec::new();
+            for item in items.by_ref().take(8) {
+                let sync = &sync;
+                let span = span.clone();
+                let dispatch = dispatch.clone();
+                workers.push(
+                    std::thread::Builder::new()
+                        .name("dfs-index-sync".into())
+                        .spawn_scoped(scope, move || {
+                            tracing::dispatcher::with_default(&dispatch, || {
+                                span.in_scope(|| sync(item))
+                            })
+                        })
+                        .map_err(error)?,
+                );
+            }
+            // Observe all outcomes, including when one barrier fails. The
+            // owner cannot start replay while another worker still holds DATA.
+            let outcomes = workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| error("index synchronization worker panicked"))
+                        .and_then(|result| result)
+                })
+                .collect::<Vec<_>>();
+            result.extend(outcomes.into_iter().collect::<Result<Vec<_>>>()?);
+        }
+        Ok(result)
+    })
+}
+
+// Publish one source record with a single barrier per shared log/directory. The
+// source cursor remains the recovery owner and cannot advance until publication
+// finishes. Temporary files stay outside refs: an interrupted private write must
+// never count as a live content root.
+#[derive(Default)]
+struct IndexPublication {
+    staging_root: PathBuf,
+    logs: Vec<(PathBuf, File)>,
+    staged: Vec<(PathBuf, PathBuf, Option<File>)>,
+    removed: Vec<PathBuf>,
+    directories: std::collections::BTreeSet<PathBuf>,
+}
+
+impl IndexPublication {
+    fn append(&mut self, path: PathBuf, initial_end: u64, bytes: &[u8]) -> Result<u64> {
+        let index = match self.logs.iter().position(|(held, _)| held == &path) {
+            Some(index) => index,
+            None => {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&path)
+                    .map_err(|e| io(&path, e))?;
+                file.set_len(initial_end).map_err(|e| io(&path, e))?;
+                file.seek(SeekFrom::Start(initial_end))
+                    .map_err(|e| io(&path, e))?;
+                self.directories
+                    .insert(path.parent().expect("index log parent").to_owned());
+                self.logs.push((path.clone(), file));
+                self.logs.len() - 1
+            }
+        };
+        let file = &mut self.logs[index].1;
+        sinomo_core::storage::io_trace::write_all(file, &(bytes.len() as u32).to_le_bytes())
+            .and_then(|_| sinomo_core::storage::io_trace::write_all(file, bytes))
+            .map_err(|e| io(&path, e))?;
+        file.stream_position().map_err(|e| io(&path, e))
+    }
+
+    fn write<T: Serialize>(&mut self, destination: &Path, value: &T) -> Result<()> {
+        // A Bind contributes a reservation and a version to the same object
+        // log. Retain only its final end marker; the log itself retains both.
+        if let Some(index) = self
+            .staged
+            .iter()
+            .position(|(_, path, _)| path == destination)
+        {
+            let (temporary, _, file) = self.staged.remove(index);
+            drop(file);
+            fs::remove_file(&temporary).map_err(|e| io(&temporary, e))?;
+        }
+        let value = Checked {
+            value,
+            checksum: blake3::hash(&encode(value)?).to_hex().to_string(),
+        };
+        let bytes = serde_ext::to_bytes(&value, 1, LengthMode::U32).map_err(error)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| error("index row has no parent"))?;
+        let temporary = self.staging_root.join(format!(
+            ".source3-index-{}.tmp",
+            sinomo_core::Id::generate()
+        ));
+        let mut file = durable_file::create_private_staged_file(&temporary).map_err(error)?;
+        self.staged.push((temporary, destination.to_owned(), None));
+        sinomo_core::storage::io_trace::write_all(&mut file, &bytes)
+            .map_err(|e| io(destination, e))?;
+        self.staged.last_mut().expect("retained stage").2 = Some(file);
+        self.directories.insert(parent.to_owned());
+        self.directories.insert(self.staging_root.clone());
+        Ok(())
+    }
+
+    fn directory(&mut self, path: &Path) -> Result<()> {
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(failure) if failure.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(failure) => return Err(io(path, failure)),
+        }
+        directory_identity(path)?;
+        self.directories.insert(path.to_owned());
+        self.directories
+            .insert(path.parent().expect("index directory parent").to_owned());
+        Ok(())
+    }
+
+    fn remove(&mut self, path: PathBuf) {
+        self.directories
+            .insert(path.parent().expect("index reference parent").to_owned());
+        self.removed.push(path);
+    }
+
+    fn publish(mut self) -> Result<()> {
+        // All data barriers precede every rename, including the per-object
+        // log end marker. A crash can expose only complete files over durable
+        // log bytes; the unchanged source cursor then replays this same row.
+        sync_index_group(&mut self.logs, |(path, file)| {
+            durable_file::sync_open_file(file, path, durable_file::DurableFileSync::All)
+                .map_err(error)
+        })?;
+        #[cfg(test)]
+        self.interrupt("logs")?;
+        #[cfg(test)]
+        if self.logs.len() == 2
+            && FAIL_INDEX_PUBLICATION.with(|fault| {
+                if fault.get() == Some("missing-stage") {
+                    fault.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+        {
+            // A real failed path/handle identity check in one barrier must
+            // prevent every install, while its sibling workers still drain.
+            let path = &self.staged[0].0;
+            fs::rename(path, path.with_extension("orphan")).map_err(|e| io(path, e))?;
+        }
+        let synced = sync_index_group(&mut self.staged, |(path, destination, file)| {
+            Ok((
+                durable_file::sync_private_staged_file(
+                    path,
+                    file.take().expect("index stage writer"),
+                )
+                .map_err(error)?,
+                destination.clone(),
+            ))
+        })?;
+        #[cfg(test)]
+        self.interrupt("files")?;
+        for (stage, destination) in &synced {
+            // Index rows are replacements under the held original conversion
+            // owner, not immutable no-clobber content publications.
+            durable_file::replace_file(stage.path(), destination).map_err(error)?;
+            #[cfg(test)]
+            self.interrupt("first-install")?;
+        }
+        for path in &self.removed {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {}
+                Err(failure) => return Err(io(path, failure)),
+            }
+        }
+        #[cfg(test)]
+        self.interrupt("before-directories")?;
+        sync_index_group(&self.directories, |directory| {
+            durable_file::sync_directory(directory).map_err(error)
+        })?;
+        #[cfg(test)]
+        self.interrupt("directories")?;
+        #[cfg(test)]
+        if !self.logs.is_empty() && FAIL_AFTER_INDEX_ROW.with(|fault| fault.replace(false)) {
+            return Err(error("injected index row before cursor publication"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn interrupt(&mut self, phase: &str) -> Result<()> {
+        if self.logs.len() == 2
+            && FAIL_INDEX_PUBLICATION.with(|fault| {
+                if fault.get() == Some(phase) {
+                    fault.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+        {
+            // Leave the same installed prefix and private files as process loss.
+            // Close handles, but do not run the normal error-path unlink cleanup.
+            self.staged.clear();
+            return Err(error(format!("injected index publication at {phase}")));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IndexPublication {
+    fn drop(&mut self) {
+        for (temporary, _, file) in &mut self.staged {
+            file.take();
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
 fn index_row(
     work: &Path,
     progress: &mut Progress,
@@ -506,27 +739,29 @@ fn index_row(
     value: Value,
     sequence: u64,
 ) -> Result<()> {
+    let mut publication = IndexPublication::default();
+    publication.staging_root = work.to_owned();
+    stage_index_row(work, progress, key, value, sequence, &mut publication)?;
+    publication.publish()
+}
+
+fn stage_index_row(
+    work: &Path,
+    progress: &mut Progress,
+    key: Key,
+    value: Value,
+    sequence: u64,
+    publication: &mut IndexPublication,
+) -> Result<()> {
+    // Duplicate log entries after replay are harmless: only the final indexed
+    // row is imported and the target arbitrates current state.
     let key_bytes = encode(&Checked {
         checksum: blake3::hash(&encode(&key)?).to_hex().to_string(),
         value: &key,
     })?;
     let path = work.join("units");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| io(&path, e))?;
-    file.set_len(progress.units_end).map_err(|e| io(&path, e))?;
-    file.seek(SeekFrom::Start(progress.units_end))
-        .map_err(|e| io(&path, e))?;
-    file.write_all(&(key_bytes.len() as u32).to_le_bytes())
-        .and_then(|_| file.write_all(&key_bytes))
-        .and_then(|_| file.sync_all())
-        .map_err(|e| io(&path, e))?;
-    progress.units_end += 4 + key_bytes.len() as u64;
-    unit_log(work, &key, &key_bytes)?;
+    progress.units_end = publication.append(path, progress.units_end, &key_bytes)?;
+    unit_log(work, &key, &key_bytes, publication)?;
     let row = row_path(work, &key)?;
     if row.exists() {
         let previous: Indexed = checked_read(&row)?;
@@ -568,19 +803,15 @@ fn index_row(
     };
     if let Some((hash, live)) = root_hash {
         let directory = work.join("refs").join(&hash[7..]);
-        durable_file::ensure_directory(&directory).map_err(error)?;
+        publication.directory(&directory)?;
         let reference = directory.join(hash_key(&key)?);
         if live {
-            checked_write(&reference, &key)?;
+            publication.write(&reference, &key)?;
         } else {
-            match fs::remove_file(&reference) {
-                Ok(()) => durable_file::sync_directory(&directory).map_err(error)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io(&reference, e)),
-            }
+            publication.remove(reference);
         }
     }
-    checked_write(
+    publication.write(
         &row,
         &Indexed {
             copy: None,
@@ -590,14 +821,12 @@ fn index_row(
             value,
         },
     )?;
-    #[cfg(test)]
-    if FAIL_AFTER_INDEX_ROW.with(|fault| fault.replace(false)) {
-        return Err(error("injected index row before cursor publication"));
-    }
     Ok(())
 }
 #[cfg(test)]
 thread_local! { static FAIL_AFTER_INDEX_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { static FAIL_INDEX_PUBLICATION: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 
 fn project_record(
     work: &Path,
@@ -818,10 +1047,12 @@ fn project_record(
     if let Some(row) = blob_row {
         rows.push(row);
     }
+    let mut publication = IndexPublication::default();
+    publication.staging_root = work.to_owned();
     for (key, value) in rows {
-        index_row(work, progress, key, value, seq)?;
+        stage_index_row(work, progress, key, value, seq, &mut publication)?;
     }
-    Ok(())
+    publication.publish()
 }
 
 fn key_at(work: &Path, offset: u64, end: u64) -> Result<Option<(Key, u64)>> {
@@ -860,7 +1091,7 @@ fn selected(selection: &OriginalV3Selection, key: &Key) -> bool {
     }
 }
 
-fn unit_log(work: &Path, key: &Key, bytes: &[u8]) -> Result<()> {
+fn unit_log(work: &Path, key: &Key, bytes: &[u8], publication: &mut IndexPublication) -> Result<()> {
     let object = match key {
         Key::Version(object, _) => object,
         Key::Reservation(identity) => &identity.object_id,
@@ -874,20 +1105,8 @@ fn unit_log(work: &Path, key: &Key, bytes: &[u8]) -> Result<()> {
     } else {
         0
     };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| io(&path, e))?;
-    file.set_len(end).map_err(|e| io(&path, e))?;
-    file.seek(SeekFrom::Start(end)).map_err(|e| io(&path, e))?;
-    file.write_all(&(bytes.len() as u32).to_le_bytes())
-        .and_then(|_| file.write_all(bytes))
-        .and_then(|_| file.sync_all())
-        .map_err(|e| io(&path, e))?;
-    checked_write(&end_path, &(end + 4 + bytes.len() as u64))
+    let end = publication.append(path, end, bytes)?;
+    publication.write(&end_path, &end)
 }
 fn receipt_path(work: &Path, key: &Key) -> Result<PathBuf> {
     Ok(work.join("covered").join(hash_key(key)?))
@@ -987,9 +1206,27 @@ impl OriginalV3Converter {
         selection: &OriginalV3Selection,
         budget: &OriginalV3Budget<'_>,
     ) -> Result<OriginalV3Step> {
+        let selection_kind = match selection {
+            OriginalV3Selection::All => "inventory",
+            OriginalV3Selection::Object(_) => "object",
+            OriginalV3Selection::Version { .. } => "version",
+            OriginalV3Selection::Blob(_) => "blob",
+        };
+        let span = tracing::trace_span!(target: "sinomo.perf", "dfs.migration.content",
+            stage = "dfs.migration.content", selection = selection_kind,
+            outcome = tracing::field::Empty, work_state = tracing::field::Empty,
+            processed_records = tracing::field::Empty, processed_bytes = tracing::field::Empty);
+        let _entered = span.enter();
         let result = self.step_inner(source, target, inventory_id, selection, budget);
+        span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+        if let Ok(step) = &result {
+            span.record("work_state", tracing::field::debug(&step.unit_result));
+            span.record("processed_records", step.processed_records as u64);
+            span.record("processed_bytes", step.processed_bytes);
+        }
         if result.is_err() {
             self.warm = None;
+            self.blob_verifiers.clear();
             self.loose_reader = None;
             self.directories = None;
             self.checkpoint_bytes = None;
@@ -997,6 +1234,7 @@ impl OriginalV3Converter {
         }
         if result.as_ref().is_ok_and(|step| step.coverage_complete) {
             self.writer = None;
+            self.blob_verifiers.clear();
         }
         result
     }
@@ -1658,10 +1896,15 @@ impl OriginalV3Converter {
             } => {
                 // Existing current retirement wins in the atomic target API.
                 // This observation only avoids copying unnecessary source bytes.
-                if !writer
+                let retired = writer
                     .object_version_is_deleted(&manifest.object_id, &manifest.version)
-                    .map_err(error)?
-                {
+                    .map_err(error)?;
+                if retired {
+                    // A terminal current deletion ends this unit's need for a
+                    // warm hash pass. Its durable source/copy DATA remains.
+                    self.blob_verifiers.remove(&manifest.content_hash);
+                    for extent in &manifest.extents { self.blob_verifiers.remove(&extent.content_hash); }
+                } else {
                     let hashes = if manifest.extents.is_empty() {
                         if manifest.size_bytes == 0 {
                             Vec::new()
@@ -1783,8 +2026,8 @@ impl OriginalV3Converter {
                 "original-v3 copy unit changed its immutable source identity",
             ));
         }
-        // Exactly one copy cursor lives in this indexed unit. Switching demand
-        // drops only a warm verifier; this durable byte cursor is never reset.
+        // Exactly one copy cursor lives in this indexed unit. The admitted
+        // verifier also retains its progress until its owning unit completes.
         let done = self.advance_blob(
             source,
             target,
@@ -1829,6 +2072,11 @@ impl OriginalV3Converter {
         let actual = fs::canonicalize(&path).map_err(|e| io(&path, e))?;
         if !actual.starts_with(source) {
             return Err(error("original-v3 blob resolves outside retained source"));
+        }
+        if !self.blob_verifiers.contains_key(&blob.hash) && self.blob_verifiers.len() >= 8 {
+            // Admitted units remain runnable; their completion wakes this
+            // selection. Capacity pressure must not evict unfinished work.
+            return Ok(false);
         }
         if copy_slot
             .as_ref()
@@ -1879,7 +2127,7 @@ impl OriginalV3Converter {
                 copy.existing = Some(expected_current);
             } else {
                 copy.copied = 0;
-                self.warm = None;
+                self.blob_verifiers.remove(&blob.hash);
             }
         }
 
@@ -1942,7 +2190,7 @@ impl OriginalV3Converter {
                 return Ok(false);
             }
         }
-        if !matches!(&self.warm,Some(Warm::Blob{hash,..}) if hash==&blob.hash) {
+        if !self.blob_verifiers.contains_key(&blob.hash) {
             let verifier = if let Some(existing) = &copy.existing {
                 sinomo_dfs::ContentImportBlobVerifier::existing(
                     existing,
@@ -1961,18 +2209,13 @@ impl OriginalV3Converter {
                 sinomo_dfs::ContentImportBlobVerifier::new(synced, blob.hash.clone(), blob.size)
                     .map_err(error)?
             };
-            self.warm = Some(Warm::Blob {
-                hash: blob.hash.clone(),
-                verifier,
-            });
+            self.blob_verifiers.insert(blob.hash.clone(), verifier);
         }
         let remaining = budget.max_bytes.saturating_sub(result.processed_bytes);
         if remaining == 0 {
             return Ok(false);
         }
-        let Some(Warm::Blob { verifier, .. }) = &mut self.warm else {
-            unreachable!()
-        };
+        let verifier = self.blob_verifiers.get_mut(&blob.hash).expect("admitted blob verifier");
         let before = verifier.verified_bytes();
         let done = verifier
             .step(remaining, budget.deadline, budget.cancelled)
@@ -1984,9 +2227,7 @@ impl OriginalV3Converter {
         if budget.cancelled.load(Ordering::Acquire) || Instant::now() >= budget.deadline {
             return Ok(false);
         }
-        let Some(Warm::Blob { verifier, .. }) = self.warm.take() else {
-            unreachable!()
-        };
+        let verifier = self.blob_verifiers.remove(&blob.hash).expect("completed blob verifier");
         match writer
             .import_verified_blob(verifier.finish().map_err(error)?)
             .map_err(error)?
@@ -2180,6 +2421,50 @@ mod tests {
         let target = LocalContentStore::new(root).unwrap();
         target.begin_inventory_import("inventory").unwrap();
         target
+    }
+    #[test]
+    fn alternating_large_units_preserve_unfinished_verification() {
+        let dir = sinomo_testdir::TestDir::new("original-v3-interleaved-verifiers");
+        let source = dir.join("source");
+        let target_path = dir.join("target");
+        let first_bytes = vec![0x31; 2 * 1024 * 1024];
+        let second_bytes = vec![0x72; 2 * 1024 * 1024];
+        let first = original(&source, &first_bytes, false);
+        let (_, _, catalog) = read_source(&source).unwrap();
+        let second = ContentManifest { object_id: "second-object".into(), version: "second-version".into(),
+            content_hash: format!("blake3:{}", blake3::hash(&second_bytes).to_hex()),
+            size_bytes: second_bytes.len() as u64, extents: Vec::new() };
+        let hex = &second.content_hash[7..];
+        let path = source.join("blobs").join(&hex[..2]).join(hex);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &second_bytes).unwrap();
+        let segment = segment_path(&source, &catalog, &catalog.segments[0]);
+        let mut writer = FrameAppender::open(&segment, FrameLimits::new(HEADER_LIMIT as u32, PAYLOAD_LIMIT).unwrap()).unwrap();
+        writer.append_bytes(&encode(&Record {
+            format_version: 2, store_incarnation: catalog.store_incarnation, generation: 1, sequence: 2,
+            operation: Operation::ExternalBinding { manifest: second.clone(), published_at_unix_nanos: 124, reservation: None },
+        }).unwrap(), &[]).unwrap();
+        drop(writer);
+        let current = target(&target_path);
+        let cancel = AtomicBool::new(false);
+        let mut converter = OriginalV3Converter::default();
+        let mut complete = [false; 2];
+        for _ in 0..200 {
+            for (index, manifest) in [&first, &second].into_iter().enumerate() {
+                if complete[index] { continue; }
+                let limits = budget(&cancel);
+                let result = converter.step(&source, &target_path, "inventory",
+                    &OriginalV3Selection::Version { object_id: manifest.object_id.clone(), version: manifest.version.clone() },
+                    &limits).unwrap();
+                assert!(result.processed_bytes <= limits.max_bytes);
+                complete[index] = result.unit_result == OriginalV3UnitResult::Covered;
+            }
+            if complete == [true, true] { break; }
+        }
+        assert_eq!(complete, [true, true], "interleaving must not restart each verifier indefinitely");
+        for (manifest, expected) in [(&first, &first_bytes), (&second, &second_bytes)] {
+            assert_eq!(current.read_object_version(&manifest.object_id, &manifest.version).unwrap().1, *expected);
+        }
     }
     #[test]
     fn original_v3_large_priority_import_restarts_and_completes_without_rewriting_source() {
@@ -2498,6 +2783,166 @@ mod tests {
         );
     }
     #[test]
+    fn original_v3_partial_index_publication_reopens_without_advancing_source() {
+        for phase in [
+            "logs",
+            "missing-stage",
+            "files",
+            "first-install",
+            "before-directories",
+            "directories",
+        ] {
+            let dir = sinomo_testdir::TestDir::new("original-v3-partial-index");
+            let source = dir.join("source");
+            let target_path = dir.join("target");
+            let bytes = b"retained payload across partial index publication";
+            let manifest = original(&source, bytes, false);
+            let (_, _, catalog) = read_source(&source).unwrap();
+            let active = segment_path(&source, &catalog, &catalog.segments[0]);
+            let before = fs::read(&active).unwrap();
+            let identity = probe_original_v3(&source, 128 * 1024).unwrap();
+            let current = target(&target_path);
+            let cancel = AtomicBool::new(false);
+            let checkpoint =
+                OriginalV3Converter::checkpoint_path(&source, &target_path, "inventory").unwrap();
+            let mut converter = OriginalV3Converter::default();
+            FAIL_INDEX_PUBLICATION.with(|fault| fault.set(Some(phase)));
+            let mut failed = false;
+            for _ in 0..200 {
+                match converter.step(
+                    &source,
+                    &target_path,
+                    "inventory",
+                    &OriginalV3Selection::All,
+                    &budget(&cancel),
+                ) {
+                    Err(error) => {
+                        if phase == "missing-stage" {
+                            assert!(error.to_string().contains(".source3-index-"), "{error}");
+                        } else {
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains(&format!("injected index publication at {phase}")),
+                                "{error}"
+                            );
+                        }
+                        failed = true;
+                        break;
+                    }
+                    Ok(step) => assert!(
+                        !step.coverage_complete,
+                        "fault must interrupt actual publication"
+                    ),
+                }
+            }
+            assert!(failed, "{phase}");
+            let progress: Progress = checked_read(&checkpoint).unwrap();
+            assert_eq!(
+                progress.sequence, 0,
+                "{phase}: cursor precedes unfinished first record"
+            );
+            assert_eq!(progress.offset, 0);
+            assert!(!progress.index_complete);
+            assert!(
+                current
+                    .read_object_version(&manifest.object_id, &manifest.version)
+                    .is_err()
+            );
+            let work = checkpoint.parent().unwrap();
+            if phase == "missing-stage" {
+                assert!(
+                    !row_path(
+                        work,
+                        &Key::Version(manifest.object_id.clone(), manifest.version.clone())
+                    )
+                    .unwrap()
+                    .exists(),
+                    "no key can install after a failed data barrier"
+                );
+                let stem = blake3::hash(manifest.object_id.as_bytes()).to_hex();
+                assert!(!work.join("objects").join(format!("{stem}.end")).exists());
+            }
+            for entry in fs::read_dir(work.join("refs")).unwrap() {
+                for reference in fs::read_dir(entry.unwrap().path()).unwrap() {
+                    let name = reference.unwrap().file_name();
+                    assert_eq!(
+                        name.to_string_lossy().len(),
+                        64,
+                        "private files cannot become live roots"
+                    );
+                }
+            }
+            drop(converter);
+            let mut converter = OriginalV3Converter::default();
+            let mut object_complete = false;
+            for _ in 0..200 {
+                let step = converter
+                    .step(
+                        &source,
+                        &target_path,
+                        "inventory",
+                        &OriginalV3Selection::Object(manifest.object_id.clone()),
+                        &budget(&cancel),
+                    )
+                    .unwrap();
+                if step.unit_result == OriginalV3UnitResult::Covered {
+                    object_complete = true;
+                    break;
+                }
+            }
+            assert!(
+                object_complete,
+                "{phase}: priority object index must retain both keys"
+            );
+            assert!(
+                covered(
+                    work,
+                    &Key::Version(manifest.object_id.clone(), manifest.version.clone())
+                )
+                .unwrap()
+            );
+            assert!(
+                covered(
+                    work,
+                    &Key::Reservation(ContentStoreReservationIdentity {
+                        object_id: manifest.object_id.clone(),
+                        version: manifest.version.clone(),
+                        content_hash: manifest.content_hash.clone(),
+                    })
+                )
+                .unwrap()
+            );
+            let mut complete = false;
+            for _ in 0..200 {
+                let step = converter
+                    .step(
+                        &source,
+                        &target_path,
+                        "inventory",
+                        &OriginalV3Selection::All,
+                        &budget(&cancel),
+                    )
+                    .unwrap();
+                if step.coverage_complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete, "{phase}");
+            assert_eq!(
+                current
+                    .read_object_version(&manifest.object_id, &manifest.version)
+                    .unwrap()
+                    .1,
+                bytes
+            );
+            current.complete_inventory_import("inventory").unwrap();
+            assert_eq!(fs::read(&active).unwrap(), before);
+            assert_eq!(probe_original_v3(&source, 128 * 1024).unwrap(), identity);
+        }
+    }
+    #[test]
     fn original_v3_row_before_cursor_failure_keeps_loose_unit_enumerated() {
         let dir = sinomo_testdir::TestDir::new("original-v3-row-before-cursor");
         let source = dir.path().join("source");
@@ -2559,7 +3004,16 @@ mod tests {
     }
     #[test]
     fn original_v3_small_demand_preempts_large_copy_and_original_unit_resumes() {
-        let dir = sinomo_testdir::TestDir::new("original-v3-priority-preemption");
+        small_demand_preemption_case(false);
+    }
+    #[test]
+    fn original_v3_small_demand_preempts_large_verification_without_resetting_it() {
+        small_demand_preemption_case(true);
+    }
+    fn small_demand_preemption_case(verifying: bool) {
+        let dir = sinomo_testdir::TestDir::new(if verifying {
+            "original-v3-verification-preemption"
+        } else { "original-v3-priority-preemption" });
         let source = dir.path().join("source");
         let target_path = dir.path().join("target");
         let large_bytes = vec![0x27; 512 * 1024];
@@ -2633,7 +3087,8 @@ mod tests {
             if row.exists() {
                 let indexed: Indexed = checked_read(&row).unwrap();
                 if let Some(copy) = indexed.copy {
-                    if copy.copied > 0 && copy.copied < large.size_bytes {
+                    if (verifying && copy.copied == large.size_bytes)
+                        || (!verifying && copy.copied > 0 && copy.copied < large.size_bytes) {
                         paused = Some(copy);
                         break;
                     }

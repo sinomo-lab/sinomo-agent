@@ -2635,6 +2635,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceJobStatus::Completed => return Ok(()),
                 DfsNamespaceJobStatus::Running => continue,
                 DfsNamespaceJobStatus::Failed => {
+                    if job.processed_object_count == 0
+                        && job.directory_move_counts()?.and_then(|counts| counts.parent_participants.as_ref()).is_some_and(|plan|
+                            plan.phase == crate::DfsParentCountPhase::Aborting
+                                && plan.confirmed == plan.participants.len()
+                                && matches!(plan.rejection, Some(crate::DfsParentCountRejection::ParentChanged
+                                    | crate::DfsParentCountRejection::Contended | crate::DfsParentCountRejection::AssignmentChanged))) {
+                        // This is a definite rejected attempt: every reservation
+                        // is withdrawn and no namespace effect was issued. Keep
+                        // its terminal identity while letting a fresh caller
+                        // replan from the changed parent/assignment.
+                        return Err(DfsPosixError::Conflict {
+                            path: job.root_path.clone(),
+                            reason: "directory parent changed before namespace effects; retry with a fresh operation".into(),
+                        });
+                    }
                     let reason = job
                         .failure_reason
                         .unwrap_or_else(|| format!("cross-shard job {} failed", job.job_id));
@@ -2777,7 +2792,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                         });
                     if structured
-                        && !parent_effects_issued
+                        && (!parent_effects_issued
+                            || (job.kind == DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                                && job.root_path == *old_path && job.processed_object_count == 1))
                         && let Some(execution) = self.publication_execution.current()
                     {
                         let actor = crate::source_adoption::actor_for_root(execution.data_root())?;
@@ -2803,7 +2820,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     &retained.file_system_id,
                                     &crate::DfsMetadataShardId::new(&source.shard_id),
                                 )?;
-                            let failed = retained.clone();
+                            let rejected_root = retained.initial_directory_root_adoption().is_some();
+                            let mut failed = retained.clone();
                             if actor.finish_locally_cancelled_adoption(
                                 &phase,
                                 &retained,
@@ -2812,10 +2830,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &physical,
                                 &execution,
                                 || {
-                                    self.fail_namespace_job(failed, error.to_string())
-                                        .map(|_| ())
+                                    if rejected_root {
+                                        // The existing source cancellation owner excludes
+                                        // all late claims while this exact decision commits.
+                                        self.begin_parent_count_abort(&mut failed, crate::DfsParentCountRejection::RootAdoptionRejected)
+                                    } else {
+                                        self.fail_namespace_job(failed, error.to_string()).map(|_| ())
+                                    }
                                 },
                             )? {
+                                if rejected_root {
+                                    self.namespace_execution.record_job();
+                                    job = self.namespace_job(&job.job_id)?.ok_or_else(|| DfsPosixError::Dfs(DfsError::Metadata {
+                                        message: "root withdrawal lost its original coordinator".into(),
+                                    }))?;
+                                    continue;
+                                }
                                 return Err(error);
                             }
                         }

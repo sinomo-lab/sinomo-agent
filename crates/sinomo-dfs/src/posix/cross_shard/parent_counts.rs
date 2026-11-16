@@ -421,7 +421,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn begin_parent_count_abort(
+    pub(super) fn begin_parent_count_abort(
         &mut self,
         job: &mut DfsNamespaceJobRecord,
         reason: Rejection,
@@ -450,7 +450,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             *job = current;
             return Ok(());
         }
-        if plan.phase != Phase::Preparing || current.processed_object_count != 0 {
+        let rejected_root = reason == Rejection::RootAdoptionRejected
+            && plan.phase == Phase::Issued && current.initial_directory_root_adoption().is_some();
+        if !rejected_root && (plan.phase != Phase::Preparing || current.processed_object_count != 0) {
             return Err(invalid(
                 "namespace issuance makes parent recovery forward-only",
             ));
@@ -519,7 +521,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         *job = self.fail_namespace_job(
                             job.clone(),
                             format!(
-                                "parent reservation rejected before namespace issuance: {:?}",
+                                "parent reservation withdrawn before namespace effects: {:?}",
                                 plan.rejection
                             ),
                         )?;

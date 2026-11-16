@@ -75,6 +75,14 @@ impl Discovery {
                 if self.completed_unchanged(&relative)? { self.cursor.pending.pop_front(); processed += 1; continue; }
                 match std::fs::read_dir(self.data_root.join(&relative)) {
                     Ok(reader) => { self.current_stamp = Some(directory_stamp(&self.data_root.join(&relative))?); self.current = Some(reader); self.cursor.unavailable.remove(&relative); }
+                    Err(failure) if failure.kind() == std::io::ErrorKind::NotFound
+                        && managed_directories().contains(&relative) => {
+                        // These are optional discovery containers, not enrolled
+                        // sources. Their owning producer registers new work;
+                        // absence must not create a permanent discovery timer.
+                        self.cursor.unavailable.remove(&relative);
+                        self.cursor.pending.pop_front(); processed += 1; continue;
+                    }
                     Err(failure) => {
                         self.cursor.unavailable.insert(relative.clone(), failure.to_string());
                         self.cursor.pending.pop_front(); processed += 1; continue;

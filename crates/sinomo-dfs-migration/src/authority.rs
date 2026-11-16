@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 mod configuration;
+mod command_preimage;
+mod activation_data;
 pub(crate) mod content_work;
 mod handoff;
 mod namespace_work;
@@ -144,6 +146,7 @@ struct NativeImportAuthority {
     namespace_work: Arc<Mutex<BTreeMap<String, namespace_work::JobOutcome>>>,
     content_plan_contexts: Arc<Mutex<content_work::verification_context::PlanContexts>>,
     retained_plan_file: Arc<plan_file::RetainedPlanFile>,
+    count_stages: Arc<Mutex<BTreeMap<String, Arc<handoff::StagedCountSource>>>>,
     source_verifiers:
         Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<staged_service::SourceTransferVerifier>>>>>,
 }
@@ -192,9 +195,21 @@ impl NativeImportAuthority {
     /// membership convergence. Keep that typed absence of authority pending;
     /// malformed data and failed proof validation still reject the unit.
     fn native_read_error(&self, failure: sinomo_core::service::ServiceError) -> MetadataBackendError {
-        if matches!(failure, sinomo_core::service::ServiceError::Network(
-            sinomo_core::network::NetworkError::ClusterReadOnly { .. }
-        )) {
+        use sinomo_core::network::NetworkError as Network;
+        let retryable = match &failure {
+            ServiceError::Network(network) => matches!(network,
+                Network::ClusterReadOnly { .. } | Network::VerifiedClusterNonLeader { .. }
+                | Network::Timeout { .. } | Network::RetryExhausted { .. }
+                | Network::DeliveryFailed { .. } | Network::OutcomeUnknown { .. }
+                | Network::Io { .. } | Network::MailboxFull { .. }
+                | Network::UnknownNode { .. } | Network::UnknownRoute { .. }
+                | Network::ObjectRpcRouteSaturated { .. } | Network::ObjectFrameMemoryUnavailable { .. }),
+            ServiceError::Kv(kv) => matches!(kv, KvError::Busy { .. } | KvError::AuthorityUnavailable { .. }
+                | KvError::LeaderOffline { .. } | KvError::QuorumUnavailable { .. }
+                | KvError::StaleLeadershipTerm { .. }),
+            _ => false,
+        };
+        if retryable {
             tracing::debug!(root=%self.metadata_root.display(), error=%failure,
                 "migration awaits native read authority");
             MetadataBackendError::StoragePreparationPending {
@@ -205,6 +220,29 @@ impl NativeImportAuthority {
     fn read_native<T>(&self, future: impl Future<Output = std::result::Result<T, sinomo_core::service::ServiceError>>) -> Result<T> {
         block_native(&self.runtime, async { Ok::<_, MetadataBackendError>(future.await) })?
             .map_err(|failure| self.native_read_error(failure))
+    }
+    // Read-only probes and idempotent DATA enrollment retain typed transport
+    // failures until the owner chooses a retry. This does not infer an effect.
+    fn read_peer<T>(&self, future: impl Future<Output = std::result::Result<T, sinomo_core::network::NetworkError>>) -> Result<T> {
+        let result = block_native(&self.runtime, async { Ok::<_, MetadataBackendError>(future.await) })?;
+        match result {
+            // These callers already selected an exact admitted participant.
+            // Its transport/route can be absent while its component mounts.
+            Err(failure @ (sinomo_core::network::NetworkError::UnknownNode { .. }
+                | sinomo_core::network::NetworkError::UnknownRoute { .. })) => {
+                tracing::debug!(error=%failure, "migration awaits its admitted peer transport");
+                Err(MetadataBackendError::StoragePreparationPending {
+                    root: self.metadata_root.clone(), processed_records: 0,
+                })
+            }
+            result => result.map_err(|failure| self.native_read_error(ServiceError::Network(failure))),
+        }
+    }
+    fn native_observation_error(&self, failure: NativeEvaluationError) -> MetadataBackendError {
+        match failure {
+            NativeEvaluationError::Native(native) => self.native_read_error(native),
+            NativeEvaluationError::Domain(domain) => domain,
+        }
     }
     pub(super) fn read_exact_evaluated(
         &self, keys: &[String],
@@ -544,7 +582,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         let mut client = self.control_client(&self.receiver_root)?;
         let view = DfsControlPlaneStore::new(&mut client)
             .cluster_view()
-            .map_err(error)?;
+            .map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?;
         let eligible = view
             .eligible_content_node_ids()
             .into_iter()
@@ -571,7 +609,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         }
         let mut client = self.control_client(&self.receiver_root)?;
         let store = DfsControlPlaneStore::new(&mut client);
-        let view = store.cluster_view().map_err(error)?;
+        let view = store.cluster_view().map_err(|failure| self.native_read_error(ServiceError::Kv(failure)))?;
         let candidates = view
             .content_nodes
             .into_iter()
@@ -645,9 +683,6 @@ impl MetadataImportAuthority for NativeImportAuthority {
                 continue;
             }
             let root = directory.path();
-            if !root.join("native-activation-request.json").is_file() {
-                continue;
-            }
             let path = root.join("native-import-plan.json");
             if !path.is_file() {
                 continue;
@@ -742,7 +777,8 @@ impl MetadataImportAuthority for NativeImportAuthority {
             ));
         }
         let local = self.local_node()?;
-        if !proof.acknowledged_node_ids.contains(&local) {
+        if local == proof.retiring_shard.primary_node_id
+            || !proof.desired_shard.replica_node_ids.contains(&local) {
             return Ok(None);
         }
         let root = self.receiver_root_for(
@@ -790,7 +826,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
         {
             return Err(error("received native image changed after its durable ACK"));
         }
-        let request = self.find_native_request(&root, &plan.expected_handoff, true)?;
+        let request = self.original_receiver_activation_request(&root, &plan, &actual)?;
         let request_proof = Self::activation_proof(&request)?
             .ok_or_else(|| error("received activation request omits its proof"))?;
         self.validate_activation_request(&request, &plan, &request_proof)?;
@@ -809,6 +845,10 @@ impl MetadataImportAuthority for NativeImportAuthority {
                 "native import moved while exact receipts were recovered",
             ));
         }
+        // Retain only the original body whose actual native outcome was just
+        // reobserved. Lookup responses and local files alone grant no authority.
+        Self::save_blueprint(&root, "native-activation-request.json", &request)?;
+        Self::save_blueprint(&root, &format!("native-request-{}.json", request.request_id), &request)?;
         let proposal = MetadataImportProposal {
             facts: MetadataImportProposalFacts {
                 source_root: source.source_root.clone(),
@@ -848,18 +888,21 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &activation_commit,
             &actual,
         )?;
-        let legacy_local_source =
-            legacy_local.map(
-                |(format, prefix)| crate::metadata::VerifiedLegacyReceiverSource {
+        let format = match legacy_local {
+            Some((format, _)) => format,
+            None => crate::metadata::original_native_root_format(&source.source_root)?
+                .ok_or_else(|| error("receiver source has no supported physical codec"))?,
+        };
+        let receiver_source = Some(crate::metadata::VerifiedReceiverSource {
                     original_root: source.source_root.clone(),
                     actual_root: source.source_root.clone(),
                     source_identity: source.source_identity.clone(),
                     snapshot_fingerprint: source.source_snapshot_fingerprint.clone(),
                     source_format_version: format,
-                    source_prefix: prefix,
+                    source_prefix: source_exact_prefix.cloned()
+                        .ok_or_else(|| error("receiver source has no exact local prefix"))?,
                     source_fences,
-                },
-            );
+                });
         let certificate = MetadataImportCertificate {
             facts: MetadataImportCertificateFacts {
                 proposal_fingerprint: digest(&ImportProposal::Native(proposal.clone()))?,
@@ -871,7 +914,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             joint_handoff_proof: actual,
             source_retirements,
             data_reservation_retirements,
-            legacy_local_source,
+            receiver_source,
         };
         Ok(Some((
             ImportProposal::Native(proposal),
@@ -1266,7 +1309,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             // never pathname equality or missing files, selects this role.
             return Ok(None);
         }
-        if !proof.acknowledged_node_ids.contains(&local) {
+        if !proof.desired_shard.replica_node_ids.contains(&local) {
             return Ok(None);
         }
         let legacy_local = crate::metadata::legacy_receiver_prefix(
@@ -1327,18 +1370,21 @@ impl MetadataImportAuthority for NativeImportAuthority {
             &activation_commit,
             &proof,
         )?;
-        let legacy_local_source =
-            legacy_local.map(
-                |(format, prefix)| crate::metadata::VerifiedLegacyReceiverSource {
+        let format = match legacy_local {
+            Some((format, _)) => format,
+            None => crate::metadata::original_native_root_format(actual_source_root)?
+                .ok_or_else(|| error("recovered receiver source has no supported physical codec"))?,
+        };
+        let receiver_source = Some(crate::metadata::VerifiedReceiverSource {
                     original_root: proposal.source_root.clone(),
                     actual_root: actual_source_root.to_owned(),
                     source_identity: proposal.source_identity.clone(),
                     snapshot_fingerprint: proposal.source_snapshot_fingerprint.clone(),
                     source_format_version: format,
-                    source_prefix: prefix,
+                    source_prefix: proposal.source_exact_prefix.clone()
+                        .ok_or_else(|| error("recovered receiver source has no exact local prefix"))?,
                     source_fences,
-                },
-            );
+                });
         Ok(Some(ImportCertificate::Native(MetadataImportCertificate {
             facts: MetadataImportCertificateFacts {
                 proposal_fingerprint: digest(&ImportProposal::Native(proposal.clone()))?,
@@ -1350,7 +1396,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             joint_handoff_proof: proof,
             source_retirements,
             data_reservation_retirements,
-            legacy_local_source,
+            receiver_source,
         })))
     }
 
@@ -1412,7 +1458,7 @@ impl MetadataImportAuthority for NativeImportAuthority {
             joint_handoff_proof: proof,
             source_retirements,
             data_reservation_retirements,
-            legacy_local_source: None,
+            receiver_source: None,
         }))
     }
 }
@@ -1423,6 +1469,14 @@ struct NativeImportKv<'a> {
     root: &'a Path,
     last_commit: Option<DfsNativeTxnCommit>,
     original_handoff: Option<KvEntry>,
+}
+fn native_read_to_kv(failure: MetadataBackendError) -> KvError {
+    match failure {
+        MetadataBackendError::StoragePreparationPending { .. } => KvError::AuthorityUnavailable {
+            detail: failure.to_string(),
+        },
+        failure => KvError::Serialization { detail: failure.to_string() },
+    }
 }
 impl std::fmt::Debug for NativeImportKv<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1466,9 +1520,7 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
             .owner
             .read_exact(&[key.into()])
             .map(|(mut entries, _)| entries.remove(0).entry)
-            .map_err(|e| KvError::Serialization {
-                detail: e.to_string(),
-            })?;
+            .map_err(native_read_to_kv)?;
         if let Some(original) = self
             .original_handoff
             .as_ref()
@@ -1488,9 +1540,7 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
         self.owner
             .read_exact(keys)
             .map(|(entries, _)| entries.into_iter().map(|entry| entry.entry).collect())
-            .map_err(|e| KvError::Serialization {
-                detail: e.to_string(),
-            })
+            .map_err(native_read_to_kv)
     }
     fn get_authoritative_consistent(
         &mut self,
@@ -1505,17 +1555,14 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
         let cluster = self.owner.cluster().map_err(|e| KvError::Serialization {
             detail: e.to_string(),
         })?;
-        let read = block_native(
-            &self.owner.runtime,
+        let read = self.owner.read_native(
             if matches!(prefix, "/" | "/dfs/filesystems/") {
                 cluster.kv_range_prefix_complete_authoritative_async(prefix.into())
             } else {
                 cluster.kv_range_prefix_authoritative_async(prefix.into())
             },
         )
-        .map_err(|e| KvError::Serialization {
-            detail: e.to_string(),
-        })?;
+        .map_err(native_read_to_kv)?;
         current_authority(&read.authority).map_err(|e| KvError::Serialization {
             detail: e.to_string(),
         })?;
@@ -1651,9 +1698,7 @@ impl DfsControlPlaneKvClient for NativeImportKv<'_> {
         let commit = self
             .owner
             .blueprint_commit(self.root, request)
-            .map_err(|e| KvError::Serialization {
-                detail: e.to_string(),
-            })?;
+            .map_err(native_read_to_kv)?;
         self.last_commit = Some(commit.clone());
         Ok((
             commit
@@ -1748,6 +1793,7 @@ fn shared_owner_with_source_authority(
         namespace_work: Arc::new(Mutex::new(BTreeMap::new())),
         content_plan_contexts: Arc::new(Mutex::new(Default::default())),
         retained_plan_file: Arc::new(Default::default()),
+        count_stages: Arc::new(Mutex::new(BTreeMap::new())),
         source_verifiers: Arc::new(Mutex::new(BTreeMap::new())),
     });
     let metadata_authority: Arc<dyn MetadataImportAuthority> = source_authority.unwrap_or_else(|| authority.clone());
@@ -4040,7 +4086,14 @@ mod provider_lifecycle_tests {
         // The existing public whole-roster start mounts every stopped component
         // before normal preparation; its KV bootstrap is already complete.
         let admission_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-        native.start_nodes().unwrap();
+        native.start_nodes().unwrap_or_else(|failure| {
+            let states = nodes.iter().map(|node| {
+                let context = native.component_context(node).unwrap();
+                let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+                format!("{node}: {}", owner.diagnostic_scheduler())
+            }).collect::<Vec<_>>();
+            panic!("{failure}; migration states: {states:?}");
+        });
         for node in &nodes {
             for shard in ["root", "services", "users"] {
                 wait_prepared_metadata_root(&native, node,

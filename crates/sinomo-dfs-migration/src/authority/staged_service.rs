@@ -28,6 +28,7 @@ const ROUTES: &[&str] = &[
     SNAPSHOT_ROUTE,
     PREFIX_ROUTE,
     BLUEPRINT_ROUTE,
+    super::activation_data::ROUTE,
     SOURCE_FLOORS_ROUTE,
     SOURCE_CHUNK_ROUTE,
     CONTENT_STAGE_ROUTE,
@@ -42,6 +43,15 @@ pub(super) struct ContentStageRequest {
     pub(super) command: sinomo_dfs::DfsMessageCommand,
     pub(super) size_bytes: u64,
     pub(super) verification: super::content_work::ContentVerificationRequest,
+}
+
+/// The full plan is already retained by the streamed source-floor challenge.
+/// Attachment heads carry only that exact challenge reference and the command.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StageSnapshotHead {
+    pub(super) command: DfsMetadataSnapshotInstallCommand,
+    pub(super) ancestry_request_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,6 +344,30 @@ impl NativeImportAuthority {
     /// Validate the SAME native source/scope/plan before accepting a large
     /// attachment. The receiver repeats these checks after the streaming wait
     /// and after its candidate effect; this head alone supplies no authority.
+    fn resolve_snapshot_head(
+        &self,
+        source: &sinomo_core::node::NodeId,
+        head: StageSnapshotHead,
+    ) -> Result<StageSnapshot> {
+        let handoff = head.command.primary_handoff_id.as_deref()
+            .ok_or_else(|| error("current stage has no original handoff identity"))?;
+        let root = self.source_ancestry_root(handoff, &head.ancestry_request_id)?;
+        let challenge = self.retained_plan_file.read_challenge(&root.join("challenge.json"))?;
+        if challenge.request_id != head.ancestry_request_id
+            || challenge.plan.expected_handoff.handoff_id != handoff {
+            return Err(error("snapshot head differs from its retained ancestry challenge"));
+        }
+        let envelope = StageSnapshot {
+            command: head.command,
+            plan: challenge.plan.clone(),
+            ancestry_request_id: head.ancestry_request_id,
+        };
+        // The reference supplies DATA only. Revalidate its authenticated source,
+        // native pending handoff and exact image before consuming the attachment.
+        self.validate_incoming_snapshot_head(source, &envelope)?;
+        Ok(envelope)
+    }
+
     fn validate_incoming_snapshot_head(
         &self,
         source: &sinomo_core::node::NodeId,
@@ -485,6 +519,7 @@ impl NativeImportAuthority {
         // Revalidate after the actual file effect; a superseding configuration
         // cannot receive an ACK for an obsolete import identity.
         self.receive_context(fs, &command.shard_id, epoch, handoff_id, &source)?;
+        super::owner::filesystem::enqueue_received_generation(&self.component_context, &envelope.plan, &root)?;
         self.source_verifiers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -725,6 +760,21 @@ impl NativeImportAuthority {
         }
         Ok(true)
     }
+    pub(super) fn owns_exact_retiring_source(
+        &self,
+        source: &Path,
+        plan: &MetadataImportPlan,
+    ) -> Result<bool> {
+        if self.local_node()? != plan.expected_handoff.retiring_shard.primary_node_id {
+            return Ok(false);
+        }
+        self.validate_source_root(source)?;
+        crate::metadata::validate_retained_source_identity(
+            source, &plan.source_cut.source_identity, &plan.source_cut.source_snapshot_fingerprint,
+        )?;
+        Ok(true)
+    }
+
     fn capture_local_source_floors(
         &self,
         fs: &sinomo_dfs::DfsFileSystemId,
@@ -832,11 +882,16 @@ impl NativeImportAuthority {
                 && plan.source_cut.source_format_version
                     != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
                 && actual.is_empty()
+                && !self.owns_exact_retiring_source(&source, plan)?
             {
                 return Err(error(
                     "current source has no independently retained native ACK floor",
                 ));
             }
+            // The actual retiring primary already owns this exact fenced cut;
+            // it need not invent a receiver ACK for its own original writes.
+            // Other participants still need independent retained constraints,
+            // and native installation still requires primary plus majority.
             if current_source
                 && actual.iter().any(|floor| {
                     floor.shard_id != *shard
@@ -1542,6 +1597,12 @@ impl Service for StagedImportService {
                 .parse::<sinomo_core::node::NodeId>()
                 .map_err(|e| ServiceError::Service(e.to_string()))?;
             match request.route.as_str() {
+                super::activation_data::ROUTE => {
+                    let lookup = context.decode_request_body_bounded::<super::activation_data::Request>(&request, 16 * 1024).await?;
+                    let response = tokio::task::block_in_place(|| self.authority.activated_request_data(source, lookup))
+                        .map_err(|failure| ServiceError::Service(failure.to_string()))?;
+                    context.respond_value(super::activation_data::ROUTE, response)?;
+                }
                 super::owner::filesystem::ROUTE => {
                     let work = context.decode_request_body_bounded::<super::owner::filesystem::Request>(&request, 64 * 1024 * 1024).await?;
                     let response = tokio::task::block_in_place(|| super::owner::filesystem::receive(&self.component_context, source, work))
@@ -1731,12 +1792,11 @@ impl Service for StagedImportService {
                     context.respond_value(CONTENT_STAGE_ROUTE, result.response)?;
                 }
                 SNAPSHOT_ROUTE => {
-                    let mut command = context
-                        .decode_request_body::<StageSnapshot>(&request)
+                    let head = context
+                        .decode_request_body::<StageSnapshotHead>(&request)
                         .await?;
-                    tokio::task::block_in_place(|| {
-                        self.authority
-                            .validate_incoming_snapshot_head(&source, &command)
+                    let mut command = tokio::task::block_in_place(|| {
+                        self.authority.resolve_snapshot_head(&source, head)
                     })
                     .map_err(|e| ServiceError::Service(e.to_string()))?;
                     if !context.has_request_attachment() {

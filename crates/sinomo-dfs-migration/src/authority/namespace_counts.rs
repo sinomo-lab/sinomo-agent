@@ -31,6 +31,19 @@ impl NativeImportAuthority {
         &self,
         catalog: &[DfsMetadataShardConfig],
     ) -> Result<()> {
+        if self.count_capabilities_ready(catalog)? { return Ok(()); }
+        Err(MetadataBackendError::StoragePreparationPending {
+            root: self.metadata_root.clone(), processed_records: 0,
+        })
+    }
+
+    /// Binary advertisements and effective permission can arrive after the
+    /// source owner mounts. Their absence parks work; it never grants permission
+    /// or turns mutable configuration into corrupt retained source DATA.
+    pub(super) fn count_capabilities_ready(
+        &self,
+        catalog: &[DfsMetadataShardConfig],
+    ) -> Result<bool> {
         let nodes = catalog
             .iter()
             .flat_map(|s| {
@@ -76,12 +89,10 @@ impl NativeImportAuthority {
                     .iter()
                     .any(|value| value.as_str() == capability)
             {
-                return Err(error(
-                    "count cohort requires actual count-aware binaries and permission on every participant",
-                ));
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(true)
     }
     fn count_plan_location(
         &self,
@@ -127,7 +138,9 @@ impl NativeImportAuthority {
         request: Probe,
     ) -> Result<ProbeResult> {
         request.seal.validate()?;
-        self.require_count_capabilities(&request.seal.catalog)?;
+        if !self.count_capabilities_ready(&request.seal.catalog)? {
+            return Ok(ProbeResult::Pending);
+        }
         let member = request.seal.member(&request.shard)?;
         if member.assignment.primary_node_id != self.local_node()?
             || !request
@@ -158,12 +171,18 @@ impl NativeImportAuthority {
                     activation_request,
                 };
                 self.verify_retirement_blueprints(&plan.source_cut, std::slice::from_ref(&retirement))?;
+                self.forget_count_stage(&plan);
                 return Ok(ProbeResult::Activated { retirement });
             }
             if request.activated_only {
                 return Ok(ProbeResult::Pending);
             }
-            let (_, proof) = self.qualify_handoff(&plan, &root, &root)?;
+            // A probe observes completed source work; it cannot stage every
+            // participant inside this network read's caller budget. The same
+            // background owner requalifies after restart or a missing observation.
+            let Some(proof) = self.observed_count_stage(&plan, &root)? else {
+                return Ok(ProbeResult::Pending);
+            };
             Ok(ProbeResult::Staged {
                 plan: (*plan).clone(),
                 proof,
@@ -205,14 +224,8 @@ impl NativeImportAuthority {
             &request,
         )
         .map_err(error)?;
-        let result = block_native(
-            &self.runtime,
-            transport.call_async(target, call, source_effect_rpc_options(), true),
-        )?;
-        let response = block_native(
-            &self.runtime,
-            result.into_materialized_value_response(4 * 1024 * 1024),
-        )?;
+        let result = self.read_peer(transport.call_async(target, call, source_effect_rpc_options(), true))?;
+        let response = self.read_peer(result.into_materialized_value_response(4 * 1024 * 1024))?;
         response.decode_body().map_err(error)
     }
     pub(super) fn require_count_cohort_staged(&self, plan: &MetadataImportPlan) -> Result<()> {
@@ -306,7 +319,7 @@ impl NativeImportAuthority {
             Ok(read) => read,
             Err(NativeEvaluationError::Native(failure)) => {
                 tracing::warn!(error=%failure, "filesystem activation awaits native authority");
-                return Ok(false);
+                return Err(self.native_read_error(failure));
             }
             Err(NativeEvaluationError::Domain(failure)) => return Err(failure),
         };
@@ -345,7 +358,7 @@ impl NativeImportAuthority {
                 "storage release checkpoint is outside its actual data owner",
             ));
         }
-        self.require_count_capabilities(&seal.catalog)?;
+        if !self.count_capabilities_ready(&seal.catalog)? { return Ok(false); }
         let mut proofs = BTreeMap::new();
         for member in &seal.members {
             let shard = &member.original_source.physical_shard;
@@ -395,7 +408,7 @@ impl NativeImportAuthority {
             Ok(range) => range,
             Err(failure) => {
                 tracing::warn!(error=%failure, "filesystem release awaits native catalog authority");
-                return Ok(false);
+                return Err(self.native_read_error(failure));
             }
         };
         sinomo_core::kv::validate_cluster_kv_authoritative_complete_range_prefix_read(
@@ -443,7 +456,7 @@ impl NativeImportAuthority {
             Ok(read) => read,
             Err(NativeEvaluationError::Native(failure)) => {
                 tracing::warn!(error=%failure, "filesystem release awaits its exact native cut");
-                return Ok(false);
+                return Err(self.native_read_error(failure));
             }
             Err(NativeEvaluationError::Domain(failure)) => return Err(failure),
         };
@@ -551,7 +564,7 @@ impl NativeImportAuthority {
             Ok(commit) => commit,
             Err(NativeEvaluationError::Native(failure)) => {
                 tracing::warn!(error=%failure, "filesystem release retains its uncertain original native request");
-                return Ok(false);
+                return Err(self.native_read_error(failure));
             }
             Err(NativeEvaluationError::Domain(failure)) => return Err(failure),
         };

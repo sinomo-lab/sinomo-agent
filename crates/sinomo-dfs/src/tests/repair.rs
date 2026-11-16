@@ -450,6 +450,209 @@ fn native_routed_manifest_write(
     )
 }
 
+#[cfg(feature = "storage-conversion")]
+#[test]
+fn native_pending_fetch_reply_keeps_correlation_through_content_preparation() {
+    let (runtime, primary, source, _, client, request, _, outcome) =
+        native_routed_manifest_write("native-fetch-import-wait", 2, 2, true, false, false, true);
+    let NetworkedDfsWriteOutcome::Pending { .. } = outcome else {
+        panic!("the denied primary fetch must leave the original write pending");
+    };
+    drop(client);
+    let executor_hold = runtime.hold_repair_executor(&primary).unwrap();
+    let mut owner = runtime.metadata_primary_service("/services").unwrap();
+    let (execution, routine_hold) = native_private_repair_owner(&runtime, &owner, "/services", ());
+    runtime.clear_faults();
+    owner.hydrate_from_metadata_backend().unwrap();
+    let intent_id = owner
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&request.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.target_version == request.target_version
+                && row.status == DfsWriteIntentStatus::ReceiptsPending
+        })
+        .expect("the actual native write retains its uncommitted target")
+        .intent_id;
+    owner
+        .restore_pending_write_for_intent_if_missing(&intent_id, &request.object_id)
+        .unwrap();
+    assert!(
+        owner.metadata.object(&request.object_id).is_some(),
+        "the live owner retains its real object anchor"
+    );
+    let intent = owner.coordinator.intent(&intent_id).unwrap().clone();
+    let pending = owner.writes.pending_writes.get(&intent_id).unwrap().clone();
+    assert!(
+        owner
+            .request_stage_blob_from_alternate(&intent, &pending)
+            .unwrap()
+    );
+    let replies = owner.transport.drain_incoming_messages().unwrap();
+    let response = replies
+        .into_iter()
+        .find_map(|reply| match reply.message {
+            DfsNetworkMessage::FetchBlobResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("the native source returned its actual stored bytes");
+    assert!(
+        matches!(&response.result, crate::DfsFetchBlobResult::Found { bytes, .. } if !bytes.is_empty())
+    );
+    let original_request = response.request_id.clone();
+    let content = owner.content().clone();
+    // The real staging API marks an empty inventory incomplete. With no
+    // converter registered its missing-version check must stay Pending.
+    content
+        .begin_inventory_import("native-empty-fetch-import")
+        .unwrap();
+    let first = owner.handle_fetch_blob_response(source.clone(), response.clone());
+    let retained = owner
+        .writes
+        .pending_writes
+        .get(&intent_id)
+        .unwrap()
+        .fetch_inflight_request_ids
+        .get(&source)
+        .cloned();
+    // Wrong request and authenticated source must not consume the retained reply.
+    let mut wrong = response.clone();
+    wrong.request_id.push_str("-foreign");
+    let wrong_request = owner.handle_fetch_blob_response(source.clone(), wrong);
+    let wrong_source = owner.handle_fetch_blob_response(primary.clone(), response.clone());
+    content
+        .complete_inventory_import("native-empty-fetch-import")
+        .unwrap();
+    let resumed = owner.handle_fetch_blob_response(source, response);
+    let record = owner
+        .metadata_backend()
+        .unwrap()
+        .get_intent(&request.object_id, &intent_id)
+        .unwrap()
+        .unwrap();
+    let stored = content
+        .read_object_version(request.object_id.as_str(), request.target_version.as_str())
+        .unwrap();
+    drop(execution);
+    drop(owner);
+    drop(routine_hold);
+    drop(executor_hold);
+    runtime.close().unwrap();
+    assert!(
+        matches!(first, Err(DfsError::StoragePreparationPending { .. })),
+        "local preparation must retain delivery: {first:?}"
+    );
+    assert_eq!(retained.as_deref(), Some(original_request.as_str()));
+    assert!(matches!(
+        wrong_request,
+        Ok(NetworkedDfsServiceEvent::BlobFetchRejected { .. })
+    ));
+    assert!(matches!(
+        wrong_source,
+        Ok(NetworkedDfsServiceEvent::BlobFetchRejected { .. })
+    ));
+    assert!(
+        matches!(resumed, Ok(NetworkedDfsServiceEvent::BlobFetched { .. })),
+        "{resumed:?}"
+    );
+    assert_eq!(record.status, DfsWriteIntentStatus::Committed);
+    assert_eq!(record.target_version, request.target_version);
+    assert_eq!(record.content_hash, Some(stored.0.content_hash));
+}
+
+#[test]
+fn native_pending_write_fetches_an_excluded_source_for_an_admitted_target() {
+    let (runtime, primary, source, _, client, request, manifest, outcome) =
+        native_routed_manifest_write(
+            "native-pending-excluded-source",
+            2,
+            2,
+            true,
+            false,
+            false,
+            true,
+        );
+    assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
+    drop(client);
+    let executor_hold = runtime.hold_repair_executor(&primary).unwrap();
+    let mut owner = runtime.metadata_primary_service("/services").unwrap();
+    let (execution, routine_hold) = native_private_repair_owner(&runtime, &owner, "/services", ());
+    owner.hydrate_from_metadata_backend().unwrap();
+    let original = owner
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&request.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.target_version == request.target_version
+                && row.status == DfsWriteIntentStatus::ReceiptsPending
+        })
+        .unwrap();
+    owner
+        .restore_pending_write_for_intent_if_missing(&original.intent_id, &request.object_id)
+        .unwrap();
+    runtime.clear_faults();
+    let before = runtime.rpc_observations().len();
+    let fetch_count = |runtime: &crate::test_runtime::DfsTestRuntime| {
+        runtime.rpc_observations()[before..]
+            .iter()
+            .filter(|call| {
+                call.source == primary
+                    && call.target == source
+                    && call.route == DFS_DATA_FETCH_BLOB_ROUTE
+                    && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            })
+            .count()
+    };
+    let all_excluded =
+        crate::DfsMaintenanceExecutionExclusions::new([primary.clone(), source.clone()]);
+    crate::test_runtime::executor()
+        .block_on(owner.retry_pending_stages_async(1, &all_excluded))
+        .unwrap();
+    assert_eq!(
+        fetch_count(&runtime),
+        0,
+        "without an admitted target, no fetch is scheduled"
+    );
+    let source_excluded = crate::DfsMaintenanceExecutionExclusions::new([source.clone()]);
+    crate::test_runtime::executor()
+        .block_on(owner.retry_pending_stages_async(1, &source_excluded))
+        .unwrap();
+    let sent = fetch_count(&runtime);
+    owner.process_incoming_until_quiescent().unwrap();
+    let current = owner
+        .metadata_backend()
+        .unwrap()
+        .get_intent(&request.object_id, &original.intent_id)
+        .unwrap()
+        .unwrap();
+    let object = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&request.object_id)
+        .unwrap()
+        .unwrap();
+    drop(execution);
+    drop(owner);
+    drop(routine_hold);
+    drop(executor_hold);
+    runtime.close().unwrap();
+    assert_eq!(
+        sent, 1,
+        "required source reads must not inherit destination exclusions"
+    );
+    assert_eq!(current.status, DfsWriteIntentStatus::Committed);
+    assert_eq!(current.operation_id, original.operation_id);
+    assert_eq!(object.version, request.target_version);
+    assert_eq!(
+        object.content_hash.as_deref(),
+        Some(manifest.content_hash.as_str())
+    );
+}
+
 fn native_routed_manifest_write_with_response_pause(
     name: &str,
     min_commit: usize,

@@ -172,7 +172,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 && self.metadata_backend.is_some()
                 && self.control_plane.is_none());
         if batched_publication {
-            let base_object = self.current_read_object_metadata(&intent.object_id)?;
+            let base_object = match self.current_read_object_metadata(&intent.object_id) {
+                Ok(object) => object,
+                Err(DfsError::UnknownObject { object_id }) if object_id == intent.object_id => {
+                    self.current_object_for_write(&object_id)?
+                }
+                Err(error) => return Err(error),
+            };
             self.commit_ready_intent_batched(
                 &intent,
                 &base_object,
@@ -445,15 +451,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // owns the exact N-W repair plan. get_intent restores that recorded
         // plan, while the repair executor checks the current head and authority
         // before effects. Committed visibility alone never retires missing N.
-        if self.writes.pending_writes.contains_key(intent_id)
-            && self.coordinator.intent(intent_id).is_some()
-            && self.metadata.object(object_id).is_some()
+        if self
+            .writes
+            .pending_writes
+            .get(intent_id)
+            .is_some_and(|pending| &pending.object_id == object_id)
+            && self
+                .coordinator
+                .intent(intent_id)
+                .is_some_and(|intent| &intent.object_id == object_id)
         {
             return Ok(None);
         }
-        // A metadata rebuild can retain the actual transfer while dropping a
-        // pre-visibility create's transient anchor. Restore that anchor from
-        // its real stored intent before consuming the original Fetch response.
+        // Missing transfer state is reconstructed from its original intent.
+        // An unpublished create's descriptor remains outside the namespace view.
         let Some(record) = (match self.metadata_backend.as_ref() {
             Some(backend) => backend.get_intent(object_id, intent_id)?,
             None => None,
@@ -551,9 +562,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        if self
-            .current_read_object_metadata(&record.object_id)
-            .is_err()
+        let hidden_create = self.control_plane.is_some()
+            && record.base_version.is_none()
+            && matches!(
+                record.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+            && !self.coordinator.is_commit_ready(intent_id)?;
+        if !hidden_create
+            && self
+                .current_read_object_metadata(&record.object_id)
+                .is_err()
             && let Some(object) = record.object_metadata.clone()
         {
             self.add_transient_object_metadata(object)?;

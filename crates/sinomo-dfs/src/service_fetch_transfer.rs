@@ -326,6 +326,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             let request_id = response.request_id.clone();
             let completed = self.complete_repair_fetch(response);
+            if matches!(&completed, Err(DfsError::StoragePreparationPending { .. })) {
+                // The detached sender still owns this exact returned frame.
+                // Local import is not a failed source or a completed attempt.
+                return completed.map(|(_, event)| event);
+            }
             let (outcome, error) = match &completed {
                 Ok((outcome, event)) => {
                     (*outcome, crate::repair_executor::repair_event_error(event))
@@ -412,6 +417,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 bytes,
             )
         {
+            if matches!(&error, DfsError::StoragePreparationPending { .. }) {
+                return Err(error);
+            }
             return Ok((DfsRepairAttemptOutcome::Failed, rejected(error.to_string())));
         }
         Ok((
@@ -498,16 +506,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let transfer_started_at = self
             .passive_fetch_started_at
             .remove(&(response.intent_id.clone(), frame_source_node_id.clone()));
-        if let Some(pending) = self.writes.pending_writes.get_mut(&response.intent_id) {
-            pending.fetch_inflight_from.remove(&frame_source_node_id);
-            pending
-                .fetch_inflight_request_ids
-                .remove(&frame_source_node_id);
-            pending
-                .fetch_inflight_started_ticks
-                .remove(&frame_source_node_id);
-        }
-        match response.result {
+        let intent_id = response.intent_id.clone();
+        let source_node_id = frame_source_node_id.clone();
+        let result = (|| match response.result {
             DfsFetchBlobResult::Found {
                 content_hash,
                 bytes,
@@ -560,6 +561,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &content_hash,
                     &bytes,
                 ) {
+                    if matches!(&error, DfsError::StoragePreparationPending { .. }) {
+                        // Preserve the typed wait and correlation so the existing
+                        // detached outbox retries local delivery of these bytes.
+                        return Err(error);
+                    }
                     self.record_fetch_failed_source_and_wake_retries(
                         &response.intent_id,
                         &response.source_node_id,
@@ -614,7 +620,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason,
                 })
             }
+        })();
+        if result.is_ok() {
+            if let Some(pending) = self.writes.pending_writes.get_mut(&intent_id) {
+                pending.fetch_inflight_from.remove(&source_node_id);
+                pending.fetch_inflight_request_ids.remove(&source_node_id);
+                pending.fetch_inflight_started_ticks.remove(&source_node_id);
+            }
         }
+        result
     }
 
     fn restored_fetch_response_source_is_authorized_without_inflight(

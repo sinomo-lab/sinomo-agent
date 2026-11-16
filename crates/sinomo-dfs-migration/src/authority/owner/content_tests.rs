@@ -4,6 +4,34 @@ use super::*;
 use sinomo_dfs::{ContentStoreStagingWriter, LocalContentStore};
 
 #[test]
+fn managed_owner_preserves_current_initialization_at_every_durable_phase() {
+    use sinomo_dfs::test_support::DfsTestRuntime;
+    for phase in 1..=5 {
+        let name = format!("managed-current-initialization-{phase}");
+        let node = DfsTestRuntime::ordered_node_ids(&name, 1).remove(0);
+        let mut native = DfsTestRuntime::new(&name, node.clone()).unwrap();
+        let live = native.data_dir(&node).dfs_dir().join("content");
+        let original = LocalContentStore::interrupt_current_initialization_for_test(&live, phase).unwrap();
+        assert!(LocalContentStore::has_current_initialization(&live).unwrap());
+        native.configure_component_factories(vec![
+            Arc::new(sinomo_dfs::component_factory_with_storage_preparation(Arc::new(storage_preparation_provider)).unwrap()),
+            Arc::new(staged_import_component_factory().unwrap()),
+        ]).unwrap();
+        native.start_nodes().unwrap();
+        let store = LocalContentStore::new(&live).unwrap();
+        assert_eq!(store.store_incarnation().unwrap(), original);
+        assert!(!LocalContentStore::has_current_initialization(&live).unwrap());
+        assert!(!live.join(".content-conversion-v2").exists(), "current initialization was enrolled as a legacy conversion");
+        let object = sinomo_core::Id::generate().to_string();
+        let version = sinomo_core::Id::generate().to_string();
+        store.put_object_version(&object, &version, b"same native incarnation").unwrap();
+        assert_eq!(store.read_object_version(&object, &version).unwrap().1, b"same native incarnation");
+        drop(store);
+        native.close().unwrap();
+    }
+}
+
+#[test]
 fn partial_content_publication_preserves_source_and_replays_exact_target() {
     let data = sinomo_testdir::TestDir::new("single-owner-content-publication");
     let live = data.join("dfs/content");
@@ -45,12 +73,19 @@ fn valid_fresh_content_cannot_replace_a_partial_publication_target() {
 
 #[test]
 fn managed_owner_migrates_never_requested_source3_in_background() {
+    managed_background_content("managed-owner-cold-content-background", b"cold content is work without a read request");
+}
+
+#[test]
+fn managed_owner_byte_progress_finishes_a_blob_larger_than_a_turn() {
+    managed_background_content("managed-owner-large-content-background", &vec![0x42; 16 * 1024 * 1024]);
+}
+
+fn managed_background_content(name: &str, expected: &[u8]) {
     use sinomo_dfs::test_support::DfsTestRuntime;
-    let name = "managed-owner-cold-content-background";
     let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
     let mut native = DfsTestRuntime::new(name, node.clone()).unwrap();
     let live = native.data_dir(&node).dfs_dir().join("content");
-    let expected = b"cold content is work without a read request";
     let manifest = crate::content::write_original_v3_fixture_data(&live, expected, false);
     native.configure_component_factories(vec![
         Arc::new(sinomo_dfs::component_factory_with_storage_preparation(Arc::new(storage_preparation_provider)).unwrap()),
@@ -213,6 +248,7 @@ fn managed_version_demand_completes_while_global_source_inventory_is_held() {
     assert!(store.inventory_import_pending().unwrap().is_some(), "per-unit readiness incorrectly cleared global coverage");
     held.store(false, Ordering::Release);
     drop(hook);
+    owner.work.notify();
     let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     block_native(&native.runtime_handle(), async {
         while store.inventory_import_pending().map_err(error)?.is_some() {

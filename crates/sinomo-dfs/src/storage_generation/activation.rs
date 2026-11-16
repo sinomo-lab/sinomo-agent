@@ -98,6 +98,17 @@ pub async fn activate_metadata_storage_generation(
             "current unit has no exact storage import activation proof",
         ));
     };
+    let acknowledged = proof.acknowledged_node_ids.iter().cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if acknowledged.len() != proof.acknowledged_node_ids.len()
+        || !crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+            &proof.retiring_shard, &proof.desired_shard, &acknowledged,
+        ) {
+        return Err(invalid("native storage activation lacks its original joint quorum"));
+    }
+    // The committed quorum selects the exact generation/image. A configured
+    // replica may install it later; activation still checks its actual owner,
+    // current assignment and complete physical image under the writer fence.
     if fs.file_system_id != identity.file_system_id
         || shard.file_system_id != identity.file_system_id
         || shard.shard_id != identity.shard_id.0
@@ -106,7 +117,6 @@ pub async fn activate_metadata_storage_generation(
         || proof.retiring_shard.shard_id != shard.shard_id
         || proof.retiring_shard.epoch.checked_add(1) != Some(shard.epoch)
         || (shard.primary_node_id != local && !shard.replica_node_ids.contains(&local))
-        || !proof.acknowledged_node_ids.contains(&local)
         || generation != &identity.generation
         || *target_format != u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
         || cut.storage_transition_id.as_ref() != Some(transition_id)

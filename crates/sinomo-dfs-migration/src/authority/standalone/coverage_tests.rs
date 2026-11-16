@@ -438,7 +438,7 @@ fn standalone_owned_candidate_resumes_before_cut_and_new_root_refuses_install() 
     let limits = crate::namespace_counts::NamespaceCountMaintenanceLimits {
         max_objects: 64,
         max_encoded_bytes: 1024 * 1024,
-        deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
     };
     let plan = crate::namespace_counts::plan_standalone_namespace_count_maintenance(
         std::slice::from_ref(&source),

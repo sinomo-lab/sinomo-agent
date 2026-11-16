@@ -26,6 +26,7 @@ fn discovery_recovers_cold_units_across_bounded_frontiers_and_restart_epoch() {
         discovery.commit().unwrap();
     }
     assert_eq!(found.len(), 320, "bounded frontier lost never-requested source roots");
+    assert!(discovery.next_retry().is_none(), "absent optional managed roots are not failed source reads");
     drop(discovery);
     // A new descendant after a completed traversal cannot be hidden by an old
     // directory observation when the owner restarts.

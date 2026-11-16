@@ -468,7 +468,7 @@ impl NativeImportAuthority {
         )>,
     > {
         self.evaluate_scope_retirement(file_system_id, shard_id)
-            .map_err(NativeEvaluationError::into_metadata)
+            .map_err(|failure| self.native_observation_error(failure))
     }
 
     pub(super) fn evaluate_scope_retirement(

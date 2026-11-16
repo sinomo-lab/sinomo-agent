@@ -3583,6 +3583,12 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
         original.version,
         "the genuinely incomplete W2 write cannot advance the visible head"
     );
+    // A different caller has no local pending-write hint: Main must fence on
+    // the actual durable write and settle this pre-effect rejection itself.
+    cluster.users_primary = cluster
+        ._runtime
+        .client(&cluster.users_primary_node)
+        .unwrap();
     let rename = cluster.users_primary.posix_rename(from, to);
     assert!(
         matches!(&rename, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
@@ -3618,16 +3624,40 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
             .iter()
             .any(|job| job.root_path == from && job.status == DfsNamespaceJobStatus::Running)
     );
+    let pending_requests = cluster
+        ._runtime
+        .node_metadata(&cluster.users_primary_node)
+        .unwrap()
+        .list_pending_namespace_requests_page(None, 128)
+        .unwrap();
+    assert!(
+        pending_requests.next_cursor.is_none(),
+        "bounded native fixture request inventory"
+    );
+    assert!(!pending_requests.requests.iter().any(|request| matches!(&request.operation,
+        DfsNamespaceOperation::Rename { from: source, to: destination } if source == from && destination == to)),
+        "a fresh rename rejected before effects must not execute later through recovery: {:?}", pending_requests.requests);
     cluster._runtime.clear_faults();
     let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
     cluster._runtime.checkpoint_rpc_observation_window().unwrap();
-    while cluster.users_primary.posix_stat_distributed(from).unwrap().version != target {
+    loop {
+        let observed = cluster.users_primary.posix_stat_distributed(from);
+        if observed.as_ref().is_ok_and(|stat| stat.version == target) { break; }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "actual stage completion must settle within its normal deadline");
+        assert!(!remaining.is_zero() && observed.is_ok(),
+            "actual stage completion boundary: target={target:?}, observed={observed:?}, source={:?}, destination={:?}, intents={:?}",
+            node_store_object_at(&cluster._runtime, &cluster.users_primary_node, from),
+            node_store_object_at(&cluster._runtime, &cluster.services_primary_node, to),
+            cluster._runtime.node_metadata(&cluster.users_primary_node).unwrap().intents_for_object(&original.object_id));
         // The delegated caller does not own Main's retained stage retries.
-        cluster._runtime.maintenance_tick(
+        let tick = cluster._runtime.maintenance_tick(
             &cluster.users_primary_node, remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
-        ).unwrap().outcome.unwrap();
+        ).unwrap().outcome;
+        assert!(tick.is_ok(), "stage retry failed: {tick:?}; source={:?}, destination={:?}, intents={:?}, jobs={:?}",
+            node_store_object_at(&cluster._runtime, &cluster.users_primary_node, from),
+            node_store_object_at(&cluster._runtime, &cluster.services_primary_node, to),
+            cluster._runtime.node_metadata(&cluster.users_primary_node).unwrap().intents_for_object(&original.object_id),
+            cluster._runtime.node_metadata(&cluster.users_primary_node).unwrap().list_namespace_jobs());
         cluster.users_primary.process_incoming().unwrap();
         cluster._runtime.checkpoint_rpc_observation_window().unwrap();
     }

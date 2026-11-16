@@ -610,12 +610,12 @@ impl ResidentLocalMetadataShardSlot {
         }
     }
 
-    fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref()).map(Box::new)
+    fn open_backend(&self, try_writer: bool) -> Result<Box<LocalSobjMetadataBackend>> {
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref(), try_writer).map(Box::new)
     }
 
     fn try_checkout(self: &Arc<Self>) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
-        self.try_checkout_with_open(&mut || self.open_backend())
+        self.try_checkout_with_open(&mut || self.open_backend(true))
     }
 
     fn try_checkout_with_open(
@@ -690,7 +690,7 @@ impl ResidentLocalMetadataShardSlot {
     }
 
     fn checkout(self: &Arc<Self>) -> Result<Box<LocalSobjMetadataBackend>> {
-        self.checkout_with_open(&mut || self.open_backend())
+        self.checkout_with_open(&mut || self.open_backend(false))
     }
 
     fn checkout_with_open(
@@ -841,7 +841,7 @@ impl ResidentLocalMetadataShardSlot {
             }
             let backend = open_local_metadata_shard_backend(
                 &self.config, &self.root, LocalMetadataShardOpenMode::Inspection,
-                self.selected_original_data_layout.clone(), None,
+                self.selected_original_data_layout.clone(), None, false,
             )?;
             let mut snapshot = initialize_resident_metadata_shard_status_snapshot(&self.config, &backend);
             if matches!(generation.state, crate::storage_generation::GenerationState::Staged { .. }) {
@@ -1234,10 +1234,11 @@ impl ResidentLocalMetadataShardHandle {
         let native_input = native_boundary.as_ref().map(|_| command.clone());
         let mut recovered = None;
         let mut open = || {
-            match self.slot.open_backend() {
+            match self.slot.open_backend(false) {
                 Ok(backend) => Ok(backend),
                 Err(error) if self.slot.open_mode == LocalMetadataShardOpenMode::ReplicaRepair
-                    && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&error) => {
+                    && crate::metadata_replication::metadata_snapshot_open_error_allows_repair(
+                        &error, &self.slot.root, &permit, command.image()?)? => {
                     let image = command.image()?.clone();
                     let (backend, archived_existing) = LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
                         &permit, self.shard_id.clone(), self.slot.root.clone(),
@@ -1949,7 +1950,7 @@ impl LocalMetadataShardSlot {
     }
 
     fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref()).map(Box::new)
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref(), false).map(Box::new)
     }
 
     fn backend(&self) -> Result<&LocalSobjMetadataBackend> {
@@ -1999,6 +2000,7 @@ fn open_local_metadata_shard_backend(
     open_mode: LocalMetadataShardOpenMode,
     selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     native_catalog: Option<&crate::DfsMetadataNamespaceCatalog>,
+    try_writer: bool,
 ) -> Result<LocalSobjMetadataBackend> {
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
     if let Some(catalog) = native_catalog {
@@ -2042,7 +2044,7 @@ fn open_local_metadata_shard_backend(
         }
     }
     if open_mode == LocalMetadataShardOpenMode::NativeGenesis {
-        return LocalSobjMetadataBackend::open_staged_native_genesis(config, root.to_owned(), selected_layout);
+        return LocalSobjMetadataBackend::open_staged_native_genesis_with_admission(config, root.to_owned(), selected_layout, try_writer);
     }
     if let Some(layout) = selected_layout {
         if open_mode == LocalMetadataShardOpenMode::Inspection {
@@ -2052,9 +2054,13 @@ fn open_local_metadata_shard_backend(
         }
         // Representation failure is non-repairable. Actual normal replica
         // corruption keeps its existing repair-only fallback below.
-        match LocalSobjMetadataBackend::new_with_selected_layout(
+        let opened = if try_writer {
+            LocalSobjMetadataBackend::try_new_with_selected_layout(shard_id.clone(), root.to_owned(),
+                Some((config.file_system_id.clone(), Arc::clone(&layout))))
+        } else { LocalSobjMetadataBackend::new_with_selected_layout(
             config.file_system_id.clone(), shard_id.clone(), root.to_path_buf(), Arc::clone(&layout),
-        ) {
+        ) };
+        match opened {
             Ok(backend) => return Ok(backend),
             Err(error) if open_mode == LocalMetadataShardOpenMode::ReplicaRepair
                 && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&error) => {
@@ -2068,10 +2074,15 @@ fn open_local_metadata_shard_backend(
     let mut backend = match open_mode {
         LocalMetadataShardOpenMode::NativeGenesis => unreachable!("handled with native scope above"),
         LocalMetadataShardOpenMode::Strict => {
-            LocalSobjMetadataBackend::new(shard_id, root.to_path_buf())?
+            if try_writer {
+                LocalSobjMetadataBackend::try_new_with_selected_layout(shard_id, root.to_owned(), None)?
+            } else { LocalSobjMetadataBackend::new(shard_id, root.to_path_buf())? }
         }
         LocalMetadataShardOpenMode::ReplicaRepair => {
-            match LocalSobjMetadataBackend::new(shard_id.clone(), root.to_path_buf()) {
+            let opened = if try_writer {
+                LocalSobjMetadataBackend::try_new_with_selected_layout(shard_id.clone(), root.to_owned(), None)
+            } else { LocalSobjMetadataBackend::new(shard_id.clone(), root.to_path_buf()) };
+            match opened {
                 Ok(backend) => backend,
                 Err(open_error)
                     if !crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(
@@ -3277,6 +3288,67 @@ mod lazy_replica_slot_tests {
             });
         }
         runtime.close().unwrap();
+    }
+
+    fn resident_open_yields_to_held_writer(local_path_guard: bool) {
+        let fixture = sinomo_testdir::TestDir::new("resident-open-held-writer");
+        let metadata = native_metadata_data(fixture.path());
+        let root = metadata.join("root");
+        let config = configs(&node("resident-open-local"))[0].clone();
+        let shard = DfsMetadataShardId::new("root");
+        let slot = Arc::new(ResidentLocalMetadataShardSlot::from_local_slot(
+            LocalMetadataShardSlot::new(config, root.clone(), LocalMetadataShardOpenMode::Strict),
+        ));
+        let before = LocalSobjMetadataBackend::new(shard.clone(), root.as_path()).unwrap();
+        let prefix = before.metadata_prefix_proof().unwrap();
+        drop(before);
+        let lock_path = root.as_path().join("journal/write.lock");
+        let fence: Box<dyn std::any::Any + Send> = if local_path_guard {
+            Box::new(crate::metadata_lock::metadata_write_lock(
+                root.as_path().to_owned(), lock_path.clone(),
+            ).unwrap())
+        } else {
+            let file = std::fs::OpenOptions::new().read(true).write(true)
+                .open(&lock_path).unwrap();
+            fs2::FileExt::lock_exclusive(&file).unwrap();
+            Box::new(file)
+        };
+        let snapshot_path = root.as_path().join("records/tables/snapshot.sobj");
+        let snapshot = std::fs::read(&snapshot_path).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let opening = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || {
+            send.send(opening.try_checkout()).unwrap();
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(1));
+        let contender = std::fs::OpenOptions::new().read(true).write(true)
+            .open(&lock_path).unwrap();
+        let still_fenced = fs2::FileExt::try_lock_exclusive(&contender)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+        drop(contender);
+        let after = std::fs::read(&snapshot_path).unwrap();
+        // Drain the old blocking implementation too, so the causal failure retains
+        // no orphan thread or lock and the original native DATA remains inspectable.
+        drop(fence);
+        worker.join().unwrap();
+        assert!(matches!(observed.expect("open must yield while its writer is busy"),
+            Err(MetadataBackendError::StoragePreparationPending { processed_records: 0, .. })));
+        assert!(still_fenced, "the failed opener cannot release the existing writer");
+        assert_eq!(after, snapshot, "no recovery may write without the actual fence");
+        assert!(matches!(*slot.state.lock().unwrap(), ResidentLocalMetadataShardState::Unopened));
+        let reopened = slot.try_checkout().unwrap().expect("released physical writer admits the same slot");
+        assert_eq!(reopened.metadata_prefix_proof().unwrap(), prefix);
+        slot.restore(reopened);
+    }
+
+    #[test]
+    fn resident_open_yields_to_a_local_path_writer() {
+        resident_open_yields_to_held_writer(true);
+    }
+
+    #[test]
+    fn resident_open_yields_to_a_physical_source_writer() {
+        resident_open_yields_to_held_writer(false);
     }
 
     #[test]

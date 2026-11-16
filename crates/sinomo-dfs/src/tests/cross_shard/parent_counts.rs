@@ -145,6 +145,94 @@ fn original_parent_job(cluster: &SifsTwoPrimaryCluster, request_id: &str) -> Dfs
 }
 
 #[test]
+fn native_rejected_root_adoption_releases_issued_parent_reservations() {
+    rejected_root_adoption_case(false);
+}
+
+#[test]
+fn native_rejected_root_adoption_withdrawal_restarts_exactly() {
+    rejected_root_adoption_case(true);
+}
+
+fn rejected_root_adoption_case(interrupt_withdrawal: bool) {
+    let mut cluster = foreign_parent_cluster(if interrupt_withdrawal {
+        "native-parent-rejected-root-withdrawal-restart"
+    } else { "native-parent-rejected-root-adoption" });
+    let abort_hook = interrupt_withdrawal.then(|| crate::posix::install_parent_count_test_hook(
+        &cluster.users_primary_node, "/users", crate::posix::ParentCountTestPoint::Aborted,
+        || Err(DfsPosixError::Dfs(DfsError::Network {
+            message: "parent withdrawal committed before its coordinator checkpoint".into(),
+        })),
+    ));
+    let root_before = directory_row(&cluster, &cluster.replica_node, "root", "/");
+    let source_before = directory_row(&cluster, &cluster.users_primary_node, "users", "/users");
+    let target = "/services/conflicting-users";
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = crate::posix::install_parent_count_test_hook(
+        &cluster.users_primary_node, "/users", crate::posix::ParentCountTestPoint::Issued,
+        move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        },
+    );
+    let request = sinomo_core::Id::generate().to_string();
+    let mut caller = cluster._runtime.client(&cluster.replica_node).unwrap();
+    let primary = cluster.users_primary_node.clone();
+    let conflict = std::thread::scope(|scope| {
+        let id = request.clone();
+        let call = scope.spawn(move || caller.route_namespace_operation_with_request_id(
+            id, primary, DfsNamespaceOperation::Rename { from: "/users".into(), to: target.into() }));
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let conflict = (|| -> std::result::Result<_, String> {
+            entered.map_err(|failure| failure.to_string())?;
+            let issued = original_parent_job(&cluster, &request);
+            assert_eq!(issued.directory_move_counts().unwrap().unwrap().parent_participants.as_ref().unwrap().phase,
+                crate::DfsParentCountPhase::Issued);
+            let mut writer = cluster._runtime.client(&cluster.services_primary_node).unwrap();
+            writer.posix_mkdir(target).map_err(|failure| failure.to_string())?;
+            Ok(directory_row(&cluster, &cluster.services_primary_node, "services", target))
+        })();
+        let _ = release_tx.send(());
+        assert!(call.join().unwrap().is_err(), "the changed destination must reject the original adoption");
+        conflict.unwrap()
+    });
+    drop(hook);
+    drop(abort_hook);
+    if interrupt_withdrawal {
+        let pending = original_parent_job(&cluster, &request);
+        assert_eq!(pending.directory_move_counts().unwrap().unwrap().parent_participants.as_ref().unwrap().phase,
+            crate::DfsParentCountPhase::Aborting);
+        drop(cluster.users_primary);
+        drop(cluster.services_primary);
+        drop(cluster.replica);
+        cluster._runtime.stop_node(&cluster.users_primary_node).unwrap();
+        cluster._runtime.stop_node(&cluster.replica_node).unwrap();
+        cluster._runtime.reopen_node(cluster.replica_node.clone()).unwrap();
+        cluster._runtime.reopen_node(cluster.users_primary_node.clone()).unwrap();
+        cluster.users_primary = cluster._runtime.client(&cluster.users_primary_node).unwrap();
+        cluster.services_primary = cluster._runtime.client(&cluster.services_primary_node).unwrap();
+        cluster.replica = cluster._runtime.client(&cluster.replica_node).unwrap();
+        assert!(cluster.replica.route_namespace_operation_with_request_id(
+            request.clone(), cluster.users_primary_node.clone(),
+            DfsNamespaceOperation::Rename { from: "/users".into(), to: target.into() }).is_err());
+    }
+    let job = original_parent_job(&cluster, &request);
+    assert_eq!(job.status, DfsNamespaceJobStatus::Failed, "known root rejection must settle every parent: {:?}", job.directory_move_counts());
+    assert_eq!(directory_row(&cluster, &cluster.replica_node, "root", "/"), root_before);
+    assert_eq!(directory_row(&cluster, &cluster.users_primary_node, "users", "/users"), source_before);
+    assert_eq!(directory_row(&cluster, &cluster.services_primary_node, "services", target), conflict);
+    let backend = cluster._runtime.node_metadata(&cluster.replica_node).unwrap();
+    assert!(backend.parent_count_reservations(&DfsMetadataShardId::new("root"), &root_before.file_system_id, &root_before.object_id).unwrap().is_empty());
+    drop(backend);
+    cluster.replica.route_namespace_operation_with_request_id(
+        sinomo_core::Id::generate().to_string(), cluster.replica_node.clone(),
+        DfsNamespaceOperation::SetMode { path: "/".into(), mode: 0o710 }).unwrap();
+    cluster.close();
+}
+
+#[test]
 fn native_parent_reservation_blocks_writes_but_not_committed_stat() {
     let mut cluster = foreign_parent_cluster("native-parent-write-only-reservation");
     let root_before = directory_row(&cluster, &cluster.replica_node, "root", "/");
@@ -331,6 +419,8 @@ fn native_parent_abort_is_terminal_before_late_reserve_or_apply() {
             result.is_err(),
             "changed parent must reject before namespace issuance"
         );
+        assert!(matches!(result, Err(DfsPosixError::Conflict { .. })),
+            "settled pre-effect parent contention must retain a structured conflict: {result:?}");
         observation.unwrap()
     });
     drop(hook);

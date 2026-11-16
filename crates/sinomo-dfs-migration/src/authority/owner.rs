@@ -25,6 +25,13 @@ mod scheduler_tests;
 mod placement_tests;
 use scheduler::OwnerWork;
 
+pub(super) fn validate_metadata_scope(shard: &sinomo_dfs::DfsMetadataShardId) -> Result<()> {
+    inventory::UnitKey {
+        relative_root: Path::new("dfs/metadata").join(&shard.0),
+        role: inventory::UnitRole::Metadata { shard: shard.clone() },
+    }.validate()
+}
+
 pub(super) struct MigrationOwner {
     pub(super) source_kind: crate::metadata::MetadataImportAuthorityKind,
     pub(super) work: OwnerWork,
@@ -43,6 +50,25 @@ pub(super) struct MigrationOwner {
     pub(super) lifecycle: tokio::sync::watch::Receiver<bool>,
 }
 impl MigrationOwner {
+    #[cfg(test)]
+    pub(in crate::authority) fn diagnostic_scheduler(&self) -> String {
+        format!("{:?}", self.work.scheduler.lock().unwrap())
+    }
+    fn current_content_initialization(&self, root: &Path) -> Result<bool> {
+        if !sinomo_dfs::LocalContentStore::has_current_initialization(root).map_err(error)? {
+            return Ok(false);
+        }
+        let mut original_job = self.content.existing_job_reference(root)?.is_some();
+        for scope in [DfsStoragePreparationScope::Content, DfsStoragePreparationScope::ContentInventory] {
+            let key = inventory::UnitKey::from_scope(&self.authority.data_root, root, &scope)?;
+            original_job |= self.work.inventory.read(&key)?.is_some_and(|reference| reference.job.is_some());
+        }
+        if original_job || content_exposure::retained_publication(&self.authority.data_root)?.is_some()
+            || content_exposure::has_retained_sources(&self.authority.data_root)? {
+            return Err(error("current content initialization conflicts with an original conversion owner"));
+        }
+        Ok(true)
+    }
     pub(super) fn schedule_placement_work(&self) -> Result<()> {
         let unit = inventory::UnitKey {
             relative_root: "dfs/metadata".into(), role: inventory::UnitRole::PlacementGoals,
@@ -210,6 +236,11 @@ impl MigrationOwner {
             return Err(error("migration owner lifecycle is closed"));
         }
         let key = inventory::UnitKey::from_scope(&self.authority.data_root, root, scope)?;
+        if matches!(scope, DfsStoragePreparationScope::Content) && self.current_content_initialization(root)? {
+            // Only the existing core initializer may finish this exact intent.
+            // Ready admits that initializer; it does not initialize or convert.
+            return Ok(sinomo_dfs::DfsStoragePreparation::Ready);
+        }
         if root == self.authority.data_root.join("dfs/content") {
             if let Some(false) = content_exposure::frontend_target(&self.authority.data_root)? {
                 self.work.scheduler.lock().map_err(error)?.enqueue(key, true)?;
@@ -303,10 +334,10 @@ impl MigrationOwner {
         scope.own_task("dfs-migration-owner", task);
         let weak = Arc::downgrade(self);
         let paths = sinomo_core::network::ClusterPaths::new(self.authority.component_context.data_dir());
-        let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(&paths, move |_| {
+        let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(&paths, move |observation| {
             if let Some(owner) = weak.upgrade() {
-                if let Ok(mut scheduler) = owner.work.scheduler.lock() { scheduler.dependencies_changed(); }
-                owner.work.wake.notify_one();
+                let changed = owner.work.scheduler.lock().is_ok_and(|mut scheduler| scheduler.native_dependencies_changed(observation));
+                if changed { owner.work.wake.notify_one(); }
             }
         });
         scope.defer(move || drop(subscription));
@@ -374,19 +405,18 @@ impl MigrationOwner {
                 Ok(Ok(reference)) => {
                     let again = matches!(reference.state, inventory::ObservedState::Runnable);
                     let key = reference.unit.clone();
+                    let mut readiness_changed = false;
                     if let Ok(mut scheduler) = self.work.scheduler.lock() {
-                        scheduler.finish(&id, reference);
+                        readiness_changed = scheduler.finish(&id, reference);
                         if again { let _ = scheduler.enqueue(key, false); }
                     }
-                    self.work.notify();
+                    if again || readiness_changed { self.work.notify(); }
                 }
                 Ok(Err(failure)) => {
-                    self.finish_failed_step(&id, original_reference, failure.to_string());
-                    tracing::error!(unit=%id, error=%failure, "migration inventory step failed without discarding source ownership");
+                    self.finish_failed_step(&id, original_reference, failure);
                 }
                 Err(failure) => {
-                    self.finish_failed_step(&id, original_reference, failure.to_string());
-                    tracing::error!(unit=%id, error=%failure, "migration owned step failed");
+                    self.finish_failed_step(&id, original_reference, error(failure));
                 }
             }
         }
@@ -418,21 +448,35 @@ impl MigrationOwner {
         if discovery.has_work() { self.work.wake.notify_one(); }
         Ok(())
     }
-    fn finish_failed_step(&self, id: &str, mut original: inventory::UnitReference, failure: String) {
+    fn finish_failed_step(&self, id: &str, mut original: inventory::UnitReference, failure: MetadataBackendError) {
         // Do not rewrite a corrupt/uncertain durable reference merely to record
         // the error. Release only the process-local running slot, retaining the
         // original job identity and bytes for actual recovery.
-        original.state = inventory::ObservedState::Blocked { evidence: failure.chars().take(2048).collect() };
-        if let Ok(mut scheduler) = self.work.scheduler.lock() { scheduler.finish(id, original); }
-        self.work.notify();
+        let retryable = matches!(&failure, MetadataBackendError::StoragePreparationPending { .. })
+            || matches!(&failure, MetadataBackendError::Io { source, .. }
+                if matches!(source.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted | std::io::ErrorKind::TimedOut));
+        let evidence = failure.to_string().chars().take(2048).collect();
+        original.state = if retryable { inventory::ObservedState::Waiting { evidence } }
+            else { inventory::ObservedState::Blocked { evidence } };
+        let mut readiness_changed = false;
+        if let Ok(mut scheduler) = self.work.scheduler.lock() {
+            readiness_changed = scheduler.finish(id, original);
+            if retryable { scheduler.retry_failed(id); }
+        }
+        if retryable { tracing::debug!(unit=%id, error=%failure, "migration operation awaits retry at its original checkpoint"); }
+        else { tracing::error!(unit=%id, error=%failure, "migration step blocked without discarding source ownership"); }
+        if readiness_changed { self.work.notify(); }
     }
-    fn advance_content_unit(&self, scope: &DfsStoragePreparationScope, reference: &mut inventory::UnitReference) -> Result<sinomo_dfs::DfsStoragePreparation> {
+    fn advance_content_unit(&self, scope: &DfsStoragePreparationScope, reference: &mut inventory::UnitReference, byte_progress: &mut bool) -> Result<sinomo_dfs::DfsStoragePreparation> {
         use crate::content::{OriginalV3Budget, OriginalV3Selection, OriginalV3UnitResult};
         use sinomo_dfs::DfsStoragePreparation as State;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         let data_root = &self.authority.data_root;
         let live = data_root.join("dfs/content");
         let existing = content_exposure::retained_publication(data_root)?;
+        if self.current_content_initialization(&live)? {
+            return Ok(State::Ready);
+        }
         if content_exposure::live_root_absent(&live)? && existing.is_none() {
             if reference.job.is_some() || content_exposure::has_retained_sources(data_root)? {
                 return Err(error("missing live content root has retained source/job evidence; fresh initialization is forbidden"));
@@ -497,6 +541,9 @@ impl MigrationOwner {
         let step = self.content_v3.lock().map_err(error)?.step(&data_root.join(&publication.retained), &live,
             &publication.inventory_id, &selection, &OriginalV3Budget { max_records: 256, max_bytes: 8 * 1024 * 1024,
                 deadline, cancelled: &self.work.cancelled })?;
+        // A durable copy/hash continuation can advance without completing a
+        // manifest record. Keep it runnable without inventing a record count.
+        *byte_progress = step.processed_bytes > 0;
         if step.coverage_complete {
             content_exposure::mark_covered(data_root, &publication)?;
             return Ok(State::Ready);
@@ -511,7 +558,27 @@ impl MigrationOwner {
             OriginalV3UnitResult::Pending | OriginalV3UnitResult::PendingIndex => Ok(State::Pending { processed_records: step.processed_records }),
         }
     }
-    fn advance_reference(&self, mut reference: inventory::UnitReference) -> Result<inventory::UnitReference> {
+    fn advance_reference(&self, reference: inventory::UnitReference) -> Result<inventory::UnitReference> {
+        use inventory::UnitRole;
+        let phase = match &reference.unit.role {
+            UnitRole::FileSystem { .. } => "filesystem",
+            UnitRole::Metadata { .. } | UnitRole::MetadataGeneration { .. } => "metadata",
+            UnitRole::MetadataRouting => "routing",
+            UnitRole::PlacementGoals => "placement",
+            UnitRole::ContentRoot => "content-root",
+            UnitRole::ContentVersion { .. } | UnitRole::ContentBlob { .. } | UnitRole::ContentObject { .. } => "content-unit",
+            UnitRole::ContentInventory => "content-inventory",
+            UnitRole::LocalState => "local-state",
+            UnitRole::RetainedArtifact => "retained",
+        };
+        let span = tracing::trace_span!(target: "sinomo.perf", "dfs.migration.step",
+            stage = "dfs.migration.step", phase, outcome = tracing::field::Empty);
+        let _entered = span.enter();
+        let result = self.advance_reference_inner(reference);
+        span.record("outcome", if result.is_ok() { "ok" } else { "error" });
+        result
+    }
+    fn advance_reference_inner(&self, mut reference: inventory::UnitReference) -> Result<inventory::UnitReference> {
         use inventory::ObservedState;
         // Demand never overwrites an existing original job reference.
         if let Some(retained) = self.work.inventory.read(&reference.unit)? { reference = retained; }
@@ -521,8 +588,8 @@ impl MigrationOwner {
             reference.state = match self.advance_placement_work() {
                 Ok(sinomo_dfs::DfsStoragePreparation::Ready) => ObservedState::VerifiedCurrent,
                 Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records }) if processed_records > 0 => ObservedState::Runnable,
-                Ok(sinomo_dfs::DfsStoragePreparation::Pending { .. }) | Err(MetadataBackendError::StoragePreparationPending { .. }) => ObservedState::Waiting { evidence: "original placement awaits complete filesystem activation or native retirement".into() },
-                Err(failure) => ObservedState::Blocked { evidence: failure.to_string().chars().take(2048).collect() },
+                Ok(sinomo_dfs::DfsStoragePreparation::Pending { .. }) => ObservedState::Waiting { evidence: "original placement awaits complete filesystem activation or native retirement".into() },
+                Err(failure) => return Err(failure),
             };
             self.work.inventory.record(&reference)?;
             return Ok(reference);
@@ -531,13 +598,21 @@ impl MigrationOwner {
             reference.state = match self.advance_filesystem(&mut reference) {
                 Ok(sinomo_dfs::DfsStoragePreparation::Ready) => ObservedState::VerifiedCurrent,
                 Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records }) if processed_records > 0 => ObservedState::Runnable,
-                Ok(sinomo_dfs::DfsStoragePreparation::Pending { .. }) | Err(MetadataBackendError::StoragePreparationPending { .. }) => ObservedState::Waiting { evidence: "original filesystem continuation awaits its source/native dependency".into() },
-                Err(failure) => ObservedState::Blocked { evidence: failure.to_string().chars().take(2048).collect() },
+                Ok(sinomo_dfs::DfsStoragePreparation::Pending { .. }) => ObservedState::Waiting { evidence: "original filesystem continuation awaits its source/native dependency".into() },
+                Err(failure) => return Err(failure),
             };
             self.work.inventory.record(&reference)?;
             return Ok(reference);
         }
         let Some(scope) = reference.unit.scope() else {
+            if root.parent() == Some(self.authority.receiver_root.as_path())
+                && root.join("native-import-plan.json").is_file() {
+                // The durable stage can precede its generation-job linkage.
+                // Recover that existing owner from the same plan DATA; all
+                // native activation/source checks remain in the generation job.
+                let plan = self.authority.retained_plan_file.read(&root.join("native-import-plan.json"))?;
+                filesystem::enqueue_received_generation(&self.authority.component_context, &plan, &root)?;
+            }
             if self.retained_metadata_observation(&reference)? {
                 reference.state = ObservedState::RetainedOriginal;
                 self.work.inventory.record(&reference)?;
@@ -566,11 +641,12 @@ impl MigrationOwner {
         }
         let current = if retained_legacy_content || self.routing_configuration_pending(&scope) { Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records: 0 }) }
             else { inspect_current_unit(&root, &scope) };
+        let mut byte_progress = false;
         let result = current.and_then(|current| {
             if current == sinomo_dfs::DfsStoragePreparation::Ready { Ok(current) }
             else if matches!(scope, DfsStoragePreparationScope::Content | DfsStoragePreparationScope::ContentVersion { .. }
                 | DfsStoragePreparationScope::ContentObject { .. } | DfsStoragePreparationScope::ContentBlob { .. } | DfsStoragePreparationScope::ContentInventory) {
-                self.advance_content_unit(&scope, &mut reference)
+                self.advance_content_unit(&scope, &mut reference, &mut byte_progress)
             } else if self.source_kind == crate::metadata::MetadataImportAuthorityKind::Native {
                 match &scope {
                     DfsStoragePreparationScope::Metadata(shard) => self.queue_filesystem_for_shard(shard),
@@ -581,9 +657,9 @@ impl MigrationOwner {
         });
         reference.state = match result {
             Ok(sinomo_dfs::DfsStoragePreparation::Ready) => ObservedState::VerifiedCurrent,
-            Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records }) if processed_records > 0 => ObservedState::Runnable,
-            Ok(sinomo_dfs::DfsStoragePreparation::Pending { .. }) | Err(MetadataBackendError::StoragePreparationPending { .. }) => ObservedState::Waiting { evidence: "source or native dependency pending at original checkpoint".into() },
-            Err(failure) => ObservedState::Blocked { evidence: failure.to_string().chars().take(2048).collect() },
+            Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records }) if processed_records > 0 || byte_progress => ObservedState::Runnable,
+            Ok(sinomo_dfs::DfsStoragePreparation::Pending { .. }) => ObservedState::Waiting { evidence: "source or native dependency pending at original checkpoint".into() },
+            Err(failure) => return Err(failure),
         };
         self.work.inventory.record(&reference)?;
         if matches!(reference.state, ObservedState::VerifiedCurrent)

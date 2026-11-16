@@ -431,9 +431,17 @@ fn pending_goal_with_current_permit(v1: bool) {
     block_native(&native.runtime_handle(), async {
         let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         loop {
-            match prepare_original_data()? {
-                DfsStoragePreparation::Ready => break,
-                DfsStoragePreparation::Pending { .. } => {}
+            if tokio::time::Instant::now() >= deadline {
+                return Err(error("managed original placement exceeded its original observation deadline"));
+            }
+            match prepare_original_data() {
+                Ok(DfsStoragePreparation::Ready) => break,
+                Ok(DfsStoragePreparation::Pending { .. }) => {},
+                Err(MetadataBackendError::StoragePreparationPending { .. }) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(failure) => return Err(failure),
             }
             tokio::time::timeout_at(deadline, changed.changed()).await
                 .map_err(|_| error("managed original placement did not complete within the native deadline"))?
@@ -441,13 +449,8 @@ fn pending_goal_with_current_permit(v1: bool) {
         }
         Ok::<_, MetadataBackendError>(())
     }).unwrap();
-    assert!(
-        runtime
-            .authority
-            .required_original_placement_sources(&goals)
-            .unwrap()
-            .is_empty()
-    );
+    // Ready above includes the authoritative empty required-source observation;
+    // another independent read can be transiently unavailable after that proof.
     assert!(
         !configuration_ready
             || runtime

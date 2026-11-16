@@ -491,7 +491,7 @@ impl DfsMetadataTables {
                     if old.phase != Phase::Aborting
                         || old.confirmed != old.participants.len()
                         || new != old
-                        || job.processed_object_count != 0
+                        || job.processed_object_count != original.processed_object_count
                     {
                         return Err(fail());
                     }
@@ -513,6 +513,18 @@ impl DfsMetadataTables {
                         job.processed_object_count == 0 && new.confirmed == 0
                     }
                     (Phase::Issued, Phase::Issued) => new.confirmed == old.confirmed,
+                    (Phase::Issued, Phase::Aborting) => {
+                        let mut frames = original.pending_frames.clone();
+                        for frame in &mut frames {
+                            if let crate::DfsNamespaceJobFrame::CrossShardDirFinish { count_plan: Some(counts), .. } = frame {
+                                counts.parent_participants = Some(new.clone());
+                            }
+                        }
+                        new.rejection == Some(crate::DfsParentCountRejection::RootAdoptionRejected)
+                            && new.confirmed == 0 && original.initial_directory_root_adoption().is_some()
+                            && job.pending_frames == frames
+                            && job.processed_object_count == original.processed_object_count
+                    }
                     (Phase::Issued, Phase::Settling) => new.confirmed == 0,
                     _ => false,
                 };

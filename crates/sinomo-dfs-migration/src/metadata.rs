@@ -116,13 +116,14 @@ pub struct NativeMetadataImportCertificate {
         Vec<crate::authority::source_retirement::NativeSourceRetirementCertificate>,
     pub(crate) data_reservation_retirements:
         Vec<crate::authority::source_retirement::NativeDataReservationRetirementCertificate>,
-    /// Re-earned only by authenticated native receiver verification. Saved
-    /// installation records cannot deserialize into this held qualifier.
+    /// Re-earned only by actual native receipt, staged-image and local source
+    /// verification. Historical quorum membership is not a local source proof.
+    /// Installation records cannot deserialize into this held qualifier.
     #[serde(skip)]
-    pub(crate) legacy_local_source: Option<VerifiedLegacyReceiverSource>,
+    pub(crate) receiver_source: Option<VerifiedReceiverSource>,
 }
 #[derive(Clone, Debug)]
-pub(crate) struct VerifiedLegacyReceiverSource {
+pub(crate) struct VerifiedReceiverSource {
     pub(crate) original_root: PathBuf,
     pub(crate) actual_root: PathBuf,
     pub(crate) source_identity: String,
@@ -817,18 +818,27 @@ impl MetadataConverter {
         -> Result<Option<DfsStoragePreparation>> {
         if budget == 0 { return Err(error("receiver preparation budget must be positive")); }
         let authority = self.authority.as_ref().ok_or_else(|| error("received image requires its actual native owner"))?;
-        if authority.kind() != MetadataImportAuthorityKind::Native
-            || !authority.current_receiver_stage_pending(destination, shard)? {
+        if authority.kind() != MetadataImportAuthorityKind::Native {
             return Ok(None);
         }
         let destination = canonical_destination(destination)?;
         let stage = conversion_stage_base_path(&destination, shard)?;
         if let Some(interrupted) = recovery::resolve_interrupted_installation(&destination, &stage)? {
+            if interrupted.proposal.scope_shard != *shard
+                || !interrupted.proposal.file_system_ids.contains(file_system_id) {
+                return Err(error("receiver installation intent changes its requested filesystem scope"));
+            }
             let Some(certificate) = authority.received_recovered(&interrupted.proposal,
                 &interrupted.actual_source, &interrupted.resolved_image_root, &interrupted.provenance_plan_root)? else { return Ok(None); };
             let session = open_session_shell(&destination, &interrupted.actual_source, shard, stage, None)?;
             install_certified_stage(&session, &interrupted.proposal, &certificate, authority.as_ref())?;
         } else {
+            // A published receiver image moved its original plan directory.
+            // Its retained installation intent, checked above, owns continuation;
+            // absence from the staging-directory scan is not completion.
+            if !authority.current_receiver_stage_pending(&destination, shard)? {
+                return Ok(None);
+            }
             let session = open_session_shell(&destination, &destination, shard, stage, None)?;
             let path = destination.join("records/tables/snapshot.sobj");
             let prefix = if path.is_file() && sinomo_core::storage::migration::stream::is_stream(&path).map_err(error)? {
@@ -1060,6 +1070,8 @@ impl MetadataConverter {
         if let (Some(hook), Ok(progress)) = (&step_hook, &result) {
             hook(&destination, shard, budget, Some(*progress))?;
         }
+        let reset_session = matches!(&result, Ok(DfsStoragePreparation::Ready))
+            || (result.is_err() && !matches!(&result, Err(MetadataBackendError::StoragePreparationPending { .. })));
         tracing::trace!(
             target: "sinomo.dfs.perf",
             converter = ?(self as *const Self),
@@ -1075,7 +1087,7 @@ impl MetadataConverter {
             retained_content_work = ?session.as_ref().map(|state| state.retained_content_work.len()),
             confirmed_source_bindings = ?session.as_ref().map(|state| state.confirmed_source_content_bindings.len()),
             outcome = ?result,
-            reset_session = result.is_err() || matches!(&result, Ok(DfsStoragePreparation::Ready)),
+            reset_session,
             "migration bounded metadata prepare returned"
         );
         #[cfg(test)]
@@ -1084,9 +1096,10 @@ impl MetadataConverter {
             "migration-prepare-turn-result",
             || serde_json::json!({"slot":format!("{:p}", Arc::as_ptr(&slot)),"shard":shard,"source":source,"result":format!("{result:?}"),"phase":format!("{:?}",session.as_ref().map(|state| &state.progress.phase))}),
         );
-        if result.is_err() || matches!(&result, Ok(DfsStoragePreparation::Ready)) {
-            // Reset under the SAME per-root lock. Queued aliases can only
-            // reconstruct the last durable cursor, never reuse partial state.
+        if reset_session {
+            // Invalid source state drops the warm view under the same lock.
+            // A typed native wait keeps its exact cursor and source custody;
+            // the next attempt still verifies the source and native authority.
             session.take();
         }
         drop(session);
@@ -2032,12 +2045,12 @@ impl MetadataConverter {
                 require_placement_goal_refs(&proposal.source_cut, goal_capsules)?;
                 let certificate = match authority.certify(&proposal) {
                     Ok(certificate) => certificate,
-                    Err(MetadataBackendError::StoragePreparationPending { processed_records, .. }) => {
-                        // A cohort predecessor still owns progress. Keep this
-                        // exact proposal and physical source custody while the
-                        // sole worker advances that dependency.
+                    Err(failure @ MetadataBackendError::StoragePreparationPending { .. }) => {
+                        // Native staging has not completed this attempt. Keep
+                        // its original proposal/custody and propagate the typed
+                        // wait to the owner's bounded retry, not a parked success.
                         session.finalization = Some(Finalization::Certify { proposal, digest });
-                        return Ok(DfsStoragePreparation::Pending { processed_records });
+                        return Err(failure);
                     }
                     Err(failure) => return Err(failure),
                 };
@@ -2887,7 +2900,7 @@ fn require_placement_goal_refs(cut: &MetadataSourceCut, capsules: &[Value]) -> R
 }
 /// Local source custody for an earned current-peer receiver exchange. This is
 /// installation DATA written only after native certificate validation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ReceiverLocalSourceBinding {
     source_root: PathBuf,
@@ -2929,6 +2942,16 @@ fn read_import_marker(
         return Ok(None);
     }
     let marker: MetadataImportMarker = read_json(&path)?;
+    validate_import_marker(&destination, shard, &marker)?;
+    Ok(Some(marker))
+}
+
+fn validate_import_marker(
+    destination: &Path,
+    shard: &DfsMetadataShardId,
+    marker: &MetadataImportMarker,
+) -> Result<()> {
+    let destination = canonical_destination(destination)?;
     let cut = &marker.source_cut;
     source_proof::validate(&marker.native_image.prefix_proof)?;
     let expected_parent = destination
@@ -2970,7 +2993,6 @@ fn read_import_marker(
         .to_hex()
         .to_string();
         if local.source_root != destination
-            || cut.source_root == destination
             || local.source_identity != marker.source_identity
             || local.source_snapshot_fingerprint != marker.source_snapshot_fingerprint
             || local.authority_binding != marker.authority_binding
@@ -2996,7 +3018,30 @@ fn read_import_marker(
             "installed marker changes its actual retained source role or identity",
         ));
     }
-    Ok(Some(marker))
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn assert_receiver_marker_path_scope_for_test(destination: &Path, shard: &DfsMetadataShardId) {
+    let path = destination.join("metadata-import-v7.json");
+    let original = fs::read(&path).unwrap();
+    let mut marker = read_import_marker(destination, shard).unwrap().unwrap();
+    assert!(marker.receiver_local_source.is_some());
+    // Only exercise the inert marker's path/role validation. A sender's opaque
+    // path may spell exactly like this node's path. The changed clone never
+    // enters native certification, is never installed, and grants no authority.
+    marker.source_cut.source_root = canonical_destination(destination).unwrap();
+    validate_import_marker(destination, shard, &marker).unwrap();
+    let mut changed = marker.clone();
+    changed.receiver_local_source.as_mut().unwrap().source_identity.push('x');
+    assert!(validate_import_marker(destination, shard, &changed).is_err());
+    let mut changed = marker.clone();
+    changed.receiver_local_source.as_mut().unwrap().retained_source_root.push("foreign");
+    assert!(validate_import_marker(destination, shard, &changed).is_err());
+    let mut changed = marker;
+    changed.receiver_local_source.as_mut().unwrap().authority_binding.push('x');
+    assert!(validate_import_marker(destination, shard, &changed).is_err());
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 fn published_import_marker(
@@ -3102,11 +3147,14 @@ fn complete_installed_import_marker(
     proposal: &MetadataImportProposal,
     identity: &sinomo_dfs::DfsMetadataCandidateIdentity,
     installation_binding: &str,
+    receiver: Option<ReceiverLocalSourceBinding>,
 ) -> Result<()> {
-    let mut marker = read_import_marker(destination, &proposal.scope_shard)?
-        .ok_or_else(|| error("verified installed image has no retained marker"))?;
+    let path = destination.join("metadata-import-v7.json");
+    let mut marker: MetadataImportMarker = read_json(&path)?;
     if marker.authority_binding != installation_binding
         || marker.native_image != *identity
+        || marker.source_identity != proposal.source_identity
+        || marker.source_snapshot_fingerprint != proposal.source_snapshot_fingerprint
         || !crate::authority::same_source_cut(&marker.source_cut, &proposal.source_cut)
         || marker.receiver_local_source.as_ref().is_some_and(|local| {
             local.source_root != proposal.source_root
@@ -3119,8 +3167,21 @@ fn complete_installed_import_marker(
             "verified installation marker changed before completion",
         ));
     }
+    match (&marker.receiver_local_source, receiver) {
+        (Some(actual), Some(expected)) if actual == &expected => {}
+        (None, Some(expected)) if !marker.installation_complete => {
+            // The predecessor compared node-local pathname strings and omitted
+            // this binding on receivers with the same path as the primary.
+            // Only the existing installer, after fresh native certification and
+            // exact source/image checks, can complete that incomplete marker.
+            marker.receiver_local_source = Some(expected);
+        }
+        (None, None) => {}
+        _ => return Err(error("verified installation changes its retained receiver role")),
+    }
+    validate_import_marker(destination, &proposal.scope_shard, &marker)?;
     marker.installation_complete = true;
-    write_json(&destination.join("metadata-import-v7.json"), &marker)
+    write_json(&path, &marker)
 }
 fn select_data_goal(
     destination: &Path,
@@ -4568,66 +4629,43 @@ fn install_certified_stage_bound(
     };
     let certified_receiver = match (proposal, certificate) {
         (MetadataImportProposal::Native(native), MetadataImportCertificate::Native(seal)) => {
-            proposal.source_root == session.destination_root
-                && proposal.source_cut.source_root != proposal.source_root
-                && matches!(
-                    seal.joint_handoff_proof.cause,
-                    sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. }
-                )
-                && seal.joint_handoff_proof.handoff_id == native.expected_handoff.handoff_id
-                && seal.joint_handoff_proof.retiring_shard == native.expected_handoff.retiring_shard
-                && seal.joint_handoff_proof.desired_shard == native.expected_handoff.desired_shard
-                && seal
-                    .joint_handoff_proof
-                    .acknowledged_node_ids
-                    .contains(&authority.local_node_id()?)
-                && proposal.source_identity == session.inventory.fingerprint
-                && proposal.source_snapshot_fingerprint
-                    == session
-                        .inventory
-                        .snapshot_fingerprint()
-                        .unwrap_or(&session.inventory.fingerprint)
-                && proposal.source_exact_prefix.is_some()
+            if let Some(local) = seal.receiver_source.as_ref() {
+                let node = authority.local_node_id()?;
+                if proposal.source_root != session.destination_root
+                    || node == seal.joint_handoff_proof.retiring_shard.primary_node_id
+                    || !seal.joint_handoff_proof.desired_shard.replica_node_ids.contains(&node)
+                    || !matches!(seal.joint_handoff_proof.cause, sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. })
+                    || seal.joint_handoff_proof.handoff_id != native.expected_handoff.handoff_id
+                    || seal.joint_handoff_proof.retiring_shard != native.expected_handoff.retiring_shard
+                    || seal.joint_handoff_proof.desired_shard != native.expected_handoff.desired_shard
+                    || local.original_root != proposal.source_root
+                    || local.actual_root != session.source_root
+                    || local.source_identity != session.inventory.fingerprint
+                    || local.source_identity != proposal.source_identity
+                    || local.snapshot_fingerprint != session.inventory.snapshot_fingerprint().unwrap_or(&session.inventory.fingerprint)
+                    || local.snapshot_fingerprint != proposal.source_snapshot_fingerprint
+                    || Some(&local.source_prefix) != proposal.source_exact_prefix.as_ref()
+                    || local.source_prefix.version != 2 || local.source_fences.is_empty() {
+                    return Err(error("native receiver qualifier changes its actual local source or current role"));
+                }
+                true
+            } else { false }
         }
         _ => false,
     };
     let certified_native_format = if certified_receiver {
         original_native_root_format(&session.source_root)?
-    } else {
-        None
-    };
+    } else { None };
     let certified_current_receiver = certified_native_format.is_some();
-    let certified_legacy_receiver = if certified_receiver && !certified_current_receiver {
-        let MetadataImportCertificate::Native(seal) = certificate else {
-            return Err(error(
-                "legacy LOCAL binding has no native receiver certificate",
-            ));
-        };
-        let local = seal
-            .legacy_local_source
-            .as_ref()
-            .ok_or_else(|| error("legacy LOCAL binding has no authenticated receiver ledger"))?;
-        if local.original_root != proposal.source_root
-            || local.actual_root != session.source_root
-            || local.source_identity != session.inventory.fingerprint
-            || local.snapshot_fingerprint
-                != session
-                    .inventory
-                    .snapshot_fingerprint()
-                    .unwrap_or(&session.inventory.fingerprint)
-            || Some(&local.source_prefix) != proposal.source_exact_prefix.as_ref()
-            || !matches!(local.source_format_version, 3 | 6)
-            || local.source_prefix.version != 2
-            || local.source_fences.is_empty()
-        {
-            return Err(error(
-                "legacy LOCAL binding changes its verified source custody",
-            ));
+    let certified_legacy_receiver = certified_receiver && !certified_current_receiver;
+    if certified_receiver {
+        let MetadataImportCertificate::Native(seal) = certificate else { unreachable!() };
+        let local = seal.receiver_source.as_ref().expect("verified receiver qualifier");
+        if certified_native_format.is_some_and(|format| format != local.source_format_version)
+            || certified_legacy_receiver && !matches!(local.source_format_version, 3 | 6) {
+            return Err(error("native receiver qualifier changes its actual source codec"));
         }
-        true
-    } else {
-        false
-    };
+    }
     for fs in &proposal.file_system_ids {
         let local_format = if certified_current_receiver {
             certified_native_format
@@ -4636,7 +4674,7 @@ fn install_certified_stage_bound(
                 unreachable!()
             };
             Some(
-                seal.legacy_local_source
+                seal.receiver_source
                     .as_ref()
                     .expect("verified legacy source")
                     .source_format_version,
@@ -4678,6 +4716,19 @@ fn install_certified_stage_bound(
         }
     }
     session.inventory.verify(&session.source_root)?;
+    let receiver_binding = |retained_source_root: PathBuf| -> Result<Option<ReceiverLocalSourceBinding>> {
+        if !(certified_current_receiver || certified_legacy_receiver) { return Ok(None); }
+        Ok(Some(ReceiverLocalSourceBinding {
+            source_root: proposal.source_root.clone(),
+            source_identity: proposal.source_identity.clone(),
+            source_snapshot_fingerprint: proposal.source_snapshot_fingerprint.clone(),
+            source_exact_prefix: proposal.source_exact_prefix.clone()
+                .ok_or_else(|| error("certified receiver omits its exact local prefix"))?,
+            retained_source_root,
+            authority_binding: installation_binding.clone(),
+            proposal_fingerprint: certificate.proposal_fingerprint.clone(),
+        }))
+    };
     // Record only real native target-image ACKs before taking the exchange
     // writer fence. This also re-earns the same hints on interrupted completion.
     retain_native_import_publication_cursors(
@@ -4737,6 +4788,7 @@ fn install_certified_stage_bound(
                 proposal,
                 &identity,
                 &installation_binding,
+                receiver_binding(session.source_root.clone())?,
             )?;
         }
         complete_installation_intent(&session.staged_root, prior)?;
@@ -4811,24 +4863,7 @@ fn install_certified_stage_bound(
             "completed-original-candidate-stamp-v8.json",
         )?;
     }
-    let receiver_local_source = if (certified_current_receiver || certified_legacy_receiver)
-        && proposal.source_cut.source_root != session.destination_root
-    {
-        Some(ReceiverLocalSourceBinding {
-            source_root: proposal.source_root.clone(),
-            source_identity: proposal.source_identity.clone(),
-            source_snapshot_fingerprint: proposal.source_snapshot_fingerprint.clone(),
-            source_exact_prefix: proposal
-                .source_exact_prefix
-                .clone()
-                .ok_or_else(|| error("certified current receiver omits its exact local prefix"))?,
-            retained_source_root: source_retained.clone(),
-            authority_binding: installation_binding.clone(),
-            proposal_fingerprint: certificate.proposal_fingerprint.clone(),
-        })
-    } else {
-        None
-    };
+    let receiver_local_source = receiver_binding(source_retained.clone())?;
     write_json(
         &candidate_marker,
         &MetadataImportMarker {
@@ -4973,6 +5008,7 @@ fn install_certified_stage_bound(
             proposal,
             &identity,
             &installation_binding,
+            receiver_binding(source_retained.clone())?,
         )?;
     }
     complete_installation_intent(&session.staged_root, prior)?;
@@ -6646,7 +6682,7 @@ impl MetadataConverter {
             let source = crate::namespace_counts::NamespaceCountMaintenanceSource { captured };
             let limits = crate::namespace_counts::NamespaceCountMaintenanceLimits {
                 max_objects: 1_000_000, max_encoded_bytes: 64 * 1024 * 1024,
-                deadline: std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                deadline: None,
             };
             let plan = crate::namespace_counts::plan_standalone_namespace_count_maintenance(std::slice::from_ref(&source), limits)?;
             let objects = plan.counted_objects(&source, limits)?;
@@ -6709,6 +6745,25 @@ pub(crate) fn associate_completed_metadata_artifact(
 /// Exact installed-lineage DATA, including a still-Staged representation. This
 /// does not authorize activation or Ready: the owner must independently match
 /// its original job/target generation and actual completed native proof.
+pub(crate) fn interrupted_receiver_source_cut(
+    destination: &Path, shard: &DfsMetadataShardId, original_plan: &Path,
+) -> Result<Option<MetadataSourceCut>> {
+    let destination = canonical_destination(destination)?;
+    let stage = conversion_stage_base_path(&destination, shard)?;
+    let Some(interrupted) = recovery::resolve_interrupted_installation(&destination, &stage)? else {
+        return Ok(None);
+    };
+    if interrupted.position != recovery::InstallationPosition::CandidatePublished
+        || interrupted.candidate.join("native-import-plan.json") != original_plan
+        || interrupted.proposal.scope_shard != *shard {
+        return Err(error("interrupted receiver differs from its original plan relocation"));
+    }
+    // Inert relocation DATA only. The owner still matches its job and plan and
+    // re-earns the actual receiver certificate before completing installation.
+    Ok(Some(interrupted.proposal.source_cut.clone()))
+}
+
+/// Completed installed-lineage DATA, never independent activation authority.
 pub(crate) fn installed_metadata_source_cut(
     destination: &Path, shard: &DfsMetadataShardId,
 ) -> Result<Option<MetadataSourceCut>> {

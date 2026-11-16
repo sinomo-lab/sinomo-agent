@@ -296,10 +296,8 @@ pub(crate) fn stage_namespace_count_cohort_at_roots(
     ))?;
     let mut members = Vec::new();
     for source in sources {
-        if std::time::Instant::now() >= limits.deadline {
-            return Err(invalid(
-                "count cohort staging reached its original deadline",
-            ));
+        if limits.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(MetadataBackendError::PreparationBudgetExhausted { work: "count-cohort staging" });
         }
         let captured = &source.captured;
         captured.validate()?;

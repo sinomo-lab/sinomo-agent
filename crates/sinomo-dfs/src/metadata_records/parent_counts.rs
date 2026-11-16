@@ -70,6 +70,9 @@ pub enum DfsParentCountRejection {
     ParentChanged,
     AssignmentChanged,
     ReservationUnavailable,
+    /// The exact initial root offer was rejected and its actual source owner
+    /// revoked every unbound claim before publishing this withdrawal decision.
+    RootAdoptionRejected,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -315,8 +318,10 @@ impl DfsParentCountPlan {
                 return Err(fail());
             }
         }
-        if self.phase == DfsParentCountPhase::Aborting && job.processed_object_count != 0 {
-            return Err(fail());
+        if self.phase == DfsParentCountPhase::Aborting {
+            if self.rejection == Some(DfsParentCountRejection::RootAdoptionRejected) {
+                if job.initial_directory_root_adoption().is_none() { return Err(fail()); }
+            } else if job.processed_object_count != 0 { return Err(fail()); }
         }
         if self.phase == DfsParentCountPhase::Settling
             && !matches!(
@@ -327,6 +332,30 @@ impl DfsParentCountPlan {
             return Err(fail());
         }
         Ok(())
+    }
+}
+
+impl DfsNamespaceJobRecord {
+    /// Structural boundary only: DirStart has planned the original root, but
+    /// its adoption and source completion are both still pending. The source
+    /// cancellation owner must separately prove that no target can apply it.
+    pub(crate) fn initial_directory_root_adoption(&self) -> Option<&DfsObjectMetadata> {
+        let [
+            DfsNamespaceJobFrame::CrossShardDirFinish { source_root, count_plan: Some(counts) },
+            DfsNamespaceJobFrame::CrossShardDirScan { source_path, target_path, cursor: None },
+            DfsNamespaceJobFrame::CrossShardComplete { moved_object: completion, old_path: completion_source },
+            DfsNamespaceJobFrame::CrossShardAdopt { moved_object, old_path, promotion_alias: None, .. },
+        ] = self.pending_frames.as_slice() else { return None; };
+        let original = &counts.parent_participants.as_ref()?.participants.first()?.binding.source;
+        (self.kind == DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+            && self.processed_object_count == 1
+            && source_root == &self.root_path && source_path == source_root
+            && old_path == source_root && completion_source == source_root
+            && self.target_path.as_ref() == Some(target_path)
+            && &moved_object.path == target_path && moved_object == completion
+            && moved_object.kind == DfsObjectKind::Directory
+            && original.object_id == moved_object.object_id)
+            .then_some(moved_object)
     }
 }
 

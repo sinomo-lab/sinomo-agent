@@ -66,6 +66,11 @@ impl DfsMetadataSnapshotImage {
     /// The caller holds the ordinary exclusive candidate writer. Keep every
     /// validated native record and its exact framing during hidden installation.
     pub(crate) fn install_candidate_copy(&self, root: &Path) -> Result<()> {
+        self.stage_candidate_copy(root)?.install(root)
+    }
+    /// Keep the validated copy outside records/journal while their old state
+    /// is archived. The caller still owns the native installation permit.
+    pub(crate) fn stage_candidate_copy(&self, root: &Path) -> Result<StagedSnapshot> {
         self.validate()?;
         let destination = crate::metadata_table_store::metadata_table_snapshot_path(root);
         let parent = destination.parent().ok_or_else(|| {
@@ -80,8 +85,7 @@ impl DfsMetadataSnapshotImage {
                 path: self.0.staged.path().to_owned(),
                 source,
             })?;
-        crate::metadata_snapshot::copy_snapshot_stream(root, source, self.descriptor())?
-            .install(root)
+        crate::metadata_snapshot::copy_snapshot_stream(root, source, self.descriptor())
     }
     pub fn attachment_source(
         &self,
