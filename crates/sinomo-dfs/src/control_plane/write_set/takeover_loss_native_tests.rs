@@ -1812,6 +1812,10 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
         catch_up(&runtime, &config, member);
     }
     keep_with_paths(&runtime, &config, &[&b, &c]);
+    // The members hold the write's prepare before P commits it. Every later
+    // batch P sends them starts with that commit record: its background
+    // publication, and the prepare of the change P makes next to record the
+    // write's eventual copies. Holding all of them keeps the commit on P.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     for member in [&b, &c] {
@@ -1822,7 +1826,7 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
             call_id: None,
             origin: None,
             remaining_hits: 8,
-            action: FaultAction::PauseWriteCommitPublication {
+            action: FaultAction::PauseWriteCommitCarriage {
                 gate: Arc::clone(&gate),
                 captured: Arc::clone(&captured),
             },
@@ -1852,6 +1856,10 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
     });
     let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
     let (original, recovery) = recovered_operation(&runtime, &winner, &config);
+    assert!(
+        original.starts_with("write:"),
+        "the successor recovers the write itself, not a later change: {original}"
+    );
     wait_until(
         "the successor commits the recovery",
         &runtime,
