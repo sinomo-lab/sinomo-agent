@@ -37,8 +37,8 @@ pub(in crate::runtime_host) enum TakeOutcome {
 
 /// Confirm the record with one authoritative read: it must still name the
 /// primary judged lost at the attempt's epoch, with this node in the write
-/// set. Only a node that can reach a KV quorum can read it, so a node on the
-/// minority side of a partition fails here.
+/// set, and admit this node's swap. Only a node that can reach a KV quorum
+/// can read it, so a node on the minority side of a partition fails here.
 pub(in crate::runtime_host) fn confirm_metadata_takeover_record(
     cluster_paths: &ClusterPaths,
     runtime: &tokio::runtime::Handle,
@@ -88,6 +88,16 @@ pub(in crate::runtime_host) fn confirm_metadata_takeover_record(
                 cut.shard.epoch,
                 if in_write_set { "in" } else { "outside" }
             ),
+        });
+    }
+    // The swap is built from this cut only after the promise. A cut that
+    // cannot build it, such as one whose filesystem configuration reserves
+    // the catalog for a pending storage transition, promises nothing; the
+    // attempt is planned again when the publication or the verdicts move.
+    if let Err(error) = crate::check_metadata_takeover_swap(&cut, local) {
+        return Err(TakeOutcome::NotTaken {
+            follow: false,
+            reason: format!("the record admits no swap: {error}"),
         });
     }
     Ok(cut)
@@ -169,6 +179,15 @@ pub(in crate::runtime_host) fn settle_takeover_promise(
     if test_hooks::stops_after_promise(data_dir) {
         return TakeOutcome::Failed {
             reason: "stopped after the promise".into(),
+        };
+    }
+    // This node checked the same cut before it promised, so its swap builds.
+    // Only a promise written before that check existed can fail here; its
+    // identical request may already be in flight, so the promise is kept
+    // rather than released, and nothing re-sends a swap that cannot be built.
+    if let Err(error) = crate::check_metadata_takeover_swap(&promise.cut, local) {
+        return TakeOutcome::Failed {
+            reason: format!("the promise's swap cannot be built from its cut: {error}"),
         };
     }
     let Some(mut client) = daemon_dfs_control_plane_client_on_runtime(cluster_paths, Some(runtime))

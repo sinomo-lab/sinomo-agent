@@ -62,7 +62,7 @@ impl NativeImportAuthority {
             proof.cause,
             sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. }
         ) || proof.handoff_id != request.handoff_id
-            || proof.desired_shard != current
+            || !sinomo_dfs::metadata_shard_storage_scope_matches(&proof.desired_shard, &current)
             || current.file_system_id != request.file_system_id
             || current.shard_id != request.shard_id.0
             || (caller != current.primary_node_id && !current.replica_node_ids.contains(&caller))

@@ -380,7 +380,8 @@ pub(crate) async fn pause_decoded_write_commit_publication(
         let observation = &context.observation;
         let mut rules = fabric.faults.lock().unwrap();
         let Some(rule) = rules.iter_mut().find(|rule| {
-            (matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+            (matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. }
+                | FaultAction::PauseWriteCommitCarriage { .. })
                 || matches!(&rule.action, FaultAction::PauseExactWriteCommitPublication { operation_id, .. }
                     if operation_id.starts_with("write:")
                         && observation.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
@@ -397,7 +398,8 @@ pub(crate) async fn pause_decoded_write_commit_publication(
                 && rule.origin.is_none_or(|origin| origin == observation.origin)
                 && rule.call_id.is_none_or(|id| id == observation.call_id)
         }) else { return Ok(None); };
-        if !command.durable_replication.as_ref().is_some_and(|purpose| purpose.background_publication)
+        let any_publication = matches!(rule.action, FaultAction::PauseWriteCommitCarriage { .. });
+        if !(any_publication || command.durable_replication.as_ref().is_some_and(|purpose| purpose.background_publication))
             || !command.batch.decoded().is_ok_and(|batch| batch.entries.iter().any(|entry| {
                 matches!(&entry.mutation, crate::DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. }
                     if digest.operation_id.starts_with("write:"))
@@ -408,7 +410,8 @@ pub(crate) async fn pause_decoded_write_commit_publication(
         }
         rule.remaining_hits -= 1;
         let (gate, captured) = match &rule.action {
-            FaultAction::PauseWriteCommitPublication { gate, captured } => (gate, captured),
+            FaultAction::PauseWriteCommitPublication { gate, captured }
+            | FaultAction::PauseWriteCommitCarriage { gate, captured } => (gate, captured),
             FaultAction::PauseExactWriteCommitPublication { gate, captured, .. } => {
                 if captured.lock().unwrap().len() >= 32 { return Err(ServiceError::Service("bounded exact write publication capture exhausted".into())); }
                 (gate, captured)
@@ -526,6 +529,14 @@ pub enum FaultAction {
     /// Hold a real committed-write journal publication before receiver ingress.
     /// Prepare/authority RPCs remain untouched; no successful reply is supplied.
     PauseWriteCommitPublication {
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
+    /// Hold every real journal batch carrying a committed write's commit
+    /// record before receiver ingress, whichever publication sends it: the
+    /// next change's prepare carries that commit in the same batch, ahead of
+    /// its own prepare. Batches without such a record remain untouched.
+    PauseWriteCommitCarriage {
         gate: Arc<Semaphore>,
         captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
     },
@@ -689,6 +700,7 @@ impl Fabric {
             {
                 if let FaultAction::PauseBeforeDispatch(gate)
                 | FaultAction::PauseWriteCommitPublication { gate, .. }
+                | FaultAction::PauseWriteCommitCarriage { gate, .. }
                 | FaultAction::PauseExactWriteCommitPublication { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
                 | FaultAction::PauseStatMetadataReplyAfterDispatch { gate, .. }
@@ -757,6 +769,7 @@ impl Fabric {
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
                     FaultAction::PauseWriteCommitPublication { .. }
+                    | FaultAction::PauseWriteCommitCarriage { .. }
                     | FaultAction::PauseExactWriteCommitPublication { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {

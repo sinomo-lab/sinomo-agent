@@ -316,7 +316,7 @@ fn registered_native_control_read_keeps_local_provenance_and_remote_contention_f
         "hold the actual resident read projection as well as mutation admission"
     );
     let started = std::time::Instant::now();
-    let (rejected, ended) = {
+    let (rejected, refused) = {
         let native = owner.native.as_ref().unwrap().lock().unwrap();
         let rejected = native
             .rpc_request(&node, &node, request(), budget)
@@ -333,23 +333,25 @@ fn registered_native_control_read_keeps_local_provenance_and_remote_contention_f
                     && r.phase == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::Constructed
             })
             .expect("actual explicit raw request");
-        let ended = observations
+        // The receiver's busy KV handler answers with an error response, as
+        // the daemon sends a handler's refusal, so the same call completes
+        // with that refusal instead of ending without a response.
+        let refused = observations
             .iter()
             .find(|r| {
                 r.call_id == constructed.call_id
-                    && r.phase
-                        == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
+                    && r.phase == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::Completed
             })
-            .expect("same explicit raw request ended without response")
+            .expect("same explicit raw request completed with the receiver's refusal")
             .clone();
-        (rejected, ended)
+        (rejected, refused)
     };
     assert!(
         rejected.contains("local Raft admission is busy"),
         "{rejected}"
     );
     assert!(started.elapsed() < budget);
-    assert!(!ended.signer.unwrap().is_local());
+    assert!(!refused.signer.unwrap().is_local());
     drop(resident);
     drop(held);
     owner

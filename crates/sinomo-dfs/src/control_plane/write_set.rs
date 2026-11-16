@@ -586,6 +586,20 @@ fn switched_write_set(
     }
 }
 
+/// Whether `cut` admits a write-set change at all: its filesystem
+/// configuration is captured, belongs to the shard's filesystem and reserves
+/// no catalog for a pending storage transition. Every builder applies it.
+/// The catalog generation is not read: it guards path assignment, which no
+/// write-set change alters.
+fn write_set_change_admitted(cut: &DfsMetadataShardRecordCut) -> Result<(), KvError> {
+    let config = cut.file_system_config()?.ok_or_else(||
+        refuse(cut, "write-set change requires the captured filesystem configuration"))?;
+    if config.file_system_id != cut.shard.file_system_id {
+        return Err(refuse(cut, "write-set change has a foreign filesystem configuration"));
+    }
+    super::catalog::validate_catalog_transition(&config, None)
+}
+
 fn change_request(
     cut: &DfsMetadataShardRecordCut,
     request_id: KvRequestId,
@@ -594,12 +608,7 @@ fn change_request(
     shard: Option<DfsMetadataShardConfig>,
     extra_success: Vec<KvOp>,
 ) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
-    let config = cut.file_system_config()?.ok_or_else(||
-        refuse(cut, "write-set change requires the captured filesystem configuration"))?;
-    if config.file_system_id != cut.shard.file_system_id {
-        return Err(refuse(cut, "write-set change has a foreign filesystem configuration"));
-    }
-    super::catalog::validate_catalog_transition(&config, None)?;
+    write_set_change_admitted(cut)?;
     if let Some(shard) = shard.as_ref() {
         write_set
             .validate_against(shard)
@@ -610,7 +619,6 @@ fn change_request(
             .map_err(|reason| refuse(cut, reason))?;
     }
     let mut all = cut.record_compares();
-    all.push(cut.file_system_config_compare());
     all.append(&mut compares);
     let mut success = vec![KvOp::put_serde(
         cut.key(metadata_shard_write_set_key),
@@ -619,11 +627,6 @@ fn change_request(
     )?];
     if let Some(shard) = shard.as_ref() {
         success.push(KvOp::put_serde(cut.key(metadata_shard_key), shard, None)?);
-        if shard != &cut.shard {
-            let successor = metadata_catalog_generation_successor(&config)?;
-            success.push(KvOp::put_serde(file_system_config_key(&config.file_system_id), &successor, None)?);
-        }
-
     }
     success.extend(extra_success);
     Ok(DfsMetadataWriteSetChangeRequest {
@@ -717,11 +720,14 @@ pub fn build_metadata_write_set_switch_with_raised_n(
             "the initial write set must be configured members including the primary",
         ));
     }
+    // A switched shard refuses its storage import, so a switch built before
+    // a storage transition reserved the catalog must not commit after it.
     let mut compares = vec![
         handoff_missing(cut)?,
         KvCompare::Missing {
             key: cut.key(metadata_shard_operation_floor_key),
         },
+        cut.file_system_config_compare(),
     ];
     let mut cluster_id = None;
     for node in &configured {
@@ -784,6 +790,8 @@ pub fn build_metadata_write_set_shrink(
         change_id(&request_id),
     )?;
     next.write_set.retain(|member| member != node_id);
+    // The W floor comes from the placement rules in the filesystem
+    // configuration.
     let compares = vec![handoff_missing(cut)?, cut.file_system_config_compare()];
     change_request(cut, request_id, compares, next, None, Vec::new())
 }
@@ -874,6 +882,7 @@ pub fn build_metadata_write_set_recruit(
         }
         _ => {}
     }
+    // N comes from the placement rules in the filesystem configuration.
     let mut compares = vec![handoff_missing(cut)?, cut.file_system_config_compare()];
     compares.extend(metadata_write_set_member_capability_compares(
         cut.member(node_id)?,
@@ -987,6 +996,8 @@ pub fn build_metadata_write_set_remove(
     shard
         .replica_node_ids
         .retain(|node| !node_ids.contains(node));
+    // The W floor comes from the placement rules in the filesystem
+    // configuration.
     let mut compares = vec![handoff_missing(cut)?, cut.file_system_config_compare()];
     // A head watermark that acknowledges a removed member could not be
     // normalized against the reduced configuration again.
@@ -1005,28 +1016,23 @@ pub fn build_metadata_write_set_remove(
     change_request(cut, request_id, compares, next, Some(shard), extra)
 }
 
-/// The takeover swap: `candidate` becomes primary at the next epoch and the
-/// old primary leaves the write set, if and only if the whole record still
-/// equals the candidate's cut. The request is a pure function of its inputs,
-/// so the candidate can resubmit the identical request to settle an unknown
-/// outcome.
-pub fn build_metadata_takeover_swap(
+/// The parts of a takeover swap that depend only on the record cut and the
+/// candidate, with every refusal they can raise.
+struct TakeoverSwapInputs {
+    current: DfsMetadataShardWriteSet,
+    shard: DfsMetadataShardConfig,
+    compares: Vec<KvCompare>,
+}
+
+fn takeover_swap_inputs(
     cut: &DfsMetadataShardRecordCut,
     candidate: &NodeId,
-    epoch_start: &crate::DfsMetadataPrefixProof,
-    request_id: &KvRequestId,
-) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+) -> Result<TakeoverSwapInputs, KvError> {
     let current = switched_write_set(cut)?;
     if candidate == &cut.shard.primary_node_id || !current.contains(candidate) {
         return Err(refuse(
             cut,
             format!("{candidate} is not a write-set member other than the primary"),
-        ));
-    }
-    if !epoch_start.is_well_formed() {
-        return Err(refuse(
-            cut,
-            "the epoch start is not a well-formed prefix proof",
         ));
     }
     let shard = metadata_shard_primary_handoff_target(&cut.shard, candidate)?;
@@ -1044,6 +1050,50 @@ pub fn build_metadata_takeover_swap(
         cut.member(candidate)?,
         &mut None,
     )?);
+    write_set_change_admitted(cut)?;
+    Ok(TakeoverSwapInputs {
+        current,
+        shard,
+        compares,
+    })
+}
+
+/// Whether a takeover swap can be built from `cut` for `candidate`: every
+/// refusal [`build_metadata_takeover_swap`] can raise except a malformed
+/// epoch start, which the promise itself produces. A candidate checks this
+/// before it promises, because its swap is built from the same cut only after
+/// the promise, and a promise whose swap can never be submitted could never
+/// settle.
+pub fn check_metadata_takeover_swap(
+    cut: &DfsMetadataShardRecordCut,
+    candidate: &NodeId,
+) -> Result<(), KvError> {
+    takeover_swap_inputs(cut, candidate).map(|_| ())
+}
+
+/// The takeover swap: `candidate` becomes primary at the next epoch and the
+/// old primary leaves the write set, if and only if the whole record still
+/// equals the candidate's cut. The request is a pure function of its inputs,
+/// so the candidate can resubmit the identical request to settle an unknown
+/// outcome. It compares no filesystem configuration: a sibling shard's swap
+/// or keeper change never rejects it.
+pub fn build_metadata_takeover_swap(
+    cut: &DfsMetadataShardRecordCut,
+    candidate: &NodeId,
+    epoch_start: &crate::DfsMetadataPrefixProof,
+    request_id: &KvRequestId,
+) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+    let TakeoverSwapInputs {
+        current,
+        shard,
+        compares,
+    } = takeover_swap_inputs(cut, candidate)?;
+    if !epoch_start.is_well_formed() {
+        return Err(refuse(
+            cut,
+            "the epoch start is not a well-formed prefix proof",
+        ));
+    }
     let mut next = current.next(
         DfsMetadataShardWriteSetChangeKind::Takeover {
             previous_primary_node_id: cut.shard.primary_node_id.clone(),

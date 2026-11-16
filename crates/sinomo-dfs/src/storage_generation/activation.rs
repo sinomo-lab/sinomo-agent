@@ -109,13 +109,15 @@ pub async fn activate_metadata_storage_generation(
     // The committed quorum selects the exact generation/image. A configured
     // replica may install it later; activation still checks its actual owner,
     // current assignment and complete physical image under the writer fence.
+    // The proof binds the shard's storage identity and the transition, not
+    // the serving configuration: a later takeover, rotation, recruit or
+    // removal leaves a lagging holder's staged copy activatable.
     if fs.file_system_id != identity.file_system_id
         || shard.file_system_id != identity.file_system_id
         || shard.shard_id != identity.shard_id.0
-        || proof.desired_shard != shard
-        || proof.retiring_shard.file_system_id != shard.file_system_id
-        || proof.retiring_shard.shard_id != shard.shard_id
-        || proof.retiring_shard.epoch.checked_add(1) != Some(shard.epoch)
+        || !crate::metadata_shard_storage_scope_matches(&proof.desired_shard, &shard)
+        || !crate::metadata_shard_storage_scope_matches(&proof.retiring_shard, &shard)
+        || proof.retiring_shard.epoch.checked_add(1) != Some(proof.desired_shard.epoch)
         || (shard.primary_node_id != local && !shard.replica_node_ids.contains(&local))
         || generation != &identity.generation
         || *target_format != u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
