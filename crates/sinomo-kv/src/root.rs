@@ -454,7 +454,7 @@ pub use rpc::{
     ClusterKvRequestOutcomeRequest, ClusterKvRpcPayload, ClusterKvStateAuthorityVoteRequest,
     ClusterKvStateAuthorityVoteResponse, ClusterKvTxnRpcResponse, ClusterKvWatchEventsRequest,
     ClusterKvWatchEventsResponse, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    ClusterRaftReadIndexProbeGap, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
     cluster_kv_authoritative_entries_response_rpc_payload,
     cluster_kv_authoritative_entries_rpc_payload,
     cluster_kv_authoritative_entry_response_rpc_payload,

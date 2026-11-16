@@ -16,8 +16,8 @@ use crate::raft_quorum::{
 };
 use sinomo_kv::{
     ClusterKvRaftReadIndexProbeMetadata, ClusterKvRaftReadIndexProbeOutcome,
-    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse, RaftAppendEntriesResponse,
+    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftReadIndexProbeGap,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse, RaftAppendEntriesResponse,
 };
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -217,6 +217,7 @@ fn handle_cluster_raft_append_request_durable(
     authenticated_peer: &ClusterAuthenticatedPeer,
 ) -> Result<ClusterRaftAppendResponse, NetworkError> {
     let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
+    let marked_probe_term = request.read_index_probe.then_some(request.append.term);
     let mut state = read_cluster_consensus_state(paths)?;
     if request.state.cluster_id != state.cluster_id {
         return cluster_raft_append_rejection(
@@ -263,6 +264,13 @@ fn handle_cluster_raft_append_request_durable(
     // role projection so restart/local demotion cannot resurrect stale voters.
     project_committed_cluster_raft_config(paths, &mut state)?;
     write_cluster_state_unlocked(paths, &state)?;
+    // A marked probe that reached this path was evaluated by the ordinary
+    // AppendEntries rules from the authorized leader's own term. A same-term
+    // rejection there is the follower's log not holding the anchor; the
+    // probe carries no entries, so only the leader's append closes the gap.
+    let read_index_gap = marked_probe_term
+        .filter(|term| !append.success && append.term == *term)
+        .map(|_| ClusterRaftReadIndexProbeGap::LogGap);
     Ok(ClusterRaftAppendResponse {
         accepted: append.success,
         detail: if append.success {
@@ -272,6 +280,7 @@ fn handle_cluster_raft_append_request_durable(
         },
         state,
         append,
+        read_index_gap,
     })
 }
 
@@ -300,6 +309,7 @@ fn marked_read_index_probe_response(
         detail: detail.into(),
         state,
         append,
+        read_index_gap: None,
     }
 }
 
@@ -376,8 +386,10 @@ fn handle_cluster_raft_read_index_probe_request(
         .raft_store()
         .read_index_probe(&local_state.local_node_id, &request.append)
         .map_err(kv_err)?;
-    let (metadata, append, detail) = match outcome {
+    let resident_cold = matches!(outcome, ClusterKvRaftReadIndexProbeOutcome::Cold);
+    let (metadata, append, detail, read_index_gap) = match outcome {
         ClusterKvRaftReadIndexProbeOutcome::NeedsDurable
+        | ClusterKvRaftReadIndexProbeOutcome::Cold
             if request.append.term <= local_state.term =>
         {
             let leader_authorized_by_local_config =
@@ -387,7 +399,7 @@ fn handle_cluster_raft_read_index_probe_request(
                         authenticated_peer,
                         &request.append.leader_id,
                     );
-            return Ok(Some(marked_read_index_probe_rejection(
+            let mut rejection = marked_read_index_probe_rejection(
                 local_state.as_ref().clone(),
                 local_state.term,
                 if leader_authorized_by_local_config {
@@ -399,13 +411,21 @@ fn handle_cluster_raft_read_index_probe_request(
                         request.append.leader_id
                     )
                 },
-            )));
+            );
+            // A cold node still answers fast and outside the durable queues.
+            // The probe does not load it, so the rejection names it cold: the
+            // authorized leader then owes it the ordinary append that does.
+            if resident_cold && leader_authorized_by_local_config {
+                rejection.read_index_gap = Some(ClusterRaftReadIndexProbeGap::ResidentCold);
+            }
+            return Ok(Some(rejection));
         }
         // A request above the locally projected term is a mandatory durable
         // safety observation. The preflight publisher has already raised the
         // process-local authority fence; retain the ordinary AppendEntries path
         // so hard state is advanced before any later acknowledgement.
-        ClusterKvRaftReadIndexProbeOutcome::NeedsDurable => return Ok(None),
+        ClusterKvRaftReadIndexProbeOutcome::NeedsDurable
+        | ClusterKvRaftReadIndexProbeOutcome::Cold => return Ok(None),
         // The probe carries a commit index, leader or term the resident has not
         // recorded. Rejecting it would leave this follower unable to answer
         // every later probe of the same read, since the waiting leader sends
@@ -418,10 +438,13 @@ fn handle_cluster_raft_read_index_probe_request(
                 success: false,
                 match_index: 0,
             };
+            // A busy owner checks the node back in on its own; the leader's
+            // paced re-send asks again, so this rejection names no gap.
             (
                 metadata,
                 append,
                 "Raft ReadIndex probe deferred while resident state is busy",
+                None,
             )
         }
         ClusterKvRaftReadIndexProbeOutcome::Responded { response, metadata } => {
@@ -430,7 +453,12 @@ fn handle_cluster_raft_read_index_probe_request(
             } else {
                 "Raft ReadIndex probe rejected by resident state"
             };
-            (metadata, response, detail)
+            // The idle resident recorded this leader for the probe's term and
+            // its log does not hold the anchor. A lower-term probe is answered
+            // with the higher term instead and names no gap.
+            let read_index_gap = (!response.success && response.term == request.append.term)
+                .then_some(ClusterRaftReadIndexProbeGap::LogGap);
+            (metadata, response, detail, read_index_gap)
         }
     };
     let projected_state =
@@ -452,11 +480,9 @@ fn handle_cluster_raft_read_index_probe_request(
             ),
         )));
     }
-    Ok(Some(marked_read_index_probe_response(
-        projected_state,
-        append,
-        detail,
-    )))
+    let mut response = marked_read_index_probe_response(projected_state, append, detail);
+    response.read_index_gap = read_index_gap;
+    Ok(Some(response))
 }
 
 fn cluster_raft_append_rejection(
@@ -472,6 +498,7 @@ fn cluster_raft_append_rejection(
             .kv_paths()
             .raft_append_rejection_response(&state.local_node_id)
             .map_err(kv_err)?,
+        read_index_gap: None,
     })
 }
 

@@ -1760,7 +1760,7 @@ fn read_resident_raft_read_index_probe(
         .get(&paths.root)
         .cloned()
     else {
-        return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsDurable);
+        return Ok(ClusterKvRaftReadIndexProbeOutcome::Cold);
     };
     slot.touch();
     let mut state = slot.state.lock().map_err(|error| KvError::Io {
@@ -1800,7 +1800,7 @@ fn read_resident_raft_read_index_probe(
             metrics::counter!("sinomo.kv.raft.resident.opens", "outcome" => "probe_invalidated")
                 .increment(1);
         }
-        return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsDurable);
+        return Ok(ClusterKvRaftReadIndexProbeOutcome::Cold);
     }
     let resident = state
         .cached
@@ -3544,6 +3544,12 @@ pub enum ClusterKvRaftReadIndexProbeOutcome {
     /// No exact resident classification is available, or the request carries a
     /// genuinely newer term which must pass through normal durable Raft.
     NeedsDurable,
+    /// No resident node is loaded for this root, or the cached one no longer
+    /// owns it. A probe never loads one, and unlike a busy owner nothing is
+    /// about to check one in; the leader's ordinary append loads it, and a
+    /// leader whose read waits on this answer sends one only once it learns
+    /// the node is cold.
+    Cold,
     /// The idle resident node cannot answer from its retained state because
     /// the probe carries leadership or commit state the node has not recorded:
     /// a newer term, a leader it has not yet heard from, or, at a matching
@@ -4889,6 +4895,7 @@ where
                 success: false,
                 match_index: 0,
             },
+            read_index_gap: None,
         }),
         watch_event_fanout_needed: false,
     })
@@ -4956,6 +4963,7 @@ where
                 success: false,
                 match_index: 0,
             },
+            read_index_gap: None,
         }),
         watch_event_fanout_needed: false,
     })

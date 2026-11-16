@@ -61,8 +61,8 @@ use sinomo_core::node::ClusterId;
 #[cfg(test)]
 use sinomo_core::node::{ClusterInviteId, cluster_member_key};
 use sinomo_core::node::{
-    DAEMON_MAIN_RUN_CAPABILITY, NodeId, cluster_member_expected_daemon_process,
-    cluster_member_is_local_process, shadow_daemon_node_id,
+    NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
+    shadow_daemon_node_id,
 };
 use sinomo_core::node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_core::{
@@ -4003,215 +4003,31 @@ impl ClusterNetworkMaintenance {
     }
 }
 
-/// A restored route to a peer, or contact from a known-behind peer, is the
-/// recovery event for a missed committed fanout. It owns one target-keyed Raft
-/// catch-up attempt per peer; there is no periodic KV pull or retry sweep. Raft
-/// append rejection/backtracking remains the only gap-recovery protocol and
-/// naturally falls back to an authoritative snapshot when the leader has
-/// compacted the missing prefix.
+/// A restored route to a peer, contact from a known-behind peer, or a marked
+/// ReadIndex probe that showed the peer's append gap starts that peer's
+/// targeted Raft catch-up. The cluster crate owns the attempt; each one uses
+/// its own daemon transport on this runtime.
 pub(crate) fn spawn_cluster_raft_member_catch_up(
     runtime: &tokio::runtime::Handle,
     paths: ClusterPaths,
     state: ClusterBootstrapState,
     target_node_ids: Vec<NodeId>,
 ) {
-    if target_node_ids.is_empty() {
-        return;
-    }
-    let worker_runtime = runtime.clone();
-    runtime.spawn(async move {
-        catch_up_cluster_raft_members_async(paths, state, target_node_ids, worker_runtime).await;
-    });
-}
-
-async fn catch_up_cluster_raft_members_async(
-    paths: ClusterPaths,
-    state: ClusterBootstrapState,
-    target_node_ids: Vec<NodeId>,
-    runtime: tokio::runtime::Handle,
-) {
-    let target_node_ids = target_node_ids
-        .into_iter()
-        .filter(|target_node_id| {
-            *target_node_id != state.local_node_id
-                && state.members.iter().any(|member| {
-                    member.node_id == *target_node_id
-                        && member.state.is_authorized()
-                        && member
-                            .capabilities
-                            .iter()
-                            .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
-                })
-        })
-        .filter(|target_node_id| {
-            sinomo_core::cluster::claim_cluster_raft_peer_catch_up(&paths, target_node_id)
-        })
-        .collect::<BTreeSet<_>>();
-    if target_node_ids.is_empty() {
-        return;
-    }
-    let release_unattempted = |accepted: bool| {
-        for target_node_id in &target_node_ids {
-            sinomo_core::cluster::finish_cluster_raft_peer_catch_up(
-                &paths,
-                target_node_id,
-                accepted,
-            );
-        }
-    };
-
-    let read_paths = paths.clone();
-    let read_state = state.clone();
-    let leader_inputs = runtime
-        .spawn_blocking(move || {
-            if !read_paths
-                .kv_paths()
-                .locked_raft_local_is_leader(&read_state)
-                .map_err(sinomo_core::network::NetworkError::directory)?
-            {
-                return Ok(None);
-            }
-            sinomo_core::kv::read_cluster_kv_watch_events(&read_paths.kv_paths())
-                .map(|read| Some(read.events))
-                .map_err(sinomo_core::network::NetworkError::directory)
-        })
-        .await;
-    let events = match leader_inputs {
-        Ok(Ok(Some(events))) => Arc::new(events),
-        // Only the leader replicates; a follower has no catch-up to owe.
-        Ok(Ok(None)) => {
-            release_unattempted(true);
-            return;
-        }
-        Ok(Err(error)) => {
-            tracing::debug!(
-                target: "sinomo.cluster.raft_catch_up",
-                %error,
-                "peer Raft catch-up could not read leader state"
-            );
-            release_unattempted(false);
-            return;
-        }
-        Err(error) => {
-            tracing::debug!(
-                target: "sinomo.cluster.raft_catch_up",
-                %error,
-                "peer Raft catch-up leader-state task failed"
-            );
-            release_unattempted(false);
-            return;
-        }
-    };
-
     let timeouts = cluster_control_plane_timeouts();
-    let fanout_options = timeouts.committed_fanout_options();
-    let mut tasks = tokio::task::JoinSet::new();
-    for target_node_id in target_node_ids.iter().cloned() {
-        let paths = paths.clone();
-        let state = state.clone();
-        let events = events.clone();
-        let runtime = runtime.clone();
-        tasks.spawn(async move {
-            let result = async {
-                let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-                    DaemonClusterRpcMode::new(runtime),
-                    timeouts,
-                );
-                let outcome = sinomo_core::cluster::replicate_cluster_kv_to_node_async_with_host(
-                    &paths,
-                    &state,
-                    &target_node_id,
-                    events.as_slice(),
-                    timeouts,
-                    fanout_options.raft_append_timeout,
-                    &mut host,
-                )
-                .await?;
-                if !outcome.response.accepted {
-                    return Ok::<_, sinomo_core::network::NetworkError>(None);
-                }
-                if outcome.watch_event_fanout_needed {
-                    for event_batch in
-                        sinomo_core::kv::cluster_kv_watch_event_fanout_batches(events.as_slice())
-                    {
-                        let request = ClusterKvWatchEventsRequest {
-                            state: state.clone(),
-                            leader_id: state.local_node_id.clone(),
-                            events: event_batch.to_vec(),
-                        };
-                        let response = sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost::send_cluster_kv_watch_events_to_node_async(
-                            &mut host,
-                            &state,
-                            &target_node_id,
-                            &request,
-                            fanout_options.watch_event_timeout,
-                        )
-                        .await;
-                        if !response.is_ok_and(|response| response.accepted) {
-                            break;
-                        }
-                    }
-                }
-                let match_index = outcome.response.append.match_index;
-                Ok(Some(sinomo_core::kv::ClusterKvRaftPeerProgress {
-                    peer_node_id: target_node_id.clone(),
-                    term: outcome.response.append.term,
-                    next_index: match_index.saturating_add(1),
-                    match_index,
-                    last_accepted_index: match_index,
-                    observed_at: OffsetDateTime::now_utc(),
-                }))
-            }
-            .await;
-            (target_node_id, result)
-        });
-    }
-
-    let mut progress = Vec::new();
-    let mut finished = BTreeSet::new();
-    while let Some(joined) = tasks.join_next().await {
-        let Ok((target_node_id, result)) = joined else {
-            continue;
-        };
-        let accepted = matches!(result, Ok(Some(_)));
-        sinomo_core::cluster::finish_cluster_raft_peer_catch_up(&paths, &target_node_id, accepted);
-        finished.insert(target_node_id);
-        match result {
-            Ok(Some(hint)) => progress.push(hint),
-            Ok(None) => {}
-            Err(error) => tracing::debug!(
-                target: "sinomo.cluster.raft_catch_up",
-                %error,
-                "peer Raft catch-up did not complete"
-            ),
-        }
-    }
-    // A panicked attempt has no outcome; release it as still behind.
-    for target_node_id in target_node_ids.difference(&finished) {
-        sinomo_core::cluster::finish_cluster_raft_peer_catch_up(&paths, target_node_id, false);
-    }
-    if progress.is_empty() {
-        return;
-    }
-    let kv_paths = paths.kv_paths();
-    match runtime
-        .spawn_blocking(move || {
-            sinomo_core::kv::record_cluster_kv_raft_peer_progress_batch(&kv_paths, progress)
-        })
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(
-            target: "sinomo.cluster.raft_catch_up",
-            %error,
-            "peer Raft catch-up could not persist peer progress"
-        ),
-        Err(error) => tracing::warn!(
-            target: "sinomo.cluster.raft_catch_up",
-            %error,
-            "peer Raft catch-up progress task failed"
-        ),
-    }
+    let worker_runtime = runtime.clone();
+    sinomo_core::cluster::spawn_cluster_raft_peer_catch_up_on_runtime(
+        runtime,
+        paths,
+        state,
+        target_node_ids,
+        timeouts,
+        move || {
+            DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+                DaemonClusterRpcMode::new(worker_runtime.clone()),
+                timeouts,
+            )
+        },
+    );
 }
 
 fn merge_probe_records_with_unsuperseded_bootstrap_connectivity(
@@ -7716,6 +7532,20 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
         );
     }
 
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        crate::cluster::spawn_cluster_raft_member_catch_up(
+            self.rpc_mode.runtime(),
+            paths.clone(),
+            state.clone(),
+            targets,
+        );
+    }
+
     fn on_kv_replication_sent(&mut self) {
         if let Some(stats) = crate::process_idle_stats() {
             stats.incr_raft_appends_sent();
@@ -8377,6 +8207,20 @@ impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for DaemonClusterControlPlan
             );
             Ok(())
         })
+    }
+
+    fn catch_up_cluster_kv_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        crate::cluster::spawn_cluster_raft_member_catch_up(
+            self.rpc_mode.runtime(),
+            paths.clone(),
+            state.clone(),
+            targets,
+        );
     }
 }
 

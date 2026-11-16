@@ -376,6 +376,7 @@ mod tests {
                     .last()
                     .map_or(request.append.prev_log_index, |e| e.index),
             },
+            read_index_gap: None,
         })
     }
     async fn wait_for_waiters(queue: &Queue, count: usize) {

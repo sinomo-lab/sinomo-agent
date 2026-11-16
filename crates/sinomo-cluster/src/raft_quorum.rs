@@ -535,6 +535,15 @@ mod post_commit_observation_tests {
                 })
             })
         }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
+        }
     }
 
     struct NativeObserverFixture {
@@ -1873,6 +1882,19 @@ pub trait ClusterKvQuorumAsyncHost: Send {
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Starts targeted log or snapshot recovery of voters whose marked
+    /// ReadIndex probe showed an append gap (a log that does not hold the
+    /// anchor, or no loaded resident node). The read that observed the gap
+    /// never waits on this work: the host spawns it with its own transport and
+    /// returns at once, and an accepted catch-up append wakes the read's paced
+    /// re-send. A host that cannot own background recovery says so explicitly.
+    fn catch_up_cluster_kv_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    );
 }
 
 pub trait ClusterRaftQuorumAsyncHost: Send {
@@ -1952,6 +1974,19 @@ pub trait ClusterRaftQuorumAsyncHost: Send {
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Starts targeted log or snapshot recovery of voters whose marked
+    /// ReadIndex probe showed an append gap (a log that does not hold the
+    /// anchor, or no loaded resident node). The read that observed the gap
+    /// never waits on this work: the host spawns it with its own transport and
+    /// returns at once, and an accepted catch-up append wakes the read's paced
+    /// re-send. A host that cannot own background recovery says so explicitly.
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    );
 }
 
 impl<T> ClusterRaftQuorumAsyncHost for T
@@ -2015,6 +2050,15 @@ where
         targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         self.fan_out_committed_cluster_kv_command_async(paths, state, events, targets)
+    }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        self.catch_up_cluster_kv_peers(paths, state, targets);
     }
 }
 
@@ -4461,6 +4505,7 @@ where
                                     success: false,
                                     match_index: 0,
                                 },
+                                read_index_gap: None,
                             });
                     completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                         target: target.target,
@@ -4685,15 +4730,41 @@ pub(crate) const READ_INDEX_RESEND_FIRST: Duration = Duration::from_millis(250);
 
 /// The local node's cluster KV lifecycle as paced re-sends observe it. A host
 /// that stops its node closes it, which wakes every paced wait of that node
-/// at once; a node that starts again begins a fresh lifecycle.
+/// at once; a node that starts again begins a fresh lifecycle. A known-behind
+/// peer that is caught up advances `peer_progress`, which ends every paced
+/// wait early so its wave is re-sent to the voter that can now acknowledge.
 #[derive(Default)]
 struct ClusterKvNodeLifecycle {
     stopping: Mutex<bool>,
     changed: Condvar,
     notify: tokio::sync::Notify,
+    peer_progress: std::sync::atomic::AtomicU64,
+    progressed: tokio::sync::Notify,
+    #[cfg(any(test, feature = "test-support"))]
+    resend_fallback_held: std::sync::atomic::AtomicBool,
 }
 
 impl ClusterKvNodeLifecycle {
+    fn peer_progress(&self) -> u64 {
+        self.peer_progress
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance_peer_progress(&self) {
+        {
+            // Advance under the blocking waiters' mutex so a waiter that has
+            // just compared the generation cannot miss this notification.
+            let _stopping = self
+                .stopping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.peer_progress
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.changed.notify_all();
+        self.progressed.notify_waiters();
+    }
+
     fn is_stopping(&self) -> bool {
         *self
             .stopping
@@ -4727,6 +4798,21 @@ fn cluster_kv_node_lifecycle(paths: &ClusterPaths) -> Arc<ClusterKvNodeLifecycle
 /// first wait, rather than sleeping out its interval.
 pub fn mark_cluster_kv_node_stopping(paths: &ClusterPaths) {
     cluster_kv_node_lifecycle(paths).stop();
+}
+
+/// A known-behind peer of this node accepted an append: a paced ReadIndex
+/// wave it rejected can now be acknowledged, so every paced wait ends now.
+pub(crate) fn signal_cluster_raft_peer_progress(paths: &ClusterPaths) {
+    cluster_kv_node_lifecycle(paths).advance_peer_progress();
+}
+
+/// Holds every paced ReadIndex re-send of this node to its caller's deadline,
+/// so only a peer-progress wake or node stop can end the wait early.
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_cluster_kv_read_index_resend_fallback_for_test(paths: &ClusterPaths, held: bool) {
+    cluster_kv_node_lifecycle(paths)
+        .resend_fallback_held
+        .store(held, std::sync::atomic::Ordering::Release);
 }
 
 /// The host started this node again; its paced re-sends wait normally.
@@ -4796,21 +4882,35 @@ pub(crate) async fn until_cluster_kv_node_stops<T>(
 /// a voter that fails fast is not probed back to back. The timer only paces
 /// re-sends: it never decides, and the caller's budget still ends the read.
 /// A wait ends early, with an error, when the node's host stops it; a
-/// cancelled caller drops the wait with its future.
+/// cancelled caller drops the wait with its future. It also ends early, to
+/// re-send at once, when a known-behind peer was caught up after the timer
+/// was created or last woke: that event, not the interval, is what lets a
+/// voter that rejected the wave acknowledge the next one.
 pub(crate) struct ReadIndexResendTimer {
     next: Duration,
     lifecycle: Arc<ClusterKvNodeLifecycle>,
+    seen_peer_progress: u64,
 }
 
 impl ReadIndexResendTimer {
     pub(crate) fn new(paths: &ClusterPaths) -> Self {
+        let lifecycle = cluster_kv_node_lifecycle(paths);
         Self {
             next: READ_INDEX_RESEND_FIRST,
-            lifecycle: cluster_kv_node_lifecycle(paths),
+            seen_peer_progress: lifecycle.peer_progress(),
+            lifecycle,
         }
     }
 
     fn next_wake_before(&mut self, deadline: Instant) -> Instant {
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .lifecycle
+            .resend_fallback_held
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return deadline;
+        }
         let wake = Instant::now()
             .checked_add(self.next)
             .map_or(deadline, |wake| wake.min(deadline));
@@ -4821,27 +4921,49 @@ impl ReadIndexResendTimer {
         wake
     }
 
+    /// Consumes a peer-progress advance since the last wave, if any.
+    fn take_peer_progress(&mut self) -> bool {
+        let current = self.lifecycle.peer_progress();
+        if current == self.seen_peer_progress {
+            return false;
+        }
+        self.seen_peer_progress = current;
+        true
+    }
+
     /// Waits for the next re-send, never past `deadline`.
     pub(crate) async fn wait_before(&mut self, deadline: Instant) -> Result<(), NetworkError> {
         let wake = self.next_wake_before(deadline);
-        let stopping = self.lifecycle.notify.notified();
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let stopping = lifecycle.notify.notified();
         tokio::pin!(stopping);
-        // Register before reading the flag so a stop between the two is kept.
+        let progressed = lifecycle.progressed.notified();
+        tokio::pin!(progressed);
+        // Register before reading the flags so a stop or a caught-up peer
+        // between the two is kept.
         stopping.as_mut().enable();
-        if self.lifecycle.is_stopping() {
+        progressed.as_mut().enable();
+        if lifecycle.is_stopping() {
             return Err(cluster_kv_node_stopping_error());
+        }
+        if self.take_peer_progress() {
+            return Ok(());
         }
         tokio::select! {
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => Ok(()),
             () = stopping => Err(cluster_kv_node_stopping_error()),
+            () = progressed => {
+                self.take_peer_progress();
+                Ok(())
+            }
         }
     }
 
     /// Waits for the next re-send on a blocking caller, never past `deadline`.
     pub(crate) fn wait_before_blocking(&mut self, deadline: Instant) -> Result<(), NetworkError> {
         let wake = self.next_wake_before(deadline);
-        let mut stopping = self
-            .lifecycle
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let mut stopping = lifecycle
             .stopping
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4849,12 +4971,16 @@ impl ReadIndexResendTimer {
             if *stopping {
                 return Err(cluster_kv_node_stopping_error());
             }
+            // Peer progress advances under this mutex, so this comparison and
+            // the wait below cannot miss it.
+            if self.take_peer_progress() {
+                return Ok(());
+            }
             let remaining = wake.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
             }
-            stopping = self
-                .lifecycle
+            stopping = lifecycle
                 .changed
                 .wait_timeout(stopping, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5106,9 +5232,11 @@ where
 /// This follows etcd's ReadIndex safety shape: the leader must already have a
 /// committed entry in its current term, the exact applied read view and
 /// heartbeat anchor are captured coherently, and a majority must acknowledge
-/// that anchor in the same term. `None` asks the caller to use the existing
-/// barrier path, which is required for the first read after an election and is
-/// also a safe catch-up fallback when a follower rejects the compact probe.
+/// that anchor in the same term. Before the term holds a commit, the caller
+/// commits the compact barrier the first read after an election requires.
+/// After that, a barrier is not how a rejecting voter catches up: a gap the
+/// voter shows starts its targeted recovery, and the caller re-sends the wave
+/// once that peer is caught up, or on its paced fallback.
 fn remaining_read_index_budget(deadline: Instant, phase: &str) -> Result<Duration, NetworkError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -5874,6 +6002,43 @@ pub(crate) fn read_index_resident_preparations_for_root(root: &std::path::Path) 
         .unwrap_or_default()
 }
 
+/// Whether a probe reply from `target` is an observed append gap this leader
+/// owes recovery: a rejection a confirmed remote voter gave at the wave's own
+/// term and typed as a gap this node knows. It is never counted as an
+/// acknowledgement; the anchor still needs a same-term majority. An
+/// unrecognized reason keeps the untyped rejection's meaning.
+fn cluster_raft_read_index_probe_shows_gap(
+    response: &ClusterRaftAppendResponse,
+    current_term: u64,
+    confirmed_voters: &BTreeSet<NodeId>,
+    target: &NodeId,
+    local_node_id: &NodeId,
+) -> bool {
+    !response.accepted
+        && matches!(
+            response.read_index_gap,
+            Some(
+                sinomo_kv::ClusterRaftReadIndexProbeGap::LogGap
+                    | sinomo_kv::ClusterRaftReadIndexProbeGap::ResidentCold
+            )
+        )
+        && response.append.term == current_term
+        && target != local_node_id
+        && confirmed_voters.contains(target)
+}
+
+/// Records the voters a ReadIndex wave showed to be behind as known-behind,
+/// so their recovery follows the same rules as a missed committed append.
+/// Returns whether any recovery is owed.
+fn observe_cluster_raft_read_index_probe_gaps(paths: &ClusterPaths, gaps: &[NodeId]) -> bool {
+    if gaps.is_empty() {
+        return false;
+    }
+    metrics::counter!("sinomo.kv.read_index.probe_gaps").increment(gaps.len() as u64);
+    crate::raft_fanout::record_cluster_raft_peer_append_results(paths, &[], gaps);
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn confirm_cluster_raft_read_index_quorum<H, S>(
     _runtime: &tokio::runtime::Handle,
@@ -5937,7 +6102,19 @@ where
         .await
         .map_err(|_| read_index_phase_timeout("quorum probe"))??;
         let mut higher_term = None;
+        let mut probe_gaps = Vec::new();
         for (target, _request, result) in outcomes {
+            if let Ok(response) = &result
+                && cluster_raft_read_index_probe_shows_gap(
+                    response,
+                    read_state.current_term,
+                    &fence.confirmed_voters,
+                    &target,
+                    &state.local_node_id,
+                )
+            {
+                probe_gaps.push(target.clone());
+            }
             match result {
                 Ok(response)
                     if response.accepted
@@ -5992,6 +6169,11 @@ where
                 observed_term: higher_term,
                 confirmed_term: read_state.current_term,
             });
+        }
+        // Every gap a confirmed voter showed at this term is owed recovery,
+        // whether or not this wave reached a quorum without it.
+        if observe_cluster_raft_read_index_probe_gaps(paths, &probe_gaps) {
+            host.catch_up_cluster_raft_peers(paths, state, probe_gaps);
         }
     }
 
@@ -6995,6 +7177,9 @@ where
 /// Synchronous transport counterpart of the async ReadIndex path. Only the
 /// heartbeat delivery is supplied by the caller; all resident-state fencing,
 /// higher-term persistence, and post-quorum projection stay shared here.
+/// Voters the wave showed to be behind are recorded as known-behind and
+/// returned in `probe_gaps`; the caller's host then starts their recovery.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_cluster_raft_with_read_index_attempt_with_transport<T, F, S>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -7003,6 +7188,7 @@ pub(crate) fn read_cluster_raft_with_read_index_attempt_with_transport<T, F, S>(
     projection_policy: ClusterRaftReadProjectionPolicy,
     read_value: F,
     mut send_probe: S,
+    probe_gaps: &mut Vec<NodeId>,
 ) -> Result<ClusterRaftReadIndexAttempt<T>, NetworkError>
 where
     F: FnOnce(&mut dyn LocalClusterRaftReadProjection) -> Result<T, NetworkError>,
@@ -7063,7 +7249,19 @@ where
     let remaining = remaining_read_index_budget(deadline, "synchronous quorum probe")?;
     let timeout = append_options.routed_node_append_attempt_timeout(remaining);
     let outcomes = send_probe(state, targets, &request, timeout, required_remote_acks)?;
+    let mut observed_gaps = Vec::new();
     for (target, outcome) in outcomes {
+        if let Ok(response) = &outcome
+            && cluster_raft_read_index_probe_shows_gap(
+                response,
+                read_state.current_term,
+                &confirmed_voters,
+                &target,
+                &state.local_node_id,
+            )
+        {
+            observed_gaps.push(target.clone());
+        }
         match outcome {
             Ok(response)
                 if response.accepted
@@ -7099,6 +7297,9 @@ where
                 read_state.current_term
             ),
         });
+    }
+    if observe_cluster_raft_read_index_probe_gaps(paths, &observed_gaps) {
+        probe_gaps.extend(observed_gaps);
     }
     if voter_acks < quorum_size {
         return Ok(ClusterRaftReadIndexAttempt::NeedsBarrier(retry_fence));
@@ -8485,6 +8686,7 @@ mod read_index_tests {
                         success: accepted,
                         match_index: request.append.prev_log_index,
                     },
+                    read_index_gap: None,
                 })
             })
         }
@@ -8524,11 +8726,21 @@ mod read_index_tests {
                                 success: accepted,
                                 match_index: request.append.prev_log_index,
                             },
+                            read_index_gap: None,
                         }),
                     ));
                 }
                 Ok(outcomes)
             })
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -8590,11 +8802,21 @@ mod read_index_tests {
                                 success: true,
                                 match_index: request.append.prev_log_index,
                             },
+                            read_index_gap: None,
                         };
                         (target, request, Ok(response))
                     })
                     .collect())
             })
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -8690,11 +8912,21 @@ mod read_index_tests {
                                 success: true,
                                 match_index: request.append.prev_log_index,
                             },
+                            read_index_gap: None,
                         };
                         (target, request, Ok(response))
                     })
                     .collect())
             })
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -8799,11 +9031,21 @@ mod read_index_tests {
                                 success: true,
                                 match_index: request.append.prev_log_index,
                             },
+                            read_index_gap: None,
                         };
                         (target, request, Ok(response))
                     })
                     .collect())
             })
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -10320,9 +10562,11 @@ mod read_index_tests {
                             success: false,
                             match_index: request.append.prev_log_index,
                         },
+                        read_index_gap: None,
                     }),
                 )])
             },
+            &mut Vec::new(),
         );
         let elapsed = started.elapsed();
 

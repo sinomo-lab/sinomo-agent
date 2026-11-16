@@ -42,8 +42,10 @@ pub struct ClusterRaftCommittedFanoutReport {
 }
 
 /// Peers this process's leader knows to be behind because their committed
-/// append failed or was rejected. A restored route or the peer's own contact
-/// starts one targeted catch-up; an accepted append clears the peer.
+/// append failed or was rejected, or because a marked ReadIndex probe showed an
+/// append gap. A restored route, the peer's own contact or that probe gap
+/// starts one targeted catch-up; an accepted append clears the peer and wakes
+/// the paced ReadIndex re-sends that were waiting on it.
 #[derive(Default)]
 struct ClusterRaftPeersBehind {
     behind: BTreeSet<NodeId>,
@@ -59,14 +61,21 @@ pub fn record_cluster_raft_peer_append_results(
     if accepted.is_empty() && lagging.is_empty() {
         return;
     }
-    let Ok(mut peers) = CLUSTER_RAFT_PEERS_BEHIND.lock() else {
-        return;
+    let caught_up = {
+        let Ok(mut peers) = CLUSTER_RAFT_PEERS_BEHIND.lock() else {
+            return;
+        };
+        let peers = peers.entry(paths.root.clone()).or_default();
+        let mut caught_up = false;
+        for node_id in accepted {
+            caught_up |= peers.behind.remove(node_id);
+        }
+        peers.behind.extend(lagging.iter().cloned());
+        caught_up
     };
-    let peers = peers.entry(paths.root.clone()).or_default();
-    for node_id in accepted {
-        peers.behind.remove(node_id);
+    if caught_up {
+        crate::raft_quorum::signal_cluster_raft_peer_progress(paths);
     }
-    peers.behind.extend(lagging.iter().cloned());
 }
 
 pub fn cluster_raft_peer_is_behind(paths: &ClusterPaths, node_id: &NodeId) -> bool {
@@ -92,15 +101,20 @@ pub fn claim_cluster_raft_peer_catch_up(paths: &ClusterPaths, node_id: &NodeId) 
 /// Release a claimed catch-up. An accepted append clears the peer; any other
 /// outcome leaves it known-behind for the next trigger.
 pub fn finish_cluster_raft_peer_catch_up(paths: &ClusterPaths, node_id: &NodeId, accepted: bool) {
-    let Ok(mut peers) = CLUSTER_RAFT_PEERS_BEHIND.lock() else {
-        return;
-    };
-    let peers = peers.entry(paths.root.clone()).or_default();
-    peers.catching_up.remove(node_id);
+    {
+        let Ok(mut peers) = CLUSTER_RAFT_PEERS_BEHIND.lock() else {
+            return;
+        };
+        let peers = peers.entry(paths.root.clone()).or_default();
+        peers.catching_up.remove(node_id);
+        if accepted {
+            peers.behind.remove(node_id);
+        } else {
+            peers.behind.insert(node_id.clone());
+        }
+    }
     if accepted {
-        peers.behind.remove(node_id);
-    } else {
-        peers.behind.insert(node_id.clone());
+        crate::raft_quorum::signal_cluster_raft_peer_progress(paths);
     }
 }
 
@@ -757,6 +771,228 @@ pub async fn replicate_cluster_kv_to_node_async_with_host(
         &mut append_host,
     )
     .await
+}
+
+/// A restored route to a peer, contact from a known-behind peer, or a marked
+/// ReadIndex probe that showed the peer's append gap is the recovery event for
+/// that peer. It owns one target-keyed Raft catch-up attempt per peer; there is
+/// no periodic KV pull or retry sweep. Raft append rejection/backtracking
+/// remains the only gap-recovery protocol and naturally falls back to an
+/// authoritative snapshot when the leader has compacted the missing prefix.
+///
+/// `host_factory` supplies each attempt its own transport.
+pub fn spawn_cluster_raft_peer_catch_up_on_runtime<H, F>(
+    runtime: &tokio::runtime::Handle,
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    target_node_ids: Vec<NodeId>,
+    timeouts: ClusterControlPlaneTimeouts,
+    host_factory: F,
+) where
+    H: ClusterKvQuorumAsyncHost + ClusterKvCommittedFanoutAsyncHost + Send + 'static,
+    F: FnMut() -> H + Send + 'static,
+{
+    if target_node_ids.is_empty() {
+        return;
+    }
+    let worker_runtime = runtime.clone();
+    runtime.spawn(async move {
+        catch_up_cluster_raft_peers_async_with_factory(
+            paths,
+            state,
+            target_node_ids,
+            worker_runtime,
+            timeouts,
+            host_factory,
+        )
+        .await;
+    });
+}
+
+/// The targeted catch-up attempts themselves, for a host that owns the task
+/// that runs them. `runtime` runs their blocking storage reads.
+pub async fn catch_up_cluster_raft_peers_async_with_factory<H, F>(
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    target_node_ids: Vec<NodeId>,
+    runtime: tokio::runtime::Handle,
+    timeouts: ClusterControlPlaneTimeouts,
+    mut host_factory: F,
+) where
+    H: ClusterKvQuorumAsyncHost + ClusterKvCommittedFanoutAsyncHost + Send + 'static,
+    F: FnMut() -> H,
+{
+    let target_node_ids = target_node_ids
+        .into_iter()
+        .filter(|target_node_id| {
+            *target_node_id != state.local_node_id
+                && state.members.iter().any(|member| {
+                    member.node_id == *target_node_id
+                        && member.state.is_authorized()
+                        && member.capabilities.iter().any(|capability| {
+                            capability.as_str() == sinomo_node::DAEMON_MAIN_RUN_CAPABILITY
+                        })
+                })
+        })
+        .filter(|target_node_id| claim_cluster_raft_peer_catch_up(&paths, target_node_id))
+        .collect::<BTreeSet<_>>();
+    if target_node_ids.is_empty() {
+        return;
+    }
+    let release_unattempted = |accepted: bool| {
+        for target_node_id in &target_node_ids {
+            finish_cluster_raft_peer_catch_up(&paths, target_node_id, accepted);
+        }
+    };
+
+    let read_paths = paths.clone();
+    let read_state = state.clone();
+    let leader_inputs = runtime
+        .spawn_blocking(move || {
+            if !read_paths
+                .kv_paths()
+                .locked_raft_local_is_leader(&read_state)
+                .map_err(NetworkError::directory)?
+            {
+                return Ok(None);
+            }
+            sinomo_kv::read_cluster_kv_watch_events(&read_paths.kv_paths())
+                .map(|read| Some(read.events))
+                .map_err(NetworkError::directory)
+        })
+        .await;
+    let events = match leader_inputs {
+        Ok(Ok(Some(events))) => std::sync::Arc::new(events),
+        // Only the leader replicates; a follower has no catch-up to owe.
+        Ok(Ok(None)) => {
+            release_unattempted(true);
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "peer Raft catch-up could not read leader state"
+            );
+            release_unattempted(false);
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "peer Raft catch-up leader-state task failed"
+            );
+            release_unattempted(false);
+            return;
+        }
+    };
+
+    let fanout_options = timeouts.committed_fanout_options();
+    let mut tasks = tokio::task::JoinSet::new();
+    for target_node_id in target_node_ids.iter().cloned() {
+        let paths = paths.clone();
+        let state = state.clone();
+        let events = events.clone();
+        let mut host = host_factory();
+        tasks.spawn(async move {
+            let result = async {
+                let outcome = replicate_cluster_kv_to_node_async_with_host(
+                    &paths,
+                    &state,
+                    &target_node_id,
+                    events.as_slice(),
+                    timeouts,
+                    fanout_options.raft_append_timeout,
+                    &mut host,
+                )
+                .await?;
+                if !outcome.response.accepted {
+                    return Ok::<_, NetworkError>(None);
+                }
+                if outcome.watch_event_fanout_needed {
+                    for event_batch in
+                        sinomo_kv::cluster_kv_watch_event_fanout_batches(events.as_slice())
+                    {
+                        let request = ClusterKvWatchEventsRequest {
+                            state: state.clone(),
+                            leader_id: state.local_node_id.clone(),
+                            events: event_batch.to_vec(),
+                        };
+                        let response =
+                            ClusterKvCommittedFanoutAsyncHost::send_cluster_kv_watch_events_to_node_async(
+                                &mut host,
+                                &state,
+                                &target_node_id,
+                                &request,
+                                fanout_options.watch_event_timeout,
+                            )
+                            .await;
+                        if !response.is_ok_and(|response| response.accepted) {
+                            break;
+                        }
+                    }
+                }
+                let match_index = outcome.response.append.match_index;
+                Ok(Some(sinomo_kv::ClusterKvRaftPeerProgress {
+                    peer_node_id: target_node_id.clone(),
+                    term: outcome.response.append.term,
+                    next_index: match_index.saturating_add(1),
+                    match_index,
+                    last_accepted_index: match_index,
+                    observed_at: time::OffsetDateTime::now_utc(),
+                }))
+            }
+            .await;
+            (target_node_id, result)
+        });
+    }
+
+    let mut progress = Vec::new();
+    let mut finished = BTreeSet::new();
+    while let Some(joined) = tasks.join_next().await {
+        let Ok((target_node_id, result)) = joined else {
+            continue;
+        };
+        let accepted = matches!(result, Ok(Some(_)));
+        finish_cluster_raft_peer_catch_up(&paths, &target_node_id, accepted);
+        finished.insert(target_node_id);
+        match result {
+            Ok(Some(hint)) => progress.push(hint),
+            Ok(None) => {}
+            Err(error) => tracing::debug!(
+                target: "sinomo.cluster.raft_catch_up",
+                %error,
+                "peer Raft catch-up did not complete"
+            ),
+        }
+    }
+    // A panicked attempt has no outcome; release it as still behind.
+    for target_node_id in target_node_ids.difference(&finished) {
+        finish_cluster_raft_peer_catch_up(&paths, target_node_id, false);
+    }
+    if progress.is_empty() {
+        return;
+    }
+    let kv_paths = paths.kv_paths();
+    match runtime
+        .spawn_blocking(move || {
+            sinomo_kv::record_cluster_kv_raft_peer_progress_batch(&kv_paths, progress)
+        })
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            target: "sinomo.cluster.raft_catch_up",
+            %error,
+            "peer Raft catch-up could not persist peer progress"
+        ),
+        Err(error) => tracing::warn!(
+            target: "sinomo.cluster.raft_catch_up",
+            %error,
+            "peer Raft catch-up progress task failed"
+        ),
+    }
 }
 
 #[cfg(test)]

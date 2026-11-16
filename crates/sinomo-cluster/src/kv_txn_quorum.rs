@@ -230,6 +230,17 @@ pub trait ClusterKvTxnQuorumHost {
         request: KvCommandRequest,
         options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>;
+
+    /// Starts targeted log or snapshot recovery of voters a synchronous
+    /// ReadIndex wave showed an append gap for. The host owns the work and
+    /// returns at once; an accepted catch-up append wakes the wave's paced
+    /// re-send. A host that cannot own background recovery says so explicitly.
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    );
 }
 
 impl<T> crate::kv_forward::ClusterKvTxnForwardHost for T
@@ -574,6 +585,16 @@ where
         options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         commit_cluster_raft_command_with_control_plane_driver(paths, state, request, options, self)
+    }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        self.transport
+            .catch_up_cluster_raft_peers(paths, state, targets);
     }
 }
 
@@ -2094,7 +2115,8 @@ fn read_cluster_kv_authoritative_snapshot_with_read_index_attempt_sync(
     deadline: Instant,
     host: &mut impl ClusterKvTxnQuorumHost,
 ) -> Result<ClusterRaftReadIndexAttempt<KvSnapshot>, NetworkError> {
-    read_cluster_raft_with_read_index_attempt_with_transport(
+    let mut probe_gaps = Vec::new();
+    let attempt = read_cluster_raft_with_read_index_attempt_with_transport(
         paths,
         state,
         deadline,
@@ -2110,7 +2132,14 @@ fn read_cluster_kv_authoritative_snapshot_with_read_index_attempt_sync(
                 required_acks,
             )
         },
-    )
+        &mut probe_gaps,
+    );
+    // Every gap a confirmed voter showed at this term is owed recovery,
+    // whether or not this wave reached a quorum without it.
+    if !probe_gaps.is_empty() {
+        host.catch_up_cluster_raft_peers(paths, state, probe_gaps);
+    }
+    attempt
 }
 
 fn read_cluster_kv_authoritative_snapshot_with_read_index_sync(
@@ -5618,6 +5647,15 @@ mod tests {
                 })
             })
         }
+
+        fn catch_up_cluster_kv_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
+        }
     }
 
     impl ClusterStateAuthorityReachabilityAsyncHost for NoNetworkRequestOutcomeHost {
@@ -5831,11 +5869,21 @@ mod tests {
                                 success: true,
                                 match_index: request.append.prev_log_index,
                             },
+                            read_index_gap: None,
                         };
                         (target, request, Ok(response))
                     })
                     .collect())
             })
+        }
+
+        fn catch_up_cluster_kv_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -6533,6 +6581,7 @@ mod tests {
                                 success: true,
                                 match_index: request.append.prev_log_index,
                             },
+                            read_index_gap: None,
                         };
                         (target, request, Ok(response))
                     })
@@ -6561,6 +6610,15 @@ mod tests {
                 }
                 Ok(())
             })
+        }
+
+        fn catch_up_cluster_kv_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -6699,6 +6757,7 @@ mod tests {
                             success: true,
                             match_index: request.append.prev_log_index,
                         },
+                        read_index_gap: None,
                     }),
                 )
             };
@@ -6831,12 +6890,22 @@ mod tests {
                                 .last()
                                 .map_or(append.append.prev_log_index, |entry| entry.index),
                         },
+                        read_index_gap: None,
                     })
                 },
                 |_paths, _state, _target, _connectivity, _latency| {},
                 |_paths, _state, _events, _targets| {},
                 || {},
             )
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -9665,6 +9734,15 @@ mod tests {
                 detail: "test stopped after recovered leader entered barrier commit".to_string(),
             })
         }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
+        }
     }
 
     #[test]
@@ -10004,6 +10082,7 @@ mod tests {
                         match_index: request.append.prev_log_index
                             + request.append.entries.len() as u64,
                     },
+                    read_index_gap: None,
                 })
             })
         }
@@ -10016,6 +10095,15 @@ mod tests {
             _targets: Vec<NodeId>,
         ) -> ClusterMembershipRpcFuture<'a, ()> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn catch_up_cluster_kv_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -10280,6 +10368,7 @@ mod tests {
                         request.append.prev_log_index + request.append.entries.len() as u64
                     },
                 },
+                read_index_gap: None,
             })
         }
 
@@ -10392,6 +10481,15 @@ mod tests {
                     .expect("resident owner started");
                 Ok(())
             })
+        }
+
+        fn catch_up_cluster_kv_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 

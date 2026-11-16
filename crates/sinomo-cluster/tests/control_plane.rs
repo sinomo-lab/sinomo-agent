@@ -1137,6 +1137,15 @@ impl ClusterKvQuorumAsyncHost for InviteChallengeReadHost {
             })
         })
     }
+
+    fn catch_up_cluster_kv_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _targets: Vec<NodeId>,
+    ) {
+        // A single-voter read probes no peer.
+    }
 }
 impl ClusterStateAuthorityReachabilityAsyncHost for InviteChallengeReadHost {
     fn probe_cluster_state_authority_node_async<'a>(
@@ -9503,6 +9512,7 @@ impl ClusterRaftQuorumTransportHost for RecordingQuorumCommitHost {
                 success: true,
                 match_index: 1,
             },
+            read_index_gap: None,
         })
     }
 
@@ -9577,6 +9587,7 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
                         success: true,
                         match_index: 1,
                     },
+                    read_index_gap: None,
                 },
                 watch_event_fanout_needed: true,
             })
@@ -10005,6 +10016,15 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
             replayed_committed_request: false,
         })
     }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _targets: Vec<NodeId>,
+    ) {
+        // Probe answers from this test host name no append gap.
+    }
 }
 
 struct RetryableCommitFailureKvTxnQuorumHost {
@@ -10114,6 +10134,15 @@ impl ClusterKvTxnQuorumHost for RetryableCommitFailureKvTxnQuorumHost {
             snapshot,
             replayed_committed_request: false,
         })
+    }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _targets: Vec<NodeId>,
+    ) {
+        // Probe answers from this test host name no append gap.
     }
 }
 
@@ -10380,6 +10409,15 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
         ) {
             self.unverified_routes.push(endpoint.node_id.clone());
         }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // This test transport sends no ReadIndex probes.
+        }
     }
 
     let now = OffsetDateTime::now_utc();
@@ -10498,6 +10536,15 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
         ) -> Result<ObjectRpcResponse, NetworkError> {
             panic!("local observation should not send node rpc")
         }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // This test transport sends no ReadIndex probes.
+        }
     }
 
     #[derive(Clone)]
@@ -10613,6 +10660,15 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
             panic!("membership preparation should not send node rpc")
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // This test transport sends no ReadIndex probes.
         }
     }
 
@@ -10816,6 +10872,15 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             _records: &[ClusterConnectivityRecord],
         ) {
             self.connectivity_remembers += 1;
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // This test transport sends no ReadIndex probes.
         }
     }
 
@@ -12118,6 +12183,7 @@ fn cluster_raft_quorum_commit_observes_higher_rejected_append_term() {
                     success: false,
                     match_index: 0,
                 },
+                read_index_gap: None,
             })
         },
         |_, _, _, _, _| {},
@@ -12188,6 +12254,7 @@ fn blocked_quorum_transport_does_not_monopolize_local_raft_storage() {
                             .prev_log_index
                             .saturating_add(request.append.entries.len() as u64),
                     },
+                    read_index_gap: None,
                 })
             },
             |_, _, _, _, _| {},
@@ -12330,6 +12397,7 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
                         .prev_log_index
                         .saturating_add(request.append.entries.len() as u64),
                 },
+                read_index_gap: None,
             })
         },
         move |_paths, _state, node_id, connectivity_state, latency_ms| {
@@ -13641,6 +13709,7 @@ fn cluster_raft_append_replication_retries_from_rejected_match_index() {
                     success: false,
                     match_index: 0,
                 },
+                read_index_gap: None,
             },
             ClusterRaftAppendResponse {
                 accepted: true,
@@ -13651,6 +13720,7 @@ fn cluster_raft_append_replication_retries_from_rejected_match_index() {
                     success: true,
                     match_index: 1,
                 },
+                read_index_gap: None,
             },
         ],
         sent_prev_log_indexes: Vec::new(),
@@ -13739,6 +13809,7 @@ fn cluster_raft_local_append_replication_host_builds_from_local_raft() {
                     success: true,
                     match_index: request.append.prev_log_index,
                 },
+                read_index_gap: None,
             })
         },
         move || {
@@ -17858,6 +17929,15 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             assert_eq!(connectivity_state, ClusterConnectivityState::Healthy);
             assert_eq!(latency_ms, None);
             self.connectivity.push(endpoint.clone());
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // This test transport sends no ReadIndex probes.
         }
     }
 
@@ -22389,6 +22469,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
                 success: accepted,
                 match_index,
             },
+            read_index_gap: None,
         }
     }
 
@@ -22559,6 +22640,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                         success: true,
                         match_index,
                     },
+                    read_index_gap: None,
                 })
             })
         }
@@ -22591,6 +22673,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                         success: true,
                         match_index,
                     },
+                    read_index_gap: None,
                 })
             })
         }
@@ -22618,6 +22701,15 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                 self.fanout_targets = targets;
                 Ok(())
             })
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -22754,6 +22846,7 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                             .map(|entry| entry.index)
                             .unwrap_or(request.append.prev_log_index),
                     },
+                    read_index_gap: None,
                 })
             })
         }
@@ -22806,6 +22899,7 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                                 success: rejected_term.is_none(),
                                 match_index,
                             },
+                            read_index_gap: None,
                         };
                         (target, request, Ok(response))
                     });
@@ -22840,6 +22934,15 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
         ) {
             self.connectivity_records
                 .push((target_node_id.clone(), connectivity_state));
+        }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Probe answers from this test host name no append gap.
         }
     }
 
@@ -32314,6 +32417,15 @@ impl ClusterRaftQuorumAsyncHost for NoRemoteObservationQuorumHost {
             Ok(())
         })
     }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _targets: Vec<NodeId>,
+    ) {
+        // Probe answers from this test host name no append gap.
+    }
 }
 
 #[test]
@@ -32393,5 +32505,791 @@ fn canonical_async_mutation_returns_possibly_applied_after_subscriber_failure() 
     assert_eq!(
         host.fanouts, 2,
         "postcommit fanout still completes before returning the delivery error"
+    );
+}
+
+/// A quiet three-voter cluster: the leader holds a commit in its current term,
+/// one voter is stopped, and the other came back with a log that ends before
+/// that commit. Nothing is written while the leader reads.
+struct LaggingVoterCluster {
+    _roots: [sinomo_testdir::TestDir; 3],
+    leader_paths: ClusterPaths,
+    lagging_paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    leader_id: NodeId,
+    lagging_id: NodeId,
+    leader_peer: ClusterAuthenticatedPeer,
+}
+
+fn lagging_voter_cluster(tag: &str) -> LaggingVoterCluster {
+    let roots = [
+        sinomo_testdir::TestDir::new(&format!("cluster-lagging-voter-{tag}-leader")),
+        sinomo_testdir::TestDir::new(&format!("cluster-lagging-voter-{tag}-lagging")),
+        sinomo_testdir::TestDir::new(&format!("cluster-lagging-voter-{tag}-stopped")),
+    ];
+    let leader_paths = ClusterPaths::new(&SinomoDataDir::new(&roots[0]));
+    let lagging_paths = ClusterPaths::new(&SinomoDataDir::new(&roots[1]));
+    let stopped_paths = ClusterPaths::new(&SinomoDataDir::new(&roots[2]));
+    for paths in [&leader_paths, &lagging_paths, &stopped_paths] {
+        paths.ensure().expect("cluster paths");
+    }
+    let (mut state, leader_id, lagging_id) = cluster_raft_handler_test_state(
+        &format!("cluster_lagging_voter_{tag}"),
+        &format!("node_lagging_voter_{tag}_leader"),
+        &format!("node_lagging_voter_{tag}_lagging"),
+    );
+    let stopped_id =
+        NodeId::from_legacy_named(format!("node_lagging_voter_{tag}_stopped")).expect("stopped");
+    let mut stopped = state.members[1].clone();
+    stopped.node_id = stopped_id.clone();
+    stopped.display_name = "stopped".to_string();
+    stopped.node_public_key = "stopped-public-key".to_string();
+    stopped.endpoints.clear();
+    mark_test_member_as_voter(&mut stopped);
+    state.members.push(stopped);
+    state.members[1].endpoints = vec![daemon_lan_endpoint(
+        &lagging_id,
+        "10.93.0.2:21353".to_string(),
+        10,
+    )];
+    state.members[2].endpoints = vec![daemon_lan_endpoint(
+        &stopped_id,
+        "10.93.0.3:21353".to_string(),
+        10,
+    )];
+    // Every node already observes the leader's term, so no append below
+    // starts a background higher-term persistence on a follower.
+    state.term = 2;
+    write_cluster_state(&leader_paths, &state).expect("leader state");
+    for (paths, node_id) in [(&lagging_paths, &lagging_id), (&stopped_paths, &stopped_id)] {
+        let mut peer_state = state.clone();
+        peer_state.local_node_id = node_id.clone();
+        peer_state.local_node_display_name = peer_state
+            .members
+            .iter()
+            .find(|member| &member.node_id == node_id)
+            .expect("peer member")
+            .display_name
+            .clone();
+        write_cluster_state(paths, &peer_state).expect("peer state");
+    }
+    append_cluster_raft_command(
+        &leader_paths,
+        &leader_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/lagging/seed".to_string(),
+            value: b"seed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed history");
+    locked_set_cluster_raft_leader(&leader_paths, &leader_id, 2).expect("leader term 2");
+    let leader_peer = ClusterAuthenticatedPeer {
+        node_id: leader_id.to_string(),
+        public_key: "local-public-key".to_string(),
+    };
+    let replication_options = ClusterRaftAppendReplicationOptions {
+        max_attempts: 16,
+        timeout: Duration::from_secs(2),
+        tcp_command_timeout: Duration::from_secs(2),
+        iroh_command_timeout: Duration::from_secs(2),
+        tcp_foreground_attempt_timeout: Duration::from_secs(2),
+        public_foreground_attempt_timeout: Duration::from_secs(2),
+        iroh_foreground_attempt_timeout: Duration::from_secs(2),
+    };
+    let commit = |state: &mut ClusterBootstrapState, key: &str, to_lagging: bool| {
+        commit_cluster_raft_command_with_local_storage_and_transport(
+            &leader_paths,
+            state,
+            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: key.to_string(),
+                value: key.as_bytes().to_vec(),
+                lease_id: None,
+            })),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(2),
+            },
+            ClusterControlPlaneTimeouts::default_daemon_transport(),
+            |endpoint, request, _timeout| {
+                if endpoint.node_id == lagging_id {
+                    if !to_lagging {
+                        return Err(NetworkError::delivery_failed(
+                            "lagging voter append",
+                            NetworkDeliveryState::DefinitelyNotSent,
+                            "the lagging voter is offline",
+                        ));
+                    }
+                    return handle_cluster_raft_append_request(
+                        &lagging_paths,
+                        request.clone(),
+                        &leader_peer,
+                    );
+                }
+                handle_cluster_raft_append_request(&stopped_paths, request.clone(), &leader_peer)
+            },
+            |_, _, _, _, _| {},
+            |_, _, _, _| {},
+            || {},
+        )
+        .expect("commit")
+    };
+    let replicate_to = |state: &ClusterBootstrapState, index: usize, peer_paths: &ClusterPaths| {
+        let outcome = replicate_cluster_raft_to_endpoint_with_local_host(
+            &leader_paths,
+            state,
+            &state.members[index].endpoints[0].clone(),
+            &[],
+            replication_options,
+            |_endpoint, request, _timeout| {
+                handle_cluster_raft_append_request(peer_paths, request.clone(), &leader_peer)
+            },
+            || {},
+        )
+        .expect("replicate");
+        assert!(outcome.response.accepted, "{}", outcome.response.detail);
+    };
+    // Both followers hold the first current-term entry; the lagging voter is
+    // down for two more current-term commits; then the other voter stops.
+    commit(&mut state, "/lagging/w1", true);
+    replicate_to(&state, 1, &lagging_paths);
+    replicate_to(&state, 2, &stopped_paths);
+    commit(&mut state, "/lagging/w2", false);
+    let last = commit(&mut state, "/lagging/w3", false);
+    // The harness carries membership in the caller state; the caller has
+    // observed the leader's committed revision.
+    state.kv_revision = state.kv_revision.max(last.snapshot.revision.0);
+    LaggingVoterCluster {
+        _roots: roots,
+        leader_paths,
+        lagging_paths,
+        state,
+        leader_id,
+        lagging_id,
+        leader_peer,
+    }
+}
+
+/// How the lagging voter's typed probe gaps reach the leader.
+#[derive(Clone, Copy, Debug)]
+enum ProbeGapWire {
+    /// As this version sends them.
+    Current,
+    /// As a follower that predates typed gaps answers: with no gap at all.
+    Untyped,
+    /// As a newer follower answers: with a reason this version does not know,
+    /// decoded from the response body that follower would send.
+    FutureReason,
+}
+
+/// A newer follower's probe response, whose gap reason this version lacks.
+#[derive(Serialize)]
+struct FutureClusterRaftAppendResponse {
+    accepted: bool,
+    detail: String,
+    state: ClusterBootstrapState,
+    append: sinomo_kv::RaftAppendEntriesResponse,
+    read_index_gap: Option<FutureClusterRaftReadIndexProbeGap>,
+}
+
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum FutureClusterRaftReadIndexProbeGap {
+    LogGap,
+    ResidentCold,
+    ReservedForAnotherReason,
+    FollowerSuspectsTheLeader,
+}
+
+/// The leader's transport: the stopped voter refuses every call, and the
+/// lagging voter is a real follower root whose gaps arrive as `wire` says.
+#[derive(Clone)]
+struct LaggingVoterHost {
+    leader_peer: ClusterAuthenticatedPeer,
+    lagging_id: NodeId,
+    lagging_paths: ClusterPaths,
+    wire: ProbeGapWire,
+    probe_answers: Arc<Mutex<Vec<LaggingVoterProbeAnswer>>>,
+    catch_up_attempts: Arc<AtomicUsize>,
+}
+
+/// Whether the lagging voter acknowledged a probe, and the gap it named.
+type LaggingVoterProbeAnswer = (bool, Option<sinomo_kv::ClusterRaftReadIndexProbeGap>);
+
+impl LaggingVoterHost {
+    fn new(cluster: &LaggingVoterCluster, wire: ProbeGapWire) -> Self {
+        Self {
+            leader_peer: cluster.leader_peer.clone(),
+            lagging_id: cluster.lagging_id.clone(),
+            lagging_paths: cluster.lagging_paths.clone(),
+            wire,
+            probe_answers: Arc::new(Mutex::new(Vec::new())),
+            catch_up_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn stopped_voter(target: &NodeId) -> NetworkError {
+        NetworkError::Io {
+            operation: format!("deliver a Raft append to {target}"),
+            detail: "connection refused: the voter is stopped".to_string(),
+        }
+    }
+
+    fn observe(
+        &self,
+        request: &sinomo_kv::ClusterRaftAppendRequest,
+        result: Result<ClusterRaftAppendResponse, NetworkError>,
+    ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+        let mut response = result?;
+        if request.read_index_probe {
+            match self.wire {
+                ProbeGapWire::Current => {}
+                ProbeGapWire::Untyped => response.read_index_gap = None,
+                ProbeGapWire::FutureReason if response.read_index_gap.is_some() => {
+                    let body = sinomo_object::serde_ext::to_bytes(
+                        &FutureClusterRaftAppendResponse {
+                            accepted: response.accepted,
+                            detail: response.detail.clone(),
+                            state: response.state.clone(),
+                            append: response.append.clone(),
+                            read_index_gap: Some(
+                                FutureClusterRaftReadIndexProbeGap::FollowerSuspectsTheLeader,
+                            ),
+                        },
+                        sinomo_kv::KV_OBJECT_VERSION_ID,
+                        sinomo_object::LengthMode::U32,
+                    )
+                    .expect("encode a newer follower's probe response");
+                    response = sinomo_kv::decode_cluster_raft_append_rpc_response_body(&body)
+                        .expect("a future gap reason must not make the response undecodable");
+                }
+                ProbeGapWire::FutureReason => {}
+            }
+            self.probe_answers
+                .lock()
+                .expect("probe answers")
+                .push((response.accepted, response.read_index_gap));
+        }
+        Ok(response)
+    }
+
+    fn spawn_catch_up(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        let host = self.clone();
+        spawn_cluster_raft_peer_catch_up_on_runtime(
+            runtime,
+            paths.clone(),
+            state.clone(),
+            targets,
+            ClusterControlPlaneTimeouts::default_daemon_transport(),
+            move || {
+                host.catch_up_attempts.fetch_add(1, Ordering::SeqCst);
+                host.clone()
+            },
+        );
+    }
+
+    fn probe_answers(&self) -> Vec<LaggingVoterProbeAnswer> {
+        self.probe_answers.lock().expect("probe answers").clone()
+    }
+}
+
+impl ClusterObjectRpcAsyncHost for LaggingVoterHost {}
+
+impl ClusterKvQuorumAsyncHost for LaggingVoterHost {
+    fn last_local_kv_replication_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64> {
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_last_raft_log_index_async(&state.local_node_id)
+                .await
+                .map_err(NetworkError::directory)
+        })
+    }
+
+    fn build_kv_replication_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftAppendRequest> {
+        Box::pin(async move {
+            paths
+                .kv_paths()
+                .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                .await
+                .map_err(NetworkError::directory)
+        })
+    }
+
+    fn send_cluster_kv_replication_to_node_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+        target: &'a NodeId,
+        request: &'a sinomo_kv::ClusterRaftAppendRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+        Box::pin(async move {
+            if *target != self.lagging_id {
+                return Err(Self::stopped_voter(target));
+            }
+            let result = handle_cluster_raft_append_request_async(
+                &tokio::runtime::Handle::current(),
+                &self.lagging_paths,
+                request.clone(),
+                &self.leader_peer,
+            )
+            .await;
+            self.observe(request, result)
+        })
+    }
+
+    fn catch_up_cluster_kv_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        self.spawn_catch_up(&tokio::runtime::Handle::current(), paths, state, targets);
+    }
+}
+
+impl ClusterKvCommittedFanoutAsyncHost for LaggingVoterHost {
+    fn replicate_cluster_kv_to_node_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        watch_events: &'a [KvEvent],
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterKvRaftAppendReplicationOutcome> {
+        Box::pin(async move {
+            replicate_cluster_kv_to_node_async_with_host(
+                paths,
+                state,
+                target_node_id,
+                watch_events,
+                ClusterControlPlaneTimeouts::default_daemon_transport(),
+                timeout,
+                self,
+            )
+            .await
+        })
+    }
+
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _target_node_id: &'a NodeId,
+        _request: &'a sinomo_kv::ClusterKvWatchEventsRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterKvWatchEventsResponse> {
+        Box::pin(async {
+            Ok(sinomo_kv::ClusterKvWatchEventsResponse {
+                accepted: true,
+                detail: "lagging voter test host stores no watch events".to_string(),
+                stored_events: 0,
+            })
+        })
+    }
+}
+
+impl ClusterStateAuthorityReachabilityAsyncHost for LaggingVoterHost {
+    fn probe_cluster_state_authority_node_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        target: &'a NodeId,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async move { Ok(*target == self.lagging_id) })
+    }
+}
+
+impl ClusterKvTxnQuorumAsyncHost for LaggingVoterHost {
+    fn request_kv_state_authority_vote_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a NodeId,
+        _request: &'a sinomo_kv::ClusterKvStateAuthorityVoteRequest,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterKvStateAuthorityVoteResponse> {
+        Box::pin(async {
+            Err(NetworkError::ClusterReadOnly {
+                detail: "a live leader's read must not campaign".to_string(),
+            })
+        })
+    }
+}
+
+/// The synchronous read path's transport over the same routing; recovery
+/// runs on `runtime` through the same catch-up worker.
+struct LaggingVoterSyncHost {
+    host: LaggingVoterHost,
+    leader_id: NodeId,
+    runtime: tokio::runtime::Handle,
+    commit_calls: usize,
+    elect_calls: usize,
+}
+
+impl ClusterKvTxnQuorumHost for LaggingVoterSyncHost {
+    fn known_kv_state_authority_id(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        Ok(Some(self.leader_id.clone()))
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "a leader-local read sends no {} to {target_node_id}",
+                request.route
+            ),
+        })
+    }
+
+    fn send_cluster_kv_read_index_probes(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &sinomo_kv::ClusterRaftAppendRequest,
+        _timeout: Duration,
+        _required_acks: usize,
+    ) -> Result<Vec<(NodeId, Result<ClusterRaftAppendResponse, NetworkError>)>, NetworkError> {
+        Ok(targets
+            .into_iter()
+            .map(|target| {
+                let result = if target == self.host.lagging_id {
+                    let result = handle_cluster_raft_append_request(
+                        &self.host.lagging_paths,
+                        request.clone(),
+                        &self.host.leader_peer,
+                    );
+                    self.host.observe(request, result)
+                } else {
+                    Err(LaggingVoterHost::stopped_voter(&target))
+                };
+                (target, result)
+            })
+            .collect())
+    }
+
+    fn local_is_kv_state_authority(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        Ok(true)
+    }
+
+    fn request_kv_state_authority_vote(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
+        _timeout: Duration,
+    ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+        Err(NetworkError::ClusterReadOnly {
+            detail: "a live leader's read must not campaign".to_string(),
+        })
+    }
+
+    fn elect_kv_state_authority(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _options: ClusterKvTxnQuorumOptions,
+    ) -> Result<bool, NetworkError> {
+        self.elect_calls += 1;
+        Ok(false)
+    }
+
+    fn reachable_cluster_state_authority_count(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _options: ClusterStateAuthorityReachabilityOptions,
+    ) -> usize {
+        2
+    }
+
+    fn commit_cluster_kv_command_with_quorum(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+        _request: KvCommandRequest,
+        _options: ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
+        self.commit_calls += 1;
+        Err(NetworkError::ClusterReadOnly {
+            detail: "a read in a term that holds a commit appends no barrier".to_string(),
+        })
+    }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        self.host
+            .spawn_catch_up(&self.runtime, paths, state, targets);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LaggingVoterReadPath {
+    Sync,
+    Async,
+}
+
+struct LaggingVoterReadOutcome {
+    result: Result<sinomo_kv::KvAuthorityProof, NetworkError>,
+    probe_answers: Vec<LaggingVoterProbeAnswer>,
+    catch_up_attempts: usize,
+}
+
+/// Reads on the leader with the paced re-send held to the read's deadline, so
+/// only a peer-progress wake can produce a later wave inside the budget.
+fn read_on_lagging_voter_leader(
+    cluster: &LaggingVoterCluster,
+    path: LaggingVoterReadPath,
+    wire: ProbeGapWire,
+    budget: Duration,
+) -> LaggingVoterReadOutcome {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let host = LaggingVoterHost::new(cluster, wire);
+    let mut options =
+        ClusterControlPlaneTimeouts::default_daemon_transport().kv_txn_quorum_options(true);
+    options.raft_append_timeout = budget;
+    let mut state = cluster.state.clone();
+    hold_cluster_kv_read_index_resend_fallback_for_test(&cluster.leader_paths, true);
+    let result = match path {
+        LaggingVoterReadPath::Sync => {
+            let mut sync_host = LaggingVoterSyncHost {
+                host: host.clone(),
+                leader_id: cluster.leader_id.clone(),
+                runtime: runtime.handle().clone(),
+                commit_calls: 0,
+                elect_calls: 0,
+            };
+            let result = read_cluster_kv_authoritative_snapshot_with_host(
+                &cluster.leader_paths,
+                &mut state,
+                options,
+                &mut sync_host,
+            )
+            .map(|read| read.authority);
+            assert_eq!(sync_host.commit_calls, 0, "the read appended a barrier");
+            assert_eq!(sync_host.elect_calls, 0, "the read campaigned");
+            result
+        }
+        LaggingVoterReadPath::Async => {
+            let mut async_host = host.clone();
+            let handle = runtime.handle().clone();
+            runtime
+                .block_on(read_cluster_kv_authoritative_entry_async_with_host(
+                    &handle,
+                    &cluster.leader_paths,
+                    &mut state,
+                    "/lagging/w3".to_string(),
+                    options,
+                    &mut async_host,
+                ))
+                .map(|read| read.authority)
+        }
+    };
+    hold_cluster_kv_read_index_resend_fallback_for_test(&cluster.leader_paths, false);
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    LaggingVoterReadOutcome {
+        result,
+        probe_answers: host.probe_answers(),
+        catch_up_attempts: host.catch_up_attempts.load(Ordering::SeqCst),
+    }
+}
+
+fn assert_lagging_voter_read_completed(
+    cluster: &LaggingVoterCluster,
+    outcome: LaggingVoterReadOutcome,
+    first_gap: sinomo_kv::ClusterRaftReadIndexProbeGap,
+) {
+    let authority = outcome.result.expect("the leader's read completes");
+    assert!(matches!(
+        authority.basis,
+        sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks: 2,
+            required_quorum: 2
+        }
+    ));
+    assert_eq!(
+        outcome.probe_answers.first().copied(),
+        Some((false, Some(first_gap))),
+        "probe answers: {:?}",
+        outcome.probe_answers
+    );
+    assert_eq!(
+        outcome.probe_answers.last().copied(),
+        Some((true, None)),
+        "the confirming wave is an acknowledgement: {:?}",
+        outcome.probe_answers
+    );
+    assert_eq!(outcome.catch_up_attempts, 1, "one targeted catch-up");
+    assert!(!cluster_raft_peer_is_behind(
+        &cluster.leader_paths,
+        &cluster.lagging_id
+    ));
+    let leader = open_cluster_raft_kv_node(&cluster.leader_paths, &cluster.leader_id)
+        .expect("inspect leader");
+    let (leader_last, leader_commit) = (leader.last_log_index(), leader.hard_state().commit_index);
+    drop(leader);
+    let lagging = open_cluster_raft_kv_node(&cluster.lagging_paths, &cluster.lagging_id)
+        .expect("inspect lagging voter");
+    assert_eq!(lagging.last_log_index(), leader_last);
+    assert_eq!(lagging.hard_state().commit_index, leader_commit);
+}
+
+fn evict_lagging_voter_resident(cluster: &LaggingVoterCluster) {
+    assert!(
+        sinomo_kv::evict_resident_raft_node_for_test(
+            &cluster
+                .lagging_paths
+                .kv_paths()
+                .raft_wal_paths(&cluster.lagging_id)
+        ),
+        "the lagging voter's resident node was loaded"
+    );
+}
+
+/// The lagging voter's probe rejection names its log gap. That is the event
+/// that starts its targeted catch-up, and the caught-up voter's accepted append
+/// wakes the read: no write and no re-send interval is needed.
+#[test]
+fn quiet_leader_read_catches_up_a_voter_behind_its_log_while_another_is_stopped() {
+    let cluster = lagging_voter_cluster("sync");
+    let outcome = read_on_lagging_voter_leader(
+        &cluster,
+        LaggingVoterReadPath::Sync,
+        ProbeGapWire::Current,
+        Duration::from_secs(10),
+    );
+    assert_lagging_voter_read_completed(
+        &cluster,
+        outcome,
+        sinomo_kv::ClusterRaftReadIndexProbeGap::LogGap,
+    );
+}
+
+#[test]
+fn quiet_leader_async_read_catches_up_a_voter_behind_its_log_while_another_is_stopped() {
+    let cluster = lagging_voter_cluster("async");
+    let outcome = read_on_lagging_voter_leader(
+        &cluster,
+        LaggingVoterReadPath::Async,
+        ProbeGapWire::Current,
+        Duration::from_secs(10),
+    );
+    assert_lagging_voter_read_completed(
+        &cluster,
+        outcome,
+        sinomo_kv::ClusterRaftReadIndexProbeGap::LogGap,
+    );
+}
+
+/// A voter that restarted with no resident node answers every probe fast and
+/// outside its durable queues. Its typed cold rejection starts the catch-up,
+/// whose ordinary append loads the node; the read then completes.
+#[test]
+fn quiet_leader_read_completes_once_catch_up_loads_a_cold_voter() {
+    for (tag, path) in [
+        ("cold_sync", LaggingVoterReadPath::Sync),
+        ("cold_async", LaggingVoterReadPath::Async),
+    ] {
+        let cluster = lagging_voter_cluster(tag);
+        evict_lagging_voter_resident(&cluster);
+        let outcome = read_on_lagging_voter_leader(
+            &cluster,
+            path,
+            ProbeGapWire::Current,
+            Duration::from_secs(10),
+        );
+        assert_lagging_voter_read_completed(
+            &cluster,
+            outcome,
+            sinomo_kv::ClusterRaftReadIndexProbeGap::ResidentCold,
+        );
+    }
+}
+
+/// Reads on the leader while the lagging voter's gaps arrive untyped or with
+/// a reason this version does not know, and asserts the leader keeps the
+/// untyped rejection's behavior: no recovery, and the read ends at its
+/// deadline.
+fn assert_unknown_gaps_start_no_recovery(
+    tag: &str,
+    wire: ProbeGapWire,
+    expected: Option<sinomo_kv::ClusterRaftReadIndexProbeGap>,
+) {
+    let cluster = lagging_voter_cluster(tag);
+    let outcome = read_on_lagging_voter_leader(
+        &cluster,
+        LaggingVoterReadPath::Async,
+        wire,
+        Duration::from_millis(800),
+    );
+    assert!(outcome.result.is_err(), "the read cannot be confirmed");
+    assert_eq!(outcome.catch_up_attempts, 0);
+    assert!(
+        !outcome.probe_answers.is_empty()
+            && outcome
+                .probe_answers
+                .iter()
+                .all(|answer| *answer == (false, expected)),
+        "{:?}",
+        outcome.probe_answers
+    );
+    let leader = open_cluster_raft_kv_node(&cluster.leader_paths, &cluster.leader_id)
+        .expect("inspect leader");
+    let leader_last = leader.last_log_index();
+    drop(leader);
+    let lagging = open_cluster_raft_kv_node(&cluster.lagging_paths, &cluster.lagging_id)
+        .expect("inspect lagging voter");
+    assert!(lagging.last_log_index() < leader_last);
+}
+
+/// A follower that predates typed probe gaps rejects as before, and the leader
+/// keeps the prior behavior.
+#[test]
+fn untyped_probe_rejections_start_no_recovery() {
+    assert_unknown_gaps_start_no_recovery("untyped", ProbeGapWire::Untyped, None);
+}
+
+/// A newer follower's gap reason this version does not know decodes as the
+/// catch-all, and the leader treats that rejection as untyped.
+#[test]
+fn unrecognized_probe_gap_reasons_start_no_recovery() {
+    assert_unknown_gaps_start_no_recovery(
+        "future_reason",
+        ProbeGapWire::FutureReason,
+        Some(sinomo_kv::ClusterRaftReadIndexProbeGap::Unrecognized),
     );
 }

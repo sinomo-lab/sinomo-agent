@@ -1844,6 +1844,16 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                 true,
             );
         }
+
+        fn catch_up_cluster_raft_peers(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            _targets: Vec<NodeId>,
+        ) {
+            // Join reconciliation sends no Raft traffic of its own; recovery
+            // of a lagging peer belongs to the daemon that leads.
+        }
     }
 
     let mut host = cluster::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport {

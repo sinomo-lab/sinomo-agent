@@ -1808,6 +1808,7 @@ mod tests {
                 success: true,
                 match_index: 1,
             },
+            read_index_gap: None,
         };
         let append_response_payload = cluster_raft_append_response_rpc_payload(&append_response)
             .expect("append response payload");
@@ -1815,6 +1816,112 @@ mod tests {
             decode_cluster_raft_append_rpc_response_body(&append_response_payload.body)
                 .expect("append response body"),
             append_response
+        );
+        // A typed probe gap round-trips, a receiver that predates the field
+        // sends a response a new leader reads as untyped, and a leader that
+        // predates it reads a typed rejection as the ordinary rejection.
+        for gap in [
+            ClusterRaftReadIndexProbeGap::LogGap,
+            ClusterRaftReadIndexProbeGap::ResidentCold,
+        ] {
+            let typed = ClusterRaftAppendResponse {
+                accepted: false,
+                detail: "Raft ReadIndex probe rejected by resident state".to_string(),
+                state: state.clone(),
+                append: RaftAppendEntriesResponse {
+                    term: 2,
+                    success: false,
+                    match_index: 1,
+                },
+                read_index_gap: Some(gap),
+            };
+            let body = cluster_raft_append_response_rpc_payload(&typed)
+                .expect("typed response payload")
+                .body;
+            assert_eq!(
+                decode_cluster_raft_append_rpc_response_body(&body).expect("typed response"),
+                typed
+            );
+            #[derive(Debug, Deserialize)]
+            struct PreGapLeaderView {
+                accepted: bool,
+                append: RaftAppendEntriesResponse,
+            }
+            let legacy: PreGapLeaderView =
+                decode_cluster_kv_rpc_body(&body).expect("pre-gap leader decodes typed rejection");
+            assert!(!legacy.accepted);
+            assert_eq!(legacy.append, typed.append);
+        }
+        #[derive(Serialize)]
+        struct LegacyClusterRaftAppendResponse {
+            accepted: bool,
+            detail: String,
+            state: ClusterBootstrapState,
+            append: RaftAppendEntriesResponse,
+        }
+        let legacy_response = encode_cluster_kv_rpc_body(&LegacyClusterRaftAppendResponse {
+            accepted: false,
+            detail: "Raft ReadIndex probe rejected by resident state".to_string(),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 2,
+                success: false,
+                match_index: 1,
+            },
+        })
+        .expect("encode pre-gap response");
+        assert_eq!(
+            decode_cluster_raft_append_rpc_response_body(&legacy_response)
+                .expect("new leader decodes pre-gap response")
+                .read_index_gap,
+            None,
+            "a missing gap must keep the untyped rejection"
+        );
+        // A reason from a newer follower decodes as the catch-all rather than
+        // making the whole response undecodable. The future reason is neither
+        // a known name nor a known variant position.
+        #[derive(Serialize)]
+        #[allow(dead_code)]
+        enum FutureClusterRaftReadIndexProbeGap {
+            LogGap,
+            ResidentCold,
+            ReservedForAnotherReason,
+            FollowerSuspectsTheLeader,
+        }
+        #[derive(Serialize)]
+        struct FutureClusterRaftAppendResponse {
+            accepted: bool,
+            detail: String,
+            state: ClusterBootstrapState,
+            append: RaftAppendEntriesResponse,
+            read_index_gap: Option<FutureClusterRaftReadIndexProbeGap>,
+        }
+        let future_response = encode_cluster_kv_rpc_body(&FutureClusterRaftAppendResponse {
+            accepted: false,
+            detail: "Raft ReadIndex probe rejected by a newer follower".to_string(),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 2,
+                success: false,
+                match_index: 1,
+            },
+            read_index_gap: Some(FutureClusterRaftReadIndexProbeGap::FollowerSuspectsTheLeader),
+        })
+        .expect("encode future-gap response");
+        let decoded = decode_cluster_raft_append_rpc_response_body(&future_response)
+            .expect("a future gap reason must not make the response undecodable");
+        assert_eq!(
+            decoded.read_index_gap,
+            Some(ClusterRaftReadIndexProbeGap::Unrecognized)
+        );
+        assert!(!decoded.accepted);
+        assert_eq!(
+            decoded.append,
+            RaftAppendEntriesResponse {
+                term: 2,
+                success: false,
+                match_index: 1,
+            }
         );
 
         let vote_request = ClusterRaftVoteRequest {
@@ -8514,6 +8621,7 @@ mod tests {
                     success: self.accepting_targets.contains(target),
                     match_index: 7,
                 },
+                read_index_gap: None,
             })
         }
 
@@ -8772,6 +8880,7 @@ mod tests {
                         success: self.accepting_targets.contains(target),
                         match_index: self.matched_prefixes.get(target).map_or(7, |pair| pair.1),
                     },
+                    read_index_gap: None,
                 })
             })
         }
@@ -9216,6 +9325,7 @@ mod tests {
                     success: true,
                     match_index: 1,
                 },
+                read_index_gap: None,
             })
         }
 
@@ -10417,6 +10527,7 @@ mod tests {
                 },
                 state: request.state.clone(),
                 append: outcome.response,
+                read_index_gap: None,
             })
         }
     }
@@ -10435,6 +10546,7 @@ mod tests {
                 success: accepted,
                 match_index,
             },
+            read_index_gap: None,
         }
     }
 

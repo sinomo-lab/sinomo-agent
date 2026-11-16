@@ -253,6 +253,16 @@ pub trait ClusterControlPlaneTransport {
     ) {
     }
 
+    /// Starts targeted log or snapshot recovery of voters a ReadIndex wave
+    /// showed an append gap for, without waiting for it. A transport that
+    /// cannot own background recovery says so explicitly.
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    );
+
     fn on_kv_replication_sent(&mut self) {}
 }
 

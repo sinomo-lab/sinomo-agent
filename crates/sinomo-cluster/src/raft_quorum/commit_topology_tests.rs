@@ -124,6 +124,15 @@ impl ClusterRaftQuorumAsyncHost for CaptureFanout {
         self.states.push(state);
         Box::pin(async { Ok(()) })
     }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _targets: Vec<NodeId>,
+    ) {
+        // Probe answers from this test host name no append gap.
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

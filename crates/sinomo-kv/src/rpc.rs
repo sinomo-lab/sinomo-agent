@@ -1001,6 +1001,35 @@ pub struct ClusterRaftAppendResponse {
     pub detail: String,
     pub state: ClusterBootstrapState,
     pub append: RaftAppendEntriesResponse,
+    /// Set only on a rejected marked ReadIndex probe that shows the follower
+    /// cannot acknowledge any later probe until the leader sends it an append.
+    ///
+    /// A receiver that predates the field omits it and a leader that predates
+    /// it ignores it; a reason this leader does not know decodes as
+    /// `Unrecognized`. In each case the rejection keeps its ordinary meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_index_gap: Option<ClusterRaftReadIndexProbeGap>,
+}
+
+/// Why a follower rejected a marked ReadIndex probe in a way only an append
+/// from the leader resolves. The rejection is never an acknowledgement; it is
+/// the observed append gap that starts the leader's targeted recovery of this
+/// peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClusterRaftReadIndexProbeGap {
+    /// The follower's log does not hold the probe's anchor entry at the
+    /// anchor's term; the rejection's match index is its log tail.
+    LogGap,
+    /// The follower has no resident Raft node loaded to evaluate the probe.
+    /// The probe stays a fast, non-durable rejection; the leader's ordinary
+    /// append loads the node.
+    ResidentCold,
+    /// A reason from a newer follower that this node does not know. Only
+    /// decoding produces it; nothing sends it. The leader treats it as an
+    /// untyped rejection: no recovery starts and the wave is re-sent on its
+    /// paced fallback.
+    #[serde(other)]
+    Unrecognized,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

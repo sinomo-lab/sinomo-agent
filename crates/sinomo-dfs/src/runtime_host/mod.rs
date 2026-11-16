@@ -1294,6 +1294,41 @@ impl sinomo_core::cluster::ClusterKvQuorumAsyncHost for TestDfsClusterQuorumHost
             Ok(())
         })
     }
+
+    fn catch_up_cluster_kv_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &sinomo_core::ClusterBootstrapState,
+        targets: Vec<NodeId>,
+    ) {
+        let Some(peers) = self.peers.as_ref().cloned() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let worker = Arc::clone(&peers);
+        let attempts = sinomo_core::cluster::catch_up_cluster_raft_peers_async_with_factory(
+            paths.clone(),
+            state.clone(),
+            targets,
+            runtime.clone(),
+            sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport(),
+            move || TestDfsClusterQuorumHost {
+                peers: Some(Arc::clone(&worker)),
+                object_rpc: None,
+            },
+        );
+        let task = runtime.spawn(async move {
+            attempts.await;
+            Ok(())
+        });
+        peers
+            .tasks
+            .lock()
+            .expect("owned fixture catch-up tasks")
+            .push(task);
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

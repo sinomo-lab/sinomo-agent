@@ -314,10 +314,12 @@ pub use publication_cache::{
     ClusterPublicationCacheLimits,
 };
 pub use raft_fanout::{
-    ClusterKvCommittedFanoutAsyncHost, claim_cluster_raft_peer_catch_up,
-    cluster_raft_peer_is_behind, finish_cluster_raft_peer_catch_up,
-    record_cluster_raft_peer_append_results, replicate_cluster_kv_to_node_async_with_host,
+    ClusterKvCommittedFanoutAsyncHost, catch_up_cluster_raft_peers_async_with_factory,
+    claim_cluster_raft_peer_catch_up, cluster_raft_peer_is_behind,
+    finish_cluster_raft_peer_catch_up, record_cluster_raft_peer_append_results,
+    replicate_cluster_kv_to_node_async_with_host,
     spawn_cluster_kv_committed_fanout_worker_on_runtime,
+    spawn_cluster_raft_peer_catch_up_on_runtime,
 };
 pub use raft_quorum::{
     ClusterKvQuorumAsyncHost, ClusterRaftQuorumBatch, ClusterRaftQuorumBatchOutcomes,
@@ -532,6 +534,8 @@ pub use raft_fanout::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use raft_quorum::commit_cluster_raft_command_with_quorum_async_with_host;
+#[cfg(any(test, feature = "test-support"))]
+pub use raft_quorum::hold_cluster_kv_read_index_resend_fallback_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use raft_quorum::{
     ClusterRaftQuorumAsyncHost, ClusterRaftQuorumTransportHost,

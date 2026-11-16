@@ -1342,6 +1342,17 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
             || self.call_node_object_rpc_direct(state, target_node_id, request, timeout),
         )
     }
+
+    fn catch_up_cluster_raft_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _targets: Vec<NodeId>,
+    ) {
+        // A CLI process ends with its command and runs no background Raft
+        // work; like committed fanout, a lagging peer's recovery belongs to the
+        // daemon that leads, which observes the same gap on its next read.
+    }
 }
 
 fn cli_cluster_control_plane_timeouts() -> cluster::ClusterControlPlaneTimeouts {
