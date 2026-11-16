@@ -3,7 +3,7 @@
 
 use super::commit_native_tests::{
     catch_up, cut, directory, durable_prefix, fail_journal_calls, members, mode_change, primary,
-    shard_root, shrink, switched, write_set_of,
+    shard_root, shrink, submit, switched, write_set_of,
 };
 use super::*;
 use crate::DfsMetadataShardId;
@@ -294,6 +294,217 @@ fn native_takeover_member_answers_the_new_epoch_while_a_local_lane_is_held() {
         holds_object(&runtime, &c, &config, &after)
     });
     assert_eq!(cut(&runtime, &config).shard.primary_node_id, b);
+    runtime.close().unwrap();
+}
+
+/// A metadata journal sender from `node`'s own peer transport, as its keeper
+/// and commits use.
+fn journal_sender(
+    runtime: &crate::test_support::DfsTestRuntime,
+    node: &NodeId,
+) -> crate::DfsMetadataJournalBatchSender {
+    let (peer, _) = crate::runtime_host::daemon_dfs_peer_transports_on_runtime(
+        runtime.data_dir(node),
+        crate::test_runtime::executor().handle(),
+    );
+    crate::metadata_replication::dfs_metadata_journal_batch_sender_from_peer_transport(
+        runtime.data_dir(node),
+        peer,
+    )
+}
+
+/// Each cycle test bounds every send through the sender's own overall
+/// timeout; the fixture's RPCs have no bound of their own.
+const CYCLE_SEND_BOUND: Duration = Duration::from_secs(30);
+
+type BoundedAnswer = (
+    Result<crate::DfsMetadataJournalBatchResponse, crate::DfsMetadataPeerTransportError>,
+    Duration,
+);
+
+/// Send `command` from `sender` to `target` on its own thread, holding
+/// `hold` until the send returns, as a holder waiting on a peer does.
+fn send_holding(
+    sender: crate::DfsMetadataJournalBatchSender,
+    target: &NodeId,
+    command: crate::DfsMetadataJournalBatchCommand,
+    hold: impl Send + 'static,
+) -> std::sync::mpsc::Receiver<BoundedAnswer> {
+    let (done, answered) = std::sync::mpsc::channel();
+    let target = target.clone();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let answer = sender(&target, &command, Some(CYCLE_SEND_BOUND));
+        drop(hold);
+        let _ = done.send((answer, started.elapsed()));
+    });
+    answered
+}
+
+/// The old primary P holds its exact lane on the shard while it waits on B,
+/// as a commit or an alignment holds it. B, the new primary after a takeover,
+/// holds its own lane while it waits on P, as its join of P does. P's probe
+/// cleared B's arrival check before B's view moved, and P admits B's probe
+/// behind P's own lane. B answers P's probe from its moved view, naming
+/// itself, without its lane; P's holder then ends and P answers B. Without
+/// that answer each waits on the other until P's send reaches its bound.
+#[test]
+fn native_old_and_new_primaries_answer_each_other_while_each_holds_its_lane() {
+    use crate::runtime_admission::answer_admission_test_hooks as hooks;
+    let (runtime, config) = switched("native-takeover-crossed-lanes", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let shard_id = shard_id_of(&config);
+    let fs = config.file_system_id.clone();
+    client_write(&runtime, &config, &c, "/services/crossed-lanes.txt");
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+
+    let to_b = crate::metadata_replication::dfs_metadata_caught_up_probe_command_for(
+        &p,
+        &b,
+        &fs,
+        &shard_id,
+        config.epoch,
+        &durable_prefix(&runtime, &p, &config).expect("P's head"),
+    );
+    let to_b_id = to_b.request_id.clone();
+    let arrival = hooks::hold_before_admission(&to_b_id);
+    let held_p = runtime
+        .hold_main_exact_admission(&p, &fs, &config.shard_id)
+        .unwrap();
+    let p_answered = send_holding(journal_sender(&runtime, &p), &b, to_b, held_p);
+    wait_for("P's probe clears B's arrival check", || {
+        hooks::arrived(&to_b_id)
+    });
+
+    hand_takeover(&runtime, &config, &b);
+    let current = cut(&runtime, &config).shard;
+    assert_eq!(current.primary_node_id, b);
+
+    let held_b = runtime
+        .hold_main_exact_admission(&b, &fs, &config.shard_id)
+        .unwrap();
+    let to_p = crate::metadata_replication::dfs_metadata_caught_up_probe_command_for(
+        &b,
+        &p,
+        &fs,
+        &shard_id,
+        current.epoch,
+        &durable_prefix(&runtime, &b, &config).expect("B's head"),
+    );
+    let to_p_id = to_p.request_id.clone();
+    hooks::watch(&to_p_id);
+    let b_answered = send_holding(journal_sender(&runtime, &b), &p, to_p, held_b);
+    wait_for("B's probe waits behind P's lane", || {
+        hooks::view_checks(&to_p_id) >= 1
+    });
+
+    // P's probe enters B's admission, behind B's lane.
+    arrival.add_permits(1);
+    let released = Instant::now();
+    let (from_b, _) = p_answered
+        .recv_timeout(CYCLE_SEND_BOUND * 2)
+        .expect("P's send returns");
+    let p_waited = released.elapsed();
+    let (from_p, _) = b_answered
+        .recv_timeout(CYCLE_SEND_BOUND * 2)
+        .expect("B's send returns");
+    let from_b = from_b.expect("B answers P's probe within the bound");
+    assert_eq!(
+        from_b.result.rejection_code(),
+        Some(crate::DfsMetadataRejectionCode::SourceEpochSuperseded),
+        "{from_b:?}"
+    );
+    let record = from_b.member_record.as_ref().expect("B's record view");
+    assert_eq!((record.epoch, &record.primary_node_id), (current.epoch, &b));
+    assert!(
+        p_waited < Duration::from_secs(10),
+        "B answers without its lane, not at the bound: {p_waited:?}"
+    );
+    assert!(hooks::view_checks(&to_b_id) >= 1);
+    from_p.expect("P answers B's probe once its holder ends");
+    runtime.close().unwrap();
+}
+
+/// A member answer waiting for its lane keeps waiting through record moves
+/// that leave the shard's epoch and primary alone: a write-set shrink, which
+/// moves the generation, and a removal, which also changes the replica set.
+/// Once the lane is free it is admitted and answered there, by the same
+/// context comparison as before.
+#[test]
+fn native_member_answer_waits_through_generation_and_replica_moves() {
+    use crate::runtime_admission::answer_admission_test_hooks as hooks;
+    let (runtime, config) = switched("native-member-answer-waits", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let shard_id = shard_id_of(&config);
+    let fs = config.file_system_id.clone();
+    client_write(&runtime, &config, &c, "/services/answer-waits.txt");
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+
+    let held_b = runtime
+        .hold_main_exact_admission(&b, &fs, &config.shard_id)
+        .unwrap();
+    let to_b = crate::metadata_replication::dfs_metadata_caught_up_probe_command_for(
+        &p,
+        &b,
+        &fs,
+        &shard_id,
+        config.epoch,
+        &durable_prefix(&runtime, &p, &config).expect("P's head"),
+    );
+    let to_b_id = to_b.request_id.clone();
+    hooks::watch(&to_b_id);
+    let answered = send_holding(journal_sender(&runtime, &p), &b, to_b, ());
+    wait_for("P's probe waits behind B's lane", || {
+        hooks::view_checks(&to_b_id) >= 1
+    });
+
+    shrink(&runtime, &config, &c, 1);
+    wait_for("the shrink is checked", || {
+        hooks::view_checks(&to_b_id) >= 2
+    });
+    let removal = build_metadata_write_set_remove(
+        &cut(&runtime, &config),
+        &std::collections::BTreeSet::from([c.clone()]),
+        &DfsMetadataShardBounds { w_floor: 1, n: 3 },
+        1,
+        true,
+    )
+    .unwrap();
+    submit(&runtime, &config, &removal);
+    wait_for("the removal is checked", || {
+        hooks::view_checks(&to_b_id) >= 3
+    });
+    let moved = cut(&runtime, &config).shard;
+    assert_eq!((moved.epoch, &moved.primary_node_id), (config.epoch, &p));
+    assert!(!moved.replica_node_ids.contains(&c));
+    assert!(
+        answered.try_recv().is_err(),
+        "the answer still waits for B's lane"
+    );
+
+    drop(held_b);
+    let (answer, _) = answered
+        .recv_timeout(CYCLE_SEND_BOUND * 2)
+        .expect("P's send returns");
+    let answer = answer.expect("B answers once its lane is free");
+    match &answer.result {
+        crate::DfsMetadataJournalBatchResult::Rejected { reason, code } => {
+            assert_eq!(*code, crate::DfsMetadataRejectionCode::Other, "{answer:?}");
+            assert!(
+                reason.contains("replica authority context"),
+                "answered by the admitted context comparison: {answer:?}"
+            );
+        }
+        other => panic!("the admitted answer compares the moved context: {other:?}"),
+    }
     runtime.close().unwrap();
 }
 

@@ -1981,10 +1981,12 @@ fn native_takeover_resends_a_failed_confirm_read_in_a_quiet_cluster() {
 
 /// The old primary returns while one of its own maintenance passes holds its
 /// global admission and waits on the new primary, as its reconciliation does
-/// when it routes a namespace request there. The new primary's join holds
-/// its own global admission while it aligns and probes the member, so the
-/// two would wait on each other until the member's pass gave up; the join's
-/// probes preempt that pass instead, and the member rejoins at once.
+/// when it routes a namespace request there. The new primary's join holds the
+/// shard's exact admission, which that request waits behind, while it aligns
+/// and probes the member, and the member answers no probe while its pass
+/// holds its global admission. The two would wait on each other until the
+/// member's pass gave up; the join's probes preempt that pass instead, and
+/// the member rejoins at once.
 #[test]
 fn native_rejoin_preempts_a_maintenance_pass_on_the_returning_member() {
     let (mut runtime, config) =

@@ -2118,6 +2118,100 @@ fn direct_replica_preflight_rejects_a_ready_changed_assignment_before_backend_in
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
 }
 
+/// An answer admitted at once takes the same path as before: its record view
+/// is not checked while it waits, even when that view moved past the request.
+/// Behind a held lane, the same answer is refused from the moved view
+/// without the lane.
+#[test]
+fn an_uncontended_replica_answer_is_admitted_without_checking_its_view() {
+    use super::super::data_plane::{
+        DaemonDfsReplicaAnswerAdmission, admit_daemon_dfs_replica_answer,
+    };
+    use crate::runtime_admission::answer_admission_test_hooks as hooks;
+    let fixture = RetryFixture::new("direct-replica-uncontended-answer");
+    let (data_dir, _paths, original_context) = current_direct_replica_context(&fixture);
+    let successor = {
+        let native = fixture.native.lock().unwrap();
+        native
+            .as_ref()
+            .unwrap()
+            .reassign_metadata_shard(
+                &fixture.shard.file_system_id,
+                &fixture.shard.shard_id,
+                fixture.remote.clone(),
+                vec![fixture.local.clone()],
+            )
+            .expect("actual normal handoff freeze, ACK and joint activation")
+    };
+    assert_ne!(successor, original_context.shard);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let peer = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+        .unwrap()
+        .unwrap();
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        &cluster_paths,
+        &peer.cluster_id,
+        &peer.local_node_id,
+        Some(fixture.runtime.handle()),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while authority
+        .replica_context_state(&original_context)
+        .unwrap()
+        .1
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the remote's view names the successor"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A scheduler of its own: nothing else holds or queues on it.
+    let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+    let scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: original_context.shard.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(&original_context.shard.shard_id),
+    };
+    let answer = |request_id: &'static str| {
+        hooks::watch(request_id);
+        fixture
+            .runtime
+            .block_on(admit_daemon_dfs_replica_answer(
+                &scheduler,
+                &scope,
+                true,
+                &authority,
+                &fixture.remote,
+                &original_context,
+                request_id,
+            ))
+            .unwrap()
+    };
+
+    let admitted = answer("uncontended-replica-answer");
+    assert!(matches!(
+        admitted,
+        DaemonDfsReplicaAnswerAdmission::Admitted(_)
+    ));
+    assert_eq!(hooks::view_checks("uncontended-replica-answer"), 0);
+    drop(admitted);
+
+    let held = fixture.runtime.block_on(scheduler.admit(&scope)).unwrap();
+    let DaemonDfsReplicaAnswerAdmission::Refused(refusal) = answer("contended-replica-answer")
+    else {
+        panic!("an answer behind a held lane is refused from the moved view");
+    };
+    assert!(
+        refusal
+            .reason
+            .contains("does not match the authorized shard identity"),
+        "{refusal:?}"
+    );
+    assert_eq!(hooks::view_checks("contended-replica-answer"), 1);
+    drop(held);
+}
+
 #[test]
 fn completed_rebind_rejects_a_moved_prefix_before_binding_then_accepts_current_ancestry() {
     let fixture = RetryFixture::new("completed-rebind-moved-prefix");

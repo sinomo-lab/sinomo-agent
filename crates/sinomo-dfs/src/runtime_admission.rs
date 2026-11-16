@@ -635,6 +635,78 @@ impl DfsMutationSchedulerRegistry {
     }
 }
 
+/// Test support for answer admission, keyed by a watched request id:
+/// whether a replica answer reached its admission, a gate that holds it there,
+/// and how often its record view was checked while it waited.
+#[cfg(test)]
+pub(crate) mod answer_admission_test_hooks {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    #[derive(Default)]
+    struct Watched {
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        arrived: bool,
+        view_checks: usize,
+    }
+
+    static WATCHED: LazyLock<Mutex<BTreeMap<String, Watched>>> = LazyLock::new(Default::default);
+
+    fn watched() -> std::sync::MutexGuard<'static, BTreeMap<String, Watched>> {
+        WATCHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Observe `request_id` without holding it.
+    pub(crate) fn watch(request_id: &str) {
+        watched().entry(request_id.to_owned()).or_default();
+    }
+
+    /// Hold `request_id` just before its admission until the returned gate
+    /// gets a permit.
+    pub(crate) fn hold_before_admission(request_id: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        watched().entry(request_id.to_owned()).or_default().gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Whether the watched request reached its admission.
+    pub(crate) fn arrived(request_id: &str) -> bool {
+        watched()
+            .get(request_id)
+            .is_some_and(|watched| watched.arrived)
+    }
+
+    /// How often the watched request's record view was checked while it
+    /// waited for admission.
+    pub(crate) fn view_checks(request_id: &str) -> usize {
+        watched()
+            .get(request_id)
+            .map_or(0, |watched| watched.view_checks)
+    }
+
+    pub(crate) async fn before_admission(request_id: &str) {
+        let gate = {
+            let mut watched = watched();
+            let Some(entry) = watched.get_mut(request_id) else {
+                return;
+            };
+            entry.arrived = true;
+            entry.gate.clone()
+        };
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
+    }
+
+    pub(crate) fn record_view_check(request_id: &str) {
+        if let Some(entry) = watched().get_mut(request_id) {
+            entry.view_checks += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

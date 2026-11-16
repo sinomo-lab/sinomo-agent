@@ -141,6 +141,186 @@ pub(super) fn replica_context_can_reselect_committed_fence(
     same_handoff == *current
 }
 
+/// The shard authority a journal batch, write-set probe or snapshot install
+/// claims: its filesystem, shard and epoch, from its authenticated source.
+pub(super) struct DaemonDfsReplicaRequestAuthority<'a> {
+    /// Names the request in a rejection.
+    pub(super) kind: &'static str,
+    pub(super) file_system_id: Option<&'a DfsFileSystemId>,
+    pub(super) shard_id: &'a DfsMetadataShardId,
+    pub(super) epoch: Option<u64>,
+    pub(super) source_node_id: &'a NodeId,
+}
+
+impl<'a> DaemonDfsReplicaRequestAuthority<'a> {
+    /// The authority of a request admitted against `context`, which the
+    /// arrival check found to name its source at its epoch.
+    fn admitted(
+        kind: &'static str,
+        context: &'a sinomo_dfs::DfsMetadataReplicaShardContext,
+        shard_id: &'a DfsMetadataShardId,
+    ) -> Self {
+        Self {
+            kind,
+            file_system_id: Some(&context.shard.file_system_id),
+            shard_id,
+            epoch: Some(context.shard.epoch),
+            source_node_id: &context.shard.primary_node_id,
+        }
+    }
+}
+
+/// How this node's record view `context` answers a replica request without
+/// any admission: nothing when the view names the request's source as the
+/// shard's primary at the request's epoch, and otherwise a rejection. On a
+/// switched shard another epoch is answered with its typed code and this
+/// node's record view. The same decision is made when the request arrives and
+/// again each time the view is published while the request waits for
+/// admission.
+pub(super) fn daemon_dfs_replica_request_refusal(
+    request: &DaemonDfsReplicaRequestAuthority<'_>,
+    context: &sinomo_dfs::DfsMetadataReplicaShardContext,
+) -> Option<sinomo_dfs::DfsMetadataRejection> {
+    let same_shard = request.file_system_id == Some(&context.shard.file_system_id)
+        && request.shard_id.0 == context.shard.shard_id;
+    if same_shard
+        && request.epoch == Some(context.shard.epoch)
+        && &context.shard.primary_node_id == request.source_node_id
+    {
+        return None;
+    }
+    if same_shard
+        && let Some(rejection) =
+            crate::metadata_replication::write_set_source_epoch_rejection(request.epoch, context)
+    {
+        return Some(rejection);
+    }
+    Some(
+        format!(
+            "{} does not match the authorized shard identity: received filesystem {:?} shard {} epoch {:?} primary {}; expected filesystem {} shard {} epoch {} primary {}",
+            request.kind,
+            request.file_system_id,
+            request.shard_id.0,
+            request.epoch,
+            request.source_node_id,
+            context.shard.file_system_id,
+            context.shard.shard_id,
+            context.shard.epoch,
+            context.shard.primary_node_id,
+        )
+        .into(),
+    )
+}
+
+/// How a replica answer's wait for admission ended.
+pub(super) enum DaemonDfsReplicaAnswerAdmission {
+    Admitted(DaemonDfsMutationAdmission),
+    /// This node's record view moved past the request while it waited.
+    Refused(sinomo_dfs::DfsMetadataRejection),
+}
+
+/// Admit this node's answer to a peer's replica request on `scope`.
+///
+/// Admission is polled first, so an answer that is admitted at once takes the
+/// same path as any other. While it waits, the request is decided again from
+/// this node's record view each time that view is published: one the current
+/// view refuses for its epoch or primary is answered with that refusal, and
+/// takes no admission. The lane serializes store mutations, and a refusal
+/// makes none; admission would refuse the request too, since the view only
+/// moves forward. A view that moved only by generation, replica set or handoff
+/// fence keeps the answer waiting.
+///
+/// This ends the cycle of two nodes that each believe they are the shard's
+/// primary at different epochs, each holding its own lane while waiting on
+/// the other. The newer node's view has moved past the older node's request
+/// by the time that request waits behind the newer node's holder.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn admit_daemon_dfs_replica_answer(
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+    scope: &DfsMessageExecutionScope,
+    preempt_maintenance: bool,
+    authority: &DaemonDfsMetadataAuthorityGeneration,
+    local_node_id: &NodeId,
+    admitted_context: &sinomo_dfs::DfsMetadataReplicaShardContext,
+    request_id: &str,
+) -> Result<DaemonDfsReplicaAnswerAdmission, DaemonError> {
+    let mut published = authority.subscribe_configuration_snapshot();
+    let admission = admit_daemon_dfs_peer_answer(scheduler, scope, preempt_maintenance);
+    tokio::pin!(admission);
+    let mut waiting = false;
+    loop {
+        tokio::select! {
+            biased;
+            admitted = &mut admission => {
+                return Ok(DaemonDfsReplicaAnswerAdmission::Admitted(admitted?));
+            }
+            () = std::future::ready(()), if !waiting => waiting = true,
+            changed = published.changed() => {
+                if changed.is_err() {
+                    // The view is no longer published; only admission ends
+                    // the wait.
+                    return Ok(DaemonDfsReplicaAnswerAdmission::Admitted(admission.await?));
+                }
+            }
+        }
+        #[cfg(test)]
+        crate::runtime_admission::answer_admission_test_hooks::record_view_check(request_id);
+        #[cfg(not(test))]
+        let _ = request_id;
+        match daemon_dfs_replica_answer_refusal_while_waiting(
+            authority,
+            local_node_id,
+            admitted_context,
+        ) {
+            Ok(Some(refusal)) => return Ok(DaemonDfsReplicaAnswerAdmission::Refused(refusal)),
+            Ok(None) => {}
+            // A view that cannot be read decides nothing; admission and its
+            // own checks still answer the request.
+            Err(error) => tracing::debug!(
+                target: "sinomo.dfs",
+                %error,
+                "replica answer record view unreadable while waiting for admission"
+            ),
+        }
+    }
+}
+
+/// The refusal this node's current record view gives a request admitted
+/// against `admitted`, if the view moved to another epoch or primary of the
+/// shard. A view that no longer holds the shard leaves the request to its
+/// admission, whose own checks answer it.
+fn daemon_dfs_replica_answer_refusal_while_waiting(
+    authority: &DaemonDfsMetadataAuthorityGeneration,
+    local_node_id: &NodeId,
+    admitted: &sinomo_dfs::DfsMetadataReplicaShardContext,
+) -> Result<Option<sinomo_dfs::DfsMetadataRejection>, DaemonError> {
+    let (generation, matches) = authority.replica_context_state(admitted)?;
+    if matches {
+        return Ok(None);
+    }
+    let Some(projection) = authority.retained_complete_prefix_for_generation(generation) else {
+        return Ok(None);
+    };
+    let shard_id = DfsMetadataShardId::new(admitted.shard.shard_id.clone());
+    let Some(current) = daemon_dfs_metadata_replica_context_from_authority_projection(
+        &projection,
+        local_node_id,
+        &admitted.shard.file_system_id,
+        &shard_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(daemon_dfs_replica_request_refusal(
+        &DaemonDfsReplicaRequestAuthority::admitted(
+            "metadata replica request",
+            admitted,
+            &shard_id,
+        ),
+        &current,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_daemon_dfs_resident_replica_operation<R, F>(
     paths: &DaemonPaths,
@@ -175,7 +355,8 @@ where
             reason: format!(
                 "DFS replica authority context names local node {}, but the daemon identity is {}",
                 expected_context.local_node_id, peer_snapshot.local_node_id
-            ),
+            )
+            .into(),
         });
     }
     let mut metadata_authority_preflight =
@@ -205,16 +386,33 @@ where
         traceparent: traceparent.as_deref(),
         enabled: trace_enabled,
     };
+    #[cfg(test)]
+    crate::runtime_admission::answer_admission_test_hooks::before_admission(trace_request.0).await;
     let scheduler = daemon_dfs_mutation_scheduler(data_dir.as_ref())?;
     let mut authority_refresh_retries = 0;
     let (admission, shard) = loop {
         admission_trace.attempt = authority_refresh_retries;
         let scheduler_started = admission_trace.start();
-        let admitted = tracing::Instrument::instrument(
-            admit_daemon_dfs_peer_answer(&scheduler, &exact_scope, preempt_maintenance),
+        let admitted = match tracing::Instrument::instrument(
+            admit_daemon_dfs_replica_answer(
+                &scheduler,
+                &exact_scope,
+                preempt_maintenance,
+                &metadata_authority_preflight.authority,
+                &peer_snapshot.local_node_id,
+                &expected_context,
+                trace_request.0,
+            ),
             admission_trace.span("initial-scheduler"),
         )
-        .await;
+        .await
+        {
+            Ok(DaemonDfsReplicaAnswerAdmission::Admitted(admission)) => Ok(admission),
+            Ok(DaemonDfsReplicaAnswerAdmission::Refused(reason)) => {
+                return Ok(DaemonDfsResidentReplicaOperation::Rejected { reason });
+            }
+            Err(error) => Err(error),
+        };
         admission_trace.record(
             "initial-scheduler",
             if admitted.is_ok() {
@@ -286,7 +484,8 @@ where
                     reason: format!(
                         "metadata replica authority context changed for filesystem {file_system_id} shard {}",
                         shard_id.0
-                    ),
+                    )
+                    .into(),
                 });
             }
             // This is a new receiver observation before the FnOnce operation,
@@ -421,15 +620,26 @@ where
             if !admission.is_global() {
                 drop(admission);
                 let upgrade_started = admission_trace.start();
-                let upgraded = tracing::Instrument::instrument(
-                    admit_daemon_dfs_message(
+                let upgraded = match tracing::Instrument::instrument(
+                    admit_daemon_dfs_replica_answer(
                         &scheduler,
                         &DfsMessageExecutionScope::GlobalExclusive,
                         preempt_maintenance,
+                        &metadata_authority_preflight.authority,
+                        &peer_snapshot.local_node_id,
+                        &expected_context,
+                        trace_request.0,
                     ),
                     admission_trace.span("global-upgrade"),
                 )
-                .await;
+                .await
+                {
+                    Ok(DaemonDfsReplicaAnswerAdmission::Admitted(admission)) => Ok(admission),
+                    Ok(DaemonDfsReplicaAnswerAdmission::Refused(reason)) => {
+                        return Ok(DaemonDfsResidentReplicaOperation::Rejected { reason });
+                    }
+                    Err(error) => Err(error),
+                };
                 admission_trace.record(
                     "global-upgrade",
                     if upgraded.is_ok() {
@@ -526,7 +736,8 @@ where
                     reason: format!(
                         "this node does not host filesystem {file_system_id} metadata shard {}",
                         shard_id.0
-                    ),
+                    )
+                    .into(),
                 });
             }
             let cache_started = admission_trace.start();
@@ -558,7 +769,8 @@ where
                 reason: format!(
                     "metadata replica authority context is stale for filesystem {file_system_id} shard {}",
                     shard_id.0
-                ),
+                )
+                .into(),
             });
         };
         #[cfg(test)]
@@ -646,8 +858,12 @@ where
 }
 
 pub(super) enum DaemonDfsResidentReplicaOperation<R> {
-    Completed { result: R },
-    Rejected { reason: String },
+    Completed {
+        result: R,
+    },
+    Rejected {
+        reason: sinomo_dfs::DfsMetadataRejection,
+    },
 }
 
 pub(super) async fn handle_daemon_dfs_inspection_async(
@@ -1081,36 +1297,17 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     "authoritative metadata replica shard context is unavailable",
                 ));
             };
-            let exact_authority = command.file_system_id.as_ref()
-                == Some(&context.shard.file_system_id)
-                && command.batch.shard_id.0 == context.shard.shard_id
-                && command.authority_epoch == Some(context.shard.epoch)
-                && context.shard.primary_node_id == authenticated_source_node_id;
-            if !exact_authority {
-                if command.file_system_id.as_ref() == Some(&context.shard.file_system_id)
-                    && command.batch.shard_id.0 == context.shard.shard_id
-                    && let Some(rejection) =
-                        crate::metadata_replication::write_set_source_epoch_rejection(
-                            command.authority_epoch,
-                            &context,
-                        )
-                {
-                    return Ok(daemon_dfs_metadata_journal_rejection(&command, rejection));
-                }
-                return Ok(daemon_dfs_metadata_journal_rejection(
-                    &command,
-                    format!(
-                        "metadata journal command does not match the authorized shard identity: received filesystem {:?} shard {} epoch {:?} primary {}; expected filesystem {} shard {} epoch {} primary {}",
-                        command.file_system_id,
-                        command.batch.shard_id.0,
-                        command.authority_epoch,
-                        authenticated_source_node_id,
-                        context.shard.file_system_id,
-                        context.shard.shard_id,
-                        context.shard.epoch,
-                        context.shard.primary_node_id,
-                    ),
-                ));
+            if let Some(rejection) = daemon_dfs_replica_request_refusal(
+                &DaemonDfsReplicaRequestAuthority {
+                    kind: "metadata journal command",
+                    file_system_id: command.file_system_id.as_ref(),
+                    shard_id: &command.batch.shard_id,
+                    epoch: command.authority_epoch,
+                    source_node_id: &authenticated_source_node_id,
+                },
+                &context,
+            ) {
+                return Ok(daemon_dfs_metadata_journal_rejection(&command, rejection));
             }
             let event_origin_node_id = context.local_node_id.clone();
             let may_have_deferred_materialization =
@@ -1282,12 +1479,21 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     "authoritative metadata replica shard context is unavailable",
                 ));
             };
-            let exact_authority = command.file_system_id.as_ref()
-                == Some(&context.shard.file_system_id)
-                && command.shard_id.0 == context.shard.shard_id
-                && command.authority_epoch == Some(context.shard.epoch)
-                && context.shard.primary_node_id == authenticated_source_node_id;
-            if !exact_authority {
+            // A snapshot install keeps its own arrival answer: an untyped
+            // mismatch. Only a wait for admission answers it with the typed
+            // epoch code.
+            if daemon_dfs_replica_request_refusal(
+                &DaemonDfsReplicaRequestAuthority {
+                    kind: "metadata snapshot command",
+                    file_system_id: command.file_system_id.as_ref(),
+                    shard_id: &command.shard_id,
+                    epoch: command.authority_epoch,
+                    source_node_id: &authenticated_source_node_id,
+                },
+                &context,
+            )
+            .is_some()
+            {
                 return Ok(daemon_dfs_metadata_snapshot_rejection(
                     &command,
                     "metadata snapshot command does not match the authorized shard identity",
