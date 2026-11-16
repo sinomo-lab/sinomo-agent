@@ -30,9 +30,7 @@ If broader restructuring is the actual request, preserve valid text within it
 rather than treating the request as permission to rewrite everything.
 
 Useful additional improvements are not automatically forbidden. State their
-value and effect separately and keep them independently reviewable. For extended
-autonomous work, use [sinomo-change-scope](../sinomo-change-scope/SKILL.md) to bind
-that explanation to the actual changed blocks and detect later unreviewed edits.
+value and effect separately and keep them independently reviewable.
 
 ## Make every document standalone
 
