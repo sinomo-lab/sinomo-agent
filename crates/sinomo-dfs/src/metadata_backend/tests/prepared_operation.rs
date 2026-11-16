@@ -1,5 +1,6 @@
 //! Native PreparedV7 kernel regressions; author guards come from real hosted services.
 mod immutable_payload;
+mod genesis_activation;
 mod conditional_current;
 mod checkpoint_cache;
 mod owned_namespace_plan;
@@ -109,9 +110,17 @@ fn candidate_journal_recovers_head_hints_but_requires_the_actual_prepare() {
     // These are hidden candidates populated from an actual native producer.
     // CandidateWriter grants no author guard and does not publish this body.
     let temporary = sinomo_testdir::TestDir::new("candidate-head-hint-images");
+    let generation = crate::DfsMetadataGenerationIdentity {
+        file_system_id: config.file_system_id.clone(),
+        shard_id: shard.clone(),
+        generation: "candidate-head-hint".into(),
+        origin: crate::DfsMetadataGenerationOrigin::StorageTransition {
+            transition_id: "candidate-head-hint-data".into(),
+        },
+    };
     for variant in ["missing", "corrupt", "stale"] {
         let root = temporary.join(variant);
-        let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+        let writer = crate::DfsMetadataCandidateWriter::open_generation(&root, generation.clone()).unwrap();
         let (prepared, after_prepare) = writer.prepare(payload.clone(), &base).unwrap();
         let head = root.join("journal/head.sobj");
         fs::rename(&head, root.join("retained-head-after-prepare.sobj")).unwrap();
@@ -158,7 +167,7 @@ fn candidate_journal_recovers_head_hints_but_requires_the_actual_prepare() {
         );
     }
     let root = temporary.join("missing-prepare");
-    let writer = crate::DfsMetadataCandidateWriter::open(&root).unwrap();
+    let writer = crate::DfsMetadataCandidateWriter::open_generation(&root, generation).unwrap();
     let (prepared, after_prepare) = writer.prepare(payload, &base).unwrap();
     fs::rename(
         root.join("journal/segments"),

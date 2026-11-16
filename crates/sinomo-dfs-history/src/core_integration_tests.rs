@@ -5181,6 +5181,7 @@ fn file_history_pending_preservation_does_not_block_current_writes_and_publishes
     // determines whether the original operation has reached W.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut observed_progress = Vec::new();
+    let mut maintenance_reports = Vec::new();
     runtime.request_repair_reconciliation(&owner).unwrap();
     for _ in 0..8 {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -5189,6 +5190,10 @@ fn file_history_pending_preservation_does_not_block_current_writes_and_publishes
             "Main progress used the existing network budget: {observed_progress:?}"
         );
         let pass = runtime.maintenance_tick(&owner, remaining).unwrap();
+        maintenance_reports.push(format!(
+            "outcome={:?}; tracked_before={}; tracked_after={}",
+            pass.outcome, pass.repair_tracked_before, pass.repair_tracked_after
+        ));
         pass.outcome.unwrap();
         assert_eq!(pass.omitted_kv_event_count, 0);
         let backend = runtime.node_metadata(&owner).unwrap();
@@ -5216,13 +5221,82 @@ fn file_history_pending_preservation_does_not_block_current_writes_and_publishes
                 canonical_id, intent_id,
                 "the original caller retains the same pending request key"
             );
-            primary.process_incoming().unwrap();
-            let NetworkedDfsWriteOutcome::Committed { version, .. } =
-                primary.test_write_outcome(&canonical_id).unwrap()
-            else {
-                panic!("the same actual Main reply must confirm W before retained completion");
-            };
-            assert_eq!(version, actual_identity.version);
+            // Durable publication and delivery into this original caller's
+            // inbox are distinct boundaries. Wait only for that same response,
+            // using the remaining original five-second budget, not another
+            // maintenance pass or a replacement preservation operation.
+            let mut reply_progress = Vec::new();
+            let mut omitted_reply_observations = 0usize;
+            let mut arrival_error = None;
+            loop {
+                let drained = primary.process_incoming();
+                let outcome = primary.test_write_outcome(&canonical_id);
+                let observed = format!("outcome={outcome:?}; incoming={drained:?}");
+                if reply_progress.last() != Some(&observed) {
+                    if reply_progress.len() < 32 {
+                        reply_progress.push(observed);
+                    } else {
+                        omitted_reply_observations += 1;
+                    }
+                }
+                if let Ok(NetworkedDfsWriteOutcome::Committed { version, .. }) = &outcome
+                    && drained.is_ok()
+                    && arrival_error.is_none()
+                    && Instant::now() < deadline
+                {
+                    assert_eq!(version, &actual_identity.version);
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if drained.is_err()
+                    || outcome.is_err()
+                    || arrival_error.is_some()
+                    || remaining.is_zero()
+                {
+                    let actual = runtime.node_metadata(&owner).map(|backend| serde_json::json!({
+                        "retained_version": backend.get_version(&identity.object_id, &identity.version).map_err(|error| error.to_string()),
+                        "receipts": backend.receipts_for_version(&identity.object_id, &identity.version).map_err(|error| error.to_string()),
+                        "current_object": backend.get_object(&identity.object_id).map_err(|error| error.to_string()),
+                    }));
+                    let calls = runtime
+                        .rpc_observations()
+                        .into_iter()
+                        .filter(|call| {
+                            call.dfs_object_id.as_ref() == Some(&identity.object_id)
+                                || call.route
+                                    == sinomo_dfs::DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE
+                                || (call.source == owner && call.target == remote)
+                        })
+                        .map(|call| format!("{call:?}"))
+                        .collect::<Vec<_>>();
+                    let evidence = serde_json::json!({
+                        "original_caller_intent": canonical_id, "retained_identity": identity,
+                        "actual_outcome": format!("{outcome:?}"), "reply_progress": reply_progress,
+                        "omitted_reply_observations": omitted_reply_observations,
+                        "transport_arrival_error": arrival_error,
+                        "original_maintenance_progress": observed_progress,
+                        "original_maintenance_reports": maintenance_reports,
+                        "actual_owner_metadata": actual, "matching_actual_rpc_observations": calls,
+                    });
+                    let path = runtime
+                        .data_dir(&owner)
+                        .root()
+                        .join("history-original-reply-failure.json");
+                    if let Err(error) =
+                        std::fs::write(&path, serde_json::to_vec_pretty(&evidence).unwrap())
+                    {
+                        eprintln!("history reply failure evidence unavailable: {error}");
+                    }
+                    panic!(
+                        "the same actual Main reply must confirm W within the original deadline: {evidence}"
+                    );
+                }
+                if let Err(error) =
+                    primary.test_wait_for_incoming(Duration::from_millis(10).min(remaining))
+                {
+                    arrival_error = Some(error.to_string());
+                }
+            }
         }
         DfsFileHistoryPreserveOutcome::Retained {
             identity: actual_identity,
@@ -5734,4 +5808,73 @@ fn file_history_repin_after_retry_receipt_eviction_keeps_replication_policy() {
 #[test]
 fn file_history_clustered_pin_operations_remain_usable_after_gc() {
     repin_after_gc_has_fresh_repair_ownership(true, true);
+}
+
+#[test]
+fn native_history_restore_preserves_current_namespace_count_and_exact_replay() {
+    let node = NodeId::from_legacy_named("history-maintained-count-owner").unwrap();
+    let (runtime, mut dfs) =
+        native_history_core_service("native-history-current-namespace-count", node.clone());
+    let options = DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+    let path = "/services/history-current-count";
+    let alias = "/services/history-current-count-alias";
+    let original = dfs
+        .posix_write_file(path, b"retained before the alias", options.clone())
+        .unwrap();
+    assert_eq!(original.link_count, 1);
+    capture_history(&mut dfs, &original);
+    dfs.posix_hardlink(path, alias).unwrap();
+    assert_eq!(dfs.posix_stat_distributed(path).unwrap().link_count, 2);
+    dfs.posix_write_file(path, b"current bytes after the alias", options.clone())
+        .unwrap();
+    let current = dfs.posix_stat_distributed(path).unwrap();
+    assert_eq!(current.object_id, original.object_id);
+    assert_eq!(current.link_count, 2);
+    let request = DfsFileHistoryRestoreRequest {
+        source: history_identity(&original),
+        destination_path: path.into(),
+        expected_destination: Some(history_identity(&current)),
+        operation_id: "history-restore-current-count-exact".into(),
+    };
+    let restored = dfs
+        .restore_file_history(request.clone(), options.clone())
+        .unwrap();
+    assert_eq!(restored.committed.object_id, original.object_id);
+    for name in [path, alias] {
+        let stat = dfs.posix_stat_distributed(name).unwrap();
+        assert_eq!(stat.object_id, original.object_id);
+        assert_eq!(stat.version, restored.committed.version);
+        assert_eq!(
+            stat.link_count, 2,
+            "restore must preserve current names, not historical count1"
+        );
+        assert_eq!(
+            dfs.posix_read_file_distributed(name).unwrap(),
+            b"retained before the alias"
+        );
+    }
+    let actual = runtime
+        .node_metadata(&node)
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual.namespace_link_count,
+        Some(2),
+        "the real committed inode carries the count"
+    );
+    assert_eq!(
+        dfs.restore_file_history(request, options).unwrap(),
+        restored
+    );
+    for name in [path, alias] {
+        assert_eq!(dfs.posix_stat_distributed(name).unwrap().link_count, 2);
+        assert_eq!(
+            dfs.posix_read_file_distributed(name).unwrap(),
+            b"retained before the alias"
+        );
+    }
+    drop(dfs);
+    runtime.close().unwrap();
 }

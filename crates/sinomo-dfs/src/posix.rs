@@ -16,11 +16,12 @@ mod cross_shard;
 #[cfg(test)]
 mod directory_identity_native_tests;
 #[cfg(test)]
-pub(crate) use cross_shard::install_hardlink_alias_after_commit_test_hook;
+pub(crate) use cross_shard::{hold_parent_apply_commit, parent_apply_commit_is_held, ParentCountTestPoint, install_parent_count_test_hook, install_hardlink_alias_after_commit_test_hook, install_hardlink_count_after_commit_test_hook};
 mod jobs;
 mod links;
 pub(crate) mod locks;
 mod metadata;
+pub(crate) use metadata::updated_namespace_link_count;
 mod namespace_ops;
 mod query;
 mod read;
@@ -662,6 +663,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.add_file_system(file_system)?;
         }
+        let mut missing_objects = Vec::new();
         for object in
             crate::namespace::distributed_sifs_bootstrap_objects(bootstrap_owner_node_id.clone())
         {
@@ -702,10 +704,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.lookup_metadata_path(&object.file_system_id, &object.path)?
             };
             match existing {
-                None => self.add_object_metadata(object)?,
+                None => missing_objects.push(object),
                 Some(_) => {}
             }
         }
+        self.publish_missing_bootstrap_objects(missing_objects)?;
         Ok(())
     }
 
@@ -1006,6 +1009,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
             object.kind = DfsObjectKind::Directory;
+                    object.namespace_link_count = Some(2);
             object.content_hash = None;
             object.content_size_bytes = None;
             object.link_target_object_id = None;
@@ -1374,6 +1378,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     let mut object = object;
                     object.kind = DfsObjectKind::Directory;
+                    object.namespace_link_count = Some(2);
                     object.content_hash = None;
                     object.content_size_bytes = None;
                     object.link_target_object_id = None;
@@ -1389,10 +1394,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object.version = next_version(&object.version);
                     if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
                         touch_directory_for_batched_child(planned_parent, false);
+                        planned_parent.namespace_link_count = Some(updated_namespace_link_count(planned_parent, 1)?);
                     } else {
-                        durable_parents_to_touch
+                        let parent = durable_parents_to_touch
                             .entry(parent_for_child.path.clone())
                             .or_insert(parent_for_child.clone());
+                        parent.namespace_link_count = Some(updated_namespace_link_count(parent, 1)?);
                     }
                     planned_parent_paths.push((current.clone(), parent_for_child.path.clone()));
                     planned.insert(current.clone(), object.clone());
@@ -1427,10 +1434,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.apply_posix_new_directory_metadata(&mut object, attrs)?;
                     if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
                         touch_directory_for_batched_child(planned_parent, false);
+                        planned_parent.namespace_link_count = Some(updated_namespace_link_count(planned_parent, 1)?);
                     } else {
-                        durable_parents_to_touch
+                        let parent = durable_parents_to_touch
                             .entry(parent_for_child.path.clone())
                             .or_insert(parent_for_child.clone());
+                        parent.namespace_link_count = Some(updated_namespace_link_count(parent, 1)?);
                     }
                     planned_parent_paths.push((current.clone(), parent_for_child.path.clone()));
                     planned.insert(current.clone(), object.clone());
@@ -3564,7 +3573,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let authoritative = service
                     .current_object_from_authority(&file_system_id, &object_id)?
                     .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                service.with_stat_read_rounds(|service| {
+                service.with_stat_read(|service| {
                     service.stat_object_from_authorities(&authoritative, &path, None)
                 })
             }),
@@ -4726,7 +4735,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     &object.object_id,
                                 )?
                                 .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                            service.with_stat_read_rounds(|service| {
+                            service.with_stat_read(|service| {
                                 service.stat_object_from_authorities(&authoritative, &path, None)
                             })
                         });

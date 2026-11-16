@@ -52,7 +52,7 @@ pub(crate) struct PlacementCustodyResponse {
 }
 
 impl NativeImportAuthority {
-    pub(super) fn placement_coordinator(
+    pub(in crate::authority) fn placement_coordinator(
         &self,
         goal: &OriginalPlacementGoal,
     ) -> Result<Option<PlacementCoordinator>> {
@@ -82,11 +82,7 @@ impl NativeImportAuthority {
                 .first()
                 .cloned()
                 .ok_or_else(|| error("terminal cleanup has no actual configured native voter"))?;
-            return Ok(Some(PlacementCoordinator {
-                node_id,
-                peers,
-                guards,
-            }));
+            return self.bind_placement_issuer(PlacementCoordinator { node_id, peers, guards });
         }
         let root = self.placement_archive();
         let mut client = self.control_client(&root)?;
@@ -113,11 +109,18 @@ impl NativeImportAuthority {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        Ok(Some(PlacementCoordinator {
-            node_id: current.primary_node_id,
-            peers,
-            guards,
-        }))
+        self.bind_placement_issuer(PlacementCoordinator { node_id: current.primary_node_id, peers, guards })
+    }
+    fn bind_placement_issuer(&self, mut coordinator: PlacementCoordinator) -> Result<Option<PlacementCoordinator>> {
+        let mut keys = coordinator.guards.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
+        keys.extend([
+            sinomo_core::node::cluster_member_key(&coordinator.node_id),
+            sinomo_core::node::cluster_capability_policy_key(&coordinator.node_id),
+        ]);
+        let (captured, _) = self.read_exact(&keys)?;
+        if captured[..coordinator.guards.len()] != coordinator.guards { return Ok(None); }
+        coordinator.guards = captured;
+        Ok(Some(coordinator))
     }
     fn custody_path(
         &self,
@@ -162,6 +165,16 @@ impl NativeImportAuthority {
             return Err(error(
                 "placement custody request has unexpected failure effects",
             ));
+        }
+        // The released v0 retirement has a fixed exact body. Its custody is
+        // still authored by the current elected work owner and verified through
+        // native outcomes; accepting a different body under that ID is forbidden.
+        if envelope.phase == PlacementCustodyPhase::Retirement
+            && original.source_schema == super::super::placement_job_source::OriginalPlacementSchema::V0 {
+            if envelope.request != Self::original_v0_retirement_request(&envelope.goal)? {
+                return Err(error("v0 custody changes its fixed original retirement request"));
+            }
+            return Ok(());
         }
         for compare in OriginalPlacementJob::exact_retirement_compares(&envelope.coordinator.guards)
         {
@@ -235,7 +248,7 @@ impl NativeImportAuthority {
         captured_rows: &[MetadataCapturedKvEntry],
     ) -> Result<Option<bool>> {
         self.placement_outcome_evaluated(request, permission_subject, captured_rows)
-            .map_err(NativeEvaluationError::into_metadata)
+            .map_err(|failure| self.native_observation_error(failure))
     }
     fn placement_outcome_evaluated(
         &self,
@@ -413,9 +426,9 @@ impl NativeImportAuthority {
         envelope: &PlacementCustodyEnvelope,
     ) -> Result<bool> {
         self.evaluate_received_placement_custody(goal, envelope)
-            .map_err(NativeEvaluationError::into_metadata)
+            .map_err(|failure| self.native_observation_error(failure))
     }
-    pub(super) fn evaluate_received_placement_custody(
+    pub(in crate::authority) fn evaluate_received_placement_custody(
         &self,
         goal: &OriginalPlacementGoal,
         envelope: &PlacementCustodyEnvelope,

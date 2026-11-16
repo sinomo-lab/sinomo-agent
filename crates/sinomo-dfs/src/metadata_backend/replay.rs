@@ -80,6 +80,15 @@ impl LocalSobjMetadataBackend {
         expected_operation: Option<&crate::DfsMetadataAuthorityOperation>,
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.require_replication_source_shard(&batch.shard_id)?;
+        if self.replica_repair_only {
+            // A repair-only handle has no qualified current serving image.
+            // Journal durability cannot create its mandatory generation or
+            // clear this state; the existing authenticated snapshot path does.
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::ReplicaUnreadable,
+                message: "metadata replica requires an authenticated current-generation snapshot before journal acknowledgement".into(),
+            });
+        }
         validate_replicated_journal_batch_entry_order(batch)?;
         if batch.entries.is_empty() {
             return Ok(DfsMetadataReplicaApplyReport::default());
@@ -158,7 +167,7 @@ impl LocalSobjMetadataBackend {
             .entries
             .partition_point(|entry| entry.sequence <= self.materialized_through_sequence);
         if let Some(proof) = self
-            .validate_replica_journal_suffix(&batch.entries[suffix_start..], expected_operation)?
+            .validate_replica_journal_suffix(&batch.entries[suffix_start..], expected_operation, permit.source_epoch())?
         {
             namespace_authority_proof = Some(proof);
         }
@@ -446,10 +455,11 @@ impl LocalSobjMetadataBackend {
         &mut self,
         entries: &[DfsMetadataJournalEntry],
         expected_operation: Option<&crate::DfsMetadataAuthorityOperation>,
+        source_epoch: u64,
     ) -> Result<Option<crate::DfsPreparedOperationDigest>> {
         // The planner restores already-applied rows itself on a malformed later
         // entry. A successful plan still grants no materialization/publication.
-        let planned = self.plan_written_journal_entries_table_ops(entries)?;
+        let planned = self.plan_written_journal_entries_table_ops_with_ingress_epoch(entries, Some(source_epoch))?;
         let proof = expected_operation.map(|operation| {
             let crate::DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } = operation;
             let record = self.tables.prepared_operations_v7.get(operation_id).ok_or_else(|| {
@@ -522,12 +532,37 @@ impl LocalSobjMetadataBackend {
         &mut self,
         entries: &[DfsMetadataJournalEntry],
     ) -> Result<PlannedWrittenJournalTableOps> {
+        self.plan_written_journal_entries_table_ops_with_ingress_epoch(entries, None)
+    }
+
+    fn plan_written_journal_entries_table_ops_with_ingress_epoch(
+        &mut self,
+        entries: &[DfsMetadataJournalEntry],
+        source_epoch: Option<u64>,
+    ) -> Result<PlannedWrittenJournalTableOps> {
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-
-        let (applied, last_materialized_sequence) = match self
-            .plan_replayed_journal_entries_into_batch(entries, &mut table_ops, &mut rollback)
-        {
+        let plan = (|| {
+            for entry in entries {
+                if let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &entry.mutation
+                    && source_epoch == Some(record.owner_epoch)
+                    && !self.tables.prepared_operations_v7.get(&record.operation_id)
+                        .is_some_and(|known| known.digest == record.digest && known.payload == record.payload)
+                {
+                    // Count-aware authoring is required for a new operation in
+                    // the active source epoch. Archived prior-epoch bodies and
+                    // exact known operations keep their immutable replay path.
+                    // A peer missing the initialized cut needs the existing
+                    // snapshot-repair path, not permission to infer counts.
+                    crate::namespace_counts::validate_new_counted_publication(&self.tables, &record.payload)
+                        .map_err(|error| MetadataBackendError::prefix_mismatch(format!(
+                            "counted metadata snapshot required before current-epoch ingress: {error}")))?;
+                }
+                self.materialize_replayed_journal_entry_into_batch(entry, &mut table_ops, &mut rollback)?;
+            }
+            Ok((entries.len(), entries.last().map_or(0, |entry| entry.sequence)))
+        })();
+        let (applied, last_materialized_sequence) = match plan {
             Ok(result) => result,
             Err(error) => {
                 rollback.rollback(&mut self.tables);
@@ -581,22 +616,7 @@ impl LocalSobjMetadataBackend {
         table_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<()> {
-        require_journal_entry_replay_payloads(entry)?;
-        let op = match &entry.mutation {
-            DfsMetadataMutation::PrepareOperationV7 { record, .. } => {
-                DfsMetadataTableOp::PutPreparedOperationV7 {
-                    record: record.clone(),
-                }
-            }
-            DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } => {
-                DfsMetadataTableOp::CommitPreparedOperationV7 {
-                    digest: digest.clone(),
-                    committed_entry: Box::new(
-                        crate::DfsPreparedOperationCommitReference::from_journal_entry(&entry)?,
-                    ),
-                }
-            }
-        };
+        let op = crate::metadata_replay::table_op_for_native_journal_entry(entry)?;
         self.tables
             .apply_checked_with_rollback(op.clone(), rollback)?;
         table_ops.push(op);

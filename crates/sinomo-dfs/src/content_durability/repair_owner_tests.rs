@@ -42,7 +42,7 @@ fn actual_cut(
     )
     .unwrap();
     reader.begin_inspection_snapshot().unwrap();
-    let cut = reader.export_table_snapshot();
+    let cut = reader.export_table_snapshot().unwrap();
     reader.end_inspection_snapshot();
     assert!(cut.prefix_proof.is_well_formed());
     cut

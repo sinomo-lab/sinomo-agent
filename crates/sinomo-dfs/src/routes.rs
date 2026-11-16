@@ -1112,6 +1112,12 @@ mod tests {
             next_after_sequence: 0,
             snapshot: crate::DfsMetadataSnapshotImageDescriptor {
                 format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                generation: crate::DfsMetadataGenerationIdentity {
+                    file_system_id: file_system_id.clone(),
+                    shard_id: DfsMetadataShardId::new("scope-snapshot-shard"),
+                    generation: "scope-only-fixture".into(),
+                    origin: crate::DfsMetadataGenerationOrigin::NativeGenesis,
+                },
                 materialized_through_sequence: 0,
                 semantic_state_fingerprint: "scope-only-fixture".into(),
                 prefix_proof: crate::metadata_records::dfs_metadata_prefix_proof_genesis(

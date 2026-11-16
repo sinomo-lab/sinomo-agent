@@ -27,7 +27,7 @@ impl LocalContentStore {
             extents: Vec::new(),
         };
         self.inline_check_manifest_conflict(&proposed)?;
-        let existing = match self.read_manifest(object_id, version) {
+        let existing = match self.read_current_manifest(object_id, version) {
             Ok(manifest) => {
                 // Existing patch layouts retain their original blob-only
                 // behavior; staging must not flatten or duplicate extents.
@@ -135,7 +135,7 @@ impl LocalContentStore {
         // Already-public manifests keep their existing renewal path (including
         // its Reserve-only inline update). Optimize only the missing public
         // manifest edge; never flatten an existing extent representation.
-        match self.read_manifest(object_id, version) {
+        match self.read_current_manifest(object_id, version) {
             Ok(_) => return Ok(None),
             Err(error) if content_error_is_not_found(&error) => {}
             Err(error) => return Err(error),

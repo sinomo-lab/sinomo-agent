@@ -133,6 +133,7 @@ thread_local! {
     // The callback observes the existing clock; it cannot replace its deadline.
     pub(crate) static SELECTED_INSTALL_AFTER_MARKER_SYNC: std::cell::RefCell<Option<(PathBuf, String, Box<dyn FnOnce(Instant)>)>> = const { std::cell::RefCell::new(None) };
     static METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    static METADATA_SNAPSHOT_INSTALL_FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_DURABLE_TABLE_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -414,7 +415,7 @@ impl LocalSobjMetadataBackend {
     /// journal entries not yet reflected in tables, and finishes interrupted
     /// namespace or visible-version commits.
     pub fn new(shard_id: DfsMetadataShardId, root: impl Into<PathBuf>) -> Result<Self> {
-        Self::new_with_expected_layout(shard_id, root.into(), None)
+        Self::new_with_expected_layout(shard_id, root.into(), None, false, false)
     }
 
     pub(crate) fn new_with_selected_layout(
@@ -425,7 +426,46 @@ impl LocalSobjMetadataBackend {
     ) -> Result<Self> {
         #[cfg(any(test, feature = "test-support"))]
         layout.admit_stage(&filesystem, &shard_id, &root)?;
-        Self::new_with_expected_layout(shard_id, root, Some((filesystem, layout)))
+        Self::new_with_expected_layout(shard_id, root, Some((filesystem, layout)), false, false)
+    }
+
+    pub(crate) fn try_new_with_selected_layout(
+        shard_id: DfsMetadataShardId,
+        root: PathBuf,
+        selected: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
+    ) -> Result<Self> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((filesystem, layout)) = &selected {
+            layout.admit_stage(filesystem, &shard_id, &root)?;
+        }
+        Self::new_with_expected_layout(shard_id, root, selected, false, true)
+    }
+
+    pub(crate) fn open_staged_native_genesis(
+        shard: &crate::DfsMetadataShardConfig,
+        root: PathBuf,
+        layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    ) -> Result<Self> {
+        Self::open_staged_native_genesis_with_admission(shard, root, layout, false)
+    }
+
+    pub(crate) fn open_staged_native_genesis_with_admission(
+        shard: &crate::DfsMetadataShardConfig,
+        root: PathBuf,
+        layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+        try_writer: bool,
+    ) -> Result<Self> {
+        if shard.epoch != 1 || !shard.replica_node_ids.is_empty() {
+            return Err(MetadataBackendError::Serde("staged genesis open requires its initial singleton".into()));
+        }
+        let generation = crate::storage_generation::read_generation(&root)?;
+        if generation.identity.file_system_id != shard.file_system_id {
+            return Err(MetadataBackendError::Serde("staged genesis belongs to another filesystem".into()));
+        }
+        Self::new_with_expected_layout(
+            DfsMetadataShardId::new(shard.shard_id.clone()), root,
+            layout.map(|layout| (shard.file_system_id.clone(), layout)), true, try_writer,
+        )
     }
 
     fn validate_expected_layout(
@@ -449,15 +489,26 @@ impl LocalSobjMetadataBackend {
         shard_id: DfsMetadataShardId,
         root: PathBuf,
         selected_original_data_layout: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
+        native_genesis_staging: bool,
+        try_writer: bool,
     ) -> Result<Self> {
         Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
         #[cfg(test)]
         METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
         let trace_started = Instant::now();
-        crate::storage_preparation::prepare_storage_root_before_open(
-            &root,
-            &crate::DfsStoragePreparationScope::Metadata(shard_id.clone()),
-        )?;
+        if !native_genesis_staging {
+            crate::storage_preparation::prepare_storage_root_before_open(
+                &root,
+                &crate::DfsStoragePreparationScope::Metadata(shard_id.clone()),
+            )?;
+        }
+        let generation = crate::storage_generation::read_generation(&root)?;
+        if generation.identity.shard_id != shard_id
+            || (matches!(generation.state, crate::storage_generation::GenerationState::Staged { .. })
+                && !(native_genesis_staging && generation.identity.is_native_genesis()))
+        {
+            return Err(MetadataBackendError::StoragePreparationPending { root, processed_records: 0 });
+        }
         if selected_original_data_layout.is_some() {
             Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
         }
@@ -503,7 +554,25 @@ impl LocalSobjMetadataBackend {
             if backend.selected_original_data_layout.is_some() {
                 Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
             }
-            let _lock = backend.metadata_write_lock()?;
+            // A resident try-checkout can hold publication/startup admission
+            // needed by the migration owner retaining this physical fence.
+            // Ordinary open retains its existing wait for short-lived writers.
+            let _lock = if try_writer {
+                crate::metadata_lock::try_metadata_write_lock(
+                    backend.root.clone(), backend.journal_write_lock_path(),
+                )?.ok_or_else(|| MetadataBackendError::StoragePreparationPending {
+                    root: backend.root.clone(), processed_records: 0,
+                })?
+            } else {
+                backend.metadata_write_lock()?
+            };
+            // Preparation may exchange this root before custody is acquired.
+            // Re-enter admission before recovering or writing the new pathname.
+            if crate::storage_generation::read_generation(&backend.root)? != generation {
+                return Err(MetadataBackendError::StoragePreparationPending {
+                    root: backend.root.clone(), processed_records: 0,
+                });
+            }
             if backend.selected_original_data_layout.is_some() {
                 Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
             }
@@ -512,6 +581,12 @@ impl LocalSobjMetadataBackend {
                 &backend.shard_id,
             )?;
             let state = load_metadata_tables(&backend.root)?;
+            if state.generation.is_none() && !native_genesis_staging {
+                return Err(MetadataBackendError::Serde("active metadata unit has no current generation checkpoint".into()));
+            }
+            if state.generation.as_ref().is_some_and(|identity| identity != &generation.identity) {
+                return Err(MetadataBackendError::Serde("snapshot and root storage generation identities differ".into()));
+            }
             let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
             backend.tables = state.tables;
             backend.tables.clear_repair_index_changes();
@@ -528,6 +603,12 @@ impl LocalSobjMetadataBackend {
             let bootstrapped_prefix = backend.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
             backend.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             backend.recover_unmaterialized_local_journal_entries()?;
+            if !native_genesis_staging && generation.identity.is_native_genesis() {
+                let actual = crate::storage_generation::native_genesis_activation_digest(&generation.identity, &backend.tables)?;
+                if generation.state != (crate::storage_generation::GenerationState::Active { activation_digest: actual, standalone_seal: None }) {
+                    return Err(MetadataBackendError::Serde("native storage generation receipt differs from committed genesis".into()));
+                }
+            }
             require_version_pin_table_invariants(&backend.tables)?;
             if bootstrapped_prefix {
                 // Persist the genuine current empty prefix before the first
@@ -867,7 +948,8 @@ impl LocalSobjMetadataBackend {
     /// appended by another backend instance after this one opened.
 
     /// Export the current materialized table state for replica snapshot repair.
-    pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
+    /// Inspection handles without a certified prefix cannot produce this DATA.
+    pub fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
         #[cfg(test)]
         METADATA_EXPORT_TABLE_SNAPSHOT_CALLS
             .set(METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.get().saturating_add(1));
@@ -879,12 +961,14 @@ impl LocalSobjMetadataBackend {
             prefix_proof: self
                 .prefix_proof
                 .clone()
-                .expect("opened current backend has certified prefix"),
+                .ok_or_else(|| MetadataBackendError::Serde(
+                    "current snapshot export requires a certified prefix".into(),
+                ))?,
         };
         snapshot.semantic_state_fingerprint =
             dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
-                .expect("current snapshot canonical encoding");
-        snapshot
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        Ok(snapshot)
     }
 
     pub fn export_snapshot_image(&self) -> Result<crate::DfsMetadataSnapshotImage> {
@@ -917,6 +1001,7 @@ impl LocalSobjMetadataBackend {
     ) -> Result<bool> {
         let candidate = snapshot.state()?;
         require_replica_snapshot_tables_file_system(&candidate.tables, permit.file_system_id())?;
+        permit.validate_counted_snapshot(&candidate.tables, candidate.generation.as_ref())?;
         drop(candidate);
         let _lock = self.begin_metadata_replica_ingest(permit, &source_shard_id)?;
         let archived = self.replace_with_replicated_snapshot_unlocked(
@@ -957,6 +1042,7 @@ impl LocalSobjMetadataBackend {
         }
         let candidate = snapshot.state()?;
         require_replica_snapshot_tables_file_system(&candidate.tables, permit.file_system_id())?;
+        permit.validate_counted_snapshot(&candidate.tables, candidate.generation.as_ref())?;
         drop(candidate);
         let root = root.into();
         let mut backend = Self {
@@ -1042,11 +1128,14 @@ impl LocalSobjMetadataBackend {
             metadata_cursor::metadata_authority_ack_floor(&self.root, &source_shard_id)?;
         let stored = (stored_acknowledged_floor.is_some(), stored_authority_floor.is_some());
         let acknowledged_floor =
-            permit.binding_ack_floor(stored_acknowledged_floor, |floor| floor.authority_epoch)?;
+            permit.binding_ack_floor(stored_acknowledged_floor, |floor| floor.authority_epoch)?
+                .filter(|floor| !permit.snapshot_replaces_imported_prefix(&floor.durable_prefix_proof, snapshot.descriptor()));
         let authority_floor =
-            permit.binding_ack_floor(stored_authority_floor, |floor| floor.authority_epoch)?;
-        // A stored floor that does not bind belongs to an earlier epoch.
-        let earlier_epoch_floor = (stored.0 && acknowledged_floor.is_none())
+            permit.binding_ack_floor(stored_authority_floor, |floor| floor.authority_epoch)?
+                .filter(|floor| !permit.snapshot_replaces_imported_prefix(&floor.durable_prefix_proof, snapshot.descriptor()));
+        // A nonbinding floor belongs to an earlier epoch or the exact source
+        // clock superseded by this committed native storage cut.
+        let superseded_floor = (stored.0 && acknowledged_floor.is_none())
             || (stored.1 && authority_floor.is_none());
         if let Some(floor) = authority_floor.as_ref() {
             if replayed_through_sequence < floor.journal_sequence {
@@ -1093,8 +1182,9 @@ impl LocalSobjMetadataBackend {
         }
         let tables = snapshot.state()?.tables.clone();
         require_version_pin_table_invariants(&tables)?;
-        if earlier_epoch_floor {
-            // Replace an earlier epoch's floors before the state they describe
+        let active_generation = permit.snapshot_generation_envelope(&snapshot.generation, &tables)?;
+        if superseded_floor {
+            // Replace superseded floors before the state they describe
             // is archived, so a restart in between never compares the new
             // state with them. Epoch-major merge lets the new floors replace
             // a higher sequence. An authority floor cannot name sequence zero.
@@ -1158,9 +1248,15 @@ impl LocalSobjMetadataBackend {
             metadata_cursor::write_journal_head(&self.root, self.next_sequence)?;
             return Ok(false);
         }
+        let staged_snapshot = snapshot.stage_candidate_copy(&self.root)?;
         crate::metadata_journal::admission::invalidate(&self.root)?;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
-        create_dir_all(self.root.join("records"))?;
+        #[cfg(test)]
+        snapshot_install_fault(&self.root, "after-archive")?;
+        // The header remains absent until the whole validated image is durable.
+        // A crash therefore enters authenticated replica repair, rather than
+        // masquerading as an unsealed migration/genesis candidate.
+        create_dir_all(self.root.join("records/tables"))?;
         if let Some(floor) = acknowledged_floor.as_ref() {
             metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)?;
         }
@@ -1183,13 +1279,13 @@ impl LocalSobjMetadataBackend {
         self.next_sequence = replayed_through_sequence.saturating_add(1).max(1);
         self.materialized_through_sequence = replayed_through_sequence;
         self.prefix_proof = Some(replacement_prefix_proof);
-        persist_metadata_table_snapshot(
-            &self.root,
-            &self.tables,
-            Some(self.materialized_through_sequence),
-            self.prefix_proof.as_ref(),
-        )?;
+        staged_snapshot.install(&self.root)?;
+        crate::metadata_table_store::truncate_metadata_table_log(&self.root)?;
+        crate::metadata_table_store::remove_metadata_table_checkpoint_log(&self.root)?;
         self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
+        #[cfg(test)]
+        snapshot_install_fault(&self.root, "after-snapshot")?;
+        crate::storage_generation::write_generation(&self.root, &active_generation)?;
         metadata_cursor::write_replay_cursor(
             &self.root,
             &DfsMetadataReplayCursor {
@@ -3286,6 +3382,16 @@ impl LocalSobjMetadataBackend {
 }
 
 #[cfg(test)]
+fn snapshot_install_fault(root: &Path, point: &'static str) -> Result<()> {
+    if METADATA_SNAPSHOT_INSTALL_FAULT.get() == Some(point) {
+        METADATA_SNAPSHOT_INSTALL_FAULT.set(None);
+        return Err(MetadataBackendError::Io { path: root.to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::Interrupted, point) });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests;
 
 mod replay;
@@ -3293,6 +3399,7 @@ mod replay;
 mod handoff;
 #[cfg(test)]
 pub(crate) mod native_prefix_history;
+mod storage_generation;
 
 mod write_set_member_state;
 pub use write_set_member_state::{

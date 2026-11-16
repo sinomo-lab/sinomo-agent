@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod namespace_counts;
+mod parent_counts;
+mod parent_supersession_negatives;
+
 /// The live object `node`'s durable metadata store holds at `path`.
 /// Callers delegating to their Main keep no store, so replica convergence is
 /// observed in the node's own store rather than through an authority read.
@@ -31,6 +35,75 @@ pub(super) fn node_store_child_objects(
         .expect("node metadata directory listing")
 }
 
+/// Fail only the decoded target adoption for this exact original move. Reads
+/// used to plan the move remain available, so the real coordinator has already
+/// persisted its job before this negative execution boundary is reached.
+pub(super) struct NativeAdoptionCarrierFault {
+    _hook: crate::runtime_host::DaemonDfsPreDispatchTestHookGuard,
+    job: Arc<Mutex<Option<String>>>,
+}
+impl NativeAdoptionCarrierFault {
+    pub(super) fn assert_observed_job(&self, expected: &str) {
+        assert_eq!(self.job.lock().unwrap().as_deref(), Some(expected));
+    }
+    pub(super) fn assert_observed(&self) {
+        assert!(self.job.lock().unwrap().is_some(), "the exact owned adoption carrier must reach the fault");
+    }
+}
+
+pub(super) fn fail_native_adoption_carrier(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    source: &NodeId,
+    target: &NodeId,
+    from: &str,
+    to: &str,
+) -> NativeAdoptionCarrierFault {
+    let source = source.clone();
+    let target = target.clone();
+    let from = from.to_owned();
+    let to = to.to_owned();
+    let file_system_id = runtime.file_system().file_system_id;
+    let job = Arc::new(Mutex::new(None::<String>));
+    let observed = Arc::clone(&job);
+    let hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&target),
+        Arc::new(move |point, command, _| {
+            if let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held } = point
+                && let Some(command) = command
+                && command.routed_message.source_node_id == source
+                && command.routed_message.target_node_id == target
+                && let DfsNetworkMessage::NamespaceRequest(request) = &command.routed_message.message
+                && let DfsNamespaceOperation::AdoptObjectAtPath { source_offer, object, source_path, .. } = &request.operation
+                && source_path == &from && object.path == to
+            {
+                assert!(admission_held);
+                assert_eq!(request.file_system_id, file_system_id);
+                assert_eq!(request.requesting_node_id, source);
+                assert_eq!(source_offer.source_node_id, source);
+                assert_eq!(source_offer.target_config.primary_node_id, target);
+                assert_eq!(source_offer.destination, *object);
+                assert_eq!(source_offer.job_id, source_offer.job_offer.job_id);
+                assert_eq!(source_offer.job_offer.coordinator_node_id, source);
+                assert_eq!(source_offer.job_offer.job_config.file_system_id, file_system_id);
+                assert!(!source_offer.job_id.is_empty());
+                assert!(!source_offer.job_offer.job_digest.is_empty());
+                assert!(source_offer.job_offer.prefix.is_well_formed());
+                let mut held = observed.lock().unwrap();
+                if let Some(original) = held.as_ref() {
+                    assert_eq!(original, &source_offer.job_id, "retry must retain its original job");
+                } else {
+                    *held = Some(source_offer.job_id.clone());
+                }
+                return Err(DfsError::Network {
+                    message: "injected exact adoption carrier failure before target effects".into(),
+                });
+            }
+            Ok(())
+        }),
+    );
+    NativeAdoptionCarrierFault { _hook: hook, job }
+}
+
 // Read-only physical DATA inspection; no opener recovery or publication guard.
 fn hardlink_read_set_snapshot(
     runtime: &crate::test_runtime::DfsTestRuntime,
@@ -39,7 +112,7 @@ fn hardlink_read_set_snapshot(
 ) -> std::result::Result<DfsMetadataTableSnapshot, MetadataBackendError> {
     let shard = DfsMetadataShardId::new(shard);
     let root = crate::local_dfs_metadata_shard_path(runtime.data_dir(node), &shard);
-    Ok(LocalSobjMetadataBackend::open_for_inspection(shard, root)?.export_table_snapshot())
+    LocalSobjMetadataBackend::open_for_inspection(shard, root)?.export_table_snapshot()
 }
 
 fn recorded_hardlink_alias_frame(
@@ -281,13 +354,22 @@ fn returning_adoption_checks_the_physical_eviction_head_before_publication() {
         eviction.tombstone_provenance,
         Some(DfsTombstoneProvenance::SourceEviction { .. })
     ));
+    // Native source retirement need not fabricate another path tombstone.
+    // Establish the independent old-path head through real namespace effects
+    // so returning adoption must compare both actual physical predecessors.
+    let replacement = service.posix_write_file(
+        "/services/old-location", b"independent old-path owner",
+        DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+    ).unwrap();
+    assert_ne!(replacement.object_id, original.object_id);
+    service.posix_unlink("/services/old-location").unwrap();
     let original_cut = hardlink_read_set_snapshot(&runtime, &node, "services").unwrap();
     let old_path_occupant = original_cut
         .tables
         .objects
         .iter()
         .find(|row| row.path == "/services/old-location" && row.object_id != original.object_id)
-        .expect("the first move durably tombstones its original path with a separate identity")
+        .expect("the explicit old-path deletion retains its separate physical predecessor")
         .clone();
     assert_eq!(old_path_occupant.kind, DfsObjectKind::Tombstone);
     let returned = service
@@ -490,17 +572,9 @@ fn content_reference_remains_fenced_by_an_actual_pending_move() {
     };
     assert!(!cluster.replica.content_reference_present(&retain).unwrap());
     let move_id = sinomo_core::Id::generate().to_string();
-    cluster
-        ._runtime
-        .install_fault(crate::test_runtime::FaultRule {
-            source: Some(cluster.users_primary_node.clone()),
-            target: Some(cluster.services_primary_node.clone()),
-            route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
-            call_id: None,
-            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-            remaining_hits: 32,
-            action: crate::test_runtime::FaultAction::BudgetExhausted,
-        });
+    let carrier_fault = fail_native_adoption_carrier(
+        &cluster._runtime, &cluster.users_primary_node, &cluster.services_primary_node, from, to,
+    );
     // Use the existing native carrier-failure choreography: the real owner
     // persists its job and returns admission, while the target remains blocked.
     let moved = cluster
@@ -559,6 +633,8 @@ fn content_reference_remains_fenced_by_an_actual_pending_move() {
         "preserve the current authenticated-query rejection: {denied:?}"
     );
     drop(observation);
+    carrier_fault.assert_observed_job(&parked.job_id);
+    drop(carrier_fault);
     cluster._runtime.clear_faults();
     let moved = cluster
         .users_primary
@@ -3389,17 +3465,9 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
         .users_primary
         .posix_write_file(&format!("{from}/child"), b"frozen child", options.clone())
         .unwrap();
-    cluster
-        ._runtime
-        .install_fault(crate::test_runtime::FaultRule {
-            source: Some(cluster.users_primary_node.clone()),
-            target: Some(cluster.services_primary_node.clone()),
-            route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
-            call_id: None,
-            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-            remaining_hits: 32,
-            action: crate::test_runtime::FaultAction::BudgetExhausted,
-        });
+    let carrier_fault = fail_native_adoption_carrier(
+        &cluster._runtime, &cluster.users_primary_node, &cluster.services_primary_node, from, to,
+    );
     let operation = sinomo_core::Id::generate().to_string();
     assert!(
         cluster
@@ -3428,6 +3496,8 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
         ),
         "the same subtree mkdir remains Busy: {blocked_mkdir:?}"
     );
+    carrier_fault.assert_observed();
+    drop(carrier_fault);
     cluster._runtime.clear_faults();
     cluster
         .users_primary
@@ -3513,6 +3583,12 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
         original.version,
         "the genuinely incomplete W2 write cannot advance the visible head"
     );
+    // A different caller has no local pending-write hint: Main must fence on
+    // the actual durable write and settle this pre-effect rejection itself.
+    cluster.users_primary = cluster
+        ._runtime
+        .client(&cluster.users_primary_node)
+        .unwrap();
     let rename = cluster.users_primary.posix_rename(from, to);
     assert!(
         matches!(&rename, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
@@ -3548,16 +3624,40 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
             .iter()
             .any(|job| job.root_path == from && job.status == DfsNamespaceJobStatus::Running)
     );
+    let pending_requests = cluster
+        ._runtime
+        .node_metadata(&cluster.users_primary_node)
+        .unwrap()
+        .list_pending_namespace_requests_page(None, 128)
+        .unwrap();
+    assert!(
+        pending_requests.next_cursor.is_none(),
+        "bounded native fixture request inventory"
+    );
+    assert!(!pending_requests.requests.iter().any(|request| matches!(&request.operation,
+        DfsNamespaceOperation::Rename { from: source, to: destination } if source == from && destination == to)),
+        "a fresh rename rejected before effects must not execute later through recovery: {:?}", pending_requests.requests);
     cluster._runtime.clear_faults();
     let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
     cluster._runtime.checkpoint_rpc_observation_window().unwrap();
-    while cluster.users_primary.posix_stat_distributed(from).unwrap().version != target {
+    loop {
+        let observed = cluster.users_primary.posix_stat_distributed(from);
+        if observed.as_ref().is_ok_and(|stat| stat.version == target) { break; }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "actual stage completion must settle within its normal deadline");
+        assert!(!remaining.is_zero() && observed.is_ok(),
+            "actual stage completion boundary: target={target:?}, observed={observed:?}, source={:?}, destination={:?}, intents={:?}",
+            node_store_object_at(&cluster._runtime, &cluster.users_primary_node, from),
+            node_store_object_at(&cluster._runtime, &cluster.services_primary_node, to),
+            cluster._runtime.node_metadata(&cluster.users_primary_node).unwrap().intents_for_object(&original.object_id));
         // The delegated caller does not own Main's retained stage retries.
-        cluster._runtime.maintenance_tick(
+        let tick = cluster._runtime.maintenance_tick(
             &cluster.users_primary_node, remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
-        ).unwrap().outcome.unwrap();
+        ).unwrap().outcome;
+        assert!(tick.is_ok(), "stage retry failed: {tick:?}; source={:?}, destination={:?}, intents={:?}, jobs={:?}",
+            node_store_object_at(&cluster._runtime, &cluster.users_primary_node, from),
+            node_store_object_at(&cluster._runtime, &cluster.services_primary_node, to),
+            cluster._runtime.node_metadata(&cluster.users_primary_node).unwrap().intents_for_object(&original.object_id),
+            cluster._runtime.node_metadata(&cluster.users_primary_node).unwrap().list_namespace_jobs());
         cluster.users_primary.process_incoming().unwrap();
         cluster._runtime.checkpoint_rpc_observation_window().unwrap();
     }
@@ -3886,17 +3986,9 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
         .unwrap();
     let operation = sinomo_core::Id::generate().to_string();
     let baseline = cluster._runtime.rpc_observations().len();
-    cluster
-        ._runtime
-        .install_fault(crate::test_runtime::FaultRule {
-            source: Some(cluster.users_primary_node.clone()),
-            target: Some(cluster.services_primary_node.clone()),
-            route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
-            call_id: None,
-            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
-            remaining_hits: 32,
-            action: crate::test_runtime::FaultAction::BudgetExhausted,
-        });
+    let carrier_fault = fail_native_adoption_carrier(
+        &cluster._runtime, &cluster.users_primary_node, &cluster.services_primary_node, from, to,
+    );
     let started = Instant::now();
     assert!(
         cluster
@@ -3942,6 +4034,8 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
         ),
         "the same write against the actual parked job remains Busy: {blocked_write:?}"
     );
+    carrier_fault.assert_observed_job(&parked.job_id);
+    drop(carrier_fault);
     cluster._runtime.clear_faults();
     if restart_source {
         let node = cluster.users_primary_node.clone();
@@ -4257,34 +4351,21 @@ fn same_node_distinct_shard_hardlink_alias_uses_durable_saga_and_survives_cold_r
                 owner_read = true
             }
             DfsNamespaceOperation::MetadataQuery { query }
-                if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
+                if matches!(query.selection, DfsMetadataSelection::StatAtPathV2 { .. }) =>
             {
-                let DfsMetadataSelection::StatAtPathV1 { request: stat } = &query.selection else {
+                let DfsMetadataSelection::StatAtPathV2 { path } = &query.selection else {
                     unreachable!()
                 };
+                assert!([canonical_path, alias_path, renamed_path].contains(&path.as_str()));
                 assert_eq!(query.file_system_id, request.file_system_id);
-                assert!(!stat.read_id.is_empty());
-                assert_eq!(
-                    stat.catalog_digest,
-                    crate::stat_projection::stat_catalog_digest(&configs).unwrap()
-                );
-                assert_eq!(request.authority_shards, configs);
-                assert!(
-                    request
-                        .authority_shards
-                        .iter()
-                        .all(|shard| shard.primary_node_id == node)
-                );
                 assert!(!request.include_metadata_journal_batches);
                 assert!(request.metadata_journal_after_sequences.is_empty());
                 let selected =
                     crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                        &query.file_system_id,
-                        &configs,
-                        &stat.path,
-                    )
-                    .unwrap()
-                    .unwrap();
+                        &query.file_system_id, &configs, path,
+                    ).unwrap().unwrap();
+                assert_eq!(request.authority_shards, vec![selected.clone()]);
+                assert_eq!(selected.primary_node_id, node);
                 assert_eq!(query.shard_id.0, selected.shard_id);
                 assert_eq!(query.epoch, selected.epoch);
                 owner_read = true;

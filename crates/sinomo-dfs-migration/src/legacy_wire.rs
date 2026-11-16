@@ -605,6 +605,31 @@ pub fn convert_version_wire(mut wire: serde_json::Value) -> Result<DfsObjectVers
 pub fn convert_file_system_wire(wire: serde_json::Value) -> Result<serde_json::Value, String> {
     convert_file_system_wire_with_current_import_defaults(wire, None)
 }
+fn validate_original_count_activation(value: &Value) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Original { schema_version: u16, initialization_id: String, cohort_id: String, activation_digest: String }
+    let original: Original = serde_json::from_value(value.clone()).map_err(invalid)?;
+    if original.schema_version != 1 || [&original.initialization_id, &original.cohort_id].iter().any(|id|
+        id.is_empty() || id.len() > 1024 || id.contains('\0'))
+        || !original.activation_digest.strip_prefix("blake3:").is_some_and(|hash|
+            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+        return Err(invalid("original namespace-count activation is malformed"));
+    }
+    Ok(())
+}
+
+/// Generation11 source DATA projects its retired activation into the archive,
+/// never into current metadata_storage. Other original filesystem fields keep
+/// their exact values; this reader does not choose new placement defaults.
+pub(crate) fn native11_file_system_data(mut value: Value) -> Result<DfsFileSystem> {
+    let fields = value.as_object_mut().ok_or_else(|| invalid("native11 filesystem is not a record"))?;
+    if let Some(activation) = fields.remove("namespace_count_activation").filter(|value| !value.is_null()) {
+        validate_original_count_activation(&activation)?;
+    }
+    serde_json::from_value(value).map_err(invalid)
+}
+
 /// A missing old count remains unchanged in the retained source archive.
 /// A supplied CURRENT count selects new import-policy defaults; it is never
 /// evidence of historical W/N or historical replica confirmation.
@@ -618,6 +643,11 @@ pub(crate) fn convert_file_system_wire_with_current_import_defaults(
         .ok_or("legacy filesystem is not an object")?;
     let history = object.remove("file_history");
     object.remove("metadata_format");
+    if let Some(activation) = object.remove("namespace_count_activation").filter(|value| !value.is_null()) {
+        validate_original_count_activation(&activation).map_err(|error| error.to_string())?;
+        // This retired native fact stays in original source bytes. It is not
+        // a current storage generation or authority to activate the target.
+    }
     if let Some(rules) = object.get_mut("subtree_policies") {
         for rule in rules
             .as_array_mut()
@@ -1867,9 +1897,16 @@ impl Serialize for Native8Job<'_> {
         .serialize(serializer)
     }
 }
-/// The original native record envelope keeps its original payload digest. The
-/// later converter alone adapts the payload and authors a new target digest.
+/// Original native envelopes keep their original payload digest in source DATA.
+/// Canonical target construction never relabels these historical bodies.
 pub(crate) struct Native8Prepare<'a>(pub(crate) &'a Value);
+pub(crate) struct Native11FileSystem<'a>(pub(crate) &'a Value);
+impl Serialize for Native11FileSystem<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        GenerationRouted { value: self.0, schema: "namespaced-file-system", generation: SourceGeneration::CanonicalTags }
+            .serialize(serializer)
+    }
+}
 impl Serialize for Native8Prepare<'_> {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -3381,6 +3418,7 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
             "file_history",
         ],
         "namespaced-file-system" => &[
+            "namespace_count_activation",
             "file_system_id",
             "display_name",
             "owner_node_id",
@@ -3388,6 +3426,7 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
             "retention_policies",
             "module_metadata",
         ],
+        "namespace-count-activation" => &["schema_version", "initialization_id", "cohort_id", "activation_digest"],
         "subtree-policy" => &[
             "path_prefix",
             "policy",
@@ -3537,6 +3576,7 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
             "file_system_id",
             "path",
             "kind",
+            "namespace_link_count",
             "tombstone_provenance",
             "owner_node_id",
             "current_locations",
@@ -4248,6 +4288,7 @@ fn original_omit(schema: &str, key: &str, value: &Value) -> bool {
                 "transaction",
                 "content_reference_identity" | "contribution_digest" | "file_version_pins"
             ) | ("object-expectation", "expected_version")
+                | ("namespaced-file-system", "namespace_count_activation")
                 | ("path-expectation", "expected_object_id")
                 | ("job-receipt", "file_restore" | "origin" | "target_path")
                 | (
@@ -4266,7 +4307,7 @@ fn original_omit(schema: &str, key: &str, value: &Value) -> bool {
                 )
                 | (
                     "object",
-                    "tombstone_provenance"
+                    "namespace_link_count" | "tombstone_provenance"
                         | "content_hash"
                         | "content_size_bytes"
                         | "link_target_object_id"
@@ -4359,6 +4400,7 @@ fn original_omit(schema: &str, key: &str, value: &Value) -> bool {
 }
 fn original_child(schema: &str, key: &str) -> &'static str {
     match (schema, key) {
+        ("namespaced-file-system", "namespace_count_activation") => "namespace-count-activation",
         ("metadata-effect/put-file-system", "file_system") => "file-system",
         ("metadata-effect/put-object", "object")
         | ("metadata-effect/finalize-cross-shard-source-eviction", "tombstone") => "object",

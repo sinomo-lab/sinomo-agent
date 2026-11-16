@@ -1641,7 +1641,7 @@ mod tests {
             sinomo_dfs::open_local_metadata_shard_backend(context.data_dir(), shard.clone())
                 .unwrap();
         let image = backend.export_snapshot_image().unwrap();
-        let snapshot = backend.export_table_snapshot();
+        let snapshot = backend.export_table_snapshot().unwrap();
         drop(backend);
         assert!(
             snapshot
@@ -1747,6 +1747,8 @@ mod tests {
                 .is_none()
         );
         let cut = MetadataSourceCut {
+            retained_placement_reservations: Vec::new(),
+            namespace_count_cohort: None,
             source_root: source_root.clone(),
             source_identity,
             scope_shard: shard.clone(),

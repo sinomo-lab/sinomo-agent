@@ -109,7 +109,13 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         nodes.iter().cloned().collect()
     );
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-    let mut file_system = runtime.file_system();
+    let receiver_head = runtime.node_metadata(&replica).unwrap()
+        .metadata_prefix_proof(&shard_id).unwrap().unwrap().journal_sequence;
+    let control = runtime.shared_control_plane().unwrap();
+    let mut file_system: crate::DfsFileSystem = control.with_client(|client| {
+        crate::DfsControlPlaneStore::new(client.as_mut())
+            .get_file_system_config(&shard.file_system_id).unwrap().unwrap().into()
+    });
     file_system.display_name = "embedded journal roundtrip".to_string();
     // Filesystem publication belongs to the store-backed owning service. This
     // normal service method performs the accepted primary config commit and
@@ -119,7 +125,7 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
 
     // Export the actual native Root cut, not a mounted requester's private image.
     let mut journal_source = runtime.metadata_primary_service("/").unwrap();
-    let mut journal_head = 0;
+    let mut journal_head = receiver_head;
     loop {
         let prepared = {
             let backend = journal_source
@@ -174,7 +180,7 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         assert_eq!(response.verified_authority_probe_id, Some(confirmation_id));
         journal_head = command.batch.next_after_sequence;
     }
-    assert!(journal_head > 0);
+    assert!(journal_head > receiver_head, "the direct roundtrip includes the new native publication suffix");
     let journal_prefix = journal_source
         .metadata_backend()
         .unwrap()
@@ -366,7 +372,7 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
         let inspected =
             LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &replica_root).unwrap();
         let materialized = inspected
-            .export_table_snapshot()
+            .export_table_snapshot().unwrap()
             .materialized_through_sequence;
         let tail = inspected
             .journal_since_limited(

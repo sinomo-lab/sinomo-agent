@@ -93,7 +93,7 @@ impl LocalSobjMetadataBackend {
         self.certified_prepared_record_at_held_cut(operation_id)
     }
 
-    fn certified_prepared_record_at_held_cut(
+    pub(super) fn certified_prepared_record_at_held_cut(
         &self,
         operation_id: &str,
     ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
@@ -327,6 +327,8 @@ impl LocalSobjMetadataBackend {
             ));
         }
 
+        self.tables.validate_parent_count_writes(&payload)?;
+        crate::namespace_counts::validate_new_counted_publication(&self.tables, &payload)?;
         let digest = DfsPreparedOperationDigest::at_sequence(&payload, self.next_sequence.max(1))?;
         let source_family = source
             .map(|source| source.validate_for(&payload, &digest))
@@ -584,6 +586,15 @@ impl LocalSobjMetadataBackend {
             });
         }
         #[cfg(test)]
+        if crate::posix::parent_apply_commit_is_held(&self.root, &record) {
+            // Negative-only native fault: the real prepare and author guard
+            // exist, but no commit or parent successor is manufactured.
+            return Err(MetadataBackendError::Io {
+                path: self.root.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::Interrupted, "test holds original parent apply before commit"),
+            });
+        }
+        #[cfg(test)]
         crate::default_cluster::genesis::defer_native_genesis_commit_at_writer(
             &self.root,
             &record,
@@ -594,6 +605,7 @@ impl LocalSobjMetadataBackend {
             .map(|source| source.validate_for(&record.payload, digest))
             .transpose()?
             .flatten();
+        self.tables.validate_parent_count_writes(&record.payload)?;
         validate_metadata_effect_content_bindings(&self.tables, &record, source_family)?;
         validate_prepared_operation_content(&self.tables, &record)?;
         if record.status == DfsPreparedOperationStatus::Prepared {
@@ -770,6 +782,7 @@ pub(crate) fn validate_preparation_against_tables(
 ) -> Result<()> {
     record.validate()?;
     let view = record;
+    let parent_chain = tables.parent_supersession_chain(&record.payload)?;
     let mut rollback = DfsMetadataTableRollback::default();
     let shadowed = (|| -> Result<()> {
         for effect in &record.metadata_effects {
@@ -795,7 +808,8 @@ pub(crate) fn validate_preparation_against_tables(
                         "replacement scope/identity changed".into(),
                     ));
                 }
-                if *status == DfsPreparedOperationStatus::Superseded {
+                if *status == DfsPreparedOperationStatus::Superseded
+                    && !parent_chain.as_ref().is_some_and(|chain| chain.contains(&digest.operation_id)) {
                     let mut unchanged = record.payload.as_ref().clone();
                     unchanged.operation_id = old.operation_id.clone();
                     unchanged.owner_epoch = old.owner_epoch;
@@ -899,6 +913,7 @@ pub(crate) fn validate_prepared_operation_commit(
     tables: &DfsMetadataTables,
     record: &DfsPreparedOperationRecord,
 ) -> Result<()> {
+    tables.validate_parent_count_writes(&record.payload)?;
     validate_prepared_operation_content(tables, record)?;
     let view = record;
     validate_conditional_write_publication(tables, record)?;
@@ -2243,19 +2258,10 @@ fn validate_metadata_effects(
                 slot_generations.insert(withdrawal.slot_key(), withdrawal.generation);
             }
             E::RemovePreparedOperation { digest } => {
-                let target = tables
-                    .prepared_operations_v7
-                    .get(&digest.operation_id)
-                    .ok_or_else(|| MetadataBackendError::Serde("eviction target missing".into()))?;
-                if target.digest != *digest
-                    || target.status == DfsPreparedOperationStatus::Prepared
-                    || digest.file_system_id != record.file_system_id
-                    || digest.shard_id != record.shard_id
-                {
-                    return Err(MetadataBackendError::Serde(
-                        "eviction target changed/scope mismatch".into(),
-                    ));
+                if digest.file_system_id != record.file_system_id || digest.shard_id != record.shard_id {
+                    return Err(MetadataBackendError::Serde("eviction target changed/scope mismatch".into()));
                 }
+                tables.terminal_eviction_for_digest(digest)?;
             }
             E::ResolvePreparedOperation { digest, status } => {
                 let old = tables

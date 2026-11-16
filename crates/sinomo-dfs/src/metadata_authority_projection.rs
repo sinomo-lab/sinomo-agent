@@ -70,9 +70,10 @@ pub(crate) fn metadata_storage_configuration_changed(
             let crate::DfsFileSystemConfig {
                 file_system_id,
                 owner_node_id,
+                metadata_storage,
                 ..
             } = config;
-            (file_system_id, owner_node_id)
+            (file_system_id, owner_node_id, metadata_storage)
         })
     };
     match (previous, current) {
@@ -138,9 +139,17 @@ pub fn metadata_shards_from_authority_projection(
     projection: &DfsAuthoritativePrefixProjection,
     file_system_id: &DfsFileSystemId,
 ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+    metadata_shards_from_authority_entries(projection.entries(), file_system_id)
+}
+
+/// Decode routing DATA for comparison with an already captured native context.
+/// This does not manufacture a completeness certificate or an authority read.
+pub(crate) fn metadata_shards_from_authority_entries(
+    entries: &[sinomo_core::kv::KvEntry],
+    file_system_id: &DfsFileSystemId,
+) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
     let expected_file_system_id = file_system_id.to_string();
-    let mut shards = projection
-        .entries()
+    let mut shards = entries
         .iter()
         .filter_map(|entry| {
             let (entry_file_system_id, entry_shard_id) =
@@ -305,7 +314,9 @@ pub fn metadata_replica_context_matches_authority_entries(
     let handoff_matches = current.is_some_and(|current| {
         current.pending_membership_handoff == context.pending_membership_handoff
     });
-    let matches = shard_matches && handoff_matches;
+    let catalog_matches = context.namespace_catalog.as_ref()
+        .map(|catalog| catalog.matches_entries(entries)).transpose()?.unwrap_or(true);
+    let matches = shard_matches && handoff_matches && catalog_matches;
     if !matches && tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE) {
         // Observe the contexts already decoded for this exact comparison. The
         // fixed field set omits member arrays, paths, and storage-import payloads.
@@ -350,12 +361,16 @@ pub fn metadata_replica_context_from_authority_projection(
     file_system_id: &DfsFileSystemId,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataReplicaShardContext>, DfsError> {
-    metadata_replica_context_from_authority_entries(
+    let mut context = metadata_replica_context_from_authority_entries(
         projection.entries(),
         local_node_id,
         file_system_id,
         shard_id,
-    )
+    )?;
+    if let Some(context) = context.as_mut() {
+        context.namespace_catalog = Some(crate::DfsMetadataNamespaceCatalog::capture(projection, file_system_id)?);
+    }
+    Ok(context)
 }
 
 pub fn metadata_replica_context_from_authority_entries(
@@ -405,6 +420,7 @@ pub fn metadata_replica_context_from_authority_entries(
     .switched()
     .cloned();
     Ok(Some(DfsMetadataReplicaShardContext {
+        namespace_catalog: None, // Raw entries are routing DATA, not a complete captured input.
         local_node_id: local_node_id.clone(),
         shard,
         pending_membership_handoff,

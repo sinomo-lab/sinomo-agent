@@ -37,9 +37,10 @@ use crate::metadata_tables::{
 
 /// Current storage schema. Older snapshots are decoded only by the external
 /// converter; the prepared-operation protocol remains independently versioned.
-/// Generation 10 requires original alias comparisons in durable job frames.
-/// Prior native declarations are admitted only by the external MIG converter.
-pub const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 10;
+/// Generation 11 requires maintained counts on authoritative live namespace rows.
+/// Prior format 10 is admitted only by the complete-cohort external converter;
+/// historical prepared bodies retain their original independently versioned codec.
+pub const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 12;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MetadataTableFileGeneration {
@@ -1366,6 +1367,12 @@ pub(crate) fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
         "{}",
         OffsetDateTime::now_utc().unix_timestamp_nanos()
     ));
+    let generation = root.join("metadata-generation.sobj");
+    if generation.exists() {
+        create_dir_all(archive_root.clone())?;
+        move_metadata_archive_path(&generation, &archive_root.join("metadata-generation.sobj"))?;
+        archived = true;
+    }
     let records = root.join("records");
     if records.exists() {
         if !archived {
@@ -1415,6 +1422,7 @@ pub(crate) fn discard_metadata_backend_state(root: &Path) -> Result<()> {
         }
     };
     remove(&root.join("records"))?;
+    remove(&root.join("metadata-generation.sobj"))?;
     remove(&root.join("coordination"))?;
     remove(&root.join("replica-repair-archives"))?;
     let journal = root.join("journal");
@@ -1501,8 +1509,27 @@ mod tests {
         ))
     }
     #[test]
+    fn current_owned_and_native_borrowed_nonempty_snapshot_checksums_match() {
+        let filesystem = crate::DfsFileSystem::sifs("00000000000000000000000000".parse().unwrap());
+        let mut rows = crate::DfsMetadataTableSnapshotTables::default();
+        rows.file_systems.push(filesystem);
+        let tables = metadata_tables_from_snapshot(rows.clone()).unwrap();
+        let fingerprint = snapshot_semantic_fingerprint(&tables, Some(0)).unwrap();
+        let snapshot = crate::DfsMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: 0,
+            semantic_state_fingerprint: fingerprint.clone(),
+            tables: Box::new(rows),
+            prefix_proof: genesis(),
+        };
+        assert_eq!(dfs_metadata_table_snapshot_state_fingerprint(&snapshot).unwrap(), fingerprint);
+        metadata_tables_from_table_snapshot(snapshot, "current owned/borrowed agreement").unwrap();
+    }
+
+    #[test]
     fn current_wire_checksum_matches_native_stream_and_includes_empty_fields() {
         let root = sinomo_testdir::TestDir::new("current-snapshot-checksum");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "root");
         let tables = DfsMetadataTables::default();
         let proof = genesis();
         let stage =
@@ -1528,6 +1555,7 @@ mod tests {
     #[test]
     fn native_stage_is_unpublished_until_atomic_install_and_drop_removes_it() {
         let root = sinomo_testdir::TestDir::new("current-snapshot-stage");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "root");
         let tables = DfsMetadataTables::default();
         let proof = genesis();
         persist_metadata_table_snapshot(root.path(), &tables, Some(0), Some(&proof)).unwrap();
@@ -1555,6 +1583,7 @@ mod tests {
     #[test]
     fn complete_unsupported_table_record_is_rejected_without_truncating_it() {
         let root = sinomo_testdir::TestDir::new("current-table-complete-corruption");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "root");
         let tables = DfsMetadataTables::default();
         let proof = genesis();
         persist_metadata_table_snapshot(root.path(), &tables, Some(0), Some(&proof)).unwrap();
@@ -1568,6 +1597,7 @@ mod tests {
     #[test]
     fn malformed_snapshot_footer_cannot_become_a_readable_checkpoint() {
         let root = sinomo_testdir::TestDir::new("current-snapshot-corrupt-footer");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "root");
         let tables = DfsMetadataTables::default();
         let proof = genesis();
         persist_metadata_table_snapshot(root.path(), &tables, Some(0), Some(&proof)).unwrap();
@@ -1581,6 +1611,7 @@ mod tests {
     #[test]
     fn retired_checkpoint_read_restarts_at_the_installed_native_generation() {
         let root = sinomo_testdir::TestDir::new("current-snapshot-generation-race");
+        crate::metadata_candidate::stage_current_test_generation(root.path(), "root");
         let tables = DfsMetadataTables::default();
         let proof = genesis();
         persist_metadata_table_snapshot(root.path(), &tables, Some(0), Some(&proof)).unwrap();

@@ -3,6 +3,14 @@
 mod accounting;
 mod fs_ops;
 mod initialization;
+#[cfg(feature = "storage-conversion")]
+mod import_blob;
+#[cfg(feature = "storage-conversion")]
+pub use import_blob::{
+    ContentImportBlobPublication, ContentImportBlobVerifier, ContentStoreVerifiedImportBlob,
+};
+mod preparation;
+use preparation::ContentInventoryState;
 mod inline_bindings;
 mod readers;
 
@@ -56,7 +64,7 @@ const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 2;
 const ORPHAN_OBSERVATION_DIR: &str = "orphan-observations";
 const CONTENT_RESERVATION_DIR: &str = "content-reservations";
 const CONTENT_RESERVATION_LOCK_FILE: &str = "write.lock";
-const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 3;
+const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 4;
 const CONTENT_BINDING_LAYOUT: &str = "inline-bindings-v2";
 const CONTENT_RESERVATION_BATCH_SENTINEL_MARKER: &str = "sinomo-dfs-content-reservation-batches-v1";
 const CONTENT_RESERVATION_BATCH_SENTINEL_SHARD: &str = "00";
@@ -873,41 +881,6 @@ pub struct ContentStoreReservationRecord {
     pub causal_stamp: ContentStoreCausalStamp,
 }
 
-/// Immutable local Repair identity. The command digest is a bound value, not
-/// part of this key: changing a head cannot create a second original request.
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RepairPayloadSubject {
-    pub queue_incarnation: String,
-    pub producer: String,
-    pub target: String,
-    pub intent_id: String,
-    pub request_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) enum RepairPayloadSource {
-    Manifest(ContentManifest),
-    Blob {
-        content_hash: String,
-        size_bytes: u64,
-    },
-}
-
-/// A retained effect root is independent of temporary pre-catalog reservations.
-/// Its physical owner is the store incarnation, not a serving-authority epoch or
-/// a packing generation (ordinary compaction preserves this logical identity).
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RepairPayloadRoot {
-    pub subject: RepairPayloadSubject,
-    pub original_command_digest: String,
-    pub store_incarnation: String,
-    pub source: RepairPayloadSource,
-}
-
-
 /// Local durable ordering; wall clocks never establish a reservation/root-cut order.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ContentStoreCausalStamp {
@@ -1041,6 +1014,10 @@ struct ContentStoreReservationBatchSentinel {
     catalog_scan_epoch: u64,
     // Required current schema gate: a future binding layout must not be ignored.
     content_binding_layout: String,
+    /// Current imports may expose ready bindings before their complete inventory.
+    /// None is a fresh, completely current store without an import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inventory: Option<ContentInventoryState>,
 }
 
 impl ContentStoreReservationBatchSentinel {
@@ -1051,6 +1028,7 @@ impl ContentStoreReservationBatchSentinel {
             store_incarnation: sinomo_core::Id::generate().to_string(),
             catalog_scan_epoch: 0,
             content_binding_layout: CONTENT_BINDING_LAYOUT.to_owned(),
+            inventory: None,
         }
     }
 
@@ -1239,6 +1217,9 @@ struct StreamedObjectVersionFile {
 }
 
 impl LocalContentStore {
+    /// Version of the sole admitted content-root representation.
+    pub const FORMAT_VERSION: u32 = CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION;
+
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         crate::storage_preparation::prepare_storage_root_before_open(
@@ -1323,6 +1304,27 @@ impl LocalContentStore {
     #[cfg(feature = "storage-conversion")]
     pub fn has_current_initialization(root: &Path) -> Result<bool> {
         initialization::pending(root)
+    }
+
+    /// Stop the real current initializer at a durable boundary for owner/restart
+    /// tests. No marker, incarnation or authority is supplied by the fixture.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn interrupt_current_initialization_for_test(root: &Path, phase: u8) -> Result<String> {
+        assert!((1..=5).contains(&phase));
+        create_dir_all(root.to_owned())?;
+        let _initialization = initialization::InitializationGuard::acquire(root)?;
+        initialization::begin(root)?;
+        let expected = initialization::marker(root)?.expect("real initialization intent");
+        if phase >= 2 {
+            let mut store = Self::open_for_inspection(root);
+            let _owner = inline_bindings::ContentMutationGuard::acquire(root, true)?;
+            create_dir_all(root.join("blobs/00"))?;
+            if phase >= 3 { store.initialize_content_reservation_writer_state()?; }
+            if phase >= 4 { store.initialize_inline_bindings()?; }
+            if phase >= 5 { inline_bindings::initialize_file_reclamation_lock(root)?; }
+        }
+        Ok(expected.store_incarnation)
     }
 
     /// Opens a read-only view without initializing the content-store layout.
@@ -1511,7 +1513,9 @@ impl LocalContentStore {
         &self,
         started_at_unix_nanos: u64,
     ) -> Result<ContentStoreCatalogScanCut> {
+        self.require_complete_content_inventory()?;
         let _owner = self.content_mutation_guard()?;
+        self.require_complete_inventory_under_owner()?;
         let mut guard = self.lock_content_reservations_for_write()?;
         guard.sentinel.catalog_scan_epoch = guard
             .sentinel
@@ -1584,10 +1588,26 @@ impl LocalContentStore {
         identity: &ContentStoreReservationIdentity,
         minimum_reserved_at_unix_nanos: u64,
     ) -> Result<()> {
+        self.ensure_content_reservation_not_before_for_inventory(
+            identity,
+            minimum_reserved_at_unix_nanos,
+            None,
+        )
+    }
+
+    fn ensure_content_reservation_not_before_for_inventory(
+        &self,
+        identity: &ContentStoreReservationIdentity,
+        minimum_reserved_at_unix_nanos: u64,
+        inventory: Option<&str>,
+    ) -> Result<()> {
         let _owner = self.content_mutation_guard()?;
         hash_hex(&identity.content_hash)?;
-        self.remove_manifest_absence_observation(identity)?;
         let reservation = self.lock_content_reservations_for_write()?;
+        if let Some(identity) = inventory {
+            preparation::require_pending_inventory(&reservation.sentinel, identity)?;
+        }
+        self.remove_manifest_absence_observation(identity)?;
         let previous = match self.inline_reservation_state(identity)? {
             Some(InlineReservationState::Live(record)) => record.reserved_at_unix_nanos,
             _ => 0,
@@ -1707,7 +1727,9 @@ impl LocalContentStore {
         _catalog_content_hashes: &BTreeSet<String>,
         options: ContentStoreReservationReconciliationOptions,
     ) -> Result<ContentStoreReservationReconciliationReport> {
+        self.require_complete_content_inventory()?;
         let _owner = self.content_mutation_guard()?;
+        self.require_complete_inventory_under_owner()?;
         if options.catalog_generation.is_empty() {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: "content reservation reconciliation requires a catalog generation"
@@ -1944,6 +1966,16 @@ impl LocalContentStore {
         version: &str,
         blob: ContentStoreQuarantinedBlob,
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
+        self.bind_current_quarantined_blob(object_id, version, blob)
+    }
+
+    fn bind_current_quarantined_blob(
+        &self,
+        object_id: &str,
+        version: &str,
+        blob: ContentStoreQuarantinedBlob,
+    ) -> Result<ContentManifest> {
         let _owner = self.content_mutation_guard()?;
         if blob.store_root != self.root {
             return Err(ContentStoreError::InvalidContentLayout {
@@ -1994,6 +2026,8 @@ impl LocalContentStore {
         version: &str,
         blob: ContentStoreQuarantinedBlob,
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(source_object_id, source_version)?;
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
         if self.object_version_is_deleted(source_object_id, source_version)?
             || self.object_version_is_deleted(object_id, version)?
@@ -2002,7 +2036,7 @@ impl LocalContentStore {
                 message: "retained source or canonical identity was explicitly collected".into(),
             });
         }
-        self.bind_quarantined_blob(object_id, version, blob)
+        self.bind_current_quarantined_blob(object_id, version, blob)
     }
 
     /// Stores one already-materialized DFS value after validating its expected
@@ -2022,6 +2056,7 @@ impl LocalContentStore {
         expected_hash: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
         if bytes.len() as u64 <= INLINE_BLOB_SMALL_LIMIT_BYTES
             && self.inline_sentinel_unlocked()?.is_some()
         {
@@ -2106,6 +2141,7 @@ impl LocalContentStore {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
         if let Some(manifest) =
             self.try_publish_inline_staged_manifest(object_id, version, content_hash, size_bytes)?
         {
@@ -2257,6 +2293,11 @@ impl LocalContentStore {
     /// Opens a blob for a single read pass, validating its stored length only.
     /// Content digests are checked by scrub, not by foreground reads.
     pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
+        self.prepare_blob_if_missing(hash)?;
+        self.open_current_blob_stream(hash)
+    }
+
+    fn open_current_blob_stream(&self, hash: &str) -> Result<BlobReader> {
         let _owner = self.content_mutation_guard()?;
         #[cfg(test)]
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
@@ -2302,6 +2343,16 @@ impl LocalContentStore {
     /// derived from the validated content identity. Scrub verifies stored bytes;
     /// ordinary reads use bounded memory without a full-blob verification pass.
     pub fn open_blob_range_stream(
+        &self,
+        hash: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<BlobRangeReader> {
+        self.prepare_blob_if_missing(hash)?;
+        self.open_current_blob_range_stream(hash, offset, max_bytes)
+    }
+
+    fn open_current_blob_range_stream(
         &self,
         hash: &str,
         offset: u64,
@@ -2429,10 +2480,11 @@ impl LocalContentStore {
         object_id: &str,
         version: &str,
     ) -> Result<(ContentManifest, ObjectVersionReader)> {
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
-        let manifest = self.read_manifest(object_id, version)?;
+        let manifest = self.read_current_manifest(object_id, version)?;
         if manifest.extents.is_empty() {
-            let reader = self.open_blob_stream(&manifest.content_hash)?;
+            let reader = self.open_current_blob_stream(&manifest.content_hash)?;
             if reader.size_bytes() != manifest.size_bytes {
                 return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
@@ -2495,7 +2547,7 @@ impl LocalContentStore {
             .min(manifest_fields.size_bytes);
         if manifest_fields.extents.is_empty() {
             let reader =
-                self.open_blob_range_stream(&manifest_fields.content_hash, start, max_bytes)?;
+                self.open_current_blob_range_stream(&manifest_fields.content_hash, start, max_bytes)?;
             return Ok(ObjectVersionReader::from_blob_range(reader));
         }
 
@@ -2590,6 +2642,11 @@ impl LocalContentStore {
     }
 
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
+        self.read_current_manifest(object_id, version)
+    }
+
+    fn read_current_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
         let _owner = self.content_mutation_guard()?;
         match self.inline_version_state(object_id, version)? {
             Some(InlineVersionState::Live(entry)) => Ok(entry.manifest),
@@ -2605,8 +2662,9 @@ impl LocalContentStore {
         object_id: &str,
         version: &str,
     ) -> Result<Arc<ValidatedContentManifest>> {
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
-        let manifest = self.read_manifest(object_id, version)?;
+        let manifest = self.read_current_manifest(object_id, version)?;
         let path = self.manifest_path(object_id, version);
         if let Some(cached) = self
             .stream_manifest_cache
@@ -2653,6 +2711,7 @@ impl LocalContentStore {
     }
 
     pub fn manifests_for_object(&self, object_id: &str) -> Result<Vec<ContentManifest>> {
+        self.prepare_content_object_inventory(object_id)?;
         let _owner = self.content_mutation_guard()?;
         let mut manifests = Vec::new();
         if let Some(view) = self.inline_binding_view()? {
@@ -2674,6 +2733,11 @@ impl LocalContentStore {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<Option<ContentManifest>> {
+        if let Some(current) = self.inline_manifest_for_content(object_id, content_hash, size_bytes)?
+        {
+            return Ok(Some(current));
+        }
+        self.prepare_content_object_inventory(object_id)?;
         self.inline_manifest_for_content(object_id, content_hash, size_bytes)
     }
 
@@ -2795,7 +2859,9 @@ impl LocalContentStore {
     }
 
     pub fn collect_garbage(&self, options: ContentStoreGcOptions) -> Result<ContentStoreGcReport> {
+        self.require_complete_content_inventory()?;
         let _owner = self.content_mutation_guard()?;
+        self.require_complete_inventory_under_owner()?;
         let catalog_observation = options
             .catalog_generation
             .as_deref()
@@ -3176,7 +3242,9 @@ impl LocalContentStore {
         &self,
         options: ContentStoreVersionGcOptions,
     ) -> Result<ContentStoreVersionGcReport> {
+        self.require_complete_content_inventory()?;
         let _owner = self.content_mutation_guard()?;
+        self.require_complete_inventory_under_owner()?;
         let destructive_catalog_observation_is_valid = options
             .catalog_generation
             .as_deref()
@@ -3540,11 +3608,12 @@ impl LocalContentStore {
         version: &str,
         expected_hash: &str,
     ) -> Result<bool> {
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
         if self.object_version_is_deleted(object_id, version)? {
             return Ok(false);
         }
-        let manifest = match self.read_manifest(object_id, version) {
+        let manifest = match self.read_current_manifest(object_id, version) {
             Ok(manifest) => manifest,
             Err(error) if content_error_is_not_found(&error) => {
                 return self.blob_storage_candidate_exists(expected_hash);
@@ -3575,7 +3644,7 @@ impl LocalContentStore {
         manifest: &ContentManifest,
     ) -> Result<bool> {
         if manifest.extents.is_empty() {
-            return match self.open_blob_stream(&manifest.content_hash) {
+            return match self.open_current_blob_stream(&manifest.content_hash) {
                 Ok(reader) => Ok(reader.size_bytes() == manifest.size_bytes),
                 Err(error) if content_error_is_not_found(&error) => Ok(false),
                 Err(error) => Err(error),
@@ -3651,6 +3720,7 @@ impl LocalContentStore {
         bytes: &[u8],
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        self.prepare_patch_units(object_id, base_version, target_version, base_identity)?;
         self.validate_object_version_patch_source(
             object_id,
             base_version,
@@ -3685,6 +3755,7 @@ impl LocalContentStore {
         trusted_content_hash: &str,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        self.prepare_patch_units(object_id, base_version, target_version, base_identity)?;
         hash_hex(trusted_content_hash)?;
         self.validate_object_version_patch_source(
             object_id,
@@ -3798,6 +3869,7 @@ impl LocalContentStore {
         mut reader: R,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        self.prepare_patch_units(object_id, base_version, target_version, base_identity)?;
         let staging_anchor = self
             .root
             .join("staging")
@@ -3857,6 +3929,7 @@ impl LocalContentStore {
         trusted_content_hash: Option<&str>,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        self.prepare_patch_units(object_id, base_version, target_version, base_identity)?;
         if let Some(trusted_content_hash) = trusted_content_hash {
             hash_hex(trusted_content_hash)?;
         }
@@ -3907,7 +3980,7 @@ impl LocalContentStore {
         base_version: &str,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentManifest> {
-        match self.read_manifest(object_id, base_version) {
+        match self.read_current_manifest(object_id, base_version) {
             Ok(manifest) => return Ok(manifest),
             Err(error) if !content_error_is_not_found(&error) => return Err(error),
             Err(error) if base_identity.is_none() => return Err(error),
@@ -3915,7 +3988,7 @@ impl LocalContentStore {
         }
         let base_identity = base_identity.expect("checked above");
         hash_hex(&base_identity.content_hash)?;
-        let reader = self.open_blob_stream(&base_identity.content_hash)?;
+        let reader = self.open_current_blob_stream(&base_identity.content_hash)?;
         if reader.size_bytes() != base_identity.size_bytes {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
@@ -4077,8 +4150,9 @@ impl LocalContentStore {
         patch_size: u64,
         base_identity: &ContentVersionIdentity,
     ) -> Result<Option<ContentManifest>> {
+        self.prepare_patch_units(object_id, base_version, target_version, Some(base_identity))?;
         let _owner = self.content_mutation_guard()?;
-        let target = match self.read_manifest(object_id, target_version) {
+        let target = match self.read_current_manifest(object_id, target_version) {
             Ok(target) => target,
             Err(error) if content_error_is_not_found(&error) => return Ok(None),
             Err(error) => return Err(error),
@@ -4110,6 +4184,7 @@ impl LocalContentStore {
         blob: ContentStoreQuarantinedBlob,
         base_identity: &ContentVersionIdentity,
     ) -> Result<ContentPatchManifest> {
+        self.prepare_patch_units(object_id, base_version, target_version, Some(base_identity))?;
         let _owner = self.content_mutation_guard()?;
         if blob.store_root != self.root {
             return Err(ContentStoreError::InvalidContentLayout {
@@ -4202,7 +4277,7 @@ impl LocalContentStore {
             size_bytes: target_size,
             extents: target_extents,
         };
-        let manifest = self.publish_existing_manifest(manifest)?;
+        let manifest = self.publish_current_manifest(manifest)?;
         if let Some(hash_tree) = hash_tree {
             self.write_hash_tree_create_new_or_existing(ContentHashTree {
                 content_hash: manifest.content_hash.clone(),
@@ -4222,6 +4297,7 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
         if let Some(manifest) = self.try_write_inline_binding(object_id, version, bytes)? {
             return Ok(manifest);
@@ -4243,7 +4319,7 @@ impl LocalContentStore {
             })?;
             self.write_tracked_blob_bytes(&manifest.content_hash, &path, bytes)?;
         }
-        self.publish_existing_manifest(manifest)
+        self.publish_current_manifest(manifest)
     }
 
     fn publish_prehashed_object_version_file(
@@ -4274,7 +4350,7 @@ impl LocalContentStore {
         } else {
             remove_file_if_exists(synced_file.path())?;
         }
-        self.publish_existing_manifest(manifest)
+        self.publish_current_manifest(manifest)
     }
 
     fn publish_prehashed_temporary_blob(
@@ -4321,6 +4397,7 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
         if let Some(manifest) = self.try_stage_inline_blob_only(object_id, version, bytes)? {
             return Ok(manifest);
@@ -4657,6 +4734,7 @@ impl LocalContentStore {
         hash: String,
         size_bytes: u64,
     ) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(object_id, version)?;
         let _owner = self.content_mutation_guard()?;
         let manifest = ContentManifest {
             object_id: object_id.into(),
@@ -4680,7 +4758,7 @@ impl LocalContentStore {
                 &manifest.content_hash,
             )?;
         }
-        self.publish_existing_manifest(manifest)
+        self.publish_current_manifest(manifest)
     }
 
     fn scrub_manifest_references(
@@ -4769,7 +4847,7 @@ impl LocalContentStore {
             diagnostic_path = entry.path().to_owned();
         }
         if !checked_blobs.contains_key(content_hash) {
-            let mut reader = match self.open_blob_stream(content_hash) {
+            let mut reader = match self.open_current_blob_stream(content_hash) {
                 Ok(reader) => reader,
                 Err(error) => {
                     report.issues.push(ContentStoreScrubIssue::MissingBlob {
@@ -5362,7 +5440,7 @@ impl LocalContentStore {
                 }
             })?;
             let mut reader =
-                self.open_blob_range_stream(&extent.content_hash, extent.blob_offset, max_bytes)?;
+                self.open_current_blob_range_stream(&extent.content_hash, extent.blob_offset, max_bytes)?;
             if reader.remaining_bytes() != extent.size_bytes {
                 return Err(ContentStoreError::InvalidContentLayout {
                     message: format!(
@@ -5391,6 +5469,11 @@ impl LocalContentStore {
     }
 
     pub fn publish_existing_manifest(&self, manifest: ContentManifest) -> Result<ContentManifest> {
+        self.prepare_version_if_missing(&manifest.object_id, &manifest.version)?;
+        self.publish_current_manifest(manifest)
+    }
+
+    fn publish_current_manifest(&self, manifest: ContentManifest) -> Result<ContentManifest> {
         let _owner = self.content_mutation_guard()?;
         self.inline_check_manifest_conflict(&manifest)?;
         if let Some(InlineVersionState::Live(entry)) =
@@ -6181,6 +6264,10 @@ fn validate_content_reservation_batch_sentinel(
     sentinel: &ContentStoreReservationBatchSentinel,
 ) -> Result<()> {
     if sentinel.format_version != CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION
+        || sentinel
+            .inventory
+            .as_ref()
+            .is_some_and(|state| !state.valid_identity())
         || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
         || sentinel.content_binding_layout != CONTENT_BINDING_LAYOUT
         || sentinel

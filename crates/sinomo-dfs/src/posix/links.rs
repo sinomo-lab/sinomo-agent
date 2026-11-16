@@ -6,6 +6,7 @@
 
 use super::now_unix_nanos;
 use crate::namespace::{initial_version, next_version};
+use crate::DfsNamespaceTransaction;
 use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
 use crate::posix_object::{
     apply_posix_create_attrs, new_posix_metadata_object, recreated_posix_metadata_object,
@@ -289,10 +290,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => {}
         }
+        if let Some(primary) = self.routed_namespace_primary_for_path(&target.path)? {
+            self.route_namespace_operation(primary, DfsNamespaceOperation::Hardlink {
+                existing_path: target.path.clone(), link_path: link_path.clone(),
+            })?;
+            return self.stat_routed_namespace_result(&link_path, false);
+        }
+        if self.hardlink_alias_target_requires_cross_shard_coordination(&link_path, &target.path)? {
+            self.coordinate_cross_shard_hardlink(&target.path, &link_path, self.node_id.clone())?;
+            return self.stat_routed_namespace_result(&link_path, false);
+        }
         let mut target = target;
         target.changed_at_unix_nanos = now_unix_nanos();
         target.version = next_version(&target.version);
-        self.add_object_metadata(target.clone())?;
+        target.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&target, 1)?);
         // A path-derived id may still belong to an inode renamed elsewhere.
         // Each new directory entry needs its own identity, even at a tombstone.
         let alias_object_id = DfsObjectId::generate();
@@ -301,6 +312,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id: target.file_system_id.clone(),
             path: link_path.clone(),
             kind: DfsObjectKind::Hardlink,
+            namespace_link_count: None,
             tombstone_provenance: None,
             owner_node_id: self.node_id.clone(),
             // The directory entry refers to the canonical object's generation;
@@ -321,8 +333,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         };
-        self.add_object_metadata(alias.clone())?;
-        self.touch_parent_directory_modified(&link_path)?;
+        // Alias, canonical count and parent timestamp are one physical-shard
+        // publication. A failed preparation cannot leave a standalone count bump.
+        let parent = self.parent_directory_touch_metadata_for_create(&alias)?;
+        let mut objects = vec![target.clone(), alias];
+        objects.extend(parent);
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            content_reference_identity: None, extension_expectations: Vec::new(),
+            contribution_digest: None, file_version_pins: None,
+            transaction_id: super::namespace_transaction_id_for_batch(
+                "hardlink-create", &target.file_system_id, &objects, &[],
+            ),
+            file_system_id: target.file_system_id.clone(), objects, versions: Vec::new(),
+            advisory_lock_states: Vec::new(), created_at: time::OffsetDateTime::now_utc(),
+        })?;
         self.stat_object_for_path(&target, &link_path)
     }
 }

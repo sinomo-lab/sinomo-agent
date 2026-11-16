@@ -143,6 +143,11 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
     let root = temp_root("sifs-sharded-point-lookup-snapshot");
     let node = NodeId::from_legacy_named("node_sifs_sharded_point_snapshot").expect("node");
     let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    for shard in &shards {
+        let physical = root.join("metadata").join(&shard.shard_id);
+        std::fs::create_dir_all(&physical).unwrap();
+        crate::test_runtime::copy_native_genesis_data(&physical, &shard.shard_id);
+    }
     let mut backend = open_local_sharded_metadata_backend(root.join("metadata"), shards.clone())
         .expect("metadata");
     let file_system_id = sifs_file_system_id();
@@ -160,6 +165,11 @@ fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
     );
     drop(backend);
     let historical_root = root.join("historical-metadata");
+    for shard in &shards {
+        let physical = historical_root.join(&shard.shard_id);
+        std::fs::create_dir_all(&physical).unwrap();
+        crate::test_runtime::copy_native_genesis_data(&physical, &shard.shard_id);
+    }
     let old = vec![
         shards
             .iter()
@@ -196,6 +206,11 @@ fn stat_projection_snapshot_pins_only_exact_shard_with_retained_ancestor() {
         .find(|shard| shard.shard_id == "root")
         .unwrap()
         .clone();
+    for shard in &shards {
+        let physical = root.join(&shard.shard_id);
+        std::fs::create_dir_all(&physical).unwrap();
+        crate::test_runtime::copy_native_genesis_data(&physical, &shard.shard_id);
+    }
     drop(open_local_sharded_metadata_backend(&root, vec![original]).unwrap());
     let mut backend = open_local_sharded_metadata_backend(&root, shards).unwrap();
     let selected = DfsMetadataShardId::new("services");
@@ -857,13 +872,13 @@ fn lookup_response_object_updates_outsider_read_view_without_journal_batches() {
         .unwrap();
     drop(writer);
     let local_snapshot = || {
-        LocalSobjMetadataBackend::open_for_inspection(
-            DfsMetadataShardId::new("services"),
-            crate::default_dfs_metadata_shards_root(runtime.data_dir(&outsider))
-                .join(crate::metadata_keys::key_segment(&"services")),
-        )
-        .unwrap()
-        .export_table_snapshot()
+        // An outsider may have no certified local prefix. Compare the actual
+        // observational rows and optional cut; never manufacture an exportable
+        // current snapshot merely to inspect an absent replica.
+        let root = crate::default_dfs_metadata_shards_root(runtime.data_dir(&outsider))
+            .join(crate::metadata_keys::key_segment(&"services"));
+        let state = crate::metadata_table_store::read_metadata_table_state_lenient(&root).unwrap();
+        (crate::metadata_table_store::metadata_tables_snapshot(&state.tables), state.prefix_proof)
     };
     let unchanged = local_snapshot();
     let before = runtime.rpc_observations().len();

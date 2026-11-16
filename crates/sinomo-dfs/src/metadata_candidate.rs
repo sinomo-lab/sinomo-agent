@@ -26,6 +26,8 @@ pub struct DfsMetadataCandidateIdentity {
 pub struct DfsMetadataCandidateInspection {
     descriptor: crate::DfsMetadataSnapshotImageDescriptor,
     identity: DfsMetadataCandidateIdentity,
+    prepared_body_count: usize,
+    prepared_reservations: Vec<crate::DfsPreparedOperationDigest>,
 }
 impl DfsMetadataCandidateInspection {
     pub fn capture(root: &Path) -> Result<Self> {
@@ -34,20 +36,61 @@ impl DfsMetadataCandidateInspection {
             path: path.clone(),
             source,
         })?;
-        let (_, descriptor) =
+        let (state, descriptor) =
             crate::metadata_snapshot::decode_snapshot_image_with_descriptor(file, None)?;
+        if crate::storage_generation::read_generation(root)?.identity != descriptor.generation {
+            return Err(MetadataBackendError::Serde("candidate envelope differs from embedded snapshot generation".into()));
+        }
         let identity = DfsMetadataCandidateIdentity {
             state_fingerprint: descriptor.semantic_state_fingerprint.clone(),
             prefix_proof: descriptor.prefix_proof.clone(),
             file_fingerprint: candidate_file_fingerprint(root)?,
         };
+        let mut prepared_reservations = Vec::new();
+        for record in state.tables.prepared_operations_v7.values() {
+            // The full current snapshot decoder already validated this body.
+            if record.status == crate::DfsPreparedOperationStatus::Prepared {
+                prepared_reservations.push(record.digest.clone());
+            }
+        }
         Ok(Self {
             descriptor,
             identity,
+            prepared_body_count: state.tables.prepared_operations_v7.len(),
+            prepared_reservations,
         })
     }
 
+    pub fn identity(&self) -> &DfsMetadataCandidateIdentity { &self.identity }
+    pub fn has_prepared_bodies(&self) -> bool { self.prepared_body_count != 0 }
+
+    /// Current-format DATA validation only. Native activation separately proves
+    /// that every inherited reservation belongs to a retired authority epoch.
+    fn validate_prepared_reservations(&self) -> Result<()> {
+        if self.prepared_body_count != self.prepared_reservations.len()
+            || self.prepared_reservations.iter().any(|digest|
+                digest.file_system_id != self.descriptor.generation.file_system_id
+                    || digest.shard_id != self.descriptor.generation.shard_id
+                    || digest.owner_epoch == 0
+                    || digest.prepare_sequence > self.identity.prefix_proof.journal_sequence) {
+            return Err(MetadataBackendError::Serde("storage transition contains a terminal body or a foreign preparation".into()));
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_retiring_reservations(&self, retiring: &crate::DfsMetadataShardConfig) -> Result<()> {
+        self.validate_prepared_reservations()?;
+        if self.descriptor.generation.file_system_id != retiring.file_system_id
+            || self.descriptor.generation.shard_id.0 != retiring.shard_id
+            || self.prepared_reservations.iter().any(|digest| digest.owner_epoch > retiring.epoch) {
+            return Err(MetadataBackendError::Serde("inherited preparation is not fenced by the retiring native assignment".into()));
+        }
+        Ok(())
+    }
+
     pub fn verify(&self, root: &Path) -> Result<DfsMetadataCandidateIdentity> {
+        if crate::storage_generation::read_generation(root)?.identity != self.descriptor.generation {
+            return Err(MetadataBackendError::Serde("candidate generation changed after full validation".into()));
+        }
         let path = metadata_table_snapshot_path(root);
         let file = File::open(&path).map_err(|source| MetadataBackendError::Io {
             path: path.clone(),
@@ -64,7 +107,7 @@ impl DfsMetadataCandidateInspection {
 }
 
 /// An exclusively owned staging directory. It cannot overwrite a populated
-/// metadata root: a durable candidate stamp must precede every image write.
+/// metadata root: its staged generation must precede every image write.
 pub struct DfsMetadataCandidateWriter {
     root: PathBuf,
     _lock: CandidateWriteLock,
@@ -120,13 +163,80 @@ mod lock_lifetime_tests {
 }
 
 impl DfsMetadataCandidateWriter {
+    fn require_unsealed_generation(&self) -> Result<crate::DfsMetadataGenerationIdentity> {
+        let envelope = crate::storage_generation::read_generation(&self.root)?;
+        if !matches!(envelope.state, crate::storage_generation::GenerationState::Staged { seal: None }) {
+            return Err(MetadataBackendError::Serde("candidate publication requires its unsealed staged generation".into()));
+        }
+        Ok(envelope.identity)
+    }
+    /// Create or resume a current hidden image under its immutable generation.
+    /// This never changes an existing identity or grants serving authority.
+    pub fn open_generation(
+        root: impl AsRef<Path>,
+        identity: crate::DfsMetadataGenerationIdentity,
+    ) -> Result<Self> {
+        identity.validate()?;
+        let writer = Self::open(root.as_ref().to_owned())?;
+        let path = writer.root.join("metadata-generation.sobj");
+        if path.exists() {
+            let current = crate::storage_generation::read_generation(&writer.root)?;
+            if current.identity != identity || !matches!(current.state, crate::storage_generation::GenerationState::Staged { .. }) {
+                return Err(MetadataBackendError::Serde("candidate generation differs from its existing staged identity".into()));
+            }
+        } else {
+            if metadata_table_snapshot_path(&writer.root).exists() {
+                return Err(MetadataBackendError::Serde("retained image has no current generation identity".into()));
+            }
+            crate::storage_generation::write_generation(&writer.root, &crate::storage_generation::GenerationEnvelope {
+                format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                identity,
+                state: crate::storage_generation::GenerationState::Staged { seal: None },
+            })?;
+        }
+        Ok(writer)
+    }
+
+    /// Bind the complete hidden image to the exact cut that native activation
+    /// must subsequently inspect. Sealing does not authorize installation.
+    pub fn seal_storage_generation(
+        &self,
+        expected: &DfsMetadataCandidateIdentity,
+    ) -> Result<crate::DfsMetadataGenerationSeal> {
+        let inspection = DfsMetadataCandidateInspection::capture(&self.root)?;
+        if inspection.identity() != expected {
+            return Err(MetadataBackendError::Serde("candidate changed before generation sealing".into()));
+        }
+        let mut envelope = crate::storage_generation::read_generation(&self.root)?;
+        match envelope.identity.origin {
+            crate::DfsMetadataGenerationOrigin::StorageTransition { .. } => inspection.validate_prepared_reservations()?,
+            crate::DfsMetadataGenerationOrigin::StandaloneOwned { .. } if inspection.has_prepared_bodies() => {
+                return Err(MetadataBackendError::Serde("standalone generation cannot inherit native preparations".into()));
+            }
+            _ => {}
+        }
+        let crate::storage_generation::GenerationState::Staged { seal } = &mut envelope.state else {
+            return Err(MetadataBackendError::Serde("active metadata generation cannot be resealed".into()));
+        };
+        let expected = crate::DfsMetadataGenerationSeal {
+            prefix_proof: expected.prefix_proof.clone(),
+            state_fingerprint: expected.state_fingerprint.clone(),
+            file_fingerprint: expected.file_fingerprint.clone(),
+        };
+        if seal.as_ref().is_some_and(|old| old != &expected) {
+            return Err(MetadataBackendError::Serde("sealed metadata generation changed".into()));
+        }
+        *seal = Some(expected.clone());
+        crate::storage_generation::write_generation(&self.root, &envelope)?;
+        Ok(expected)
+    }
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|source| MetadataBackendError::Io {
             path: root.clone(),
             source,
         })?;
-        let stamp = root.join("metadata-candidate-v7.json");
+        let generation = root.join("metadata-generation.sobj");
         let lock_path = root.join("metadata-candidate.lock");
         let lock = OpenOptions::new()
             .create(true)
@@ -143,17 +253,14 @@ impl DfsMetadataCandidateWriter {
                 path: lock_path.clone(),
                 source,
             })?;
-        // Install the guard immediately after acquisition so a rejected stamp
+        // Install the guard immediately after acquisition so a rejected identity
         // or failed initialization also ends the acquired custody explicitly.
         let lock = CandidateWriteLock(lock);
-        if stamp.exists() {
-            let bytes = fs::read(&stamp).map_err(|source| MetadataBackendError::Io {
-                path: stamp.clone(),
-                source,
-            })?;
-            if bytes != b"{\"format_version\":7,\"candidate\":true}" {
+        if generation.exists() {
+            if !matches!(crate::storage_generation::read_generation(&root)?.state,
+                crate::storage_generation::GenerationState::Staged { .. }) {
                 return Err(MetadataBackendError::Serde(
-                    "invalid current candidate stamp".into(),
+                    "candidate writer cannot open an active generation".into(),
                 ));
             }
         } else {
@@ -171,10 +278,6 @@ impl DfsMetadataCandidateWriter {
                     ));
                 }
             }
-            crate::metadata_io::write_file_atomic(
-                &stamp,
-                b"{\"format_version\":7,\"candidate\":true}",
-            )?;
         }
         Ok(Self { root, _lock: lock })
     }
@@ -183,6 +286,7 @@ impl DfsMetadataCandidateWriter {
         tables: DfsMetadataTableSnapshotTables,
         proof: DfsMetadataPrefixProof,
     ) -> Result<DfsMetadataCandidateIdentity> {
+        self.require_unsealed_generation()?;
         let mut snapshot = DfsMetadataTableSnapshot {
             format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: proof.journal_sequence,
@@ -209,6 +313,10 @@ impl DfsMetadataCandidateWriter {
         entry: &crate::DfsMetadataJournalEntry,
         previous: &DfsMetadataPrefixProof,
     ) -> Result<DfsMetadataPrefixProof> {
+        let generation = self.require_unsealed_generation()?;
+        if generation.shard_id != entry.shard_id {
+            return Err(MetadataBackendError::Serde("candidate frame belongs to another generation scope".into()));
+        }
         let frame = crate::metadata_journal::DfsMetadataJournalFrame::encode(entry)?;
         let proof = crate::metadata_journal::metadata_prefix_proof_after_exact_frame(
             previous,
@@ -393,9 +501,24 @@ pub fn write_metadata_candidate_image_inspected(
     fs: &crate::DfsFileSystemId,
 ) -> Result<DfsMetadataCandidateInspection> {
     image.validate_file_system(fs)?;
-    let writer = DfsMetadataCandidateWriter::open(root)?;
+    if image.generation.file_system_id != *fs {
+        return Err(MetadataBackendError::Serde("candidate image generation names another filesystem".into()));
+    }
+    let writer = DfsMetadataCandidateWriter::open_generation(root, image.generation.clone())?;
+    if matches!(crate::storage_generation::read_generation(root)?.state,
+        crate::storage_generation::GenerationState::Staged { seal: Some(_) }) {
+        let inspected = DfsMetadataCandidateInspection::capture(root)?;
+        if inspected.descriptor != *image.descriptor() {
+            return Err(MetadataBackendError::Serde("sealed received image differs from its exact replay".into()));
+        }
+        writer.seal_storage_generation(inspected.identity())?;
+        return Ok(inspected);
+    }
+    writer.require_unsealed_generation()?;
     image.install_candidate_copy(&writer.root)?;
-    DfsMetadataCandidateInspection::capture(root)
+    let inspected = DfsMetadataCandidateInspection::capture(root)?;
+    writer.seal_storage_generation(inspected.identity())?;
+    Ok(inspected)
 }
 
 /// Reuse the normal owned chunk worker for a hidden import candidate. Its real
@@ -460,6 +583,15 @@ impl DfsMetadataCandidateState {
             tables: crate::metadata_table_store::metadata_tables_from_snapshot(tables)?,
         })
     }
+    /// Reconstruct one exact native source event as DATA. The caller retains
+    /// source custody and validates the contiguous original prefix separately.
+    /// This shares ordinary replay (including Prepare receipts), never author
+    /// admission or normalization of historical payloads/digests.
+    pub fn replay_native_journal_entry(&mut self, entry: &crate::DfsMetadataJournalEntry) -> Result<()> {
+        let op = crate::metadata_replay::table_op_for_native_journal_entry(entry)?;
+        self.tables.apply_checked(op)
+    }
+
     pub fn apply(&mut self, effect: crate::DfsPreparedMetadataEffect) -> Result<()> {
         if let crate::DfsPreparedMetadataEffect::PutObject { object } = &effect {
             let transaction = crate::DfsNamespaceTransaction {
@@ -590,4 +722,18 @@ impl DfsMetadataCandidateState {
         }
         self.tables.rebuild_prepared_operation_reservations()
     }
+}
+
+/// Construct current staged DATA for physical codec/cursor tests. This never
+/// activates a generation, qualifies native authority, or opens a serving backend.
+#[cfg(test)]
+pub(crate) fn stage_current_test_generation(root: &Path, shard: &str) {
+    drop(DfsMetadataCandidateWriter::open_generation(root, crate::DfsMetadataGenerationIdentity {
+        file_system_id: crate::DfsFileSystemId::from_legacy_named("physical-data-fixture").unwrap(),
+        shard_id: crate::DfsMetadataShardId::new(shard),
+        generation: "physical-reader-generation".into(),
+        origin: crate::DfsMetadataGenerationOrigin::StorageTransition {
+            transition_id: "physical-reader-candidate".into(),
+        },
+    }).unwrap());
 }

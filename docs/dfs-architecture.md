@@ -49,9 +49,12 @@ The history module uses its namespace to translate source and capture provenance
 into user-facing history. Other modules can retain immutable revisions under
 their own namespaces without introducing a second content database or modifying
 history's semantics. `sinomo-dfs-migration` alone interprets retained legacy
-records and converts them into the current representation. The DFS runtime
-accepts only its current storage and wire protocols; incompatible nodes must be
-upgraded before participating.
+records and converts them into the current representation. One component-owned
+migration lifecycle covers background conversion of cold data and prioritized
+requests from DFS operations. Ready data remains available where its authority
+allows; incomplete migration never establishes absence or permits collection.
+The DFS runtime accepts only its current storage and wire protocols; incompatible
+nodes must be upgraded before participating.
 
 A disabled feature exposes no routes or
 workers, while core create/read/overwrite/rename/unlink remains available.
@@ -196,7 +199,7 @@ The logical metadata model contains:
 
 | Record | Purpose |
 |---|---|
-| Object | Stable identity, path, kind, owner, policy, and visible version. |
+| Object | Stable identity, path, kind, owner, policy, visible version, and canonical namespace link count. |
 | Version | Content hash, length, manifest, parent/base, writer, and commit state. |
 | Intent | Base version, target version, authority epoch, placement, and required receipts. |
 | Receipt | Evidence that an eligible node durably holds the expected content. |
@@ -380,9 +383,11 @@ exists elsewhere. The branch never becomes a second canonical history.
 
 ## Reads and Caches
 
-Distributed POSIX stat derives current inode fields through bounded authenticated
-metadata projections; see [the authoritative stat contract](dfs-authoritative-stat.md)
-for generation, cross-shard completeness, compatibility and outage behavior.
+Distributed POSIX stat reads canonical inode metadata and its maintained link
+count from the current authority. Namespace mutations own count changes; stat
+does not reconstruct them across shards. See
+[the authoritative stat contract](dfs-authoritative-stat.md) for read semantics,
+compatibility and count initialization.
 Path and object metadata is answered by the shard's primary or one of its
 replicas. A node outside the replica set reads paths, open handles, inode
 identities and hardlink targets through the primary, plans its writes against

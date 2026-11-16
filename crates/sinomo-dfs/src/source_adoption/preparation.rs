@@ -283,11 +283,11 @@ impl DfsSourceAdoptionActor {
         execution: &crate::publication_guard::DfsPublicationExecutionOwners,
         finish: impl FnOnce() -> crate::posix_model::Result<()>,
     ) -> crate::posix_model::Result<bool> {
-        if job.kind != crate::DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-            || job.status != DfsNamespaceJobStatus::Running
-            || job.processed_object_count != 0
-            || job.root_path != source_path
-            || destination.kind != crate::DfsObjectKind::File
+        let initial_file = job.kind == crate::DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+            && job.processed_object_count == 0 && destination.kind == crate::DfsObjectKind::File;
+        let initial_directory = job.initial_directory_root_adoption() == Some(destination);
+        if (!initial_file && !initial_directory)
+            || job.status != DfsNamespaceJobStatus::Running || job.root_path != source_path
         {
             return Ok(false);
         }
@@ -358,7 +358,7 @@ impl DfsSourceAdoptionActor {
             || plan.source_config.primary_node_id != self.node
             || plan.destination != *destination
             || plan.source_path != source_path
-            || cancelled.prepared.family.source_object.kind != crate::DfsObjectKind::File
+            || cancelled.prepared.family.source_object.kind != destination.kind
             || &cancelled.physical_scope != physical_scope
             || self.authority.storage_generation() != cancelled.storage_generation
             || self.authority.generation() != cancelled.authority_generation
@@ -854,6 +854,12 @@ impl DfsSourceAdoptionActor {
                 &family.source_object.path,
                 &family,
                 transfer,
+                if family.source_object.kind == crate::DfsObjectKind::Directory
+                    && completed.original_job.kind == crate::DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                    && crate::namespace::metadata_path(&completed.original_job.root_path)
+                        == crate::namespace::metadata_path(&family.source_object.path) {
+                    completed.original_job.directory_move_counts()?.map_or(0, |plan| plan.source_effect_delta(&family.source_object.path))
+                } else { 0 },
             )
             .map_err(error)?;
         Ok(())

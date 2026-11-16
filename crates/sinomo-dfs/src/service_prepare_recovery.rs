@@ -136,6 +136,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if record.status != DfsPreparedOperationStatus::Prepared {
             return Ok(false);
         }
+        if record.metadata_effects.iter().any(|effect| matches!(effect,
+            DfsPreparedMetadataEffect::PutNamespaceJob { job }
+                if job.kind == DfsNamespaceJobKind::ParentCountParticipant)) {
+            // The original coordinator owns issuance/abort and the exact
+            // parent ancestry. Generic recovery cannot mint a recover: ID or
+            // commit this participant independently of that durable decision.
+            record.validate()?;
+            let (participant, _) = record.metadata_effects.iter().find_map(|effect| match effect {
+                DfsPreparedMetadataEffect::PutNamespaceJob { job } => job.parent_count_participant(),
+                _ => None,
+            }).ok_or_else(|| DfsError::Metadata { message: "parent prepare omitted its declared participant".into() })?;
+            participant.validate_phase_payload(&record.payload)?;
+            return Ok(false);
+        }
         if self.control_plane.is_none() {
             if record.digest.owner_epoch == 0 {
                 let committed = self.commit_stored_prepared_operation(&record.digest)?;
@@ -332,7 +346,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A current create can durably admit its intent/receipt before the
         // sealed content body or first visible object exists. Its saved object
         // is an identity anchor only; the same certified shard check below
-        // still owns adoption, and hydration exposes it only after W is ready.
+        // still owns adoption. Transient transfer recovery grants neither a
+        // content receipt nor a visible namespace entry.
         let object = match self.current_read_object_metadata(&intent.object_id) {
             Ok(object) => object,
             Err(DfsError::UnknownObject { object_id })

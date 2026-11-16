@@ -33,6 +33,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+mod catalog;
+pub use catalog::{metadata_catalog_generation_update, metadata_catalog_generation_successor, metadata_storage_pending_transition_update};
+use catalog::{append_catalog_generation_update, catalog_handoff_guard, catalog_handoff_successor};
+
 mod write_set;
 pub use write_set::*;
 
@@ -464,7 +468,30 @@ fn merge_file_system_config_publication(
     merged.subtree_policies = current.subtree_policies.clone();
     merged.retention_policies = current.retention_policies.clone();
     merged.module_metadata = current.module_metadata.clone();
+    merged.metadata_storage = current.metadata_storage.clone();
+    merged.catalog_generation = current.catalog_generation;
     merged
+}
+
+fn validate_ordinary_metadata_storage(
+    expected: Option<&DfsFileSystemConfig>, desired: &DfsFileSystemConfig,
+) -> Result<(), KvError> {
+    if desired.catalog_generation != expected.map_or(0, |config| config.catalog_generation) {
+        return Err(KvError::Serialization {
+            detail: "catalog generation is authored only with its metadata-shard catalog mutation".into(),
+        });
+    }
+    if expected.and_then(|config| config.metadata_storage.as_ref())
+        != desired.metadata_storage.as_ref()
+    {
+        return Err(KvError::Serialization {
+            detail: "metadata storage generation is authored only by the native generation transition transaction".into(),
+        });
+    }
+    if let Some(activation) = &desired.metadata_storage {
+        activation.validate_at_catalog_generation(desired.catalog_generation).map_err(|detail| KvError::Serialization { detail })?;
+    }
+    Ok(())
 }
 
 fn merge_file_system_config_defaults(
@@ -1057,6 +1084,8 @@ pub enum DfsMetadataShardHandoffCause {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DfsMetadataStorageImportCut {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_transition_id: Option<String>,
     pub source_cut_digest: String,
     pub source_journal_sequence: u64,
     pub source_state_fingerprint: String,
@@ -1930,6 +1959,7 @@ impl<'a> PlacementUpdatePublication<'a> {
         desired: &'a DfsFileSystemConfig,
         job: &DfsPlacementReconciliationJob,
     ) -> Result<Self, KvError> {
+        validate_ordinary_metadata_storage(Some(expected), desired)?;
         let mut durable_job = job.clone();
         durable_job.accepted_config = scoped_placement_config_for_job(desired, job);
         validate_v1_placement_reconciliation_job(&durable_job)?;
@@ -2365,6 +2395,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                     .to_string(),
             });
         }
+        validate_ordinary_metadata_storage(expected, desired)?;
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get(&key)?;
         let creating = expected.is_none() && current_entry.is_none();
@@ -3359,11 +3390,15 @@ impl<'a> DfsControlPlaneStore<'a> {
                     self.kv, shard,
                 )?);
             }
+            let mut success = vec![KvOp::put_serde(key.clone(), shard, None)?];
+            append_catalog_generation_update(
+                self.kv.get(&file_system_config_key(&shard.file_system_id))?, &shard.file_system_id, &mut compares, &mut success,
+            )?;
             if self
                 .kv
                 .txn(KvTxn {
                     compares,
-                    success: vec![KvOp::put_serde(key.clone(), shard, None)?],
+                    success,
                     failure: Vec::new(),
                 })?
                 .succeeded
@@ -3384,6 +3419,25 @@ impl<'a> DfsControlPlaneStore<'a> {
         &mut self,
         expected: Option<&DfsMetadataShardConfig>,
         desired: &DfsMetadataShardConfig,
+    ) -> Result<bool, KvError> {
+        self.compare_and_put_metadata_shard_inner(expected, desired, None)
+    }
+
+    /// Publish an absent native birth only while its original captured storage
+    /// binding still matches the exact filesystem entry advanced by this CAS.
+    pub fn compare_and_put_metadata_shard_for_genesis(
+        &mut self,
+        desired: &DfsMetadataShardConfig,
+        expected_storage: Option<&crate::DfsMetadataStorageState>,
+    ) -> Result<bool, KvError> {
+        self.compare_and_put_metadata_shard_inner(None, desired, Some(expected_storage))
+    }
+
+    fn compare_and_put_metadata_shard_inner(
+        &mut self,
+        expected: Option<&DfsMetadataShardConfig>,
+        desired: &DfsMetadataShardConfig,
+        genesis_binding: Option<Option<&crate::DfsMetadataStorageState>>,
     ) -> Result<bool, KvError> {
         validate_metadata_shard_cas_identity(expected, desired)?;
         let key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
@@ -3432,11 +3486,23 @@ impl<'a> DfsControlPlaneStore<'a> {
                 self.kv, desired,
             )?);
         }
+        let mut success = vec![KvOp::put_serde(key, desired, None)?];
+        if expected.is_none() {
+            let filesystem_entry = self.kv.get(&file_system_config_key(&desired.file_system_id))?;
+            if let Some(captured) = genesis_binding {
+                let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
+                let actual: DfsFileSystemConfig = entry.decode()?;
+                if actual.metadata_storage.as_ref() != captured { return Ok(false); }
+            }
+            append_catalog_generation_update(
+                filesystem_entry, &desired.file_system_id, &mut compares, &mut success,
+            )?;
+        }
         Ok(self
             .kv
             .txn(KvTxn {
                 compares,
-                success: vec![KvOp::put_serde(key, desired, None)?],
+                success,
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -3505,6 +3571,9 @@ impl<'a> DfsControlPlaneStore<'a> {
             if shard_entry.decode::<DfsMetadataShardConfig>()? != *retiring {
                 return Ok(None);
             }
+            let (catalog_compares, _) = catalog_handoff_guard(
+                self.kv.get(&file_system_config_key(&retiring.file_system_id))?, self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?, retiring, desired, &cause,
+            )?;
             if let Some(entry) = self.kv.get(&handoff_key)? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
@@ -3605,6 +3674,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             compares.extend(metadata_prepared_operation_admission_compares(
                 self.kv, desired,
             )?);
+            compares.extend(catalog_compares);
             let response = self.kv.txn(KvTxn {
                 compares,
                 success: vec![KvOp::put_serde(handoff_key.clone(), &handoff, None)?],
@@ -3873,11 +3943,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         compares.extend(metadata_prepared_operation_admission_compares(
             self.kv, desired,
         )?);
-        Ok(self
-            .kv
-            .txn(KvTxn {
-                compares,
-                success: vec![
+        let mut success: Vec<KvOp> = vec![
                     KvOp::put_serde(shard_key, desired, None)?,
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
                     KvOp::put_serde(proof_key, &proof, None)?,
@@ -3885,7 +3951,17 @@ impl<'a> DfsControlPlaneStore<'a> {
                 ]
                 .into_iter()
                 .chain(write_set_put)
-                .collect(),
+                .collect();
+        let (catalog_compares, catalog_config) = catalog_handoff_guard(
+            self.kv.get(&file_system_config_key(&retiring.file_system_id))?, self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?, retiring, desired, &handoff.cause,
+        )?;
+        compares.extend(catalog_compares);
+        success.push(catalog_handoff_successor(&catalog_config)?);
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares,
+                success,
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -4528,6 +4604,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     .to_string(),
             });
         }
+        validate_ordinary_metadata_storage(expected, desired)?;
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get_async(&key).await?;
         let creating = expected.is_none() && current_entry.is_none();
@@ -4731,11 +4808,15 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     metadata_prepared_operation_admission_compares_async(self.kv, shard).await?,
                 );
             }
+            let mut success = vec![KvOp::put_serde(key.clone(), shard, None)?];
+            append_catalog_generation_update(
+                self.kv.get_async(&file_system_config_key(&shard.file_system_id)).await?, &shard.file_system_id, &mut compares, &mut success,
+            )?;
             if self
                 .kv
                 .txn_async(KvTxn {
                     compares,
-                    success: vec![KvOp::put_serde(key.clone(), shard, None)?],
+                    success,
                     failure: Vec::new(),
                 })
                 .await?
@@ -4753,6 +4834,25 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         &mut self,
         expected: Option<&DfsMetadataShardConfig>,
         desired: &DfsMetadataShardConfig,
+    ) -> Result<bool, KvError> {
+        self.compare_and_put_metadata_shard_inner(expected, desired, None).await
+    }
+
+    /// Publish an absent native birth only while its original captured storage
+    /// binding still matches the exact filesystem entry advanced by this CAS.
+    pub async fn compare_and_put_metadata_shard_for_genesis(
+        &mut self,
+        desired: &DfsMetadataShardConfig,
+        expected_storage: Option<&crate::DfsMetadataStorageState>,
+    ) -> Result<bool, KvError> {
+        self.compare_and_put_metadata_shard_inner(None, desired, Some(expected_storage)).await
+    }
+
+    async fn compare_and_put_metadata_shard_inner(
+        &mut self,
+        expected: Option<&DfsMetadataShardConfig>,
+        desired: &DfsMetadataShardConfig,
+        genesis_binding: Option<Option<&crate::DfsMetadataStorageState>>,
     ) -> Result<bool, KvError> {
         validate_metadata_shard_cas_identity(expected, desired)?;
         let key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
@@ -4801,11 +4901,23 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 metadata_prepared_operation_admission_compares_async(self.kv, desired).await?,
             );
         }
+        let mut success = vec![KvOp::put_serde(key, desired, None)?];
+        if expected.is_none() {
+            let filesystem_entry = self.kv.get_async(&file_system_config_key(&desired.file_system_id)).await?;
+            if let Some(captured) = genesis_binding {
+                let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
+                let actual: DfsFileSystemConfig = entry.decode()?;
+                if actual.metadata_storage.as_ref() != captured { return Ok(false); }
+            }
+            append_catalog_generation_update(
+                filesystem_entry, &desired.file_system_id, &mut compares, &mut success,
+            )?;
+        }
         Ok(self
             .kv
             .txn_async(KvTxn {
                 compares,
-                success: vec![KvOp::put_serde(key, desired, None)?],
+                success,
                 failure: Vec::new(),
             })
             .await?
@@ -4865,6 +4977,9 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             if shard_entry.decode::<DfsMetadataShardConfig>()? != *retiring {
                 return Ok(None);
             }
+            let (catalog_compares, _) = catalog_handoff_guard(
+                self.kv.get_async(&file_system_config_key(&retiring.file_system_id)).await?, self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?, retiring, desired, &cause,
+            )?;
             if let Some(entry) = self.kv.get_async(&handoff_key).await? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
@@ -4968,6 +5083,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             compares.extend(
                 metadata_prepared_operation_admission_compares_async(self.kv, desired).await?,
             );
+            compares.extend(catalog_compares);
             let response = self
                 .kv
                 .txn_async(KvTxn {
@@ -5186,11 +5302,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         ];
         compares
             .extend(metadata_prepared_operation_admission_compares_async(self.kv, desired).await?);
-        Ok(self
-            .kv
-            .txn_async(KvTxn {
-                compares,
-                success: vec![
+        let mut success: Vec<KvOp> = vec![
                     KvOp::put_serde(shard_key, desired, None)?,
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
                     KvOp::put_serde(proof_key, &proof, None)?,
@@ -5198,7 +5310,17 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 ]
                 .into_iter()
                 .chain(write_set_put)
-                .collect(),
+                .collect();
+        let (catalog_compares, catalog_config) = catalog_handoff_guard(
+            self.kv.get_async(&file_system_config_key(&retiring.file_system_id)).await?, self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?, retiring, desired, &handoff.cause,
+        )?;
+        compares.extend(catalog_compares);
+        success.push(catalog_handoff_successor(&catalog_config)?);
+        Ok(self
+            .kv
+            .txn_async(KvTxn {
+                compares,
+                success,
                 failure: Vec::new(),
             })
             .await?
@@ -5550,7 +5672,8 @@ fn validate_metadata_shard_handoff_cause(
             let digest = |value: &str| {
                 value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
             };
-            if *desired != next
+            if cut.storage_transition_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 1024 || id.contains('\0'))
+                || *desired != next
                 || !digest(&cut.source_cut_digest)
                 || !digest(&cut.pending_mapping_digest)
                 || cut.source_state_fingerprint.is_empty()
@@ -5847,6 +5970,17 @@ fn metadata_prepared_operation_member_compares(
                 "metadata shard {} cannot activate {} namespace prepares: assigned node {} effective capability policy does not advertise {}",
                 desired.shard_id, "prepared-v7", node_id, required_capability,
             ),
+        });
+    }
+    // A capability policy grants permission; it cannot make an older assigned
+    // binary understand current storage generation admission.
+    let storage_generation_capability = sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY;
+    if !member.capabilities.iter().any(|capability| capability.as_str() == storage_generation_capability)
+        || !effective_capabilities.iter().any(|capability| capability.as_str() == storage_generation_capability)
+    {
+        return Err(KvError::Serialization {
+            detail: format!("metadata shard {} assigned node {} does not advertise and permit {}",
+                desired.shard_id, node_id, storage_generation_capability),
         });
     }
     if cluster_id
@@ -6775,6 +6909,8 @@ mod tests {
             (1, 0, true),
         ] {
             let config = DfsFileSystemConfig {
+                catalog_generation: 0,
+                metadata_storage: None,
                 file_system_id: DfsFileSystemId::generate(),
                 display_name: "structural-policy-DATA".into(),
                 owner_node_id: owner.clone(),
@@ -7137,6 +7273,8 @@ mod tests {
         desired_replicas: usize,
     ) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -7853,6 +7991,8 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let expected = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8120,6 +8260,8 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-monotonic-partial-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8476,6 +8618,8 @@ mod tests {
 
         store
             .put_file_system_config(&DfsFileSystemConfig {
+                catalog_generation: 0,
+                metadata_storage: None,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: custom.file_system_id.clone(),
@@ -8493,6 +8637,8 @@ mod tests {
         assert_eq!(published.subtree_policies, custom.subtree_policies);
 
         let defaults = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: custom.file_system_id.clone(),
@@ -8532,6 +8678,8 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-publication-deleted-policy-owner");
         let deleted = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8637,6 +8785,8 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permit-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8734,6 +8884,8 @@ mod tests {
     fn stale_observed_generation_cannot_pass_the_authoritative_permit_transaction() {
         let owner = node("placement-stale-observed-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8815,6 +8967,8 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-permanent-permit-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8922,6 +9076,8 @@ mod tests {
     fn placement_failed_release_survives_ephemeral_store_and_fresh_store_finishes_exact_delete() {
         let owner = node("placement-release-recovery-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9001,6 +9157,8 @@ mod tests {
     fn placement_ambiguous_acquisition_is_queued_before_any_metadata_mutation() {
         let owner = node("placement-ambiguous-acquisition-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9121,6 +9279,8 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         let owner = node("placement-prior-process-owner");
         let base = DfsFileSystemConfig {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9587,6 +9747,8 @@ mod tests {
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(&mut kv, vec![node("node_owner"), node("node_replica")]);
         let file_system = DfsFileSystem {
+            catalog_generation: 0,
+            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9622,7 +9784,7 @@ mod tests {
             control
                 .get_file_system_config(&file_system.file_system_id)
                 .expect("get filesystem config"),
-            Some(file_system_config)
+            Some(metadata_catalog_generation_successor(&file_system_config).unwrap())
         );
         assert_eq!(
             control
@@ -9644,6 +9806,7 @@ mod tests {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut data = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut data);
         copy_native_member_fixture_data(
             &mut data,
             std::iter::once(shard.primary_node_id.clone())
@@ -9690,6 +9853,7 @@ mod tests {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut raw_kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut raw_kv);
         assert!(matches!(
             DfsControlPlaneAsyncStore::new(&mut raw_kv)
                 .put_metadata_shard(&packed)
@@ -9707,6 +9871,7 @@ mod tests {
             .expect("capability-proved async raw create");
 
         let mut cas_kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut cas_kv);
         assert!(matches!(
             DfsControlPlaneAsyncStore::new(&mut cas_kv)
                 .compare_and_put_metadata_shard(None, &packed)
@@ -10299,6 +10464,38 @@ mod tests {
         })
         .join()
         .expect("actual native control-plane DATA producer")
+    }
+
+    #[test]
+    fn ordinary_filesystem_updates_preserve_and_cannot_author_count_activation() {
+        // Configuration DATA only; these comparisons grant no maintenance CAS.
+        let mut current = DfsFileSystemConfig::from(&crate::DfsFileSystem::sifs(node("count-config-owner")));
+        current.metadata_storage = Some(crate::DfsMetadataStorageState::Active {
+            generation: "original-generation".into(), target_format: 12, catalog_generation: 0,
+            activation_digest: format!("blake3:{}", "a".repeat(64)),
+        });
+        let mut ordinary = current.clone();
+        ordinary.metadata_storage = None;
+        ordinary.display_name = "renamed".into();
+        let merged = merge_file_system_config_publication(Some(&current), &ordinary);
+        assert_eq!(merged.metadata_storage, current.metadata_storage);
+        assert_eq!(merged.display_name, "renamed");
+        assert_eq!(merge_file_system_config_defaults(Some(&current), &ordinary).metadata_storage,
+            current.metadata_storage);
+        assert!(validate_ordinary_metadata_storage(Some(&current), &merged).is_ok());
+        assert!(validate_ordinary_metadata_storage(None, &current).is_err());
+        assert!(validate_ordinary_metadata_storage(Some(&current), &ordinary).is_err());
+        let mut replacement = current.clone();
+        if let Some(crate::DfsMetadataStorageState::Active { generation, .. }) = replacement.metadata_storage.as_mut() { *generation = "another-generation".into(); }
+        assert!(validate_ordinary_metadata_storage(Some(&current), &replacement).is_err());
+    }
+
+    fn seed_catalog_fixture_config(kv: &mut InProcessKvStore) {
+        // Structural DATA fixture prerequisite: catalog mutations now publish
+        // their generation in the existing filesystem config atomically.
+        let config = DfsFileSystemConfig::from(&DfsFileSystem::sifs(node("catalog-fixture-owner")));
+        kv.put(file_system_config_key(&config.file_system_id),
+            sinomo_core::kv::encode_kv_value(&config).unwrap(), None).unwrap();
     }
 
     fn copy_native_member_fixture_data(kv: &mut InProcessKvStore, nodes: Vec<NodeId>) {
@@ -11168,6 +11365,13 @@ mod tests {
                 2 => {
                     actual[0].as_mut().unwrap().key = "/unrelated-participant".into();
                 }
+                3 => {
+                    let entry = actual[0].as_mut().unwrap();
+                    let mut member = entry.decode::<ClusterMemberRecord>()?;
+                    member.capabilities.retain(|capability| capability.as_str()
+                        != sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY);
+                    entry.value = sinomo_core::kv::encode_kv_value(&member)?;
+                }
                 _ => {}
             }
             Ok(actual)
@@ -11216,8 +11420,12 @@ mod tests {
             metadata_prepared_operation_admission_compares(&observer, &shard),
             Err(KvError::Serialization { detail }) if detail.contains("exact key scope")
         ));
+        observer.negative_response.store(3, Ordering::SeqCst);
+        assert!(matches!(metadata_prepared_operation_admission_compares(&observer, &shard),
+            Err(KvError::Serialization { detail }) if detail.contains(sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY)),
+            "an existing assignment and an effective policy cannot supply missing binary support");
         assert_eq!(observer.scalar_reads.load(Ordering::SeqCst), 0);
-        assert_eq!(observer.consistent_reads.load(Ordering::SeqCst), 3);
+        assert_eq!(observer.consistent_reads.load(Ordering::SeqCst), 4);
         drop(observer);
         drop(fixture.service);
         fixture.runtime.clear_faults();
@@ -11555,6 +11763,7 @@ mod tests {
         let node_owner = node("node_shard_select_owner");
         let node_replica = node("node_shard_select_replica");
         let mut kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut kv);
         // These names are structural assignment DATA; admitted member bytes
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(
@@ -11631,6 +11840,7 @@ mod tests {
         let node_services = node("node_shard_partial_services");
         let node_users = node("node_shard_partial_users");
         let mut kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut kv);
         // These names are structural assignment DATA; admitted member bytes
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(
@@ -11730,6 +11940,7 @@ mod tests {
         let node_owner = node("node_shard_hash_owner");
         let node_replica = node("node_shard_hash_replica");
         let mut kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut kv);
         // These names are structural assignment DATA; admitted member bytes
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(
@@ -11787,6 +11998,7 @@ mod tests {
     fn metadata_shard_selection_prefers_narrower_hash_range() {
         let node_owner = node("node_shard_hash_width_owner");
         let mut kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut kv);
         // These names are structural assignment DATA; admitted member bytes
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(&mut kv, vec![node("node_shard_hash_width_owner")]);
@@ -11923,6 +12135,7 @@ mod tests {
     fn metadata_shard_selection_rejects_nul_paths() {
         let node_owner = node("node_shard_invalid_owner");
         let mut kv = InProcessKvStore::new();
+        seed_catalog_fixture_config(&mut kv);
         // These names are structural assignment DATA; admitted member bytes
         // come unchanged from their actual ordinary native source owner.
         copy_native_member_fixture_data(&mut kv, vec![node("node_shard_invalid_owner")]);

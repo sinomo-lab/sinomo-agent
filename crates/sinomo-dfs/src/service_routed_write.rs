@@ -182,6 +182,40 @@ mod canonical_completion_proof_tests {
     use sinomo_core::DfsObjectPolicy;
 
     #[test]
+    fn native_primary_rejects_requester_supplied_fresh_link_aggregate() {
+        let name = "native-fresh-count-admission";
+        let (runtime, initial, shard) =
+            crate::test_support::current_native_metadata_service(name, 1, "/services").unwrap();
+        drop(initial);
+        let mut owner = runtime.metadata_primary_service("/services/forged-fresh-count").unwrap();
+        assert!(!owner.transport.delegates_local_namespace_authority());
+        let mut offered = crate::posix_object::new_posix_metadata_object(
+            &shard.primary_node_id, "/services/forged-fresh-count", DfsObjectKind::File,
+        );
+        offered.namespace_link_count = Some(99);
+        let request = DfsWriteRequest {
+            file_system_id: offered.file_system_id.clone(),
+            object_id: offered.object_id.clone(),
+            target_version: crate::namespace::next_version(&offered.version),
+            requesting_node_id: shard.primary_node_id.clone(),
+        };
+        let error = owner.ensure_routed_write_object_metadata(
+            &request, Some(&offered), true, None,
+        ).unwrap_err();
+        assert!(error.to_string().contains("count one"), "actual fresh-owner check: {error}");
+        assert!(owner.metadata_backend().unwrap().get_object(&offered.object_id).unwrap().is_none());
+        drop(owner);
+        let mut caller = runtime.client(&shard.primary_node_id).unwrap();
+        let created = caller.posix_write_file(
+            &offered.path, b"owner creates one name",
+            DfsWriteOptions::replicated_eventual(vec![shard.primary_node_id.clone()]),
+        ).unwrap();
+        assert_eq!(created.link_count, 1);
+        drop(caller);
+        runtime.close().unwrap();
+    }
+
+    #[test]
     fn current_completion_proof_rejects_retained_unknown_and_superseded_publication() {
         let version = DfsVersion::from_legacy_named("completion-version").unwrap();
         let hash = content_hash(b"canonical bytes");
@@ -191,6 +225,7 @@ mod canonical_completion_proof_tests {
             object_id: DfsObjectId::from_legacy_named("completion-object").unwrap(),
             file_system_id: sifs_file_system_id(),
             path: "/completion".into(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: NodeId::from_legacy_named("completion-primary").unwrap(),
@@ -3321,6 +3356,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "routed write metadata mismatch for object {}",
                     request.object_id
                 ),
+            });
+        }
+        // Absence was established by this authority above. A content create
+        // introduces one name; caller-supplied metadata cannot mint an aggregate.
+        // Existing inodes take the current-owner branch and preserve its count.
+        if matches!(object.kind,
+            DfsObjectKind::Directory | DfsObjectKind::Hardlink | DfsObjectKind::Tombstone)
+            || object.namespace_link_count != Some(1)
+        {
+            return Err(DfsError::Metadata {
+                message: "routed content create requires a fresh canonical name with count one".into(),
             });
         }
         let Some(mut shard) = self.select_metadata_shard_for_object(object)? else {

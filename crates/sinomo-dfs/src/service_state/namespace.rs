@@ -276,6 +276,19 @@ impl DfsNamespaceExecution {
         self.durability.job_recorded = true;
     }
 
+    /// Observe the actual original coordinator after a phase, even when no
+    /// new journal write was needed. A terminal matching caller must not keep
+    /// the Running fact left by an earlier cursor update in this invocation.
+    pub(crate) fn observe_coordinator_job(&mut self, job: &crate::DfsNamespaceJobRecord) {
+        if job.status == crate::DfsNamespaceJobStatus::Running {
+            self.record_job();
+        } else if self.request.as_ref().is_some_and(|request| {
+            job.origin.as_ref().is_some_and(|origin| origin.matches_request(request))
+        }) {
+            self.durability.job_recorded = false;
+        }
+    }
+
     /// Intermediate cross-shard publications retain feed provenance without
     /// completing the outer request. Job evidence is deliberately retained.
     pub(crate) fn suspend_request_prepare(&mut self) -> (Option<DfsNamespaceRequestRecord>, bool) {

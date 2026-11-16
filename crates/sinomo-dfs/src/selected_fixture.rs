@@ -100,6 +100,19 @@ impl SelectedOriginalFixtureIdentity {
         Ok(identity)
     }
 
+    /// Fresh fixture admission may precede current-generation staging. Only
+    /// its exact checked marker is initialization DATA; retained rows refuse.
+    pub(crate) fn contains_only_marker(&self) -> Result<bool, DfsError> {
+        self.check()?;
+        let mut count = 0usize;
+        for entry in fs::read_dir(&self.root).map_err(|error| io_error(&self.root, error))? {
+            let entry = entry.map_err(|error| io_error(&self.root, error))?;
+            if entry.file_name() != SELECTED_FIXTURE_MARKER { return Ok(false); }
+            count += 1;
+        }
+        Ok(count == 1)
+    }
+
     /// Default readers refuse a root that carries a selected fixture marker.
     pub(crate) fn reject_default_root(root: &Path) -> Result<(), DfsError> {
         match fs::symlink_metadata(root.join(SELECTED_FIXTURE_MARKER)) {

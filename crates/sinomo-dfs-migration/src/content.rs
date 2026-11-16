@@ -1,7 +1,14 @@
 //! Incremental conversion of retired content layouts into the sole native layout.
-//! DFS never invokes old readers: its cold-open provider runs this converter.
+//! The migration owner drives conversion; cold-open hooks only enqueue or inspect.
 mod incremental;
+mod legacy_stage;
+mod legacy_blob;
+pub(crate) use legacy_stage::{LegacyContentJobReference, LegacyPublishedV3};
 mod snapshot_cursor;
+mod original_v3;
+#[cfg(test)]
+pub(crate) use original_v3::write_original_v3_fixture_data;
+pub(crate) use original_v3::{OriginalV3Converter, OriginalV3Budget, OriginalV3Selection, OriginalV3Step, OriginalV3UnitResult, OriginalV3SourceIdentity, probe_original_v3};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -18,7 +25,8 @@ use std::path::{Path, PathBuf};
 type Result<T> = std::result::Result<T, MetadataBackendError>;
 const CONVERSION: &str = ".content-conversion-v2";
 const MARKER: &str = "content-reservations/00/batch-format-v1.sobj";
-const RECORD_LIMIT: u64 = u32::MAX as u64;
+// Progress/receipt DATA is bounded independently from source payload streams.
+const CONTROL_RECORD_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct BlobSource {
@@ -37,7 +45,7 @@ fn io(path: &Path, source: std::io::Error) -> MetadataBackendError {
     }
 }
 fn read<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let bytes = durable_file::read_object_file_bytes(path, RECORD_LIMIT).map_err(error)?;
+    let bytes = durable_file::read_object_file_bytes(path, CONTROL_RECORD_LIMIT).map_err(error)?;
     serde_ext::from_bytes(&bytes).map_err(error)
 }
 fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -64,106 +72,39 @@ fn lock(path: &Path) -> Result<File> {
         .map_err(|source| io(path, source))?;
     Ok(file)
 }
+/// Source-only generation discovery. Current core does not interpret these
+/// historical marker values; an absent marker remains the legacy loose path.
+pub(crate) fn source_format(root: &Path) -> Result<Option<u32>> {
+    let path = root.join(MARKER);
+    match fs::metadata(&path) {
+        Err(failure) if failure.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(failure)=>return Err(io(&path,failure)),
+        Ok(_)=>{},
+    }
+    let bytes = durable_file::read_object_file_bytes(&path, 64 * 1024).map_err(error)?;
+    let marker: serde_json::Value = serde_ext::from_bytes(&bytes).map_err(error)?;
+    let version=marker.get("format_version").and_then(|value|value.as_u64())
+        .ok_or_else(||error("existing content marker has no valid source generation"))?;
+    Ok(Some(u32::try_from(version).map_err(error)?))
+}
 pub(crate) fn current(root: &Path) -> Result<bool> {
-    if !root.join(MARKER).exists() {
+    let marker_path = root.join(MARKER);
+    match fs::metadata(&marker_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io(&marker_path,error)),
+        Ok(_) => {}
+    }
+    let bytes=durable_file::read_object_file_bytes(&marker_path,64*1024).map_err(error)?;
+    let marker:serde_json::Value=serde_ext::from_bytes(&bytes).map_err(error)?;
+    if marker.get("format_version").and_then(|v|v.as_u64()) != Some(LocalContentStore::FORMAT_VERSION as u64) {
         return Ok(false);
     }
-    let marker: serde_json::Value = read(&root.join(MARKER))?;
-    Ok(
-        marker.get("format_version").and_then(|v| v.as_u64()) == Some(3)
-            && marker
-                .get("content_binding_layout")
-                .and_then(|v| v.as_str())
-                == Some("inline-bindings-v2"),
-    )
+    LocalContentStore::open_for_inspection(root).validate_current_layout().map_err(error)?;
+    Ok(true)
 }
-fn copy_blob(root: &Path, target: &Path, blob: &BlobSource) -> Result<()> {
-    let hex = blob
-        .hash
-        .strip_prefix("blake3:")
-        .filter(|hex| {
-            hex.len() == 64
-                && hex
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-        .ok_or_else(|| error("invalid source blob identity"))?;
-    let destination = target.join("blobs").join(&hex[..2]).join(hex);
-    let source = root.join(&blob.path);
-    let mut input = File::open(&source).map_err(|e| io(&source, e))?;
-    let len = input.metadata().map_err(|e| io(&source, e))?.len();
-    if blob
-        .offset
-        .checked_add(blob.size)
-        .is_none_or(|end| end > len)
-    {
-        return Err(error("source blob locator exceeds file"));
-    }
-    input
-        .seek(SeekFrom::Start(blob.offset))
-        .map_err(|e| io(&source, e))?;
-    durable_file::ensure_directory(destination.parent().unwrap()).map_err(error)?;
-    let temporary = destination.with_extension("conversion-tmp");
-    let mut output = File::create(&temporary).map_err(|e| io(&temporary, e))?;
-    let mut remaining = blob.size;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0; 64 * 1024];
-    while remaining != 0 {
-        let count = usize::try_from(remaining.min(buffer.len() as u64)).map_err(error)?;
-        input
-            .read_exact(&mut buffer[..count])
-            .map_err(|e| io(&source, e))?;
-        hasher.update(&buffer[..count]);
-        output
-            .write_all(&buffer[..count])
-            .map_err(|e| io(&temporary, e))?;
-        remaining -= count as u64;
-    }
-    if hasher.finalize().to_hex().as_str() != hex {
-        return Err(error(format!(
-            "source content hash mismatch for {}",
-            blob.hash
-        )));
-    }
-    let synced = durable_file::sync_private_staged_file(&temporary, output).map_err(error)?;
-    match durable_file::install_synced_private_staged_file(&synced, &destination) {
-        Ok(()) => {}
-        Err(_) if destination.is_file() => {
-            let (hash, size) =
-                durable_file::file_blake3_hash_and_size(&destination).map_err(error)?;
-            if hash.to_hex().as_str() != hex || size != blob.size {
-                return Err(error("candidate blob conflicts with source"));
-            }
-            durable_file::remove_file_if_exists_and_sync_parent(&temporary).map_err(error)?;
-        }
-        Err(e) => return Err(error(e)),
-    }
-    Ok(())
-}
-fn install_blob(root: &Path, target: &Path, blob: &BlobSource) -> Result<()> {
-    let hex = blob
-        .hash
-        .strip_prefix("blake3:")
-        .ok_or_else(|| error("invalid source hash"))?;
-    let relative = Path::new("blobs").join(&hex[..2]).join(hex);
-    let source = target.join(&relative);
-    let destination = root.join(&relative);
-    if destination.exists() {
-        let (hash, size) = durable_file::file_blake3_hash_and_size(&destination).map_err(error)?;
-        if hash.to_hex().as_str() != hex || size != blob.size {
-            return Err(error("existing file blob conflicts with converted content"));
-        }
-    } else {
-        durable_file::ensure_directory(&root.join("blobs")).map_err(error)?;
-        durable_file::sync_directory(root).map_err(error)?;
-        durable_file::ensure_directory(destination.parent().unwrap()).map_err(error)?;
-        fs::hard_link(&source, &destination).map_err(|e| io(&destination, e))?;
-        durable_file::sync_directory(destination.parent().unwrap()).map_err(error)?;
-        durable_file::sync_directory(&root.join("blobs")).map_err(error)?;
-    }
-    Ok(())
-}
-pub use incremental::{ContentConversionInspection, ContentConverter};
+
+pub use incremental::ContentConversionInspection;
+pub(crate) use incremental::ContentConverter;
 
 #[cfg(test)]
 mod tests;

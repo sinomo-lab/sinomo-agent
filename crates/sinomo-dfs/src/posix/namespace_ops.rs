@@ -83,7 +83,7 @@ fn conditional_rename_result(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    fn hardlink_alias_target_requires_cross_shard_coordination(
+    pub(super) fn hardlink_alias_target_requires_cross_shard_coordination(
         &mut self,
         alias_path: &str,
         target_path: &str,
@@ -195,11 +195,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.posix_unlink_resolved_object(path, object)
     }
 
-    fn posix_unlink_resolved_object(
+    pub(super) fn posix_unlink_resolved_object(
         &mut self,
         path: String,
         object: DfsObjectMetadata,
     ) -> Result<DfsStat> {
+        self.posix_unlink_resolved_object_with_promotion(path, object).map(|(stat, _)| stat)
+    }
+
+    pub(super) fn posix_unlink_resolved_object_with_promotion(
+        &mut self,
+        path: String,
+        object: DfsObjectMetadata,
+    ) -> Result<(DfsStat, Option<String>)> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
@@ -212,10 +220,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .link_target_object_id
                 .clone()
                 .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-            let mut target = self
-                .object_by_id(&target_object_id)?
-                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-            if target.kind == DfsObjectKind::Tombstone || target.kind == DfsObjectKind::Hardlink {
+            let mut target = self.resolve_hardlink_target_distributed(&object, None)?;
+            if target.object_id != target_object_id
+                || target.kind == DfsObjectKind::Tombstone || target.kind == DfsObjectKind::Hardlink {
                 return Err(DfsPosixError::NotFound { path });
             }
             let tombstone = self.tombstone_path_object(object.clone());
@@ -245,13 +252,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &object,
                     &path,
                     alias_transaction,
-                    "unlink",
+                    super::cross_shard::HardlinkAliasMutation::Unlink,
                 )?;
-                return self.stat_replayed_tombstone(&path);
+                return self.stat_replayed_tombstone(&path).map(|stat| (stat, None));
             }
             target.changed_at_unix_nanos =
                 now_unix_nanos().max(target.changed_at_unix_nanos.saturating_add(1));
             target.version = next_version(&target.version);
+            target.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&target, -1)?);
             let mut objects = alias_transaction.objects;
             objects.push(target);
             self.apply_namespace_transaction(DfsNamespaceTransaction {
@@ -271,25 +279,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 advisory_lock_states: Vec::new(),
                 created_at: alias_transaction.created_at,
             })?;
-            return self.stat_object(&tombstone);
+            return self.stat_object(&tombstone).map(|stat| (stat, None));
         }
         if self.link_count_for_object(&object)? > 1 {
-            // Unlinking a canonical record promotes one of its hardlink
-            // aliases. When the chosen alias lives in a shard owned by
-            // another primary, the promotion is a cross-shard move of the
-            // canonical record onto the alias path.
-            if let Some(alias) = self.first_hardlink_to_object(&object.object_id)? {
-                let alias_path = normalize_posix_path(&alias.path)?;
-                if let Some(destination_primary) =
-                    self.routed_namespace_primary_for_path(&alias_path)?
-                {
-                    self.coordinate_cross_shard_rename(&path, &alias_path, destination_primary)?;
-                    return self.stat_replayed_tombstone(&path);
-                }
+            let alias = self.first_hardlink_to_object(&object.object_id)?
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            let alias_path = normalize_posix_path(&alias.path)?;
+            let destination_primary = self.routed_namespace_primary_for_path(&alias_path)?;
+            if destination_primary.is_some()
+                || self.hardlink_alias_target_requires_cross_shard_coordination(&path, &alias_path)?
+            {
+                self.coordinate_cross_shard_unlink_promotion(
+                    &path, &alias_path, destination_primary.unwrap_or_else(|| self.node_id.clone()),
+                    DfsNamespaceObjectPrecondition { object_id: alias.object_id.clone(), version: alias.version.clone() },
+                )?;
+                return self.stat_replayed_tombstone(&path).map(|stat| (stat, Some(alias_path)));
             }
-            return self.unlink_canonical_with_hardlinks(object, &path);
+            return self.unlink_canonical_with_hardlinks(object, &path, alias)
+                .map(|stat| (stat, Some(alias_path)));
         }
-        self.commit_namespace_tombstone("unlink", &path, object)
+        self.commit_namespace_tombstone("unlink", &path, object).map(|stat| (stat, None))
     }
 
     pub(crate) fn posix_unlink_local_if_generation(
@@ -420,10 +429,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         object: DfsObjectMetadata,
     ) -> Result<DfsStat> {
+        let removed_directory = object.kind == DfsObjectKind::Directory;
         let object = self.tombstone_path_object(object);
         let mut objects = vec![object.clone()];
         if let Some(parent_path) = parent_posix_path(path) {
-            objects.push(self.directory_modified_metadata(&parent_path)?);
+            let mut parent = self.directory_modified_metadata(&parent_path)?;
+            if removed_directory {
+                parent.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&parent, -1)?);
+            }
+            objects.push(parent);
         }
         let versions = objects
             .iter()
@@ -809,6 +823,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotDirectory { path: to });
         }
         self.ensure_parent_directory(&to)?;
+        if self.hardlink_alias_target_requires_cross_shard_coordination(&from, &to)? {
+            self.coordinate_cross_shard_rename(&from, &to, self.node_id.clone())?;
+            return self.stat_routed_namespace_result(&to, true);
+        }
         if source.kind == DfsObjectKind::Directory {
             let child_prefix = format!("{}/", from.trim_end_matches('/'));
             if to.starts_with(&child_prefix) {
@@ -874,6 +892,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 updated_target.changed_at_unix_nanos = destination_target_changed_at
                     .max(updated_target.changed_at_unix_nanos.saturating_add(1));
                 updated_target.version = next_version(&updated_target.version);
+                updated_target.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&updated_target, -1)?);
                 local_hardlink_target_updates.push(updated_target);
             }
             if !matches!(
@@ -907,6 +926,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 destination.path = alias.path.clone();
                 destination.changed_at_unix_nanos = destination_target_changed_at;
                 destination.version = next_version(&destination.version);
+                destination.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&destination, -1)?);
                 moved_children.push(alias_tombstone);
                 moved_children.push(destination);
             } else {
@@ -983,7 +1003,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &source_generation,
                 &source.path,
                 transaction,
-                "rename",
+                super::cross_shard::HardlinkAliasMutation::Rename,
             )?;
             return self.posix_stat_distributed(&source.path);
         }
@@ -1007,6 +1027,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (to, _) = normalize_posix_path_with_trailing_directory(to)?;
         let from = self.resolve_posix_path_distributed(&from, false)?;
         let to = self.resolve_posix_path_distributed(&to, false)?;
+        // Conditional rename cannot discard its destination CAS by entering
+        // the ordinary saga, even when both physical shards share one node.
+        if let Some(shards) = self.refresh_sifs_metadata_shards()? {
+            let source_shard = self.select_sifs_metadata_shard_for_path_from_snapshot(&from, &shards)?;
+            let destination_shard = self.select_sifs_metadata_shard_for_path_from_snapshot(&to, &shards)?;
+            ensure_same_atomic_namespace_shard(
+                source_shard.as_ref().map(|shard| shard.shard_id.as_str()),
+                destination_shard.as_ref().map(|shard| shard.shard_id.as_str()), &from, &to,
+            )?;
+        }
         let source = self.lookup_sifs_path(&from)?;
         if source.as_ref().is_none_or(|object| {
             object.kind == DfsObjectKind::Tombstone
@@ -1054,12 +1084,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         mut object: DfsObjectMetadata,
         old_path: &str,
+        alias: DfsObjectMetadata,
     ) -> Result<DfsStat> {
-        let alias = self
-            .first_hardlink_to_object(&object.object_id)?
-            .ok_or_else(|| DfsPosixError::NotFound {
-                path: old_path.to_string(),
-            })?;
         let alias_path = normalize_posix_path(&alias.path)?;
         let hidden_path =
             self.hidden_alias_tombstone_path_on_destination_shard(&alias_path, &alias.object_id)?;
@@ -1077,6 +1103,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.path = alias.path.clone();
         object.changed_at_unix_nanos = now_unix_nanos();
         object.version = next_version(&object.version);
+        object.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&object, -1)?);
+        let mut objects = vec![old_path_tombstone.clone(), alias_tombstone, object.clone()];
+        if let Some(parent) = parent_posix_path(old_path) {
+            objects.push(self.directory_modified_metadata(&parent)?);
+        }
 
         self.apply_namespace_transaction(DfsNamespaceTransaction {
             content_reference_identity: None,
@@ -1090,12 +1121,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 old_path,
             ),
             file_system_id: object.file_system_id.clone(),
-            objects: vec![old_path_tombstone.clone(), alias_tombstone, object],
+            objects,
             versions: Vec::new(),
             advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
-        self.touch_parent_directory_modified(old_path)?;
         self.stat_object(&old_path_tombstone)
     }
 
@@ -1112,6 +1142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.path = path;
         }
         object.kind = DfsObjectKind::Tombstone;
+        object.namespace_link_count = Some(0);
         object.version = next_version(&object.version);
         object.changed_at_unix_nanos =
             now_unix_nanos().max(object.changed_at_unix_nanos.saturating_add(1));
@@ -1522,3 +1553,6 @@ mod atomic_namespace_tests {
         runtime.close().unwrap();
     }
 }
+
+#[cfg(test)]
+mod maintained_count_tests;

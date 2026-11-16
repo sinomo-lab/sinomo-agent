@@ -103,7 +103,9 @@ impl RetainedPlanFile {
     pub(super) fn read(&self, path: &Path) -> Result<Arc<MetadataImportPlan>> {
         // Every call reads the entire actual file. Replacement, same-size edits,
         // truncation and missing files cannot reuse the previous parsed value.
-        let bytes = std::fs::read(path).map_err(error)?;
+        let bytes = std::fs::read(path).map_err(|source| sinomo_dfs::MetadataBackendError::Io {
+            path: path.to_owned(), source,
+        })?;
         {
             let saved = self.checkpoint.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(saved) = saved.as_ref().filter(|saved| saved.bytes == bytes) {
@@ -120,6 +122,17 @@ impl RetainedPlanFile {
             plan: Arc::clone(&plan),
         });
         Ok(plan)
+    }
+
+    /// An observational lookup may race the existing stage-to-live rename.
+    /// Absence supplies no cached plan and no evidence of native completion.
+    pub(super) fn read_if_present(&self, path: &Path) -> Result<Option<Arc<MetadataImportPlan>>> {
+        match self.read(path) {
+            Ok(plan) => Ok(Some(plan)),
+            Err(sinomo_dfs::MetadataBackendError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(failure) => Err(failure),
+        }
     }
 }
 
@@ -240,18 +253,26 @@ pub(super) fn assert_exact_native_plan_retention(plan: &MetadataImportPlan) {
         retained.read(&first).is_err(),
         "same-size changed plan is revalidated"
     );
+    assert!(retained.read_if_present(&first).is_err());
     std::fs::write(&first, &bytes[..bytes.len() - 1]).unwrap();
     assert!(
         retained.read(&first).is_err(),
         "truncation cannot reuse saved DATA"
     );
+    assert!(retained.read_if_present(&first).is_err());
     std::fs::remove_file(&first).unwrap();
     assert!(
         retained.read(&first).is_err(),
         "missing file is not a retained receipt"
     );
+    assert!(retained.read_if_present(&first).unwrap().is_none());
     std::fs::write(&first, &bytes).unwrap();
     assert!(Arc::ptr_eq(&original, &retained.read(&first).unwrap()));
+    let relocated = first.with_extension("relocated.json");
+    std::fs::rename(&first, &relocated).unwrap();
+    assert!(retained.read_if_present(&first).unwrap().is_none());
+    assert!(Arc::ptr_eq(&original, &retained.read_if_present(&relocated).unwrap().unwrap()));
+    std::fs::rename(relocated, &first).unwrap();
     let restarted = RetainedPlanFile::default();
     let reopened = restarted.read(&first).unwrap();
     assert!(!Arc::ptr_eq(&original, &reopened));

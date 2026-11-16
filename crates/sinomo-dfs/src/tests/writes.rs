@@ -2420,7 +2420,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
     ) -> (u64, DfsMetadataPrefixProof) {
         let backend = metadata(data_dir, shard_id);
         let materialized = backend
-            .export_table_snapshot()
+            .export_table_snapshot().unwrap()
             .materialized_through_sequence;
         let tail = complete_journal_tail(&backend, materialized);
         (
@@ -2441,7 +2441,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
         lane: &DfsMutationLaneKey,
     ) -> ReplicaState {
         let backend = metadata(data_dir, &lane.shard_id);
-        let tables = backend.export_table_snapshot();
+        let tables = backend.export_table_snapshot().unwrap();
         // ACKed native entries may await the asynchronous table materializer.
         // Capture the complete bounded durable tail under this actual receiver
         // admission as well; observing it neither applies nor authors entries.
@@ -2907,6 +2907,8 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
     policy.required_node_ids = nodes.clone();
     let shard = DfsMetadataShardId::new("services");
+    let receiver_head = runtime.node_metadata(&replica).unwrap()
+        .metadata_prefix_proof(&shard).unwrap().unwrap().journal_sequence;
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let paused = delay_materialization.then(|| {
         // Setup publication may be materialized while its coalesced worker is
@@ -2956,6 +2958,29 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
         panic!("actual Stage reply waits in its native incoming queue before W2")
     };
     assert_eq!((durable_receipts, required_receipts), (1, 2));
+    struct ReleaseOriginalPublication(Arc<tokio::sync::Semaphore>);
+    impl Drop for ReleaseOriginalPublication {
+        fn drop(&mut self) { self.0.add_permits(32); }
+    }
+    let held_publication = delay_materialization.then(|| {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let captured = Arc::new(Mutex::new(Vec::<crate::DfsMetadataJournalBatchCommand>::new()));
+        let operation_id = format!("write:{intent_id}");
+        // Prevent a duplicate background commit ingest from materializing the
+        // same deferred suffix before the deliberately held worker is observed.
+        // The exact original prepare/authority probes and foreground suffix
+        // remain on their normal authenticated paths.
+        runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(owner.clone()), target: Some(replica.clone()),
+            route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+            call_id: None, origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::PauseExactWriteCommitPublication {
+                operation_id: operation_id.clone(), gate: Arc::clone(&gate), captured,
+            },
+        });
+        (operation_id, ReleaseOriginalPublication(gate))
+    });
     writer.process_incoming().unwrap();
     assert!(matches!(
         writer.write_outcome(&intent_id).unwrap(),
@@ -2986,7 +3011,7 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
     let batch = backend
         .journal_batch_for_shard_since_limited(
             &shard,
-            0,
+            receiver_head,
             crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
             crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )
@@ -3071,6 +3096,15 @@ fn native_missing_commit_content_case(delay_materialization: bool) {
         }
         pause.release();
         drop(pause);
+    }
+    if let Some((operation_id, release)) = held_publication {
+        assert_eq!(runtime.remove_faults_matching(|rule| {
+            rule.source.as_ref() == Some(&owner) && rule.target.as_ref() == Some(&replica)
+                && matches!(&rule.action, crate::test_runtime::FaultAction::PauseExactWriteCommitPublication {
+                    operation_id: actual, ..
+                } if actual == &operation_id)
+        }), 1);
+        drop(release);
     }
     // W2 commits the primary journal before the queued CommitVersion RPC.
     // Observe that SAME original commit's actual replica materialization before
@@ -3195,6 +3229,7 @@ fn local_owned_write_routes_to_owner() {
             object_id: object_id.clone(),
             file_system_id,
             path: "src/lib.rs".to_string(),
+            namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
             kind: DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: owner.clone(),

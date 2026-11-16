@@ -306,6 +306,7 @@ fn snapshots_round_trip_receipt_generations_and_withdrawals() {
     assert_eq!(generation(&restored, &withdrawn), 2);
 
     let directory = sinomo_testdir::TestDir::new("receipt-generation-snapshot-image");
+    crate::metadata_candidate::stage_current_test_generation(directory.path(), "root");
     let proof = DfsMetadataPrefixProof::from_digest(
         9,
         format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64)),

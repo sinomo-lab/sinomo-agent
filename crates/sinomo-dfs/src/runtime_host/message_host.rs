@@ -1,7 +1,11 @@
 use super::*;
 
 fn open_daemon_native_content_store(data_dir: &SinomoDataDir) -> Result<LocalContentStore, crate::DfsError> {
-    crate::runtime_host::open_dfs_runtime_content_store(data_dir).map_err(|error| crate::DfsError::Metadata { message: error.to_string() })
+    crate::runtime_host::open_dfs_runtime_content_store(data_dir).map_err(|error| match error {
+        DfsRuntimeError::StoragePreparationPending { root, processed_records } =>
+            crate::DfsError::StoragePreparationPending { root, processed_records },
+        error => crate::DfsError::Metadata { message: error.to_string() },
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1090,6 +1094,9 @@ fn try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
     if shards.is_empty() {
         return Ok(None);
     }
+    let storage_catalog = sinomo_dfs::DfsMetadataNamespaceCatalog::capture(
+        projection, &sinomo_dfs::sifs_file_system_id(),
+    ).map_err(|error| sinomo_dfs::MetadataBackendError::Serde(error.to_string()))?;
     #[cfg(test)]
     if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
         hook(
@@ -1108,11 +1115,12 @@ fn try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
     )?;
     let metadata_root = sinomo_dfs::default_dfs_metadata_shards_root(data_dir);
     let backend = match retained_backend {
-        Some(previous) => previous.into_reconfigured_for_replica_repair(
+        Some(previous) => previous.into_reconfigured_for_replica_repair_and_catalog(
             metadata_root,
             shards,
             local_node_id,
             &discarded,
+            Some(storage_catalog.clone()),
         )?,
         None => {
             sinomo_dfs::discard_local_metadata_shard_copies(&metadata_root, &discarded)?;
@@ -1124,15 +1132,9 @@ fn try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
                 .transpose().map_err(|error| sinomo_dfs::MetadataBackendError::Rejected {
                     code: sinomo_dfs::DfsMetadataRejectionCode::Other, message: error.to_string(),
                 })?.flatten();
-            if let Some(layout) = selected {
-                sinomo_dfs::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
-                    metadata_root, shards, local_node_id, layout,
-                )?.into_resident()
-            } else {
-                sinomo_dfs::open_local_sharded_metadata_backend_for_replica_repair(
-                    metadata_root, shards, local_node_id,
-                )?.into_resident()
-            }
+            sinomo_dfs::LocalShardedMetadataBackend::open_with_native_catalog(
+                metadata_root, shards, local_node_id, selected, &storage_catalog,
+            )?.into_resident()
         },
     };
     backend.initialize_bounded_status_snapshots()?;
@@ -3809,6 +3811,7 @@ fn daemon_dfs_genesis_ingress_scopes(
                     | Op::VerifyObjectFamilyAdoption { .. }
                     | Op::AdoptHardlinkAlias { .. }
                     | Op::InstallHardlinkTargetFence { .. }
+                    | Op::ParentCountParticipant { .. }
                     | Op::CommitHardlinkTargetFence { .. }
             ) =>
         {

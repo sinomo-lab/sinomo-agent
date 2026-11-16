@@ -394,6 +394,7 @@ mod tests {
         use crate::DfsMetadataBackend;
         use std::os::unix::fs::MetadataExt;
         let root = sinomo_testdir::TestDir::new("resident-local-source-fence-description");
+        crate::test_runtime::copy_native_genesis_data(root.path(), "root");
         let mut backend = crate::LocalSobjMetadataBackend::new(
             crate::DfsMetadataShardId::new("root"),
             root.path(),

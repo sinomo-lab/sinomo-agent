@@ -197,7 +197,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // This target-side reservation is released only by the
             // authenticated source coordinator after its alias generation is
             // durable. Background maintenance must not expose it early.
-            DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary => Ok(job),
+            DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+            | DfsNamespaceJobKind::ParentCountParticipant => Ok(job),
         }
     }
 
@@ -660,42 +661,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if namespace_job_kind_is_cross_shard(&job.kind)
             || (job.kind == DfsNamespaceJobKind::ContentCopy && self.control_plane.is_some())
         {
-            let mut checkpoint_object =
-                self.lookup_metadata_path_raw(&job.file_system_id, &job.root_path)?;
-            if checkpoint_object.is_none()
-                && let Some(target_path) = job.target_path.as_ref()
-            {
-                checkpoint_object =
-                    self.lookup_metadata_path_raw(&job.file_system_id, target_path)?;
-            }
-            if checkpoint_object.is_none() && job.kind == DfsNamespaceJobKind::ContentCopy {
-                // The job owns a namespace path even before exclusive create
-                // publishes an object. This descriptor selects its shard only.
-                checkpoint_object = Some(crate::posix_object::new_posix_metadata_object(
-                    &self.node_id,
-                    &job.root_path,
-                    DfsObjectKind::File,
-                ));
-            }
-            let mut checkpoint_object = checkpoint_object.ok_or_else(|| {
-                DfsPosixError::Dfs(crate::DfsError::Metadata {
-                    message: format!(
-                        "cross-shard job {} has no source-side object for a durable checkpoint",
-                        job.job_id
-                    ),
-                })
-            })?;
-            // Namespace jobs are stored in the shard selected by their root
-            // path. Once an adoption has moved the live object to the foreign
-            // destination, by-id resolution can return that destination
-            // record (and the source-path lookup may fall back to it). Keep
-            // the durability barrier on the source shard that owns the job;
-            // otherwise the source coordinator incorrectly redirects the
-            // final Running/Completed checkpoint to the destination primary
-            // and leaves its transient move lock installed.
-            checkpoint_object.path = job.root_path.clone();
+            // The durable job outlives source eviction. Its filesystem/root
+            // selects the same real source shard and prefix without assuming
+            // this node replicates the destination object.
             let target = self
-                .capture_metadata_quorum_sync_target(&checkpoint_object)
+                .capture_metadata_quorum_sync_target_for_namespace_scope(
+                    &job.file_system_id, &job.root_path, &job.job_id,
+                )
                 .map_err(DfsPosixError::from)?;
             self.sync_metadata_shard_to_quorum(&target, crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
                 .map_err(DfsPosixError::from)?;
@@ -749,6 +721,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     let page =
                         self.child_objects_for_sifs_dir_page(&path, cursor.as_ref(), page_size)?;
                     let mut child_dirs = Vec::new();
+                    let mut revisit_directory = false;
                     for object in page.objects {
                         steps = steps.saturating_add(1);
                         let object_path = normalize_posix_path(&object.path)?;
@@ -765,12 +738,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             child_dirs.push(object_path);
                             continue;
                         }
-                        if self.clear_visible_object_for_recursive_job(&object_path, &prefix)? {
-                            job.processed_object_count =
-                                job.processed_object_count.saturating_add(1);
+                        let (removed, promoted_inside) = self.clear_visible_object_for_recursive_job(&object_path, &prefix)?;
+                        revisit_directory |= promoted_inside;
+                        if removed {
+                            job.processed_object_count = job.processed_object_count.saturating_add(1);
                         }
                     }
-                    if let Some(next_cursor) = page.next_cursor {
+                    if revisit_directory {
+                        // Promotion consumes one namespace entry but changes
+                        // the chosen alias identity. Revisit this actual page
+                        // within the unchanged step budget rather than skip a
+                        // still-live canonical entry under its old alias id.
+                        job.pending_frames.push(DfsNamespaceJobFrame::ScanDirectory {
+                            path: path.clone(), cursor: None,
+                        });
+                    } else if let Some(next_cursor) = page.next_cursor {
                         job.pending_frames
                             .push(DfsNamespaceJobFrame::ScanDirectory {
                                 path: path.clone(),
@@ -791,7 +773,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceJobFrame::CompleteDirectory { path } => {
                     steps = steps.saturating_add(1);
                     if path != root_path
-                        && self.clear_visible_object_for_recursive_job(&path, &prefix)?
+                        && self.clear_visible_object_for_recursive_job(&path, &prefix)?.0
                     {
                         job.processed_object_count = job.processed_object_count.saturating_add(1);
                     }
@@ -808,6 +790,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
                 | DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }
+                | DfsNamespaceJobFrame::ParentCountParticipant { .. }
                 | DfsNamespaceJobFrame::CrossShardDirStart { .. }
                 | DfsNamespaceJobFrame::CrossShardDirScan { .. }
                 | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {
@@ -826,74 +809,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object_path: &str,
         prefix: &str,
-    ) -> Result<bool> {
-        for _ in 0..64 {
-            let Some(object) = self.lookup_sifs_path(object_path)? else {
-                return Ok(false);
-            };
-            if object.kind == DfsObjectKind::Tombstone {
-                return Ok(false);
-            }
-            if !matches!(
-                object.kind,
-                DfsObjectKind::Hardlink | DfsObjectKind::Directory | DfsObjectKind::Tombstone
-            ) && self.link_count_for_object(&object)? > 1
-                && let Some(alias) = self.first_hardlink_alias_outside_prefix(&object, prefix)?
-            {
-                // Promoting onto an alias in another primary's shard runs the
-                // cross-shard move saga instead of a local transaction.
-                let alias_path = normalize_posix_path(&alias.path)?;
-                if let Some(destination_primary) =
-                    self.routed_namespace_primary_for_path(&alias_path)?
-                {
-                    self.coordinate_cross_shard_rename(
-                        object_path,
-                        &alias_path,
-                        destination_primary,
-                    )?;
-                    return Ok(true);
-                }
-                let hidden_path = self.hidden_alias_tombstone_path_on_destination_shard(
-                    &alias_path,
-                    &alias.object_id,
-                )?;
-                let alias_tombstone = self.tombstone_path_object_at(alias.clone(), hidden_path);
-
-                let mut old_path_tombstone = object.clone();
-                old_path_tombstone.object_id = DfsObjectId::generate();
-                let old_path_tombstone = self.tombstone_path_object(old_path_tombstone);
-
-                let mut promoted = object.clone();
-                promoted.path = alias.path.clone();
-                promoted.changed_at_unix_nanos = now_unix_nanos();
-                promoted.version = next_version(&promoted.version);
-                self.apply_namespace_transaction(DfsNamespaceTransaction {
-                    content_reference_identity: None,
-                    extension_expectations: Vec::new(),
-                    contribution_digest: None,
-                    file_version_pins: None,
-                    transaction_id: namespace_transaction_id_for_versioned_path(
-                        "clear-hardlink",
-                        &promoted.object_id,
-                        &promoted.version,
-                        &promoted.path,
-                    ),
-                    file_system_id: promoted.file_system_id.clone(),
-                    objects: vec![old_path_tombstone, alias_tombstone, promoted],
-                    versions: Vec::new(),
-                    advisory_lock_states: Vec::new(),
-                    created_at: time::OffsetDateTime::now_utc(),
-                })?;
-                continue;
-            }
-            let mut tombstone = object;
-            tombstone.object_id = DfsObjectId::generate();
-            tombstone.owner_node_id = self.node_id.clone();
-            let tombstone = self.tombstone_path_object(tombstone);
-            self.add_object_metadata(tombstone)?;
-            return Ok(true);
+    ) -> Result<(bool, bool)> {
+        let Some(object) = self.lookup_sifs_path(object_path)? else { return Ok((false, false)); };
+        if object.kind == DfsObjectKind::Tombstone { return Ok((false, false)); }
+        if object.kind == DfsObjectKind::Directory {
+            self.posix_rmdir_local(object_path)?;
+            return Ok((true, false));
         }
-        Ok(false)
+        // The ordinary owner reports the alias it actually promoted; a second
+        // discovery could choose another identity and misdirect the revisit.
+        let (_, promoted) = self.posix_unlink_resolved_object_with_promotion(object_path.to_owned(), object)?;
+        let promoted_inside = promoted.is_some_and(|path| path.starts_with(prefix));
+        Ok((true, promoted_inside))
     }
 
     pub(super) fn posix_rename_directory_bounded_resolved(
@@ -1161,6 +1088,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
                 | DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }
+                | DfsNamespaceJobFrame::ParentCountParticipant { .. }
                 | DfsNamespaceJobFrame::CrossShardDirStart { .. }
                 | DfsNamespaceJobFrame::CrossShardDirScan { .. }
                 | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {
@@ -1209,6 +1137,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let mut transaction_objects = Vec::new();
+        let mut replaces_directory = false;
         if let Some(destination) = self.lookup_sifs_path(target_root)?
             && destination.kind != DfsObjectKind::Tombstone
             && destination.object_id != source.object_id
@@ -1223,6 +1152,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: target_root.to_string(),
                 });
             }
+            replaces_directory = true;
             transaction_objects.push(self.tombstone_path_object(destination));
         }
 
@@ -1236,6 +1166,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source.version = next_version(&source.version);
         transaction_objects.insert(0, old_path_tombstone);
         transaction_objects.insert(1, source.clone());
+        // Count changes share the exact root-entry move. Its unchanged replay
+        // exits above once the original inode is already at target_root.
+        let old_parent = parent_posix_path(source_root);
+        let new_parent = parent_posix_path(target_root);
+        if old_parent == new_parent {
+            if replaces_directory && let Some(parent_path) = old_parent.as_deref() {
+                let mut parent = self.directory_modified_metadata(parent_path)?;
+                parent.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&parent, -1)?);
+                transaction_objects.push(parent);
+            }
+        } else {
+            if let Some(parent_path) = old_parent.as_deref() {
+                let mut parent = self.directory_modified_metadata(parent_path)?;
+                parent.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&parent, -1)?);
+                transaction_objects.push(parent);
+            }
+            if let Some(parent_path) = new_parent.as_deref() {
+                let mut parent = self.directory_modified_metadata(parent_path)?;
+                parent.namespace_link_count = Some(super::metadata::updated_namespace_link_count(&parent, if replaces_directory { 0 } else { 1 })?);
+                transaction_objects.push(parent);
+            }
+        }
         self.apply_namespace_transaction(DfsNamespaceTransaction {
             content_reference_identity: None,
             extension_expectations: Vec::new(),

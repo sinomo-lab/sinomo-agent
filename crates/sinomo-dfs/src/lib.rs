@@ -47,6 +47,7 @@ mod intent;
 mod lifecycle;
 mod repair_deadlines;
 mod stat_projection;
+mod namespace_counts;
 pub use lifecycle::*;
 mod local_state;
 mod maintenance;
@@ -58,14 +59,22 @@ mod configuration_snapshot;
 mod metadata_authority_projection;
 mod metadata_authority_runtime;
 mod storage_preparation;
+mod storage_generation;
+pub use storage_generation::{DfsMetadataGenerationIdentity, DfsMetadataGenerationOrigin, DfsMetadataGenerationSeal};
+pub use storage_generation::{DfsMetadataGenerationHeader, DfsMetadataGenerationState, inspect_metadata_storage_generation};
+#[cfg(feature = "storage-conversion")]
+pub use storage_generation::activate_metadata_storage_generation;
+#[cfg(feature = "storage-conversion")]
+pub use storage_generation::{DfsStandaloneStorageActivationWitness, activate_standalone_metadata_storage_generation};
 pub use storage_preparation::{
     DFS_STORAGE_PREPARATION_RECORD_BUDGET, DfsStoragePreparation, DfsStoragePreparationProvider,
-    DfsStoragePreparationProviderBuilder, DfsStoragePreparationRegistration,
-    DfsStoragePreparationScope, dfs_storage_preparation_lifecycle,
+    DfsStoragePreparationProviderBuilder, DfsStoragePreparationProviderBinding,
+    DfsStoragePreparationRegistration,
+    DfsStoragePreparationScope, dfs_storage_preparation_lifecycle, dfs_storage_preparation_readiness,
     register_dfs_storage_preparation_provider,
 };
 mod metadata_backend;
-#[cfg(feature = "storage-conversion")]
+#[cfg(any(test, feature = "storage-conversion"))]
 mod metadata_candidate;
 mod metadata_cursor;
 mod metadata_error;
@@ -83,6 +92,7 @@ mod metadata_pages;
 mod metadata_read_snapshot;
 mod metadata_receipt;
 mod metadata_records;
+pub use metadata_records::{DfsParentCountAction, DfsParentCountBinding, DfsParentCountOutcome, DfsParentCountParticipant, DfsParentCountPhase, DfsParentCountPlan, DfsParentCountReceipt, DfsParentCountRejection, DfsParentCountState};
 mod metadata_rejection;
 mod metadata_replay;
 mod metadata_replica_observer;
@@ -103,7 +113,7 @@ pub use metadata_backend::prepared_operation::NativeHeldMetadataSnapshotV1;
 #[cfg(any(test, feature = "test-support"))]
 pub use native_shard_trace::ObservedNative as NativeObservedFact;
 
-#[cfg(feature = "storage-conversion")]
+#[cfg(any(test, feature = "storage-conversion"))]
 pub use metadata_candidate::{
     DfsMetadataCandidateIdentity, DfsMetadataCandidateInspection, DfsMetadataCandidateState,
     DfsMetadataCandidateWriter, inspect_metadata_candidate, read_metadata_candidate,
@@ -112,7 +122,7 @@ pub use metadata_candidate::{
 };
 #[cfg(feature = "storage-conversion")]
 pub use metadata_cursor::read_current_metadata_acknowledgement_floors;
-#[cfg(feature = "storage-conversion")]
+#[cfg(any(test, feature = "storage-conversion"))]
 pub use metadata_records::DfsMetadataTableOp as DfsMetadataCandidateRow;
 mod metadata_summary;
 mod metadata_table_apply;
@@ -136,6 +146,7 @@ mod placement;
 
 #[cfg(feature = "storage-conversion")]
 pub use control_plane::{
+    metadata_catalog_generation_update, metadata_catalog_generation_successor, metadata_storage_pending_transition_update,
     DfsPlacementUpdatePlan, build_adaptive_placement_reconciliation_job,
     build_placement_reconciliation_job,
 };
@@ -361,7 +372,10 @@ pub use content_store::{
     ContentVersionIdentity, LocalContentStore, ObjectVersionReader,
 };
 #[cfg(feature = "storage-conversion")]
-pub use content_store::{ContentStoreStagingRow, ContentStoreStagingWriter};
+pub use content_store::{
+    ContentImportBlobPublication, ContentImportBlobVerifier, ContentStoreStagingRow,
+    ContentStoreStagingWriter, ContentStoreVerifiedImportBlob,
+};
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
     DfsAuthoritativePrefixProjection, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
@@ -573,6 +587,7 @@ pub use metadata_records::{
     DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
     DfsMetadataTableSnapshotTables, DfsMetadataVersionPinPage, DfsMetadataVersionPinPageCursor,
     DfsMetadataVersionPinRecord, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobOrigin,
+    DfsDirectoryMoveCounts,
     DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespaceObjectVersionExpectation,
     DfsNamespacePathOccupantExpectation, DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt,
@@ -612,7 +627,7 @@ pub use metadata_replication::{
     DfsMetadataJournalReplicationTransport, DfsMetadataJournalReplicationTransportError,
     DfsMetadataJournalReplicationTransportFuture, DfsMetadataNodeTransport,
     DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
-    DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext,
+    DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext, DfsMetadataNamespaceCatalog,
     DfsMetadataSnapshotInstallSender, DfsPreparedClusterMetadataJournalPublish,
     LocalDfsMetadataJournalPublisherHost, cluster_dfs_metadata_replica_shard_context,
     dfs_events_advance_metadata_replica, dfs_events_should_publish_metadata,
@@ -654,6 +669,7 @@ pub use metadata_sharded_backend::{
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
     discard_local_metadata_shard_copies,
 };
+pub use sinomo_api::dfs::model::{DfsMetadataStorageState, DfsMetadataStorageActivation};
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPlacementScope, DfsPolicyViolation, DfsSubtreePolicy, DfsTombstoneProvenance, ReadRoute,

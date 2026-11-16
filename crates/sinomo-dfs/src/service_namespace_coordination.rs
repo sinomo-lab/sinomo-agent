@@ -112,6 +112,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
     ) -> Result<Option<String>, DfsError> {
         let source_path = match operation {
+            DfsNamespaceOperation::ParentCountParticipant { participant, .. } => &participant.binding.root_path,
             // This validates only the exact already-published destination and
             // absence of active transfers. It cannot install or finalize data.
             DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => return Ok(None),
@@ -200,6 +201,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shards: &[DfsMetadataShardConfig],
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
         let candidates = match operation {
+            DfsNamespaceOperation::AdoptObjectAtPath { object, .. }
+                if file_system_id == &sifs_file_system_id() && object.kind == DfsObjectKind::Directory => {
+                // The exact original directory job binds any foreign parent
+                // participant; destination adoption never writes that parent.
+                Self::normalized_namespace_paths([object.path.as_str()], false, "directory adoption")?
+            }
+            DfsNamespaceOperation::ParentCountParticipant { participant, .. } => {
+                Self::normalized_namespace_paths([participant.expected.path.as_str()], false, "parent participant")?
+            }
             DfsNamespaceOperation::BeginContentCopy { path, .. } => {
                 Self::normalized_namespace_paths([path.as_str()], false, "file restore")?
             }
@@ -378,8 +388,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // as a fresh rename after the source path has been evicted.
             return Ok(());
         }
-        let destination_primary =
-            self.namespace_coordinator_foreign_primary(file_system_id, from, to)?;
+        let directory_rename = file_system_id == &sifs_file_system_id()
+            && self.lookup_sifs_path(from)?.is_some_and(|source| source.kind == DfsObjectKind::Directory);
+        let destination_primary = self.namespace_coordinator_foreign_primary(
+            file_system_id, from, to, directory_rename,
+        )?;
         let Some(destination_primary) = destination_primary else {
             return self.posix_rename_local(from, to).map(drop);
         };
@@ -421,7 +434,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let destination_primary =
-            self.namespace_coordinator_foreign_primary(file_system_id, existing_path, link_path)?;
+            self.namespace_coordinator_foreign_primary(file_system_id, existing_path, link_path, false)?;
         let Some(destination_primary) = destination_primary else {
             return self
                 .posix_hardlink_local(existing_path, link_path)
@@ -438,13 +451,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         source_path: &str,
         destination_path: &str,
+        directory_rename: bool,
     ) -> posix_model::Result<Option<NodeId>> {
         if self.control_plane.is_none() {
             return Ok(None);
         }
         let source_paths = Self::normalized_namespace_paths([source_path], false, "operation")?;
-        let destination_paths =
-            Self::normalized_namespace_paths([destination_path], true, "operation")?;
+        let mut destination_paths =
+            Self::normalized_namespace_paths([destination_path], false, "operation")?;
         let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
             return Ok(None);
         };
@@ -464,11 +478,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             }));
         }
-        let destination_shards = Self::namespace_shards_for_normalized_paths_from_snapshot(
-            file_system_id,
-            &shards,
-            destination_paths.iter().map(String::as_str),
+        let mut destination_shards = Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id, &shards, destination_paths.iter().map(String::as_str),
         )?;
+        let distributed_directory = directory_rename && source_shards.iter().any(|source|
+            destination_shards.iter().any(|destination| source.shard_id != destination.shard_id));
+        if !distributed_directory {
+            destination_paths = Self::normalized_namespace_paths([destination_path], true, "operation")?;
+            destination_shards = Self::namespace_shards_for_normalized_paths_from_snapshot(
+                file_system_id, &shards, destination_paths.iter().map(String::as_str),
+            )?;
+        }
+        // The counted directory saga separately declares/reserves foreign
+        // parents before child effects. Only its destination row selects the
+        // adoption owner; other operations retain the original parent gate.
         let mut foreign_primary: Option<NodeId> = None;
         for shard in destination_shards {
             if shard.primary_node_id == self.node_id {

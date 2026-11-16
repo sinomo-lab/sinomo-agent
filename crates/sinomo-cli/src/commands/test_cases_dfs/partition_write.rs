@@ -231,7 +231,7 @@ fn run_partition_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let root = dfs::local_dfs_metadata_shard_path(&data, &shard);
     let capture = || {
         LocalSobjMetadataBackend::open_for_inspection(shard.clone(), root.clone())
-            .map(|backend| backend.export_table_snapshot())
+            .and_then(|backend| backend.export_table_snapshot())
             .map_err(|error| fail(error.to_string()))
     };
     let before = capture()?;
@@ -470,6 +470,7 @@ mod original_pending_guard_tests {
             object_id: DfsObjectId::from_legacy_named("partition-predicate-object").unwrap(),
             file_system_id: dfs::sifs_file_system_id(),
             path: "/services/cluster-tests/runs/predicate/value.txt".into(),
+            namespace_link_count: (dfs::DfsObjectKind::File).initial_namespace_link_count(),
             kind: dfs::DfsObjectKind::File,
             tombstone_provenance: None,
             owner_node_id: owner.clone(),

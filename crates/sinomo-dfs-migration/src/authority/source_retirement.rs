@@ -166,8 +166,7 @@ impl NativeImportAuthority {
         }
         for reservation in crate::metadata::data_reservation_refs(source)? {
             let captured = source
-                .pending_operations
-                .iter()
+                .data_reservation_capsules()
                 .find(|row| {
                     row["capsule_digest"].as_str() == Some(reservation.capsule_digest.as_str())
                         && row["disposition"].as_str()
@@ -233,8 +232,7 @@ impl NativeImportAuthority {
                 continue;
             };
             let captured = source
-                .pending_operations
-                .iter()
+                .data_reservation_capsules()
                 .find(|row| {
                     row["capsule_digest"].as_str() == Some(reservation.capsule_digest.as_str())
                         && row["disposition"].as_str()
@@ -311,8 +309,7 @@ impl NativeImportAuthority {
         let mut certificates = Vec::new();
         for reservation in crate::metadata::data_reservation_refs(source)? {
             let captured = source
-                .pending_operations
-                .iter()
+                .data_reservation_capsules()
                 .find(|row| {
                     row["capsule_digest"].as_str() == Some(reservation.capsule_digest.as_str())
                         && row["disposition"].as_str()
@@ -376,8 +373,7 @@ impl NativeImportAuthority {
         }
         let original_capsules = plan
             .source_cut
-            .pending_operations
-            .iter()
+            .data_reservation_capsules()
             .filter(|row| {
                 row["capsule_digest"].as_str() == Some(reservation.capsule_digest.as_str())
                     && row["disposition"].as_str()
@@ -472,7 +468,7 @@ impl NativeImportAuthority {
         )>,
     > {
         self.evaluate_scope_retirement(file_system_id, shard_id)
-            .map_err(NativeEvaluationError::into_metadata)
+            .map_err(|failure| self.native_observation_error(failure))
     }
 
     pub(super) fn evaluate_scope_retirement(

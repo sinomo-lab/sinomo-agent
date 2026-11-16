@@ -9,13 +9,45 @@ pub(super) use custody::{
     PlacementCustodyEnvelope, PlacementCustodyPhase, PlacementCustodyRequest,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OriginalPlacementGoal {
     job: OriginalPlacementJob,
     assignments: Vec<DfsMetadataShardConfig>,
     #[serde(default)]
     related_entries: Vec<MetadataCapturedKvEntry>,
+}
+impl OriginalPlacementGoal {
+    #[cfg(test)]
+    pub(super) fn original_entry(&self) -> &KvEntry { &self.job.entry }
+    #[cfg(test)]
+    pub(super) fn current_job_key(&self) -> Result<String> { self.job.current_job_key() }
+    pub(super) fn file_system_id(&self) -> &sinomo_dfs::DfsFileSystemId { &self.job.file_system_id }
+    pub(super) fn is_terminal(&self) -> bool { self.job.terminal }
+    pub(super) fn validate_catalog(&self, catalog: &[DfsMetadataShardConfig]) -> Result<()> {
+        let decoded = OriginalPlacementJob::decode(&self.job.entry)?;
+        if decoded != self.job || self.job.terminal || self.assignments != catalog {
+            return Err(error("captured placement goal changes its original source or complete catalog"));
+        }
+        if self.related_entries.iter().map(|entry| &entry.key).collect::<Vec<_>>()
+            != self.job.related_keys().iter().collect::<Vec<_>>()
+            || self.related_entries.iter().any(|row| row.entry.as_ref().is_some_and(|entry| entry.key != row.key)) {
+            return Err(error("captured placement goal changes its related native key set"));
+        }
+        Ok(())
+    }
+    pub(super) fn source_compares(&self) -> Vec<KvCompare> {
+        // Count capture does not mutate shared placement scheduling rows.
+        // Their effects retain the retirement producer's own exact guards.
+        OriginalPlacementJob::exact_retirement_compares(&[MetadataCapturedKvEntry {
+            key: self.job.entry.key.clone(), entry: Some(self.job.entry.clone()),
+        }])
+    }
+    pub(super) fn evidence(&self, shard: &sinomo_dfs::DfsMetadataShardId) -> Result<crate::metadata::RetainedPlacementReservation> {
+        let assignment = self.assignments.iter().find(|row| row.shard_id == shard.0)
+            .ok_or_else(|| error("placement evidence omits an original assignment"))?;
+        crate::metadata::RetainedPlacementReservation::from_capsule(self.job.capsule_for_scope(assignment)?)
+    }
 }
 #[derive(Clone, Debug)]
 pub(super) struct OriginalPlacementSource {
@@ -44,8 +76,7 @@ impl NativeImportAuthority {
     ) -> Result<Option<Vec<OriginalPlacementGoal>>> {
         let root = self.placement_archive();
         std::fs::create_dir_all(&root).map_err(error)?;
-        let observed = block_native(
-            &self.runtime,
+        let observed = self.read_native(
             self.cluster()?
                 .kv_range_prefix_complete_authoritative_async("/dfs/filesystems/".into()),
         )?;
@@ -176,6 +207,12 @@ impl NativeImportAuthority {
             .map(|cfg| (&cfg.file_system_id, &cfg.shard_id))
             .collect::<BTreeSet<_>>();
         for blueprint in blueprints {
+            if !blueprint.plan.source_cut.retained_placement_reservations.is_empty()
+                && !self.count_cohort_ready(&blueprint.plan.source_cut)? {
+                return Err(MetadataBackendError::StoragePreparationPending {
+                    root: self.metadata_root.clone(), processed_records: 0,
+                });
+            }
             let native_scopes = blueprint
                 .plan
                 .source_cut
@@ -271,6 +308,13 @@ impl NativeImportAuthority {
                         if crate::metadata::data_reservation_refs(&plan.source_cut)?
                             .contains(&reservation) =>
                     {
+                        if !plan.source_cut.retained_placement_reservations.is_empty()
+                            && !self.count_cohort_ready(&plan.source_cut)? {
+                            pending.entry((assignment.file_system_id.clone(), assignment.shard_id.clone()))
+                                .or_insert_with(|| OriginalPlacementSource { assignment: assignment.clone(), capsules: Vec::new() })
+                                .capsules.push(capsule);
+                            continue;
+                        }
                         Self::validate_data_reservation_retirement(
                             &reservation,
                             &capsule,
@@ -463,6 +507,19 @@ impl NativeImportAuthority {
         Ok(true)
     }
 
+    pub(super) fn original_v0_retirement_request(goal: &OriginalPlacementGoal) -> Result<KvTxnRequest> {
+        Ok(KvTxnRequest::new(
+            KvRequestId::derived("dfs-original-placement-data-retirement-v7", goal.job.source_digest()?.as_bytes()),
+            KvTxn {
+                compares: captured_compares(&[MetadataCapturedKvEntry {
+                    key: goal.job.entry.key.clone(), entry: Some(goal.job.entry.clone()),
+                }]),
+                success: vec![KvOp::Delete { key: goal.job.entry.key.clone() }],
+                failure: Vec::new(),
+            },
+        ))
+    }
+
     fn retire_original_placement_goal(
         &self,
         goal: &OriginalPlacementGoal,
@@ -471,27 +528,24 @@ impl NativeImportAuthority {
         let root = self.placement_archive();
         let binding = goal.job.source_digest()?;
         if goal.job.source_schema == super::placement_job_source::OriginalPlacementSchema::V0 {
-            // Preserve the original v0 fixed-request retirement. These old
-            // jobs predate the v1 queue/permit family; current named work only
-            // excludes their later fresh planner callback, as before.
-            let request = KvTxnRequest::new(
-                KvRequestId::derived(
-                    "dfs-original-placement-data-retirement-v7",
-                    binding.as_bytes(),
-                ),
-                KvTxn {
-                    compares: captured_compares(&[MetadataCapturedKvEntry {
-                        key: goal.job.entry.key.clone(),
-                        entry: Some(goal.job.entry.clone()),
-                    }]),
-                    success: vec![KvOp::Delete {
-                        key: goal.job.entry.key.clone(),
-                    }],
-                    failure: Vec::new(),
+            // Keep the fixed original body/ID, but use the existing custody
+            // owner so peers observe the winning request instead of submitting
+            // it under a different native caller's authorization preimage.
+            let Some(coordinator) = self.placement_coordinator(goal)? else { return Ok(false); };
+            if coordinator.node_id != self.local_node()? {
+                return self.fetch_placement_custody(goal, PlacementCustodyPhase::Retirement, &coordinator);
+            }
+            let envelope = match self.saved_placement_custody(goal, PlacementCustodyPhase::Retirement)? {
+                Some(saved) => saved,
+                None => PlacementCustodyEnvelope {
+                    goal: goal.clone(), phase: PlacementCustodyPhase::Retirement,
+                    coordinator, request: Self::original_v0_retirement_request(goal)?, blueprints: blueprints.to_vec(),
                 },
-            );
-            let commit = self.blueprint_commit(&root, request)?;
+            };
+            let Some(commit) = self.commit_owned_placement_attempt(&envelope)? else { return Ok(false); };
             Self::require_committed(&commit)?;
+            #[cfg(test)]
+            if !native_tests::observe_goal_step(self, "retired-before-reply", Some(&commit)) { return Ok(false); }
             return Ok(true);
         }
         // Election must not prevent another upgraded host from recovering
@@ -717,6 +771,8 @@ impl NativeImportAuthority {
             return Err(error("placement restore owner lifecycle is closed"));
         }
         self.verify_placement_blueprints(goal, blueprints)?;
+        #[cfg(test)]
+        if !native_tests::observe_goal_step(self, "before-current-publication", None) { return Ok(false); }
         let root = self.placement_archive();
         let Some(coordinator) = self.placement_coordinator(goal)? else {
             return Ok(false);

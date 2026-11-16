@@ -418,7 +418,7 @@ fn native_read_fixture_observing_materialization(
     let published = source.get_object(&stat.object_id).unwrap().unwrap();
     assert_eq!(published.version, stat.version);
     assert_eq!(published.content_hash, stat.content_hash);
-    let snapshot = source.export_table_snapshot();
+    let snapshot = source.export_table_snapshot().unwrap();
     assert!(snapshot.prefix_proof.is_well_formed());
     assert_eq!(
         snapshot.prefix_proof.journal_sequence,
@@ -566,6 +566,8 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
 
 fn file_system(owner: NodeId) -> DfsFileSystem {
     DfsFileSystem {
+        catalog_generation: 0,
+        metadata_storage: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
@@ -580,6 +582,7 @@ fn file_metadata(owner: NodeId) -> DfsObjectMetadata {
         object_id: DfsObjectId::from_legacy_named("obj_file").expect("object"),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
         path: "src/lib.rs".to_string(),
+        namespace_link_count: (DfsObjectKind::File).initial_namespace_link_count(),
         kind: DfsObjectKind::File,
         tombstone_provenance: None,
         owner_node_id: owner.clone(),

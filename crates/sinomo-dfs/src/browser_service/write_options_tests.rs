@@ -695,16 +695,20 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
             .policy,
         sinomo_core::DfsObjectPolicy::ReplicatedConfirmed
     );
-    let parent = dfs.posix_stat("/documents/dir").unwrap();
-    let mut tombstone = dfs
-        .metadata_backend()
-        .unwrap()
-        .get_object(&parent.object_id)
-        .unwrap()
-        .unwrap();
-    tombstone.kind = DfsObjectKind::Tombstone;
-    dfs.add_object_metadata(tombstone)
-        .expect("tombstoned ancestor");
+    // A real bounded rename publishes its old-root tombstone before moving
+    // descendants. This exercises a hidden child without authoring an invalid
+    // directory tombstone or inventing a maintained parent count.
+    let owner = dfs.node_id().clone();
+    drop(dfs);
+    let mut caller = runtime.client(&owner).unwrap();
+    let job = caller.posix_rename_directory_bounded_routed(
+        "/documents/dir", "/documents/moved", 1,
+    ).expect("publish original directory move");
+    assert_eq!(job.status, crate::DfsNamespaceJobStatus::Running);
+    drop(caller);
+    let dfs = runtime.metadata_primary_service("/documents").unwrap();
+    assert!(dfs.metadata_backend().unwrap()
+        .get_object(&file.object_id).unwrap().is_some(), "the original child DATA remains present");
     for path in [
         "/documents/dir/file",
         "/documents/link",
@@ -721,6 +725,12 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
         );
     }
     drop(dfs);
+    let mut caller = runtime.client(&owner).unwrap();
+    let completed = caller.posix_resume_namespace_job_bounded_routed(
+        &job.job_id, &job.root_path, 128,
+    ).expect("complete the original directory move");
+    assert_eq!(completed.status, crate::DfsNamespaceJobStatus::Completed);
+    drop(caller);
     runtime.close().unwrap();
 }
 
@@ -746,7 +756,7 @@ fn browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks() {
 
     crate::posix::reset_posix_directory_link_count_calls();
     assert_eq!(dfs.posix_stat("/documents/dir").unwrap().link_count, 3);
-    assert_eq!(crate::posix::posix_directory_link_count_calls(), 1);
+    assert_eq!(crate::posix::posix_directory_link_count_calls(), 0);
     for parent in ["/documents/dir", "/documents/alias"] {
         assert_eq!(
             dfs.posix_object_metadata_hint(parent).unwrap().kind,
@@ -779,7 +789,7 @@ fn browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks() {
         assert!(dfs.posix_object_metadata_hint("/documents/alias").is_err());
         registry.remove_job("parent-hint-flight");
     }
-    assert_eq!(crate::posix::posix_directory_link_count_calls(), 1);
+    assert_eq!(crate::posix::posix_directory_link_count_calls(), 0);
     drop(dfs);
     runtime.close().unwrap();
 }

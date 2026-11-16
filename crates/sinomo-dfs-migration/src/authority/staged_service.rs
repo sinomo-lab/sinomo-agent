@@ -23,9 +23,12 @@ pub(super) const CONTENT_VERIFY_ROUTE: &str = "/dfs-migration/retained-content-v
 pub(super) const PLACEMENT_CUSTODY_ROUTE: &str = "/dfs-migration/placement-request-custody-v7";
 pub(super) const NAMESPACE_JOB_ROUTE: &str = "/dfs-migration/current-namespace-job-data-v7";
 const ROUTES: &[&str] = &[
+    super::owner::filesystem::ROUTE,
+    super::namespace_counts::PROBE_ROUTE,
     SNAPSHOT_ROUTE,
     PREFIX_ROUTE,
     BLUEPRINT_ROUTE,
+    super::activation_data::ROUTE,
     SOURCE_FLOORS_ROUTE,
     SOURCE_CHUNK_ROUTE,
     CONTENT_STAGE_ROUTE,
@@ -40,6 +43,15 @@ pub(super) struct ContentStageRequest {
     pub(super) command: sinomo_dfs::DfsMessageCommand,
     pub(super) size_bytes: u64,
     pub(super) verification: super::content_work::ContentVerificationRequest,
+}
+
+/// The full plan is already retained by the streamed source-floor challenge.
+/// Attachment heads carry only that exact challenge reference and the command.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StageSnapshotHead {
+    pub(super) command: DfsMetadataSnapshotInstallCommand,
+    pub(super) ancestry_request_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -332,6 +344,30 @@ impl NativeImportAuthority {
     /// Validate the SAME native source/scope/plan before accepting a large
     /// attachment. The receiver repeats these checks after the streaming wait
     /// and after its candidate effect; this head alone supplies no authority.
+    fn resolve_snapshot_head(
+        &self,
+        source: &sinomo_core::node::NodeId,
+        head: StageSnapshotHead,
+    ) -> Result<StageSnapshot> {
+        let handoff = head.command.primary_handoff_id.as_deref()
+            .ok_or_else(|| error("current stage has no original handoff identity"))?;
+        let root = self.source_ancestry_root(handoff, &head.ancestry_request_id)?;
+        let challenge = self.retained_plan_file.read_challenge(&root.join("challenge.json"))?;
+        if challenge.request_id != head.ancestry_request_id
+            || challenge.plan.expected_handoff.handoff_id != handoff {
+            return Err(error("snapshot head differs from its retained ancestry challenge"));
+        }
+        let envelope = StageSnapshot {
+            command: head.command,
+            plan: challenge.plan.clone(),
+            ancestry_request_id: head.ancestry_request_id,
+        };
+        // The reference supplies DATA only. Revalidate its authenticated source,
+        // native pending handoff and exact image before consuming the attachment.
+        self.validate_incoming_snapshot_head(source, &envelope)?;
+        Ok(envelope)
+    }
+
     fn validate_incoming_snapshot_head(
         &self,
         source: &sinomo_core::node::NodeId,
@@ -444,16 +480,27 @@ impl NativeImportAuthority {
                     "existing immutable receiver candidate belongs to another cut",
                 ));
             }
-        } else {
-            let inspection = sinomo_dfs::write_metadata_candidate_image_inspected(&root, image, fs)?;
-            let actual = self.retained_plan_file.retain_candidate(&root, inspection)?;
-            if actual.prefix_proof != cut.target_prefix
-                || actual.state_fingerprint != cut.converted_image_fingerprint
-            {
-                return Err(error(
-                    "actual current candidate checksum differs after durable write",
-                ));
+        }
+        // The ordinary candidate writer also qualifies exact replay and the
+        // current generation seal. Contention is unreadable/Pending, never an
+        // installation ACK or a reduced native quorum.
+        let inspection = match sinomo_dfs::write_metadata_candidate_image_inspected(&root, image, fs) {
+            Ok(inspection) => inspection,
+            Err(failure) if candidate_publication_busy(&failure) => {
+                return Ok(DfsMetadataSnapshotInstallResponse {
+                    request_id: command.request_id.clone(), shard_id: command.shard_id.clone(),
+                    next_after_sequence: command.next_after_sequence,
+                    result: DfsMetadataSnapshotInstallResult::Rejected {
+                        code: sinomo_dfs::DfsMetadataRejectionCode::ReplicaUnreadable,
+                        reason: failure.to_string(),
+                    },
+                });
             }
+            Err(failure) => return Err(failure),
+        };
+        let actual = self.retained_plan_file.retain_candidate(&root, inspection)?;
+        if actual.prefix_proof != cut.target_prefix || actual.state_fingerprint != cut.converted_image_fingerprint {
+            return Err(error("actual current candidate checksum differs after durable write"));
         }
         Self::save_blueprint(&root, "native-import-plan.json", &envelope.plan)?;
         Self::save_blueprint(
@@ -472,6 +519,7 @@ impl NativeImportAuthority {
         // Revalidate after the actual file effect; a superseding configuration
         // cannot receive an ACK for an obsolete import identity.
         self.receive_context(fs, &command.shard_id, epoch, handoff_id, &source)?;
+        super::owner::filesystem::enqueue_received_generation(&self.component_context, &envelope.plan, &root)?;
         self.source_verifiers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -619,8 +667,13 @@ impl NativeImportAuthority {
             "target-format-{}",
             sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
         );
-        let supported_target = |value: &str| value == "target-format-9" || value == current_target;
+        let supported_target = |value: &str| value == "target-format-9" || value == "target-format-10" || value == current_target;
         match parts.as_slice() {
+            [actual_key, target, "namespace-count-current-image"] => {
+                let Some(cohort) = &cut.namespace_count_cohort else { return Ok(false); };
+                cohort.validate_bound_cut(cut)?;
+                Ok(*target == current_target && *actual_key == key && capsules.is_empty())
+            }
             [actual_key, target, "current-image"] => {
                 Ok(supported_target(target) && *actual_key == key && capsules.is_empty())
             }
@@ -707,6 +760,21 @@ impl NativeImportAuthority {
         }
         Ok(true)
     }
+    pub(super) fn owns_exact_retiring_source(
+        &self,
+        source: &Path,
+        plan: &MetadataImportPlan,
+    ) -> Result<bool> {
+        if self.local_node()? != plan.expected_handoff.retiring_shard.primary_node_id {
+            return Ok(false);
+        }
+        self.validate_source_root(source)?;
+        crate::metadata::validate_retained_source_identity(
+            source, &plan.source_cut.source_identity, &plan.source_cut.source_snapshot_fingerprint,
+        )?;
+        Ok(true)
+    }
+
     fn capture_local_source_floors(
         &self,
         fs: &sinomo_dfs::DfsFileSystemId,
@@ -814,11 +882,16 @@ impl NativeImportAuthority {
                 && plan.source_cut.source_format_version
                     != Some(sinomo_dfs::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
                 && actual.is_empty()
+                && !self.owns_exact_retiring_source(&source, plan)?
             {
                 return Err(error(
                     "current source has no independently retained native ACK floor",
                 ));
             }
+            // The actual retiring primary already owns this exact fenced cut;
+            // it need not invent a receiver ACK for its own original writes.
+            // Other participants still need independent retained constraints,
+            // and native installation still requires primary plus majority.
             if current_source
                 && actual.iter().any(|floor| {
                     floor.shard_id != *shard
@@ -1473,6 +1546,7 @@ impl NativeImportAuthority {
             &format!("native-request-{}.json", envelope.request.request_id),
             &envelope.request,
         )?;
+        super::owner::filesystem::enqueue_received_generation(&self.component_context, &envelope.plan, &root)?;
         Ok(BlueprintStored {
             request_id: envelope.request.request_id,
             handoff_id: h.handoff_id.clone(),
@@ -1523,6 +1597,24 @@ impl Service for StagedImportService {
                 .parse::<sinomo_core::node::NodeId>()
                 .map_err(|e| ServiceError::Service(e.to_string()))?;
             match request.route.as_str() {
+                super::activation_data::ROUTE => {
+                    let lookup = context.decode_request_body_bounded::<super::activation_data::Request>(&request, 16 * 1024).await?;
+                    let response = tokio::task::block_in_place(|| self.authority.activated_request_data(source, lookup))
+                        .map_err(|failure| ServiceError::Service(failure.to_string()))?;
+                    context.respond_value(super::activation_data::ROUTE, response)?;
+                }
+                super::owner::filesystem::ROUTE => {
+                    let work = context.decode_request_body_bounded::<super::owner::filesystem::Request>(&request, 64 * 1024 * 1024).await?;
+                    let response = tokio::task::block_in_place(|| super::owner::filesystem::receive(&self.component_context, source, work))
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    context.respond_value(super::owner::filesystem::ROUTE, response)?;
+                }
+                super::namespace_counts::PROBE_ROUTE => {
+                    let probe = context.decode_request_body::<super::namespace_counts::Probe>(&request).await?;
+                    let result = tokio::task::block_in_place(|| self.authority.receive_count_probe(source, probe))
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    context.respond_value(super::namespace_counts::PROBE_ROUTE, result)?;
+                }
                 PLACEMENT_CUSTODY_ROUTE => {
                     let data = context
                         .decode_request_body::<super::placement_work::PlacementCustodyRequest>(
@@ -1700,12 +1792,11 @@ impl Service for StagedImportService {
                     context.respond_value(CONTENT_STAGE_ROUTE, result.response)?;
                 }
                 SNAPSHOT_ROUTE => {
-                    let mut command = context
-                        .decode_request_body::<StageSnapshot>(&request)
+                    let head = context
+                        .decode_request_body::<StageSnapshotHead>(&request)
                         .await?;
-                    tokio::task::block_in_place(|| {
-                        self.authority
-                            .validate_incoming_snapshot_head(&source, &command)
+                    let mut command = tokio::task::block_in_place(|| {
+                        self.authority.resolve_snapshot_head(&source, head)
                     })
                     .map_err(|e| ServiceError::Service(e.to_string()))?;
                     if !context.has_request_attachment() {
@@ -1811,7 +1902,7 @@ pub(super) fn factory()
                         "staged service has no actual current provider lifecycle",
                     )
                 })?;
-            let runtime = super::shared_runtime(context, lifecycle)?;
+            let runtime = super::shared_owner(context, lifecycle)?;
             scope.set_services(
                 ServiceRegistryBuilder::default()
                     .register(StagedImportService {
@@ -1834,6 +1925,8 @@ mod ancestry_ledger_tests {
         // No ACKs, cfg, native receipt or permission is created by this
         // filesystem-boundary fixture. The verifier tests only durable framing.
         MetadataSourceCut {
+            retained_placement_reservations: Vec::new(),
+            namespace_count_cohort: None,
             source_root: root.to_owned(),
             source_identity: "ledger-fixture".into(),
             scope_shard: sinomo_dfs::DfsMetadataShardId::new("root"),
@@ -2204,5 +2297,20 @@ mod ancestry_ledger_tests {
         pure_v1["prefix_proof"] = serde_json::to_value(old).unwrap();
         write(&pure_v1);
         assert!(crate::metadata::legacy_receiver_prefix(&root, Some(&prefix)).is_err());
+    }
+}
+
+fn candidate_publication_busy(failure: &MetadataBackendError) -> bool {
+    matches!(failure, MetadataBackendError::Io { source, .. } if source.kind() == std::io::ErrorKind::WouldBlock)
+}
+#[cfg(test)]
+mod candidate_contention_tests {
+    use super::*;
+    #[test]
+    fn only_actual_candidate_would_block_is_pending() {
+        let busy = MetadataBackendError::Io { path: "owned/metadata-candidate.lock".into(), source: std::io::Error::from(std::io::ErrorKind::WouldBlock) };
+        assert!(candidate_publication_busy(&busy));
+        assert!(!candidate_publication_busy(&MetadataBackendError::Serde("malformed image".into())));
+        assert!(!candidate_publication_busy(&MetadataBackendError::Io { path: "owned/image".into(), source: std::io::Error::from(std::io::ErrorKind::InvalidData) }));
     }
 }

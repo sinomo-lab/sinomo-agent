@@ -23,6 +23,7 @@ fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() 
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
         path: "artifacts/build.log".to_string(),
+        namespace_link_count: (DfsObjectKind::Artifact).initial_namespace_link_count(),
         kind: DfsObjectKind::Artifact,
         tombstone_provenance: None,
         owner_node_id: node_a.clone(),

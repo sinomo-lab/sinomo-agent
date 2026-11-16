@@ -494,6 +494,9 @@ pub struct StageExchangeCapture {
 #[derive(Clone, Debug)]
 pub enum StatReplyFault {
     Unsupported,
+    MissingCount,
+    InvalidCount,
+    WrongObjectPath,
     Incomplete,
     WrongRequest,
     WrongEpoch,
@@ -514,7 +517,7 @@ pub enum FaultAction {
     },
     /// Pause an actual completed initial stat projection without changing its
     /// response bytes. Observation/fault DATA cannot supply read authority.
-    PauseStatProjectionReplyAfterDispatch {
+    PauseStatMetadataReplyAfterDispatch {
         object_id: crate::DfsObjectId,
         gate: Arc<Semaphore>,
         captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
@@ -649,7 +652,7 @@ impl Fabric {
                 | FaultAction::PauseWriteCommitPublication { gate, .. }
                 | FaultAction::PauseExactWriteCommitPublication { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
-                | FaultAction::PauseStatProjectionReplyAfterDispatch { gate, .. }
+                | FaultAction::PauseStatMetadataReplyAfterDispatch { gate, .. }
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
                 {
                     gate.close();
@@ -711,7 +714,7 @@ impl Fabric {
                     // negative fault from the real completed typed reply,
                     // without consuming or reconstructing the request body.
                     FaultAction::AlterStatReplyAfterDispatch { .. }
-                    | FaultAction::PauseStatProjectionReplyAfterDispatch { .. } => false,
+                    | FaultAction::PauseStatMetadataReplyAfterDispatch { .. } => false,
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
                     FaultAction::PauseWriteCommitPublication { .. }
@@ -1404,7 +1407,7 @@ impl Carrier {
         // normal publication without nesting a writer under that read owner.
         let stat_pause_rules = if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE {
             self.fabric.faults.lock().unwrap().iter().filter_map(|rule| {
-                let FaultAction::PauseStatProjectionReplyAfterDispatch {
+                let FaultAction::PauseStatMetadataReplyAfterDispatch {
                     object_id, gate, captured,
                 } = &rule.action else { return None; };
                 (rule.source.as_ref().is_none_or(|id| id == &observation.source)
@@ -1430,15 +1433,18 @@ impl Carrier {
             for routed in &response.outbound_messages {
                 let crate::DfsNetworkMessage::NamespaceResponse(reply) = &routed.message else { continue; };
                 let Some(crate::DfsPosixCoordinationResult::MetadataQuery(query)) = &reply.posix_coordination_result else { continue; };
-                let (request, initial_page) = match &query.result {
+                let (observed_object_id, initial_page) = match &query.result {
+                    crate::DfsMetadataQueryResult::StatAtPathV2 { object: Some(object) }
+                    | crate::DfsMetadataQueryResult::StatObjectV1 { object: Some(object), .. } =>
+                        (&object.object_id, true),
                     crate::DfsMetadataQueryResult::StatProjectionV1 { page } =>
-                        (&page.request, !page.request.fence_only && page.request.expected_prefix.is_none()),
+                        (&page.request.object_id, !page.request.fence_only && page.request.expected_prefix.is_none()),
                     crate::DfsMetadataQueryResult::StatProjectionChangedV1 { request, .. } =>
-                        (request.as_ref(), false),
+                        (&request.object_id, false),
                     _ => continue,
                 };
                 for (object_id, gate, captured) in &stat_pause_rules {
-                    if request.object_id != *object_id { continue; }
+                    if observed_object_id != object_id { continue; }
                     {
                         let mut observed = captured.lock().unwrap();
                         assert!(observed.len() < 32, "bounded actual stat capture");
@@ -1447,7 +1453,7 @@ impl Carrier {
                     let pause = if initial_page {
                         let mut rules = self.fabric.faults.lock().unwrap();
                         rules.iter_mut().find(|rule| {
-                            matches!(&rule.action, FaultAction::PauseStatProjectionReplyAfterDispatch {
+                            matches!(&rule.action, FaultAction::PauseStatMetadataReplyAfterDispatch {
                                 object_id: actual, gate: owned, captured: observed,
                             } if actual == object_id && Arc::ptr_eq(owned, gate) && Arc::ptr_eq(observed, captured))
                                 && rule.remaining_hits > 0
@@ -1519,13 +1525,16 @@ impl Carrier {
                     query.result,
                     crate::DfsMetadataQueryResult::StatProjectionV1 { .. }
                         | crate::DfsMetadataQueryResult::StatAtPathV1 { .. }
+                        | crate::DfsMetadataQueryResult::StatAtPathV2 { .. }
+                        | crate::DfsMetadataQueryResult::StatObjectV1 { .. }
                 ) {
                     continue;
                 }
                 if matches!(change, StatReplyFault::SameVersionHashChanged)
-                    && !matches!(&query.result,
+                    && !(matches!(&query.result,
                         crate::DfsMetadataQueryResult::StatProjectionV1 { page }
                             if page.object.is_some())
+                        || matches!(&query.result, crate::DfsMetadataQueryResult::StatObjectV1 { object: Some(_), .. }))
                 {
                     continue;
                 }
@@ -1574,6 +1583,18 @@ impl Carrier {
                             NodeId::from_legacy_named("forged-stat-target").unwrap()
                     }
                     _ => {
+                        if let crate::DfsMetadataQueryResult::StatAtPathV2 { object: Some(object) }
+                            | crate::DfsMetadataQueryResult::StatObjectV1 { object: Some(object), .. } = &mut query.result {
+                            match &change {
+                                StatReplyFault::MissingCount => object.namespace_link_count = None,
+                                StatReplyFault::InvalidCount => object.namespace_link_count = Some(0),
+                                StatReplyFault::WrongObjectPath => object.path = "/forged-stat-path".into(),
+                                StatReplyFault::SameVersionHashChanged => object.content_hash = Some(format!(
+                                    "blake3:{}", blake3::hash(b"negative stat same-version hash corruption"))),
+                                _ => unreachable!("legacy projection fault on a maintained-count read"),
+                            }
+                            continue;
+                        }
                         if let crate::DfsMetadataQueryResult::StatAtPathV1 { view } =
                             &mut query.result
                         {
@@ -3326,7 +3347,7 @@ impl DfsTestRuntime {
         }))
     }
 
-    fn wait_startup_completion(&self) -> Result<(), String> {
+    pub fn wait_startup_completion(&self) -> Result<(), String> {
         self.wait_startup_completion_with_budget(None, None)
     }
     fn wait_startup_completion_with_budget(
@@ -5495,7 +5516,7 @@ impl DfsTestRuntime {
     /// Run an ordinary RPC action once the real mounted host admits it, before
     /// waiting for its current startup generation. Recovery can enable that
     /// generation; action and completion share the original network budget.
-    pub(crate) fn reopen_node_with_startup_action(
+    pub fn reopen_node_with_startup_action(
         &mut self,
         node: NodeId,
         action: Box<dyn FnOnce(Duration) -> Result<(), String> + '_>,
@@ -7233,3 +7254,8 @@ mod owned_fault_cleanup_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod data_fixture;
+#[cfg(test)]
+pub(crate) use data_fixture::{copy_native_genesis_data, copy_native_genesis_data_into_selected};

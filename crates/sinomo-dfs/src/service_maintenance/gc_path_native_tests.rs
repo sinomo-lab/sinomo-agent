@@ -103,6 +103,16 @@ fn completed_move_then_gc(directory: bool, recreate_source: bool) {
     } else {
         None
     };
+    if !directory && !recreate_source {
+        // Native retirement owns the original physical SourceEviction; it
+        // need not invent a second logical tombstone. Produce that independent
+        // marker through ordinary create/delete before testing GC's path guard.
+        let marker = client.posix_write_file(
+            &from, REPLACEMENT, DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        ).unwrap();
+        assert_ne!(marker.object_id, original.object_id);
+        client.posix_unlink(&from).unwrap();
+    }
     drop(client);
     let before_source = physical_cut(&native, &source, &original.object_id, &from);
     let before_target = physical_cut(&native, &target, &original.object_id, &to);

@@ -111,6 +111,10 @@ pub struct DfsPreparedOperationRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DfsPreparedOperationEviction {
+    /// Original committed generation-bound birth evidence, never reconstructed
+    /// from mutable filesystem rows after the immutable body is collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_storage_activation: Option<crate::DfsMetadataStorageActivation>,
     pub digest: DfsPreparedOperationDigest,
     pub status: DfsPreparedOperationStatus,
     pub committed_entry: Option<Box<DfsPreparedOperationCommitReference>>,
@@ -180,6 +184,44 @@ impl DfsPreparedOperationCommitReference {
     }
 }
 impl DfsPreparedOperationEviction {
+    /// Derive compact terminal DATA from its exact validated immutable body.
+    /// This constructor supplies no native publication or storage authority.
+    pub fn from_terminal_record(record: &DfsPreparedOperationRecord) -> Result<Self> {
+        record.validate()?;
+        let genesis_storage_activation = if record.status == DfsPreparedOperationStatus::Committed
+            && is_exact_genesis_digest(&record.digest) {
+            let mut filesystems = record.metadata_effects.iter().filter_map(|effect| match effect {
+                crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } => Some(file_system),
+                _ => None,
+            });
+            let file_system = filesystems.next().ok_or_else(|| MetadataBackendError::Serde(
+                "committed genesis has no original filesystem binding".into()))?;
+            if filesystems.next().is_some() || file_system.file_system_id != record.digest.file_system_id {
+                return Err(MetadataBackendError::Serde("committed genesis has contradictory filesystem bindings".into()));
+            }
+            match &file_system.metadata_storage {
+                None => None,
+                Some(state @ crate::DfsMetadataStorageState::Active { .. }) => {
+                    state.validate_at_catalog_generation(file_system.catalog_generation)
+                        .map_err(MetadataBackendError::Serde)?;
+                    state.active_descriptor()
+                }
+                Some(crate::DfsMetadataStorageState::PendingTransition { .. }) =>
+                    return Err(MetadataBackendError::Serde("committed genesis cannot bind a pending storage transition".into())),
+            }
+        } else { None };
+        let terminal = Self { genesis_storage_activation, digest: record.digest.clone(),
+            status: record.status, committed_entry: record.committed_entry.clone() };
+        terminal.validate()?;
+        Ok(terminal)
+    }
+
+    pub fn validate_against_record(&self, record: &DfsPreparedOperationRecord) -> Result<()> {
+        if *self != Self::from_terminal_record(record)? {
+            return Err(MetadataBackendError::Serde("terminal eviction changes its original body or generation witness".into()));
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
         if self.digest.protocol_version != DFS_PREPARED_OPERATION_PROTOCOL_VERSION
             || self.digest.prepare_sequence == 0
@@ -205,8 +247,18 @@ impl DfsPreparedOperationEviction {
         if let Some(entry) = &self.committed_entry {
             entry.validate(&self.digest)?;
         }
+        if let Some(activation) = &self.genesis_storage_activation {
+            if self.status != DfsPreparedOperationStatus::Committed || !is_exact_genesis_digest(&self.digest) {
+                return Err(MetadataBackendError::Serde("generation witness does not name committed exact genesis".into()));
+            }
+            activation.validate().map_err(MetadataBackendError::Serde)?;
+        }
         Ok(())
     }
+}
+
+fn is_exact_genesis_digest(digest: &DfsPreparedOperationDigest) -> bool {
+    digest.owner_epoch == 1 && digest.operation_id == format!("genesis:{}:{}:1", digest.file_system_id, digest.shard_id.0)
 }
 
 pub(crate) fn compound_prepared_operation_id(
@@ -442,7 +494,9 @@ impl DfsPreparedOperationPayload {
 }
 
 impl DfsPreparedOperationDigest {
-    pub(crate) fn at_sequence(
+    /// Compute the exact current payload identity as DATA. This does not
+    /// authorize preparation, publication, source recovery or storage activation.
+    pub fn at_sequence(
         payload: &DfsPreparedOperationPayload,
         prepare_sequence: u64,
     ) -> Result<Self> {

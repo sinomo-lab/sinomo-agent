@@ -184,9 +184,12 @@ change that does not reopen metadata stores.
 
 Every switch, shrink, add, recruit, N raise, removal and takeover swap is one
 guarded transaction built from one exact-key-set read. It compares the exact bytes of
-both keys, the pending handoff, the filesystem configuration when its guard
-uses W or N, and the member and capability-policy records of each member it
-admits. Each change advances the generation, so a transaction built from an
+both keys, the pending handoff, the filesystem configuration, and the member
+and capability-policy records of each member it admits. No change is built
+while the filesystem configuration reserves the catalog for a pending storage
+transition, and a change that rewrites the shard configuration (recruit,
+removal, takeover swap) also advances the filesystem's catalog generation.
+Each change advances the generation, so a transaction built from an
 earlier record can never apply. Transactions carry a stable request id: a
 takeover candidate settles an unknown swap by resubmitting the identical
 request, which returns the committed reply or commits once, and the resulting
