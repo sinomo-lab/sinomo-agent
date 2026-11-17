@@ -147,9 +147,22 @@ async fn cancelled_replica_wait_does_not_preempt_a_later_maintenance_turn() {
 
 #[test]
 fn routed_authority_ingress_preserves_source_target_and_epoch_checks() {
+    native_authority_ingress(false);
+}
+
+#[test]
+fn native_replica_answer_progresses_behind_queued_materialization() {
+    native_authority_ingress(true);
+}
+
+fn native_authority_ingress(queued_materialization: bool) {
     let path = "/services/native-routed-probe-identities";
     let (native, client, shard) = crate::test_support::current_native_metadata_service(
-        "native-routed-probe-identities",
+        if queued_materialization {
+            "native-replica-queued-materialization"
+        } else {
+            "native-routed-probe-identities"
+        },
         3,
         path,
     )
@@ -278,7 +291,63 @@ fn routed_authority_ingress_preserves_source_target_and_epoch_checks() {
             );
         }
     }
-    let response: crate::DfsMessageResponse = call(&command).unwrap().decode_body().unwrap();
+    let response: crate::DfsMessageResponse = if queued_materialization {
+        let scheduler = daemon_dfs_mutation_scheduler(native.data_dir(&replica)).unwrap();
+        let other = native
+            .metadata_shards()
+            .unwrap()
+            .into_iter()
+            .find(|other| other.shard_id != shard.shard_id)
+            .unwrap();
+        let other_scope = DfsMessageExecutionScope::ExactShard {
+            file_system_id: other.file_system_id,
+            shard_id: DfsMetadataShardId::new(other.shard_id),
+        };
+        let replica_scope = dfs_message_execution_scope(&command);
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+            crate::DFS_RPC_CATEGORY,
+            &command,
+        )
+        .unwrap();
+        let answer = native.rpc_result_future(
+            &primary,
+            &replica,
+            sinomo_core::network::ObjectRpcCall::value(request),
+            Duration::from_secs(3),
+        );
+        native.runtime_handle().block_on(async {
+            // Hold real native admission on an unrelated shard. Both queued
+            // futures are polled to their actual wait, without timing sleeps.
+            let holding = scheduler.admit(&other_scope).await.unwrap();
+            let mut global = Box::pin(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive));
+            assert!(
+                poll_queued_admission_once(global.as_mut())
+                    .await
+                    .is_pending()
+            );
+            let mut materialization = Box::pin(scheduler.admit(&replica_scope));
+            assert!(
+                poll_queued_admission_once(materialization.as_mut())
+                    .await
+                    .is_pending()
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), answer).await;
+            drop(materialization);
+            drop(global);
+            drop(holding);
+            result
+                .expect("real authority ACK must pass queued materialization")
+                .unwrap()
+                .into_materialized_value_response(64 * 1024)
+                .await
+                .unwrap()
+                .decode_body()
+                .unwrap()
+        })
+    } else {
+        call(&command).unwrap().decode_body().unwrap()
+    };
     assert_eq!(response.request_id, command.request_id);
     assert_eq!(response.outbound_messages.len(), 1);
     let returned = &response.outbound_messages[0];
@@ -392,6 +461,279 @@ fn routed_authority_probe_does_not_wait_for_general_request_view() {
     assert_eq!(
         generic_view_entries, 0,
         "replica proof must not depend on the general request-view constructor"
+    );
+}
+
+#[test]
+fn native_content_stage_answers_while_an_unrelated_shard_publishes() {
+    let path = "/services/native-required-content-stage";
+    let (native, mut client, shard) = crate::test_support::current_native_metadata_service(
+        "native-required-content-stage",
+        3,
+        path,
+    )
+    .unwrap();
+    let primary = shard.primary_node_id.clone();
+    let replica = shard.replica_node_ids[0].clone();
+    let bytes = b"native content and original durable intent";
+    let stat = client
+        .posix_write_file(
+            path,
+            bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 3).unwrap(),
+                replica_candidates: std::iter::once(primary.clone())
+                    .chain(shard.replica_node_ids.iter().cloned())
+                    .collect(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    client
+        .posix_sync_file(path, DfsPosixSyncKind::File)
+        .unwrap();
+    drop(client);
+    let owner = native.metadata_primary_service(path).unwrap();
+    let backend = owner.metadata_backend().unwrap();
+    let object = backend.get_object(&stat.object_id).unwrap().unwrap();
+    let intent = backend
+        .intents_for_object(&stat.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.target_version == stat.version
+                && row.status == crate::DfsWriteIntentStatus::Committed
+        })
+        .unwrap();
+    let stage = crate::DfsStageBlobCommand {
+        request_id: "native-required-content-stage-replay".into(),
+        intent_id: intent.intent_id.clone(),
+        file_system_id: stat.file_system_id.clone(),
+        object_id: stat.object_id.clone(),
+        expected_base_version: intent.base_version,
+        version: stat.version.clone(),
+        content_hash: stat.content_hash.clone().unwrap(),
+        bytes: bytes.to_vec(),
+        object_metadata: Some(object),
+        authority_shard: Some(shard.clone()),
+        receipt_generation: 0,
+    };
+    drop(owner);
+    let routed = crate::routes::build_dfs_routed_message(
+        &primary,
+        &replica,
+        1,
+        1,
+        DfsNetworkMessage::StageBlob(stage.clone()),
+    );
+    let command = crate::DfsMessageCommand {
+        request_id: stage.request_id.clone(),
+        routed_message: routed,
+    };
+    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+        crate::DFS_DATA_STAGE_BLOB_ROUTE,
+        crate::DFS_RPC_CATEGORY,
+        &command,
+    )
+    .unwrap();
+    let scheduler = daemon_dfs_mutation_scheduler(native.data_dir(&replica)).unwrap();
+    let cached = daemon_dfs_message_service_cache()
+        .existing_root(&native.data_dir(&replica).root())
+        .unwrap()
+        .unwrap();
+    let original_owner = cached
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .primary_service
+        .as_ref()
+        .unwrap()
+        .clone();
+    let other = native
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|other| other.shard_id == "users")
+        .unwrap();
+    let scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: other.file_system_id,
+        shard_id: DfsMetadataShardId::new(other.shard_id),
+    };
+    let answer = native.rpc_result_future(
+        &primary,
+        &replica,
+        sinomo_core::network::ObjectRpcCall::value(request),
+        Duration::from_secs(3),
+    );
+    let result = native.runtime_handle().block_on(async {
+        let placement = scheduler.admit(&scope).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), answer).await;
+        drop(placement);
+        match result {
+            Ok(Ok(reply)) => Some(
+                reply
+                    .into_materialized_value_response(64 * 1024)
+                    .await
+                    .unwrap()
+                    .decode_body::<crate::DfsMessageResponse>()
+                    .unwrap(),
+            ),
+            _ => None,
+        }
+    });
+    let response = result.expect("durable stage answer must pass unrelated placement admission");
+    let current_owner = cached
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .primary_service
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(
+        Arc::ptr_eq(&original_owner, &current_owner),
+        "same transfer-state owner"
+    );
+    {
+        let lane = current_owner.lock().unwrap();
+        let active = lane
+            .service
+            .writes
+            .active_replica_stages
+            .get(&stage.object_id)
+            .unwrap();
+        assert_eq!(active.intent_id, stage.intent_id);
+        assert_eq!(active.content_hash, stage.content_hash);
+        assert!(
+            lane.service.metadata_backend.is_none(),
+            "scoped checkout returned"
+        );
+        assert!(matches!(
+            lane.resident_metadata_scope,
+            Some(DaemonDfsResidentMetadataScope::Global(_))
+        ));
+    }
+    drop(original_owner);
+    drop(current_owner);
+    drop(cached);
+    native.close().unwrap();
+    assert_eq!(response.request_id, command.request_id);
+    assert!(response.outbound_messages.iter().any(|message| matches!(
+        &message.message, DfsNetworkMessage::StageBlobResponse(reply)
+            if reply.intent_id == stage.intent_id && reply.object_id == stage.object_id
+                && reply.version == stage.version && reply.replica_node_id == replica
+                && matches!(&reply.result, crate::DfsBlobTransferResult::Durable { content_hash }
+                    if content_hash == &stage.content_hash)
+    )));
+}
+
+#[test]
+fn native_first_write_stages_during_unrelated_publication() {
+    let path = "/services/native-first-stage-progress";
+    let (native, mut client, shard) = crate::test_support::current_native_metadata_service(
+        "native-first-stage-progress",
+        3,
+        path,
+    )
+    .unwrap();
+    let replica = shard.replica_node_ids[0].clone();
+    let scheduler = daemon_dfs_mutation_scheduler(native.data_dir(&replica)).unwrap();
+    let other = native
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|other| other.shard_id == "users")
+        .unwrap();
+    let scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: other.file_system_id,
+        shard_id: DfsMetadataShardId::new(other.shard_id),
+    };
+    let placement = native
+        .runtime_handle()
+        .block_on(scheduler.admit(&scope))
+        .unwrap();
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    let (completed, (mut client, result)) = std::thread::scope(|threads| {
+        let writer = threads.spawn(move || {
+            let result = client.posix_write_file_with_operation_id(
+                path,
+                b"first version with its real nonterminal stage intent",
+                DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(3, 3).unwrap(),
+                    replica_candidates: std::iter::once(shard.primary_node_id)
+                        .chain(shard.replica_node_ids)
+                        .collect(),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+                "native-first-stage-progress-operation",
+            );
+            let _ = sent.send(());
+            (client, result)
+        });
+        let completed = received.recv_timeout(Duration::from_secs(5)).is_ok();
+        if !completed {
+            let observations = native.rpc_observations();
+            eprintln!(
+                "first-stage waiting RPCs: {:#?}",
+                &observations[observations.len().saturating_sub(12)..]
+            );
+        }
+        drop(placement);
+        (completed, writer.join().unwrap())
+    });
+    let bytes = result
+        .as_ref()
+        .ok()
+        .map(|_| client.posix_read_file_distributed(path));
+    // The cold stage initialized one shard only. A real later global owner
+    // must finish its ordinary hydration before borrowing general state.
+    crate::runtime_host::message_host::with_daemon_dfs_main_maintenance_service(
+        native.data_dir(&replica),
+        &native.runtime_handle(),
+        |service| {
+            assert!(
+                service
+                    .metadata_backend
+                    .as_ref()
+                    .unwrap()
+                    .resident_exact_shard_id()
+                    .is_none()
+            );
+        },
+    )
+    .unwrap();
+    let cached = daemon_dfs_message_service_cache()
+        .existing_root(&native.data_dir(&replica).root())
+        .unwrap()
+        .unwrap();
+    let global = cached
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .primary_service
+        .clone()
+        .unwrap();
+    assert!(!global.lock().unwrap().needs_global_hydration);
+    drop(global);
+    drop(cached);
+    drop(client);
+    native.close().unwrap();
+    assert!(
+        completed,
+        "actual first write must finish before unrelated admission is released"
+    );
+    assert!(
+        result.is_ok(),
+        "actual producer and original operation: {result:?}"
+    );
+    assert_eq!(
+        bytes.unwrap().unwrap(),
+        b"first version with its real nonterminal stage intent"
     );
 }
 

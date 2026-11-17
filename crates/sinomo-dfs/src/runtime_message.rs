@@ -724,6 +724,10 @@ pub(crate) struct DfsRuntimeMessageServiceLane {
     pub service: DfsRuntimeMessageService,
     pub peer_node_ids: Vec<sinomo_core::node::NodeId>,
     pub resident_metadata_scope: Option<DfsResidentMetadataScope>,
+    /// A first replica answer can initialize the sole global transfer owner
+    /// from its exact shard. Its first global borrow must restore all durable
+    /// identifier floors and namespace guards before general mutation.
+    pub needs_global_hydration: bool,
 }
 
 #[derive(Debug)]
@@ -1133,6 +1137,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    stage_shard: Option<ResidentLocalMetadataShardHandle>,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError> {
     let completes_fetch = matches!(
         &command.routed_message.message,
@@ -1140,6 +1145,19 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     );
     let is_verified_fetch = verified_fetch.is_some();
     let is_read_only = is_verified_fetch || crate::dfs_message_is_read_only_request(&command);
+    if let Some(shard) = stage_shard.as_ref()
+        && (!matches!(
+            &command.routed_message.message,
+            DfsNetworkMessage::StageBlob(_)
+        ) || !matches!(execution_scope, crate::DfsMessageExecutionScope::ExactShard { file_system_id, shard_id }
+                if file_system_id == shard.file_system_id() && shard_id == shard.shard_id())
+            || is_verified_fetch
+            || completed_phase.is_some())
+    {
+        return Err(crate::DfsError::Metadata {
+            message: "certified stage scope used for another execution".into(),
+        });
+    }
     let lane_lock_wait_started = std::time::Instant::now();
     let mut service_lane = service_lane_handle
         .lock()
@@ -1168,10 +1186,15 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     let _publication_provider_scope = publication_provider
         .map(|provider| service_lane.service.publication_provider.install(provider));
     service_lane.refresh_peer_targets(peer_node_ids);
-    let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
+    // A certified stage borrows the same transfer-state owner as ordinary
+    // global ingress, but it needs only its actual intent's resident shard.
+    let scoped_stage = stage_shard.is_some();
+    let resident_metadata_scope = stage_shard
+        .map(DfsResidentMetadataScope::ExactShard)
+        .or_else(|| service_lane.resident_metadata_scope.clone());
     let backend_checkout_started = std::time::Instant::now();
     if let Some(scope) = resident_metadata_scope.as_ref() {
-        scope.attach(&mut service_lane.service)?;
+        service_lane.attach_metadata_scope(scope)?;
     }
     let backend_checkout = backend_checkout_started.elapsed();
     if let Some(completed) = completed_phase {
@@ -1310,7 +1333,8 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
             })
     };
     let committed_work = committed_work_tracker.take();
-    let exact_projection_release_error = if matches!(
+    let exact_projection_release_error = if !scoped_stage
+        && matches!(
             &resident_metadata_scope,
             Some(DfsResidentMetadataScope::ExactShard(_))
         ) {
@@ -1346,6 +1370,21 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
 }
 
 impl DfsRuntimeMessageServiceLane {
+    pub(crate) fn attach_metadata_scope(
+        &mut self,
+        scope: &DfsResidentMetadataScope,
+    ) -> Result<(), crate::DfsError> {
+        scope.attach(&mut self.service)?;
+        if self.needs_global_hydration && matches!(scope, DfsResidentMetadataScope::Global(_)) {
+            if let Err(error) = self.service.hydrate_file_systems_from_metadata_backend() {
+                self.service.release_resident_metadata_backend()?;
+                return Err(error);
+            }
+            self.needs_global_hydration = false;
+        }
+        Ok(())
+    }
+
     pub fn refresh_peer_targets(&mut self, peer_node_ids: Vec<sinomo_core::node::NodeId>) {
         if self.peer_node_ids == peer_node_ids {
             return;

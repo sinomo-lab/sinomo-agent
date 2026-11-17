@@ -1,5 +1,7 @@
 use super::*;
 
+mod stage_answer;
+
 fn open_daemon_native_content_store(data_dir: &SinomoDataDir) -> Result<LocalContentStore, crate::DfsError> {
     crate::runtime_host::open_dfs_runtime_content_store(data_dir).map_err(|error| match error {
         DfsRuntimeError::StoragePreparationPending { root, processed_records } =>
@@ -542,7 +544,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
         signature.metadata_storage_generation,
     )?;
     if let Some(scope) = lane.resident_metadata_scope.clone() {
-        scope.attach(&mut lane.service)?;
+        lane.attach_metadata_scope(&scope)?;
     }
     daemon_dfs_require_retained_authority(
         &metadata_authority_generation,
@@ -1748,6 +1750,7 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
             service,
             peer_node_ids,
             resident_metadata_scope,
+            needs_global_hydration: false,
         },
         detached_send_runtime,
     )))
@@ -1777,6 +1780,7 @@ pub(crate) fn open_daemon_dfs_message_content_read_lane_with_content(
             service: NetworkedDfsService::new(transport, content),
             peer_node_ids,
             resident_metadata_scope: None,
+            needs_global_hydration: false,
         },
         detached_send_runtime,
     )))
@@ -3363,6 +3367,7 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         runtime,
         traceparent,
         None,
+        None,
     )
 }
 
@@ -3382,6 +3387,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    stage_shard: Option<ResidentLocalMetadataShardHandle>,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     match reject_daemon_dfs_incomplete_genesis_before_effects(
@@ -3571,6 +3577,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
         publication_provider,
         completed_phase,
+        stage_shard,
     );
     if let Some(scope) = publication_scope.take() {
         scope.finish()?;
@@ -4564,6 +4571,19 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         } else {
             None
         };
+        let stage_answer = stage_answer::prepare_stage_answer(
+            &data_dir,
+            &peer_snapshot,
+            &command,
+            metadata_authority_preflight.as_ref(),
+            Arc::clone(&data_owner_lock),
+            runtime,
+        )
+        .await?;
+        let (stage_scope, process_stage_shard, stage_admission) = match stage_answer {
+            Some((scope, shard, admission)) => (Some(scope), Some(shard), Some(admission)),
+            None => (None, None, None),
+        };
         let uses_content_read_lane = verified_fetch.is_some() || uses_content_read_lane;
         let request_id = command.request_id.clone();
         let source_node_id = command.routed_message.source_node_id.clone();
@@ -4571,7 +4591,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let frame_id = command.routed_message.frame_id;
         let message_id = command.routed_message.message_id;
         let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
-        let execution_scope = dfs_message_execution_scope(&command);
+        let execution_scope = stage_scope.unwrap_or_else(|| dfs_message_execution_scope(&command));
         let execution_scope_label = match &execution_scope {
             DfsMessageExecutionScope::ReadOnly => "read-only".to_string(),
             DfsMessageExecutionScope::ExactShard {
@@ -4653,11 +4673,15 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let scheduler_started = admission_trace.start();
         let preempt_maintenance =
             daemon_dfs_message_preempts_maintenance(&command.routed_message.message);
-        let admitted = tracing::Instrument::instrument(
-            admit_daemon_dfs_message(&scheduler, &admission_scope, preempt_maintenance),
-            admission_trace.span("initial-scheduler"),
-        )
-        .await;
+        let admitted = if let Some(admission) = stage_admission {
+            Ok(admission)
+        } else {
+            tracing::Instrument::instrument(
+                admit_daemon_dfs_message(&scheduler, &admission_scope, preempt_maintenance),
+                admission_trace.span("initial-scheduler"),
+            )
+            .await
+        };
         admission_trace.record(
             "initial-scheduler",
             if admitted.is_ok() {
@@ -4832,6 +4856,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     &process_runtime,
                     process_traceparent.clone(),
                     process_completed_phase.map(|completed| *completed),
+                    process_stage_shard,
                 )
             });
             // A blocking task keeps running when its async JoinHandle is dropped.
@@ -5192,6 +5217,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         Duration::ZERO,
         &mut mutation_admission,
         runtime,
+        None,
         None,
         None,
     )?{
