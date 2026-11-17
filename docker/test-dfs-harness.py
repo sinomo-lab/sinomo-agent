@@ -157,6 +157,27 @@ class HarnessTests(unittest.TestCase):
                     'bulk_requester_is_nonprimary "$1"', "test", str(path)], capture_output=True)
                 self.assertEqual(result.returncode == 0, expected, result.stderr.decode())
 
+    def test_initial_readiness_assigns_fresh_nodes_before_requiring_resident_counts(self):
+        script = Path(__file__).with_name("test-cluster.sh").read_text()
+        body = script.split("wait_for_dfs_benchmark_ready() {", 1)[1].split("\n}\n", 1)[0]
+        function = "wait_for_dfs_benchmark_ready() {" + body + "\n}\n"
+        for reuse, order in [("0", ["converged", "ready"]), ("1", ["ready", "converged"])]:
+            for failing in ["", "ready", "converged"]:
+                with self.subTest(reuse=reuse, failing=failing):
+                    prelude = r'''
+wait_for_dfs_ready() { printf 'ready\n'; [ "$failing" != ready ]; }
+wait_for_dfs_converged() { printf 'converged\n'; [ "$failing" != converged ]; }
+SINOMO_TEST_REUSE="$1"
+failing="$2"
+'''
+                    result = subprocess.run(["bash", "-c", prelude + function +
+                        'wait_for_dfs_benchmark_ready; result=$?\nprintf "%s\\n" "$FAILED_SCENARIOS" >&2\nexit "$result"',
+                        "test", reuse, failing], capture_output=True, text=True, timeout=5)
+                    expected = order if not failing else order[:order.index(failing) + 1]
+                    self.assertEqual(result.stdout.splitlines(), expected)
+                    self.assertEqual(result.returncode, 1 if failing else 0)
+                    self.assertEqual(result.stderr.strip(), f"pre-benchmark-dfs-{failing}" if failing else "")
+
     def test_convergence_probe_receives_the_remaining_command_budget(self):
         script = Path(__file__).with_name("test-cluster.sh").read_text()
         function = script.split("wait_for_dfs_converged() {", 1)[1].split("\n}\n", 1)[0]

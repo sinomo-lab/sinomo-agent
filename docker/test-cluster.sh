@@ -2797,8 +2797,13 @@ request_fresh_dfs_topology() {
   layout="$ARTIFACTS/dfs-requested-topology.layout.last.json"
   while :; do
     command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
-    compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
-      --require-cluster --json >"$layout" 2>"$ARTIFACTS/dfs-requested-topology.layout.last.stderr.log" || return 1
+    if ! compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
+      --require-cluster --json >"$layout" 2>"$ARTIFACTS/dfs-requested-topology.layout.last.stderr.log"; then
+      # Initial native bootstrap may still be publishing its layout. Only retry
+      # this read, within the same convergence deadline; never replay a mutation.
+      sleep "$POLL_INTERVAL"
+      continue
+    fi
     jq -e '.status == "passed" and (.diagnostics.pending_handoff_keys | type) == "array"
       and (.diagnostics.shards | length) == 3
       and ([.diagnostics.shards[].lane] | sort) == ["root", "services", "users"]' \
@@ -5067,6 +5072,22 @@ if ! wait_for_network_ready; then
   exit 1
 fi
 
+wait_for_dfs_benchmark_ready() {
+  local phase phases="ready converged"
+  # Fresh nodes outside the bootstrap assignment have no resident metadata
+  # counts yet. Activate the requested six-member layout before requiring those
+  # observations on every node. Retained projects keep their existing ordering.
+  if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
+    phases="converged ready"
+  fi
+  for phase in $phases; do
+    if ! "wait_for_dfs_$phase"; then
+      FAILED_SCENARIOS="pre-benchmark-dfs-$phase"
+      return 1
+    fi
+  done
+}
+
 # The quiet gate measures the complete service containers, so every control
 # plane that shares those containers must have reached its own stable state
 # first. In particular, a freshly formed cluster can already route RPCs while
@@ -5075,12 +5096,7 @@ fi
 # would conflate expected formation work with idle control-plane load and make
 # every throughput result depend on a race. These are readiness prerequisites,
 # not part of the Docker-only 60-second cluster-join gate above.
-if ! wait_for_dfs_ready; then
-  FAILED_SCENARIOS="pre-benchmark-dfs-ready"
-  exit 1
-fi
-if ! wait_for_dfs_converged; then
-  FAILED_SCENARIOS="pre-benchmark-dfs-converged"
+if ! wait_for_dfs_benchmark_ready; then
   exit 1
 fi
 if [ "$QUIET_ONLY" = 1 ]; then
