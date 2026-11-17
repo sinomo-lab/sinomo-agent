@@ -453,6 +453,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Reject up front while writes are still settling so the caller sees
         // a clean retriable error with no job created.
         self.ensure_no_open_write_state_for_object(&source, &from)?;
+        // Likewise while a moved alias's target shard is converting.
+        self.ensure_hardlink_target_storage_active([&source])?;
 
         let mut moved = source.clone();
         if source.kind != DfsObjectKind::Hardlink {
@@ -851,6 +853,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             resolved.push((moved, old_path, new_path));
         }
+        // Before any frame of this page: while a carried alias's target shard
+        // converts, the job keeps this scan frame and stays Running.
+        self.ensure_hardlink_target_storage_active(resolved.iter().map(|(moved, _, _)| moved))?;
         if let Some(next_cursor) = page.next_cursor {
             job.pending_frames
                 .push(DfsNamespaceJobFrame::CrossShardDirScan {
@@ -1030,6 +1035,90 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(())
+    }
+
+    /// A cross-shard move of a hardlink alias keeps its object id and never
+    /// touches its canonical target, yet it moves the alias's count
+    /// contribution to the target's shard from one shard to another. While
+    /// that shard converts its storage (its record is Converting, so it is
+    /// closed), its contributions must stay where its conversion reads them.
+    /// Surfaces `Busy` (retriable) before any effect: a coordinator rejects up
+    /// front, and a parked directory saga keeps the page until the shard is
+    /// Active again.
+    ///
+    /// The target is resolved through the current shard catalog, and its
+    /// owner's record is read from the retained configuration projection. A
+    /// closed shard cannot answer that resolution, so a failed resolution
+    /// while any shard converts is the same wait. A dangling alias names no
+    /// target and moves no contribution. A shard without a record is not
+    /// closed by this check.
+    fn ensure_hardlink_target_storage_active<'a>(
+        &mut self,
+        moved: impl IntoIterator<Item = &'a DfsObjectMetadata>,
+    ) -> Result<()> {
+        let aliases = moved
+            .into_iter()
+            .filter(|object| object.kind == DfsObjectKind::Hardlink)
+            .collect::<Vec<_>>();
+        let Some(first) = aliases.first() else {
+            return Ok(());
+        };
+        if self.control_plane.is_none() {
+            return Ok(());
+        }
+        let catalog = self.metadata_shard_authorities(&first.file_system_id)?;
+        for alias in aliases {
+            let busy = || {
+                Err(DfsPosixError::Dfs(DfsError::Busy {
+                    path: alias.path.clone(),
+                }))
+            };
+            let resolved = {
+                // A storage check, not a mutation input: keep its target read
+                // out of the caller's recorded read set.
+                let _check = self.namespace_execution.begin_independent_planning();
+                self.resolve_hardlink_target_distributed(alias, Some(&catalog))
+            };
+            let target = match resolved {
+                Ok(target) => target,
+                Err(DfsPosixError::NotFound { .. } | DfsPosixError::InvalidPath { .. }) => continue,
+                Err(error) => {
+                    for shard in &catalog {
+                        if self.metadata_shard_storage_is_converting(shard)? {
+                            return busy();
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            let owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &alias.file_system_id,
+                &catalog,
+                &target.path,
+            )
+            .map_err(DfsError::from)?;
+            if let Some(owner) = owner
+                && self.metadata_shard_storage_is_converting(&owner)?
+            {
+                return busy();
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `shard`'s storage record, in the retained configuration
+    /// projection, names a conversion in progress.
+    fn metadata_shard_storage_is_converting(
+        &mut self,
+        shard: &crate::DfsMetadataShardConfig,
+    ) -> Result<bool> {
+        let Some(kv) = self.control_plane.as_mut() else {
+            return Ok(false);
+        };
+        let record = crate::DfsControlPlaneStore::new(kv.as_mut())
+            .get_metadata_shard_storage(&shard.file_system_id, &shard.shard_id)
+            .map_err(DfsError::from)?;
+        Ok(record.is_some_and(|record| !record.is_active()))
     }
 
     fn run_cross_shard_adopt_for_job(

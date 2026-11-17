@@ -1,6 +1,7 @@
 //! One demand/background queue. Conversion progress remains in the job checkpoint.
 use super::inventory::{Inventory, ObservedState, UnitKey, UnitReference};
 use super::*;
+use sinomo_core::node::NodeId;
 use std::collections::VecDeque;
 
 #[derive(Debug)]
@@ -20,6 +21,12 @@ pub(super) struct Scheduler {
     // Advisory exact-key subscriptions for the existing owned units. These
     // only wake revalidation; configuration and permission are read natively.
     native_watch_keys: BTreeMap<String, BTreeSet<String>>,
+    // Advisory node subscriptions: a unit parked on an unreachable node is
+    // requeued when that node becomes reachable, never by a timer.
+    reachability_watch_nodes: BTreeMap<String, BTreeSet<NodeId>>,
+    // Nodes that became reachable during a running step, so a watch that
+    // step registers afterwards still observes them.
+    reachable_while_running: BTreeMap<String, BTreeSet<NodeId>>,
     content_verified: BTreeMap<String, (String, String)>,
 }
 impl Scheduler {
@@ -35,6 +42,8 @@ impl Scheduler {
             retry_at: BTreeMap::new(),
             retry_delay: BTreeMap::new(),
             native_watch_keys: BTreeMap::new(),
+            reachability_watch_nodes: BTreeMap::new(),
+            reachable_while_running: BTreeMap::new(),
             content_verified: BTreeMap::new(),
         }
     }
@@ -96,10 +105,12 @@ impl Scheduler {
         self.prefer_demand = !self.prefer_demand;
         self.queued.remove(&id);
         self.running.insert(id.clone(), false);
+        self.reachable_while_running.insert(id.clone(), BTreeSet::new());
         Some((id.clone(), self.units[&id].clone()))
     }
     pub fn finish(&mut self, id: &str, reference: UnitReference) -> bool {
         let changed_while_running = self.running.remove(id).unwrap_or(false);
+        self.reachable_while_running.remove(id);
         self.retry_at.remove(id);
         if !matches!(reference.state, ObservedState::Waiting { .. }) {
             self.retry_delay.remove(id);
@@ -116,6 +127,7 @@ impl Scheduler {
             changed_while_running && matches!(reference.state, ObservedState::Waiting { .. });
         if matches!(reference.state, ObservedState::VerifiedCurrent | ObservedState::RetainedOriginal | ObservedState::Blocked { .. }) {
             self.native_watch_keys.remove(id);
+            self.reachability_watch_nodes.remove(id);
             self.demanded.remove(id);
         }
         self.units.insert(id.to_owned(), reference);
@@ -221,6 +233,32 @@ impl Scheduler {
         self.native_watch_keys.insert(id, keys);
         Ok(())
     }
+    /// Park `unit` on `nodes` until one of them becomes reachable. A node
+    /// that became reachable earlier in the unit's running step reruns it.
+    pub fn watch_reachable_nodes(&mut self, unit: &UnitKey, nodes: BTreeSet<NodeId>) -> Result<()> {
+        let id = unit.id()?;
+        if !self.units.contains_key(&id) { return Err(error("reachability dependency has no existing work owner")); }
+        if let (Some(changed), Some(seen)) = (self.running.get_mut(&id), self.reachable_while_running.get(&id))
+            && !seen.is_disjoint(&nodes) {
+            *changed = true;
+        }
+        self.reachability_watch_nodes.insert(id, nodes);
+        Ok(())
+    }
+    /// Every node some unit waits to reach.
+    pub fn watched_nodes(&self) -> BTreeSet<NodeId> {
+        self.reachability_watch_nodes.values().flatten().cloned().collect()
+    }
+    /// Requeue the Waiting or running units watching any of `nodes`.
+    pub fn nodes_became_reachable(&mut self, nodes: &BTreeSet<NodeId>) -> bool {
+        for seen in self.reachable_while_running.values_mut() {
+            seen.extend(nodes.iter().cloned());
+        }
+        let watching = self.reachability_watch_nodes.iter()
+            .filter(|(_, watched)| !watched.is_disjoint(nodes))
+            .map(|(id, _)| id.clone()).collect::<BTreeSet<_>>();
+        !watching.is_empty() && self.dependencies_changed(|unit| unit.id().is_ok_and(|id| watching.contains(&id)))
+    }
     /// Reloaded observations are hints; the owner revalidates current DATA.
     pub fn recovered(&mut self, reference: UnitReference) -> Result<()> {
         let key = reference.unit.clone();
@@ -275,6 +313,8 @@ pub(in crate::authority) struct OwnerWork {
     pub inventory: Inventory,
     pub discovery: Mutex<super::discovery::Discovery>,
     pub wake: tokio::sync::Notify,
+    /// Wakes the reachability watcher when a unit registers nodes to wait on.
+    pub reachability: tokio::sync::Notify,
     pub changed: tokio::sync::watch::Sender<u64>,
     pub attached: std::sync::atomic::AtomicBool,
     pub active: std::sync::atomic::AtomicUsize,
@@ -291,12 +331,21 @@ impl OwnerWork {
             inventory,
             discovery: Mutex::new(discovery),
             wake: Default::default(),
+            reachability: Default::default(),
             changed,
             attached: Default::default(),
             active: Default::default(),
             cancelled: Default::default(),
             drained: Default::default(),
         })
+    }
+    /// Park `unit` on `nodes` (decision Q2): it waits for one of them to
+    /// become reachable instead of retrying on a timer.
+    #[cfg_attr(not(test), allow(dead_code, reason = "consumed by the per-shard conversion driver"))]
+    pub(super) fn watch_reachable_nodes(&self, unit: &UnitKey, nodes: BTreeSet<NodeId>) -> Result<()> {
+        self.scheduler.lock().map_err(error)?.watch_reachable_nodes(unit, nodes)?;
+        self.reachability.notify_one();
+        Ok(())
     }
     pub fn notify(&self) {
         if let Ok(mut scheduler) = self.scheduler.lock() {

@@ -16,6 +16,12 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) mod contributions;
+pub use contributions::{
+    NamespaceCountAliasContribution, NamespaceCountChildDirectoryContribution,
+    ShardCountContributions,
+};
+
 type Result<T> = std::result::Result<T, MetadataBackendError>;
 type ObjectKey = (DfsFileSystemId, DfsObjectId);
 type ScopeKey = (DfsFileSystemId, DfsMetadataShardId);
@@ -160,71 +166,24 @@ fn plan_count_census(
     sources: &[NamespaceCountMaintenanceSource],
     limits: NamespaceCountMaintenanceLimits,
 ) -> Result<NamespaceCountMaintenancePlan> {
-    check_deadline(limits)?;
-    // Reject an oversized complete input before cloning/reconstructing native
-    // tables or hashing any candidate. Input snapshots are immutably borrowed.
-    let mut object_count = 0usize;
-    for source in sources {
-        check_deadline(limits)?;
-        object_count = object_count
-            .checked_add(source.captured.projected_rows.objects.len())
-            .ok_or_else(|| invalid("namespace census record count overflow"))?;
-        if object_count > limits.max_objects {
-            return Err(invalid(
-                "namespace-count maintenance object budget exhausted",
-            ));
-        }
-    }
-    let mut budget = EncodedBudget {
-        remaining: limits.max_encoded_bytes,
-        deadline: limits.deadline,
-        deadline_exhausted: false,
-    };
-    for source in sources {
-        check_deadline(limits)?;
-        serde_json::to_writer(
-            &mut budget,
-            source.captured.as_ref(),
-        )
-        .map_err(|error| if budget.deadline_exhausted {
-            MetadataBackendError::PreparationBudgetExhausted { work: "namespace-count input validation" }
-        } else { invalid(error.to_string()) })?;
-    }
+    preflight_count_input(sources.iter().map(|source| source.captured.as_ref()), 0, limits)?;
     let scopes = native_catalog.map(catalog_by_scope).transpose()?;
     let mut standalone_filesystems = BTreeSet::new();
     if sources.is_empty() {
         return Err(invalid("namespace census requires a complete source set"));
     }
     let mut covered = BTreeSet::new();
-    let mut rows = BTreeMap::<ObjectKey, (DfsMetadataShardId, DfsObjectMetadata)>::new();
-    let mut paths = BTreeMap::<(DfsFileSystemId, String), ObjectKey>::new();
+    let mut owned = CountedRows::default();
     for source in sources {
         check_deadline(limits)?;
-        source.captured.validate()?;
+        admit_settled_count_source(&source.captured)?;
         let cut = &source.captured.source;
-        if cut.source_identity.is_empty()
-            || cut.source_snapshot_fingerprint.is_empty()
-            || source.captured.has_unresolved_work()
-            || cut.original_handoff.is_some()
-        {
-            return Err(invalid(
-                "namespace-count source identity/catalog is incomplete or has unfinished conversion",
-            ));
-        }
         if let Some(scopes) = &scopes {
             if catalog_by_scope(&cut.projection_assignments)? != *scopes {
                 return Err(invalid("namespace-count source catalog differs from complete cut"));
             }
-            let expected_scopes = scopes
-                .keys()
-                .filter(|(_, shard)| shard == &cut.physical_shard)
-                .cloned()
-                .collect::<Vec<_>>();
-            if expected_scopes.is_empty() {
-                return Err(invalid("namespace-count source has a foreign shard"));
-            }
-            for key in expected_scopes {
-                if !cut.file_system_ids.contains(&key.0) || !covered.insert(key) {
+            for key in source_scopes(cut, scopes)? {
+                if !covered.insert(key) {
                     return Err(invalid(
                         "namespace-count sources repeat or omit a filesystem/shard",
                     ));
@@ -240,94 +199,8 @@ fn plan_count_census(
                 }
             }
         }
-        let tables = &source.captured.projected_rows;
-        if tables
-            .prepared_operations_v7
-            .iter()
-            .any(|row| row.status == DfsPreparedOperationStatus::Prepared
-                && !source.captured.recovery_preparations().contains(row))
-            || tables
-                .namespace_jobs
-                .iter()
-                .any(|row| row.status != DfsNamespaceJobStatus::Completed)
-            || tables
-                .namespace_requests
-                .iter()
-                .any(|row| row.status == DfsNamespaceRequestStatus::Pending)
-            || tables.intents.iter().any(|row| {
-                matches!(
-                    row.status,
-                    DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-                )
-            })
-        {
-            return Err(invalid(
-                "namespace-count maintenance requires settled original namespace and write operations",
-            ));
-        }
-        let mut current_paths = BTreeMap::new();
-        for row in &tables.paths {
-            check_deadline(limits)?;
-            let key = (
-                row.file_system_id.clone(),
-                row.path.trim_matches('/').to_owned(),
-            );
-            if current_paths.insert(key, row).is_some() {
-                return Err(invalid(
-                    "namespace census contains duplicate path-index entries",
-                ));
-            }
-        }
-        for object in &tables.objects {
-            check_deadline(limits)?;
-            if !canonical_path(&object.path) {
-                return Err(invalid("namespace census contains a noncanonical path"));
-            }
-            if object.kind == DfsObjectKind::Tombstone || object.tombstone_provenance.is_some() {
-                continue;
-            }
-            if let Some(catalog) = native_catalog {
-                let owner = sinomo_dfs::select_metadata_shard_config_for_path(
-                    &object.file_system_id,
-                    catalog,
-                    &object.path,
-                )
-                .map_err(|error| invalid(error.to_string()))?
-                .ok_or_else(|| invalid("live namespace object has no current catalog owner"))?;
-                if owner.shard_id != cut.physical_shard.0 {
-                    continue;
-                } // historical physical copy, not an extra link
-            } else if !cut.file_system_ids.contains(&object.file_system_id) {
-                return Err(invalid("standalone object is outside captured filesystem coverage"));
-            }
-            let current_path = current_paths.get(&(
-                object.file_system_id.clone(),
-                object.path.trim_matches('/').to_owned(),
-            ));
-            if current_path
-                .is_none_or(|row| row.object_id != object.object_id || row.kind != object.kind)
-            {
-                return Err(invalid(
-                    "live authoritative object has no matching current namespace entry",
-                ));
-            }
-            if object.kind == DfsObjectKind::Hardlink && object.namespace_link_count.is_some() {
-                return Err(invalid(
-                    "alias marker cannot own a canonical namespace count",
-                ));
-            }
-            let key = (object.file_system_id.clone(), object.object_id.clone());
-            if rows
-                .insert(key.clone(), (cut.physical_shard.clone(), object.clone()))
-                .is_some()
-                || paths
-                    .insert((object.file_system_id.clone(), object.path.clone()), key)
-                    .is_some()
-            {
-                return Err(invalid(
-                    "namespace census repeats an authoritative object identity or path",
-                ));
-            }
+        for object in owned_live_rows(&source.captured, native_catalog, limits)? {
+            owned.insert(&cut.physical_shard, object)?;
         }
     }
     if scopes.as_ref().is_some_and(|scopes| covered != scopes.keys().cloned().collect()) {
@@ -335,7 +208,260 @@ fn plan_count_census(
             "namespace-count maintenance omits a current authority scope",
         ));
     }
-    let mut counts = rows
+    let counts = local_counts(&owned, CountScope::Complete, limits)?;
+    let updates = verified_count_updates(counts, owned.rows, limits)?;
+    finish_count_plan(native_catalog.unwrap_or_default().to_vec(), sources, updates, limits)
+}
+
+/// Reject an oversized input before cloning/reconstructing native tables or
+/// hashing any candidate. Input snapshots are immutably borrowed.
+/// `extra_records` counts already-extracted contribution entries.
+fn preflight_count_input<'a>(
+    sources: impl Iterator<Item = &'a CapturedMetadataUnit> + Clone,
+    extra_records: usize,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<()> {
+    check_deadline(limits)?;
+    let exhausted = || invalid("namespace-count maintenance object budget exhausted");
+    let mut object_count = extra_records;
+    if object_count > limits.max_objects {
+        return Err(exhausted());
+    }
+    for source in sources.clone() {
+        check_deadline(limits)?;
+        object_count = object_count
+            .checked_add(source.projected_rows.objects.len())
+            .ok_or_else(|| invalid("namespace census record count overflow"))?;
+        if object_count > limits.max_objects {
+            return Err(exhausted());
+        }
+    }
+    let mut budget = EncodedBudget {
+        remaining: limits.max_encoded_bytes,
+        deadline: limits.deadline,
+        deadline_exhausted: false,
+    };
+    for source in sources {
+        check_deadline(limits)?;
+        serde_json::to_writer(&mut budget, source)
+        .map_err(|error| if budget.deadline_exhausted {
+            MetadataBackendError::PreparationBudgetExhausted { work: "namespace-count input validation" }
+        } else { invalid(error.to_string()) })?;
+    }
+    Ok(())
+}
+
+/// Source admission shared by every count mode: an exact captured identity
+/// with no unfinished conversion and no unsettled original work.
+fn admit_settled_count_source(captured: &CapturedMetadataUnit) -> Result<()> {
+    captured.validate()?;
+    let cut = &captured.source;
+    if cut.source_identity.is_empty()
+        || cut.source_snapshot_fingerprint.is_empty()
+        || captured.has_unresolved_work()
+        || cut.original_handoff.is_some()
+    {
+        return Err(invalid(
+            "namespace-count source identity/catalog is incomplete or has unfinished conversion",
+        ));
+    }
+    refuse_unsettled_count_work(captured)
+}
+
+/// A partial cross-shard saga or write is not a namespace cut: refuse
+/// Prepared V7 operations recovery does not cover, non-Completed namespace
+/// jobs, Pending requests and staging intents.
+fn refuse_unsettled_count_work(captured: &CapturedMetadataUnit) -> Result<()> {
+    let tables = &captured.projected_rows;
+    if tables
+        .prepared_operations_v7
+        .iter()
+        .any(|row| row.status == DfsPreparedOperationStatus::Prepared
+            && !captured.recovery_preparations().contains(row))
+        || tables
+            .namespace_jobs
+            .iter()
+            .any(|row| row.status != DfsNamespaceJobStatus::Completed)
+        || tables
+            .namespace_requests
+            .iter()
+            .any(|row| row.status == DfsNamespaceRequestStatus::Pending)
+        || tables.intents.iter().any(|row| {
+            matches!(
+                row.status,
+                DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+            )
+        })
+    {
+        return Err(invalid(
+            "namespace-count maintenance requires settled original namespace and write operations",
+        ));
+    }
+    Ok(())
+}
+
+/// The catalog scopes a source's physical shard serves; each must be covered
+/// by the source's captured filesystems.
+fn source_scopes(
+    cut: &CapturedMetadataSource,
+    scopes: &BTreeMap<ScopeKey, DfsMetadataShardConfig>,
+) -> Result<Vec<ScopeKey>> {
+    let expected_scopes = scopes
+        .keys()
+        .filter(|(_, shard)| shard == &cut.physical_shard)
+        .cloned()
+        .collect::<Vec<_>>();
+    if expected_scopes.is_empty() {
+        return Err(invalid("namespace-count source has a foreign shard"));
+    }
+    if expected_scopes.iter().any(|key| !cut.file_system_ids.contains(&key.0)) {
+        return Err(invalid(
+            "namespace-count sources repeat or omit a filesystem/shard",
+        ));
+    }
+    Ok(expected_scopes)
+}
+
+fn current_owner(
+    file_system_id: &DfsFileSystemId,
+    catalog: &[DfsMetadataShardConfig],
+    path: &str,
+) -> Result<DfsMetadataShardConfig> {
+    sinomo_dfs::select_metadata_shard_config_for_path(file_system_id, catalog, path)
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| invalid("live namespace object has no current catalog owner"))
+}
+
+/// One source's live rows attributed to it: tombstones are skipped, and
+/// under a native catalog a row whose path another shard currently owns is a
+/// historical physical copy, not an extra link.
+fn owned_live_rows<'a>(
+    captured: &'a CapturedMetadataUnit,
+    native_catalog: Option<&[DfsMetadataShardConfig]>,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<Vec<&'a DfsObjectMetadata>> {
+    let cut = &captured.source;
+    let tables = &captured.projected_rows;
+    let mut current_paths = BTreeMap::new();
+    for row in &tables.paths {
+        check_deadline(limits)?;
+        let key = (
+            row.file_system_id.clone(),
+            row.path.trim_matches('/').to_owned(),
+        );
+        if current_paths.insert(key, row).is_some() {
+            return Err(invalid(
+                "namespace census contains duplicate path-index entries",
+            ));
+        }
+    }
+    let mut owned = Vec::new();
+    for object in &tables.objects {
+        check_deadline(limits)?;
+        if !canonical_path(&object.path) {
+            return Err(invalid("namespace census contains a noncanonical path"));
+        }
+        if object.kind == DfsObjectKind::Tombstone || object.tombstone_provenance.is_some() {
+            continue;
+        }
+        if let Some(catalog) = native_catalog {
+            let owner = current_owner(&object.file_system_id, catalog, &object.path)?;
+            if owner.shard_id != cut.physical_shard.0 {
+                continue;
+            } // historical physical copy, not an extra link
+        } else if !cut.file_system_ids.contains(&object.file_system_id) {
+            return Err(invalid("standalone object is outside captured filesystem coverage"));
+        }
+        let current_path = current_paths.get(&(
+            object.file_system_id.clone(),
+            object.path.trim_matches('/').to_owned(),
+        ));
+        if current_path
+            .is_none_or(|row| row.object_id != object.object_id || row.kind != object.kind)
+        {
+            return Err(invalid(
+                "live authoritative object has no matching current namespace entry",
+            ));
+        }
+        if object.kind == DfsObjectKind::Hardlink && object.namespace_link_count.is_some() {
+            return Err(invalid(
+                "alias marker cannot own a canonical namespace count",
+            ));
+        }
+        owned.push(object);
+    }
+    Ok(owned)
+}
+
+/// The counted rows, unique by object identity and by path.
+#[derive(Default)]
+struct CountedRows {
+    rows: BTreeMap<ObjectKey, (DfsMetadataShardId, DfsObjectMetadata)>,
+    paths: BTreeMap<(DfsFileSystemId, String), ObjectKey>,
+}
+impl CountedRows {
+    fn insert(&mut self, shard: &DfsMetadataShardId, object: &DfsObjectMetadata) -> Result<()> {
+        let key = (object.file_system_id.clone(), object.object_id.clone());
+        if self
+            .rows
+            .insert(key.clone(), (shard.clone(), object.clone()))
+            .is_some()
+            || self
+                .paths
+                .insert((object.file_system_id.clone(), object.path.clone()), key)
+                .is_some()
+        {
+            return Err(invalid(
+                "namespace census repeats an authoritative object identity or path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Which counts the counted rows complete.
+#[derive(Clone, Copy)]
+enum CountScope<'a> {
+    /// Every current owner's rows: each parent and alias target is present.
+    Complete,
+    /// One shard's owned rows. A parent path or alias target another shard
+    /// owns is counted by that owner from this shard's contributions.
+    Shard {
+        catalog: &'a [DfsMetadataShardConfig],
+        shard: &'a DfsMetadataShardId,
+    },
+}
+impl CountScope<'_> {
+    fn owns(self, file_system_id: &DfsFileSystemId, path: &str) -> Result<bool> {
+        match self {
+            Self::Complete => Ok(true),
+            Self::Shard { catalog, shard } => {
+                Ok(current_owner(file_system_id, catalog, path)?.shard_id == shard.0)
+            }
+        }
+    }
+}
+
+fn increment_count(counts: &mut BTreeMap<ObjectKey, u64>, key: &ObjectKey) -> Result<()> {
+    let count = counts
+        .get_mut(key)
+        .ok_or_else(|| invalid("namespace count has no canonical owner"))?;
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| invalid("namespace link count overflow"))?;
+    Ok(())
+}
+
+/// Base counts (2 for a directory, 1 for another canonical object) plus the
+/// increments the counted rows give each other: an alias to its target, a
+/// directory to its parent.
+fn local_counts(
+    owned: &CountedRows,
+    scope: CountScope<'_>,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<BTreeMap<ObjectKey, u64>> {
+    let mut counts = owned
+        .rows
         .iter()
         .filter(|(_, (_, object))| object.kind != DfsObjectKind::Hardlink)
         .map(|(key, (_, object))| {
@@ -349,17 +475,22 @@ fn plan_count_census(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    for (key, (_, object)) in &rows {
+    for (key, (_, object)) in &owned.rows {
         check_deadline(limits)?;
-        if let Some(parent_path) = parent(&object.path) {
-            let parent_key = paths
+        let mut parent_key = None;
+        if let Some(parent_path) = parent(&object.path)
+            && scope.owns(&key.0, parent_path)?
+        {
+            let found = owned
+                .paths
                 .get(&(key.0.clone(), parent_path.into()))
                 .ok_or_else(|| {
                     invalid("live namespace object parent is absent from complete cut")
                 })?;
-            if rows[parent_key].1.kind != DfsObjectKind::Directory {
+            if owned.rows[found].1.kind != DfsObjectKind::Directory {
                 return Err(invalid("live namespace object parent is not a directory"));
             }
+            parent_key = Some(found);
         }
         let increment = if object.kind == DfsObjectKind::Hardlink {
             let target = object
@@ -367,43 +498,44 @@ fn plan_count_census(
                 .as_ref()
                 .ok_or_else(|| invalid("namespace alias has no canonical target"))?;
             let target_key = (object.file_system_id.clone(), target.clone());
-            let (_, target_object) = rows
-                .get(&target_key)
-                .ok_or_else(|| invalid("namespace alias target is missing from complete cut"))?;
-            if matches!(
-                target_object.kind,
-                DfsObjectKind::Directory | DfsObjectKind::Hardlink | DfsObjectKind::Tombstone
-            ) {
-                return Err(invalid(
-                    "namespace alias names a noncanonical or directory target",
-                ));
-            }
-            Some(target_key)
-        } else if object.kind == DfsObjectKind::Directory {
-            parent(&object.path)
-                .map(|parent| {
-                    let parent_key =
-                        paths.get(&(key.0.clone(), parent.into())).ok_or_else(|| {
-                            invalid("namespace directory parent is absent from complete cut")
-                        })?;
-                    if rows[parent_key].1.kind != DfsObjectKind::Directory {
-                        return Err(invalid("namespace directory parent is not a directory"));
+            match owned.rows.get(&target_key) {
+                Some((_, target_object)) => {
+                    if matches!(
+                        target_object.kind,
+                        DfsObjectKind::Directory | DfsObjectKind::Hardlink | DfsObjectKind::Tombstone
+                    ) {
+                        return Err(invalid(
+                            "namespace alias names a noncanonical or directory target",
+                        ));
                     }
-                    Ok(parent_key.clone())
-                })
-                .transpose()?
+                    Some(target_key)
+                }
+                None if matches!(scope, CountScope::Complete) => {
+                    return Err(invalid("namespace alias target is missing from complete cut"));
+                }
+                // Another shard's canonical object: its owner counts this
+                // alias from this shard's contributions.
+                None => None,
+            }
+        } else if object.kind == DfsObjectKind::Directory {
+            parent_key.cloned()
         } else {
             None
         };
         if let Some(key) = increment {
-            let count = counts
-                .get_mut(&key)
-                .ok_or_else(|| invalid("namespace count has no canonical owner"))?;
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| invalid("namespace link count overflow"))?;
+            increment_count(&mut counts, &key)?;
         }
     }
+    Ok(counts)
+}
+
+/// Existing initialized counts are verified, never recomputed; only absent
+/// counts become updates.
+fn verified_count_updates(
+    counts: BTreeMap<ObjectKey, u64>,
+    mut rows: BTreeMap<ObjectKey, (DfsMetadataShardId, DfsObjectMetadata)>,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<Vec<NamespaceCountMaintenanceUpdate>> {
     let mut updates = Vec::new();
     for (key, count) in counts {
         check_deadline(limits)?;
@@ -424,8 +556,17 @@ fn plan_count_census(
             });
         }
     }
+    Ok(updates)
+}
+
+fn finish_count_plan(
+    catalog: Vec<DfsMetadataShardConfig>,
+    sources: &[NamespaceCountMaintenanceSource],
+    updates: Vec<NamespaceCountMaintenanceUpdate>,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<NamespaceCountMaintenancePlan> {
     let plan = NamespaceCountMaintenancePlan {
-        catalog: native_catalog.unwrap_or_default().to_vec(),
+        catalog,
         sources: sources
             .iter()
             .map(|source| source.captured.source.clone())
@@ -562,7 +703,7 @@ mod tests {
 
     // Conversion DATA tests: ordinary candidate codecs create immutable staged
     // images, not an authenticated cluster cut or permission to install them.
-    fn limits() -> NamespaceCountMaintenanceLimits {
+    pub(super) fn limits() -> NamespaceCountMaintenanceLimits {
         NamespaceCountMaintenanceLimits {
             max_objects: 100,
             max_encoded_bytes: 4 * 1024 * 1024,
@@ -604,7 +745,7 @@ mod tests {
             })
             .collect()
     }
-    fn object(name: &str, path: &str, kind: DfsObjectKind) -> DfsObjectMetadata {
+    pub(super) fn object(name: &str, path: &str, kind: DfsObjectKind) -> DfsObjectMetadata {
         DfsObjectMetadata {
             object_id: DfsObjectId::from_legacy_named(name).unwrap(),
             file_system_id: sinomo_dfs::sifs_file_system_id(),
@@ -630,7 +771,7 @@ mod tests {
             last_modified_by_event_id: None,
         }
     }
-    fn source(
+    pub(super) fn source(
         root: &std::path::Path,
         catalog: &[DfsMetadataShardConfig],
         shard: &str,
@@ -800,7 +941,7 @@ mod tests {
         });
         config
     }
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         sinomo_testdir::TestDir,
         Vec<DfsMetadataShardConfig>,
         Vec<NamespaceCountMaintenanceSource>,
@@ -1001,7 +1142,7 @@ mod tests {
         assert!(!staging.exists());
     }
 
-    fn reseal(source: &mut NamespaceCountMaintenanceSource) {
+    pub(super) fn reseal(source: &mut NamespaceCountMaintenanceSource) {
         let old = &source.captured;
         source.captured = Arc::new(
             CapturedMetadataUnit::from_test_projection(

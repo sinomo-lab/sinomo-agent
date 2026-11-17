@@ -341,6 +341,13 @@ impl MigrationOwner {
             }
         });
         scope.defer(move || drop(subscription));
+        // Units parked on an unreachable node wake on its reachability, not
+        // on a timer. A standalone owner has no cluster peers to wait on.
+        if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&paths) {
+            let owner = Arc::clone(self);
+            let task = self.authority.runtime.spawn(owner.watch_peer_reachability(paths, state));
+            scope.own_task("dfs-migration-peer-reachability", task);
+        }
         let owner = Arc::clone(self);
         scope.on_task_drain("dfs-migration-owned-steps", move |deadline| {
             let owner = Arc::clone(&owner);
@@ -420,6 +427,57 @@ impl MigrationOwner {
                 }
             }
         }
+    }
+    /// Hold this node's peer-reachability subscription only while some unit
+    /// watches a node, and requeue the watchers of each node that becomes
+    /// reachable. Nothing here polls: each wake is a verdict change or a new
+    /// watch.
+    async fn watch_peer_reachability(
+        self: Arc<Self>,
+        paths: sinomo_core::network::ClusterPaths,
+        state: sinomo_core::ClusterBootstrapState,
+    ) {
+        use sinomo_core::network::PeerPathVerdict;
+        let mut shutdown = self.lifecycle.clone();
+        let mut subscription: Option<sinomo_core::network::PeerReachabilitySubscription> = None;
+        loop {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() { break; }
+            let Ok(watched) = self.work.scheduler.lock().map(|scheduler| scheduler.watched_nodes()) else { break };
+            if watched.is_empty() {
+                subscription = None;
+            } else if subscription.is_none() {
+                let created = sinomo_core::network::subscribe_peer_reachability(&paths, &state);
+                // A node that became reachable before this subscription
+                // existed is no change to it: deliver the current verdicts once.
+                let reachable = created.current().peers.iter()
+                    .filter(|(node, peer)| watched.contains(*node) && peer.verdict == PeerPathVerdict::Path)
+                    .map(|(node, _)| node.clone()).collect();
+                subscription = Some(created);
+                self.nodes_became_reachable(&reachable);
+            }
+            let changes = async {
+                match subscription.as_mut() {
+                    Some(subscription) => subscription.changed().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = shutdown.changed() => {}
+                _ = self.work.reachability.notified() => {}
+                changes = changes => {
+                    let reachable = changes.into_iter()
+                        .filter(|change| change.current.as_ref().is_some_and(|peer| peer.verdict == PeerPathVerdict::Path)
+                            && change.previous.as_ref().is_none_or(|peer| peer.verdict != PeerPathVerdict::Path))
+                        .map(|change| change.peer_node_id).collect();
+                    self.nodes_became_reachable(&reachable);
+                }
+            }
+        }
+    }
+    fn nodes_became_reachable(&self, nodes: &BTreeSet<sinomo_core::node::NodeId>) {
+        if nodes.is_empty() { return; }
+        let changed = self.work.scheduler.lock().is_ok_and(|mut scheduler| scheduler.nodes_became_reachable(nodes));
+        if changed { self.work.wake.notify_one(); }
     }
     fn discover_step(&self) -> Result<()> {
         let mut discovery = self.work.discovery.lock().map_err(error)?;

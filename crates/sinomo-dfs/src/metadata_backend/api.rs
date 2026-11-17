@@ -899,6 +899,27 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         crate::file_history_query::query_backend_metadata(self, query)
     }
 
+    fn count_contributions_on_shard(
+        &self,
+        query: &crate::DfsMetadataShardQuery,
+        catalog: &[crate::DfsMetadataShardConfig],
+    ) -> Result<crate::DfsMetadataQueryResult> {
+        if query.shard_id != self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "count contribution query names another metadata shard".into(),
+            ));
+        }
+        let prefix = LocalSobjMetadataBackend::metadata_prefix_proof(self)?;
+        let tables = self.current_tables_snapshot()?;
+        crate::count_contributions::query_count_contributions(
+            &tables,
+            query,
+            catalog,
+            prefix,
+            &mut |_| Ok(true),
+        )
+    }
+
     fn retained_revision_records_page(
         &self,
         namespace: Option<&str>,

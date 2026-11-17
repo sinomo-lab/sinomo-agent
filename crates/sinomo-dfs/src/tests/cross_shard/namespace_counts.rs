@@ -632,3 +632,362 @@ fn concurrent_alias_owners_cannot_reserve_the_same_canonical_count_generation() 
         )
         .unwrap();
 }
+
+/// `shard`'s storage record as the control plane holds it now.
+fn shard_storage_entry(kv: &mut dyn DfsControlPlaneKvClient, shard: &str) -> sinomo_core::kv::KvEntry {
+    let key = crate::metadata_shard_storage_key(&sifs_file_system_id(), shard);
+    kv.get_authoritative_consistent(&[key])
+        .unwrap()
+        .pop()
+        .unwrap()
+        .expect("a born shard carries a storage record")
+}
+
+/// Test setup only: replace the exact record `expected` with `value` and wait
+/// until every node in `nodes` publishes it. No conversion runs; a Converting
+/// record only closes the shard until the original record is restored. `kv`
+/// is a node's native settings producer, so a node whose configuration is
+/// withheld does not stall the setup.
+fn replace_shard_storage(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    kv: &mut dyn DfsControlPlaneKvClient,
+    nodes: &[NodeId],
+    expected: &sinomo_core::kv::KvEntry,
+    value: Vec<u8>,
+) -> sinomo_core::kv::KvEntry {
+    let replaced = kv
+        .txn(KvTxn {
+            compares: vec![sinomo_core::kv::KvCompare::ValueEquals {
+                key: expected.key.clone(),
+                value: expected.value.clone(),
+            }],
+            success: vec![sinomo_core::kv::KvOp::Put {
+                key: expected.key.clone(),
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })
+        .unwrap()
+        .succeeded;
+    assert!(replaced, "the storage record changed under the test");
+    for node in nodes {
+        runtime.wait_published_configuration_current(node).unwrap();
+    }
+    let shard = expected.key.rsplit('/').next().unwrap();
+    shard_storage_entry(kv, shard)
+}
+
+/// Close `shard` as a conversion does: its Active record turns Converting.
+/// Returns the Active and the Converting record.
+fn close_shard_for_conversion(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    kv: &mut dyn DfsControlPlaneKvClient,
+    nodes: &[NodeId],
+    shard: &str,
+) -> (sinomo_core::kv::KvEntry, sinomo_core::kv::KvEntry) {
+    let config = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.shard_id == shard)
+        .unwrap();
+    let active = shard_storage_entry(kv, shard);
+    assert!(
+        active
+            .decode::<crate::DfsMetadataShardStorage>()
+            .unwrap()
+            .is_active()
+    );
+    let converting = replace_shard_storage(
+        runtime,
+        kv,
+        nodes,
+        &active,
+        sinomo_core::kv::encode_kv_value(&crate::DfsMetadataShardStorage::converting_for_test(
+            &config, 1,
+        ))
+        .unwrap(),
+    );
+    (active, converting)
+}
+
+/// A cluster whose root, services and users shards each have one member, so
+/// the root primary that coordinates a move holds no copy of users: users
+/// can be closed for conversion while root and services keep serving.
+fn disjoint_shard_cluster(name: &str) -> (SifsTwoPrimaryCluster, [NodeId; 3]) {
+    let cluster = super::parent_counts::foreign_parent_cluster(name);
+    let members = |config: &DfsMetadataShardConfig| {
+        std::iter::once(config.primary_node_id.clone())
+            .chain(config.replica_node_ids.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    let shards = cluster._runtime.metadata_shards().unwrap();
+    let member_of = |shard: &str| {
+        members(shards.iter().find(|config| config.shard_id == shard).unwrap())
+    };
+    assert_eq!(member_of("root"), vec![cluster.replica_node.clone()]);
+    assert_eq!(member_of("services"), vec![cluster.services_primary_node.clone()]);
+    assert_eq!(member_of("users"), vec![cluster.users_primary_node.clone()]);
+    let nodes = [
+        cluster.users_primary_node.clone(),
+        cluster.services_primary_node.clone(),
+        cluster.replica_node.clone(),
+    ];
+    (cluster, nodes)
+}
+
+#[test]
+fn cross_shard_alias_rename_waits_while_its_target_shard_converts() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-alias-rename-target-converting");
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let canonical = "/users/converting-target";
+    let alias = "/converting-alias";
+    let moved = "/services/converting-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            canonical,
+            b"converting target bytes",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster.replica.posix_hardlink(canonical, alias).unwrap();
+    let linked = cluster.replica.posix_namespace_lstat_distributed(alias).unwrap();
+    assert_eq!(linked.kind, DfsObjectKind::Hardlink);
+
+    // The alias moves from root to services; neither owns its target.
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    let refused = cluster.replica.posix_rename(alias, moved);
+    assert!(
+        matches!(&refused, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "a move of an alias whose target shard converts is retriable: {refused:?}"
+    );
+    assert_eq!(
+        node_store_object_at(&cluster._runtime, &root_node, alias).map(|object| object.object_id),
+        Some(linked.object_id.clone())
+    );
+    assert!(node_store_object_at(&cluster._runtime, &services_node, moved).is_none());
+    let store = cluster._runtime.node_metadata(&root_node).unwrap();
+    assert!(
+        !store
+            .list_namespace_jobs()
+            .unwrap()
+            .iter()
+            .any(|job| job.root_path == alias),
+        "the refusal precedes the move's job"
+    );
+    let pending = store.list_pending_namespace_requests_page(None, 128).unwrap();
+    assert!(pending.next_cursor.is_none(), "bounded native fixture request inventory");
+    assert!(
+        !pending.requests.iter().any(|request| matches!(&request.operation,
+            DfsNamespaceOperation::Rename { from, .. } if from == alias)),
+        "a fresh refused rename is not recorded for later execution: {:?}",
+        pending.requests
+    );
+    drop(store);
+
+    replace_shard_storage(&cluster._runtime, kv.as_mut(), &nodes, &converting, active.value.clone());
+    let renamed = cluster.replica.posix_rename(alias, moved).unwrap();
+    assert_eq!(renamed.link_count, 2);
+    assert_eq!(
+        cluster.replica.posix_namespace_lstat_distributed(moved).unwrap().object_id,
+        linked.object_id
+    );
+    assert!(node_store_object_at(&cluster._runtime, &root_node, alias).is_none());
+    drop(kv);
+    cluster.close();
+}
+
+#[test]
+fn cross_shard_alias_rename_reads_the_target_record_while_the_target_still_serves() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-alias-rename-target-record");
+    let users_node = cluster.users_primary_node.clone();
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let canonical = "/users/record-converting-target";
+    let alias = "/record-converting-alias";
+    let moved = "/services/record-converting-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            canonical,
+            b"record converting target bytes",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster.replica.posix_hardlink(canonical, alias).unwrap();
+    let linked = cluster.replica.posix_namespace_lstat_distributed(alias).unwrap();
+
+    // The target's own node has not yet observed its record turning
+    // Converting and still answers for the target; the coordinator has.
+    let key = crate::metadata_shard_storage_key(&sifs_file_system_id(), "users");
+    let gap = cluster
+        ._runtime
+        .lose_configuration_delta_and_pause_rebuild(&users_node, key.clone())
+        .unwrap();
+    let observers = [root_node.clone(), services_node.clone()];
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &observers, "users");
+    assert!(
+        gap.dropped_delta()
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.key == key),
+        "the target's node withheld the record change"
+    );
+    let refused = cluster.replica.posix_rename(alias, moved);
+    assert!(
+        matches!(&refused, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "the coordinator reads the target's record, not only its reachability: {refused:?}"
+    );
+    assert_eq!(
+        node_store_object_at(&cluster._runtime, &root_node, alias).map(|object| object.object_id),
+        Some(linked.object_id.clone())
+    );
+    assert!(node_store_object_at(&cluster._runtime, &services_node, moved).is_none());
+
+    // Restoring the record is the next delta the target's node observes; it
+    // detects the withheld one and rebuilds once released.
+    replace_shard_storage(&cluster._runtime, kv.as_mut(), &observers, &converting, active.value.clone());
+    gap.wait_rebuild(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    gap.release();
+    drop(gap);
+    for node in &nodes {
+        cluster._runtime.wait_published_configuration_current(node).unwrap();
+    }
+    cluster.replica.posix_rename(alias, moved).unwrap();
+    assert_eq!(
+        cluster.replica.posix_namespace_lstat_distributed(moved).unwrap().object_id,
+        linked.object_id
+    );
+    drop(kv);
+    cluster.close();
+}
+
+fn directory_move_job(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    node: &NodeId,
+    from: &str,
+) -> DfsNamespaceJobRecord {
+    runtime
+        .node_metadata(node)
+        .unwrap()
+        .list_namespace_jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| {
+            job.kind == DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                && job.root_path == from
+        })
+        .expect("the directory move persisted its job")
+}
+
+#[test]
+fn cross_shard_directory_move_keeps_a_page_whose_alias_target_shard_converts() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-tree-move-target-converting");
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let canonical = "/users/tree-converting-target";
+    let from = "/converting-tree";
+    let to = "/services/converting-tree";
+    let alias = format!("{from}/alias");
+    let plain = format!("{from}/plain");
+    let options = || DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]);
+    cluster.replica.posix_mkdir_all(from).unwrap();
+    cluster
+        .replica
+        .posix_write_file(canonical, b"tree target bytes", options())
+        .unwrap();
+    cluster
+        .replica
+        .posix_write_file(&plain, b"plain bytes", options())
+        .unwrap();
+    cluster.replica.posix_hardlink(canonical, &alias).unwrap();
+    let linked = cluster.replica.posix_namespace_lstat_distributed(&alias).unwrap();
+    assert_eq!(linked.kind, DfsObjectKind::Hardlink);
+
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    let parked = cluster.replica.posix_rename(from, to);
+    assert!(
+        matches!(&parked, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "the move waits on its carried alias's target shard: {parked:?}"
+    );
+    let job = directory_move_job(&cluster._runtime, &root_node, from);
+    assert_eq!(job.status, DfsNamespaceJobStatus::Running);
+    assert!(
+        job.pending_frames.iter().any(|frame| matches!(frame,
+            DfsNamespaceJobFrame::CrossShardDirScan { source_path, cursor: None, .. }
+                if source_path == from)),
+        "the job keeps the page: {:?}",
+        job.pending_frames
+    );
+    for child in [&alias, &plain] {
+        assert!(
+            node_store_object_at(&cluster._runtime, &root_node, child).is_some(),
+            "{child} keeps its source row"
+        );
+        let target = child.replacen(from, to, 1);
+        assert!(
+            node_store_object_at(&cluster._runtime, &services_node, &target).is_none(),
+            "no frame of the page ran: {target}"
+        );
+    }
+
+    replace_shard_storage(&cluster._runtime, kv.as_mut(), &nodes, &converting, active.value.clone());
+    // The existing driver resumes the Running job: the coordinator's
+    // maintenance runs its pending request and namespace jobs.
+    let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    // A pass can meet unrelated transient work, such as a membership handoff
+    // the fixture's default setup still runs; the next pass retries it.
+    let mut last_tick = None;
+    while directory_move_job(&cluster._runtime, &root_node, from).status
+        == DfsNamespaceJobStatus::Running
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "the parked move did not resume: {:?}, last maintenance pass {last_tick:?}",
+            directory_move_job(&cluster._runtime, &root_node, from)
+        );
+        let tick = cluster
+            ._runtime
+            .maintenance_tick(
+                &root_node,
+                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .unwrap()
+            .outcome;
+        last_tick = Some(tick);
+    }
+    assert_eq!(
+        directory_move_job(&cluster._runtime, &root_node, from).status,
+        DfsNamespaceJobStatus::Completed
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_namespace_lstat_distributed(&format!("{to}/alias"))
+            .unwrap()
+            .object_id,
+        linked.object_id
+    );
+    assert_eq!(
+        cluster.replica.posix_stat_distributed(canonical).unwrap().link_count,
+        2
+    );
+    assert!(node_store_object_at(&cluster._runtime, &root_node, &alias).is_none());
+    assert!(
+        node_store_object_at(&cluster._runtime, &services_node, &format!("{to}/plain")).is_some()
+    );
+    drop(kv);
+    cluster.close();
+}

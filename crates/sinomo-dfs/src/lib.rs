@@ -31,6 +31,7 @@ mod content_durability;
 mod content_root_catalog;
 mod content_store;
 mod control_plane;
+mod count_contributions;
 mod default_cluster;
 mod default_projection;
 mod default_reconciliation;
@@ -985,6 +986,10 @@ pub use sinomo_api::dfs::{DfsContentCopyRequest, DfsContentCopyResponse, DfsRevi
 
 pub use file_history_query::{
     DfsMetadataQueryResult, DfsMetadataSelection, DfsMetadataShardQuery, DfsMetadataShardResponse,
+};
+pub use count_contributions::{
+    DfsAliasContribution, DfsChildDirectoryContribution, DfsCountContributionCursor,
+    DfsCountContributionPage, DfsRunningJobContribution,
 };
 pub use metadata_records::{
     DfsContentCopyJobReceipt, DfsContentCopyJobResult, DfsContentCopyJobState,

@@ -428,7 +428,7 @@ pub(crate) fn child_objects_for_directory_page_entries_from_tables(
     }
 }
 
-fn object_is_visible_at_path_from_tables(
+pub(crate) fn object_is_visible_at_path_from_tables(
     tables: &DfsMetadataTables,
     file_system_id: &DfsFileSystemId,
     object: &DfsObjectMetadata,

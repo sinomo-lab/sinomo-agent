@@ -1893,6 +1893,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         ))
     }
 
+    /// Serve `count-contributions-v1` from the queried physical shard's
+    /// tables, attributing paths with `catalog`. Only a backend holding that
+    /// shard answers; the caller has already bound its current primary.
+    fn count_contributions_on_shard(
+        &self,
+        query: &crate::DfsMetadataShardQuery,
+        catalog: &[crate::DfsMetadataShardConfig],
+    ) -> Result<crate::DfsMetadataQueryResult> {
+        let _ = (query, catalog);
+        Err(MetadataBackendError::Serde(
+            "backend does not support shard count contributions".into(),
+        ))
+    }
+
     /// Compatibility helper that drains all versions for one object.
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
         collect_metadata_pages(|cursor| {

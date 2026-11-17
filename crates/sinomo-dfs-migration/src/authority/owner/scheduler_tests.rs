@@ -1,5 +1,5 @@
 use super::inventory::{ObservedState, UnitKey, UnitReference, UnitRole};
-use super::scheduler::Scheduler;
+use super::scheduler::{OwnerWork, Scheduler};
 
 #[test]
 fn caller_priority_survives_owned_steps_and_dependency_waits() {
@@ -237,4 +237,102 @@ fn hard_failure_is_not_retried_by_background_dependencies_but_restart_revalidate
     let mut restarted = Scheduler::new();
     restarted.recovered(reference.clone()).unwrap();
     assert_eq!(restarted.next().unwrap().1, reference, "restart revalidates the original retained unit once");
+}
+
+fn reachability_unit(shard: &str) -> UnitKey {
+    UnitKey {
+        relative_root: std::path::Path::new("dfs/metadata").join(shard),
+        role: UnitRole::Metadata {
+            shard: sinomo_dfs::DfsMetadataShardId::new(shard),
+        },
+    }
+}
+fn reachability_nodes(names: &[&str]) -> std::collections::BTreeSet<sinomo_core::node::NodeId> {
+    names
+        .iter()
+        .map(|name| sinomo_core::node::NodeId::from_legacy_named(*name).unwrap())
+        .collect()
+}
+fn park_on(scheduler: &mut Scheduler, key: &UnitKey, node: &str) {
+    scheduler.enqueue(key.clone(), false).unwrap();
+    let (id, mut reference) = scheduler.next().unwrap();
+    assert_eq!(&reference.unit, key);
+    scheduler
+        .watch_reachable_nodes(key, reachability_nodes(&[node]))
+        .unwrap();
+    reference.state = ObservedState::Waiting {
+        evidence: "contributing shard has no reachable member".into(),
+    };
+    scheduler.finish(&id, reference);
+}
+
+#[test]
+fn a_waiting_unit_wakes_only_when_a_node_it_watches_becomes_reachable() {
+    let mut scheduler = Scheduler::new();
+    let (on_x, on_y) = (reachability_unit("alpha"), reachability_unit("beta"));
+    park_on(&mut scheduler, &on_x, "node-x");
+    park_on(&mut scheduler, &on_y, "node-y");
+    assert!(scheduler.next().is_none());
+    assert!(scheduler.next_retry().is_none(), "a parked wait owns no timer");
+    assert_eq!(scheduler.watched_nodes(), reachability_nodes(&["node-x", "node-y"]));
+    assert!(!scheduler.nodes_became_reachable(&reachability_nodes(&["node-z"])));
+    assert!(scheduler.next().is_none());
+    assert!(scheduler.nodes_became_reachable(&reachability_nodes(&["node-x"])));
+    let (id, mut woken) = scheduler.next().expect("the unit watching X is requeued");
+    assert_eq!(woken.unit, on_x);
+    assert!(scheduler.next().is_none(), "the unit watching Y keeps waiting");
+    assert!(scheduler.next_retry().is_none());
+    woken.state = ObservedState::VerifiedCurrent;
+    scheduler.finish(&id, woken);
+    assert_eq!(
+        scheduler.watched_nodes(),
+        reachability_nodes(&["node-y"]),
+        "a settled unit drops its watch"
+    );
+}
+
+#[test]
+fn reachability_during_a_step_survives_its_park() {
+    let mut scheduler = Scheduler::new();
+    let key = reachability_unit("alpha");
+    scheduler.enqueue(key.clone(), false).unwrap();
+    let (id, mut reference) = scheduler.next().unwrap();
+    // The step observed X unreachable; X became reachable before the step
+    // registered its watch.
+    assert!(!scheduler.nodes_became_reachable(&reachability_nodes(&["node-x"])));
+    scheduler
+        .watch_reachable_nodes(&key, reachability_nodes(&["node-x"]))
+        .unwrap();
+    reference.state = ObservedState::Waiting {
+        evidence: "contributing shard has no reachable member".into(),
+    };
+    scheduler.finish(&id, reference);
+    let (id, mut rerun) = scheduler.next().expect("the earlier change reruns the parked step");
+    assert_eq!(rerun.unit, key);
+    rerun.state = ObservedState::Waiting {
+        evidence: "contributing shard has no reachable member".into(),
+    };
+    scheduler.finish(&id, rerun);
+    assert!(scheduler.next().is_none(), "a later step starts with no stale change");
+    assert!(scheduler
+        .watch_reachable_nodes(&reachability_unit("unowned"), reachability_nodes(&["node-x"]))
+        .is_err());
+}
+
+#[test]
+fn registering_a_reachability_watch_wakes_the_watcher_without_a_timer() {
+    let root = sinomo_testdir::TestDir::new("owner-reachability-watch");
+    let work = OwnerWork::new(root.path()).unwrap();
+    let key = reachability_unit("alpha");
+    assert!(work
+        .watch_reachable_nodes(&key, reachability_nodes(&["node-x"]))
+        .is_err(), "a watch needs an existing work owner");
+    work.scheduler.lock().unwrap().enqueue(key.clone(), false).unwrap();
+    work.watch_reachable_nodes(&key, reachability_nodes(&["node-x"])).unwrap();
+    assert_eq!(work.scheduler.lock().unwrap().watched_nodes(), reachability_nodes(&["node-x"]));
+    // The watcher may not be waiting yet: the registration is a stored permit.
+    let registered = std::pin::pin!(work.reachability.notified());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(registered.poll(&mut context).is_ready());
+    assert!(work.scheduler.lock().unwrap().next_retry().is_none());
 }

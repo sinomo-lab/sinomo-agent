@@ -3437,6 +3437,8 @@ impl<'a> DfsControlPlaneStore<'a> {
 
     /// Publish an absent native birth only while its original captured storage
     /// binding still matches the exact filesystem entry advanced by this CAS.
+    /// A path-prefix birth also compares the storage record of the shard that
+    /// owns its parent path, and is refused while that shard is converting.
     pub fn compare_and_put_metadata_shard_for_genesis(
         &mut self,
         desired: &DfsMetadataShardConfig,
@@ -3505,6 +3507,18 @@ impl<'a> DfsControlPlaneStore<'a> {
                 let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
                 let actual: DfsFileSystemConfig = entry.decode()?;
                 if actual.metadata_storage.as_ref() != captured { return Ok(false); }
+                // Read after the filesystem entry whose catalog generation this
+                // transaction compares: a later birth, removal or rescope of a
+                // shard fails the transaction.
+                let shards = self.list_metadata_shards(&desired.file_system_id)?;
+                if let Some(parent) = metadata_shard_birth_parent(desired, &shards)? {
+                    let key = metadata_shard_storage_key(&parent.file_system_id, &parent.shard_id);
+                    let parent_storage = self.kv.get(&key)?;
+                    let Some(compare) = metadata_shard_birth_parent_storage_compare(key, parent_storage)? else {
+                        return Ok(false);
+                    };
+                    compares.push(compare);
+                }
                 append_native_genesis_shard_storage(desired, captured, &mut compares, &mut success)?;
             }
             append_catalog_generation_update(
@@ -4075,6 +4089,15 @@ impl<'a> DfsControlPlaneStore<'a> {
         shard_id: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         self.get_serde(&metadata_shard_key(file_system_id, shard_id))
+    }
+
+    /// sinomo:kv-configuration: Read the shard's storage record through the existing retained configuration projection.
+    pub fn get_metadata_shard_storage(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Option<crate::DfsMetadataShardStorage>, KvError> {
+        self.get_serde(&metadata_shard_storage_key(file_system_id, shard_id))
     }
 
     pub fn get_metadata_shard_head_watermark(
@@ -4859,6 +4882,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
 
     /// Publish an absent native birth only while its original captured storage
     /// binding still matches the exact filesystem entry advanced by this CAS.
+    /// A path-prefix birth also compares the storage record of the shard that
+    /// owns its parent path, and is refused while that shard is converting.
     pub async fn compare_and_put_metadata_shard_for_genesis(
         &mut self,
         desired: &DfsMetadataShardConfig,
@@ -4927,6 +4952,18 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
                 let actual: DfsFileSystemConfig = entry.decode()?;
                 if actual.metadata_storage.as_ref() != captured { return Ok(false); }
+                // Read after the filesystem entry whose catalog generation this
+                // transaction compares: a later birth, removal or rescope of a
+                // shard fails the transaction.
+                let shards = self.list_metadata_shards(&desired.file_system_id).await?;
+                if let Some(parent) = metadata_shard_birth_parent(desired, &shards)? {
+                    let key = metadata_shard_storage_key(&parent.file_system_id, &parent.shard_id);
+                    let parent_storage = self.kv.get_async(&key).await?;
+                    let Some(compare) = metadata_shard_birth_parent_storage_compare(key, parent_storage)? else {
+                        return Ok(false);
+                    };
+                    compares.push(compare);
+                }
                 append_native_genesis_shard_storage(desired, captured, &mut compares, &mut success)?;
             }
             append_catalog_generation_update(
@@ -5673,6 +5710,53 @@ fn append_native_genesis_shard_storage(
     compares.push(KvCompare::Missing { key: key.clone() });
     success.push(KvOp::put_serde(key, &record, None)?);
     Ok(())
+}
+
+/// The shard a native birth adds its root directory under: the owner of the
+/// prefix's parent path in the current catalog, the new shard excluded. The
+/// root becomes a child-directory contribution to that shard's count.
+///
+/// A Root shard has no parent. A name-hash-range shard has no root directory:
+/// it owns paths by name hash, not a subtree, so no single shard owns the
+/// parent of what it is born with.
+fn metadata_shard_birth_parent(
+    desired: &DfsMetadataShardConfig,
+    shards: &[DfsMetadataShardConfig],
+) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+    let DfsMetadataShardAssignment::PathPrefix { prefix } = &desired.assignment else {
+        return Ok(None);
+    };
+    let Some(parent) =
+        crate::posix_path::parent_posix_path(&normalize_metadata_selection_path(prefix)?)
+    else {
+        return Ok(None);
+    };
+    let others = shards
+        .iter()
+        .filter(|shard| shard.shard_id != desired.shard_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    select_metadata_shard_config_for_path(&desired.file_system_id, &others, &parent)
+}
+
+/// The compare a birth adds on its parent shard's storage record, read as
+/// `entry` at `key`: the exact Active record, or its absence while the parent
+/// is still admitted without one. `None` refuses the birth: a Converting
+/// parent is closed, and its contributions stay fixed until it is Active.
+fn metadata_shard_birth_parent_storage_compare(
+    key: String,
+    entry: Option<KvEntry>,
+) -> Result<Option<KvCompare>, KvError> {
+    let Some(entry) = entry else {
+        return Ok(Some(KvCompare::Missing { key }));
+    };
+    if !entry.decode::<crate::DfsMetadataShardStorage>()?.is_active() {
+        return Ok(None);
+    }
+    Ok(Some(KvCompare::ValueEquals {
+        key,
+        value: entry.value,
+    }))
 }
 
 fn validate_metadata_shard_cas_identity(
@@ -12179,6 +12263,79 @@ mod tests {
                 .map(str::to_string);
             assert_eq!(indexed, reference, "routing mismatch for {path}");
         }
+    }
+
+    #[test]
+    fn a_path_prefix_birth_compares_the_storage_record_of_its_parent_owner() {
+        let owner = node("node_birth_parent_owner");
+        let config = |shard_id: &str, assignment| DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: shard_id.into(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let root = config("root", DfsMetadataShardAssignment::Root);
+        let users = config(
+            "users",
+            DfsMetadataShardAssignment::PathPrefix { prefix: "/users".into() },
+        );
+        let child = config(
+            "child",
+            DfsMetadataShardAssignment::PathPrefix { prefix: "/users/team/".into() },
+        );
+        let parent_of = |desired: &DfsMetadataShardConfig, shards: &[DfsMetadataShardConfig]| {
+            metadata_shard_birth_parent(desired, shards)
+                .unwrap()
+                .map(|shard| shard.shard_id)
+        };
+        // The owner of the prefix's parent path, never the new shard itself.
+        let catalog = [root.clone(), users.clone(), child.clone()];
+        assert_eq!(parent_of(&child, &catalog).as_deref(), Some("users"));
+        assert_eq!(parent_of(&users, &catalog).as_deref(), Some("root"));
+        assert_eq!(parent_of(&child, std::slice::from_ref(&child)), None);
+        // Root and name-hash-range shards have no root directory under a parent.
+        assert_eq!(parent_of(&root, &catalog), None);
+        let hashed = config(
+            "hashed",
+            DfsMetadataShardAssignment::NameHashRange { start_inclusive: 0, end_exclusive: 7 },
+        );
+        assert_eq!(parent_of(&hashed, &catalog), None);
+
+        let key = metadata_shard_storage_key(&users.file_system_id, &users.shard_id);
+        let entry = |record: &crate::DfsMetadataShardStorage| KvEntry {
+            key: key.clone(),
+            value: sinomo_core::kv::encode_kv_value(record).unwrap(),
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(1),
+            version: sinomo_core::kv::KvVersion(1),
+            lease_id: None,
+        };
+        let active = crate::DfsMetadataShardStorage::native_genesis(
+            &users,
+            crate::storage_generation::native_genesis_generation_identity(&users, None),
+        );
+        assert_eq!(
+            metadata_shard_birth_parent_storage_compare(key.clone(), Some(entry(&active))).unwrap(),
+            Some(KvCompare::ValueEquals {
+                key: key.clone(),
+                value: entry(&active).value,
+            })
+        );
+        assert_eq!(
+            metadata_shard_birth_parent_storage_compare(key.clone(), None).unwrap(),
+            Some(KvCompare::Missing { key: key.clone() }),
+            "a parent still admitted without a record keeps that absence"
+        );
+        let converting = crate::DfsMetadataShardStorage::converting_for_test(&users, 3);
+        assert_eq!(
+            metadata_shard_birth_parent_storage_compare(key.clone(), Some(entry(&converting)))
+                .unwrap(),
+            None,
+            "a converting parent refuses the birth"
+        );
     }
 
     #[test]

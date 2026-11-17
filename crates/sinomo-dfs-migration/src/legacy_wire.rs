@@ -13,6 +13,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
 fn encoded<T: Serialize>(value: T) -> Result<Value> {
     serde_json::to_value(value).map_err(invalid)
 }
+pub(crate) mod hardlink_settlement;
 macro_rules! source_identifier {
     ($fn:ident,$ty:ty) => {
         fn $fn(value: Value) -> Result<Value> {

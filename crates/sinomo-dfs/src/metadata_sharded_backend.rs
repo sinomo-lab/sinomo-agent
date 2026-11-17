@@ -5873,6 +5873,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .query_file_history_on_shard(query)
     }
 
+    /// Rows the catalog gives this shard are also subject to the shard's
+    /// residue hiding: a live row a move left behind is not reported.
+    fn count_contributions_on_shard(
+        &self,
+        query: &crate::DfsMetadataShardQuery,
+        catalog: &[crate::DfsMetadataShardConfig],
+    ) -> Result<crate::DfsMetadataQueryResult> {
+        let backend = self.shard_backend(&query.shard_id)?;
+        let prefix = LocalSobjMetadataBackend::metadata_prefix_proof(backend)?;
+        let tables = backend.current_tables_snapshot()?;
+        crate::count_contributions::query_count_contributions(
+            &tables,
+            query,
+            catalog,
+            prefix,
+            &mut |object| self.object_is_listable_from_shard(object, &query.shard_id),
+        )
+    }
+
     fn retained_revision_records_page(
         &self,
         namespace: Option<&str>,
