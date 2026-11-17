@@ -1117,10 +1117,35 @@ impl DfsMetadataAuthorityRuntime {
     pub async fn ready_configuration_snapshot_async(
         self: &Arc<Self>,
     ) -> Result<Arc<DfsConfigurationSnapshot>, DfsError> {
+        self.ready_configuration_snapshot_at_least_async(KvRevision::ZERO)
+            .await
+    }
+
+    /// Join the existing publication after a known commit. A revision is a
+    /// visibility floor, never authority to install caller-supplied config.
+    /// The caller retains its original deadline around this future.
+    pub async fn ready_configuration_snapshot_at_least_async(
+        self: &Arc<Self>,
+        minimum: KvRevision,
+    ) -> Result<Arc<DfsConfigurationSnapshot>, DfsError> {
         let mut published = self.published.subscribe();
         loop {
+            // A delta that is still arriving needs no separate refresh. Reuse
+            // the owner's existing missed-observation recovery only when its
+            // native resident floor has already applied this revision.
+            if minimum != KvRevision::ZERO {
+                self.observe_client_revision(minimum);
+            }
             match self.read_configuration_snapshot() {
-                Ok(snapshot) => return Ok(snapshot),
+                Ok(snapshot)
+                    if minimum == KvRevision::ZERO
+                        || snapshot
+                            .revision()
+                            .is_some_and(|revision| revision >= minimum) =>
+                {
+                    return Ok(snapshot);
+                }
+                Ok(_) => {}
                 Err(DfsWriteConfigurationReadError::Unavailable(error)) => return Err(error),
                 Err(DfsWriteConfigurationReadError::Pending(_)) => {}
             }

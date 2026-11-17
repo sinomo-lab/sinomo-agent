@@ -1027,6 +1027,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
             store
                 .compare_and_put_placement_update(&expected, &desired, &job)
                 .expect("publish placement and job")
+                .is_some()
         );
         job
     });

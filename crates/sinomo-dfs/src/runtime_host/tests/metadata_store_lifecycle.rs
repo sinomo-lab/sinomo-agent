@@ -431,7 +431,8 @@ fn committed_placement_policy_retains_resident_lanes_and_updates_configuration()
                     &job,
                 )
             })
-            .unwrap(),
+            .unwrap()
+            .is_some(),
         "normal placement Apply commits its actual checked policy transition"
     );
     lookup(2);

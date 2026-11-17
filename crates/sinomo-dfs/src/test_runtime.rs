@@ -4291,10 +4291,10 @@ impl DfsTestRuntime {
                     .compare_and_put_placement_update(&expected, &desired, &job)
             })
             .map_err(|error| error.to_string())?;
-        if !committed {
+        let Some(committed) = committed else {
             return Err("normal placement Apply rejected a changed current configuration".into());
-        }
-        Ok(job)
+        };
+        Ok(committed.reconciliation)
     }
 
     pub fn data_dir(&self, node: &NodeId) -> &SinomoDataDir {
@@ -6706,6 +6706,7 @@ struct NativeConfigurationFault {
     lose_delta_key: Option<String>,
     remaining_delta_loss: AtomicUsize,
     dropped_delta: Mutex<Option<sinomo_core::kv::ClusterKvCommittedDelta>>,
+    dropped_changed: std::sync::Condvar,
     pause_rebuild: AtomicBool,
     pause_used: AtomicBool,
     entered: Mutex<bool>,
@@ -6772,6 +6773,33 @@ impl DfsTestNativeConfigurationFault {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+    /// Observe the exact committed delta this fault withheld, without polling
+    /// or treating elapsed time as proof that the mutation reached its owner.
+    pub fn wait_dropped_delta(
+        &self,
+        budget: Duration,
+    ) -> Result<sinomo_core::kv::ClusterKvCommittedDelta, String> {
+        let deadline = std::time::Instant::now() + budget;
+        let mut dropped = self
+            .fault
+            .dropped_delta
+            .lock()
+            .map_err(|_| "delta observation poisoned")?;
+        loop {
+            if let Some(delta) = dropped.as_ref() {
+                return Ok(delta.clone());
+            }
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or("native configuration delta was not withheld")?;
+            dropped = self
+                .fault
+                .dropped_changed
+                .wait_timeout(dropped, left)
+                .map_err(|_| "delta observation poisoned")?
+                .0;
+        }
+    }
     pub fn release(&self) {
         self.fault.release.close();
     }
@@ -6821,6 +6849,7 @@ pub(crate) fn withhold_native_configuration_delta(
         .dropped_delta
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(delta.clone());
+    fault.dropped_changed.notify_all();
     true
 }
 
@@ -6981,6 +7010,7 @@ impl DfsTestRuntime {
             remaining_delta_loss: AtomicUsize::new(usize::from(lose_delta_key.is_some())),
             lose_delta_key,
             dropped_delta: Mutex::new(None),
+            dropped_changed: std::sync::Condvar::new(),
             pause_used: AtomicBool::new(false),
             entered: Mutex::new(false),
             reached: std::sync::Condvar::new(),

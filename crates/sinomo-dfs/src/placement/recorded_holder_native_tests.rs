@@ -137,6 +137,7 @@ fn accept(
             DfsControlPlaneStore::new(kv.as_mut())
                 .compare_and_put_placement_update(expected, &desired, job)
                 .unwrap()
+                .is_some()
         );
     });
 }

@@ -2822,7 +2822,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 true
             } else {
-                store.compare_and_put_placement_update(config, config, &job)?
+                store
+                    .compare_and_put_placement_update(config, config, &job)?
+                    .is_some()
             }
         };
         if !enqueued {
@@ -7301,6 +7303,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&base, &first_config, &first)
                     .expect("first update")
+                    .is_some()
             );
 
             let mut second_config = first_config.clone();
@@ -7325,6 +7328,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&first_config, &second_config, &second)
                     .expect("second update")
+                    .is_some()
             );
             (first, second)
         });
@@ -7434,6 +7438,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&base, &first_config, &first)
                     .expect("team update")
+                    .is_some()
             );
 
             let mut unrelated_config = first_config.clone();
@@ -7458,6 +7463,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&first_config, &unrelated_config, &unrelated,)
                     .expect("unrelated update")
+                    .is_some()
             );
             first
         });

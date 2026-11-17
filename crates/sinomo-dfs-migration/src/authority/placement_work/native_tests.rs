@@ -303,6 +303,7 @@ fn pending_goal_with_current_permit(v1: bool) {
         store
             .compare_and_put_placement_update(&config, &config, &held_job)
             .unwrap()
+            .is_some()
     );
     drop(store);
     drop(current);
