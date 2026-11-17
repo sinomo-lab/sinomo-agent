@@ -17,6 +17,9 @@ mod cross_shard;
 mod directory_identity_native_tests;
 #[cfg(test)]
 pub(crate) use cross_shard::{hold_parent_apply_commit, parent_apply_commit_is_held, ParentCountTestPoint, install_parent_count_test_hook, install_hardlink_alias_after_commit_test_hook, install_hardlink_count_after_commit_test_hook};
+#[cfg(test)]
+pub(crate) use cross_shard::fail_directory_move_scan_of;
+mod job_events;
 mod jobs;
 mod links;
 pub(crate) mod locks;

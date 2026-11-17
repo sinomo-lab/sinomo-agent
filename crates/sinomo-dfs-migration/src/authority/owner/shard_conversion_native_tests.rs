@@ -43,6 +43,9 @@ use sinomo_dfs::{
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
+mod passive;
+mod takeover;
+
 const HELD: &str = "ordinary opens held while shards convert";
 
 struct Cluster {
@@ -522,6 +525,12 @@ impl<C: ContributionSource> ShardConversionEnv for EpochMovesBeforeActivation<'_
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         self.inner.capture(shard)
     }
+    fn placement_evidence(
+        &self,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<Option<Vec<crate::metadata::RetainedPlacementReservation>>> {
+        self.inner.placement_evidence(shard)
+    }
     fn contribution_source(&self) -> &C {
         self.inner.contribution_source()
     }
@@ -671,6 +680,133 @@ fn native_takeover_during_a_conversion_supersedes_its_attempt_on_every_node() {
     await_unstaged(&cluster, &owners, "users", &attempt.attempt_id);
     for owner in &owners {
         assert!(!attempt_dir(owner, &fs, "users", &stale.attempt_id).exists());
+    }
+    drop(owners);
+    cluster.native.close().unwrap();
+}
+
+/// Step `shard`'s conversion until a step fails with a reason a retry does
+/// not change, and return that reason.
+fn settle_until_stopped<E: ShardConversionEnv>(env: &E, fs: &DfsFileSystemId, shard: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        match advance_shard_conversion(env, fs, shard) {
+            Ok(ConversionProgress::Pending { .. }) => {}
+            Ok(progress) => panic!("{shard} conversion settled without stopping: {progress:?}"),
+            Err(failure) if retryable(&failure) => std::thread::sleep(Duration::from_millis(20)),
+            Err(failure) => return failure.to_string(),
+        }
+        assert!(Instant::now() < deadline, "{shard} conversion neither settled nor stopped");
+    }
+}
+
+/// A hardlink alias whose target exists in no shard stops only its own
+/// shard's conversion, with a typed reason naming the alias and its target.
+/// The filesystem's other shards convert and serve, every member records the
+/// old copy it keeps as a retained original, and the stopped shard stays
+/// closed.
+#[test]
+fn native_dangling_alias_stops_only_its_own_shard() {
+    let mut cluster = start(
+        "shard-conversion-dangling",
+        3,
+        &[("root", 0, &[1, 2]), ("services", 1, &[0, 2]), ("users", 2, &[0, 1])],
+    );
+    write_namespace(&cluster);
+    // The services primary adopts an alias whose canonical target no shard
+    // has, as only a lost or damaged canonical row leaves one: the adopt step
+    // of a cross-shard hardlink, sent by the primary of its source path, does
+    // not read the target.
+    let target = sinomo_dfs::DfsObjectId::from_legacy_named("native-dangling-target").unwrap();
+    let now = sinomo_dfs::test_support::now_unix_nanos();
+    let dangling = sinomo_dfs::DfsObjectMetadata {
+        object_id: sinomo_dfs::DfsObjectId::from_legacy_named("native-dangling-alias").unwrap(),
+        file_system_id: cluster.fs.clone(),
+        path: "/services/dangling".into(),
+        kind: sinomo_dfs::DfsObjectKind::Hardlink,
+        namespace_link_count: None,
+        tombstone_provenance: None,
+        owner_node_id: cluster.nodes[1].clone(),
+        current_locations: Vec::new(),
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: Some(target.clone()),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: now,
+        modified_at_unix_nanos: now,
+        created_at_unix_nanos: now,
+        changed_at_unix_nanos: now,
+        version: sinomo_dfs::DfsVersion::from_legacy_named("native-dangling-alias-version").unwrap(),
+        policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    {
+        let mut services = cluster.native.client(&cluster.nodes[1]).unwrap();
+        let reply = services
+            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                cluster.fs.clone(),
+                cluster.nodes[1].clone(),
+                sinomo_dfs::DfsNamespaceOperation::AdoptHardlinkAlias {
+                    alias: dangling.clone(),
+                    source_path: "/services/file".into(),
+                },
+                Duration::from_secs(30),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(reply.result, sinomo_dfs::DfsNamespaceResult::Applied);
+    }
+    hold(&mut cluster, &["root", "services", "users"]);
+    let owners = owners(&cluster);
+    let fs = cluster.fs.clone();
+    for shard in ["root", "services", "users"] {
+        close(&owners[0], &fs, shard);
+    }
+    for (shard, primary) in [("services", 1), ("users", 2)] {
+        let parked = drive(&owners[primary], &fs, shard);
+        assert!(matches!(parked, ConversionProgress::Parked { .. }), "{shard}: {parked:?}");
+    }
+    for (shard, primary, path) in [("root", 0, "/"), ("users", 2, "/users/doc")] {
+        assert_eq!(drive(&owners[primary], &fs, shard), ConversionProgress::Ready, "{shard}");
+        let config = shard_config(&owners[0], &fs, shard);
+        let members = configured(&config);
+        await_activated(&cluster, &owners, shard, &members);
+        release(&cluster, &owners, shard);
+        for reader in 0..cluster.nodes.len() {
+            await_serving(&cluster, reader, &config, path);
+        }
+        // The primary's unit records its retained original when its step
+        // reports the shard ready; the members' units record theirs on their
+        // own owners.
+        owners[primary].record_completed_metadata_archives(&owners[primary].metadata_root.join(shard)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for (owner, node) in owners.iter().zip(&cluster.nodes).filter(|(_, node)| members.contains(*node)) {
+            while !owner.shard_conversion_original_recorded(&owner.metadata_root.join(shard)).unwrap() {
+                assert!(Instant::now() < deadline, "{node} did not record the retained original of {shard}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let unit = metadata_unit(&owners[1], "services");
+    let env = OwnerConversionEnv::new(&owners[1], &unit, NativeContributionSource::new(Arc::clone(&owners[1].authority)));
+    let stopped = settle_until_stopped(&env, &fs, "services");
+    assert!(
+        stopped.contains("dangling alias /services/dangling") && stopped.contains(target.as_str()),
+        "{stopped}"
+    );
+    drop(env);
+    let services = storage(&owners[0], &fs, "services").unwrap();
+    assert!(
+        services.converting_attempt().is_some_and(|attempt| attempt.sealed().is_none()),
+        "the stopped shard stays closed: {services:?}"
+    );
+    for (shard, path) in [("root", "/written-beside-stopped"), ("users", "/users/written-beside-stopped")] {
+        assert!(storage(&owners[0], &fs, shard).unwrap().is_active());
+        write_beside_closed(&cluster, 2, path);
     }
     drop(owners);
     cluster.native.close().unwrap();

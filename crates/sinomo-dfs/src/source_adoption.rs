@@ -1934,6 +1934,7 @@ impl RemoteTargetNamespacePhase {
             | crate::DfsNamespaceOperation::AdoptHardlinkAlias { .. }
             | crate::DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
             | crate::DfsNamespaceOperation::ParentCountParticipant { .. }
+            | crate::DfsNamespaceOperation::ReleaseDirectoryMoveDestination { .. }
             | crate::DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => Ok(None),
             _ => Err(error(
                 "owned target phase contains another namespace operation",

@@ -6,7 +6,9 @@ mod inventory;
 pub(super) mod filesystem;
 pub(super) mod shard_conversion;
 pub(super) mod conversion_receiver;
+mod retained_conversion;
 mod scheduler;
+mod source_job_wakes;
 mod discovery;
 mod content_exposure;
 #[cfg(test)]
@@ -29,6 +31,8 @@ mod shard_conversion_tests;
 mod shard_conversion_native_tests;
 #[cfg(test)]
 mod placement_tests;
+#[cfg(test)]
+mod shard_conversion_legacy_tests;
 use scheduler::OwnerWork;
 
 pub(super) fn validate_metadata_scope(shard: &sinomo_dfs::DfsMetadataShardId) -> Result<()> {
@@ -358,6 +362,8 @@ impl MigrationOwner {
         // Units parked on an unreachable node wake on its reachability, not
         // on a timer. A standalone owner has no cluster peers to wait on.
         if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&paths) {
+            // Conversions waiting on another shard's job wake on its events.
+            self.listen_for_source_jobs(&state.local_node_id, scope);
             let owner = Arc::clone(self);
             let task = self.authority.runtime.spawn(owner.watch_peer_reachability(paths, state));
             scope.own_task("dfs-migration-peer-reachability", task);
@@ -443,8 +449,9 @@ impl MigrationOwner {
         }
     }
     /// Hold this node's peer-reachability subscription only while some unit
-    /// watches a node, and requeue the watchers of each node that becomes
-    /// reachable. Nothing here polls: each wake is a verdict change or a new
+    /// watches a node, requeue the watchers of each node that becomes
+    /// reachable, and requeue the verdict watchers of each node whose verdict
+    /// changes. Nothing here polls: each wake is a verdict change or a new
     /// watch.
     async fn watch_peer_reachability(
         self: Arc<Self>,
@@ -468,6 +475,9 @@ impl MigrationOwner {
                     .map(|(node, _)| node.clone()).collect();
                 subscription = Some(created);
                 self.nodes_became_reachable(&reachable);
+                // Verdict watchers registered before the subscription read
+                // the verdicts it starts from once.
+                self.node_verdicts_changed(&watched);
             }
             let changes = async {
                 match subscription.as_mut() {
@@ -479,11 +489,13 @@ impl MigrationOwner {
                 _ = shutdown.changed() => {}
                 _ = self.work.reachability.notified() => {}
                 changes = changes => {
+                    let changed = changes.iter().map(|change| change.peer_node_id.clone()).collect();
                     let reachable = changes.into_iter()
                         .filter(|change| change.current.as_ref().is_some_and(|peer| peer.verdict == PeerPathVerdict::Path)
                             && change.previous.as_ref().is_none_or(|peer| peer.verdict != PeerPathVerdict::Path))
                         .map(|change| change.peer_node_id).collect();
                     self.nodes_became_reachable(&reachable);
+                    self.node_verdicts_changed(&changed);
                 }
             }
         }
@@ -491,6 +503,11 @@ impl MigrationOwner {
     fn nodes_became_reachable(&self, nodes: &BTreeSet<sinomo_core::node::NodeId>) {
         if nodes.is_empty() { return; }
         let changed = self.work.scheduler.lock().is_ok_and(|mut scheduler| scheduler.nodes_became_reachable(nodes));
+        if changed { self.work.wake.notify_one(); }
+    }
+    fn node_verdicts_changed(&self, nodes: &BTreeSet<sinomo_core::node::NodeId>) {
+        if nodes.is_empty() { return; }
+        let changed = self.work.scheduler.lock().is_ok_and(|mut scheduler| scheduler.node_verdicts_changed(nodes));
         if changed { self.work.wake.notify_one(); }
     }
     fn discover_step(&self) -> Result<()> {
@@ -685,7 +702,7 @@ impl MigrationOwner {
                 let plan = self.authority.retained_plan_file.read(&root.join("native-import-plan.json"))?;
                 filesystem::enqueue_received_generation(&self.authority.component_context, &plan, &root)?;
             }
-            if self.retained_metadata_observation(&reference)? {
+            if self.retained_metadata_observation(&reference)? || self.shard_conversion_original_observed(&reference)? {
                 reference.state = ObservedState::RetainedOriginal;
                 self.work.inventory.record(&reference)?;
                 return Ok(reference);
@@ -763,6 +780,8 @@ impl MigrationOwner {
     /// Associate inactive evidence only after its actual owner qualifies the
     /// completed generation. This is not an archive scrub or a GC permit.
     pub(super) fn record_completed_metadata_archives(&self, destination: &Path) -> Result<()> {
+        // A per-shard conversion keeps its old copy beside the activated image.
+        if self.record_shard_conversion_original(destination)? { return Ok(()); }
         let Some(lineage) = crate::metadata::associated_completed_metadata_lineage(destination)? else { return Ok(()); };
         if !self.completed_metadata_lineage_is_owned(destination, &lineage.source_cut)? { return Ok(()); }
         let job = inventory::JobReference {

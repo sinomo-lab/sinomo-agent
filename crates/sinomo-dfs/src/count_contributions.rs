@@ -7,6 +7,13 @@
 //! account for moves that are still in flight. This is read data from S's
 //! current primary, bound to one exact metadata prefix; it grants no write or
 //! publication authority.
+//!
+//! The same read answers T's question about what S holds: which object ids
+//! are live canonical rows S owns, which paths are live directories S owns,
+//! and which job ids are Running jobs S records. A converting shard asks this
+//! to learn whether the targets of its aliases and the parents of its rows
+//! exist in another shard, and whether a fence it settles is still held.
+//! Every answer of one read is bound to the same prefix as its pages.
 
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -15,6 +22,10 @@ use std::ops::Bound::{Excluded, Unbounded};
 /// Largest number of reported entries (aliases, child directories and jobs
 /// together) one contribution page carries.
 pub(crate) const DFS_COUNT_CONTRIBUTION_PAGE_LIMIT: usize = 512;
+
+/// Largest number of entries (objects, directories and jobs together) one
+/// request's question asks.
+pub const DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT: usize = 512;
 
 /// Rows one page may visit per reportable entry, whether or not they are
 /// reported. Child directories have no index by parent ownership, so that
@@ -39,6 +50,66 @@ pub enum DfsCountContributionCursor {
     Jobs {
         job_id: String,
     },
+    /// Every section is read; the request only asks its question.
+    Complete,
+}
+
+/// What a converting target asks the source beside its contributions.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsCountContributionQuestion {
+    /// Object ids that may be live canonical rows of the source.
+    #[serde(default)]
+    pub objects: Vec<DfsObjectId>,
+    /// Canonical paths that may be live directories of the source.
+    #[serde(default)]
+    pub directories: Vec<String>,
+    /// Job ids that may be Running jobs of the source.
+    #[serde(default)]
+    pub jobs: Vec<String>,
+}
+
+impl DfsCountContributionQuestion {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len() + self.directories.len() + self.jobs.len()
+    }
+}
+
+/// The entries of a request's question the source holds, in question order.
+/// `answered` counts the entries the source evaluated, so an answer from a
+/// source that did not read the question is never taken as "holds none".
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsCountContributionHoldings {
+    #[serde(default)]
+    pub answered: u64,
+    /// Live canonical (non-alias) rows whose path the source owns.
+    #[serde(default)]
+    pub objects: Vec<DfsObjectId>,
+    /// Paths the source owns that hold a live directory.
+    #[serde(default)]
+    pub directories: Vec<String>,
+    /// Running namespace jobs of the source.
+    #[serde(default)]
+    pub jobs: Vec<String>,
+}
+
+impl DfsCountContributionHoldings {
+    /// Whether this answers exactly `question`: every entry evaluated and
+    /// every held entry asked.
+    pub fn answers(&self, question: &DfsCountContributionQuestion) -> bool {
+        usize::try_from(self.answered).is_ok_and(|answered| answered == question.len())
+            && self.objects.iter().all(|id| question.objects.contains(id))
+            && self
+                .directories
+                .iter()
+                .all(|path| question.directories.contains(path))
+            && self.jobs.iter().all(|id| question.jobs.contains(id))
+    }
 }
 
 /// A live hardlink alias whose path the source shard owns. The source cannot
@@ -67,6 +138,10 @@ pub struct DfsChildDirectoryContribution {
 /// fence successors are not carried: those jobs change a count only through
 /// the target's own fence record, and are identified here by id, kind and
 /// paths.
+///
+/// A directory move parked at a scan page carries that page's objects in no
+/// frame yet: each is still a live row at its old path in the shard that
+/// serves the page, and is reported, at most once, among that shard's rows.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DfsRunningJobContribution {
@@ -75,6 +150,12 @@ pub struct DfsRunningJobContribution {
     pub root_path: String,
     pub target_path: Option<String>,
     pub carried: Vec<DfsObjectMetadata>,
+    /// The shards whose storage the job's next step waits to be Active, as
+    /// the serving primary recorded when it refused that step; empty while
+    /// the job does not wait there. Its job cannot run that step, or any
+    /// later one, until each of these shards activates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_for_storage_of: Vec<DfsMetadataShardId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -90,6 +171,9 @@ pub struct DfsCountContributionPage {
     /// A page may report nothing and still advance `after`, when its visit
     /// budget ran out on unreported rows.
     pub after: Option<DfsCountContributionCursor>,
+    /// The answer to the request's question, bound to `prefix`.
+    #[serde(default)]
+    pub held: DfsCountContributionHoldings,
     /// Explicitly required on the wire; omission is not an empty final page.
     pub complete: bool,
 }
@@ -100,21 +184,29 @@ impl DfsCountContributionPage {
     }
 }
 
+/// What the serving primary recorded about a Running job's next step: the
+/// shards whose storage it waits on (see `maintenance::storage_waits`).
+pub(crate) type DfsJobStorageWaits<'a> = &'a dyn Fn(&DfsNamespaceJobRecord) -> Vec<DfsMetadataShardId>;
+
 /// Serve `count-contributions-v1` from one shard's tables and the prefix
 /// those tables materialize. `listable` is the backend's additional
-/// visibility rule for rows whose path the catalog gives this shard.
+/// visibility rule for rows whose path the catalog gives this shard;
+/// `storage_waits` names, for a reported job as these tables hold it, the
+/// shards its next step waits on.
 pub(crate) fn query_count_contributions(
     tables: &crate::metadata_tables::DfsMetadataTables,
     query: &DfsMetadataShardQuery,
     catalog: &[DfsMetadataShardConfig],
     prefix: DfsMetadataPrefixProof,
     listable: &mut dyn FnMut(&DfsObjectMetadata) -> Result<bool, MetadataBackendError>,
+    storage_waits: DfsJobStorageWaits<'_>,
 ) -> Result<DfsMetadataQueryResult, MetadataBackendError> {
     let invalid = |message: &str| MetadataBackendError::Serde(message.to_owned());
     let DfsMetadataSelection::CountContributionsV1 {
         target_shard,
         expected_prefix,
         after,
+        question,
     } = &query.selection
     else {
         return Err(invalid(
@@ -125,6 +217,9 @@ pub(crate) fn query_count_contributions(
         return Err(invalid(
             "count contributions have no exact materialized prefix",
         ));
+    }
+    if question.len() > DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT {
+        return Err(invalid("count contribution question asks too many entries"));
     }
     if (after.is_some() && expected_prefix.is_none())
         || expected_prefix
@@ -139,7 +234,7 @@ pub(crate) fn query_count_contributions(
     {
         return Ok(DfsMetadataQueryResult::CountContributionsChangedV1 { prefix });
     }
-    let page = count_contributions_page(
+    let mut page = count_contributions_page(
         tables,
         &query.file_system_id,
         &query.shard_id.0,
@@ -150,7 +245,105 @@ pub(crate) fn query_count_contributions(
         prefix,
         listable,
     )?;
+    for job in &mut page.running_jobs {
+        if let Some(record) = tables.namespace_jobs.get(&job.job_id) {
+            job.waiting_for_storage_of = storage_waits(record);
+        }
+    }
+    page.held = held_entries(
+        tables,
+        &query.file_system_id,
+        &query.shard_id.0,
+        catalog,
+        question,
+    )?;
     Ok(DfsMetadataQueryResult::CountContributionsV1 { page })
+}
+
+/// Answer `question` from `source_shard`'s tables: the asked objects that are
+/// live canonical rows at a path the catalog gives the source, the asked
+/// paths the source owns that hold a live directory, and the asked jobs the
+/// source records as Running. Only the request's catalog decides ownership.
+/// Holdings are not subject to the backend's residue rule: a live row a
+/// failed move cleanup left behind names an object that exists at the move's
+/// destination, so it never makes an existing object look absent.
+pub(crate) fn held_entries(
+    tables: &crate::metadata_tables::DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    source_shard: &str,
+    catalog: &[DfsMetadataShardConfig],
+    question: &DfsCountContributionQuestion,
+) -> Result<DfsCountContributionHoldings, MetadataBackendError> {
+    let mut held = DfsCountContributionHoldings {
+        answered: u64::try_from(question.len())
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?,
+        ..Default::default()
+    };
+    if question.is_empty() {
+        return Ok(held);
+    }
+    let routing =
+        crate::control_plane::DfsMetadataShardRoutingIndex::new(file_system_id.clone(), catalog)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+    let owned = |path: &str| -> Result<bool, MetadataBackendError> {
+        routing
+            .select_shard_id(path, true)
+            .map(|shard| shard == Some(source_shard))
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))
+    };
+    let live = |object: &DfsObjectMetadata| {
+        object.file_system_id == *file_system_id
+            && object.kind != DfsObjectKind::Tombstone
+            && object.tombstone_provenance.is_none()
+    };
+    for object_id in &question.objects {
+        let Some(object) = tables.objects.get(object_id) else {
+            continue;
+        };
+        if object.object_id == *object_id
+            && live(object)
+            && object.kind != DfsObjectKind::Hardlink
+            && crate::metadata_pages::object_is_visible_at_path_from_tables(
+                tables,
+                file_system_id,
+                object,
+            )
+            && owned(&object.path)?
+        {
+            held.objects.push(object_id.clone());
+        }
+    }
+    for path in &question.directories {
+        if crate::metadata_keys::normalize_posix_path(path) != *path {
+            return Err(MetadataBackendError::Serde(
+                "count contribution question names a noncanonical path".into(),
+            ));
+        }
+        if !owned(path)? {
+            continue;
+        }
+        let Some(object) =
+            crate::metadata_pages::object_by_path_from_tables(tables, file_system_id, path)
+        else {
+            continue;
+        };
+        if object.kind == DfsObjectKind::Directory
+            && live(&object)
+            && crate::metadata_keys::normalize_posix_path(&object.path) == *path
+        {
+            held.directories.push(path.clone());
+        }
+    }
+    for job_id in &question.jobs {
+        if tables.namespace_jobs.get(job_id).is_some_and(|job| {
+            job.job_id == *job_id
+                && job.file_system_id == *file_system_id
+                && job.status == DfsNamespaceJobStatus::Running
+        }) {
+            held.jobs.push(job_id.clone());
+        }
+    }
+    Ok(held)
 }
 
 /// One bounded page of `source_shard`'s contributions to `target_shard`.
@@ -199,7 +392,12 @@ pub(crate) fn count_contributions_page(
         running_jobs: Vec::new(),
         after: None,
         complete: false,
+        held: DfsCountContributionHoldings::default(),
     };
+    if matches!(after, Some(DfsCountContributionCursor::Complete)) {
+        page.complete = true;
+        return Ok(page);
+    }
     let mut visits = limit.saturating_mul(DFS_COUNT_CONTRIBUTION_VISITS_PER_ENTRY);
     let mut last = None::<DfsCountContributionCursor>;
     // Checked before each row, so a page that reaches the end of the last
@@ -332,6 +530,7 @@ pub(crate) fn count_contributions_page(
             root_path: job.root_path.clone(),
             target_path: job.target_path.clone(),
             carried,
+            waiting_for_storage_of: Vec::new(),
         });
     }
     page.complete = true;
@@ -584,6 +783,7 @@ mod tests {
                 root_path: "/users/moved-link".into(),
                 target_path: Some("/services/moved-link".into()),
                 carried: vec![moved],
+                waiting_for_storage_of: Vec::new(),
             }],
             "the Running move, its object carried once"
         );
@@ -668,10 +868,13 @@ mod tests {
                 target_shard: target_shard.into(),
                 expected_prefix,
                 after,
+                question: Default::default(),
             },
         };
         let serve = |query: &DfsMetadataShardQuery, current: DfsMetadataPrefixProof| {
-            query_count_contributions(&tables, query, &catalog(), current, &mut |_| Ok(true))
+            query_count_contributions(&tables, query, &catalog(), current, &mut |_| Ok(true), &|_| {
+                Vec::new()
+            })
         };
         let mut moved = prefix();
         moved.journal_sequence += 1;
@@ -707,12 +910,112 @@ mod tests {
         assert!(read_page(&tables, "root", None, DFS_COUNT_CONTRIBUTION_PAGE_LIMIT + 1).is_err());
     }
 
+    /// The read answers which asked objects, directories and jobs the
+    /// source holds at paths the catalog gives it, and a question-only
+    /// request after the last section visits no rows.
+    #[test]
+    fn a_question_is_answered_from_the_rows_the_source_owns() {
+        let (tables, _) = users_tables();
+        let question = DfsCountContributionQuestion {
+            objects: vec![
+                id("obj_count_doc"),
+                id("obj_count_doc_link"),
+                id("obj_count_remote"),
+                id("obj_count_stale_dir"),
+                id("obj_count_users"),
+            ],
+            directories: vec![
+                "/users/alice".into(),
+                "/users/doc".into(),
+                "/users/missing".into(),
+                "/services/stale-dir".into(),
+            ],
+            jobs: vec!["job-count-rename".into(), "job-count-done".into()],
+        };
+        let query = |after, question: DfsCountContributionQuestion| DfsMetadataShardQuery {
+            file_system_id: sifs_file_system_id(),
+            shard_id: DfsMetadataShardId::new("users"),
+            epoch: 1,
+            selection: DfsMetadataSelection::CountContributionsV1 {
+                target_shard: "root".into(),
+                expected_prefix: Some(prefix()),
+                after,
+                question,
+            },
+        };
+        let serve = |query: &DfsMetadataShardQuery| {
+            let DfsMetadataQueryResult::CountContributionsV1 { page } =
+                query_count_contributions(&tables, query, &catalog(), prefix(), &mut |_| Ok(true), &|_| Vec::new())
+                    .unwrap()
+            else {
+                panic!("an unchanged prefix serves its page");
+            };
+            page
+        };
+        let page = serve(&query(
+            Some(DfsCountContributionCursor::Complete),
+            question.clone(),
+        ));
+        assert!(page.complete && page.after.is_none() && page.entry_count() == 0);
+        assert_eq!(
+            page.held,
+            DfsCountContributionHoldings {
+                answered: 11,
+                // Never an alias, or a stale copy of a path another shard owns.
+                objects: vec![id("obj_count_doc"), id("obj_count_users")],
+                directories: vec!["/users/alice".into()],
+                jobs: vec!["job-count-rename".into()],
+            }
+        );
+        assert!(page.held.answers(&question));
+        assert!(
+            !DfsCountContributionHoldings::default().answers(&question),
+            "an answer that evaluated nothing does not answer"
+        );
+        let first = serve(&query(None, question.clone()));
+        assert_eq!(first.held, page.held, "every page answers its own question");
+        assert!(!first.aliases.is_empty());
+        let oversized = DfsCountContributionQuestion {
+            jobs: (0..=DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT)
+                .map(|index| format!("job-{index}"))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            query_count_contributions(
+                &tables,
+                &query(None, oversized),
+                &catalog(),
+                prefix(),
+                &mut |_| Ok(true),
+                &|_| Vec::new()
+            )
+            .is_err()
+        );
+        let noncanonical = DfsCountContributionQuestion {
+            directories: vec!["/users/alice/".into()],
+            ..Default::default()
+        };
+        assert!(
+            query_count_contributions(
+                &tables,
+                &query(None, noncanonical),
+                &catalog(),
+                prefix(),
+                &mut |_| Ok(true),
+                &|_| Vec::new()
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn contribution_wire_is_tagged_and_explicit() {
         let selection = DfsMetadataSelection::CountContributionsV1 {
             target_shard: "root".into(),
             expected_prefix: None,
             after: None,
+            question: Default::default(),
         };
         assert_eq!(
             serde_json::to_value(&selection).unwrap()["kind"],
@@ -732,6 +1035,7 @@ mod tests {
                 target_object_id: id("obj_count_doc"),
                 alias_object_id: id("obj_count_doc_link"),
             }),
+            question: Default::default(),
         };
         let (tables, _) = users_tables();
         let result = DfsMetadataQueryResult::CountContributionsV1 {
@@ -804,6 +1108,7 @@ mod tests {
                     target_shard: target_shard.into(),
                     expected_prefix,
                     after: None,
+                    question: Default::default(),
                 },
             )
         };

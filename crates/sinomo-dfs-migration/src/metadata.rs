@@ -2,6 +2,7 @@
 //! after the native host certifies the exact source/current cut.
 pub(crate) mod ack_floor;
 pub(crate) mod canonical_generation;
+pub(crate) mod combined_root;
 mod legacy_projection;
 mod prior_native;
 mod placement_reservations;
@@ -2162,6 +2163,41 @@ pub fn owned_metadata_source_stage(source: &MetadataSourceContentWorkScope) -> R
         ));
     }
     Ok(cut.staged_root)
+}
+/// Register under `actual` the writer fence a session of this process holds
+/// on the copy a capture recorded at `recorded`, when that copy has since
+/// moved to `actual`: the held fence is `actual`'s own lock file. Without
+/// such a fence nothing is registered, and the next retain takes a new one.
+pub(crate) fn rebind_relocated_source_fence(recorded: &Path, actual: &Path) -> Result<()> {
+    if recorded == actual {
+        return Ok(());
+    }
+    let Ok(key) = recorded.canonicalize() else {
+        return Ok(());
+    };
+    let held = SOURCE_FENCES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .and_then(|custody| custody.fence.upgrade());
+    let Some(file) = held else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let lock = match fs::metadata(actual.join("journal/write.lock")) {
+            Ok(lock) => lock,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(cause) => return Err(error(cause)),
+        };
+        let held = file.metadata().map_err(error)?;
+        if held.dev() == lock.dev() && held.ino() == lock.ino() {
+            register_source_fence(actual, &file)?;
+        }
+    }
+    Ok(())
 }
 /// Retain the actual converter writer fence across a self or peer stage RPC.
 /// The registry carries only weak custody; it cannot manufacture ownership.
@@ -6396,19 +6432,60 @@ impl MetadataConverter {
     /// shard's primary. The same converter session replays the source under
     /// its writer fence and keeps the fence while the session is warm; the
     /// capture intent makes a current-format copy a source as well.
+    ///
+    /// `reservations` is the shard's share of the original placement goals,
+    /// which the capture binds as the complete-filesystem capture binds its
+    /// share; it cannot change once the source is captured.
+    ///
+    /// `source` is the copy the capture reads: the shard's own copy at
+    /// `destination`, or the legacy combined `root` copy that holds the
+    /// shard's rows ([`combined_root`]), of which the capture keeps only the
+    /// shard's rows.
     pub(crate) fn capture_shard_conversion_source(
-        &self, destination: &Path, shard: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, budget: usize,
+        &self, destination: &Path, source: &Path, shard: &DfsMetadataShardId, file_system_id: &DfsFileSystemId,
+        reservations: &[RetainedPlacementReservation], budget: usize,
     ) -> Result<(DfsStoragePreparation, Option<Arc<canonical_generation::CapturedMetadataUnit>>)> {
         let authority = self.authority.as_ref().ok_or_else(|| error("shard conversion requires its actual import owner"))?;
         if authority.kind() != MetadataImportAuthorityKind::Native {
             return Err(error("per-shard conversion requires native source authority"));
         }
         let destination = canonical_destination(destination)?;
-        authority.validate_owned_source(&destination, shard, std::slice::from_ref(file_system_id))?;
+        let source = canonical_destination(source)?;
+        authority.validate_owned_source(&source, shard, std::slice::from_ref(file_system_id))?;
         let stage = conversion_stage_base_path(&destination, shard)?;
         fs::create_dir_all(&stage).map_err(error)?;
+        validate_placement_reservations(reservations, std::slice::from_ref(file_system_id), shard)?;
+        let evidence = stage.join("placement-reservations.json");
+        let captured = conversion_stage_path(&destination, shard)?.join("captured-unit.json");
+        if captured.exists() {
+            let original: canonical_generation::CapturedMetadataUnit = read_json(&captured)?;
+            original.validate()?;
+            if original.source.retained_placement_reservations != reservations {
+                return Err(error("placement evidence cannot change after source capture"));
+            }
+        }
+        if !evidence.exists() && !reservations.is_empty()
+            && stage.join("captured-source-cut.json").exists() {
+            return Err(error("new placement evidence cannot attach to retained original source facts"));
+        }
+        write_count_cohort_checkpoint(&evidence, &reservations)?;
         write_count_cohort_checkpoint(&stage.join(SHARD_CONVERSION_CAPTURE), file_system_id)?;
-        self.capture_metadata_unit_progress(&destination, &destination, shard, budget)
+        if source != destination {
+            combined_root::record_combined_source_capture(&destination, shard, file_system_id)?;
+        }
+        self.capture_metadata_unit_progress(&destination, &source, shard, budget)
+    }
+
+    /// The placement evidence a capture of `destination` recorded, if any.
+    pub(crate) fn recorded_placement_evidence(
+        &self, destination: &Path, shard: &DfsMetadataShardId,
+    ) -> Result<Option<Vec<RetainedPlacementReservation>>> {
+        let destination = canonical_destination(destination)?;
+        let path = conversion_stage_base_path(&destination, shard)?.join("placement-reservations.json");
+        if !path.try_exists().map_err(error)? {
+            return Ok(None);
+        }
+        read_placement_capture(&destination, shard).map(Some)
     }
 
     /// End the capture of `destination` once its shard's storage is Active:
@@ -6605,10 +6682,17 @@ pub(crate) fn original_unit_absent(root: &Path, shard: &DfsMetadataShardId) -> R
         return Ok(false);
     }
     // Older combined roots can own an absent split scope. Do not classify that
-    // source as empty merely because its later physical directory is missing.
-    let combined = root.parent().ok_or_else(|| error("metadata unit has no parent"))?.join("root");
+    // source as empty merely because its later physical directory is missing,
+    // whether the combined copy is still live or was retained beside the
+    // image a per-shard conversion of `root` installed.
+    let metadata_root = root.parent().ok_or_else(|| error("metadata unit has no parent"))?;
+    let combined = metadata_root.join("root");
     if combined != root && original_source_present(&combined)?
         && sinomo_dfs::inspect_metadata_storage_generation(&combined).is_err() {
+        return Ok(false);
+    }
+    if let Some(retained) = combined_root::legacy_combined_root(metadata_root, shard)?
+        && original_source_present(&retained)? {
         return Ok(false);
     }
     let mut directories = vec![root.to_owned()];
@@ -6851,4 +6935,43 @@ pub(crate) fn installed_metadata_source_cut(
         }
     }
     Ok(Some(marker.source_cut))
+}
+
+#[cfg(test)]
+mod held_copy_tests {
+    use super::*;
+
+    /// The provider's check of a live copy: held exactly while its stage
+    /// holds the complete-filesystem conversion's count-capture intent and no
+    /// installed image replaced the copy. The per-shard capture intent does
+    /// not hold it; that conversion closes the shard through its storage
+    /// record instead.
+    #[test]
+    fn a_live_copy_is_held_only_by_an_unfinished_complete_filesystem_capture() {
+        let root = sinomo_testdir::TestDir::new("held-copy-intents");
+        let shard = DfsMetadataShardId::new("users");
+        let destination = root.path().join("dfs/metadata/users");
+        assert!(!live_copy_held_by_conversion(&destination, &shard).unwrap(), "no copy");
+        fs::create_dir_all(&destination).unwrap();
+        assert!(!live_copy_held_by_conversion(&destination, &shard).unwrap(), "no capture intent");
+        let stage = conversion_stage_base_path(&canonical_destination(&destination).unwrap(), &shard).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        write_count_cohort_checkpoint(&stage.join(SHARD_CONVERSION_CAPTURE), &sinomo_dfs::sifs_file_system_id())
+            .unwrap();
+        assert!(
+            !live_copy_held_by_conversion(&destination, &shard).unwrap(),
+            "the per-shard capture intent does not hold the copy"
+        );
+        assert!(namespace_count_capture_requested(&canonical_destination(&destination).unwrap(), &shard).unwrap());
+        write_count_cohort_checkpoint(&stage.join("namespace-count-capture.json"), &Vec::<DfsMetadataShardConfig>::new())
+            .unwrap();
+        assert!(
+            live_copy_held_by_conversion(&destination, &shard).unwrap(),
+            "the complete-filesystem count capture holds the copy"
+        );
+        fs::remove_file(stage.join(SHARD_CONVERSION_CAPTURE)).unwrap();
+        assert!(live_copy_held_by_conversion(&destination, &shard).unwrap());
+        fs::remove_file(stage.join("namespace-count-capture.json")).unwrap();
+        assert!(!live_copy_held_by_conversion(&destination, &shard).unwrap());
+    }
 }

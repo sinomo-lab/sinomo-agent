@@ -203,6 +203,39 @@ impl DfsParentCountParticipant {
             }
     }
 
+    /// This declaration with the participant id its contents derive, as the
+    /// directory move that declares it derives it.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_derived_id_for_test(mut self) -> std::result::Result<Self, crate::MetadataBackendError> {
+        self.participant_id = self.identity()?;
+        Ok(self)
+    }
+
+    /// Validate the declaration's identity and its successor, as its parent
+    /// shard does before it records any phase.
+    pub fn validate_declaration(&self) -> std::result::Result<(), crate::MetadataBackendError> {
+        self.validate()
+    }
+
+    /// The participant's row in its parent shard once that shard records
+    /// `state` at `at`: the row the participant's own phase writes, which a
+    /// later command for the same phase finds as already recorded.
+    pub fn recorded_job(&self, state: DfsParentCountState, at: OffsetDateTime) -> DfsNamespaceJobRecord {
+        let mut job = self.job(state.clone());
+        job.updated_at = at.max(job.created_at);
+        job.completed_at = (state != DfsParentCountState::Reserved).then_some(job.updated_at);
+        job
+    }
+
+    /// The directory version row the Applied phase writes with the
+    /// successor.
+    pub fn applied_version(
+        &self,
+    ) -> std::result::Result<DfsObjectVersionRecord, crate::MetadataBackendError> {
+        self.successor_version()
+    }
+
     pub(crate) fn job(&self, state: DfsParentCountState) -> DfsNamespaceJobRecord {
         DfsNamespaceJobRecord {
             job_id: self.participant_id.clone(),

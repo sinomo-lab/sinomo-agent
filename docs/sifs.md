@@ -135,6 +135,9 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   publish fails with a conflict; FUSE reports it as `ESTALE`. Re-resolve the
   path and retry. Normal operation keeps no conflict records.
 - A path locked by an in-progress cross-shard move returns a retryable error.
+  While a cross-shard directory move runs, creates, writes, renames and
+  unlinks under its destination return the same error until the move finishes
+  or aborts; reads there are not blocked.
 - Unix FUSE mounts support distributed whole-file shared and exclusive POSIX
   advisory locks. Partial byte ranges are rejected with `EOPNOTSUPP`; a lock
   that loses its authority epoch or expires poisons its associated handles and

@@ -3,6 +3,8 @@
 use super::*;
 
 mod closed_copies;
+mod destination_reservation;
+mod job_events;
 mod namespace_counts;
 mod parent_counts;
 mod parent_supersession_negatives;

@@ -152,6 +152,7 @@ mod mounted_mutation_outbox;
 mod mounted_sifs;
 mod namespace;
 mod namespace_change_feed;
+mod namespace_job_events;
 mod node_transport;
 mod operator;
 mod performance_metrics;
@@ -993,8 +994,15 @@ pub use file_history_query::{
     DfsMetadataQueryResult, DfsMetadataSelection, DfsMetadataShardQuery, DfsMetadataShardResponse,
 };
 pub use count_contributions::{
-    DfsAliasContribution, DfsChildDirectoryContribution, DfsCountContributionCursor,
-    DfsCountContributionPage, DfsRunningJobContribution,
+    DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT, DfsAliasContribution, DfsChildDirectoryContribution,
+    DfsCountContributionCursor, DfsCountContributionHoldings, DfsCountContributionPage,
+    DfsCountContributionQuestion, DfsRunningJobContribution,
+};
+pub use namespace_job_events::{
+    DFS_NAMESPACE_JOB_COMPLETED_EVENT_KIND, DFS_NAMESPACE_JOB_EVENT_SCHEMA_ID,
+    DFS_NAMESPACE_JOB_EVENT_SCHEMA_VERSION, DFS_NAMESPACE_JOB_PARKED_EVENT_KIND,
+    DfsNamespaceJobEvent, DfsNamespaceJobEventKind, DfsNamespaceJobEventListener,
+    listen_for_namespace_job_events,
 };
 pub use metadata_records::{
     DfsContentCopyJobReceipt, DfsContentCopyJobResult, DfsContentCopyJobState,

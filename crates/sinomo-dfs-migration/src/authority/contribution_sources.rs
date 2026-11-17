@@ -30,21 +30,36 @@
 //!
 //! **Phase.** A job's phase is the type of the frame it runs next (the last
 //! pending frame), `no-pending-frame` when it has none, or `failed`. A job
-//! holding a counted parent plan appends `;parent-counts=<plan phase>`, and a
-//! parent participant frame appends `;state=<participant state>`. A Pending
-//! request has phase `pending`; an intent has its status.
+//! holding a counted parent plan appends `;parent-counts=<plan phase>` and,
+//! for each participant the plan declares, `;participant=<participant id>`,
+//! so the participant's shard can find the plan phase of the move it holds a
+//! participant for; while the job's frames still hold the move of its root
+//! out of or into that participant's directory it also appends
+//! `;participant-effect-pending=<participant id>`. A parent participant
+//! frame appends `;state=<participant state>`. A Running
+//! job of an open source whose primary recorded that its next step waits for
+//! T's storage appends `;parked-on-target`. A Pending request has phase
+//! `pending`; an intent has its status.
 //!
 //! **Basis.** Every answer names what it was read from: S's serving epoch,
 //! a digest of S's storage record (or its absence), the catalog ownership it
 //! is attributed with, and either the prefix proof of S's current tables or
 //! the captured source identity and fingerprints of S's old image.
+//!
+//! **Question.** The target's question to S is asked after the contribution
+//! pages, in bounded parts bound to the same prefix (current tables) or the
+//! same basis (old image), and S's answer is checked to cover every asked
+//! entry. A hardlink job's phase names the target fence it installs or
+//! commits as `;fence=<fence job id>`, so the fence's shard can find the job
+//! that holds its fence.
 #![cfg_attr(
     not(test),
     allow(dead_code, reason = "consumed by the per-shard conversion driver")
 )]
 use super::contribution_extraction as extraction;
 use super::contribution_source::{
-    ContributionSource, SourceContributionAnswer, SourceContributionRead, SourceJobTouchingTarget,
+    ContributionSource, SourceContributionAnswer, SourceContributionRead, SourceHoldings,
+    SourceJobTouchingTarget, SourceQuestion,
 };
 use super::*;
 use crate::namespace_counts::{
@@ -74,24 +89,92 @@ impl NativeContributionSource {
     }
 }
 
-impl ContributionSource for NativeContributionSource {
-    fn read(
+impl NativeContributionSource {
+    fn answer(
         &self,
         target: &DfsMetadataShardConfig,
         source: &DfsMetadataShardConfig,
-    ) -> impl Future<Output = Result<SourceContributionRead>> + Send {
+        question: SourceQuestion,
+    ) -> impl Future<Output = Result<SourceContributionRead>> + Send + use<> {
         let authority = Arc::clone(&self.authority);
         let (target, source) = (target.clone(), source.clone());
         async move {
             // Every read below blocks on KV and peer calls, as the owner's
             // other steps do; keep them off the async executor.
             tokio::task::spawn_blocking(move || {
-                authority.read_source_contributions(&target, &source)
+                authority.read_source_contributions(&target, &source, &question)
             })
             .await
             .map_err(error)?
         }
     }
+}
+
+impl ContributionSource for NativeContributionSource {
+    fn read(
+        &self,
+        target: &DfsMetadataShardConfig,
+        source: &DfsMetadataShardConfig,
+    ) -> impl Future<Output = Result<SourceContributionRead>> + Send {
+        self.answer(target, source, SourceQuestion::default())
+    }
+
+    fn read_asking(
+        &self,
+        target: &DfsMetadataShardConfig,
+        source: &DfsMetadataShardConfig,
+        question: &SourceQuestion,
+    ) -> impl Future<Output = Result<SourceContributionRead>> + Send {
+        self.answer(target, source, question.clone())
+    }
+}
+
+/// Bytes of one question part on the wire, besides its entries' text.
+const QUESTION_ENTRY_OVERHEAD: usize = 8;
+/// Largest encoded size of one question part, well inside the request
+/// limits of both routes.
+const QUESTION_PART_BYTES: usize = 32 * 1024;
+
+/// Split `question` into parts that each fit one request, in question order.
+pub(super) fn question_parts(question: &SourceQuestion) -> Vec<SourceQuestion> {
+    let mut parts = Vec::new();
+    let mut part = SourceQuestion::default();
+    let mut bytes = 0usize;
+    let mut push = |part: &mut SourceQuestion, bytes: &mut usize, len: usize| {
+        let size = len + QUESTION_ENTRY_OVERHEAD;
+        if !part.is_empty()
+            && (part.len() >= sinomo_dfs::DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT
+                || *bytes + size > QUESTION_PART_BYTES)
+        {
+            parts.push(std::mem::take(part));
+            *bytes = 0;
+        }
+        *bytes += size;
+    };
+    for object in &question.objects {
+        push(&mut part, &mut bytes, object.as_str().len());
+        part.objects.push(object.clone());
+    }
+    for directory in &question.directories {
+        push(&mut part, &mut bytes, directory.len());
+        part.directories.push(directory.clone());
+    }
+    for job in &question.jobs {
+        push(&mut part, &mut bytes, job.len());
+        part.jobs.push(job.clone());
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+/// Add one part's answer to the answer of the whole question.
+pub(super) fn add_holdings(held: &mut SourceHoldings, part: SourceHoldings) {
+    held.answered += part.answered;
+    held.objects.extend(part.objects);
+    held.directories.extend(part.directories);
+    held.jobs.extend(part.jobs);
 }
 
 /// Digest of the path ownership a catalog assigns: every shard's identity
@@ -281,6 +364,12 @@ impl TargetScope<'_> {
                     || self.is_target(&participant.binding.coordinator_scope)
                     || self.owns_object(&participant.expected)
             }
+            Frame::DirectoryMoveDestinationReservation {
+                source_root,
+                target_root,
+                ..
+            } => self.owns(source_root) || self.owns(target_root),
+            Frame::CrossShardDirAbort { .. } => false,
         })
     }
 
@@ -396,6 +485,9 @@ pub(super) fn recorded_phase(job: &DfsNamespaceJobRecord) -> Result<String> {
             } => {
                 if let Some(parents) = &plan.parent_participants {
                     phase.push_str(&format!(";parent-counts={}", wire_tag(&parents.phase)?));
+                    for participant in &parents.participants {
+                        phase.push_str(&participant_phase(job, participant));
+                    }
                 }
             }
             DfsNamespaceJobFrame::ParentCountParticipant { state, .. } => {
@@ -404,7 +496,52 @@ pub(super) fn recorded_phase(job: &DfsNamespaceJobRecord) -> Result<String> {
             _ => {}
         }
     }
+    let mut fences = BTreeSet::new();
+    for frame in &job.pending_frames {
+        let fence = match frame {
+            DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { fence_job_id, .. } => {
+                fence_job_id
+            }
+            DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall { fence, .. } => {
+                &fence.job_id
+            }
+            _ => continue,
+        };
+        if fences.insert(fence) {
+            phase.push_str(&format!(";fence={fence}"));
+        }
+    }
     Ok(phase)
+}
+
+/// The phase parts naming one parent participant of a directory move's
+/// plan: `;participant=<id>`, and `;participant-effect-pending=<id>` while
+/// the job's frames still hold the move of its root out of or into the
+/// participant's directory (the root's start, or the root's own source
+/// completion for the source parent, or adoption for the target parent).
+fn participant_phase(
+    job: &DfsNamespaceJobRecord,
+    participant: &sinomo_dfs::DfsParentCountParticipant,
+) -> String {
+    let id = &participant.participant_id;
+    let parent = participant.expected.path.as_str();
+    let source_side = parent_path(&job.root_path) == Some(parent);
+    let target_side = job.target_path.as_deref().and_then(parent_path) == Some(parent);
+    let pending = job.pending_frames.iter().any(|frame| match frame {
+        DfsNamespaceJobFrame::CrossShardDirStart { .. } => true,
+        DfsNamespaceJobFrame::CrossShardComplete { old_path, .. } => {
+            source_side && *old_path == job.root_path
+        }
+        DfsNamespaceJobFrame::CrossShardAdopt { moved_object, .. } => {
+            target_side && job.target_path.as_ref() == Some(&moved_object.path)
+        }
+        _ => false,
+    });
+    let mut parts = format!(";participant={id}");
+    if pending {
+        parts.push_str(&format!(";participant-effect-pending={id}"));
+    }
+    parts
 }
 
 /// What one source has, as read from KV.
@@ -452,6 +589,7 @@ impl NativeImportAuthority {
         &self,
         target: &DfsMetadataShardConfig,
         source: &DfsMetadataShardConfig,
+        question: &SourceQuestion,
     ) -> Result<SourceContributionRead> {
         if target.file_system_id != source.file_system_id || target.shard_id == source.shard_id {
             return Err(error(
@@ -476,12 +614,12 @@ impl NativeImportAuthority {
         let attempt = match old {
             Some(converter) => {
                 let node = converter.unwrap_or_else(|| state.shard.primary_node_id.clone());
-                self.read_old_image(&state, target, &node)
+                self.read_old_image(&state, target, &node, question)
             }
             None => Err(Unanswered::NotOld),
         };
         let attempt = match attempt {
-            Err(Unanswered::NotOld) => self.read_current_tables(&state, target),
+            Err(Unanswered::NotOld) => self.read_current_tables(&state, target, question),
             other => other,
         };
         match attempt {
@@ -568,9 +706,11 @@ impl NativeImportAuthority {
         state: &SourceState,
         target: &DfsMetadataShardConfig,
         node: &NodeId,
+        question: &SourceQuestion,
     ) -> std::result::Result<SourceContributionAnswer, Unanswered> {
         let fs = &state.shard.file_system_id;
         let mut restarted = false;
+        let parts = question_parts(question);
         'read: loop {
             let mut contributions = ShardCountContributions {
                 source_shard: DfsMetadataShardId::new(&state.shard.shard_id),
@@ -580,14 +720,27 @@ impl NativeImportAuthority {
             };
             let mut jobs = Vec::new();
             let mut continuation = None::<extraction::Continuation>;
+            let mut held = SourceHoldings::default();
+            let mut read = 0u64;
+            // The question's parts follow the last page, as continuations
+            // past every entry of the same basis.
+            let mut asking = None::<(String, usize)>;
             loop {
+                let part = asking.as_ref().map(|(_, index)| parts[*index].clone());
                 let request = extraction::Request {
                     file_system_id: fs.clone(),
                     source_shard: state.shard.shard_id.clone(),
                     target_shard: target.shard_id.clone(),
                     source_epoch: state.shard.epoch,
                     catalog_digest: state.catalog_digest.clone(),
-                    continuation: continuation.clone(),
+                    continuation: match &asking {
+                        Some((basis, _)) => Some(extraction::Continuation {
+                            basis: basis.clone(),
+                            after: read,
+                        }),
+                        None => continuation.clone(),
+                    },
+                    question: part.clone().unwrap_or_default(),
                 };
                 let response = match self.extraction_call(node, &request) {
                     Ok(response) => response,
@@ -608,7 +761,30 @@ impl NativeImportAuthority {
                         running_jobs_touching_target,
                         after,
                         complete,
+                        held: part_held,
                     } => {
+                        if let Some((asked_basis, index)) = &mut asking {
+                            let part = part.expect("an asked part");
+                            if *asked_basis != basis
+                                || !complete
+                                || !aliases.is_empty()
+                                || !child_directories.is_empty()
+                                || !running_jobs_touching_target.is_empty()
+                                || !part_held.answers(&part)
+                            {
+                                return Err(Unanswered::Failed(error(
+                                    "old-image question answer does not continue its read",
+                                )));
+                            }
+                            add_holdings(&mut held, part_held);
+                            *index += 1;
+                            if *index == parts.len() {
+                                let mut answer = finish_answer(contributions, jobs, basis);
+                                answer.held = held;
+                                return Ok(answer);
+                            }
+                            continue;
+                        }
                         if continuation
                             .as_ref()
                             .is_some_and(|previous| previous.basis != basis)
@@ -618,6 +794,12 @@ impl NativeImportAuthority {
                                 "contribution page does not continue its read",
                             )));
                         }
+                        read += u64::try_from(
+                            aliases.len()
+                                + child_directories.len()
+                                + running_jobs_touching_target.len(),
+                        )
+                        .map_err(|failure| Unanswered::Failed(error(failure)))?;
                         contributions.aliases.extend(aliases);
                         contributions.child_directories.extend(child_directories);
                         jobs.extend(running_jobs_touching_target);
@@ -625,7 +807,10 @@ impl NativeImportAuthority {
                             Some(after) => {
                                 continuation = Some(extraction::Continuation { basis, after });
                             }
-                            None => return Ok(finish_answer(contributions, jobs, basis)),
+                            None if parts.is_empty() => {
+                                return Ok(finish_answer(contributions, jobs, basis));
+                            }
+                            None => asking = Some((basis, 0)),
                         }
                     }
                     extraction::Response::Changed { .. } if !restarted => {
@@ -668,6 +853,7 @@ impl NativeImportAuthority {
         &self,
         state: &SourceState,
         target: &DfsMetadataShardConfig,
+        question: &SourceQuestion,
     ) -> std::result::Result<SourceContributionAnswer, Unanswered> {
         let unavailable = |failure: &dyn std::fmt::Display| {
             tracing::debug!(source=%state.shard.shard_id, error=%failure,
@@ -703,6 +889,7 @@ impl NativeImportAuthority {
                             target_shard: target.shard_id.clone(),
                             expected_prefix: prefix.clone(),
                             after: after.clone(),
+                            question: SourceQuestion::default(),
                         },
                     )
                     .map_err(|failure| unavailable(&failure))?;
@@ -738,7 +925,13 @@ impl NativeImportAuthority {
                             child_path: child.child_path,
                         }
                     }));
-                running.extend(page.running_jobs.into_iter().map(|job| job.job_id));
+                running.extend(page.running_jobs.into_iter().map(|job| {
+                    let parked = job
+                        .waiting_for_storage_of
+                        .iter()
+                        .any(|shard| shard.0 == target.shard_id);
+                    (job.job_id, parked)
+                }));
                 prefix = Some(page.prefix);
                 if page.complete {
                     break;
@@ -746,8 +939,43 @@ impl NativeImportAuthority {
                 after = page.after;
             }
             let prefix = prefix.expect("a complete read has a page");
+            // The question, in parts bound to the pages' prefix.
+            let mut held = SourceHoldings::default();
+            for part in question_parts(question) {
+                let result = service
+                    .query_metadata_authority(
+                        &state.shard,
+                        DfsMetadataSelection::CountContributionsV1 {
+                            target_shard: target.shard_id.clone(),
+                            expected_prefix: Some(prefix.clone()),
+                            after: Some(sinomo_dfs::DfsCountContributionCursor::Complete),
+                            question: part.clone(),
+                        },
+                    )
+                    .map_err(|failure| unavailable(&failure))?;
+                match result {
+                    DfsMetadataQueryResult::CountContributionsV1 { page }
+                        if page.held.answers(&part)
+                            && page.complete
+                            && page.aliases.is_empty()
+                            && page.child_directories.is_empty()
+                            && page.running_jobs.is_empty() =>
+                    {
+                        add_holdings(&mut held, page.held);
+                    }
+                    DfsMetadataQueryResult::CountContributionsChangedV1 { .. } if !restarted => {
+                        restarted = true;
+                        continue 'read;
+                    }
+                    other => {
+                        return Err(unavailable(&format!(
+                            "unexpected contribution question result {other:?}"
+                        )));
+                    }
+                }
+            }
             let mut jobs = Vec::new();
-            for job_id in running {
+            for (job_id, parked) in running {
                 let result = service
                     .query_metadata_authority(
                         &state.shard,
@@ -764,7 +992,8 @@ impl NativeImportAuthority {
                         jobs.extend(
                             scope
                                 .job_touching(&job)
-                                .map_err(|failure| unavailable(&failure))?,
+                                .map_err(|failure| unavailable(&failure))?
+                                .map(|touching| parked_on_target_hook(touching, parked)),
                         );
                     }
                     // The job moved on after the page was read: the source
@@ -785,9 +1014,23 @@ impl NativeImportAuthority {
             }
             .render()
             .map_err(|failure| unavailable(&failure))?;
-            return Ok(finish_answer(contributions, jobs, basis));
+            let mut answer = finish_answer(contributions, jobs, basis);
+            answer.held = held;
+            return Ok(answer);
         }
     }
+}
+
+/// Mark a job its page reported as waiting on the target's storage. The
+/// read-back job is from the same primary; a job that moved on between the
+/// two reads changed the source's prefix, so the next round differs.
+fn parked_on_target_hook(mut job: SourceJobTouchingTarget, parked: bool) -> SourceJobTouchingTarget {
+    if parked {
+        job.phase.push(';');
+        job.phase
+            .push_str(super::contribution_source::PARKED_ON_TARGET_PHASE);
+    }
+    job
 }
 
 /// Canonical order, so equal reads give equal answers.
@@ -812,6 +1055,7 @@ pub(super) fn finish_answer(
         contributions,
         running_jobs_touching_target: jobs,
         basis,
+        held: SourceHoldings::default(),
     }
 }
 
@@ -908,6 +1152,135 @@ mod touch_tests {
     }
 
     #[test]
+    fn a_job_its_page_reports_waiting_on_the_target_is_parked_on_it() {
+        let job = SourceJobTouchingTarget {
+            job_id: "move".into(),
+            family: "rename-directory-across-shard-primaries".into(),
+            phase: "cross-shard-dir-scan;parent-counts=issued".into(),
+        };
+        assert!(!job.parked_on_target());
+        assert_eq!(parked_on_target_hook(job.clone(), false), job);
+        let parked = parked_on_target_hook(job.clone(), true);
+        assert_eq!(
+            parked.phase,
+            "cross-shard-dir-scan;parent-counts=issued;parked-on-target"
+        );
+        assert!(parked.parked_on_target());
+        // Only the exact phase part marks the park.
+        let other = SourceJobTouchingTarget {
+            phase: "cross-shard-dir-scan;state=parked-on-target-shard".into(),
+            ..job
+        };
+        assert!(!other.parked_on_target());
+    }
+
+    /// A directory move names each participant of its plan, and marks one
+    /// whose child effect its frames still hold: the root's start, the
+    /// root's source completion for the source parent, or the root's
+    /// adoption for the target parent. A child's frames mark nothing.
+    #[test]
+    fn a_directory_moves_phase_names_its_participants_and_their_pending_effects() {
+        let catalog = catalog();
+        let participant = |root: &str, target: &str| {
+            let mut parent = object("phase-root", "/", DfsObjectKind::Directory);
+            parent.namespace_link_count = Some(4);
+            sinomo_dfs::DfsParentCountParticipant {
+                participant_id: format!("participant-of-{root}"),
+                binding: sinomo_dfs::DfsParentCountBinding {
+                    job_id: "move".into(),
+                    file_system_id: sinomo_dfs::sifs_file_system_id(),
+                    root_path: root.into(),
+                    target_path: target.into(),
+                    coordinator_scope: catalog[2].clone(),
+                    source: object("phase-dir", root, DfsObjectKind::Directory),
+                    expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+                    origin: None,
+                    created_at: time::OffsetDateTime::UNIX_EPOCH,
+                },
+                parent_scope: catalog[0].clone(),
+                expected: parent.clone(),
+                successor: parent,
+                delta: -1,
+            }
+        };
+        let moved = |path: &str| object("phase-dir", path, DfsObjectKind::Directory);
+        let complete = |old: &str| DfsNamespaceJobFrame::CrossShardComplete {
+            moved_object: moved("/unused"),
+            old_path: old.into(),
+        };
+        let adopt = |path: &str, old: &str| DfsNamespaceJobFrame::CrossShardAdopt {
+            moved_object: moved(path),
+            old_path: old.into(),
+            promotion_alias: None,
+            destination_primary_node_id: NodeId::from_legacy_named("phase-destination").unwrap(),
+        };
+        let phase = |root: &str, target: &str, frames: Vec<DfsNamespaceJobFrame>| {
+            let participant = participant(root, target);
+            let id = participant.participant_id.clone();
+            let mut pending = vec![DfsNamespaceJobFrame::CrossShardDirFinish {
+                source_root: root.into(),
+                count_plan: Some(sinomo_dfs::DfsDirectoryMoveCounts {
+                    parent_participants: Some(sinomo_dfs::DfsParentCountPlan {
+                        participants: vec![participant],
+                        phase: sinomo_dfs::DfsParentCountPhase::Issued,
+                        confirmed: 0,
+                        rejection: None,
+                    }),
+                    expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+                    source_parent_delta: -1,
+                    target_parent_delta: 1,
+                }),
+            }];
+            pending.extend(frames);
+            let job = job(
+                "move",
+                DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                root,
+                Some(target),
+                pending,
+            );
+            let phase = recorded_phase(&job).unwrap();
+            let named = phase.split(';').any(|part| part == format!("participant={id}"));
+            let marked = phase
+                .split(';')
+                .any(|part| part == format!("participant-effect-pending={id}"));
+            assert!(named, "{phase}");
+            marked
+        };
+        let scan = |source: &str, target: &str| DfsNamespaceJobFrame::CrossShardDirScan {
+            source_path: source.into(),
+            target_path: target.into(),
+            cursor: None,
+        };
+        // The source parent "/" of a moved shard root.
+        let (root, target) = ("/users", "/services/moved");
+        let start = DfsNamespaceJobFrame::CrossShardDirStart {
+            source_object_id: moved(root).object_id,
+            source_root: root.into(),
+            target_root: target.into(),
+        };
+        assert!(phase(root, target, vec![scan(root, target), start]));
+        assert!(phase(root, target, vec![scan(root, target), complete(root), adopt(target, root)]));
+        assert!(phase(root, target, vec![scan(root, target), complete(root)]));
+        assert!(!phase(root, target, vec![scan(root, target)]));
+        assert!(!phase(
+            root,
+            target,
+            vec![
+                scan(root, target),
+                complete("/users/child"),
+                adopt("/services/moved/child", "/users/child")
+            ]
+        ));
+        assert!(!phase(root, target, Vec::new()), "only the finish is left");
+        // The target parent "/" of a move that makes a new shard root.
+        let (root, target) = ("/services/dir", "/users");
+        assert!(phase(root, target, vec![scan(root, target), complete(root), adopt(target, root)]));
+        assert!(!phase(root, target, vec![scan(root, target), complete(root)]));
+        assert!(!phase(root, target, vec![scan(root, target)]));
+    }
+
+    #[test]
     fn work_touches_a_target_through_its_paths_fences_and_parent_participants() {
         let rename = job(
             "rename",
@@ -940,7 +1313,8 @@ mod touch_tests {
         assert_eq!(touched(&fence), BTreeSet::from(["services", "users"]));
         assert_eq!(
             recorded_phase(&fence).unwrap(),
-            "cross-shard-hardlink-target-fence-commit"
+            "cross-shard-hardlink-target-fence-commit;fence=fence-target",
+            "the phase names the fence the job commits"
         );
 
         // A directory move under services holds a parent participant on root.
@@ -1002,7 +1376,8 @@ mod touch_tests {
         assert_eq!(touched(&directory), BTreeSet::from(["services", "root"]));
         assert_eq!(
             recorded_phase(&directory).unwrap(),
-            "cross-shard-dir-scan;parent-counts=issued"
+            "cross-shard-dir-scan;parent-counts=issued;participant=participant",
+            "the phase names the participants of the job's plan"
         );
         let local = job(
             "local",
@@ -1065,7 +1440,7 @@ mod touch_tests {
             BTreeSet::from([
                 (
                     "dir".into(),
-                    "cross-shard-dir-scan;parent-counts=issued".into()
+                    "cross-shard-dir-scan;parent-counts=issued;participant=participant".into()
                 ),
                 ("rename".into(), "no-pending-frame".into()),
             ])
@@ -1077,7 +1452,7 @@ mod touch_tests {
                 ("failed".into(), "failed;parent-counts=issued".into()),
                 (
                     "fence".into(),
-                    "cross-shard-hardlink-target-fence-commit".into()
+                    "cross-shard-hardlink-target-fence-commit;fence=fence-target".into()
                 ),
                 (format!("{requester}:mkdir"), "pending".into()),
             ])

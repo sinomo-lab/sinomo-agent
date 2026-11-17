@@ -824,6 +824,12 @@ pub enum DfsNamespaceOperation {
         participant: Box<crate::DfsParentCountParticipant>,
         action: crate::DfsParentCountAction,
     },
+    /// Release the destination reservation a cross-shard directory move's
+    /// root adoption installed on the shard of its target root. Sent by the
+    /// coordinator once the whole subtree has moved; idempotent.
+    ReleaseDirectoryMoveDestination {
+        reservation: Box<DfsNamespaceJobRecord>,
+    },
 }
 
 impl DfsNamespaceOperation {
@@ -843,6 +849,7 @@ impl DfsNamespaceOperation {
                 | Self::DirectorySync { .. }
                 | Self::InstallHardlinkTargetFence { .. }
                 | Self::ParentCountParticipant { action: crate::DfsParentCountAction::Reserve | crate::DfsParentCountAction::Abort, .. }
+                | Self::ReleaseDirectoryMoveDestination { .. }
                 | Self::VerifyObjectFamilyAdoption { .. }
                 | Self::ContentReference { .. }
                 | Self::BeginContentCopy { .. }
@@ -856,6 +863,7 @@ impl DfsNamespaceOperation {
     pub(crate) fn routing_path(&self) -> Option<&str> {
         match self {
             Self::ParentCountParticipant { participant, .. } => Some(&participant.expected.path),
+            Self::ReleaseDirectoryMoveDestination { reservation } => Some(&reservation.root_path),
             Self::BeginContentCopy { path, .. } => Some(path),
             Self::ContentReference { request } => Some(&request.path),
             Self::MetadataQuery { .. } => None,
@@ -919,6 +927,7 @@ impl DfsNamespaceOperation {
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
             Self::ParentCountParticipant { participant, .. } => vec![&participant.expected.path],
+            Self::ReleaseDirectoryMoveDestination { reservation } => vec![&reservation.root_path],
             Self::BeginContentCopy { path, .. } => vec![path],
             // The locator belongs to the immutable operation digest. It may
             // differ from the stable object's current authority after rename.

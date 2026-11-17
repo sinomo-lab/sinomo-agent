@@ -23,8 +23,12 @@
 //!   that moved between shards can appear in two of them and counts once. The
 //!   same identity with a different target or parent fails closed.
 //! - A non-directory row whose parent path another shard owns (possible only
-//!   under hash routing) is not a count input, and its parent's existence is
-//!   not checked here; the complete census checked it.
+//!   under hash routing) is not a count input. Its parent's existence is
+//!   checked by the converting shard, which asks the parent's owner whether
+//!   the parent is a live directory there ([`foreign_references`]).
+//! - Likewise an alias whose target is none of the shard's own rows is
+//!   checked by asking every other shard whether it holds the target as a
+//!   live canonical row; one that no shard holds is dangling.
 #![cfg_attr(not(test), allow(dead_code, reason = "consumed by the per-shard conversion driver"))]
 use super::*;
 use sinomo_dfs::DfsMetadataShardAssignment;
@@ -80,6 +84,10 @@ fn same_ownership(
 enum SourceWork {
     /// Refused, as the census refuses it.
     Settled,
+    /// Refused, except the rows the shard keeps for another shard's job
+    /// through its conversion: target fences ([`is_kept_target_fence`]) and
+    /// Reserved parent-count participants ([`is_kept_parent_participant`]).
+    SettledKeepingPairRows,
     /// Left to the caller, which reports the work that touches the target.
     /// Other original work without a proven outcome is still refused: its
     /// effects on the rows are not known.
@@ -95,6 +103,18 @@ fn admit_shard_source(
     let scopes = catalog_by_scope(catalog)?;
     match work {
         SourceWork::Settled => admit_settled_count_source(captured)?,
+        SourceWork::SettledKeepingPairRows => {
+            admit_count_source_identity(captured, captured.has_unresolved_work())?;
+            if has_unrecovered_preparation(captured)
+                || has_unsettled_namespace_work_beside(&captured.projected_rows, |job| {
+                    is_kept_target_fence(job) || is_kept_parent_participant(job)
+                })
+            {
+                return Err(invalid(
+                    "namespace-count maintenance requires settled original namespace and write operations",
+                ));
+            }
+        }
         SourceWork::Reported => {
             admit_count_source_identity(captured, captured.has_unresolved_work_beside_recorded_rows())?;
             if has_unrecovered_preparation(captured) {
@@ -213,7 +233,7 @@ pub(crate) fn plan_shard_namespace_count_maintenance(
             .ok_or_else(|| invalid("namespace census record count overflow"))?;
     }
     preflight_count_input(std::iter::once(target.captured.as_ref()), contributed, limits)?;
-    admit_shard_source(&target.captured, catalog, SourceWork::Settled)?;
+    admit_shard_source(&target.captured, catalog, SourceWork::SettledKeepingPairRows)?;
     let shard = &target.captured.source.physical_shard;
     let mut owned = CountedRows::default();
     for object in owned_live_rows(&target.captured, Some(catalog), limits)? {
@@ -247,6 +267,171 @@ pub(crate) fn validate_shard_image_counts(
         return Err(invalid("built image leaves a namespace count uninitialized"));
     }
     Ok(())
+}
+
+/// A Running target fence another shard's hardlink job installed on this
+/// shard and that the shard keeps through its conversion: its count change
+/// waits for that job's fence commit, so the shard's rows carry the counts
+/// from before the fence.
+pub(crate) fn is_kept_target_fence(job: &sinomo_dfs::DfsNamespaceJobRecord) -> bool {
+    job.kind == sinomo_dfs::DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+        && job.status == DfsNamespaceJobStatus::Running
+        && matches!(
+            job.pending_frames.as_slice(),
+            [sinomo_dfs::DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }]
+        )
+}
+
+/// A Running parent-count participant the shard holds Reserved for another
+/// shard's directory move and keeps through its conversion: the parent's
+/// count change waits for that move's apply, so the shard's rows carry the
+/// count from before the participant's delta.
+pub(crate) fn is_kept_parent_participant(job: &sinomo_dfs::DfsNamespaceJobRecord) -> bool {
+    job.kind == sinomo_dfs::DfsNamespaceJobKind::ParentCountParticipant
+        && job.status == DfsNamespaceJobStatus::Running
+        && matches!(
+            job.pending_frames.as_slice(),
+            [sinomo_dfs::DfsNamespaceJobFrame::ParentCountParticipant {
+                state: sinomo_dfs::DfsParentCountState::Reserved,
+                ..
+            }]
+        )
+}
+
+/// A live alias of the shard whose target is none of the shard's own live
+/// canonical rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForeignAliasTarget {
+    pub alias_path: String,
+    pub alias_object_id: DfsObjectId,
+    pub target_object_id: DfsObjectId,
+}
+
+/// A live non-directory row of the shard whose parent path another shard owns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForeignParent {
+    pub path: String,
+    pub parent_path: String,
+    pub parent_shard: String,
+}
+
+/// What the shard `captured` holds refers to in other shards, under the
+/// census rules: aliases whose target it does not hold, and non-directory
+/// rows whose parent path another shard owns. Each is in path order.
+pub(crate) fn foreign_references(
+    captured: &CapturedMetadataUnit,
+    catalog: &[DfsMetadataShardConfig],
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<(Vec<ForeignAliasTarget>, Vec<ForeignParent>)> {
+    let shard = &captured.source.physical_shard;
+    let mut owned = CountedRows::default();
+    for object in owned_live_rows(captured, Some(catalog), limits)? {
+        owned.insert(shard, object)?;
+    }
+    let (mut aliases, mut parents) = (Vec::new(), Vec::new());
+    for ((file_system_id, _), key) in &owned.paths {
+        check_deadline(limits)?;
+        let object = &owned.rows[key].1;
+        if object.kind == DfsObjectKind::Hardlink {
+            let target = object
+                .link_target_object_id
+                .clone()
+                .ok_or_else(|| invalid("namespace alias has no canonical target"))?;
+            if !owned.rows.contains_key(&(file_system_id.clone(), target.clone())) {
+                aliases.push(ForeignAliasTarget {
+                    alias_path: object.path.clone(),
+                    alias_object_id: object.object_id.clone(),
+                    target_object_id: target,
+                });
+            }
+        }
+        if object.kind != DfsObjectKind::Directory
+            && let Some(parent_path) = parent(&object.path)
+        {
+            let owner = current_owner(file_system_id, catalog, parent_path)?;
+            if owner.shard_id != shard.0 {
+                parents.push(ForeignParent {
+                    path: object.path.clone(),
+                    parent_path: parent_path.to_owned(),
+                    parent_shard: owner.shard_id,
+                });
+            }
+        }
+    }
+    Ok((aliases, parents))
+}
+
+/// What one captured shard holds under a catalog: its live canonical
+/// (non-alias) rows and live directories, by the census rules, and its
+/// Running namespace jobs.
+#[derive(Default)]
+pub(crate) struct ShardHoldings {
+    objects: BTreeSet<ObjectKey>,
+    directories: BTreeSet<(DfsFileSystemId, String)>,
+    jobs: BTreeSet<(DfsFileSystemId, String)>,
+}
+
+impl ShardHoldings {
+    /// The entries of `question` this shard holds in `file_system_id`.
+    pub(crate) fn answer(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        question: &sinomo_dfs::DfsCountContributionQuestion,
+    ) -> Result<sinomo_dfs::DfsCountContributionHoldings> {
+        if question.directories.iter().any(|path| !canonical_path(path)) {
+            return Err(invalid("namespace holdings question names a noncanonical path"));
+        }
+        let fs = || file_system_id.clone();
+        Ok(sinomo_dfs::DfsCountContributionHoldings {
+            answered: u64::try_from(question.len()).map_err(|error| invalid(error.to_string()))?,
+            objects: question
+                .objects
+                .iter()
+                .filter(|id| self.objects.contains(&(fs(), (*id).clone())))
+                .cloned()
+                .collect(),
+            directories: question
+                .directories
+                .iter()
+                .filter(|path| self.directories.contains(&(fs(), (*path).clone())))
+                .cloned()
+                .collect(),
+            jobs: question
+                .jobs
+                .iter()
+                .filter(|id| self.jobs.contains(&(fs(), (*id).clone())))
+                .cloned()
+                .collect(),
+        })
+    }
+}
+
+/// [`ShardHoldings`] of the captured shard under `catalog`.
+pub(crate) fn shard_holdings(
+    captured: &CapturedMetadataUnit,
+    catalog: &[DfsMetadataShardConfig],
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<ShardHoldings> {
+    let mut holdings = ShardHoldings::default();
+    for object in owned_live_rows(captured, Some(catalog), limits)? {
+        let key = (object.file_system_id.clone(), object.object_id.clone());
+        match object.kind {
+            DfsObjectKind::Hardlink => {}
+            DfsObjectKind::Directory => {
+                holdings.directories.insert((object.file_system_id.clone(), object.path.clone()));
+                holdings.objects.insert(key);
+            }
+            _ => {
+                holdings.objects.insert(key);
+            }
+        }
+    }
+    for job in &captured.projected_rows.namespace_jobs {
+        if job.status == DfsNamespaceJobStatus::Running {
+            holdings.jobs.insert((job.file_system_id.clone(), job.job_id.clone()));
+        }
+    }
+    Ok(holdings)
 }
 
 fn add_contributed_counts(

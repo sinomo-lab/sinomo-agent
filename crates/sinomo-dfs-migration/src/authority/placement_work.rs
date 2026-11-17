@@ -49,6 +49,30 @@ impl OriginalPlacementGoal {
         crate::metadata::RetainedPlacementReservation::from_capsule(self.job.capsule_for_scope(assignment)?)
     }
 }
+/// One shard's share of the original placement goals of its filesystem: the
+/// evidence of every non-terminal goal whose captured assignments name the
+/// shard, in reference order. A goal captured before the shard existed has no
+/// share in it.
+pub(super) fn shard_placement_share(
+    goals: &[OriginalPlacementGoal],
+    file_system_id: &sinomo_dfs::DfsFileSystemId,
+    shard: &sinomo_dfs::DfsMetadataShardId,
+) -> Result<Vec<crate::metadata::RetainedPlacementReservation>> {
+    let mut evidence = Vec::new();
+    for goal in goals {
+        if goal.is_terminal()
+            || goal.file_system_id() != file_system_id
+            || !goal.assignments.iter().any(|assignment| assignment.shard_id == shard.0)
+        {
+            continue;
+        }
+        let item = goal.evidence(shard)?;
+        evidence.push((item.reference()?, item));
+    }
+    evidence.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(evidence.into_iter().map(|(_, item)| item).collect())
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct OriginalPlacementSource {
     pub(super) assignment: DfsMetadataShardConfig,

@@ -903,6 +903,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         &self,
         query: &crate::DfsMetadataShardQuery,
         catalog: &[crate::DfsMetadataShardConfig],
+        storage_waits: crate::count_contributions::DfsJobStorageWaits<'_>,
     ) -> Result<crate::DfsMetadataQueryResult> {
         if query.shard_id != self.shard_id {
             return Err(MetadataBackendError::Serde(
@@ -917,6 +918,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             catalog,
             prefix,
             &mut |_| Ok(true),
+            storage_waits,
         )
     }
 
@@ -1679,6 +1681,21 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         tables.parent_count_reservation_ids(file_system_id, object_id).map(|job_id| {
             tables.namespace_jobs.get(job_id).cloned().ok_or_else(|| MetadataBackendError::Serde("parent reservation index lost its original job".into()))
         }).collect()
+    }
+
+    fn directory_move_destination_reservations(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsNamespaceJobRecord>> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "destination reservation physical shard mismatch".into(),
+            ));
+        }
+        self.current_tables_snapshot()?
+            .move_destination_reservations_covering(file_system_id, path)
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {

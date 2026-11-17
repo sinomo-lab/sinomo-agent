@@ -89,13 +89,16 @@ pub enum DfsMetadataSelection {
     /// The queried shard's contributions to `target_shard`'s maintained
     /// namespace counts under the serving primary's current catalog. Only the
     /// shard's current primary answers. A continuation names the prefix of
-    /// its first page; older peers reject this selection.
+    /// its first page; older peers reject this selection. Each page also
+    /// answers the request's `question` about what the shard holds.
     CountContributionsV1 {
         target_shard: String,
         #[serde(default)]
         expected_prefix: Option<DfsMetadataPrefixProof>,
         #[serde(default)]
         after: Option<DfsCountContributionCursor>,
+        #[serde(default)]
+        question: DfsCountContributionQuestion,
     },
 }
 
@@ -1023,7 +1026,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend.begin_consistent_read_snapshot()?;
             }
             let result = match contribution_catalog.as_deref() {
-                Some(catalog) => backend.count_contributions_on_shard(query, catalog),
+                Some(catalog) => {
+                    // This node is the shard's primary, which runs its jobs.
+                    let node = self.node_id.clone();
+                    backend.count_contributions_on_shard(query, catalog, &|job| {
+                        crate::maintenance::storage_waits::job_storage_waits(&node, job)
+                    })
+                }
                 None => backend.query_file_history_on_shard(query),
             };
             if exact_stat_scope {
@@ -1197,11 +1206,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match (&query.selection, &response.result) {
             (
                 DfsMetadataSelection::CountContributionsV1 {
-                    expected_prefix, ..
+                    expected_prefix,
+                    question,
+                    ..
                 },
                 DfsMetadataQueryResult::CountContributionsV1 { page },
             ) => {
                 if page.source_shard != query.shard_id.0
+                    || !page.held.answers(question)
                     || !page.prefix.is_well_formed()
                     || expected_prefix
                         .as_ref()

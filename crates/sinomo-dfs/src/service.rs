@@ -465,8 +465,15 @@ fn component_factory_with_selected_layout(
             .publish_event(crate::runtime_host::dfs_write_set_event_publication(
                 crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS[6],
             ))
+            .publish_event(crate::namespace_job_events::namespace_job_event_publication(
+                crate::DfsNamespaceJobEventKind::Parked,
+            ))
+            .publish_event(crate::namespace_job_events::namespace_job_event_publication(
+                crate::DfsNamespaceJobEventKind::Completed,
+            ))
             .subscribe_event(crate::runtime_host::host_cluster_control_subscription())
-            .subscribe_event(crate::runtime_host::host_connectivity_subscription());
+            .subscribe_event(crate::runtime_host::host_connectivity_subscription())
+            .subscribe_event(crate::namespace_job_events::namespace_job_event_subscription());
     let descriptor = crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS
         .into_iter()
         .fold(descriptor, |descriptor, kind| {
@@ -593,6 +600,25 @@ fn component_factory_with_selected_layout(
                             detail: error.to_string(),
                         })?,
                 ];
+                let job_events = events
+                    .subscribe(&crate::namespace_job_events::namespace_job_event_subscription())
+                    .map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(
+                    &ClusterPaths::new(&data_dir),
+                ) {
+                    scope.own_task(
+                        "DFS namespace job events",
+                        runtime.spawn(crate::namespace_job_events::run_namespace_job_events(
+                            state.local_node_id.clone(),
+                            events.clone(),
+                            job_events,
+                            scope.shutdown_receiver(),
+                        )),
+                    );
+                }
                 let host = Arc::new(crate::runtime_host::DfsRuntimeHost::new(
                     cluster,
                     object_rpc,
@@ -1788,24 +1814,29 @@ mod tests {
                 "feature route remains core-owned {route}"
             );
         }
-        // Three DFS events, the write-set keeper's typed events and the
-        // takeover events.
+        // Three DFS events, the write-set keeper's typed events, the
+        // takeover events and the two namespace job events.
         let publications = &factory.descriptor().event_publications;
         assert_eq!(
             publications.len(),
             3 + crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS.len()
                 + crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS.len()
+                + 2
         );
         for kind in crate::runtime_host::DFS_WRITE_SET_EVENT_KINDS
             .into_iter()
             .chain(crate::runtime_host::DFS_TAKEOVER_EVENT_KINDS)
+            .chain([
+                crate::DFS_NAMESPACE_JOB_PARKED_EVENT_KIND,
+                crate::DFS_NAMESPACE_JOB_COMPLETED_EVENT_KIND,
+            ])
         {
             assert!(
                 publications.iter().any(|publication| publication.kind == kind),
                 "missing event publication {kind}"
             );
         }
-        assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
+        assert_eq!(factory.descriptor().event_subscriptions.len(), 3);
         drop(registry);
         runtime
             .stop_node(&node)

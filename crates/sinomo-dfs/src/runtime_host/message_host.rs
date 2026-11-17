@@ -4026,6 +4026,7 @@ fn daemon_dfs_genesis_ingress_scopes(
                     | Op::AdoptHardlinkAlias { .. }
                     | Op::InstallHardlinkTargetFence { .. }
                     | Op::ParentCountParticipant { .. }
+                    | Op::ReleaseDirectoryMoveDestination { .. }
                     | Op::CommitHardlinkTargetFence { .. }
             ) =>
         {

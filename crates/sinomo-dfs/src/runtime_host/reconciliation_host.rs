@@ -647,6 +647,19 @@ pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
     }
 }
 
+/// Whether preparing one shard copy before its open found the copy closed: its
+/// storage awaits preparation that made no progress in this call, or its
+/// storage record names a conversion in progress. Pending with progress is
+/// preparation advancing, which the current generation keeps driving.
+fn passive_shard_copy_is_closed(error: &crate::MetadataBackendError) -> bool {
+    crate::metadata_sharded_backend::metadata_shard_storage_is_closed(error)
+        && !matches!(
+            error,
+            crate::MetadataBackendError::StoragePreparationPending { processed_records, .. }
+                if *processed_records > 0
+        )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DaemonDefaultDfsLifecycleOutcome {
     Completed,
@@ -901,15 +914,26 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
                     &crate::DfsStoragePreparationScope::MetadataRouting,
                 )?;
                 for shard in captured_shards {
-                    crate::storage_preparation::prepare_storage_root_before_open(
-                        &crate::local_dfs_metadata_shard_path(
-                            &task_data_dir,
-                            &DfsMetadataShardId::new(&shard.shard_id),
-                        ),
-                        &crate::DfsStoragePreparationScope::Metadata(
-                            DfsMetadataShardId::new(&shard.shard_id),
-                        ),
-                    )?;
+                    let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+                    match crate::storage_preparation::prepare_storage_root_before_open(
+                        &crate::local_dfs_metadata_shard_path(&task_data_dir, &shard_id),
+                        &crate::DfsStoragePreparationScope::Metadata(shard_id.clone()),
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if passive_shard_copy_is_closed(&error) => {
+                            // The demand handed the copy to its preparation
+                            // owner, whose own unit, events and wakes drive it.
+                            // Its ordinary opens are refused until its storage
+                            // activates or its preparation is Ready; the first
+                            // open after that serves it. The node's other copies
+                            // serve meanwhile, so this generation completes
+                            // without it.
+                            tracing::debug!(target: "sinomo.dfs.reconciliation",
+                                shard = %shard.shard_id, data_root = %task_data_dir.root().display(),
+                                "DFS passive storage preparation left a closed shard copy to its owner");
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 if authority
                     .retained_complete_prefix_revision_for_generation(*generation)

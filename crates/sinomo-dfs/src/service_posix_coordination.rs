@@ -88,6 +88,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => None,
         };
+        self.ensure_namespace_operation_not_reserved_by_directory_move(operation)?;
         match operation {
             DfsNamespaceOperation::ParentCountParticipant { coordinator_job, participant, action } => {
                 let outcome = self.execute_parent_count_participant(coordinator_job, participant, action)?;

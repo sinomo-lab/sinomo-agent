@@ -143,24 +143,49 @@ impl CapturedMetadataUnit {
             unresolved,
         )
     }
-    /// This capture with its namespace jobs replaced by their settled form.
-    /// A converting shard settles its own legacy cross-shard jobs from its
-    /// own rows before counting; every other captured fact is kept, and the
-    /// projection and any V7 recovery evidence are rebound to the settled
-    /// rows, so the result is admitted only as this settled projection.
-    pub(crate) fn with_settled_namespace_jobs(
-        &self,
-        namespace_jobs: Vec<sinomo_dfs::DfsNamespaceJobRecord>,
-    ) -> Result<Self> {
+    /// This capture with its rows replaced by their settled form. A
+    /// converting shard settles its own legacy cross-shard jobs, their outer
+    /// requests and the canonical targets their fence commits apply before
+    /// counting, and decides the rows it holds for other shards' jobs. The
+    /// capture's references to its own non-Completed namespace jobs, and to
+    /// Pending requests the settled rows complete, are dropped from its
+    /// unresolved work: the settled rows state each of them, and the count
+    /// admission checks those rows. Every other captured fact is kept, and
+    /// the projection and any V7 recovery evidence are rebound to the
+    /// settled rows, so the result is admitted only as this settled
+    /// projection.
+    pub(crate) fn with_settled_rows(&self, rows: DfsMetadataTableSnapshotTables) -> Result<Self> {
         self.validate()?;
-        let mut rows = self.projected_rows.clone();
-        rows.namespace_jobs = namespace_jobs;
+        let recorded_job = |id: &str| {
+            self.projected_rows.namespace_jobs.iter().any(|job| {
+                job.job_id == id && job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed
+            })
+        };
+        let completed_request = |id: &str| {
+            self.projected_rows.namespace_requests.iter().any(|request| {
+                request.request_id == id
+                    && request.status == sinomo_dfs::DfsNamespaceRequestStatus::Pending
+            }) && rows.namespace_requests.iter().any(|request| {
+                request.request_id == id
+                    && request.status != sinomo_dfs::DfsNamespaceRequestStatus::Pending
+            })
+        };
+        let unresolved = self
+            .unresolved
+            .iter()
+            .filter(|work| match work.family.as_str() {
+                "namespace_jobs" => !recorded_job(&work.original_id),
+                "namespace_requests" => !completed_request(&work.original_id),
+                _ => true,
+            })
+            .cloned()
+            .collect();
         let mut settled = Self::bind_projection(
             self.source.clone(),
             rows,
             self.original_outcomes.clone(),
             self.proven_v7_terminals.clone(),
-            self.unresolved.clone(),
+            unresolved,
         )?;
         if let Some(recovery) = &self.recovery {
             let mut recovery = recovery.clone();
@@ -310,13 +335,22 @@ pub(super) fn capture_projected_source(
     shard: &DfsMetadataShardId,
 ) -> Result<CapturedMetadataUnit> {
     session.inventory.verify(&session.source_root)?;
-    let projected_rows = session.projection.current_tables()?;
+    let mut projected_rows = session.projection.current_tables()?;
     let mut operations = session.projection.pending_operations()?;
-    let (original_outcomes, proven_v7_terminals, unresolved) = collect_original_outcomes(
-        &projected_rows,
-        &operations,
-        session.projection.required_native_work(),
-    )?;
+    let mut required_work = session.projection.required_native_work();
+    if super::combined_root::combined_source_capture(&session.destination_root, shard)? {
+        // A combined copy of other shards: only this shard's rows.
+        (projected_rows, operations, required_work) = super::combined_root::partition_capture(
+            projected_rows,
+            operations,
+            required_work,
+            &facts.projection_assignments,
+            &facts.file_system_ids,
+            shard,
+        )?;
+    }
+    let (original_outcomes, proven_v7_terminals, unresolved) =
+        collect_original_outcomes(&projected_rows, &operations, required_work)?;
     // Settled bodies remain archived. Do not retain their decoded JSON while
     // binding the capture and the small set of eligible original reservations.
     operations.retain(|operation| operation["status"] == "prepared"

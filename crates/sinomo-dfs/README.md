@@ -105,8 +105,13 @@ copy does not stop operations or node-wide passes on its other shards: a
 node-wide pass sees the node as one without that copy and deletes nothing of
 it, while work that addresses the closed shard is refused, or parked until its
 storage activates. An activation wakes only the nodes holding work parked on
-that shard. A shard without a record is admitted under the filesystem-level
-storage state.
+that shard. While a job waits at such a step, its coordinator's
+count-contribution pages report the shards it waits on. The coordinator
+announces the park, and the job's end while a shard it touched converts, as
+typed `dfs.namespace.job.parked` and `dfs.namespace.job.completed` events
+naming the filesystem, coordinator shard, job and touched shards; a
+conversion waiting on the job wakes on them. A shard without a record is
+admitted under the filesystem-level storage state.
 
 `sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.
 

@@ -299,10 +299,19 @@ pub(crate) fn has_unrecovered_preparation(captured: &CapturedMetadataUnit) -> bo
 
 /// Non-Completed namespace jobs, Pending requests and staging intents.
 fn has_unsettled_namespace_work(tables: &sinomo_dfs::DfsMetadataTableSnapshotTables) -> bool {
+    has_unsettled_namespace_work_beside(tables, |_| false)
+}
+
+/// [`has_unsettled_namespace_work`], not counting the non-Completed jobs
+/// `kept` accepts.
+fn has_unsettled_namespace_work_beside(
+    tables: &sinomo_dfs::DfsMetadataTableSnapshotTables,
+    kept: impl Fn(&sinomo_dfs::DfsNamespaceJobRecord) -> bool,
+) -> bool {
     tables
         .namespace_jobs
         .iter()
-        .any(|row| row.status != DfsNamespaceJobStatus::Completed)
+        .any(|row| row.status != DfsNamespaceJobStatus::Completed && !kept(row))
         || tables
             .namespace_requests
             .iter()

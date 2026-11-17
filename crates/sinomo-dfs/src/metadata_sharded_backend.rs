@@ -6174,6 +6174,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &self,
         query: &crate::DfsMetadataShardQuery,
         catalog: &[crate::DfsMetadataShardConfig],
+        storage_waits: crate::count_contributions::DfsJobStorageWaits<'_>,
     ) -> Result<crate::DfsMetadataQueryResult> {
         let backend = self.shard_backend(&query.shard_id)?;
         let prefix = LocalSobjMetadataBackend::metadata_prefix_proof(backend)?;
@@ -6184,6 +6185,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             catalog,
             prefix,
             &mut |object| self.object_is_listable_from_shard(object, &query.shard_id),
+            storage_waits,
         )
     }
 
@@ -6779,6 +6781,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &self, shard_id: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, object_id: &DfsObjectId,
     ) -> Result<Vec<DfsNamespaceJobRecord>> {
         self.shard_backend(shard_id)?.parent_count_reservations(shard_id, file_system_id, object_id)
+    }
+
+    fn directory_move_destination_reservations(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsNamespaceJobRecord>> {
+        self.shard_backend(shard_id)?
+            .directory_move_destination_reservations(shard_id, file_system_id, path)
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {

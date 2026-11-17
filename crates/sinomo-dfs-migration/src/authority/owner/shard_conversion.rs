@@ -22,6 +22,10 @@
 //! its driver deletes the attempt's files, and the shard's new primary starts
 //! a new attempt from its own copy, whose Converting record replaces the
 //! stale one.
+//!
+//! A closed shard whose primary is lost is converted by a member instead
+//! ([`takeover`]): the same steps from that member's own copy, under a
+//! promise quorum, with an activation that also makes it primary.
 use super::*;
 use crate::authority::contribution_source::{
     ContributionSource, SourceContributionAnswer, SourceContributionRead,
@@ -32,6 +36,7 @@ use crate::namespace_counts::{
     NamespaceCountMaintenanceLimits, NamespaceCountMaintenanceSource, ShardCountContributions,
 };
 use sinomo_core::node::NodeId;
+use sinomo_dfs::DfsMetadataConversionTakeover;
 use sinomo_dfs::{
     DfsFileSystemId, DfsMetadataConversionSource, DfsMetadataGenerationSeal,
     DfsMetadataShardConversion, DfsMetadataShardConversionInstallRule, DfsMetadataShardStorage,
@@ -40,9 +45,16 @@ use sinomo_dfs::{
 };
 use std::future::Future;
 
+mod pairs;
+
+pub(in crate::authority) mod takeover;
+
 const ATTEMPT_VERSION: u16 = 1;
 /// The captured source facts of the attempt, as members receive them.
 const SOURCE_CUT: &str = "source-cut.json";
+/// The shard's share of the original placement goals the attempt's capture
+/// binds.
+const PLACEMENT_EVIDENCE: &str = "placement-evidence.json";
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// One shard's capture and count inputs are held in memory while its image
 /// is built.
@@ -109,6 +121,16 @@ pub(in crate::authority) enum ConversionStop {
     CountlessDirectoryMove { job_id: String },
     /// Another non-Completed job coordinated by this shard.
     UnsettledNamespaceJob { job_id: String, kind: String },
+    /// A live alias of this shard whose target no shard holds as a live
+    /// canonical row, this shard included.
+    DanglingAlias { alias_path: String, alias_object_id: String, target_object_id: String },
+    /// A live row of this shard whose parent path another shard owns, and
+    /// that shard holds no live directory there.
+    ParentDirectoryAbsent { path: String, parent_path: String, parent_shard: String },
+    /// A hardlink job of this shard whose only step left commits a target
+    /// fence that a current shard still holds: releasing it needs a
+    /// fence-release step.
+    TargetFenceNeedsRelease { job_id: String, fence_job_id: String, fence_shard: String },
 }
 
 impl std::fmt::Display for ConversionStop {
@@ -133,6 +155,15 @@ impl std::fmt::Display for ConversionStop {
             Self::UnsettledNamespaceJob { job_id, kind } => {
                 write!(f, "namespace job {job_id} ({kind}) is not Completed")
             }
+            Self::DanglingAlias { alias_path, alias_object_id, target_object_id } => write!(
+                f, "dangling alias {alias_path} ({alias_object_id}): no shard holds its target {target_object_id}"
+            ),
+            Self::ParentDirectoryAbsent { path, parent_path, parent_shard } => write!(
+                f, "{path} has no live parent directory {parent_path} in shard {parent_shard}"
+            ),
+            Self::TargetFenceNeedsRelease { job_id, fence_job_id, fence_shard } => write!(
+                f, "hardlink job {job_id} commits fence {fence_job_id}, which current shard {fence_shard} still holds"
+            ),
         }
     }
 }
@@ -185,8 +216,17 @@ pub(in crate::authority) trait ShardConversionEnv {
     /// storage record whose copy is current has nothing to convert.
     fn local_copy_current(&self, shard: &DfsMetadataShardConfig) -> Result<bool>;
     /// Capture the local copy of `shard` with the converter session, under
-    /// its source fence.
+    /// its source fence, binding the shard's [`Self::placement_evidence`].
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress>;
+    /// The shard's share of its filesystem's original placement goals, which
+    /// its capture binds as the complete-filesystem capture binds its share;
+    /// `None` while the goals are still being captured.
+    fn placement_evidence(
+        &self,
+        _shard: &DfsMetadataShardConfig,
+    ) -> Result<Option<Vec<crate::metadata::RetainedPlacementReservation>>> {
+        Ok(Some(Vec::new()))
+    }
     fn contribution_source(&self) -> &Self::Source;
     fn block_on<F: Future>(&self, future: F) -> Result<F::Output>;
     /// Send the sealed image of `attempt` to member `node`. `source` is the
@@ -212,6 +252,11 @@ pub(in crate::authority) trait ShardConversionEnv {
     fn watch_keys(&self, keys: BTreeSet<String>) -> Result<()>;
     /// Wake the unit when any of `nodes` becomes reachable.
     fn watch_nodes(&self, nodes: BTreeSet<NodeId>) -> Result<()>;
+    /// This node's converting-takeover facilities: its verdicts of its peers
+    /// and its members' promises. Without them only the primary converts.
+    fn takeover(&self) -> Option<&dyn takeover::TakeoverEnv> {
+        None
+    }
 }
 
 /// The attempt's immutable identity and the serving record it started under.
@@ -244,6 +289,17 @@ struct SettledJobs {
     namespace_jobs: Vec<DfsNamespaceJobRecord>,
     /// Settled job ids, with their outcome.
     settled: Vec<(String, String)>,
+    /// The settled jobs' outer namespace requests, terminal.
+    #[serde(default)]
+    requests: Vec<sinomo_dfs::DfsNamespaceRequestRecord>,
+    /// Canonical targets whose fence commit the settlement applied.
+    #[serde(default)]
+    objects: Vec<sinomo_dfs::DfsObjectMetadata>,
+    /// Jobs kept Running for the per-pair settlement of the rounds.
+    #[serde(default)]
+    pending_pairs: Vec<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    settled_at: Option<time::OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -578,6 +634,10 @@ fn step<E: ShardConversionEnv>(
     if let Some(active) = record.as_ref().filter(|record| record.is_active()) {
         return finish_active(env, &shard_files, &keys, active, &local);
     }
+    // A takeover recorded at this epoch, or a member other than the primary.
+    if let Some(step) = takeover::step(env, &shard_files, &keys, record.as_ref(), &local)? {
+        return Ok(step);
+    }
     let running = record
         .as_ref()
         .and_then(DfsMetadataShardStorage::converting_attempt)
@@ -611,7 +671,7 @@ fn step<E: ShardConversionEnv>(
     let cut = keys.cut(&members, member_compares);
 
     // 2. The attempt, fixed from the primary's own captured source.
-    let (attempt, files, captured) = match fix_attempt(env, &shard_files, &keys, running, &local)? {
+    let (attempt, files, captured) = match fix_attempt(env, &shard_files, &keys, running, &local, None)? {
         Fixed::Attempt { attempt, files, captured } => (attempt, files, captured),
         Fixed::Capturing { processed_records } => {
             return Ok(Step::Done(ConversionProgress::Pending { processed_records }));
@@ -697,7 +757,7 @@ fn finish_active<E: ShardConversionEnv>(
     let ours = active
         .converted_activation()
         .map(|(attempt, _)| attempt)
-        .filter(|attempt| attempt.primary_node_id == *local && attempt.takeover.is_none());
+        .filter(|attempt| attempt.primary_node_id == *local);
     let Some(attempt) = ours else {
         shard_files.remove_except(None)?;
         return Ok(Step::Done(ConversionProgress::Handover));
@@ -726,16 +786,18 @@ enum Fixed {
     Capturing { processed_records: usize },
 }
 
-/// Steps 2 and 4. Derive the attempt from the primary's captured source and bind
-/// the capture to it. Once the image is built the capture is not needed.
+/// Steps 2 and 4. Derive the attempt from the converter's captured source and
+/// bind the capture to it. Once the image is built the capture is not needed.
+/// `takeover` names the lost primary when this node converts in its place.
 fn fix_attempt<E: ShardConversionEnv>(
     env: &E,
     shard_files: &ShardFiles,
     keys: &ShardKeys,
     running: Option<&DfsMetadataShardConversion>,
     local: &NodeId,
+    takeover: Option<&DfsMetadataConversionTakeover>,
 ) -> Result<Fixed> {
-    let ours = running.filter(|running| running.primary_node_id == *local && running.takeover.is_none());
+    let ours = running.filter(|running| running.primary_node_id == *local && running.takeover.as_ref() == takeover);
     if let Some(running) = ours {
         let files = shard_files.attempt(&running.attempt_id)?;
         if files.read::<BuiltImage>("built.json")?.is_some() {
@@ -751,6 +813,13 @@ fn fix_attempt<E: ShardConversionEnv>(
             return Ok(Fixed::Capturing { processed_records: processed_records.max(1) });
         }
     };
+    // The capture binds the shard's share of the placement goals.
+    let Some(placement) = env.placement_evidence(&keys.shard)? else {
+        return Ok(Fixed::Capturing { processed_records: 1 });
+    };
+    if captured.source.retained_placement_reservations != placement {
+        return Err(error("the shard's capture omits or changes its share of the original placement goals"));
+    }
     let source = conversion_source(&captured)?;
     let shard = &keys.shard;
     let attempt_id = sinomo_dfs::metadata_shard_conversion_attempt_id(
@@ -760,7 +829,7 @@ fn fix_attempt<E: ShardConversionEnv>(
         shard.epoch,
         local,
         &source,
-        None,
+        takeover,
     )?;
     if let Some(running) = ours
         && running.attempt_id != attempt_id
@@ -774,7 +843,7 @@ fn fix_attempt<E: ShardConversionEnv>(
         attempt_id: attempt_id.clone(),
         epoch: shard.epoch,
         primary_node_id: local.clone(),
-        takeover: None,
+        takeover: takeover.cloned(),
         source,
         seal: None,
         contributions_digest: None,
@@ -796,6 +865,7 @@ fn fix_attempt<E: ShardConversionEnv>(
             )?;
         }
     }
+    files.write_once(PLACEMENT_EVIDENCE, &placement)?;
     // The source facts members reconcile their floors against at install.
     files.write_once(
         SOURCE_CUT,
@@ -887,15 +957,21 @@ fn build_image<E: ShardConversionEnv>(
             settled
         }
     };
-    let settled_unit = Arc::new(captured.with_settled_namespace_jobs(settled.namespace_jobs)?);
+    // What the rounds ask the other shards, from the shard's settled rows.
+    let own = pairs::settled_unit(captured, &settled)?;
     // 6. Contributions, after Converting.
     let accepted = match files.read::<AcceptedContributions>("contributions-accepted.json")? {
         Some(accepted) => accepted,
-        None => match contribution_round(env, files, shard, &catalog, attempt)? {
-            Some(accepted) => accepted,
-            None => return Ok(None),
-        },
+        None => {
+            let questions = pairs::RoundQuestions::new(&catalog, shard, &own, &settled)?;
+            match contribution_round(env, files, shard, &catalog, attempt, &questions)? {
+                Some(accepted) => accepted,
+                None => return Ok(None),
+            }
+        }
     };
+    let questions = pairs::RoundQuestions::new(&accepted.catalog, shard, &own, &settled)?;
+    let settled_unit = Arc::new(pairs::with_pair_settlement(captured, &settled, &questions, &accepted.answers)?);
     // 7. The image, with counts from the shard's own rows and the accepted
     // contributions.
     let target = NamespaceCountMaintenanceSource { captured: settled_unit };
@@ -970,6 +1046,7 @@ fn contribution_round<E: ShardConversionEnv>(
     target: &DfsMetadataShardConfig,
     catalog: &[DfsMetadataShardConfig],
     attempt: &DfsMetadataShardConversion,
+    questions: &pairs::RoundQuestions,
 ) -> Result<Option<AcceptedContributions>> {
     let sources = catalog
         .iter()
@@ -985,7 +1062,8 @@ fn contribution_round<E: ShardConversionEnv>(
     let mut round = ContributionRound::new();
     let (mut nodes, mut keys) = (BTreeSet::new(), BTreeSet::new());
     for source in &sources {
-        match env.block_on(env.contribution_source().read(target, source))?? {
+        let question = questions.for_source(&source.shard_id);
+        match env.block_on(env.contribution_source().read_asking(target, source, &question))?? {
             SourceContributionRead::Answered(answer) => {
                 round.insert(source.shard_id.clone(), answer);
             }
@@ -1006,18 +1084,27 @@ fn contribution_round<E: ShardConversionEnv>(
         )?;
         return Ok(None);
     }
+    // A job parked on this shard itself moves none of its contributions
+    // until it activates, and a job whose only effect here is a fence this
+    // shard holds is settled per pair from its recorded phase; any other job
+    // touching the shard holds the rounds.
     let touching = round
         .iter()
-        .filter(|(_, answer)| !answer.running_jobs_touching_target.is_empty())
+        .filter(|(_, answer)| {
+            answer
+                .running_jobs_touching_target
+                .iter()
+                .any(|job| !job.parked_on_target() && !questions.settles_per_pair(job))
+        })
         .map(|(shard, _)| shard.clone())
         .collect::<Vec<_>>();
     let previous = files.read::<ContributionRound>("contributions-round.json")?;
     files.write("contributions-round.json", &round)?;
     if !touching.is_empty() {
-        // Per-pair settlement of another coordinator's job from its recorded
-        // phase (DESIGN-BD C.4) belongs here. Until it exists, such a job
-        // keeps the rounds from agreeing; the job's completion changes the
-        // source's answer, and the source's keys wake this unit.
+        // Such a job keeps the rounds from agreeing until it parks on this
+        // shard or ends. Its coordinator's `dfs.namespace.job.parked` and
+        // `dfs.namespace.job.completed` events wake this unit
+        // (`source_job_wakes`), as do the source's keys.
         files.write(
             "round-state.json",
             &RoundState::Parked {
@@ -1028,6 +1115,11 @@ fn contribution_round<E: ShardConversionEnv>(
     }
     if previous.as_ref() != Some(&round) {
         files.write("round-state.json", &RoundState::Again)?;
+        return Ok(None);
+    }
+    // Per-pair checks and settlements, decided on the stable round.
+    if let pairs::PairDecision::Wait(evidence) = pairs::settle_pairs(questions, &round)? {
+        files.write("round-state.json", &RoundState::Parked { evidence })?;
         return Ok(None);
     }
     let accepted = AcceptedContributions {
@@ -1049,7 +1141,8 @@ fn settle_own_jobs(
     captured: &CapturedMetadataUnit,
 ) -> Result<SettledJobs> {
     use crate::legacy_wire::hardlink_settlement::{LegacyHardlinkSettlement, settle_legacy_hardlink_job};
-    if captured.has_unresolved_work() {
+    // The loop below decides each of the shard's own non-Completed jobs.
+    if captured.has_unresolved_work_beside_recorded_jobs() {
         return Err(ConversionStop::UnresolvedOriginalWork {
             references: captured
                 .unresolved
@@ -1064,9 +1157,14 @@ fn settle_own_jobs(
     let at = time::OffsetDateTime::now_utc();
     let mut namespace_jobs = Vec::with_capacity(rows.namespace_jobs.len());
     let mut settled = Vec::new();
+    let mut own = pairs::OwnPairWork::new(catalog, shard, rows);
     for job in &rows.namespace_jobs {
         if job.status == DfsNamespaceJobStatus::Completed {
             namespace_jobs.push(job.clone());
+            continue;
+        }
+        // Target fences and fence-commit-only hardlink jobs.
+        if own.claim(job)? {
             continue;
         }
         let legacy_hardlink = job.kind == DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
@@ -1117,7 +1215,7 @@ fn settle_own_jobs(
         }
         .into());
     }
-    Ok(SettledJobs { namespace_jobs, settled })
+    own.finish(namespace_jobs, settled, at)
 }
 
 /// Step 9: install the sealed image on the members the rule names. Returns
@@ -1264,10 +1362,19 @@ impl<C: ContributionSource> ShardConversionEnv for OwnerConversionEnv<'_, C> {
     }
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         let physical = sinomo_dfs::DfsMetadataShardId::new(&shard.shard_id);
+        let Some(placement) = self.placement_evidence(shard)? else {
+            return Ok(CaptureProgress::Pending { processed_records: 1 });
+        };
+        let destination = self.owner.metadata_root.join(&shard.shard_id);
+        // The shard's own copy, or the combined copy that holds its rows.
+        let source = crate::metadata::combined_root::shard_conversion_source(&destination, &physical)?
+            .ok_or_else(|| error("the shard has no copy to convert"))?;
         let (progress, captured) = self.owner.metadata.capture_shard_conversion_source(
-            &self.owner.metadata_root.join(&shard.shard_id),
+            &destination,
+            &source,
             &physical,
             &shard.file_system_id,
+            &placement,
             sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET,
         )?;
         Ok(match (captured, progress) {
@@ -1279,6 +1386,26 @@ impl<C: ContributionSource> ShardConversionEnv for OwnerConversionEnv<'_, C> {
                 return Err(error("the shard's copy has no source to convert"));
             }
         })
+    }
+    /// Fixed by the first capture: the share recorded beside the capture,
+    /// otherwise the share of the goals captured now.
+    fn placement_evidence(
+        &self,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<Option<Vec<crate::metadata::RetainedPlacementReservation>>> {
+        let physical = sinomo_dfs::DfsMetadataShardId::new(&shard.shard_id);
+        let destination = self.owner.metadata_root.join(&shard.shard_id);
+        if let Some(recorded) = self.owner.metadata.recorded_placement_evidence(&destination, &physical)? {
+            return Ok(Some(recorded));
+        }
+        let Some(goals) = self
+            .owner
+            .authority
+            .capture_original_placement_goals(sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET)?
+        else {
+            return Ok(None);
+        };
+        crate::authority::placement_work::shard_placement_share(&goals, &shard.file_system_id, &physical).map(Some)
     }
     fn contribution_source(&self) -> &C {
         &self.source
@@ -1338,6 +1465,9 @@ impl<C: ContributionSource> ShardConversionEnv for OwnerConversionEnv<'_, C> {
         watched.extend(nodes);
         self.owner.work.watch_reachable_nodes(self.unit, watched.clone())
     }
+    fn takeover(&self) -> Option<&dyn takeover::TakeoverEnv> {
+        Some(self)
+    }
 }
 
 /// Put an activated attempt's sealed image in place of the shard's local
@@ -1386,23 +1516,17 @@ pub(super) enum MetadataUnitDispatch {
     CompleteFileSystem,
 }
 
-/// The conversion a shard's unit runs, from its storage record and whether
-/// its local copy is a legacy (pre-native) layout.
+/// The conversion a shard's unit runs, from its storage record.
 ///
 /// - A native-genesis record holds no old storage; its unit keeps the
 ///   complete-filesystem path, which leaves a native-genesis copy to the core.
-/// - A legacy copy without a record also keeps that path. Legacy members can
-///   retain acknowledgement floors that only a local checkpoint capture
-///   anchors, and the per-shard conversion stage refuses such a member. If
-///   the per-shard driver ran, its Converting record would close the shard
-///   and the install could then never reach the members its rule needs, so
-///   the shard would have no path to conversion.
-/// - Every other shard, and every shard whose conversion already wrote a
-///   record, runs the per-shard driver.
-pub(super) fn metadata_unit_dispatch(
-    record: Option<&DfsMetadataShardStorage>,
-    legacy_copy: bool,
-) -> MetadataUnitDispatch {
+/// - Every other shard runs the per-shard driver: a copy without a record,
+///   legacy or not, a shard whose rows live only in the legacy combined
+///   `root` copy (`crate::metadata::combined_root`), and every shard whose
+///   conversion already wrote a record.
+///   The per-shard stage reconciles a legacy member's acknowledgement floors,
+///   including those only a local checkpoint capture anchors.
+pub(super) fn metadata_unit_dispatch(record: Option<&DfsMetadataShardStorage>) -> MetadataUnitDispatch {
     match record {
         Some(DfsMetadataShardStorage {
             state:
@@ -1411,7 +1535,6 @@ pub(super) fn metadata_unit_dispatch(
                 },
             ..
         }) => MetadataUnitDispatch::CompleteFileSystem,
-        None if legacy_copy => MetadataUnitDispatch::CompleteFileSystem,
         _ => MetadataUnitDispatch::PerShard,
     }
 }
@@ -1435,19 +1558,16 @@ impl MigrationOwner {
             .as_ref()
             .map(|entry| entry.decode::<DfsMetadataShardStorage>().map_err(error))
             .transpose()?;
-        let root = self.metadata_root.join(&shard.0);
-        let legacy_copy = crate::metadata::original_source_present(&root)?
-            && crate::metadata::original_native_root_format(&root)?.is_none();
-        match metadata_unit_dispatch(record.as_ref(), legacy_copy) {
+        match metadata_unit_dispatch(record.as_ref()) {
             MetadataUnitDispatch::CompleteFileSystem => self.queue_filesystem_for_shard(shard),
             MetadataUnitDispatch::PerShard => self.advance_shard_unit(unit, shard, &file_system_id),
         }
     }
 
-    /// Run one bounded step of the shard's conversion. Only the shard's
-    /// current primary converts; on any other holder the step parks, and the
-    /// local copy is activated by its own installed image or repaired by
-    /// snapshot.
+    /// Run one bounded step of the shard's conversion. The shard's current
+    /// primary converts, or a member in the place of a lost primary
+    /// ([`takeover`]); on any other holder the step parks, and the local copy
+    /// is activated by its own installed image or repaired by snapshot.
     fn advance_shard_unit(
         &self,
         unit: &inventory::UnitKey,
@@ -1456,7 +1576,7 @@ impl MigrationOwner {
     ) -> Result<sinomo_dfs::DfsStoragePreparation> {
         use sinomo_dfs::DfsStoragePreparation as State;
         let root = self.metadata_root.join(&shard.0);
-        if !crate::metadata::original_source_present(&root)? {
+        if crate::metadata::combined_root::shard_conversion_source(&root, shard)?.is_none() {
             return Ok(State::Pending { processed_records: 0 });
         }
         let file_system_id = file_system_id.clone();

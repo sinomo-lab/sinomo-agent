@@ -183,12 +183,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // destination adoption, and source eviction. Lock transitions must
         // serialize with that cutover or a source-side renew/grant could be
         // omitted from the transferred aggregate.
+        // Lock commands write no namespace row; a destination reservation
+        // does not hold them.
         self.ensure_no_running_cross_shard_move_for_path(path)?;
-        self.ensure_resolved_path_not_in_cross_shard_flight(path)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), path)?;
         let object = self.advisory_lock_object_by_id(expected_object_id, path)?;
         if object.path != path {
             self.ensure_no_running_cross_shard_move_for_path(&object.path)?;
-            self.ensure_resolved_path_not_in_cross_shard_flight(&object.path)?;
+            self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &object.path)?;
         }
 
         // Capture the committed configuration epoch without a Raft write. The

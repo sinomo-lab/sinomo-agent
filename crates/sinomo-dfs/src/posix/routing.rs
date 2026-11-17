@@ -1190,6 +1190,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::InstallHardlinkTargetFence { fence, source_path } => {
                 return self.install_hardlink_target_fence_local(fence, source_path);
             }
+            DfsNamespaceOperation::ReleaseDirectoryMoveDestination { reservation } => {
+                return Ok(self.release_directory_move_destination_local(reservation)?);
+            }
             DfsNamespaceOperation::CommitHardlinkTargetFence {
                 fence_job_id,
                 source_path,
@@ -1279,6 +1282,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(drop),
             DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
             | DfsNamespaceOperation::ParentCountParticipant { .. }
+            | DfsNamespaceOperation::ReleaseDirectoryMoveDestination { .. }
             | DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => {
                 unreachable!("hardlink target fence phases return before generic path guards")
             }
@@ -1408,9 +1412,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Local namespace mutations must not interleave with an in-flight
     /// cross-shard move of the same resolved path (the move's saga may be
-    /// suspended awaiting recovery, with its lock still held).
-    pub(super) fn ensure_resolved_path_not_in_cross_shard_flight(&self, path: &str) -> Result<()> {
+    /// suspended awaiting recovery, with its lock still held), nor land in
+    /// the destination subtree a cross-shard directory move reserves.
+    pub(super) fn ensure_resolved_path_not_in_cross_shard_flight(
+        &mut self,
+        path: &str,
+    ) -> Result<()> {
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), path)?;
+        self.ensure_path_not_reserved_by_directory_move(&sifs_file_system_id(), path)?;
         Ok(())
     }
 

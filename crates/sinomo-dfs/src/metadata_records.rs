@@ -1756,6 +1756,7 @@ mod parent_counts;
 pub use parent_counts::*;
 mod hardlink_fence;
 pub use hardlink_fence::DfsHardlinkTargetFence;
+mod move_destination_reservation;
 
 /// Compact terminal evidence for a collected namespace job.
 ///
@@ -1842,6 +1843,10 @@ pub enum DfsNamespaceJobKind {
     HardlinkTargetFenceAcrossShardPrimary,
     RenameDirectoryAcrossShardPrimaries,
     ParentCountParticipant,
+    /// Destination-side reservation of a cross-shard directory move's target
+    /// subtree. The destination shard holds it from the root adoption until
+    /// the coordinator releases it; maintenance never runs it.
+    DirectoryMoveDestinationReservation,
 }
 
 impl DfsNamespaceJobKind {
@@ -2017,6 +2022,20 @@ pub enum DfsNamespaceJobFrame {
         count_plan: Option<DfsDirectoryMoveCounts>,
     },
     ParentCountParticipant { participant: Box<DfsParentCountParticipant>, state: DfsParentCountState },
+    /// Marker retained inside a destination reservation job: the coordinator
+    /// job that owns it and the subtree it reserves. Only the coordinator's
+    /// finish or abort frame releases it.
+    DirectoryMoveDestinationReservation {
+        coordinator_job_id: String,
+        source_root: String,
+        target_root: String,
+    },
+    /// Cross-shard-primary directory rename that failed after its root may
+    /// have moved: release the destination reservation, then fail the job
+    /// with the recorded reason.
+    CrossShardDirAbort {
+        failure_reason: String,
+    },
 }
 
 /// Compact identity of the SAME current native record-stream image carried

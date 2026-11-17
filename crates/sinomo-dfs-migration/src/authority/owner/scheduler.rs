@@ -27,6 +27,13 @@ pub(super) struct Scheduler {
     // Nodes that became reachable during a running step, so a watch that
     // step registers afterwards still observes them.
     reachable_while_running: BTreeMap<String, BTreeSet<NodeId>>,
+    // Advisory verdict subscriptions: a unit waiting on how this node judges
+    // a peer (a converting takeover waiting for its primary, or a candidate
+    // that outranks it, to be judged lost) is requeued on any change of that
+    // peer's verdict, never by a timer.
+    verdict_watch_nodes: BTreeMap<String, BTreeSet<NodeId>>,
+    // Nodes whose verdict changed during a running step.
+    verdicts_changed_while_running: BTreeMap<String, BTreeSet<NodeId>>,
     content_verified: BTreeMap<String, (String, String)>,
 }
 impl Scheduler {
@@ -44,6 +51,8 @@ impl Scheduler {
             native_watch_keys: BTreeMap::new(),
             reachability_watch_nodes: BTreeMap::new(),
             reachable_while_running: BTreeMap::new(),
+            verdict_watch_nodes: BTreeMap::new(),
+            verdicts_changed_while_running: BTreeMap::new(),
             content_verified: BTreeMap::new(),
         }
     }
@@ -106,11 +115,13 @@ impl Scheduler {
         self.queued.remove(&id);
         self.running.insert(id.clone(), false);
         self.reachable_while_running.insert(id.clone(), BTreeSet::new());
+        self.verdicts_changed_while_running.insert(id.clone(), BTreeSet::new());
         Some((id.clone(), self.units[&id].clone()))
     }
     pub fn finish(&mut self, id: &str, reference: UnitReference) -> bool {
         let changed_while_running = self.running.remove(id).unwrap_or(false);
         self.reachable_while_running.remove(id);
+        self.verdicts_changed_while_running.remove(id);
         self.retry_at.remove(id);
         if !matches!(reference.state, ObservedState::Waiting { .. }) {
             self.retry_delay.remove(id);
@@ -128,6 +139,7 @@ impl Scheduler {
         if matches!(reference.state, ObservedState::VerifiedCurrent | ObservedState::RetainedOriginal | ObservedState::Blocked { .. }) {
             self.native_watch_keys.remove(id);
             self.reachability_watch_nodes.remove(id);
+            self.verdict_watch_nodes.remove(id);
             self.demanded.remove(id);
         }
         self.units.insert(id.to_owned(), reference);
@@ -245,9 +257,32 @@ impl Scheduler {
         self.reachability_watch_nodes.insert(id, nodes);
         Ok(())
     }
-    /// Every node some unit waits to reach.
+    /// Requeue `unit` on any change of how this node judges one of `nodes`.
+    /// A change earlier in the unit's running step reruns it.
+    pub fn watch_node_verdicts(&mut self, unit: &UnitKey, nodes: BTreeSet<NodeId>) -> Result<()> {
+        let id = unit.id()?;
+        if !self.units.contains_key(&id) { return Err(error("verdict dependency has no existing work owner")); }
+        if let (Some(changed), Some(seen)) = (self.running.get_mut(&id), self.verdicts_changed_while_running.get(&id))
+            && !seen.is_disjoint(&nodes) {
+            *changed = true;
+        }
+        self.verdict_watch_nodes.insert(id, nodes);
+        Ok(())
+    }
+    /// Every node some unit waits to reach or waits on the verdict of.
     pub fn watched_nodes(&self) -> BTreeSet<NodeId> {
-        self.reachability_watch_nodes.values().flatten().cloned().collect()
+        self.reachability_watch_nodes.values().chain(self.verdict_watch_nodes.values()).flatten().cloned().collect()
+    }
+    /// Requeue the Waiting or running units watching the verdict of any of
+    /// `nodes`.
+    pub fn node_verdicts_changed(&mut self, nodes: &BTreeSet<NodeId>) -> bool {
+        for seen in self.verdicts_changed_while_running.values_mut() {
+            seen.extend(nodes.iter().cloned());
+        }
+        let watching = self.verdict_watch_nodes.iter()
+            .filter(|(_, watched)| !watched.is_disjoint(nodes))
+            .map(|(id, _)| id.clone()).collect::<BTreeSet<_>>();
+        !watching.is_empty() && self.dependencies_changed(|unit| unit.id().is_ok_and(|id| watching.contains(&id)))
     }
     /// Requeue the Waiting or running units watching any of `nodes`.
     pub fn nodes_became_reachable(&mut self, nodes: &BTreeSet<NodeId>) -> bool {
@@ -354,6 +389,15 @@ impl OwnerWork {
     pub(super) fn watch_reachable_nodes(&self, unit: &UnitKey, nodes: BTreeSet<NodeId>) -> Result<()> {
         self.scheduler.lock().map_err(error)?.watch_reachable_nodes(unit, nodes)?;
         self.reachability.notify_one();
+        Ok(())
+    }
+    /// Requeue `unit` when this node's verdict of any of `nodes` changes.
+    pub(super) fn watch_node_verdicts(&self, unit: &UnitKey, nodes: BTreeSet<NodeId>) -> Result<()> {
+        let watching = !nodes.is_empty();
+        self.scheduler.lock().map_err(error)?.watch_node_verdicts(unit, nodes)?;
+        if watching {
+            self.reachability.notify_one();
+        }
         Ok(())
     }
     pub fn notify(&self) {

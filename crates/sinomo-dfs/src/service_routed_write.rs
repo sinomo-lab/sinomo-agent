@@ -865,7 +865,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: current.epoch,
             });
         }
-        Ok(())
+        self.ensure_path_not_reserved_on_primary_shard(
+            &DfsMetadataShardId::new(current.shard_id),
+            &object.file_system_id,
+            &object.path,
+        )
     }
 
     pub(crate) fn replayed_routed_write_outcome_if_known(

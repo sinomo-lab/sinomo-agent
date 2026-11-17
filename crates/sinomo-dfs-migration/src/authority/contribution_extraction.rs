@@ -12,16 +12,20 @@
 //! The contributions follow the census rules for one source
 //! ([`crate::namespace_counts::contributions::contributions_beside_unsettled_work`]). S's
 //! non-Completed namespace jobs, Pending requests and staging intents that
-//! touch T are reported beside them with their recorded phase; S's other
-//! work is ignored.
+//! touch T are reported beside them with their recorded phase, in the format
+//! the current-table answer uses, including the fences and parent
+//! participants a job names; S's other work is ignored.
 //!
 //! The answer is paged and bound to a basis: S's serving epoch, its storage
 //! record, the captured source identity and fingerprints and the catalog it
 //! is attributed with. A continuation whose basis moved is answered
-//! `Changed`. Refusals are typed and retryable: the node is not the one
+//! `Changed`. Every page also answers the request's question about what the
+//! capture holds: live canonical rows and live directories S owns under the
+//! catalog, by the census rules, and S's Running jobs. A continuation past
+//! the last entry carries only a question. Refusals are typed and retryable: the node is not the one
 //! that converts S at the requested epoch, S is not old, or the requester's
 //! catalog assigns paths differently.
-use super::contribution_source::SourceJobTouchingTarget;
+use super::contribution_source::{SourceHoldings, SourceJobTouchingTarget, SourceQuestion};
 use super::contribution_sources::{
     AnswerBasis, TargetScope, catalog_ownership_digest, storage_record_digest,
 };
@@ -47,6 +51,9 @@ const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CAPTURE_RECORDS: usize = 1_000_000;
 /// Extractions retained between pages and rounds, per serving node.
 const RETAINED_EXTRACTIONS: usize = 64;
+/// Captures whose holdings are retained between question parts and rounds.
+/// Each indexes every live canonical row of one shard.
+const RETAINED_HOLDINGS: usize = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +68,9 @@ pub(super) struct Request {
     pub catalog_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<Continuation>,
+    /// What the requester asks about the capture's holdings.
+    #[serde(default, skip_serializing_if = "SourceQuestion::is_empty")]
+    pub question: SourceQuestion,
 }
 
 /// Resume after `after` entries of the read whose first page had `basis`.
@@ -83,6 +93,9 @@ pub(super) enum Response {
         after: Option<u64>,
         /// Explicit on the wire; omission is not a final page.
         complete: bool,
+        /// The answer to the request's question.
+        #[serde(default)]
+        held: SourceHoldings,
     },
     /// S's conversion has not recorded a usable capture of this copy yet.
     SourcePending {
@@ -173,13 +186,37 @@ impl CaptureFile {
 
 type ExtractionKey = (CaptureFile, String, String);
 
-/// Extractions this node computed, bounded by [`RETAINED_EXTRACTIONS`].
+/// Extractions this node computed, bounded by [`RETAINED_EXTRACTIONS`], and
+/// the holdings of the captures they were read from, bounded by
+/// [`RETAINED_HOLDINGS`].
 #[derive(Default)]
 pub(super) struct Extractions {
     entries: BTreeMap<ExtractionKey, Extraction>,
     order: std::collections::VecDeque<ExtractionKey>,
+    holdings: BTreeMap<HoldingsKey, Arc<CaptureHoldings>>,
+    holdings_order: std::collections::VecDeque<HoldingsKey>,
 }
+
+/// A capture and the catalog ownership its holdings are attributed with.
+type HoldingsKey = (CaptureFile, String);
+
+/// What one capture holds under the catalog it is attributed with.
+type CaptureHoldings = crate::namespace_counts::contributions::ShardHoldings;
+
 impl Extractions {
+    fn holdings(&self, key: &HoldingsKey) -> Option<Arc<CaptureHoldings>> {
+        self.holdings.get(key).cloned()
+    }
+    fn insert_holdings(&mut self, file: HoldingsKey, holdings: Arc<CaptureHoldings>) {
+        if self.holdings.insert(file.clone(), holdings).is_none() {
+            self.holdings_order.push_back(file);
+        }
+        while self.holdings_order.len() > RETAINED_HOLDINGS {
+            if let Some(oldest) = self.holdings_order.pop_front() {
+                self.holdings.remove(&oldest);
+            }
+        }
+    }
     fn get(&self, key: &ExtractionKey) -> Option<Extraction> {
         self.entries.get(key).cloned()
     }
@@ -206,6 +243,9 @@ impl NativeImportAuthority {
             || request.target_shard.is_empty()
         {
             return Err(error("contribution extraction needs two distinct shards"));
+        }
+        if request.question.len() > sinomo_dfs::DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT {
+            return Err(error("contribution extraction question asks too many entries"));
         }
         let fs = &request.file_system_id;
         let catalog = self.assignments(std::slice::from_ref(fs))?;
@@ -292,16 +332,24 @@ impl NativeImportAuthority {
             .lock()
             .map_err(error)?
             .get(&key);
-        let extraction = match retained {
-            Some(extraction) => extraction,
-            None => {
+        let retained_holdings = self
+            .contribution_extractions
+            .lock()
+            .map_err(error)?
+            .holdings(&(file.clone(), catalog_digest.clone()));
+        let (extraction, holdings) = match (retained, retained_holdings) {
+            (Some(extraction), Some(holdings)) => (extraction, Some(holdings)),
+            (Some(extraction), None) if request.question.is_empty() => (extraction, None),
+            _ => {
                 match self.extract_contributions(&path, &shard, &catalog, &request.target_shard)? {
-                    CaptureExtraction::Ready(extraction) => {
-                        self.contribution_extractions
-                            .lock()
-                            .map_err(error)?
-                            .insert(key, extraction.clone());
-                        extraction
+                    CaptureExtraction::Ready(extraction, holdings) => {
+                        let mut retained = self.contribution_extractions.lock().map_err(error)?;
+                        retained.insert(key, extraction.clone());
+                        retained.insert_holdings(
+                            (file.clone(), catalog_digest.clone()),
+                            Arc::clone(&holdings),
+                        );
+                        (extraction, Some(holdings))
                     }
                     CaptureExtraction::Unresolved => {
                         return Ok(Response::SourcePending {
@@ -355,6 +403,10 @@ impl NativeImportAuthority {
             }
         }
         let complete = end == total;
+        let held = match &holdings {
+            Some(holdings) => holdings.answer(fs, &request.question)?,
+            None => SourceHoldings::default(),
+        };
         Ok(Response::Page {
             basis,
             aliases,
@@ -365,6 +417,7 @@ impl NativeImportAuthority {
                 .transpose()
                 .map_err(error)?,
             complete,
+            held,
         })
     }
 
@@ -445,22 +498,26 @@ impl NativeImportAuthority {
                 .into_iter()
                 .map(Entry::Work),
         );
+        let holdings = crate::namespace_counts::contributions::shard_holdings(&captured, catalog, limits)?;
         let source = &captured.source;
-        Ok(CaptureExtraction::Ready(Extraction {
-            basis_facts: CaptureFacts {
-                source_identity: source.source_identity.clone(),
-                source_snapshot_fingerprint: source.source_snapshot_fingerprint.clone(),
-                source_journal_sequence: source.source_journal_sequence,
-                source_state_fingerprint: source.source_state_fingerprint.clone(),
-                capture: captured.projection_fingerprint().to_owned(),
+        Ok(CaptureExtraction::Ready(
+            Extraction {
+                basis_facts: CaptureFacts {
+                    source_identity: source.source_identity.clone(),
+                    source_snapshot_fingerprint: source.source_snapshot_fingerprint.clone(),
+                    source_journal_sequence: source.source_journal_sequence,
+                    source_state_fingerprint: source.source_state_fingerprint.clone(),
+                    capture: captured.projection_fingerprint().to_owned(),
+                },
+                entries: Arc::new(entries),
             },
-            entries: Arc::new(entries),
-        }))
+            Arc::new(holdings),
+        ))
     }
 }
 
 enum CaptureExtraction {
-    Ready(Extraction),
+    Ready(Extraction, Arc<CaptureHoldings>),
     /// Original preparations still have no proven outcome; the shard's own
     /// conversion resolves them through its fenced recovery.
     Unresolved,

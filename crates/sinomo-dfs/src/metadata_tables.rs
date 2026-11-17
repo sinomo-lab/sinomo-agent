@@ -4,6 +4,7 @@
 //! table maps, secondary indexes, and rollback bookkeeping used while
 //! materializing journal entries.
 
+mod move_destination_reservations;
 mod parent_counts;
 
 use std::borrow::Cow;
@@ -102,6 +103,9 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
     /// Nonserialized active parent-write lookup, derived only from durable jobs.
     parent_count_reservations: BTreeMap<(DfsFileSystemId, DfsObjectId), BTreeSet<String>>,
+    /// Nonserialized running directory-move destination reservations by
+    /// reserved subtree root, derived only from durable jobs.
+    move_destination_reservations: BTreeMap<(DfsFileSystemId, String), BTreeSet<String>>,
     pub(crate) namespace_job_receipts: BTreeMap<String, DfsNamespaceJobReceipt>,
     pub(crate) namespace_requests: BTreeMap<(NodeId, String), DfsNamespaceRequestRecord>,
     pub(crate) namespace_request_receipts: BTreeMap<(NodeId, String), DfsNamespaceRequestReceipt>,
@@ -1162,6 +1166,11 @@ impl DfsMetadataTables {
                 participant.validate()?;
                 if !participant.matches_job(job, state) { return Err(MetadataBackendError::Serde("parent participant job changes its declared identity".into())); }
                 Ok(())
+            }
+            DfsMetadataTableOp::PutNamespaceJob { job }
+                if job.kind == crate::DfsNamespaceJobKind::DirectoryMoveDestinationReservation =>
+            {
+                Self::validate_move_destination_reservation(job)
             }
             DfsMetadataTableOp::PutNamespaceJobReceipt { receipt } if receipt.kind == crate::DfsNamespaceJobKind::ParentCountParticipant => {
                 if receipt.status != DfsNamespaceJobStatus::Completed || !receipt.parent_count.as_ref().is_some_and(|terminal| terminal.participant_id == receipt.job_id && terminal.state != crate::DfsParentCountState::Reserved) {
@@ -2468,13 +2477,16 @@ impl DfsMetadataTables {
 
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 self.remove_parent_count_index(&job.job_id);
+                self.remove_move_destination_reservation_index(&job.job_id);
                 self.namespace_job_receipts.remove(&job.job_id);
                 let job_id = job.job_id.clone();
                 self.namespace_jobs.insert(job_id.clone(), job);
                 self.insert_parent_count_index(&job_id);
+                self.insert_move_destination_reservation_index(&job_id);
             }
             DfsMetadataTableOp::PutNamespaceJobReceipt { receipt } => {
                 self.remove_parent_count_index(&receipt.job_id);
+                self.remove_move_destination_reservation_index(&receipt.job_id);
                 self.namespace_jobs.remove(&receipt.job_id);
                 self.namespace_job_receipts
                     .insert(receipt.job_id.clone(), receipt);
@@ -3231,6 +3243,7 @@ impl DfsMetadataTableRollback {
         tables.rebuild_namespace_prepare_request_index();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
         tables.rebuild_parent_count_index();
+        tables.rebuild_move_destination_reservation_index();
         rollback_map(
             &mut tables.namespace_job_receipts,
             self.namespace_job_receipts,

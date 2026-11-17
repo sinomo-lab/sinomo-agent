@@ -32,6 +32,9 @@ use crate::{
 };
 use sinomo_core::node::NodeId;
 
+mod destination_reservation;
+#[cfg(test)]
+pub(crate) use destination_reservation::fail_directory_move_scan_of;
 mod parent_counts;
 #[cfg(test)]
 pub(crate) use parent_counts::{
@@ -774,6 +777,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_path: &str,
         cursor: Option<&DfsDirectoryPageCursor>,
     ) -> Result<()> {
+        #[cfg(test)]
+        destination_reservation::directory_move_scan_test_failure(source_path)?;
         let source_prefix = subtree_prefix(source_path);
         let target_prefix = subtree_prefix(target_path);
         let recorded_job = self.namespace_job(&job.job_id)?.ok_or_else(|| {
@@ -856,6 +861,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Before any frame of this page: while a carried alias's target shard
         // is not Active, the job keeps this scan frame and stays Running.
         self.park_until_hardlink_target_storage_active(
+            job,
+            &DfsNamespaceJobFrame::CrossShardDirScan {
+                source_path: source_path.to_owned(),
+                target_path: target_path.to_owned(),
+                cursor: cursor.cloned(),
+            },
             resolved.iter().map(|(moved, _, _)| moved),
         )?;
         if let Some(next_cursor) = page.next_cursor {
@@ -1060,14 +1071,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// [`Self::ensure_hardlink_target_storage_active`] for a job step that
     /// stays Running while it waits: the refusal records the shards it waits
-    /// on for this node, so their activation wakes its maintenance.
+    /// on for this node, so their activation wakes its maintenance, and
+    /// records and announces the park of `job` at its next frame `frame`
+    /// (see `posix/job_events.rs`).
     fn park_until_hardlink_target_storage_active<'a>(
         &mut self,
+        job: &DfsNamespaceJobRecord,
+        frame: &DfsNamespaceJobFrame,
         moved: impl IntoIterator<Item = &'a DfsObjectMetadata>,
     ) -> Result<()> {
         let Some((path, shards)) = self.hardlink_target_storage_wait(moved)? else {
             return Ok(());
         };
+        self.note_namespace_job_parked(job, frame, &shards);
         crate::maintenance::storage_waits::record_parked_on_shard_storage(
             &self.node_id,
             shards.into_iter().map(|shard| {
@@ -1159,7 +1175,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Whether `shard`'s storage record, in the retained configuration
     /// projection, names a conversion in progress.
-    fn metadata_shard_storage_is_converting(
+    pub(super) fn metadata_shard_storage_is_converting(
         &mut self,
         shard: &crate::DfsMetadataShardConfig,
     ) -> Result<bool> {
@@ -2156,6 +2172,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
                 | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
                 | DfsNamespaceOperation::ParentCountParticipant { .. }
+                | DfsNamespaceOperation::ReleaseDirectoryMoveDestination { .. }
                 | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
         ) {
             let job = job.ok_or_else(|| {
@@ -2173,6 +2190,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     | DfsNamespaceOperation::AdoptHardlinkAlias { .. }
                     | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
                     | DfsNamespaceOperation::ParentCountParticipant { .. }
+                    | DfsNamespaceOperation::ReleaseDirectoryMoveDestination { .. }
                     | DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
             ) && let Some(outcome) = self.completed_remote_namespace_phases.remove(&request)
             {
@@ -2874,6 +2892,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if !parent_progress? { return Ok(job); }
             let frame = job.pending_frames.pop().expect("nonempty job frames");
             steps = steps.saturating_add(1);
+            if matches!(frame, DfsNamespaceJobFrame::CrossShardDirAbort { .. }) {
+                return self.run_directory_move_abort(job, frame);
+            }
             let hardlink_alias_coordination_frame = matches!(
                 &frame,
                 DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall { .. }
@@ -3048,7 +3069,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceJobFrame::CrossShardDirFinish {
                     source_root,
                     count_plan,
-                } => {
+                } => self.release_directory_move_destination(&job).and_then(|()| {
                     if count_plan
                         .as_ref()
                         .is_some_and(|plan| plan.parent_is_participant(&source_root))
@@ -3057,7 +3078,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } else {
                         self.touch_parent_directory_if_local_primary(&source_root)
                     }
-                }
+                }),
                 DfsNamespaceJobFrame::CrossShardHardlinkAdopt {
                     alias,
                     target_object_id,
@@ -3208,6 +3229,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     job.updated_at = time::OffsetDateTime::now_utc();
                     self.persist_namespace_job(&job)?;
                     return Err(error);
+                }
+                Err(error) if job.directory_move_root_adopted() => {
+                    // The root's adoption installed the destination
+                    // reservation: the abort frame releases it before failing.
+                    self.begin_directory_move_abort(&mut job, frame, &error)?;
                 }
                 Err(error) => {
                     // Structured POSIX rejection from validation: abort before
@@ -3551,6 +3577,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(&object.path)?;
+        self.admit_directory_move_adoption(&object.file_system_id, &path)?;
+        let mut destination_reservation = None;
         let directory_root_plan = if object.kind == DfsObjectKind::Directory {
             let offer = self.source_adoption.offer().ok_or_else(|| {
                 DfsPosixError::Dfs(DfsError::Metadata {
@@ -3576,6 +3604,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     message: "directory count adoption has no original tree-move scope".into(),
                 }));
             }
+            destination_reservation =
+                Self::directory_move_destination_reservation_for_root(&job, &path)?;
             // Descendants materialize an already-counted transported subtree.
             // Only its root changes membership of an external parent.
             let plan = job
@@ -3994,6 +4024,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 transaction_objects.push(parent);
             }
+            // The root's adoption reserves the destination subtree in the same
+            // transaction; an exact retry finds it installed with the root.
+            family_effects.extend(destination_reservation.take().map(|job| {
+                crate::DfsPreparedMetadataEffect::PutNamespaceJob { job }
+            }));
             let mut visible_version = cross_shard_object_version_record(object);
             visible_version.content_durability = versions
                 .iter()

@@ -210,6 +210,24 @@ impl CapturedMetadataUnit {
                     .any(|record| work_matches(work, record))
         })
     }
+    /// [`Self::has_unresolved_work`] without the captured rows' own
+    /// non-Completed namespace jobs: a converting shard settles each of
+    /// those from its rows, keeps it for another shard's job, or stops.
+    pub(crate) fn has_unresolved_work_beside_recorded_jobs(&self) -> bool {
+        let rows = &self.projected_rows;
+        self.unresolved.iter().any(|work| {
+            let recorded = work.family == "namespace_jobs"
+                && rows.namespace_jobs.iter().any(|job| {
+                    job.job_id == work.original_id
+                        && job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed
+                });
+            !recorded
+                && !self
+                    .recovery_preparations()
+                    .iter()
+                    .any(|record| work_matches(work, record))
+        })
+    }
     pub(crate) fn validate_recovery_counts(&self, counted: &[DfsObjectMetadata]) -> Result<()> {
         for record in self.recovery_preparations() {
             for effect in &record.metadata_effects {

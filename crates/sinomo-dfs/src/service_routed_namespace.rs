@@ -828,6 +828,7 @@ fn namespace_transaction_proves_operation_completed(
         | DfsNamespaceOperation::PollNamespaceChanges { .. }
         | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
         | DfsNamespaceOperation::ParentCountParticipant { .. }
+        | DfsNamespaceOperation::ReleaseDirectoryMoveDestination { .. }
         | DfsNamespaceOperation::RenameDirectoryBounded { .. }
         | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
         | DfsNamespaceOperation::ClearDirRecursive { .. }
@@ -2288,6 +2289,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceResult::Rejected {
                 reason,
                 posix_error: None,
+                current_primary_node_id: None,
+            }
+        } else if let Err(error) =
+            self.ensure_namespace_operation_not_reserved_by_directory_move(&command.operation)
+        {
+            DfsNamespaceResult::Rejected {
+                reason: error.to_string(),
+                posix_error: posix_model::namespace_posix_error_for(&error),
                 current_primary_node_id: None,
             }
         } else {

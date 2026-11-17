@@ -1912,13 +1912,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Serve `count-contributions-v1` from the queried physical shard's
     /// tables, attributing paths with `catalog`. Only a backend holding that
-    /// shard answers; the caller has already bound its current primary.
+    /// shard answers; the caller has already bound its current primary, and
+    /// `storage_waits` gives what that primary recorded about each reported
+    /// job's next step.
     fn count_contributions_on_shard(
         &self,
         query: &crate::DfsMetadataShardQuery,
         catalog: &[crate::DfsMetadataShardConfig],
+        storage_waits: crate::count_contributions::DfsJobStorageWaits<'_>,
     ) -> Result<crate::DfsMetadataQueryResult> {
-        let _ = (query, catalog);
+        let _ = (query, catalog, storage_waits);
         Err(MetadataBackendError::Serde(
             "backend does not support shard count contributions".into(),
         ))
@@ -2623,6 +2626,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         let _ = (shard_id, file_system_id, object_id);
         Err(MetadataBackendError::Serde("backend has no indexed parent participant view".into()))
     }
+
+    /// Running cross-shard directory-move destination reservations on the
+    /// physical owner whose reserved subtree contains `path`. An indexed view
+    /// of existing namespace job rows, not new authority.
+    fn directory_move_destination_reservations(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsNamespaceJobRecord>>;
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>>;
 

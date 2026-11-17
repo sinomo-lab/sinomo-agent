@@ -636,3 +636,12 @@ impl StandaloneDataOwnerFixture {
         Ok(Self { _owner: owner })
     }
 }
+
+/// Announce a namespace job event from `node`, as its coordinator's step
+/// would: its listeners on that node hear it at once.
+pub fn announce_namespace_job_event(
+    node: &sinomo_core::node::NodeId,
+    event: crate::DfsNamespaceJobEvent,
+) {
+    crate::namespace_job_events::announce_namespace_job_event(node, event);
+}

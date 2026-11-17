@@ -40,6 +40,7 @@ const ROUTES: &[&str] = &[
     conversion_install::FLOORS_ROUTE,
     conversion_install::CHUNK_ROUTE,
     conversion_install::STAGE_ROUTE,
+    super::owner::shard_conversion::takeover::promise::ROUTE,
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1615,6 +1616,15 @@ impl Service for StagedImportService {
                     let response = tokio::task::block_in_place(|| super::owner::filesystem::receive(&self.component_context, source, work))
                         .map_err(|error| ServiceError::Service(error.to_string()))?;
                     context.respond_value(super::owner::filesystem::ROUTE, response)?;
+                }
+                super::owner::shard_conversion::takeover::promise::ROUTE => {
+                    use super::owner::shard_conversion::takeover::promise;
+                    let ask = context
+                        .decode_request_body_bounded::<promise::PromiseRequest>(&request, promise::MAX_REQUEST_BYTES)
+                        .await?;
+                    let response = tokio::task::block_in_place(|| self.authority.receive_takeover_promise(&source, ask))
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    context.respond_value(promise::ROUTE, response)?;
                 }
                 super::contribution_extraction::ROUTE => {
                     let extraction = context

@@ -1205,6 +1205,29 @@ pub(in crate::authority) fn seed_pending_v0_goal(owner: &MigrationOwner, job_id:
         .into_iter().find(|goal| goal.job.entry.key == key).unwrap()
 }
 
+/// A pending original v0 placement goal captured over `assignments`, from
+/// its row as an in-process store holds it; no cluster is needed.
+pub(in crate::authority) fn pending_v0_goal_for_test(
+    job_id: &str,
+    assignments: &[DfsMetadataShardConfig],
+) -> OriginalPlacementGoal {
+    let fs = sinomo_dfs::sifs_file_system_id();
+    let source = OriginalV0Job {
+        job_id, file_system_id: fs.as_str(), path: "/users", scope: "subtree", state: "pending",
+        total_object_count: 0, scanned_object_count: 0, matched_object_count: 0, updated_object_count: 0,
+        scheduled_repair_count: 0, completed_repair_count: 0, pending_repair_count: 0,
+        revision: 1, created_at_unix_nanos: 1, updated_at_unix_nanos: 1,
+    };
+    let key = format!("/dfs/filesystems/{fs}/placement-reconciliations/{job_id}");
+    let value = sinomo_core::object::serde_ext::to_bytes(&source, 1, sinomo_core::object::LengthMode::U32).unwrap();
+    let mut store = sinomo_core::kv::InProcessKvStore::default();
+    store.put(key.clone(), value, None).unwrap();
+    let entry = store.get(&key).cloned().unwrap();
+    let job = OriginalPlacementJob::decode(&entry).unwrap();
+    let related_entries = job.related_keys().into_iter().map(|key| MetadataCapturedKvEntry { entry: None, key }).collect();
+    OriginalPlacementGoal { job, assignments: assignments.to_vec(), related_entries }
+}
+
 pub(in crate::authority) fn seed_pending_v1_goal(
     native: &sinomo_dfs::test_support::DfsTestRuntime,
     node: &sinomo_core::node::NodeId,

@@ -510,10 +510,6 @@ mod transactions {
         }
     }
 
-    fn value_digest(entry: Option<&KvEntry>) -> Option<String> {
-        entry.map(|entry| blake3::hash(&entry.value).to_hex().to_string())
-    }
-
     /// Request identity of one attempt's transaction against one exact cut.
     /// The same cut always gives the same identity, so a lost outcome is
     /// settled by resubmitting the same request; a definite rejection spends
@@ -766,6 +762,31 @@ mod transactions {
             }
         }
 
+        /// The rule a converting takeover by `converter` installs under: the
+        /// rule of the configuration its activation makes current. A switched
+        /// shard installs on its write set without the lost primary, which
+        /// the takeover removes from it; an unswitched shard needs the
+        /// converter, as the next primary, and a majority of its configured
+        /// members.
+        pub fn for_takeover(
+            shard: &DfsMetadataShardConfig,
+            write_set: Option<&KvEntry>,
+            converter: &NodeId,
+        ) -> KvResult<Self> {
+            match Self::for_shard(shard, write_set)? {
+                Self::WriteSet { mut required } => {
+                    required.remove(&shard.primary_node_id);
+                    if !required.contains(converter) {
+                        return Err(refuse("the takeover's converter is not in the shard's write set"));
+                    }
+                    Ok(Self::WriteSet { required })
+                }
+                Self::PrimaryAndMajority { .. } => Ok(Self::PrimaryAndMajority {
+                    shard: crate::control_plane::metadata_shard_primary_handoff_target(shard, converter)?,
+                }),
+            }
+        }
+
         /// Every member the image is sent to.
         pub fn install_set(&self) -> BTreeSet<NodeId> {
             match self {
@@ -797,12 +818,14 @@ mod transactions {
     /// Fix one attempt's target in the shard's storage record before its image
     /// exists: the record must be an unsealed Converting attempt that runs
     /// under the current serving record. It replaces an absent record, a
-    /// Converting record of an attempt a serving change superseded, or one of
-    /// another converter at the same epoch (a takeover of a lost primary's
-    /// attempt, or the reverse); never another attempt of the same converter.
-    /// The same attempt is idempotent. The request identity binds the attempt
-    /// and every compare: the same cut keeps the identity, and another cut
-    /// gets another one.
+    /// Converting record of an attempt a serving change superseded, or, with
+    /// a takeover attempt, the lost primary's own attempt at the same epoch.
+    /// A takeover attempt that runs under the serving record is final for its
+    /// epoch: neither another takeover nor the primary replaces it, so at most
+    /// one takeover attempt is recorded per epoch and only its converter
+    /// continues it. The same attempt is idempotent. The request identity
+    /// binds the attempt and every compare: the same cut keeps the identity,
+    /// and another cut gets another one.
     ///
     /// A takeover attempt also compares every configured member's records,
     /// each of which must advertise the storage generation capability
@@ -834,10 +857,15 @@ mod transactions {
                     if current != *record {
                         return Err(refuse("the attempt changed its fixed target"));
                     }
-                } else if cut.attempt_runs_under(&shard, previous).is_ok()
-                    && previous.primary_node_id == attempt.primary_node_id
-                {
-                    return Err(refuse("another attempt of the same converter runs at this epoch"));
+                } else if cut.attempt_runs_under(&shard, previous).is_ok() {
+                    if previous.takeover.is_some() {
+                        return Err(refuse(
+                            "a converting takeover runs at this epoch; only its converter continues it",
+                        ));
+                    }
+                    if attempt.takeover.is_none() {
+                        return Err(refuse("another attempt of the same converter runs at this epoch"));
+                    }
                 }
             }
         }
@@ -974,7 +1002,8 @@ mod transactions {
     /// exact serving record, write set, storage record, handoff and
     /// watermark, every configured member's capability records and the
     /// caller's member compares; it neither compares nor writes the
-    /// filesystem configuration or its catalog generation.
+    /// filesystem configuration or its catalog generation. Its request
+    /// identity binds the attempt and every compare.
     pub fn build_metadata_shard_storage_takeover_activate(
         cut: &DfsMetadataShardStorageCut<'_>,
     ) -> KvResult<(KvTxnRequest, DfsMetadataShardStorage)> {
@@ -1002,15 +1031,25 @@ mod transactions {
         };
         let handoff = bound(cut.handoff, key(crate::metadata_shard_membership_handoff_key))?;
         let watermark = bound(cut.watermark, key(crate::metadata_shard_head_watermark_key))?;
-        let identity = serde_json::to_vec(&(
-            &attempt.attempt_id,
-            value_digest(Some(cut.shard)),
-            value_digest(cut.write_set),
-            value_digest(cut.handoff),
-            value_digest(cut.watermark),
-        ))
-        .map_err(refuse)?;
-        let request_id = KvRequestId::derived("dfs-shard-storage-takeover-activate-v1", identity);
+        let (superseded_compares, superseded_deletes) =
+            crate::control_plane::metadata_takeover_superseded_keys(
+                &shard,
+                handoff.as_ref(),
+                watermark.as_ref(),
+            );
+        let mut compares = vec![
+            exact(key(crate::metadata_shard_key), Some(cut.shard))?,
+            exact(key(crate::metadata_shard_write_set_key), cut.write_set)?,
+            exact(key(crate::metadata_shard_storage_key), cut.storage)?,
+        ];
+        compares.extend(superseded_compares);
+        extend_unique(&mut compares, cut.storage_capable_member_compares(&shard)?);
+        extend_unique(&mut compares, cut.member_compares.clone());
+        // As for the other storage transactions, the identity binds every
+        // compare, member records included: a definite rejection is
+        // re-planned from the changed cut under a new identity.
+        let request_id =
+            cut_request_id("dfs-shard-storage-takeover-activate-v1", &attempt.attempt_id, &compares)?;
         let next_shard =
             crate::control_plane::metadata_shard_primary_handoff_target(&shard, &attempt.primary_node_id)?;
         let next_write_set = cut
@@ -1029,20 +1068,6 @@ mod transactions {
             write_set.validate_against(&next_shard).map_err(refuse)?;
         }
         active.validate_against(&next_shard).map_err(refuse)?;
-        let (superseded_compares, superseded_deletes) =
-            crate::control_plane::metadata_takeover_superseded_keys(
-                &shard,
-                handoff.as_ref(),
-                watermark.as_ref(),
-            );
-        let mut compares = vec![
-            exact(key(crate::metadata_shard_key), Some(cut.shard))?,
-            exact(key(crate::metadata_shard_write_set_key), cut.write_set)?,
-            exact(key(crate::metadata_shard_storage_key), cut.storage)?,
-        ];
-        compares.extend(superseded_compares);
-        extend_unique(&mut compares, cut.storage_capable_member_compares(&shard)?);
-        extend_unique(&mut compares, cut.member_compares.clone());
         let mut success = vec![KvOp::put_serde(key(crate::metadata_shard_key), &next_shard, None)?];
         if let Some(write_set) = &next_write_set {
             success.push(KvOp::put_serde(key(crate::metadata_shard_write_set_key), write_set, None)?);
@@ -1496,6 +1521,37 @@ mod transaction_tests {
         ));
     }
 
+    /// A converting takeover installs under the rule of the configuration its
+    /// activation makes current, never needing the lost primary.
+    #[test]
+    fn a_takeover_installs_under_the_configuration_its_activation_makes_current() {
+        use std::collections::BTreeSet;
+        let current = ring(3);
+        let (primary, b, c) = (node("primary-a"), node("replica-b"), node("replica-c"));
+        let set = |nodes: &[&NodeId]| nodes.iter().map(|node| (*node).clone()).collect::<BTreeSet<_>>();
+        let rule = |write_set: Option<&KvEntry>, converter: &NodeId| {
+            DfsMetadataShardConversionInstallRule::for_takeover(&current, write_set, converter)
+        };
+        // Unswitched: the converter, as the next primary, and a majority of
+        // the configured members.
+        let unswitched = rule(None, &b).unwrap();
+        assert_eq!(unswitched.install_set(), set(&[&primary, &b, &c]));
+        assert!(unswitched.satisfied_by(&set(&[&b, &c])), "the lost primary is not needed");
+        assert!(!unswitched.satisfied_by(&set(&[&primary, &c])), "the converter must hold the image");
+        assert!(!unswitched.satisfied_by(&set(&[&b])));
+        // Switched: the whole write set without the lost primary.
+        let write_set_key = crate::metadata_shard_write_set_key(&current.file_system_id, &current.shard_id);
+        let switched = entry(write_set_key.clone(), &write_set_for(&current, &[primary.clone(), b.clone(), c.clone()]));
+        let rule_switched = rule(Some(&switched), &b).unwrap();
+        assert_eq!(rule_switched.install_set(), set(&[&b, &c]));
+        assert!(rule_switched.satisfied_by(&set(&[&b, &c])));
+        assert!(!rule_switched.satisfied_by(&set(&[&primary, &b])));
+        // A converter outside the write set, or the primary itself, has none.
+        let partial = entry(write_set_key, &write_set_for(&current, &[primary.clone(), b.clone()]));
+        assert!(rule(Some(&partial), &c).is_err());
+        assert!(rule(None, &primary).is_err());
+    }
+
     #[test]
     fn converting_fixes_one_attempt_under_the_current_serving_record() {
         let current = shard(3, "primary-a");
@@ -1711,13 +1767,62 @@ mod transaction_tests {
         assert!(replaced.txn.compares.contains(&KvCompare::ValueEquals {
             key: own_kv.key.clone(), value: own_kv.value.clone(),
         }));
-        // Another converter's takeover replaces it too, but the same converter
-        // never replaces its own attempt with another one.
+        // The same converter never replaces its own attempt with another one;
+        // the same attempt is idempotent.
         let by_b_kv = storage_entry(&by_b);
-        build_metadata_shard_storage_converting(&takeover_cut(Some(&by_b_kv), None), &by_c).unwrap();
         let by_b_again = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-b"), 10));
         assert!(build_metadata_shard_storage_converting(&takeover_cut(Some(&by_b_kv), None), &by_b_again).is_err());
         build_metadata_shard_storage_converting(&takeover_cut(Some(&by_b_kv), None), &by_b).unwrap();
+    }
+
+    /// A takeover attempt recorded under the current serving record is the
+    /// only one at its epoch: neither another member's takeover nor the
+    /// primary's own attempt replaces it, sealed or not. A serving change that
+    /// supersedes it lets the next epoch's attempt replace it.
+    #[test]
+    fn a_recorded_takeover_attempt_is_final_for_its_epoch() {
+        let current = ring(3);
+        let shard_kv = shard_entry(&current);
+        let configured = crate::metadata_shard_configured_node_ids(&current);
+        let records = configured.iter()
+            .map(|node_id| (node_id.clone(), entry(sinomo_core::node::cluster_member_key(node_id), &member_record(node_id, true))))
+            .collect::<Vec<_>>();
+        let members = records.iter()
+            .map(|(node_id, record)| DfsMetadataShardStorageMember { node_id: node_id.clone(), member: Some(record), policy: None })
+            .collect::<Vec<_>>();
+        let by_b = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-b"), 9));
+        let by_c = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-c"), 9));
+        let own = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 9));
+        let by_b_sealed = DfsMetadataShardStorage::converting(
+            &current, sealed(unsealed_attempt(&current, Some("replica-b"), 9), 9));
+        for recorded in [&by_b, &by_b_sealed] {
+            let recorded_kv = storage_entry(recorded);
+            let refused = build_metadata_shard_storage_converting(
+                &DfsMetadataShardStorageCut { members: &members, ..cut(&shard_kv, Some(&recorded_kv)) }, &by_c)
+                .unwrap_err();
+            assert!(refused.to_string().contains("only its converter continues it"), "{refused}");
+            let refused = build_metadata_shard_storage_converting(
+                &DfsMetadataShardStorageCut { members: &members, ..cut(&shard_kv, Some(&recorded_kv)) }, &own)
+                .unwrap_err();
+            assert!(refused.to_string().contains("only its converter continues it"), "{refused}");
+        }
+        // The lost primary's own attempt is replaced by a takeover.
+        let own_kv = storage_entry(&own);
+        build_metadata_shard_storage_converting(
+            &DfsMetadataShardStorageCut { members: &members, ..cut(&shard_kv, Some(&own_kv)) }, &by_c).unwrap();
+        // A serving change supersedes the takeover attempt: the next epoch's
+        // primary replaces it.
+        let successor = DfsMetadataShardConfig {
+            primary_node_id: node("replica-c"),
+            replica_node_ids: vec![node("primary-a"), node("replica-b")],
+            epoch: current.epoch + 1,
+            ..current.clone()
+        };
+        let successor_kv = shard_entry(&successor);
+        let next = DfsMetadataShardStorage::converting(&successor, unsealed_attempt(&successor, None, 9));
+        let by_b_kv = storage_entry(&by_b);
+        build_metadata_shard_storage_converting(
+            &DfsMetadataShardStorageCut { members: &members, ..cut(&successor_kv, Some(&by_b_kv)) }, &next).unwrap();
     }
 
     /// The shard's own keys and its members' records, read from `kv`.
@@ -1869,6 +1974,28 @@ mod transaction_tests {
         let read = Read::from(&kv, &shard, &nodes);
         let members = read.members();
         assert!(build_metadata_shard_storage_takeover_activate(&read.cut(&members)).is_err());
+    }
+
+    /// A member-record change between the takeover activation's read and its
+    /// commit rejects it, and the activation re-planned from the changed cut
+    /// commits under a new identity.
+    #[test]
+    fn a_takeover_activation_rejected_by_a_member_record_change_is_replanned() {
+        let (mut kv, current, nodes) = sealed_takeover(false);
+        let activation = |kv: &InProcessKvStore| {
+            let read = Read::from(kv, &current, &nodes);
+            let members = read.members();
+            build_metadata_shard_storage_takeover_activate(&read.cut(&members)).unwrap().0
+        };
+        let first = activation(&kv);
+        assert_eq!(activation(&kv), first, "the same cut gives the same request");
+        let mut moved = member_record(&nodes[2], true);
+        moved.display_name.push_str("-renamed");
+        put(&mut kv, sinomo_core::node::cluster_member_key(&nodes[2]), &moved);
+        assert!(!apply(&mut kv, &first));
+        let replanned = activation(&kv);
+        assert_ne!(replanned.request_id, first.request_id);
+        assert!(apply(&mut kv, &replanned));
     }
 
     #[test]

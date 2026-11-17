@@ -111,8 +111,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
         requester_node_id: &NodeId,
     ) -> Result<Option<String>, DfsError> {
-        let source_path = match operation {
+        let source_path: &str = match operation {
             DfsNamespaceOperation::ParentCountParticipant { participant, .. } => &participant.binding.root_path,
+            DfsNamespaceOperation::ReleaseDirectoryMoveDestination { reservation } => {
+                match reservation.directory_move_destination_reservation() {
+                    Some(reservation) => reservation.source_root,
+                    None => return Ok(Some("destination release carries no reservation".into())),
+                }
+            }
             // This validates only the exact already-published destination and
             // absence of active transfers. It cannot install or finalize data.
             DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => return Ok(None),
@@ -209,6 +215,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsNamespaceOperation::ParentCountParticipant { participant, .. } => {
                 Self::normalized_namespace_paths([participant.expected.path.as_str()], false, "parent participant")?
+            }
+            DfsNamespaceOperation::ReleaseDirectoryMoveDestination { reservation } => {
+                Self::normalized_namespace_paths([reservation.root_path.as_str()], false, "destination reservation")?
             }
             DfsNamespaceOperation::BeginContentCopy { path, .. } => {
                 Self::normalized_namespace_paths([path.as_str()], false, "file restore")?

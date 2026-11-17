@@ -1,7 +1,8 @@
 //! Install of a per-shard conversion's sealed image on the shard's members.
 //!
-//! The attempt's primary sends each member of the install set three requests
-//! on `dfs-migration` object RPC:
+//! The attempt's converter, the shard's primary or the member converting a
+//! closed shard in its lost primary's place, sends each member of the install
+//! set three requests on `dfs-migration` object RPC:
 //!
 //! 1. **Floors.** The member reports the acknowledgement floors its own copy
 //!    of the shard retains, each checked to be anchored. The request carries
@@ -20,21 +21,27 @@
 //! Before each effect and again before it replies, the member reads the
 //! shard's serving, write-set and storage records in one exact-set read and
 //! requires the storage record Converting for exactly this attempt and seal,
-//! the attempt at the shard's current epoch, the sender the shard's primary
-//! and the attempt's converter, and itself in the install set. There is no
-//! handoff and no fence: the shard is closed on every node.
+//! the attempt at the shard's current epoch, the sender the attempt's
+//! converter, and itself in the install set. A primary's own attempt comes
+//! from the shard's primary and installs under the shard's rule; a takeover
+//! attempt comes from its converter, names the shard's primary as lost, and
+//! installs under the rule of the configuration its activation makes current.
+//! There is no handoff and no fence: the shard is closed on every node.
 //!
 //! **Floors** are a migration-only obligation: an image may replace a
 //! member's copy only if every prefix that copy acknowledged is an ancestor
-//! of the primary's source cut. A copy in a per-shard native format retains
-//! exactly its own shard's floors, each with a prefix proof, and is
-//! reconciled by the exchange above, keyed by the attempt. A legacy copy can
-//! retain floors in a combined root or as height-only rows that only a local
-//! checkpoint capture anchors; such a copy is staged only when it retains no
-//! floors and is refused otherwise.
+//! of the primary's source cut. The exchange above reconciles them, keyed by
+//! the attempt. [`member_floors`] reads and anchors them: a native copy's
+//! floors carry prefix proofs, and a legacy copy's height-only rows are
+//! anchored by a local checkpoint capture of the copy, which the floors reply
+//! names so the primary streams from it. The member records the capture with
+//! the challenge and requires the same floors and captures at every later
+//! effect.
 //!
 //! A member that cannot be reached, is busy, or refuses is reported to the
 //! driver as unavailable; the driver parks on its reachability.
+mod member_floors;
+
 use super::*;
 use crate::authority::owner::conversion_receiver::{
     StagedConversion, conversion_stage_root, enqueue_received_conversion,
@@ -43,8 +50,9 @@ use crate::authority::owner::shard_conversion::InstallReply;
 use crate::metadata::ack_floor::LegacyAcknowledgement;
 use crate::metadata::canonical_generation::CapturedMetadataSource;
 use crate::metadata::source_ancestry::{
-    MAX_SOURCE_ANCESTRY_CHUNK_BYTES, SourceAncestryChunk, SourceAncestryVerifier,
+    MAX_SOURCE_ANCESTRY_CHUNK_BYTES, SourceAncestryChunk, SourceCheckpointAnchor,
 };
+use member_floors::{CHECKPOINTS_RECORD, FloorRefusal, MemberFloors, recorded_checkpoint_captures};
 use sinomo_core::node::NodeId;
 use sinomo_dfs::{
     DfsFileSystemId, DfsMetadataGenerationSeal, DfsMetadataShardConversion,
@@ -97,6 +105,9 @@ pub(in crate::authority) struct FloorsRequest {
 pub(in crate::authority) struct FloorsResponse {
     pub attempt_id: String,
     pub floors: Vec<SourceFloor>,
+    /// The local checkpoint anchors of the member's height-only floors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<SourceCheckpointAnchor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,16 +191,24 @@ pub(in crate::authority) fn admit_conversion_stage(
     if attempt.sealed().is_none_or(|(seal, _)| *seal != request.seal) {
         return Err(refused("the attempt is not sealed with this image"));
     }
-    if attempt.takeover.is_some() {
-        return Err(refused("a takeover attempt is installed by its converter's own path"));
-    }
     if attempt.epoch != request.epoch || attempt.epoch != shard.epoch {
         return Err(refused("the attempt does not run at the shard's current epoch"));
     }
-    if *source != shard.primary_node_id || attempt.primary_node_id != shard.primary_node_id {
-        return Err(refused("the sender is not the shard's primary and the attempt's converter"));
+    let rule = match &attempt.takeover {
+        Some(takeover) => {
+            if takeover.previous_primary != shard.primary_node_id || *source != attempt.primary_node_id {
+                return Err(refused("the sender is not the converter of a takeover of the shard's primary"));
+            }
+            DfsMetadataShardConversionInstallRule::for_takeover(&shard, write_set, &attempt.primary_node_id)
+        }
+        None => {
+            if *source != shard.primary_node_id || attempt.primary_node_id != shard.primary_node_id {
+                return Err(refused("the sender is not the shard's primary and the attempt's converter"));
+            }
+            DfsMetadataShardConversionInstallRule::for_shard(&shard, write_set)
+        }
     }
-    let rule = DfsMetadataShardConversionInstallRule::for_shard(&shard, write_set).map_err(error)?;
+    .map_err(error)?;
     if local == source || !rule.install_set().contains(local) {
         return Err(refused("this node is not a member the attempt installs on"));
     }
@@ -290,66 +309,26 @@ impl NativeImportAuthority {
         )
     }
 
-    /// The floors this member's own copy of the shard retains, under that
-    /// copy's source fence.
+    /// The floors this member's copies of the shard retain, each anchored for
+    /// `cut`, under the source fences of those copies.
     fn conversion_local_floors(
         &self,
         fs: &DfsFileSystemId,
         shard: &DfsMetadataShardId,
-    ) -> Result<(Option<Arc<std::fs::File>>, Vec<LegacyAcknowledgement>)> {
-        let root = self.metadata_root.join(&shard.0);
-        if !root.try_exists().map_err(error)? {
-            return Ok((None, Vec::new()));
-        }
-        let fence = crate::metadata::retain_source_fence(&root)?;
-        if root.join("metadata-import-v7.json").is_file() {
-            return Err(refused("this member's copy retains the floors of an earlier import"));
-        }
-        if let Some(format) = crate::metadata::original_native_root_format(&root)? {
-            let floors = crate::metadata::ack_floor::acknowledged_source_floors_for_root(
-                &root,
-                fs,
-                Some(format),
-                shard,
-            )?;
-            if floors.iter().any(|floor| {
-                floor.shard_id != *shard
-                    || floor.durable_prefix_proof.as_ref().is_none_or(|proof| proof.version != 2)
-            }) {
-                return Err(refused("this member's copy retains a foreign or unanchored floor"));
-            }
-            return Ok((Some(fence), floors));
-        }
-        let mut floors =
-            crate::metadata::ack_floor::legacy_acknowledged_source_floors_for_root(&root, fs)?;
-        let combined = self.metadata_root.join("root");
-        if shard.0 != "root"
-            && combined.try_exists().map_err(error)?
-            && crate::metadata::original_native_root_format(&combined)?.is_none()
-            && !crate::metadata::current_root(&combined)?
-        {
-            floors.extend(
-                crate::metadata::ack_floor::legacy_acknowledged_source_floors_for_root(&combined, fs)?
-                    .into_iter()
-                    .filter(|floor| floor.shard_id == *shard),
-            );
-        }
-        if !floors.is_empty() {
-            return Err(refused(
-                "this member's legacy copy retains acknowledgement floors that a conversion stage does not reconcile",
-            ));
-        }
-        Ok((Some(fence), floors))
+        cut: &MetadataSourceCut,
+    ) -> Result<MemberFloors> {
+        member_floors::member_floors(&self.metadata_root, fs, shard, cut)
     }
 
     /// The floors recorded at the challenge, which must still be the
-    /// member's own, and the attempt's source cut.
+    /// member's own with the same checkpoint captures, and the attempt's
+    /// source cut.
     fn recorded_conversion_floors(
         &self,
         ancestry: &Path,
         admitted: &Admitted,
         request: &StagedAttempt,
-    ) -> Result<(Option<Arc<std::fs::File>>, MetadataSourceCut, Vec<LegacyAcknowledgement>)> {
+    ) -> Result<(MemberFloors, MetadataSourceCut)> {
         let challenge: FloorsRequest =
             serde_json::from_slice(&std::fs::read(ancestry.join("challenge.json")).map_err(error)?)
                 .map_err(error)?;
@@ -360,14 +339,18 @@ impl NativeImportAuthority {
         let recorded: FloorsResponse =
             serde_json::from_slice(&std::fs::read(ancestry.join("floors.json")).map_err(error)?)
                 .map_err(error)?;
-        let (fence, floors) = self.conversion_local_floors(
+        let floors = self.conversion_local_floors(
             &request.file_system_id,
             &DfsMetadataShardId::new(&request.shard_id),
+            &cut,
         )?;
-        if recorded.floors != floors.iter().map(SourceFloor::from).collect::<Vec<_>>() {
+        if recorded.floors != floors.floors.iter().map(SourceFloor::from).collect::<Vec<_>>()
+            || recorded.checkpoints != floors.anchors()
+            || recorded_checkpoint_captures(ancestry)? != floors.checkpoints
+        {
             return Err(error("this member's floors changed after its conversion challenge"));
         }
-        Ok((fence, cut, floors))
+        Ok((floors, cut))
     }
 
     /// The record of what this member stages for `request`, and the
@@ -399,32 +382,39 @@ impl NativeImportAuthority {
     ) -> Result<FloorsResponse> {
         let admitted = self.conversion_receive_context(&source, &request.attempt)?;
         let cut = ancestry_cut(&admitted.attempt, &request.source)?;
-        let (_fence, floors) = self.conversion_local_floors(
+        let floors = self.conversion_local_floors(
             &request.attempt.file_system_id,
             &DfsMetadataShardId::new(&request.attempt.shard_id),
+            &cut,
         )?;
-        SourceAncestryVerifier::new(&cut, &floors, &[])?;
         let response = FloorsResponse {
             attempt_id: request.attempt.attempt_id.clone(),
-            floors: floors.iter().map(SourceFloor::from).collect(),
+            floors: floors.floors.iter().map(SourceFloor::from).collect(),
+            checkpoints: floors.anchors(),
         };
         let (stage, _) = self.register_conversion_stage(context, &source, &request.attempt)?;
         let ancestry = stage.join("ancestry");
         if ancestry.join("floors.json").is_file() {
-            // A retry keeps the recorded challenge, floors and chunks.
+            // A retry keeps the recorded challenge, floors, captures and chunks.
             let recorded: FloorsRequest =
                 serde_json::from_slice(&std::fs::read(ancestry.join("challenge.json")).map_err(error)?)
                     .map_err(error)?;
             let retained: FloorsResponse =
                 serde_json::from_slice(&std::fs::read(ancestry.join("floors.json")).map_err(error)?)
                     .map_err(error)?;
-            if recorded != request || retained != response {
+            if recorded != request
+                || retained != response
+                || recorded_checkpoint_captures(&ancestry)? != floors.checkpoints
+            {
                 return Err(error("a conversion challenge retry changes its challenge or this member's floors"));
             }
             return Ok(retained);
         }
         std::fs::create_dir_all(&ancestry).map_err(error)?;
         Self::save_blueprint(&ancestry, "challenge.json", &request)?;
+        if !floors.checkpoints.is_empty() {
+            Self::save_blueprint(&ancestry, CHECKPOINTS_RECORD, &floors.checkpoints)?;
+        }
         Self::save_blueprint(&ancestry, "floors.json", &response)?;
         Ok(response)
     }
@@ -444,9 +434,8 @@ impl NativeImportAuthority {
             if let Some(progress) = registry.get(&ancestry) {
                 Arc::clone(progress)
             } else {
-                let (_fence, cut, floors) =
-                    self.recorded_conversion_floors(&ancestry, &admitted, &transfer.attempt)?;
-                let mut verifier = SourceAncestryVerifier::new(&cut, &floors, &[])?;
+                let (floors, cut) = self.recorded_conversion_floors(&ancestry, &admitted, &transfer.attempt)?;
+                let mut verifier = floors.verifier(&cut)?;
                 let next_ordinal = Self::replay_source_chunks(&ancestry, &mut verifier, None)?;
                 let progress = Arc::new(Mutex::new(SourceTransferVerifier { verifier, next_ordinal }));
                 registry.insert(ancestry.clone(), Arc::clone(&progress));
@@ -470,7 +459,7 @@ impl NativeImportAuthority {
                 return Err(error("source ancestry chunk cursor has a gap"));
             }
             let effect = (|| -> Result<()> {
-                progress.verifier.apply(&transfer.chunk)?;
+                progress.verifier.apply(&transfer.chunk).map_err(FloorRefusal::not_ancestor)?;
                 sinomo_core::storage::durable_file::write_file_atomic(
                     &path,
                     &bytes,
@@ -528,10 +517,10 @@ impl NativeImportAuthority {
         image.validate_file_system(fs)?;
         let (stage, record) = self.register_conversion_stage(context, &source, request)?;
         let ancestry = stage.join("ancestry");
-        let (_fence, cut, floors) = self.recorded_conversion_floors(&ancestry, &admitted, request)?;
-        let mut verifier = SourceAncestryVerifier::new(&cut, &floors, &[])?;
+        let (floors, cut) = self.recorded_conversion_floors(&ancestry, &admitted, request)?;
+        let mut verifier = floors.verifier(&cut)?;
         Self::replay_source_chunks(&ancestry, &mut verifier, None)?;
-        verifier.finish()?;
+        verifier.finish().map_err(FloorRefusal::not_ancestor)?;
         let reply = |result| StageReply {
             request_id: head.command.request_id.clone(),
             attempt_id: request.attempt_id.clone(),
@@ -657,13 +646,18 @@ impl NativeImportAuthority {
         if floors.attempt_id != attempt.attempt_id {
             return unavailable("the member answered the floor challenge of another attempt".into());
         }
+        let checkpoints = floors.checkpoints;
         let floors = floors.floors.into_iter().map(Into::into).collect::<Vec<LegacyAcknowledgement>>();
         // A member whose floors the source cannot extend is not installed.
+        // A combined source copy can have moved beside the image `root`'s
+        // own conversion installed since the capture recorded it.
+        let actual = crate::metadata::combined_root::current_location(&cut.source_root, &cut.scope_shard)?;
+        crate::metadata::rebind_relocated_source_fence(&cut.source_root, &actual)?;
         let mut reader = match crate::metadata::source_ancestry::source_ancestry_reader(
             &cut,
-            &cut.source_root,
+            &actual,
             &floors,
-            &[],
+            &checkpoints,
         ) {
             Ok(reader) => reader,
             Err(failure) => return unavailable(failure.to_string()),

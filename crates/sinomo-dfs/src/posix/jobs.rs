@@ -198,7 +198,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // authenticated source coordinator after its alias generation is
             // durable. Background maintenance must not expose it early.
             DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
-            | DfsNamespaceJobKind::ParentCountParticipant => Ok(job),
+            | DfsNamespaceJobKind::ParentCountParticipant
+            | DfsNamespaceJobKind::DirectoryMoveDestinationReservation => Ok(job),
         }
     }
 
@@ -605,6 +606,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
             })?
             .get_namespace_job(&job.job_id)?;
+        let ended = existing
+            .as_ref()
+            .is_some_and(|existing| existing.status == DfsNamespaceJobStatus::Running)
+            && job.status != DfsNamespaceJobStatus::Running;
         if existing.as_ref() != Some(job) {
             let mut route = crate::posix_object::new_posix_metadata_object(
                 &self.node_id,
@@ -671,6 +676,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map_err(DfsPosixError::from)?;
             self.sync_metadata_shard_to_quorum(&target, crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
                 .map_err(DfsPosixError::from)?;
+        }
+        if ended {
+            // A conversion of a shard the job touched may wait on it.
+            self.note_namespace_job_ended(job);
         }
         Ok(())
     }
@@ -791,6 +800,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
                 | DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }
                 | DfsNamespaceJobFrame::ParentCountParticipant { .. }
+                | DfsNamespaceJobFrame::DirectoryMoveDestinationReservation { .. }
+                | DfsNamespaceJobFrame::CrossShardDirAbort { .. }
                 | DfsNamespaceJobFrame::CrossShardDirStart { .. }
                 | DfsNamespaceJobFrame::CrossShardDirScan { .. }
                 | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {
@@ -1089,6 +1100,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
                 | DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }
                 | DfsNamespaceJobFrame::ParentCountParticipant { .. }
+                | DfsNamespaceJobFrame::DirectoryMoveDestinationReservation { .. }
+                | DfsNamespaceJobFrame::CrossShardDirAbort { .. }
                 | DfsNamespaceJobFrame::CrossShardDirStart { .. }
                 | DfsNamespaceJobFrame::CrossShardDirScan { .. }
                 | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {

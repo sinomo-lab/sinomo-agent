@@ -5,7 +5,8 @@ use super::inventory::{ObservedState, UnitKey, UnitRole};
 use super::scheduler::Scheduler;
 use super::shard_conversion::*;
 use crate::authority::contribution_source::{
-    ContributionSource, SourceContributionAnswer, SourceContributionRead, SourceJobTouchingTarget,
+    ContributionSource, SourceContributionAnswer, SourceContributionRead, SourceHoldings,
+    SourceJobTouchingTarget, SourceQuestion,
 };
 use crate::metadata::canonical_generation::CapturedMetadataUnit;
 use crate::namespace_counts::tests::{object, source};
@@ -107,6 +108,9 @@ impl Cluster {
 struct ScriptedSource {
     answers: Mutex<BTreeMap<String, SourceContributionRead>>,
     reads: Mutex<usize>,
+    /// The object ids, paths and job ids each source holds, answering a
+    /// round's question.
+    holds: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl ScriptedSource {
@@ -125,6 +129,28 @@ impl ContributionSource for ScriptedSource {
         *self.reads.lock().unwrap() += 1;
         let read = self.answers.lock().unwrap().get(&source.shard_id).cloned();
         async move { read.ok_or_else(|| MetadataBackendError::Serde("unscripted source".into())) }
+    }
+    fn read_asking(
+        &self,
+        target: &DfsMetadataShardConfig,
+        source: &DfsMetadataShardConfig,
+        question: &SourceQuestion,
+    ) -> impl std::future::Future<Output = Result<SourceContributionRead>> + Send {
+        let read = self.read(target, source);
+        let holds = self.holds.lock().unwrap().get(&source.shard_id).cloned().unwrap_or_default();
+        let question = question.clone();
+        async move {
+            let mut read = read.await?;
+            if let SourceContributionRead::Answered(answer) = &mut read {
+                answer.held = SourceHoldings {
+                    answered: question.len() as u64,
+                    objects: question.objects.iter().filter(|id| holds.contains(id.as_str())).cloned().collect(),
+                    directories: question.directories.iter().filter(|path| holds.contains(*path)).cloned().collect(),
+                    jobs: question.jobs.iter().filter(|job| holds.contains(*job)).cloned().collect(),
+                };
+            }
+            Ok(read)
+        }
     }
 }
 
@@ -147,6 +173,8 @@ struct Env {
     watched_nodes: RefCell<BTreeSet<NodeId>>,
     /// The local copy is already current format.
     current: std::cell::Cell<bool>,
+    /// The shard's share of the original placement goals.
+    placement: RefCell<Vec<crate::metadata::RetainedPlacementReservation>>,
     captures: std::cell::Cell<usize>,
     runtime: tokio::runtime::Runtime,
 }
@@ -217,6 +245,12 @@ impl ShardConversionEnv for Env {
     fn capture(&self, _shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         self.captures.set(self.captures.get() + 1);
         Ok(CaptureProgress::Captured(Arc::clone(&self.captured)))
+    }
+    fn placement_evidence(
+        &self,
+        _shard: &DfsMetadataShardConfig,
+    ) -> Result<Option<Vec<crate::metadata::RetainedPlacementReservation>>> {
+        Ok(Some(self.placement.borrow().clone()))
     }
     fn contribution_source(&self) -> &ScriptedSource {
         &self.source
@@ -310,6 +344,7 @@ fn answer(source: &str, aliases: usize, basis: &str) -> SourceContributionRead {
         },
         running_jobs_touching_target: Vec::new(),
         basis: basis.into(),
+        held: SourceHoldings::default(),
     })
 }
 
@@ -375,6 +410,7 @@ fn env(name: &str, local: &str, cluster: &Rc<RefCell<Cluster>>) -> Env {
         watched_keys: RefCell::new(BTreeSet::new()),
         watched_nodes: RefCell::new(BTreeSet::new()),
         current: std::cell::Cell::new(false),
+        placement: RefCell::new(Vec::new()),
         captures: std::cell::Cell::new(0),
         runtime: tokio::runtime::Builder::new_current_thread().build().unwrap(),
         root,
@@ -578,6 +614,109 @@ fn a_job_touching_the_shard_keeps_rounds_from_agreeing_until_it_is_gone() {
     assert_eq!(file_count(&env), Some(3));
 }
 
+/// The services directory move whose next page carries an alias of the
+/// users file, as its source reports it: its phase and, when its primary
+/// recorded its step waiting for the users shard's storage, that park.
+fn directory_move(parked: bool) -> SourceJobTouchingTarget {
+    let mut phase = "cross-shard-dir-scan".to_owned();
+    if parked {
+        phase.push_str(";parked-on-target");
+    }
+    SourceJobTouchingTarget {
+        job_id: "services-directory-move".into(),
+        family: "rename-directory-across-shard-primaries".into(),
+        phase,
+    }
+}
+
+/// `read` with `jobs` touching the users shard.
+fn with_jobs(read: SourceContributionRead, jobs: impl IntoIterator<Item = SourceJobTouchingTarget>) -> SourceContributionRead {
+    let SourceContributionRead::Answered(mut answer) = read else { unreachable!() };
+    answer.running_jobs_touching_target.extend(jobs);
+    answer.running_jobs_touching_target.sort();
+    SourceContributionRead::Answered(answer)
+}
+
+#[test]
+fn rounds_agree_beside_a_job_parked_on_the_shard() {
+    let cluster = cluster("rounds-parked-job", &["primary-p"], None);
+    let env = env("shard-conversion-rounds-parked-job", "primary-p", &cluster);
+    // The job's step waits for this shard's storage, so it moves none of the
+    // shard's contributions before the shard activates.
+    env.source.set("services", with_jobs(answer("services", 1, "basis-1"), [directory_move(true)]));
+    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
+    assert!(cluster.borrow().storage("users").unwrap().is_active());
+    assert_eq!(file_count(&env), Some(3));
+}
+
+#[test]
+fn a_job_touching_the_shard_but_not_parked_on_it_still_holds_the_rounds() {
+    let cluster = cluster("rounds-unparked-job", &["primary-p"], None);
+    let env = env("shard-conversion-rounds-unparked-job", "primary-p", &cluster);
+    // Running toward its parked step: the job may still move the shard's
+    // contributions.
+    env.source.set("services", with_jobs(answer("services", 1, "basis-1"), [directory_move(false)]));
+    let held = |env: &Env, by: &str| {
+        for _ in 0..3 {
+            let parked = settle(env).unwrap();
+            assert!(
+                matches!(&parked, ConversionProgress::Parked { evidence }
+                    if evidence == &format!("jobs of shards {by} touch this shard")),
+                "{parked:?}"
+            );
+        }
+        assert!(cluster.borrow().storage("users").unwrap().converting_attempt().unwrap().sealed().is_none());
+    };
+    held(&env, "services");
+    // Parked on the shard, beside another source's job that is not, the
+    // rounds still wait for that other job.
+    env.source.set("services", with_jobs(answer("services", 1, "basis-2"), [directory_move(true)]));
+    env.source.set(
+        "root",
+        with_jobs(
+            answer("root", 0, "root-basis"),
+            [SourceJobTouchingTarget {
+                job_id: "root-rename".into(),
+                family: "rename-object-across-shard-primaries".into(),
+                phase: "cross-shard-adopt".into(),
+            }],
+        ),
+    );
+    held(&env, "root");
+    // Once only the parked job is left, two equal rounds agree.
+    env.source.set("root", answer("root", 0, "root-basis"));
+    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
+    assert_eq!(file_count(&env), Some(3));
+}
+
+/// The alias the parked job carries at its next page is still a live row at
+/// its old path in its source, and is counted from there. Wherever another
+/// answer also holds that alias, it counts once, by object id.
+#[test]
+fn a_parked_jobs_carried_alias_counts_once() {
+    let cluster = cluster("rounds-parked-carried", &["primary-p"], None);
+    let env = env("shard-conversion-rounds-parked-carried", "primary-p", &cluster);
+    let carried = |path: &str| NamespaceCountAliasContribution {
+        file_system_id: fs_id(),
+        alias_object_id: DfsObjectId::from_legacy_named("tree-carried-alias").unwrap(),
+        alias_path: path.into(),
+        target_object_id: file_object().object_id,
+    };
+    let with_alias = |read: SourceContributionRead, path: &str| {
+        let SourceContributionRead::Answered(mut answer) = read else { unreachable!() };
+        answer.contributions.aliases.push(carried(path));
+        SourceContributionRead::Answered(answer)
+    };
+    env.source.set(
+        "services",
+        with_jobs(with_alias(answer("services", 0, "services-basis"), "/services/tree/alias"), [directory_move(true)]),
+    );
+    env.source.set("root", with_alias(answer("root", 0, "root-basis"), "/tree/alias"));
+    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
+    // The file's own link and the local alias, plus the carried alias once.
+    assert_eq!(file_count(&env), Some(3));
+}
+
 #[test]
 fn a_waiting_source_parks_the_unit_without_a_timer() {
     let cluster = cluster("rounds-waiting", &["primary-p"], None);
@@ -704,15 +843,13 @@ fn a_record_less_shard_with_a_current_copy_is_not_converted() {
     assert_eq!(env.captures.get(), 0, "the current copy is never captured as a source");
 }
 
-/// A legacy copy without a storage record keeps the complete-filesystem
-/// conversion: its members can retain floors the per-shard stage refuses, so
-/// writing Converting would strand the shard. A native-genesis record keeps it
-/// too; any other record-less copy converts per shard.
+/// A copy without a storage record, legacy or not, converts per shard, as
+/// does a shard whose conversion wrote a record. Only a native-genesis
+/// record keeps the complete-filesystem path, which holds no old storage.
 #[test]
-fn a_legacy_copy_without_a_record_keeps_the_complete_filesystem_conversion() {
+fn a_legacy_copy_without_a_record_converts_per_shard() {
     use super::shard_conversion::{MetadataUnitDispatch, metadata_unit_dispatch};
-    assert_eq!(metadata_unit_dispatch(None, true), MetadataUnitDispatch::CompleteFileSystem);
-    assert_eq!(metadata_unit_dispatch(None, false), MetadataUnitDispatch::PerShard);
+    assert_eq!(metadata_unit_dispatch(None), MetadataUnitDispatch::PerShard);
     let shard = shard_config("users", "primary-a", &["replica-b"], 3);
     let born = sinomo_dfs::DfsMetadataShardStorage::native_genesis(
         &shard,
@@ -723,10 +860,239 @@ fn a_legacy_copy_without_a_record_keeps_the_complete_filesystem_conversion() {
             origin: sinomo_dfs::DfsMetadataGenerationOrigin::NativeGenesis,
         },
     );
-    for legacy_copy in [false, true] {
-        assert_eq!(
-            metadata_unit_dispatch(Some(&born), legacy_copy),
-            MetadataUnitDispatch::CompleteFileSystem
+    assert_eq!(metadata_unit_dispatch(Some(&born)), MetadataUnitDispatch::CompleteFileSystem);
+    let source = sinomo_dfs::DfsMetadataConversionSource {
+        source_identity: "legacy-source".into(),
+        source_format: Some(3),
+        source_journal_sequence: 9,
+        source_state_fingerprint: "legacy-state".into(),
+        source_cut_digest: "a".repeat(64),
+        pending_mapping_digest: "b".repeat(64),
+    };
+    let converting = sinomo_dfs::DfsMetadataShardStorage::converting(
+        &shard,
+        sinomo_dfs::DfsMetadataShardConversion {
+            attempt_id: sinomo_dfs::metadata_shard_conversion_attempt_id(
+                &shard.file_system_id,
+                &shard.shard_id,
+                &shard.assignment,
+                shard.epoch,
+                &shard.primary_node_id,
+                &source,
+                None,
+            )
+            .unwrap(),
+            epoch: shard.epoch,
+            primary_node_id: shard.primary_node_id.clone(),
+            takeover: None,
+            source,
+            seal: None,
+            contributions_digest: None,
+        },
+    );
+    converting.validate_against(&shard).unwrap();
+    assert_eq!(metadata_unit_dispatch(Some(&converting)), MetadataUnitDispatch::PerShard);
+}
+
+/// A projects move of `/users/projects`, the projects shard's root, to
+/// `/services/old-projects`, parked on users at its settling step: users
+/// holds the move's parent participant Reserved, as its captured rows record
+/// it, and a real capture names that Running row as unresolved original
+/// work. The rounds accept the parked move, users applies the participant's
+/// successor from the move's reported plan phase, its counts agree with the
+/// contributions (projects no longer holds `/users/projects`), and the shard
+/// activates with the participant recorded Applied.
+#[test]
+fn a_parked_move_with_a_parent_participant_in_the_shard_converges() {
+    let cluster = cluster("parked-participant", &["primary-p"], None);
+    let mut projects = shard_config("projects", "primary-p", &[], 1);
+    projects.assignment = DfsMetadataShardAssignment::PathPrefix { prefix: "/users/projects".into() };
+    cluster.borrow_mut().put(sinomo_dfs::metadata_shard_key(&fs_id(), "projects"), &projects);
+    let mut env = env("shard-conversion-parked-participant", "primary-p", &cluster);
+    let catalog = env.catalog(&fs_id()).unwrap();
+    let users = catalog.iter().find(|shard| shard.shard_id == "users").unwrap().clone();
+    let mut parent = object("users-dir", "/users", DfsObjectKind::Directory);
+    parent.namespace_link_count = Some(4);
+    let mut successor = parent.clone();
+    successor.namespace_link_count = Some(3);
+    successor.version = sinomo_dfs::DfsVersion::from_legacy_named("users-dir-after-move").unwrap();
+    successor.modified_at_unix_nanos = 9;
+    successor.changed_at_unix_nanos = 9;
+    let participant = sinomo_dfs::DfsParentCountParticipant {
+        participant_id: String::new(),
+        binding: sinomo_dfs::DfsParentCountBinding {
+            job_id: "projects-move".into(),
+            file_system_id: fs_id(),
+            root_path: "/users/projects".into(),
+            target_path: "/services/old-projects".into(),
+            coordinator_scope: projects.clone(),
+            source: object("projects-dir", "/users/projects", DfsObjectKind::Directory),
+            expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+            origin: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+        parent_scope: users,
+        expected: parent.clone(),
+        successor: successor.clone(),
+        delta: -1,
+    }
+    .with_derived_id_for_test()
+    .unwrap();
+    let held = participant.recorded_job(sinomo_dfs::DfsParentCountState::Reserved, time::OffsetDateTime::UNIX_EPOCH);
+    let file = file_object();
+    let mut alias = object("users-alias", "/users/alias", DfsObjectKind::Hardlink);
+    alias.link_target_object_id = Some(file.object_id.clone());
+    let base = source(
+        &env.root.path().join("source-participant"),
+        &catalog,
+        "users",
+        vec![parent, file, alias, object("users-sub", "/users/sub", DfsObjectKind::Directory)],
+    )
+    .captured;
+    let mut rows = base.projected_rows.clone();
+    rows.namespace_jobs = vec![held.clone()];
+    env.captured = Arc::new(
+        CapturedMetadataUnit::from_test_projection(base.source.clone(), rows, Vec::new())
+            .unwrap()
+            .with_original_work_for_test(vec![crate::metadata::canonical_generation::OriginalWorkRef {
+                family: "namespace_jobs".into(),
+                original_id: held.job_id.clone(),
+                original_digest: None,
+                reason: "original namespace job has not completed".into(),
+            }])
+            .unwrap(),
+    );
+    let id = &participant.participant_id;
+    env.source.set(
+        "projects",
+        with_jobs(
+            answer("projects", 0, "projects-basis"),
+            [SourceJobTouchingTarget {
+                job_id: "projects-move".into(),
+                family: "rename-directory-across-shard-primaries".into(),
+                phase: format!("cross-shard-dir-finish;parent-counts=settling;participant={id};parked-on-target"),
+            }],
+        ),
+    );
+    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
+    let record = cluster.borrow().storage("users").unwrap();
+    assert!(record.is_active());
+    let (attempt, _) = record.converted_activation().unwrap();
+    let image = env
+        .root
+        .path()
+        .join("dfs/migration-owner/shards")
+        .join(fs_id().to_string())
+        .join("users")
+        .join(&attempt.attempt_id)
+        .join("image");
+    let tables = sinomo_dfs::read_metadata_candidate(&image).unwrap().tables;
+    let applied = tables.objects.iter().find(|object| object.object_id == successor.object_id).unwrap();
+    assert_eq!(*applied, successor, "the image carries the participant's successor");
+    let job = tables.namespace_jobs.iter().find(|job| job.job_id == *id).unwrap();
+    assert_eq!(job.status, sinomo_dfs::DfsNamespaceJobStatus::Completed);
+    assert!(matches!(
+        job.pending_frames.as_slice(),
+        [sinomo_dfs::DfsNamespaceJobFrame::ParentCountParticipant {
+            state: sinomo_dfs::DfsParentCountState::Applied,
+            ..
+        }]
+    ));
+    assert!(tables.versions.contains(&participant.applied_version().unwrap()));
+    assert_eq!(file_count(&env), Some(3));
+}
+
+/// The users shard's capture, as [`captured`] gives it, with `extra` rows.
+fn captured_with(env: &Env, extra: Vec<sinomo_dfs::DfsObjectMetadata>) -> Arc<CapturedMetadataUnit> {
+    let file = file_object();
+    let mut alias = object("users-alias", "/users/alias", DfsObjectKind::Hardlink);
+    alias.link_target_object_id = Some(file.object_id.clone());
+    let mut objects = vec![
+        object("users-dir", "/users", DfsObjectKind::Directory),
+        file,
+        alias,
+        object("users-sub", "/users/sub", DfsObjectKind::Directory),
+    ];
+    objects.extend(extra);
+    source(&env.root.path().join("source-with"), &env.catalog(&fs_id()).unwrap(), "users", objects).captured
+}
+
+/// An alias whose target no shard holds stops the shard's conversion with a
+/// typed reason naming the alias and the target, after the shard is closed
+/// and only once every other shard answered; a shard that cannot answer is
+/// waited for, never taken to hold nothing. Once a shard holds the target,
+/// the conversion goes on.
+#[test]
+fn a_dangling_alias_stops_the_conversion_only_once_every_shard_answered() {
+    let cluster = cluster("dangling", &["primary-p"], None);
+    let mut env = env("shard-conversion-dangling", "primary-p", &cluster);
+    let target = DfsObjectId::from_legacy_named("dangling-target").unwrap();
+    let mut dangling = object("users-dangling", "/users/dangling", DfsObjectKind::Hardlink);
+    dangling.link_target_object_id = Some(target.clone());
+    env.captured = captured_with(&env, vec![dangling]);
+    env.source.set(
+        "services",
+        SourceContributionRead::Waiting { nodes: [node("services-member")].into(), keys: BTreeSet::new() },
+    );
+    let parked = settle(&env).unwrap();
+    assert!(matches!(&parked, ConversionProgress::Parked { evidence } if evidence.contains("no member that can answer")), "{parked:?}");
+    env.source.set("services", answer("services", 1, "services-basis"));
+    for _ in 0..2 {
+        let stopped = settle(&env).unwrap_err().to_string();
+        assert!(
+            stopped.contains("dangling alias /users/dangling") && stopped.contains(target.as_str()),
+            "{stopped}"
         );
     }
+    let storage = cluster.borrow().storage("users").unwrap();
+    assert!(storage.converting_attempt().unwrap().sealed().is_none(), "a stopped shard stays closed and unsealed");
+    env.source.holds.lock().unwrap().insert("services".into(), [target.to_string()].into());
+    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
+}
+
+/// The attempt binds the shard's share of the original placement goals: the
+/// capture carries it, the attempt's files record it, and a capture without
+/// it is refused.
+#[test]
+fn the_attempt_binds_the_shards_share_of_the_placement_goals() {
+    let cluster = cluster("placement", &["primary-p"], None);
+    let mut env = env("shard-conversion-placement", "primary-p", &cluster);
+    let catalog = env.catalog(&fs_id()).unwrap();
+    let goal = crate::authority::placement_work::native_tests::pending_v0_goal_for_test("per-shard-goal", &catalog);
+    let evidence = crate::authority::placement_work::shard_placement_share(
+        std::slice::from_ref(&goal),
+        &fs_id(),
+        &DfsMetadataShardId::new("users"),
+    )
+    .unwrap();
+    assert_eq!(evidence.len(), 1);
+    *env.placement.borrow_mut() = evidence.clone();
+    let refused = settle(&env).unwrap_err().to_string();
+    assert!(refused.contains("share of the original placement goals"), "{refused}");
+    let mut facts = env.captured.source.clone();
+    facts.retained_placement_reservations = evidence.clone();
+    env.captured = Arc::new(
+        CapturedMetadataUnit::from_test_projection(
+            facts,
+            env.captured.projected_rows.clone(),
+            env.captured.proven_v7_terminals.clone(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
+    let attempt = attempt_dirs(&env).pop().unwrap();
+    let recorded = std::fs::read(
+        env.root
+            .path()
+            .join("dfs/migration-owner/shards")
+            .join(fs_id().to_string())
+            .join("users")
+            .join(attempt)
+            .join("placement-evidence.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<crate::metadata::RetainedPlacementReservation>>(&recorded).unwrap(),
+        evidence
+    );
 }
