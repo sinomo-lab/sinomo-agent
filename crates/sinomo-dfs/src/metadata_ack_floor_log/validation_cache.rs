@@ -39,9 +39,9 @@ pub(super) struct Source {
     log: FileGeneration,
 }
 
-struct Validated {
+pub(super) struct Validated {
     source: Source,
-    bytes_hash: blake3::Hash,
+    bytes: blake3::Hasher,
     loaded: Box<dyn Any>,
 }
 thread_local! {
@@ -107,7 +107,7 @@ pub(super) fn reuse<T: AckFloor>(source: &Source, log: &mut File) -> Result<Opti
             .as_ref()
             .filter(|entry| entry.source == *source)?;
         Some((
-            entry.bytes_hash,
+            entry.bytes.finalize(),
             entry.loaded.downcast_ref::<Loaded<T>>()?.clone(),
         ))
     });
@@ -149,7 +149,7 @@ pub(super) fn reuse<T: AckFloor>(source: &Source, log: &mut File) -> Result<Opti
 pub(super) fn remember<T: AckFloor>(
     before: Option<Source>,
     after: Option<Source>,
-    bytes_hash: blake3::Hash,
+    bytes: blake3::Hasher,
     loaded: &Loaded<T>,
 ) {
     let Some(index) = slot::<T>() else { return };
@@ -162,14 +162,88 @@ pub(super) fn remember<T: AckFloor>(
     LAST.with(|last| {
         last.borrow_mut()[index] = Some(Validated {
             source,
-            bytes_hash,
+            bytes,
             loaded: Box::new(loaded.clone()),
         })
     });
 }
 
-pub(super) fn forget<T: AckFloor>() {
-    if let Some(index) = slot::<T>() {
-        LAST.with(|last| last.borrow_mut()[index] = None);
+/// Remove validation before any persistence can fail. The returned DATA is
+/// private to this put and cannot be reused until all its barriers succeeded.
+pub(super) fn take_for_append<T: AckFloor>() -> Option<Validated> {
+    let index = slot::<T>()?;
+    LAST.with(|last| last.borrow_mut()[index].take())
+}
+
+pub(super) fn prepare_append<T: AckFloor>(
+    previous: Option<Validated>,
+    path: &Path,
+    held_lock: Option<&File>,
+    log: &File,
+    loaded: &Loaded<T>,
+    floor: &T,
+    record: Option<&[u8]>,
+) -> Option<Validated> {
+    let mut previous = previous?;
+    if !loaded.initialized
+        || loaded.complete_len != loaded.file_len
+        || previous.loaded.downcast_ref::<Loaded<T>>()? != loaded
+    {
+        return None;
     }
+    let pointer = read_optional(path).ok()?;
+    let current = source::<T>(path, floor.shard(), held_lock, log, pointer.as_deref()).ok()??;
+    if current != previous.source {
+        return None;
+    }
+    let mut updated = loaded.clone();
+    if let Some(record) = record {
+        let length = (record.len() as u32).to_le_bytes();
+        previous.bytes.update(&length);
+        previous.bytes.update(record);
+        updated.records += 1;
+        updated.complete_len += length.len() as u64 + record.len() as u64;
+        updated.file_len = updated.complete_len;
+    }
+    updated.floor = Some(floor.clone());
+    previous.loaded = Box::new(updated);
+    Some(previous)
+}
+
+/// Seed the existing bounded cache only for a completed append to the same
+/// locked file. Cache observation failure leaves it empty; it cannot change a
+/// completed persistence outcome. The next use still hashes the actual bytes.
+pub(super) fn remember_appended<T: AckFloor>(
+    path: &Path,
+    held_lock: Option<&File>,
+    log: &File,
+    validated: Validated,
+) {
+    let reseed = || -> Option<()> {
+        let loaded = validated.loaded.downcast_ref::<Loaded<T>>()?;
+        let before = &validated.source;
+        let pointer = read_optional(path).ok()?;
+        let after = source::<T>(path, &before.shard, held_lock, log, pointer.as_deref()).ok()??;
+        if before.path != after.path
+            || before.shard != after.shard
+            || before.kind != after.kind
+            || before.parents != after.parents
+            || before.lock != after.lock
+            || before.pointer != after.pointer
+            || before.pointer_hash != after.pointer_hash
+            || before.log.device != after.log.device
+            || before.log.inode != after.log.inode
+            || after.log.len != loaded.complete_len
+        {
+            return None;
+        }
+        remember::<T>(
+            Some(after.clone()),
+            Some(after),
+            validated.bytes.clone(),
+            loaded,
+        );
+        Some(())
+    };
+    let _ = reseed();
 }

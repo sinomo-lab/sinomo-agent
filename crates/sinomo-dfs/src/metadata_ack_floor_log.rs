@@ -79,7 +79,7 @@ struct Record {
     checksum: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct Loaded<T> {
     floor: Option<T>,
     initialized: bool,
@@ -301,7 +301,7 @@ fn load<T: AckFloor>(
                 &identity_handle,
                 current_pointer.as_deref(),
             )?;
-            validation_cache::remember::<T>(before, after, validated_bytes.finalize(), &loaded);
+            validation_cache::remember::<T>(before, after, validated_bytes, &loaded);
         }
     }
     if initialized && loaded.floor.is_none() {
@@ -335,7 +335,9 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
     // Decoded DATA never certifies a write or a barrier. Drop it before any
     // append, rotation, truncation or equal-value resynchronization can fail.
     #[cfg(unix)]
-    validation_cache::forget::<T>();
+    let validation = validation_cache::take_for_append::<T>();
+    #[cfg(unix)]
+    let mut appended_validation = None;
     let floor = match loaded.floor.as_ref() {
         Some(current) => T::merge(current, incoming)?,
         None => incoming.clone(),
@@ -396,10 +398,20 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
         } else {
             None
         };
+        #[cfg(unix)]
+        let next_validation = validation_cache::prepare_append(
+            validation,
+            path,
+            _lock.as_ref(),
+            &log,
+            &loaded,
+            &floor,
+            record.as_deref(),
+        );
         durable_file::append_length_prefixed_records(
             &mut log,
             &log_path,
-            record,
+            record.as_deref(),
             durable_file::DurableRecordAppendOptions::new(DurableLengthEndian::Little),
         )
         .map_err(metadata_durable_file_error)?;
@@ -413,10 +425,18 @@ pub(crate) fn put<T: AckFloor>(path: &Path, incoming: &T) -> Result<()> {
                 .sync(DurableFileSync::All),
         )
         .map_err(metadata_durable_file_error)?;
+        #[cfg(unix)]
+        {
+            appended_validation = next_validation.map(|validation| (log, validation));
+        }
     }
     #[cfg(test)]
     fail_if_requested(FailurePoint::DirectorySync)?;
     durable_file::sync_directory(parent).map_err(metadata_durable_file_error)?;
+    #[cfg(unix)]
+    if let Some((log, validation)) = appended_validation {
+        validation_cache::remember_appended::<T>(path, _lock.as_ref(), &log, validation);
+    }
     tracing::Span::current().record("outcome", "ok");
     Ok(())
 }
@@ -672,6 +692,10 @@ mod tests {
             )
             .unwrap();
         }
+        // Start with genuinely cold validation, independent of the successful
+        // appends above having populated the bounded DATA cache.
+        let _ = validation_cache::take_for_append::<DfsMetadataAuthorityAckFloor>();
+        let _ = validation_cache::take_for_append::<DfsMetadataPrefixAckFloor>();
         RECORD_DECODES.with(|count| count.set(0));
         assert_eq!(
             read::<DfsMetadataAuthorityAckFloor>(&authority, &floor(76).shard_id).unwrap(),
@@ -696,11 +720,61 @@ mod tests {
             "the already validated unchanged authority history is not decoded again to publish its next ACK"
         );
         assert_eq!(current(&authority), floor(77));
+        put(&authority, &floor(78)).unwrap();
+        assert_eq!(current(&authority), floor(78));
+        assert_eq!(
+            RECORD_DECODES.with(|count| count.get()),
+            first,
+            "successful advancing appends retain validated DATA for later reads and appends"
+        );
         // Decoded state cannot substitute for the next durability barrier.
         FAIL_NEXT.with(|point| point.set(Some(FailurePoint::LogSync)));
-        assert!(put(&authority, &floor(77)).is_err());
-        put(&authority, &floor(77)).unwrap();
-        assert_eq!(current(&authority), floor(77));
+        assert!(put(&authority, &floor(78)).is_err());
+        assert!(validation_cache::take_for_append::<DfsMetadataAuthorityAckFloor>().is_none());
+        put(&authority, &floor(78)).unwrap();
+        assert_eq!(current(&authority), floor(78));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_validation_keeps_floor_kinds_separate_and_requires_every_barrier() {
+        let root = sinomo_testdir::TestDir::new("ack-floor-append-validation-barriers");
+        let authority = sidecar(&root);
+        let prefix = root.join("coordination/metadata-prefix-ack-floors/floor-test.sobj");
+        let prefix_floor = |sequence| DfsMetadataPrefixAckFloor {
+            shard_id: floor(sequence).shard_id,
+            journal_sequence: sequence,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: floor(sequence).durable_prefix_proof,
+            authority_epoch: None,
+        };
+        for sequence in 1..=3 {
+            put(&authority, &floor(sequence)).unwrap();
+            put(&prefix, &prefix_floor(sequence)).unwrap();
+        }
+        RECORD_DECODES.with(|count| count.set(0));
+        assert_eq!(current(&authority), floor(3));
+        assert_eq!(
+            read::<DfsMetadataPrefixAckFloor>(&prefix, &floor(3).shard_id).unwrap(),
+            Some(prefix_floor(3))
+        );
+        assert_eq!(RECORD_DECODES.with(|count| count.get()), 0);
+
+        FAIL_NEXT.with(|point| point.set(Some(FailurePoint::DirectorySync)));
+        assert!(put(&authority, &floor(4)).is_err());
+        assert!(validation_cache::take_for_append::<DfsMetadataAuthorityAckFloor>().is_none());
+        // The readable append is not a durability certificate. Its retry must
+        // reach the directory barrier even though there is nothing to append.
+        FAIL_NEXT.with(|point| point.set(Some(FailurePoint::DirectorySync)));
+        assert!(put(&authority, &floor(4)).is_err());
+        put(&authority, &floor(4)).unwrap();
+        RECORD_DECODES.with(|count| count.set(0));
+        assert_eq!(current(&authority), floor(4));
+        assert_eq!(
+            read::<DfsMetadataPrefixAckFloor>(&prefix, &floor(3).shard_id).unwrap(),
+            Some(prefix_floor(3))
+        );
+        assert_eq!(RECORD_DECODES.with(|count| count.get()), 0);
     }
 
     #[test]
@@ -708,7 +782,9 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("ack-floor-validation-corruption");
         let path = sidecar(&root);
         put(&path, &floor(1)).unwrap();
-        assert_eq!(current(&path), floor(1));
+        put(&path, &floor(2)).unwrap();
+        // Corrupt the successful append without first populating validation
+        // through a read: put itself is now the cache producer.
         let log_path = path.with_extension("slog");
         let original = fs::read(&log_path).unwrap();
         let modified = fs::metadata(&log_path).unwrap().modified().unwrap();
@@ -729,10 +805,28 @@ mod tests {
             fs::metadata(&log_path).unwrap().modified().unwrap(),
             modified
         );
-        assert!(read::<DfsMetadataAuthorityAckFloor>(&path, &floor(1).shard_id).is_err());
-        assert!(put(&path, &floor(2)).is_err());
+        assert!(read::<DfsMetadataAuthorityAckFloor>(&path, &floor(2).shard_id).is_err());
+        assert!(put(&path, &floor(3)).is_err());
         fs::write(&log_path, original).unwrap();
-        assert_eq!(current(&path), floor(1));
+        assert_eq!(current(&path), floor(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_append_validation_does_not_cross_roots_with_the_same_shard() {
+        let first = sinomo_testdir::TestDir::new("ack-floor-append-first-root");
+        let second = sinomo_testdir::TestDir::new("ack-floor-append-second-root");
+        let a = sidecar(&first);
+        let b = sidecar(&second);
+        put(&a, &floor(1)).unwrap();
+        put(&a, &floor(2)).unwrap();
+        put(&b, &floor(1)).unwrap();
+        put(&b, &floor(3)).unwrap();
+        assert_eq!(current(&a), floor(2));
+        assert_eq!(current(&b), floor(3));
+        put(&a, &floor(4)).unwrap();
+        assert_eq!(current(&b), floor(3));
+        assert_eq!(current(&a), floor(4));
     }
 
     #[cfg(unix)]
