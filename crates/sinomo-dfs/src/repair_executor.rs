@@ -181,6 +181,10 @@ pub(crate) struct DfsRepairExecutor {
     /// Shards this node was primary for at its last pass; `None` before it,
     /// when the first pass reads every primary shard's whole index anyway.
     primary_shards: Mutex<Option<BTreeSet<String>>>,
+    /// Primary shards the last pass left out because this node's copy was
+    /// closed for storage. Their activation wakes the executor, whose next
+    /// pass gains them and reads their whole index.
+    storage_closed_primaries: Mutex<BTreeSet<String>>,
     events: Mutex<DfsRepairExecutorEvents>,
     /// The attempt in flight for each need, whoever sent it: the executor's
     /// own dispatch or a write's send beyond its commit quorum.
@@ -546,6 +550,25 @@ pub(crate) fn wake_repair_executor(data_root: &Path, source: &'static str) {
     raise_wake(data_root, source);
 }
 
+/// Shards whose storage turned Active on this node's configuration. When the
+/// executor's last pass left one of them out as a closed primary copy, wake
+/// it: its next pass gains the shard and reads its whole index. An executor
+/// with no such shard has no work from this and is not woken.
+pub(crate) fn repair_executor_shard_storage_activated(
+    data_root: &Path,
+    activated: &BTreeSet<crate::DfsMetadataShardStorageKey>,
+) -> bool {
+    let waiting = {
+        let executor = executor(data_root);
+        let closed = lock(&executor.storage_closed_primaries);
+        activated.iter().any(|(_, shard)| closed.contains(&shard.0))
+    };
+    if waiting {
+        raise_wake(data_root, "storage_activated");
+    }
+    waiting
+}
+
 /// The executor's timer fired: the next pass serves it. The caller already
 /// runs that pass, so no further wake is raised.
 pub(crate) fn repair_executor_timer_fired(data_root: &Path) {
@@ -866,7 +889,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusions: &DfsMaintenanceExecutionExclusions,
         limit: usize,
     ) -> Result<DfsRepairExecutorPassReport, DfsError> {
-        let primaries = local_primary_shards(metadata_shards, &self.node_id);
+        let mut primaries = local_primary_shards(metadata_shards, &self.node_id);
+        // A primary whose local copy is closed for storage is left out, as on
+        // a node that is not its primary: its needs are not read or timed
+        // while it is closed, and its whole index is read once it opens.
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            let mut closed = BTreeSet::new();
+            for shard in primaries.keys() {
+                if backend.metadata_shard_storage_is_closed(&DfsMetadataShardId::new(shard.as_str()))? {
+                    closed.insert(shard.clone());
+                }
+            }
+            primaries.retain(|shard, _| !closed.contains(shard));
+            *lock(&executor(data_root).storage_closed_primaries) = closed;
+        }
         self.run_repair_executor_pass_with(data_root, Some(primaries), exclusions, limit)
     }
 

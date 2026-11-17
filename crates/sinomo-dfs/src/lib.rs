@@ -71,7 +71,7 @@ pub use storage_generation::{
 };
 #[cfg(feature = "storage-conversion")]
 pub use storage_generation::{
-    DfsMetadataShardStorageCut, DfsMetadataShardStorageMember,
+    DfsMetadataShardConversionInstallRule, DfsMetadataShardStorageCut, DfsMetadataShardStorageMember,
     build_metadata_shard_storage_activate, build_metadata_shard_storage_converting,
     build_metadata_shard_storage_seal, build_metadata_shard_storage_takeover_activate,
 };
@@ -272,6 +272,7 @@ pub use metadata_authority_runtime::{
     DFS_METADATA_AUTHORITY_PREFIX, DfsMetadataAuthorityDeltaObservation, DfsMetadataAuthorityHost,
     DfsMetadataAuthorityReadFuture, DfsMetadataAuthorityRuntime,
     DfsMetadataAuthorityRuntimeRegistry, DfsMetadataAuthorityState, DfsMetadataAuthorityTask,
+    DfsMetadataShardStorageKey,
 };
 pub use configuration_snapshot::{
     DfsConfigurationSnapshot, DfsFetchedConfiguration, decode_dfs_configuration_snapshot_response,
@@ -581,7 +582,10 @@ pub use metadata_backend::{
     DfsSourceAdoptionCapture, DfsSourceAdoptionJobCapture, DfsSourceAdoptionSourceCapture,
     LocalSobjMetadataBackend,
 };
-pub use metadata_error::MetadataBackendError;
+pub use metadata_error::{
+    METADATA_SHARD_STORAGE_CONVERTING_REFUSAL, METADATA_STORAGE_PREPARATION_PENDING_REFUSAL,
+    MetadataBackendError,
+};
 pub use metadata_history_gc::{
     DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
     DfsMetadataHistoryShardStats, DfsMetadataRetainedTableStats, DfsMetadataVersionIdentity,

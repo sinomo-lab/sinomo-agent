@@ -143,6 +143,33 @@ impl CapturedMetadataUnit {
             unresolved,
         )
     }
+    /// This capture with its namespace jobs replaced by their settled form.
+    /// A converting shard settles its own legacy cross-shard jobs from its
+    /// own rows before counting; every other captured fact is kept, and the
+    /// projection and any V7 recovery evidence are rebound to the settled
+    /// rows, so the result is admitted only as this settled projection.
+    pub(crate) fn with_settled_namespace_jobs(
+        &self,
+        namespace_jobs: Vec<sinomo_dfs::DfsNamespaceJobRecord>,
+    ) -> Result<Self> {
+        self.validate()?;
+        let mut rows = self.projected_rows.clone();
+        rows.namespace_jobs = namespace_jobs;
+        let mut settled = Self::bind_projection(
+            self.source.clone(),
+            rows,
+            self.original_outcomes.clone(),
+            self.proven_v7_terminals.clone(),
+            self.unresolved.clone(),
+        )?;
+        if let Some(recovery) = &self.recovery {
+            let mut recovery = recovery.clone();
+            recovery.binding = recovery.expected_binding(&settled)?;
+            settled.recovery = Some(recovery);
+        }
+        settled.validate()?;
+        Ok(settled)
+    }
     fn bind_projection(
         source: CapturedMetadataSource,
         projected_rows: DfsMetadataTableSnapshotTables,

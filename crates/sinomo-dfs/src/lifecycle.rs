@@ -30,17 +30,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let authorities = self.metadata_shard_authorities(file_system_id)?;
         let mut deleted = None;
         let mut retained = false;
+        let mut fan_out = crate::file_history_query::DfsAuthorityFanOut::default();
         for shard in &authorities {
-            let DfsMetadataQueryResult::ObjectLifecycle {
-                object,
-                has_content_references,
-                references_complete,
-            } = self.query_metadata_authority(
+            let Some(result) = self.query_metadata_authority_in_fan_out(
+                &mut fan_out,
                 shard,
                 DfsMetadataSelection::ObjectLifecycle {
                     object_id: object_id.clone(),
                 },
+                None,
             )?
+            else {
+                continue;
+            };
+            let DfsMetadataQueryResult::ObjectLifecycle {
+                object,
+                has_content_references,
+                references_complete,
+            } = result
             else {
                 return Err(DfsError::Metadata {
                     message: "object lifecycle authority omitted its typed evidence".into(),
@@ -64,10 +71,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             deleted = Some(*object);
         }
-        Ok(DfsObjectLifecycle {
-            reclaimable: deleted.is_some() && !retained,
-            object: deleted,
-        })
+        // Without a live record, a closed authority could hold the object or
+        // a reference to it: reclaimability is undecided until it answers.
+        fan_out.undecided(
+            format!("object {object_id}"),
+            DfsObjectLifecycle {
+                reclaimable: deleted.is_some() && !retained,
+                object: deleted,
+            },
+        )
     }
 
     /// sinomo:dfs-operation
@@ -632,14 +644,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool, DfsError> {
         request.validate()?;
         let id = content_reference_storage_id(&request.namespace, request.operation.reference_id());
+        let mut fan_out = crate::file_history_query::DfsAuthorityFanOut::default();
         for shard in self.metadata_shard_authorities(&request.identity.file_system_id)? {
-            match self.query_metadata_authority(
+            let Some(result) = self.query_metadata_authority_in_fan_out(
+                &mut fan_out,
                 &shard,
                 DfsMetadataSelection::VersionPin {
                     identity: request.identity.clone(),
                     pin_id: id.clone(),
                 },
-            )? {
+                None,
+            )?
+            else {
+                continue;
+            };
+            match result {
                 DfsMetadataQueryResult::VersionPin {
                     identity,
                     pin_id,
@@ -656,6 +675,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        Ok(false)
+        fan_out.undecided(format!("object {}", request.identity.object_id), false)
     }
 }

@@ -110,7 +110,7 @@ fn supported(unit: &CapturedMetadataUnit, record: &DfsPreparedOperationRecord) -
 }
 
 impl PreparedRecovery {
-    fn expected_binding(&self, unit: &CapturedMetadataUnit) -> Result<String> {
+    pub(super) fn expected_binding(&self, unit: &CapturedMetadataUnit) -> Result<String> {
         fingerprint(&(
             "exact-v7-recovery-v1",
             &unit.capture_fingerprint,
@@ -175,6 +175,39 @@ impl CapturedMetadataUnit {
                 .recovery_preparations()
                 .iter()
                 .any(|record| work_matches(work, record))
+        })
+    }
+    /// [`Self::has_unresolved_work`] without the captured rows' own
+    /// non-Completed namespace jobs, Pending requests and staging intents:
+    /// those are recorded rows a reader can report as they stand. What
+    /// remains has no known effect on the rows yet.
+    pub(crate) fn has_unresolved_work_beside_recorded_rows(&self) -> bool {
+        let rows = &self.projected_rows;
+        self.unresolved.iter().any(|work| {
+            let recorded = match work.family.as_str() {
+                "namespace_jobs" => rows.namespace_jobs.iter().any(|job| {
+                    job.job_id == work.original_id
+                        && job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed
+                }),
+                "namespace_requests" => rows.namespace_requests.iter().any(|request| {
+                    request.request_id == work.original_id
+                        && request.status == sinomo_dfs::DfsNamespaceRequestStatus::Pending
+                }),
+                "intents" => rows.intents.iter().any(|intent| {
+                    intent.intent_id == work.original_id
+                        && matches!(
+                            intent.status,
+                            sinomo_dfs::DfsWriteIntentStatus::Staging
+                                | sinomo_dfs::DfsWriteIntentStatus::ReceiptsPending
+                        )
+                }),
+                _ => false,
+            };
+            !recorded
+                && !self
+                    .recovery_preparations()
+                    .iter()
+                    .any(|record| work_matches(work, record))
         })
     }
     pub(crate) fn validate_recovery_counts(&self, counted: &[DfsObjectMetadata]) -> Result<()> {

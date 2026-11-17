@@ -406,23 +406,25 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
                     &metadata_authority_generation,
                 )
         });
-        let (retained_content_store, retained_metadata_backend) = if stale {
-            let entry = cache.take().expect("stale cache entry exists");
-            let same_owner = entry.signature.cluster_id == signature.cluster_id
-                && entry.signature.local_node_id == signature.local_node_id
-                && Arc::ptr_eq(
-                    &entry.metadata_authority_generation,
-                    &metadata_authority_generation,
-                );
-            (
-                Some(entry.content_store),
-                same_owner
-                    .then_some(entry.resident_metadata_backend)
-                    .flatten(),
-            )
-        } else {
-            (None, None)
-        };
+        let (retained_content_store, retained_metadata_backend, retained_namespace_locks) =
+            if stale {
+                let entry = cache.take().expect("stale cache entry exists");
+                let same_owner = entry.signature.cluster_id == signature.cluster_id
+                    && entry.signature.local_node_id == signature.local_node_id
+                    && Arc::ptr_eq(
+                        &entry.metadata_authority_generation,
+                        &metadata_authority_generation,
+                    );
+                (
+                    Some(entry.content_store),
+                    same_owner
+                        .then_some(entry.resident_metadata_backend)
+                        .flatten(),
+                    same_owner.then_some(entry.cross_shard_namespace_locks),
+                )
+            } else {
+                (None, None, None)
+            };
         if cache.is_none() {
             let content_store = match retained_content_store {
                 Some(content_store) => content_store,
@@ -445,7 +447,8 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
                 resident_metadata_initialized: true,
                 write_intent_maintenance_scan: Arc::new(Default::default()),
                 maintenance_progress: Arc::new(Default::default()),
-                cross_shard_namespace_locks: Default::default(),
+                // As in the global rollover: the same owner keeps its guards.
+                cross_shard_namespace_locks: retained_namespace_locks.unwrap_or_default(),
                 primary_service: None,
                 exact_shard_services: BTreeMap::new(),
                 content_read_service: None,
@@ -2256,26 +2259,25 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
     if cache.as_ref().is_none() || (storage_changed && allow_generation_rollover) {
         // Release the superseded backend-bearing lanes before opening their
         // replacement, while retaining the one process-local content store.
-        let (content_store, retained_metadata_backend) = match cache.take() {
-            Some(entry) => {
-                let same_owner = entry.signature.cluster_id == signature.cluster_id
-                    && entry.signature.local_node_id == signature.local_node_id
-                    && Arc::ptr_eq(
-                        &entry.metadata_authority_generation,
-                        &metadata_authority_generation,
-                    );
-                (
-                    entry.content_store,
-                    same_owner
-                        .then_some(entry.resident_metadata_backend)
-                        .flatten(),
-                )
-            }
-            None => (
-                open_daemon_native_content_store(data_dir)?,
-                None,
-            ),
-        };
+        let (content_store, retained_metadata_backend, retained_namespace_locks) =
+            match cache.take() {
+                Some(entry) => {
+                    let same_owner = entry.signature.cluster_id == signature.cluster_id
+                        && entry.signature.local_node_id == signature.local_node_id
+                        && Arc::ptr_eq(
+                            &entry.metadata_authority_generation,
+                            &metadata_authority_generation,
+                        );
+                    (
+                        entry.content_store,
+                        same_owner
+                            .then_some(entry.resident_metadata_backend)
+                            .flatten(),
+                        same_owner.then_some(entry.cross_shard_namespace_locks),
+                    )
+                }
+                None => (open_daemon_native_content_store(data_dir)?, None, None),
+            };
         tracing::info!(
             data_root = %cache_key.display(),
             metadata_authority_generation = signature.metadata_authority_generation,
@@ -2293,7 +2295,10 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
             resident_metadata_initialized: false,
             write_intent_maintenance_scan: Arc::new(Default::default()),
             maintenance_progress: Arc::new(Default::default()),
-            cross_shard_namespace_locks: Default::default(),
+            // The same owner keeps its guards: the next global hydration
+            // replaces those of every shard it reads, and a shard whose copy
+            // is closed keeps the guards replica ingest installed for it.
+            cross_shard_namespace_locks: retained_namespace_locks.unwrap_or_default(),
             primary_service: None,
             exact_shard_services: BTreeMap::new(),
             content_read_service: None,

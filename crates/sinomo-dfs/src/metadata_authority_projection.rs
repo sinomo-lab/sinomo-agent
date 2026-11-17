@@ -57,23 +57,30 @@ pub(crate) fn dfs_metadata_shard_storage_key_is_exact(key: &str) -> bool {
         })
 }
 
-/// Whether one key's change turns a shard's storage record Active from a
-/// record that kept the shard closed (converting, or unreadable). A first
-/// record, as a shard's birth writes, closed nothing and is not an
-/// activation.
+/// The shard whose storage record one key's change turns Active from a record
+/// that kept the shard closed (converting, or unreadable). A first record, as
+/// a shard's birth writes, closed nothing and is not an activation.
 pub(crate) fn metadata_shard_storage_activated(
     key: &str,
     previous: Option<&sinomo_core::kv::KvEntry>,
     current: Option<&sinomo_core::kv::KvEntry>,
-) -> bool {
+) -> Option<crate::DfsMetadataShardStorageKey> {
     let active = |entry: &sinomo_core::kv::KvEntry| {
         entry
             .decode::<crate::DfsMetadataShardStorage>()
-            .is_ok_and(|record| record.is_active())
+            .ok()
+            .filter(|record| record.is_active())
     };
-    dfs_metadata_shard_storage_key_is_exact(key)
-        && previous.is_some_and(|previous| !active(previous))
-        && current.is_some_and(active)
+    if !dfs_metadata_shard_storage_key_is_exact(key)
+        || previous.is_none_or(|previous| active(previous).is_some())
+    {
+        return None;
+    }
+    let record = active(current?)?;
+    Some((
+        record.file_system_id,
+        crate::DfsMetadataShardId::new(record.shard_id),
+    ))
 }
 
 pub(crate) fn dfs_metadata_file_system_config_key_is_exact(key: &str) -> bool {

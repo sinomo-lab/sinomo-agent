@@ -492,6 +492,7 @@ mod transactions {
     use super::*;
     use crate::DfsMetadataShardWriteSetState;
     use sinomo_core::kv::{KvCompare, KvEntry, KvError, KvOp, KvRequestId, KvTxn, KvTxnRequest};
+    use std::collections::BTreeSet;
 
     type KvResult<T> = std::result::Result<T, KvError>;
 
@@ -511,6 +512,20 @@ mod transactions {
 
     fn value_digest(entry: Option<&KvEntry>) -> Option<String> {
         entry.map(|entry| blake3::hash(&entry.value).to_hex().to_string())
+    }
+
+    /// Request identity of one attempt's transaction against one exact cut.
+    /// The same cut always gives the same identity, so a lost outcome is
+    /// settled by resubmitting the same request; a definite rejection spends
+    /// only that cut's identity, and a re-plan from the changed cut that
+    /// caused it gets a new one.
+    fn cut_request_id(
+        domain: &'static str,
+        identity: &impl Serialize,
+        compares: &[KvCompare],
+    ) -> KvResult<KvRequestId> {
+        let bytes = serde_json::to_vec(&(identity, compares)).map_err(refuse)?;
+        Ok(KvRequestId::derived(domain, bytes))
     }
 
     fn extend_unique(compares: &mut Vec<KvCompare>, more: Vec<KvCompare>) {
@@ -654,9 +669,31 @@ mod transactions {
             &self,
             shard: &DfsMetadataShardConfig,
         ) -> KvResult<Vec<KvCompare>> {
+            self.storage_capable_compares(shard, &crate::metadata_shard_configured_node_ids(shard))
+        }
+
+        /// Exact member and capability-policy compares for `nodes`, each of
+        /// which must be an authorized member that advertises and permits the
+        /// storage generation capability. A conversion passes them as
+        /// [`Self::member_compares`] for the members it installs on or counts
+        /// as acknowledgements, so a member that loses the capability or its
+        /// membership after the read cannot be admitted.
+        pub fn storage_capable_compares_for(
+            &self,
+            nodes: &BTreeSet<NodeId>,
+        ) -> KvResult<Vec<KvCompare>> {
+            let shard = self.shard_config()?;
+            self.storage_capable_compares(&shard, nodes)
+        }
+
+        fn storage_capable_compares(
+            &self,
+            shard: &DfsMetadataShardConfig,
+            nodes: &BTreeSet<NodeId>,
+        ) -> KvResult<Vec<KvCompare>> {
             let mut cluster_id = None;
             let mut compares = Vec::new();
-            for node_id in crate::metadata_shard_configured_node_ids(shard) {
+            for node_id in nodes.iter().cloned() {
                 let records = self
                     .members
                     .iter()
@@ -682,10 +719,78 @@ mod transactions {
                         &mut cluster_id,
                         sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY,
                     )
-                    .map_err(|error| refuse(format!("takeover member {node_id}: {error}")))?,
+                    .map_err(|error| refuse(format!("member {node_id}: {error}")))?,
                 );
             }
             Ok(compares)
+        }
+    }
+
+    /// Which members a primary's conversion attempt installs its image on,
+    /// and which acknowledgements its activation needs. A switched shard
+    /// installs on every member its commits require: the write set (a closed
+    /// shard has no durable pending adds, since adds need joins under exact
+    /// admission). An unswitched shard needs its primary and a majority of its
+    /// configured members, the membership-handoff acknowledgement rule with
+    /// the retiring and desired configurations equal; the remaining members
+    /// repair by snapshot once the shard is active.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum DfsMetadataShardConversionInstallRule {
+        WriteSet { required: BTreeSet<NodeId> },
+        PrimaryAndMajority { shard: DfsMetadataShardConfig },
+    }
+
+    impl DfsMetadataShardConversionInstallRule {
+        /// The rule under the shard's current serving record and write-set
+        /// entry. A stale write-set record leaves the all-member rule in
+        /// force, as it does for every other commit; an unreadable one is
+        /// refused.
+        pub fn for_shard(
+            shard: &DfsMetadataShardConfig,
+            write_set: Option<&KvEntry>,
+        ) -> KvResult<Self> {
+            let key = crate::metadata_shard_write_set_key(&shard.file_system_id, &shard.shard_id);
+            if write_set.is_some_and(|entry| entry.key != key) {
+                return Err(refuse("the write-set entry is bound to another key"));
+            }
+            match crate::metadata_shard_write_set_state(shard, write_set.map(|entry| entry.value.as_slice())) {
+                DfsMetadataShardWriteSetState::Switched(write_set) => Ok(Self::WriteSet {
+                    required: write_set.write_set.iter().cloned().collect(),
+                }),
+                DfsMetadataShardWriteSetState::Unswitched | DfsMetadataShardWriteSetState::Stale { .. } => {
+                    Ok(Self::PrimaryAndMajority { shard: shard.clone() })
+                }
+                DfsMetadataShardWriteSetState::Unreadable { reason } => {
+                    Err(refuse(format!("the write-set record is unreadable: {reason}")))
+                }
+            }
+        }
+
+        /// Every member the image is sent to.
+        pub fn install_set(&self) -> BTreeSet<NodeId> {
+            match self {
+                Self::WriteSet { required } => required.clone(),
+                Self::PrimaryAndMajority { shard } => crate::metadata_shard_configured_node_ids(shard),
+            }
+        }
+
+        /// Whether `acknowledged` members holding the sealed image are enough
+        /// to activate it.
+        pub fn satisfied_by(&self, acknowledged: &BTreeSet<NodeId>) -> bool {
+            match self {
+                Self::WriteSet { required } => required.is_subset(acknowledged),
+                Self::PrimaryAndMajority { shard } => {
+                    let acknowledged = acknowledged
+                        .intersection(&crate::metadata_shard_configured_node_ids(shard))
+                        .cloned()
+                        .collect();
+                    crate::control_plane::metadata_shard_membership_handoff_acknowledgements_are_safe(
+                        shard,
+                        shard,
+                        &acknowledged,
+                    )
+                }
+            }
         }
     }
 
@@ -695,7 +800,9 @@ mod transactions {
     /// Converting record of an attempt a serving change superseded, or one of
     /// another converter at the same epoch (a takeover of a lost primary's
     /// attempt, or the reverse); never another attempt of the same converter.
-    /// The same attempt is idempotent.
+    /// The same attempt is idempotent. The request identity binds the attempt
+    /// and every compare: the same cut keeps the identity, and another cut
+    /// gets another one.
     ///
     /// A takeover attempt also compares every configured member's records,
     /// each of which must advertise the storage generation capability
@@ -738,6 +845,7 @@ mod transactions {
         if attempt.takeover.is_some() {
             extend_unique(&mut compares, cut.storage_capable_member_compares(&shard)?);
         }
+        let request_id = cut_request_id("dfs-shard-storage-converting-v1", &attempt.attempt_id, &compares)?;
         let txn = KvTxn {
             compares,
             success: vec![KvOp::put_serde(
@@ -747,18 +855,16 @@ mod transactions {
             )?],
             failure: Vec::new(),
         };
-        Ok(KvTxnRequest::new(
-            KvRequestId::derived("dfs-shard-storage-converting-v1", attempt.attempt_id.as_bytes()),
-            txn,
-        ))
+        Ok(KvTxnRequest::new(request_id, txn))
     }
 
     /// Seal the shard's Converting attempt with the image its holders install
     /// and the contributions it was built from. The attempt must still run
     /// under the current serving record, and the transaction compares the
-    /// exact current record. Sealing the same image again is idempotent and
-    /// keeps the request identity; another image for a sealed attempt is
-    /// refused.
+    /// exact current record. Sealing the same image again is idempotent; the
+    /// request identity binds the attempt, the image, the contributions and
+    /// every compare, so it is kept while the cut is unchanged. Another image
+    /// for a sealed attempt is refused.
     pub fn build_metadata_shard_storage_seal(
         cut: &DfsMetadataShardStorageCut<'_>,
         seal: &DfsMetadataGenerationSeal,
@@ -777,16 +883,20 @@ mod transactions {
             Some((sealed, digest)) if sealed == seal && digest == contributions_digest => {}
             Some(_) => return Err(refuse("the attempt is already sealed with another image")),
         }
-        let identity = serde_json::to_vec(&(&attempt.attempt_id, seal, contributions_digest))
-            .map_err(refuse)?;
         let mut sealed = current.clone();
         if let DfsMetadataShardStorageState::Converting { attempt } = &mut sealed.state {
             attempt.seal = Some(seal.clone());
             attempt.contributions_digest = Some(contributions_digest.to_owned());
         }
         sealed.validate_against(&shard).map_err(refuse)?;
+        let compares = cut.compares(&shard)?;
+        let request_id = cut_request_id(
+            "dfs-shard-storage-seal-v1",
+            &(&attempt.attempt_id, seal, contributions_digest),
+            &compares,
+        )?;
         let txn = KvTxn {
-            compares: cut.compares(&shard)?,
+            compares,
             success: vec![KvOp::put_serde(
                 crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id),
                 &sealed,
@@ -794,10 +904,7 @@ mod transactions {
             )?],
             failure: Vec::new(),
         };
-        Ok((
-            KvTxnRequest::new(KvRequestId::derived("dfs-shard-storage-seal-v1", identity), txn),
-            sealed,
-        ))
+        Ok((KvTxnRequest::new(request_id, txn), sealed))
     }
 
     /// The Active record of a sealed attempt.
@@ -822,7 +929,10 @@ mod transactions {
 
     /// Activate the shard's sealed Converting attempt of its own primary. The
     /// caller has established that its install rule holds for the current
-    /// serving record; this transaction makes that observation exact.
+    /// serving record; this transaction makes that observation exact. Its
+    /// request identity binds the attempt and every compare, the
+    /// acknowledging members' records included, so a change to any of them
+    /// is re-planned under a new identity.
     pub fn build_metadata_shard_storage_activate(
         cut: &DfsMetadataShardStorageCut<'_>,
     ) -> KvResult<(KvTxnRequest, DfsMetadataShardStorage)> {
@@ -840,8 +950,10 @@ mod transactions {
         cut.attempt_runs_under(&shard, &attempt)?;
         let active = activated(&current, &attempt)?;
         active.validate_against(&shard).map_err(refuse)?;
+        let compares = cut.compares(&shard)?;
+        let request_id = cut_request_id("dfs-shard-storage-activate-v1", &attempt.attempt_id, &compares)?;
         let txn = KvTxn {
-            compares: cut.compares(&shard)?,
+            compares,
             success: vec![KvOp::put_serde(
                 crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id),
                 &active,
@@ -849,16 +961,7 @@ mod transactions {
             )?],
             failure: Vec::new(),
         };
-        let identity = serde_json::to_vec(&(
-            &attempt.attempt_id,
-            value_digest(Some(cut.shard)),
-            value_digest(cut.write_set),
-        ))
-        .map_err(refuse)?;
-        Ok((
-            KvTxnRequest::new(KvRequestId::derived("dfs-shard-storage-activate-v1", identity), txn),
-            active,
-        ))
+        Ok((KvTxnRequest::new(request_id, txn), active))
     }
 
     /// Activate a sealed takeover attempt and make its converter primary, in
@@ -1295,6 +1398,104 @@ mod transaction_tests {
         })
     }
 
+    /// A definite rejection spends only its own cut's request identity: the
+    /// Converting and seal transactions re-planned from the changed cut that
+    /// rejected them commit.
+    #[test]
+    fn a_rejected_storage_transaction_is_replanned_from_the_changed_cut() {
+        let mut kv = InProcessKvStore::new();
+        let current = ring(3);
+        let nodes = vec![node("primary-a"), node("replica-b"), node("replica-c")];
+        put(&mut kv, crate::metadata_shard_key(&current.file_system_id, &current.shard_id), &current);
+        for node_id in &nodes {
+            put(&mut kv, sinomo_core::node::cluster_member_key(node_id), &member_record(node_id, true));
+        }
+        let write_set_key = crate::metadata_shard_write_set_key(&current.file_system_id, &current.shard_id);
+        let record = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 9));
+        let converting = |kv: &InProcessKvStore| {
+            let read = Read::from(kv, &current, &nodes);
+            let members = read.members();
+            build_metadata_shard_storage_converting(&read.cut(&members), &record).unwrap()
+        };
+        let first = converting(&kv);
+        assert_eq!(converting(&kv), first, "the same cut gives the same request");
+        // A same-epoch write-set change lands between the read and the commit.
+        put(&mut kv, write_set_key.clone(), &write_set_for(&current, &nodes));
+        assert!(!apply(&mut kv, &first));
+        let replanned = converting(&kv);
+        assert_ne!(replanned.request_id, first.request_id);
+        assert!(apply(&mut kv, &replanned));
+        let seal_request = |kv: &InProcessKvStore| {
+            let read = Read::from(kv, &current, &nodes);
+            let members = read.members();
+            build_metadata_shard_storage_seal(&read.cut(&members), &seal(9), &"c".repeat(64)).unwrap().0
+        };
+        let first = seal_request(&kv);
+        let mut changed = write_set_for(&current, &nodes);
+        changed.generation = 2;
+        put(&mut kv, write_set_key, &changed);
+        assert!(!apply(&mut kv, &first));
+        let replanned = seal_request(&kv);
+        assert_ne!(replanned.request_id, first.request_id);
+        assert!(apply(&mut kv, &replanned));
+        let sealed: DfsMetadataShardStorage = kv
+            .get(&crate::metadata_shard_storage_key(&current.file_system_id, &current.shard_id))
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert!(sealed.converting_attempt().unwrap().sealed().is_some());
+        // A member-record change between the activation's read and its commit.
+        let activation = |kv: &InProcessKvStore| {
+            let read = Read::from(kv, &current, &nodes);
+            let members = read.members();
+            let mut cut = read.cut(&members);
+            cut.member_compares = cut.storage_capable_compares_for(&nodes.iter().cloned().collect()).unwrap();
+            build_metadata_shard_storage_activate(&cut).unwrap().0
+        };
+        let first = activation(&kv);
+        assert_eq!(activation(&kv), first, "the same cut gives the same request");
+        let mut moved = member_record(&nodes[2], true);
+        moved.display_name.push_str("-renamed");
+        put(&mut kv, sinomo_core::node::cluster_member_key(&nodes[2]), &moved);
+        assert!(!apply(&mut kv, &first));
+        let replanned = activation(&kv);
+        assert_ne!(replanned.request_id, first.request_id);
+        assert!(apply(&mut kv, &replanned));
+    }
+
+    #[test]
+    fn conversion_install_rule_follows_the_shards_commit_rule() {
+        use std::collections::BTreeSet;
+        let current = ring(3);
+        let (primary, b, c) = (node("primary-a"), node("replica-b"), node("replica-c"));
+        let set = |nodes: &[&NodeId]| nodes.iter().map(|node| (*node).clone()).collect::<BTreeSet<_>>();
+        // Unswitched: the image goes to every member; the primary and a
+        // majority of the configured members are enough.
+        let rule = DfsMetadataShardConversionInstallRule::for_shard(&current, None).unwrap();
+        assert_eq!(rule.install_set(), set(&[&primary, &b, &c]));
+        assert!(rule.satisfied_by(&set(&[&primary, &b])));
+        assert!(!rule.satisfied_by(&set(&[&b, &c])), "the primary must hold the image");
+        assert!(
+            !rule.satisfied_by(&set(&[&primary, &node("outsider")])),
+            "a node outside the configured members is not counted"
+        );
+        // Switched: every member of the write set, and only those.
+        let switched = entry(
+            crate::metadata_shard_write_set_key(&current.file_system_id, &current.shard_id),
+            &write_set_for(&current, &[primary.clone(), b.clone()]),
+        );
+        let rule = DfsMetadataShardConversionInstallRule::for_shard(&current, Some(&switched)).unwrap();
+        assert_eq!(rule.install_set(), set(&[&primary, &b]));
+        assert!(!rule.satisfied_by(&set(&[&primary, &c])), "a majority outside the write set is not enough");
+        assert!(rule.satisfied_by(&set(&[&primary, &b])));
+        // A write set bound to an older serving record leaves the all-member rule.
+        let successor = DfsMetadataShardConfig { epoch: 4, ..current.clone() };
+        assert!(matches!(
+            DfsMetadataShardConversionInstallRule::for_shard(&successor, Some(&switched)).unwrap(),
+            DfsMetadataShardConversionInstallRule::PrimaryAndMajority { .. }
+        ));
+    }
+
     #[test]
     fn converting_fixes_one_attempt_under_the_current_serving_record() {
         let current = shard(3, "primary-a");
@@ -1314,10 +1515,14 @@ mod transaction_tests {
         // The target is fixed before the image exists: a sealed record is refused.
         let presealed = DfsMetadataShardStorage::converting(&current, attempt_for(&current, 9));
         assert!(build_metadata_shard_storage_converting(&cut(&shard_kv, None), &presealed).is_err());
-        // The same attempt is idempotent and keeps its request identity.
+        // The same cut keeps its request identity; the same attempt over its
+        // own recorded target is idempotent under another identity.
+        let same = build_metadata_shard_storage_converting(&cut(&shard_kv, None), &record).unwrap();
+        assert_eq!(same, request);
         let existing = storage_entry(&record);
         let again = build_metadata_shard_storage_converting(&cut(&shard_kv, Some(&existing)), &record).unwrap();
-        assert_eq!(again.request_id, request.request_id);
+        assert_ne!(again.request_id, request.request_id);
+        assert_eq!(again.txn.success, request.txn.success);
         // Another attempt at the same epoch and primary is refused.
         let rival = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 10));
         assert!(build_metadata_shard_storage_converting(&cut(&shard_kv, Some(&existing)), &rival).is_err());
@@ -1401,10 +1606,14 @@ mod transaction_tests {
         let (_, active) = build_metadata_shard_storage_activate(&cut(&shard_kv, Some(&sealed_kv))).unwrap();
         assert!(matches!(active.converted_activation(),
             Some((activated, _)) if activated.sealed() == Some((&image, contributions.as_str()))));
-        // Sealing the same image again is idempotent and keeps its identity.
+        // The same cut keeps its identity; sealing the same image again over
+        // the sealed record is idempotent under another identity.
+        let (same, _) =
+            build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&unsealed_kv)), &image, &contributions).unwrap();
+        assert_eq!(same, request);
         let (again, again_record) =
             build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&sealed_kv)), &image, &contributions).unwrap();
-        assert_eq!(again.request_id, request.request_id);
+        assert_ne!(again.request_id, request.request_id);
         assert_eq!(again_record, sealed_record);
         // Another image, other contributions or a malformed seal are refused.
         let mut other = image.clone();

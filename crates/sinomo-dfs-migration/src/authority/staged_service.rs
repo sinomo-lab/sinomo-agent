@@ -22,9 +22,11 @@ pub(super) const CONTENT_STAGE_ROUTE: &str = "/dfs-migration/retained-content-st
 pub(super) const CONTENT_VERIFY_ROUTE: &str = "/dfs-migration/retained-content-verify-v7";
 pub(super) const PLACEMENT_CUSTODY_ROUTE: &str = "/dfs-migration/placement-request-custody-v7";
 pub(super) const NAMESPACE_JOB_ROUTE: &str = "/dfs-migration/current-namespace-job-data-v7";
+pub(super) mod conversion_install;
 const ROUTES: &[&str] = &[
     super::owner::filesystem::ROUTE,
     super::namespace_counts::PROBE_ROUTE,
+    super::contribution_extraction::ROUTE,
     SNAPSHOT_ROUTE,
     PREFIX_ROUTE,
     BLUEPRINT_ROUTE,
@@ -35,6 +37,9 @@ const ROUTES: &[&str] = &[
     CONTENT_VERIFY_ROUTE,
     NAMESPACE_JOB_ROUTE,
     PLACEMENT_CUSTODY_ROUTE,
+    conversion_install::FLOORS_ROUTE,
+    conversion_install::CHUNK_ROUTE,
+    conversion_install::STAGE_ROUTE,
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1566,7 +1571,8 @@ impl Service for StagedImportService {
             .iter()
             .map(|route| {
                 let content_stage = *route == CONTENT_STAGE_ROUTE;
-                let snapshot_stage = *route == SNAPSHOT_ROUTE;
+                let snapshot_stage =
+                    *route == SNAPSHOT_ROUTE || *route == conversion_install::STAGE_ROUTE;
                 let content_verify = *route == CONTENT_VERIFY_ROUTE;
                 let route = ServiceRoute::new(*route, "dfs-migration")
                     .with_auth_scope("cluster-member")
@@ -1609,6 +1615,19 @@ impl Service for StagedImportService {
                     let response = tokio::task::block_in_place(|| super::owner::filesystem::receive(&self.component_context, source, work))
                         .map_err(|error| ServiceError::Service(error.to_string()))?;
                     context.respond_value(super::owner::filesystem::ROUTE, response)?;
+                }
+                super::contribution_extraction::ROUTE => {
+                    let extraction = context
+                        .decode_request_body_bounded::<super::contribution_extraction::Request>(
+                            &request,
+                            super::contribution_extraction::MAX_REQUEST_BYTES,
+                        )
+                        .await?;
+                    let response = tokio::task::block_in_place(|| {
+                        self.authority.receive_contribution_extraction(&source, extraction)
+                    })
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    context.respond_value(super::contribution_extraction::ROUTE, response)?;
                 }
                 super::namespace_counts::PROBE_ROUTE => {
                     let probe = context.decode_request_body::<super::namespace_counts::Probe>(&request).await?;
@@ -1854,6 +1873,65 @@ impl Service for StagedImportService {
                     })
                     .map_err(|e| ServiceError::Service(e.to_string()))?;
                     context.respond_value(SOURCE_FLOORS_ROUTE, result)?;
+                }
+                conversion_install::FLOORS_ROUTE => {
+                    let challenge = context
+                        .decode_request_body_bounded::<conversion_install::FloorsRequest>(
+                            &request,
+                            conversion_install::MAX_FLOORS_REQUEST_BYTES,
+                        )
+                        .await?;
+                    let result = tokio::task::block_in_place(|| {
+                        self.authority.receive_conversion_floors(
+                            &self.component_context,
+                            source,
+                            challenge,
+                        )
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    context.respond_value(conversion_install::FLOORS_ROUTE, result)?;
+                }
+                conversion_install::CHUNK_ROUTE => {
+                    let transfer = context
+                        .decode_request_body::<conversion_install::ChunkTransfer>(&request)
+                        .await?;
+                    let result = tokio::task::block_in_place(|| {
+                        self.authority.receive_conversion_chunk(source, transfer)
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    context.respond_value(conversion_install::CHUNK_ROUTE, result)?;
+                }
+                conversion_install::STAGE_ROUTE => {
+                    let head = context
+                        .decode_request_body::<conversion_install::StageHead>(&request)
+                        .await?;
+                    tokio::task::block_in_place(|| {
+                        self.authority.validate_conversion_stage_head(&source, &head)
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    if !context.has_request_attachment() {
+                        return Err(ServiceError::Service(
+                            "a conversion stage requires its image attachment".into(),
+                        ));
+                    }
+                    let image = sinomo_dfs::receive_metadata_candidate_image(
+                        self.authority.data_root.clone(),
+                        head.command.snapshot.clone(),
+                        context.take_request_body(),
+                        Arc::clone(&_owner),
+                    )
+                    .await
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    let result = tokio::task::block_in_place(|| {
+                        self.authority.receive_conversion_stage(
+                            &self.component_context,
+                            source,
+                            head,
+                            image,
+                        )
+                    })
+                    .map_err(|e| ServiceError::Service(e.to_string()))?;
+                    context.respond_value(conversion_install::STAGE_ROUTE, result)?;
                 }
                 SOURCE_CHUNK_ROUTE => {
                     let transfer = context

@@ -974,9 +974,14 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     for shard in recovery_shards.iter().filter(|shard|
                         shard.primary_node_id == cluster_state.local_node_id)
                     {
-                        if backend.metadata_shard_authoritative_writes_frozen(
-                            &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
-                        ).map_err(DaemonError::from)? {
+                        let shard_id = crate::DfsMetadataShardId::new(shard.shard_id.clone());
+                        // A closed copy is left out, as by the recovery scan
+                        // that follows: it holds no writes to recover yet.
+                        if backend.metadata_shard_storage_is_closed(&shard_id).map_err(DaemonError::from)? {
+                            continue;
+                        }
+                        if backend.metadata_shard_authoritative_writes_frozen(&shard_id)
+                            .map_err(DaemonError::from)? {
                             return Ok(None);
                         }
                     }

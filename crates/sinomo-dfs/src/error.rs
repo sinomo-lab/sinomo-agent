@@ -462,3 +462,16 @@ mod tests {
         ));
     }
 }
+
+/// Whether `error` is a shard's refusal to open because its storage is closed:
+/// its root awaits storage preparation, or its storage record names a
+/// conversion. The refusal arrives typed from a local copy and by its wording
+/// from a remote one; either way the shard's state is unknown, not absent.
+pub(crate) fn dfs_error_is_closed_shard_storage(error: &DfsError) -> bool {
+    if matches!(error, DfsError::StoragePreparationPending { .. }) {
+        return true;
+    }
+    let message = error.to_string();
+    message.contains(crate::METADATA_SHARD_STORAGE_CONVERTING_REFUSAL)
+        || message.contains(crate::METADATA_STORAGE_PREPARATION_PENDING_REFUSAL)
+}

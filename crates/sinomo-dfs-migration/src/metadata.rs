@@ -6388,6 +6388,48 @@ impl MetadataConverter {
     }
 }
 
+/// Intent naming a shard whose own copy its per-shard conversion captures.
+const SHARD_CONVERSION_CAPTURE: &str = "shard-conversion-capture.json";
+
+impl MetadataConverter {
+    /// Capture `shard`'s local copy for its per-shard conversion, on the
+    /// shard's primary. The same converter session replays the source under
+    /// its writer fence and keeps the fence while the session is warm; the
+    /// capture intent makes a current-format copy a source as well.
+    pub(crate) fn capture_shard_conversion_source(
+        &self, destination: &Path, shard: &DfsMetadataShardId, file_system_id: &DfsFileSystemId, budget: usize,
+    ) -> Result<(DfsStoragePreparation, Option<Arc<canonical_generation::CapturedMetadataUnit>>)> {
+        let authority = self.authority.as_ref().ok_or_else(|| error("shard conversion requires its actual import owner"))?;
+        if authority.kind() != MetadataImportAuthorityKind::Native {
+            return Err(error("per-shard conversion requires native source authority"));
+        }
+        let destination = canonical_destination(destination)?;
+        authority.validate_owned_source(&destination, shard, std::slice::from_ref(file_system_id))?;
+        let stage = conversion_stage_base_path(&destination, shard)?;
+        fs::create_dir_all(&stage).map_err(error)?;
+        write_count_cohort_checkpoint(&stage.join(SHARD_CONVERSION_CAPTURE), file_system_id)?;
+        self.capture_metadata_unit_progress(&destination, &destination, shard, budget)
+    }
+
+    /// End the capture of `destination` once its shard's storage is Active:
+    /// drop the warm session with its source fence and remove the capture
+    /// intent, so the activated image is never read as a new source. The
+    /// captured evidence stays in the conversion stage.
+    pub(crate) fn finish_shard_conversion_capture(&self, destination: &Path, shard: &DfsMetadataShardId) -> Result<()> {
+        let destination = canonical_destination(destination)?;
+        let slot = self.roots.lock().map_err(error)?.get(&destination).cloned();
+        if let Some(slot) = slot {
+            let mut session = slot.try_lock_session().ok_or_else(|| MetadataBackendError::StoragePreparationPending {
+                root: destination.clone(), processed_records: 0,
+            })?;
+            session.take();
+        }
+        sinomo_core::storage::durable_file::remove_file_if_exists_and_sync_parent(
+            &conversion_stage_base_path(&destination, shard)?.join(SHARD_CONVERSION_CAPTURE),
+        ).map(|_| ()).map_err(error)
+    }
+}
+
 fn read_placement_capture(destination: &Path, shard: &DfsMetadataShardId) -> Result<Vec<RetainedPlacementReservation>> {
     let path = conversion_stage_base_path(destination, shard)?.join("placement-reservations.json");
     match fs::read(&path) {
@@ -6398,6 +6440,25 @@ fn read_placement_capture(destination: &Path, shard: &DfsMetadataShardId) -> Res
 }
 
 fn namespace_count_capture_requested(destination: &Path, shard: &DfsMetadataShardId) -> Result<bool> {
+    let stage = conversion_stage_base_path(destination, shard)?;
+    if stage.join(SHARD_CONVERSION_CAPTURE).is_file() { return Ok(true); }
+    unfinished_count_capture(destination, shard)
+}
+
+/// Whether the live copy at `destination` is a source an unfinished
+/// complete-filesystem conversion has captured: the conversion asked for the
+/// copy's count capture and has not installed the image that replaces it.
+/// Until then the conversion compares the copy with the source cut it
+/// recorded, so the copy is closed storage whatever its own header says, and
+/// is not offered to an ordinary open, which could write into it.
+pub(crate) fn live_copy_held_by_conversion(destination: &Path, shard: &DfsMetadataShardId) -> Result<bool> {
+    if !destination.try_exists().map_err(error)? {
+        return Ok(false);
+    }
+    unfinished_count_capture(&canonical_destination(destination)?, shard)
+}
+
+fn unfinished_count_capture(destination: &Path, shard: &DfsMetadataShardId) -> Result<bool> {
     let requested = conversion_stage_base_path(destination, shard)?.join("namespace-count-capture.json").is_file();
     if !requested { return Ok(false); }
     // After the certified physical exchange this path names the NEW image.
@@ -6416,6 +6477,15 @@ pub(crate) fn validate_count_cohort_prefix(prefix: &DfsMetadataPrefixProof) -> R
 }
 pub(crate) fn namespace_count_plan_root(destination: &Path, shard: &DfsMetadataShardId) -> Result<PathBuf> {
     Ok(conversion_stage_base_path(destination, shard)?.join("namespace-count-current-image"))
+}
+
+/// Where the converter records its capture of the local copy at
+/// `destination`: the session stage's `captured-unit.json`. The file is
+/// written once, when the bounded source replay completes, and is not
+/// rewritten afterwards.
+pub(crate) fn shard_capture_path(destination: &Path, shard: &DfsMetadataShardId) -> Result<PathBuf> {
+    let destination = canonical_destination(destination)?;
+    Ok(conversion_stage_path(&destination, shard)?.join("captured-unit.json"))
 }
 
 

@@ -11,6 +11,8 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+mod slots;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -76,6 +78,7 @@ use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
     DfsOperatorStatusOmission, DfsVersion,
 };
+use slots::{LocalMetadataShardSlots, ShardStorageClosure};
 
 fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
     object.kind == DfsObjectKind::Tombstone
@@ -398,11 +401,12 @@ struct LocalMetadataShardSlot {
     native_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     initialization: Mutex<()>,
     backend: OnceLock<Box<LocalSobjMetadataBackend>>,
-    /// A global lease's slot whose checkout was refused because the shard's
-    /// storage is closed. The lease owns it unopened. A read routed to the
-    /// shard opens it and meets the same refusal; node-wide scans leave it
-    /// out (see [`LocalShardedMetadataBackend::scanned_slots`]).
-    storage_closed: bool,
+    /// Whether opening this slot was refused because the shard's storage is
+    /// closed. A closed slot stays held and unopened: a read routed to the
+    /// shard opens it and meets the same refusal, and node-wide scans leave it
+    /// out (see [`slots`]). A global lease reserves such a slot without
+    /// opening it.
+    storage_closure: ShardStorageClosure,
 }
 
 /// One resident shard-local backend slot shared by scoped mutation sessions.
@@ -604,7 +608,7 @@ impl ResidentLocalMetadataShardSlot {
             native_catalog,
             initialization: _,
             backend,
-            storage_closed: _,
+            storage_closure: _,
         } = slot;
         let backend = backend.into_inner();
         let status_snapshot = backend
@@ -1984,7 +1988,7 @@ impl ResidentLocalShardedMetadataBackend {
     /// closed shard does not stop global operations on the node's other
     /// shards. A read routed to the closed shard still opens it and meets
     /// its refusal; node-wide scans see the router as a node without a copy
-    /// of that shard ([`LocalShardedMetadataBackend::scanned_slots`]).
+    /// of that shard ([`slots`]).
     pub fn checkout_global(&self) -> Result<ResidentLocalShardedMetadataBackendLease> {
         /// A closed slot reserved to this checkout until the lease owns it.
         struct ClosedReservation(Option<Arc<ResidentLocalMetadataShardSlot>>);
@@ -2060,7 +2064,7 @@ impl ResidentLocalShardedMetadataBackend {
                 native_catalog: slot.native_catalog.clone(),
                 initialization: Mutex::new(()),
                 backend: OnceLock::new(),
-                storage_closed: false,
+                storage_closure: ShardStorageClosure::default(),
             };
             local_slot
                 .backend
@@ -2088,7 +2092,7 @@ impl ResidentLocalShardedMetadataBackend {
                     native_catalog: slot.native_catalog.clone(),
                     initialization: Mutex::new(()),
                     backend: OnceLock::new(),
-                    storage_closed: true,
+                    storage_closure: ShardStorageClosure::reserved_closed(),
                 },
             );
         }
@@ -2100,7 +2104,7 @@ impl ResidentLocalShardedMetadataBackend {
                 shard_configs: router.shard_configs,
                 routing_indexes: router.routing_indexes,
                 fallback_routing_indexes: router.fallback_routing_indexes,
-                shards,
+                shards: shards.into_iter().collect(),
             }),
         })
     }
@@ -2175,8 +2179,8 @@ impl Drop for ResidentLocalShardedMetadataBackendLease {
             .router
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for (shard_id, slot) in shards {
-            let storage_closed = slot.storage_closed;
+        for (shard_id, slot) in shards.into_including_closed() {
+            let storage_closed = slot.storage_closure.is_closed();
             let backend = slot.backend.into_inner();
             let resident_slot = self
                 .resident
@@ -2221,7 +2225,7 @@ impl LocalMetadataShardSlot {
             native_catalog: None,
             initialization: Mutex::new(()),
             backend: OnceLock::new(),
-            storage_closed: false,
+            storage_closure: ShardStorageClosure::default(),
         }
     }
 
@@ -2293,7 +2297,7 @@ pub(crate) fn metadata_shard_backend_opens_for_test(root: &Path) -> usize {
 /// Whether a slot's open was refused only because the shard's storage is
 /// closed: its root awaits storage preparation, or its storage record names a
 /// conversion in progress. Any other open failure is not a closed slot.
-fn metadata_shard_storage_is_closed(error: &MetadataBackendError) -> bool {
+pub(crate) fn metadata_shard_storage_is_closed(error: &MetadataBackendError) -> bool {
     matches!(
         error,
         MetadataBackendError::StoragePreparationPending { .. }
@@ -2433,7 +2437,9 @@ pub struct LocalShardedMetadataBackend {
     shard_configs: BTreeMap<String, DfsMetadataShardConfig>,
     routing_indexes: BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>,
     fallback_routing_indexes: Vec<BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>>,
-    shards: BTreeMap<DfsMetadataShardId, LocalMetadataShardSlot>,
+    /// Every shard copy this router holds. Node-wide reads go through
+    /// [`LocalMetadataShardSlots::scan`], which leaves closed copies out.
+    shards: LocalMetadataShardSlots,
 }
 
 impl LocalShardedMetadataBackend {
@@ -2547,7 +2553,7 @@ impl LocalShardedMetadataBackend {
             shards,
         } = self;
         let shards = shards
-            .into_iter()
+            .into_including_closed()
             .map(|(shard_id, slot)| {
                 (
                     shard_id,
@@ -2688,10 +2694,17 @@ impl LocalShardedMetadataBackend {
                     scope.spawn(sinomo_core::service::observed_blocking_task(
                         "dfs.metadata.open",
                         move || {
-                            let backend = slot.open_backend()?;
-                            slot.backend.set(backend).expect(
-                                "new metadata shard slot accepts eager backend initialization",
-                            );
+                            // A copy whose storage is closed stays held and
+                            // unopened, reserved closed like a global
+                            // checkout's: the router still serves its other
+                            // shards, and a read routed to it meets the refusal.
+                            if let Some(backend) =
+                                slot.storage_closure.observe_open(slot.open_backend())?
+                            {
+                                slot.backend.set(backend).expect(
+                                    "new metadata shard slot accepts eager backend initialization",
+                                );
+                            }
                             Ok((shard_id, slot))
                         },
                     ))
@@ -2711,7 +2724,7 @@ impl LocalShardedMetadataBackend {
         opened.extend(deferred_slots);
         #[cfg(test)]
         crate::metadata_backend::record_metadata_backend_open_calls_from_workers(eager_open_count);
-        let backends = opened.into_iter().collect::<BTreeMap<_, _>>();
+        let backends = opened.into_iter().collect::<LocalMetadataShardSlots>();
         let routing_indexes = compile_routing_indexes(shard_configs.values().cloned())?;
         let fallback_routing_indexes = routing_history
             .fallbacks
@@ -2735,25 +2748,16 @@ impl LocalShardedMetadataBackend {
         })
     }
 
-    pub(crate) fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
-        self.shards.keys().cloned().collect()
-    }
-
-    /// The slots a node-wide scan reads. A slot a global lease holds closed
-    /// for storage is left out, so the scan sees what a node without a copy
-    /// of that shard sees; a read routed to that shard still opens its slot
-    /// and meets the refusal. Scans that do not use this read every slot and
-    /// fail on a closed one.
-    fn scanned_slots(
-        &self,
-    ) -> impl Iterator<Item = (&DfsMetadataShardId, &LocalMetadataShardSlot)> {
-        self.shards.iter().filter(|(_, slot)| !slot.storage_closed)
+    /// The shards a node-wide scan of this router visits: every held copy but
+    /// a closed one (see [`slots`]).
+    pub(crate) fn shard_ids(&self) -> Result<Vec<DfsMetadataShardId>> {
+        self.shards.scanned_ids()
     }
 
     /// Refresh and pin every inspection-only shard without taking writer locks
     /// or running authoritative recovery.
     pub(crate) fn begin_inspection_snapshot(&mut self) -> Result<()> {
-        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        let shard_ids = self.shards.scanned_ids()?;
         for (index, shard_id) in shard_ids.iter().enumerate() {
             let begin = self
                 .shards
@@ -2777,7 +2781,12 @@ impl LocalShardedMetadataBackend {
     }
 
     pub(crate) fn end_inspection_snapshot(&mut self) {
-        for slot in self.shards.values_mut() {
+        // The copies the scan in `begin_inspection_snapshot` pinned: a closed
+        // one stays closed for this router even if a routed read opened it.
+        for (_, slot) in self.shards.including_closed_mut() {
+            if slot.storage_closure.is_closed() {
+                continue;
+            }
             if let Some(backend) = slot.opened_backend_mut() {
                 backend.end_inspection_snapshot();
             }
@@ -2853,7 +2862,7 @@ impl LocalShardedMetadataBackend {
     #[cfg(test)]
     fn opened_shard_ids(&self) -> BTreeSet<DfsMetadataShardId> {
         self.shards
-            .iter()
+            .including_closed()
             .filter_map(|(shard_id, slot)| slot.backend.get().map(|_| shard_id.clone()))
             .collect()
     }
@@ -2921,7 +2930,7 @@ impl LocalShardedMetadataBackend {
                 continue;
             };
             let shard_id = DfsMetadataShardId::new(shard_id);
-            if self.shards.contains_key(&shard_id) && seen.insert(shard_id.clone()) {
+            if self.shards.holds(&shard_id) && seen.insert(shard_id.clone()) {
                 shard_ids.push(shard_id);
             }
         }
@@ -2938,7 +2947,7 @@ impl LocalShardedMetadataBackend {
         shard_ids.extend(self.fallback_shard_ids_for_path(file_system_id, path, &selected)?);
         if let Some(missing) = shard_ids
             .iter()
-            .find(|shard_id| !self.shards.contains_key(*shard_id))
+            .find(|shard_id| !self.shards.holds(shard_id))
         {
             return Err(MetadataBackendError::Serde(format!(
                 "path {path} routed to unavailable local metadata shard {missing:?}"
@@ -3007,7 +3016,7 @@ impl LocalShardedMetadataBackend {
         object_id: &DfsObjectId,
         index: &DfsObjectShardIndexRecord,
     ) -> Result<bool> {
-        if !self.shards.contains_key(&index.shard_id) {
+        if !self.shards.holds(&index.shard_id) {
             return Ok(false);
         }
         let Some(object) = self.shard_backend(&index.shard_id)?.get_object(object_id)? else {
@@ -3046,8 +3055,8 @@ impl LocalShardedMetadataBackend {
         }
 
         let mut active_intent_shard_id = None;
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             let mut has_active_intent = false;
             walk_metadata_pages(|cursor| {
                 let page = backend.intents_for_object_version_page(
@@ -3106,14 +3115,14 @@ impl LocalShardedMetadataBackend {
         index: Option<&DfsObjectShardIndexRecord>,
     ) -> Result<Option<(DfsMetadataShardId, DfsObjectMetadata)>> {
         let mut candidates = Vec::new();
-        // The slot the object's hint names is read even when held closed:
-        // there the placement is unknown, not absent, so it meets the shard's
+        // The slot the object's hint names is read even when closed: there
+        // the placement is unknown, not absent, so it meets the shard's
         // refusal instead of resolving to another shard or to none.
-        let slots = self.shards.iter().filter(|(shard_id, slot)| {
-            !slot.storage_closed || index.is_some_and(|index| index.shard_id == **shard_id)
-        });
-        for (shard_id, slot) in slots {
-            let backend = slot.backend()?;
+        for scanned in self
+            .shards
+            .scan_addressing(index.map(|index| &index.shard_id))
+        {
+            let (shard_id, backend) = scanned?;
             let Some(object) = backend.get_object(object_id)? else {
                 continue;
             };
@@ -3170,14 +3179,12 @@ impl LocalShardedMetadataBackend {
             for object_id in object_ids {
                 let (existing, rebuild_existing) =
                     read_object_shard_index_for_rebuild(&self.root, object_id)?;
-                // A hint naming a slot held closed stays as it is: this node
-                // holds that shard's copy, which it reads again once the
-                // shard's storage activates.
-                if existing.as_ref().is_some_and(|index| {
-                    self.shards
-                        .get(&index.shard_id)
-                        .is_some_and(|slot| slot.storage_closed)
-                }) {
+                // A hint naming a closed slot stays as it is: this node holds
+                // that shard's copy, which it reads again once the shard's
+                // storage activates.
+                if let Some(index) = existing.as_ref()
+                    && self.shards.probe_closed(&index.shard_id)?
+                {
                     continue;
                 }
                 let Some((shard_id, object)) =
@@ -3389,8 +3396,8 @@ impl LocalShardedMetadataBackend {
         P: FnMut(&DfsObjectMetadata) -> bool,
     {
         let mut best = None::<DfsObjectMetadata>;
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             walk_metadata_pages(|cursor| {
                 let page = backend.hardlinks_to_object_page(
                     file_system_id,
@@ -3511,7 +3518,7 @@ mod lazy_replica_slot_tests {
         )
         .unwrap();
         let mut lease = resident.checkout_global().unwrap();
-        assert!(lease.shards[&services_id].storage_closed);
+        assert!(lease.shards.probe_closed(&services_id).unwrap());
         assert_eq!(lease.read_object_shard_index(&object_id).unwrap().as_ref(), Some(&hint));
         lease.reconcile_object_shard_indexes([&object_id]).unwrap();
         assert_eq!(lease.read_object_shard_index(&object_id).unwrap().as_ref(), Some(&hint));
@@ -3520,6 +3527,79 @@ mod lazy_replica_slot_tests {
         let routed = lease.shard_id_for_object(&object_id);
         assert!(matches!(routed, Err(MetadataBackendError::StorageConverting)), "{routed:?}");
         drop(lease);
+    }
+
+    /// A global hydration reads no closed copy's jobs: the guards replica
+    /// ingest installed for that shard stay, while every other shard's guards
+    /// are replaced by what the scan read. Once the copy opens, the next
+    /// hydration replaces its guards from its own tables.
+    #[test]
+    fn a_global_hydration_keeps_a_closed_copy_guards_until_the_copy_opens() {
+        let root = sinomo_testdir::TestDir::new("dfs-closed-slot-guards");
+        let metadata_root = native_metadata_data(root.path());
+        let local = node("closed-slot-guards-local");
+        let mut shards = configs(&local);
+        shards[1].primary_node_id = local.clone();
+        shards[1].replica_node_ids = Vec::new();
+        let fs = crate::sifs_file_system_id();
+        let services_id = DfsMetadataShardId::new("services");
+        let open = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone(), None);
+        let closed = open
+            .clone()
+            .with_shard_storage_for_test(crate::DfsMetadataShardStorage::converting_for_test(
+                &shards[1], 5,
+            ));
+        let guarded = format!("{}/closed-copy-guarded", crate::SIFS_SERVICES_PATH);
+        let finished = "/finished-root-guarded";
+        let guards = crate::service_state::DfsCrossShardNamespaceLockRegistry::default();
+        guards.upsert_job(
+            Some(services_id.clone()),
+            "closed-copy-job".into(),
+            fs.clone(),
+            vec![guarded.clone()],
+        );
+        guards.upsert_job(
+            Some(DfsMetadataShardId::new("root")),
+            "finished-root-job".into(),
+            fs.clone(),
+            vec![finished.to_string()],
+        );
+        let hydrate = |catalog: &crate::DfsMetadataNamespaceCatalog| {
+            let router = LocalShardedMetadataBackend::open_with_native_catalog(
+                metadata_root.clone(),
+                shards.clone(),
+                &local,
+                None,
+                catalog,
+            )
+            .unwrap();
+            crate::NetworkedDfsService::new(
+                crate::test_runtime::DfsTestRuntime::local_transport(local.clone()),
+                crate::LocalContentStore::open_for_inspection(root.path().join("content")),
+            )
+            .with_cross_shard_namespace_lock_registry(guards.clone())
+            .with_boxed_metadata_backend_lazy(Box::new(router))
+            .unwrap()
+        };
+
+        let service = hydrate(&closed);
+        assert!(
+            matches!(
+                service.ensure_path_not_in_cross_shard_flight(&fs, &guarded),
+                Err(crate::DfsError::Busy { .. })
+            ),
+            "the closed copy keeps its guard"
+        );
+        service
+            .ensure_path_not_in_cross_shard_flight(&fs, finished)
+            .expect("the scanned shard's guards are replaced by its jobs");
+        drop(service);
+
+        let service = hydrate(&open);
+        service
+            .ensure_path_not_in_cross_shard_flight(&fs, &guarded)
+            .expect("the opened copy's guards come from its own tables");
+        drop(service);
     }
 
     /// A takeover rebinds a deferred replica slot in place: the new primary and
@@ -4411,7 +4491,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     #[cfg(test)]
     fn test_receipt_scan_counts_by_shard(&self) -> BTreeMap<DfsMetadataShardId, (usize, usize)> {
         self.shards
-            .iter()
+            .including_closed()
             .filter_map(|(shard, slot)| {
                 slot.backend
                     .get()
@@ -4421,7 +4501,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
     #[cfg(test)]
     fn reset_test_receipt_scan_counts_by_shard(&self) {
-        for slot in self.shards.values() {
+        for (_, slot) in self.shards.including_closed() {
             if let Some(backend) = slot.backend.get() {
                 backend.reset_test_receipt_scan_counts();
             }
@@ -4436,7 +4516,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<(bool, bool)> {
         let mut remaining = max_prepares;
         let mut complete = true;
-        for (shard, slot) in &self.shards {
+        for scanned in self.shards.scan_slots() {
+            let (_, slot) = scanned?;
             if slot.config.file_system_id != *file_system_id {
                 continue;
             }
@@ -4446,7 +4527,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 return Ok((false, false));
             }
             remaining -= 1;
-            let tables = self.shard_backend(shard)?.current_tables_snapshot()?;
+            let tables = slot.backend()?.current_tables_snapshot()?;
             let owners = tables.prepared_content_reference_owner_count(file_system_id, object_id);
             let (protected, root_complete) = tables.prepared_content_reference_protection(
                 file_system_id,
@@ -4459,7 +4540,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             remaining = remaining.saturating_sub(owners.min(remaining));
             complete &= root_complete;
         }
-        Ok((false, complete))
+        // A closed copy's prepares are unknown, not absent: the protection is
+        // incomplete until the shard opens, so nothing is released on it.
+        let closed_copy = self.shards.closed_ids().any(|shard| {
+            self.shard_configs
+                .get(&shard.0)
+                .is_none_or(|config| config.file_system_id == *file_system_id)
+        });
+        Ok((false, complete && !closed_copy))
     }
     fn plan_cross_shard_pin_transfer(
         &self,
@@ -4554,8 +4642,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
     fn list_prepared_operations(&self) -> Result<Vec<DfsPreparedOperationRecord>> {
         let mut records = Vec::new();
-        for shard in self.shards.keys() {
-            records.extend(self.shard_backend(shard)?.list_prepared_operations()?);
+        for scanned in self.shards.scan() {
+            records.extend(scanned?.1.list_prepared_operations()?);
         }
         Ok(records)
     }
@@ -4565,9 +4653,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         request_id: &str,
     ) -> Result<Option<DfsPreparedOperationRecord>> {
         let mut found = None;
-        for shard in self.shards.keys() {
-            if let Some(record) = self
-                .shard_backend(shard)?
+        for scanned in self.shards.scan() {
+            if let Some(record) = scanned?
+                .1
                 .prepared_operation_for_request(requester, request_id)?
             {
                 if found.is_some() {
@@ -4613,8 +4701,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         operation_id: &str,
     ) -> Result<Option<DfsPreparedOperationDigest>> {
         let mut found = None;
-        for (_, slot) in self.scanned_slots() {
-            if let Some(digest) = slot.backend()?.prepared_operation_digest(operation_id)? {
+        for scanned in self.shards.scan() {
+            if let Some(digest) = scanned?.1.prepared_operation_digest(operation_id)? {
                 if found.is_some() {
                     return Err(MetadataBackendError::Serde(
                         "v7 operation identity occurs on multiple shards".into(),
@@ -4748,19 +4836,20 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
-        let shard_ids = self
-            .scanned_slots()
-            .map(|(shard_id, _)| shard_id.clone())
-            .collect::<Vec<_>>();
+        let shard_ids = self.shards.scanned_ids()?;
         self.begin_consistent_read_snapshot_for_shards(&shard_ids)
     }
 
     fn begin_stat_read_snapshot(&mut self) -> Result<()> {
-        let ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        let ids = self.shards.scanned_ids()?;
         self.begin_stat_read_snapshot_on_shards(&ids)
     }
     fn end_stat_read_snapshot(&mut self) {
-        let ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        // The begin's scan opened every copy it pins, so this one opens none.
+        let ids = self
+            .shards
+            .scanned_ids()
+            .expect("pinned stat shards remain open");
         self.end_stat_read_snapshot_on_shards(&ids);
     }
     fn begin_stat_read_snapshot_on_shard(&mut self, id: &DfsMetadataShardId) -> Result<()> {
@@ -4790,14 +4879,22 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn has_physical_read_scope(&self, shard_id: &DfsMetadataShardId) -> bool {
-        self.shards.contains_key(shard_id)
+        self.shards.holds(shard_id)
+    }
+
+    fn closed_metadata_shard_ids(&self) -> BTreeSet<DfsMetadataShardId> {
+        self.shards.closed_ids().cloned().collect()
+    }
+
+    fn metadata_shard_storage_is_closed(&self, shard_id: &DfsMetadataShardId) -> Result<bool> {
+        self.shards.probe_closed(shard_id)
     }
 
     fn begin_consistent_read_snapshot_on_shard(
         &mut self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<()> {
-        if !self.shards.contains_key(shard_id) {
+        if !self.shards.holds(shard_id) {
             return Err(MetadataBackendError::Serde(
                 "read snapshot names an unavailable shard".into(),
             ));
@@ -4810,10 +4907,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn end_consistent_read_snapshot(&mut self) {
+        // The begin's scan opened every copy it pinned, so this one opens none.
         let shard_ids = self
-            .scanned_slots()
-            .map(|(shard_id, _)| shard_id.clone())
-            .collect::<Vec<_>>();
+            .shards
+            .scanned_ids()
+            .expect("pinned consistent-read shards remain open");
         self.end_consistent_read_snapshot_for_shards(&shard_ids);
     }
 
@@ -4839,8 +4937,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             if let Some(file_system) = backend.get_file_system(file_system_id)? {
                 return Ok(Some(file_system));
             }
@@ -4858,8 +4956,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>> {
         let mut file_systems = BTreeMap::<DfsFileSystemId, DfsFileSystem>::new();
-        for (_, slot) in self.scanned_slots() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             for file_system in backend.list_file_systems()? {
                 file_systems.insert(file_system.file_system_id.clone(), file_system);
             }
@@ -4962,8 +5060,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
         let mut objects = BTreeMap::<DfsObjectId, DfsObjectMetadata>::new();
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             walk_metadata_pages(|cursor| {
                 let page = backend.objects_for_file_system_page(
                     file_system_id,
@@ -5012,13 +5110,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let entries = collect_resumed_sharded_page_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             resume_shard_id,
             max_entries,
             local_object_page_cursor,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.objects_for_subtree_page(
                     file_system_id,
                     subtree_path,
@@ -5079,13 +5176,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let mut entries = collect_resumed_sharded_page_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             resume_shard_id,
             max_entries,
             local_directory_page_cursor,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.child_objects_for_directory_page_entries(
                     file_system_id,
                     directory_path,
@@ -5118,8 +5214,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         directory_path: &str,
     ) -> Result<Vec<DfsObjectMetadata>> {
         let mut candidate_paths = BTreeSet::new();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             for tombstone in
                 backend.child_tombstones_for_directory(file_system_id, directory_path)?
             {
@@ -5190,13 +5286,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let entries = collect_resumed_sharded_page_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             resume_shard_id,
             max_entries,
             local_object_page_cursor,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.hardlinks_to_object_page(
                     file_system_id,
                     target_object_id,
@@ -5226,8 +5321,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         target_object_id: &DfsObjectId,
     ) -> Result<usize> {
         let mut object_ids = BTreeSet::<DfsObjectId>::new();
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        // A count of every alias: one a closed copy holds is unknown, not
+        // absent, and an undercount could release the target. Refuse instead.
+        for copy in self.shards.every_copy() {
+            let (shard_id, backend) = copy?;
             walk_metadata_pages(|cursor| {
                 let page = backend.hardlinks_to_object_page(
                     file_system_id,
@@ -5589,7 +5686,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         after: Option<&(DfsObjectId, DfsVersion, NodeId)>,
         max_entries: usize,
     ) -> Result<crate::DfsRepairIndexPage> {
-        if !self.shards.contains_key(shard_id) {
+        if !self.shards.holds(shard_id) {
             return Ok(crate::DfsRepairIndexPage::default());
         }
         self.shard_backend(shard_id)?
@@ -5601,7 +5698,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
         keys: &[(DfsObjectId, DfsVersion, NodeId)],
     ) -> Result<crate::DfsRepairIndexPage> {
-        if !self.shards.contains_key(shard_id) {
+        if !self.shards.holds(shard_id) {
             return Ok(crate::DfsRepairIndexPage::default());
         }
         self.shard_backend(shard_id)?.repair_index_needs(shard_id, keys)
@@ -5612,7 +5709,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
         objects: &std::collections::BTreeSet<DfsObjectId>,
     ) -> Result<crate::DfsRepairIndexPage> {
-        if !self.shards.contains_key(shard_id) {
+        if !self.shards.holds(shard_id) {
             return Ok(crate::DfsRepairIndexPage::default());
         }
         self.shard_backend(shard_id)?
@@ -5620,7 +5717,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn repair_index_owned_count(&self, shard_id: &DfsMetadataShardId) -> Result<usize> {
-        if !self.shards.contains_key(shard_id) {
+        if !self.shards.holds(shard_id) {
             return Ok(0);
         }
         self.shard_backend(shard_id)?.repair_index_owned_count(shard_id)
@@ -5645,8 +5742,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut intents = BTreeMap::<String, DfsWriteIntentRecord>::new();
         let mut receipts = BTreeMap::<String, DfsWriteIntentReceipt>::new();
         let mut retention = DfsWriteIntentReceiptRetentionState::default();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             let history = backend.object_write_intent_history(object_id)?;
             retention.merge_conservative(history.retention);
             for intent in history.intents {
@@ -5707,8 +5804,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 .get_intent_receipt(object_id, intent_id);
         }
         let mut found = None;
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             let Some(receipt) = backend.get_intent_receipt(object_id, intent_id)? else {
                 continue;
             };
@@ -5733,8 +5830,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 .intent_receipt_retention_for_object(object_id);
         }
         let mut retention = DfsWriteIntentReceiptRetentionState::default();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             retention.merge_conservative(backend.intent_receipt_retention_for_object(object_id)?);
         }
         Ok(retention)
@@ -5750,8 +5847,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 .shard_backend(&shard_id)?
                 .get_intent(object_id, intent_id);
         }
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             if let Some(intent) = backend.get_intent(object_id, intent_id)? {
                 return Ok(Some(intent));
             }
@@ -5789,8 +5886,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn write_intent_counter_floor(&self) -> Result<u64> {
         // An exact lane floors on its own shard alone; likewise a slot held
         // closed adds nothing, since no intent is minted against it.
-        self.scanned_slots().try_fold(0_u64, |floor, (_, slot)| {
-            let backend = slot.backend()?;
+        self.shards.scan().try_fold(0_u64, |floor, scanned| {
+            let (_, backend) = scanned?;
             Ok(floor.max(backend.write_intent_counter_floor()?))
         })
     }
@@ -5808,8 +5905,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             });
         }
         let mut intents = BTreeMap::<String, DfsWriteIntentRecord>::new();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             walk_metadata_pages(|cursor| {
                 let page = backend.intents_for_object_page(
                     object_id,
@@ -5850,13 +5947,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let mut seen_intent_ids = BTreeSet::<String>::new();
         let entries = collect_resumed_sharded_page_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             resume_shard_id,
             max_entries,
             local_write_intent_page_cursor,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.intents_for_object_page(object_id, cursor, limit)?;
                 Ok((page.intents, page.next_cursor))
             },
@@ -5907,13 +6003,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let mut seen_intent_ids = BTreeSet::<String>::new();
         let entries = collect_resumed_sharded_page_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             resume_shard_id,
             max_entries,
             local_write_intent_page_cursor,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.intents_for_object_version_page(
                     object_id,
                     target_version,
@@ -5956,11 +6051,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
         let entries = collect_sharded_scan_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             max_entries,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.write_intents_page(cursor, limit)?;
                 Ok((page.intents, page.next_cursor))
             },
@@ -5995,24 +6089,26 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 ..Default::default()
             });
         }
+        // A scan resumed at the cursor's shard: a closed copy is passed over
+        // like a shard this node does not hold.
         let lower = after
-            .map(|cursor| Included(cursor.shard_id.clone()))
+            .map(|cursor| Included(&cursor.shard_id))
             .unwrap_or(Unbounded);
-        let Some((shard_id, slot)) = self.shards.range((lower, Unbounded)).next() else {
+        let Some(scanned) = self.shards.scan_slots_in((lower, Unbounded)).next() else {
             return Ok(crate::DfsWriteIntentMaintenancePage::default());
         };
+        let (shard_id, slot) = scanned?;
         let local_after = after.filter(|cursor| &cursor.shard_id == shard_id);
         let mut page = slot
             .backend()?
             .write_intent_maintenance_page(local_after, max_records)?;
         if page.next_cursor.is_none() {
+            // Named without opening it; the page that resumes there passes
+            // over it if it turns out closed.
             page.next_cursor = self
                 .shards
-                .range((Excluded(shard_id.clone()), Unbounded))
-                .next()
-                .map(|(next, _)| {
-                    crate::DfsWriteIntentMaintenanceCursor::first_in_shard(next.clone())
-                });
+                .next_scanned_id_in((Excluded(shard_id), Unbounded))
+                .map(|next| crate::DfsWriteIntentMaintenanceCursor::first_in_shard(next.clone()));
         }
         Ok(page)
     }
@@ -6022,7 +6118,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
         intent: &DfsWriteIntentRecord,
     ) -> Result<bool> {
-        if !self.shards.contains_key(shard_id) || !write_intent_status_is_active(&intent.status) {
+        if !self.shards.holds(shard_id) || !write_intent_status_is_active(&intent.status) {
             return Ok(false);
         }
         self.active_intent_is_listable_from_shard(intent, shard_id)
@@ -6109,8 +6205,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         // Cursor advancement counts candidates, including an ineligible
         // physical source copy. Do not drain filtered pages to fill a result.
         let mut candidates = BTreeMap::<_, Option<DfsObjectVersionRecord>>::new();
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             let page = backend.retained_revision_records_page(
                 namespace,
                 file_system_id,
@@ -6161,16 +6257,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let mut seen = BTreeSet::<(DfsObjectId, DfsVersion)>::new();
         let entries = collect_sharded_scan_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             max_entries,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.version_records_page(cursor, limit)?;
                 Ok((page.versions, page.next_cursor))
             },
-            |shard_id, slot, version| {
-                let backend = slot.backend()?;
+            |shard_id, backend, version| {
                 let Some(object) = backend.get_object(&version.object_id)? else {
                     return Ok(None);
                 };
@@ -6211,11 +6305,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             Option<DfsMetadataShardId>,
         >::new();
         let entries = collect_sharded_scan_entries(
-            &self.shards,
+            self.shards.scan(),
             after,
             max_entries,
-            |_, slot, cursor, limit| {
-                let backend = slot.backend()?;
+            |_, backend, cursor, limit| {
                 let page = backend.receipt_records_page(cursor, limit)?;
                 Ok((page.receipts, page.next_cursor))
             },
@@ -6267,13 +6360,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let now = options
             .now_unix_nanos
             .unwrap_or_else(metadata_now_unix_nanos);
-        for (shard_id, slot) in &self.shards {
-            if !self.shard_is_local_authoritative_primary(shard_id)
-                || self.metadata_shard_authoritative_writes_frozen(shard_id)?
-            {
+        for scanned in self
+            .shards
+            .scan_where(|shard_id| self.shard_is_local_authoritative_primary(shard_id))
+        {
+            let (shard_id, backend) = scanned?;
+            if self.metadata_shard_authoritative_writes_frozen(shard_id)? {
                 continue;
             }
-            let backend = slot.backend()?;
             let tables = backend.current_tables_snapshot()?;
             report.merge(plan_tombstone_compaction(&tables, &options, now).report);
         }
@@ -6285,8 +6379,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         options: DfsMetadataHistoryGcOptions,
     ) -> Result<DfsMetadataHistoryGcReport> {
         let mut report = DfsMetadataHistoryGcReport::for_options(&options);
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             let mut shard_report = backend.metadata_history_gc_projection(options.clone())?;
             if self.shard_is_local_authoritative_primary(shard_id)
                 && !self.metadata_shard_authoritative_writes_frozen(shard_id)?
@@ -6316,9 +6410,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         // Only a shard's primary applies its history effects.
         let ids = self
             .shards
-            .keys()
+            .scanned_ids()?
+            .into_iter()
             .filter(|shard_id| self.shard_is_local_authoritative_primary(shard_id))
-            .cloned()
             .collect::<Vec<_>>();
         for shard in ids {
             let plan = self
@@ -6340,8 +6434,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection> {
         let mut protection = DfsMetadataContentProtection::default();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        // A union of every copy's protection: a closed copy's references are
+        // unknown, and leaving them out could release content they protect.
+        for copy in self.shards.every_copy() {
+            let (_, backend) = copy?;
             protection.merge(backend.metadata_content_protection()?);
         }
         Ok(protection)
@@ -6381,7 +6477,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         options: DfsTombstoneCompactionOptions,
     ) -> Result<DfsTombstoneCompactionReport> {
         let mut report = DfsTombstoneCompactionReport::for_options(&options);
-        let shard_ids = self.shard_ids();
+        let shard_ids = self.shard_ids()?;
         let mut compacted_object_ids = Vec::new();
         for shard_id in shard_ids {
             if !self.shard_is_local_authoritative_primary(&shard_id)
@@ -6433,8 +6529,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         request_id: &str,
     ) -> Result<Option<DfsNamespaceRequestRecord>> {
         let mut found = None;
-        for (_, slot) in self.scanned_slots() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             if let Some(request) = backend.get_namespace_request(requester_node_id, request_id)? {
                 if found.is_some() {
                     return Err(MetadataBackendError::Serde(format!(
@@ -6453,8 +6549,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         request_id: &str,
     ) -> Result<Option<DfsNamespaceRequestReceipt>> {
         let mut found = None;
-        for (_, slot) in self.scanned_slots() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             if let Some(receipt) =
                 backend.get_namespace_request_receipt(requester_node_id, request_id)?
             {
@@ -6482,8 +6578,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         // remote primaries are represented here by their local replica state,
         // and same-node topology changes retain both shard histories.
         self.shard_backend(shard_id)?;
-        for (history_shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        // As in `namespace_request_admission_snapshot`: a closed copy's
+        // history is left out like a node without that copy.
+        for scanned in self.shards.scan() {
+            let (history_shard_id, backend) = scanned?;
             if backend.namespace_request_history_expired_on_shard(
                 history_shard_id,
                 requester_node_id,
@@ -6506,13 +6604,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut receipt = None;
         let mut prepared = None;
         let mut history_expired = false;
-        for (history_shard_id, slot) in &mut self.shards {
-            // As in `scanned_slots`: the admission shard itself opened above,
-            // and a request admitted under a closed shard addresses it.
-            if slot.storage_closed {
-                continue;
-            }
-            let backend = slot.backend_mut()?;
+        // A scan: the admission shard itself opened above, and a request
+        // admitted under a closed shard addresses it.
+        for scanned in self.shards.scan_mut() {
+            let (history_shard_id, backend) = scanned?;
             let local = backend.namespace_request_admission_snapshot(
                 history_shard_id,
                 requester_node_id,
@@ -6557,8 +6652,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
         let mut requests = BTreeMap::new();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             for request in backend.list_namespace_requests()? {
                 let key = (
                     request.requester_node_id.clone(),
@@ -6587,8 +6682,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let mut requests_by_identity =
             BTreeMap::<(NodeId, String), DfsNamespaceRequestRecord>::new();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             let page = backend
                 .list_pending_namespace_requests_page(after, max_entries.saturating_add(1))?;
             for request in page.requests {
@@ -6633,8 +6728,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         transaction_id: &str,
     ) -> Result<Option<DfsNamespaceTransactionReceipt>> {
         let mut found = None;
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             if let Some(receipt) = backend.get_namespace_transaction_receipt(transaction_id)? {
                 if found
                     .as_ref()
@@ -6688,8 +6783,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
         let mut found = None;
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        // Every copy: a job lookup meets a closed copy's refusal.
+        for copy in self.shards.every_copy() {
+            let (_, backend) = copy?;
             if let Some(job) = backend.get_namespace_job(job_id)? {
                 if found.is_some() {
                     return Err(MetadataBackendError::Serde(format!(
@@ -6704,8 +6800,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn get_namespace_job_receipt(&self, job_id: &str) -> Result<Option<DfsNamespaceJobReceipt>> {
         let mut found = None;
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        // Every copy: a job receipt lookup meets a closed copy's refusal.
+        for copy in self.shards.every_copy() {
+            let (_, backend) = copy?;
             if let Some(receipt) = backend.get_namespace_job_receipt(job_id)? {
                 if found.is_some() {
                     return Err(MetadataBackendError::Serde(format!(
@@ -6728,8 +6825,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         origin: &DfsNamespaceJobOrigin,
     ) -> Result<Option<DfsNamespaceJobReceipt>> {
         let mut found = None;
-        for (_, slot) in self.scanned_slots() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             let Some(receipt) = backend.completed_namespace_job_receipt_for_paths_since(
                 file_system_id,
                 root_path,
@@ -6777,8 +6874,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let mut merged = BTreeMap::<String, DfsNamespaceJobRecord>::new();
         let mut shard_has_more = false;
-        for (_, slot) in self.scanned_slots() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             let page = backend.list_namespace_jobs_page(after, max_entries.saturating_add(1))?;
             shard_has_more |= page.next_cursor.is_some();
             for job in page.jobs {
@@ -6803,13 +6900,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
         let mut summary = DfsMetadataSummary::default();
         let mut file_system_ids = BTreeSet::new();
-        for (shard_id, slot) in &self.shards {
-            // A slot of a shard this node does not replicate is not kept
-            // current and is not part of its inventory.
-            if !self.shard_is_locally_replicated(shard_id) {
-                continue;
-            }
-            let backend = slot.backend()?;
+        // A slot of a shard this node does not replicate is not kept current
+        // and is not part of its inventory.
+        for scanned in self
+            .shards
+            .scan_where(|shard_id| self.shard_is_locally_replicated(shard_id))
+        {
+            let (shard_id, backend) = scanned?;
             let tables = backend.current_tables_snapshot()?;
             file_system_ids.extend(tables.file_systems.keys().cloned());
             let shard_summary = metadata_summary_from_tables(&tables, |object| {
@@ -6824,14 +6921,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn metadata_summary_for_local_primary_shards(&self) -> Result<DfsMetadataSummary> {
         let mut summary = DfsMetadataSummary::default();
         let mut file_system_ids = BTreeSet::new();
-        for (shard_id, slot) in &self.shards {
-            if !self.shard_is_local_authoritative_primary(shard_id) {
-                continue;
-            }
+        for scanned in self
+            .shards
+            .scan_where(|shard_id| self.shard_is_local_authoritative_primary(shard_id))
+        {
+            let (shard_id, backend) = scanned?;
             if let Some(config) = self.shard_configs.get(&shard_id.0) {
                 file_system_ids.insert(config.file_system_id.clone());
             }
-            let backend = slot.backend()?;
             let tables = backend.current_tables_snapshot()?;
             let shard_summary = metadata_summary_from_tables(&tables, |object| {
                 self.object_is_listable_from_shard(object, shard_id)
@@ -6847,8 +6944,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut primary_summary = DfsMetadataSummary::default();
         let mut file_system_ids = BTreeSet::new();
         let mut primary_file_system_ids = BTreeSet::new();
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             let shard_summary = backend.resident_metadata_status_summary();
             if shard_summary.file_system_count > 0
                 && let Some(config) = self.shard_configs.get(&shard_id.0)
@@ -6899,8 +6996,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             file_system_count: 1,
             ..DfsMetadataSummary::default()
         };
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (shard_id, backend) = scanned?;
             let tables = backend.current_tables_snapshot()?;
             let Some(shard_summary) =
                 metadata_summary_for_file_system_from_tables(&tables, file_system_id, |object| {
@@ -6916,8 +7013,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
         let mut entries = Vec::new();
-        for slot in self.shards.values() {
-            let backend = slot.backend()?;
+        for scanned in self.shards.scan() {
+            let (_, backend) = scanned?;
             entries.extend(backend.journal_since(after_sequence)?);
         }
         entries.sort_by(|left, right| {
@@ -7172,7 +7269,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                     .into(),
             ));
         }
-        let slot = self.shards.values().next().expect("one physical shard");
+        // The router's one copy, addressed: a closed one meets its refusal.
+        let (_, slot) = self
+            .shards
+            .including_closed()
+            .next()
+            .expect("one physical shard");
         LocalSobjMetadataBackend::export_table_snapshot(slot.backend()?)
     }
 
@@ -7319,12 +7421,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut statuses = Vec::new();
         for shard in self.shard_configs.values() {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-            // As in `scanned_slots`: a slot held closed reports no status.
-            if self
-                .shards
-                .get(&shard_id)
-                .is_some_and(|slot| slot.storage_closed)
-            {
+            // As in a scan: a closed copy reports no status, as on a node
+            // without that copy.
+            if self.shards.probe_closed(&shard_id)? {
                 continue;
             }
             let backend = self.shard_backend(&shard_id)?;
@@ -7422,11 +7521,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
+        // The first held copy, addressed by the subscription's polls.
         let shard_id = self
             .shards
-            .keys()
+            .including_closed()
             .next()
-            .cloned()
+            .map(|(shard_id, _)| shard_id.clone())
             .unwrap_or_else(|| DfsMetadataShardId::new("default"));
         DfsMetadataSubscription::new(shard_id, after_sequence)
     }

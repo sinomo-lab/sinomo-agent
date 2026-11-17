@@ -1314,7 +1314,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.with_stat_deadline(|service| {
                 let catalog = service.metadata_shard_authorities(&target.file_system_id)?;
                 let mut pages_left = crate::file_history_query::HISTORY_PAGE_LIMIT;
-                for shard in &catalog {
+                let mut fan_out = crate::file_history_query::DfsAuthorityFanOut::default();
+                'shards: for shard in &catalog {
                     let mut request = crate::DfsStatProjectionRequest {
                         object_id: target.object_id.clone(), object_path: target.path.clone(),
                         object_kind: target.kind.clone(), object_version: target.version.clone(),
@@ -1327,9 +1328,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             return Err(DfsError::Metadata { message: "namespace alias discovery exhausted its existing read budget".into() }.into());
                         }
                         pages_left -= 1;
-                        let reply = service.query_metadata_authority_from_snapshot(
-                            shard, DfsMetadataSelection::StatProjectionV1 { request: Box::new(request.clone()) }, Some(&catalog),
-                        )?;
+                        let Some(reply) = service.query_metadata_authority_in_fan_out(
+                            &mut fan_out, shard,
+                            DfsMetadataSelection::StatProjectionV1 { request: Box::new(request.clone()) }, Some(&catalog),
+                        )? else {
+                            continue 'shards;
+                        };
                         let DfsMetadataQueryResult::StatProjectionV1 { page } = reply else {
                             return Err(DfsError::Metadata { message: "alias authority omitted its bounded projection".into() }.into());
                         };
@@ -1355,7 +1359,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         request.expected_prefix.get_or_insert(page.prefix.clone());
                     }
                 }
-                Ok(None)
+                // The maintained count names an alias: one a closed shard
+                // holds is unknown, so no alias found is not "none".
+                Ok(fan_out.undecided(format!("aliases of {}", target.path), None)?)
             })?
         };
         if let Some(object) = result.as_ref() {
@@ -1449,10 +1455,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         resolve_hardlink_target_with(object, |target_id| self.object_by_id(target_id))
     }
 
+    /// Resolve `object`'s canonical target from the shard authorities. A
+    /// target that only a closed shard could hold is unknown, not absent: the
+    /// resolution returns the retryable `Busy` (see
+    /// [`crate::file_history_query::DfsAuthorityFanOut`]).
     pub(super) fn resolve_hardlink_target_distributed(
         &mut self,
         object: &DfsObjectMetadata,
         captured_catalog: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<DfsObjectMetadata> {
+        let mut fan_out = crate::file_history_query::DfsAuthorityFanOut::default();
+        match self.resolve_hardlink_target_distributed_noting_closed(
+            object,
+            captured_catalog,
+            &mut fan_out,
+        ) {
+            Err(DfsPosixError::NotFound { .. }) if !fan_out.closed().is_empty() => {
+                Err(fan_out.refusal(&object.path).into())
+            }
+            resolved => resolved,
+        }
+    }
+
+    /// [`Self::resolve_hardlink_target_distributed`], leaving to the caller
+    /// what an unfound target means: the shards whose storage is closed are
+    /// noted in `fan_out` and the search goes on past them.
+    pub(super) fn resolve_hardlink_target_distributed_noting_closed(
+        &mut self,
+        object: &DfsObjectMetadata,
+        captured_catalog: Option<&[DfsMetadataShardConfig]>,
+        fan_out: &mut crate::file_history_query::DfsAuthorityFanOut,
     ) -> Result<DfsObjectMetadata> {
         if object.kind != DfsObjectKind::Hardlink || self.control_plane.is_none() {
             return self.resolve_hardlink_target(object);
@@ -1467,14 +1499,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         resolve_hardlink_target_with(object, |target_id| {
             for shard in catalog {
-                let DfsMetadataQueryResult::StatObjectV1 { object: target, prefix } = self
-                    .query_metadata_authority_from_snapshot(
-                        shard,
-                        DfsMetadataSelection::StatObjectV1 {
-                            object_id: target_id.clone(),
-                        },
-                        Some(catalog),
-                    )?
+                let Some(queried) = self.query_metadata_authority_in_fan_out(
+                    fan_out,
+                    shard,
+                    DfsMetadataSelection::StatObjectV1 {
+                        object_id: target_id.clone(),
+                    },
+                    Some(catalog),
+                )?
+                else {
+                    continue;
+                };
+                let DfsMetadataQueryResult::StatObjectV1 { object: target, prefix } = queried
                 else {
                     return Err(DfsError::Metadata {
                         message: "hardlink authority returned the wrong query kind".into(),

@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 mod configuration;
+pub(crate) mod contribution_source;
+mod contribution_extraction;
+pub(crate) mod contribution_sources;
 mod command_preimage;
 mod activation_data;
 pub(crate) mod content_work;
@@ -147,6 +150,7 @@ struct NativeImportAuthority {
     content_plan_contexts: Arc<Mutex<content_work::verification_context::PlanContexts>>,
     retained_plan_file: Arc<plan_file::RetainedPlanFile>,
     count_stages: Arc<Mutex<BTreeMap<String, Arc<handoff::StagedCountSource>>>>,
+    contribution_extractions: Arc<Mutex<contribution_extraction::Extractions>>,
     source_verifiers:
         Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<staged_service::SourceTransferVerifier>>>>>,
 }
@@ -1794,6 +1798,7 @@ fn shared_owner_with_source_authority(
         content_plan_contexts: Arc::new(Mutex::new(Default::default())),
         retained_plan_file: Arc::new(Default::default()),
         count_stages: Arc::new(Mutex::new(BTreeMap::new())),
+        contribution_extractions: Arc::new(Mutex::new(Default::default())),
         source_verifiers: Arc::new(Mutex::new(BTreeMap::new())),
     });
     let metadata_authority: Arc<dyn MetadataImportAuthority> = source_authority.unwrap_or_else(|| authority.clone());

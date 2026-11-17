@@ -854,8 +854,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             resolved.push((moved, old_path, new_path));
         }
         // Before any frame of this page: while a carried alias's target shard
-        // converts, the job keeps this scan frame and stays Running.
-        self.ensure_hardlink_target_storage_active(resolved.iter().map(|(moved, _, _)| moved))?;
+        // is not Active, the job keeps this scan frame and stays Running.
+        self.park_until_hardlink_target_storage_active(
+            resolved.iter().map(|(moved, _, _)| moved),
+        )?;
         if let Some(next_cursor) = page.next_cursor {
             job.pending_frames
                 .push(DfsNamespaceJobFrame::CrossShardDirScan {
@@ -1040,55 +1042,104 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// A cross-shard move of a hardlink alias keeps its object id and never
     /// touches its canonical target, yet it moves the alias's count
     /// contribution to the target's shard from one shard to another. While
-    /// that shard converts its storage (its record is Converting, so it is
-    /// closed), its contributions must stay where its conversion reads them.
-    /// Surfaces `Busy` (retriable) before any effect: a coordinator rejects up
-    /// front, and a parked directory saga keeps the page until the shard is
-    /// Active again.
-    ///
-    /// The target is resolved through the current shard catalog, and its
-    /// owner's record is read from the retained configuration projection. A
-    /// closed shard cannot answer that resolution, so a failed resolution
-    /// while any shard converts is the same wait. A dangling alias names no
-    /// target and moves no contribution. A shard without a record is not
-    /// closed by this check.
+    /// that shard's storage is not Active (its record is Converting, or its
+    /// copy refuses to open because its storage is closed), its contributions
+    /// must stay where its conversion reads them. Surfaces `Busy` (retriable)
+    /// before any effect: a coordinator rejects up front, and a parked
+    /// directory saga keeps the page until the shard is Active again (see
+    /// [`Self::park_until_hardlink_target_storage_active`]).
     fn ensure_hardlink_target_storage_active<'a>(
         &mut self,
         moved: impl IntoIterator<Item = &'a DfsObjectMetadata>,
     ) -> Result<()> {
+        match self.hardlink_target_storage_wait(moved)? {
+            Some((path, _)) => Err(DfsPosixError::Dfs(DfsError::Busy { path })),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::ensure_hardlink_target_storage_active`] for a job step that
+    /// stays Running while it waits: the refusal records the shards it waits
+    /// on for this node, so their activation wakes its maintenance.
+    fn park_until_hardlink_target_storage_active<'a>(
+        &mut self,
+        moved: impl IntoIterator<Item = &'a DfsObjectMetadata>,
+    ) -> Result<()> {
+        let Some((path, shards)) = self.hardlink_target_storage_wait(moved)? else {
+            return Ok(());
+        };
+        crate::maintenance::storage_waits::record_parked_on_shard_storage(
+            &self.node_id,
+            shards.into_iter().map(|shard| {
+                (
+                    shard.file_system_id,
+                    crate::DfsMetadataShardId::new(shard.shard_id),
+                )
+            }),
+        );
+        Err(DfsPosixError::Dfs(DfsError::Busy { path }))
+    }
+
+    /// The first moved alias whose target's shard is not Active, with the
+    /// shards it waits on; `None` when every target's shard is Active.
+    ///
+    /// The target is resolved through the current shard catalog, and its
+    /// owner's record is read from the retained configuration projection. A
+    /// shard whose copy refuses because its storage is closed cannot answer
+    /// that resolution: the search goes on past it, and a target found
+    /// nowhere else is unknown, not dangling, so the alias waits on those
+    /// shards. A failed resolution while any shard converts waits on the
+    /// converting shards. A dangling alias names no target and moves no
+    /// contribution. A shard without a record whose copy opens is admitted by
+    /// the filesystem-level rule and is not closed by this check.
+    fn hardlink_target_storage_wait<'a>(
+        &mut self,
+        moved: impl IntoIterator<Item = &'a DfsObjectMetadata>,
+    ) -> Result<Option<(String, Vec<crate::DfsMetadataShardConfig>)>> {
         let aliases = moved
             .into_iter()
             .filter(|object| object.kind == DfsObjectKind::Hardlink)
             .collect::<Vec<_>>();
         let Some(first) = aliases.first() else {
-            return Ok(());
+            return Ok(None);
         };
         if self.control_plane.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let catalog = self.metadata_shard_authorities(&first.file_system_id)?;
         for alias in aliases {
-            let busy = || {
-                Err(DfsPosixError::Dfs(DfsError::Busy {
-                    path: alias.path.clone(),
-                }))
-            };
+            let mut fan_out = crate::file_history_query::DfsAuthorityFanOut::default();
             let resolved = {
                 // A storage check, not a mutation input: keep its target read
                 // out of the caller's recorded read set.
                 let _check = self.namespace_execution.begin_independent_planning();
-                self.resolve_hardlink_target_distributed(alias, Some(&catalog))
+                self.resolve_hardlink_target_distributed_noting_closed(
+                    alias,
+                    Some(&catalog),
+                    &mut fan_out,
+                )
             };
+            let mut closed = fan_out.closed().to_vec();
             let target = match resolved {
                 Ok(target) => target,
-                Err(DfsPosixError::NotFound { .. } | DfsPosixError::InvalidPath { .. }) => continue,
+                Err(DfsPosixError::NotFound { .. } | DfsPosixError::InvalidPath { .. })
+                    if closed.is_empty() =>
+                {
+                    continue;
+                }
+                Err(DfsPosixError::NotFound { .. } | DfsPosixError::InvalidPath { .. }) => {
+                    return Ok(Some((alias.path.clone(), closed)));
+                }
                 Err(error) => {
                     for shard in &catalog {
-                        if self.metadata_shard_storage_is_converting(shard)? {
-                            return busy();
+                        if !closed.contains(shard) && self.metadata_shard_storage_is_converting(shard)? {
+                            closed.push(shard.clone());
                         }
                     }
-                    return Err(error);
+                    if closed.is_empty() {
+                        return Err(error);
+                    }
+                    return Ok(Some((alias.path.clone(), closed)));
                 }
             };
             let owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
@@ -1098,12 +1149,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
             .map_err(DfsError::from)?;
             if let Some(owner) = owner
-                && self.metadata_shard_storage_is_converting(&owner)?
+                && (closed.contains(&owner) || self.metadata_shard_storage_is_converting(&owner)?)
             {
-                return busy();
+                return Ok(Some((alias.path.clone(), vec![owner])));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Whether `shard`'s storage record, in the retained configuration

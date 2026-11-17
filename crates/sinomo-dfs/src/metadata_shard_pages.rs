@@ -4,8 +4,6 @@
 //! exposes merged pages that must carry the shard id in each continuation
 //! cursor, and must resume only the shard referenced by an incoming cursor.
 
-use std::collections::BTreeMap;
-
 use crate::metadata_error::Result;
 use crate::metadata_keys::{
     object_version_page_cursor_with_shard, replica_receipt_page_cursor_with_shard,
@@ -34,14 +32,16 @@ fn local_cursor_for_resumed_shard<O, C>(
     after.map(map_cursor)
 }
 
-/// Collect `(record, cursor_after_record)` pairs from every shard.
+/// Collect `(record, cursor_after_record)` pairs from every shard `shards`
+/// yields, in its order. A shard the caller cannot read is yielded as an error,
+/// which ends the scan.
 ///
 /// Callers provide the shard-local page fetcher and record mapper so this
 /// helper can centralize the repeated cursor progression, per-shard page
 /// limit, and "collect one extra accepted record" behavior used by merged
 /// global scans.
-pub(crate) fn collect_sharded_scan_entries<T, O, C: Clone, B>(
-    shards: &BTreeMap<DfsMetadataShardId, B>,
+pub(crate) fn collect_sharded_scan_entries<'a, T, O, C: Clone, B: 'a>(
+    shards: impl IntoIterator<Item = Result<(&'a DfsMetadataShardId, &'a B)>>,
     after: Option<&C>,
     max_entries: usize,
     mut fetch_page: impl FnMut(
@@ -57,7 +57,8 @@ pub(crate) fn collect_sharded_scan_entries<T, O, C: Clone, B>(
     }
     let per_shard_limit = max_entries.saturating_add(1);
     let mut entries = Vec::new();
-    for (shard_id, backend) in shards {
+    for shard in shards {
+        let (shard_id, backend) = shard?;
         let mut cursor = after.cloned();
         let mut shard_entries = 0usize;
         loop {
@@ -90,9 +91,10 @@ pub(crate) fn collect_sharded_scan_entries<T, O, C: Clone, B>(
 /// This variant is for APIs whose cursors include a shard id. It skips shards
 /// before the resume shard, resumes only the referenced shard with a local
 /// cursor, then collects one extra accepted record across the merged shard
-/// stream so callers can build a continuation cursor.
-pub(crate) fn collect_resumed_sharded_page_entries<T, O, C, L, B>(
-    shards: &BTreeMap<DfsMetadataShardId, B>,
+/// stream so callers can build a continuation cursor. `shards` yields shards
+/// in shard order; one the caller cannot read is an error, which ends the page.
+pub(crate) fn collect_resumed_sharded_page_entries<'a, T, O, C, L, B: 'a>(
+    shards: impl IntoIterator<Item = Result<(&'a DfsMetadataShardId, &'a B)>>,
     after: Option<&C>,
     resume_shard_id: Option<&DfsMetadataShardId>,
     max_entries: usize,
@@ -109,7 +111,8 @@ pub(crate) fn collect_resumed_sharded_page_entries<T, O, C, L, B>(
         return Ok(Vec::new());
     }
     let mut entries = Vec::new();
-    'shards: for (shard_id, backend) in shards {
+    'shards: for shard in shards {
+        let (shard_id, backend) = shard?;
         if shard_is_before_resume(shard_id, resume_shard_id) {
             continue;
         }
@@ -174,6 +177,7 @@ pub(crate) fn write_intent_page_with_shard_cursor(
 mod tests {
     use super::*;
     use crate::metadata_error::Result;
+    use std::collections::BTreeMap;
 
     #[test]
     fn sharded_scan_entries_skip_filtered_records_and_collect_one_extra() {
@@ -182,7 +186,7 @@ mod tests {
         shards.insert(DfsMetadataShardId::new("b"), vec![6, 7, 8]);
 
         let entries = collect_sharded_scan_entries(
-            &shards,
+            shards.iter().map(Ok),
             None,
             2,
             |_, records, cursor, limit| {
@@ -215,7 +219,7 @@ mod tests {
 
         let resume_shard_id = DfsMetadataShardId::new("b");
         let entries = collect_resumed_sharded_page_entries(
-            &shards,
+            shards.iter().map(Ok),
             Some(&5),
             Some(&resume_shard_id),
             2,

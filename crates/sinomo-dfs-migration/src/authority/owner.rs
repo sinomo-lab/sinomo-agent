@@ -4,6 +4,8 @@ use super::*;
 
 mod inventory;
 pub(super) mod filesystem;
+pub(super) mod shard_conversion;
+pub(super) mod conversion_receiver;
 mod scheduler;
 mod discovery;
 mod content_exposure;
@@ -21,6 +23,10 @@ mod filesystem_remote_tests;
 mod discovery_tests;
 #[cfg(test)]
 mod scheduler_tests;
+#[cfg(test)]
+mod shard_conversion_tests;
+#[cfg(test)]
+mod shard_conversion_native_tests;
 #[cfg(test)]
 mod placement_tests;
 use scheduler::OwnerWork;
@@ -293,6 +299,14 @@ impl MigrationOwner {
         }
         if !self.routing_configuration_pending(scope)
             && matches!(inspect_current_unit(root, scope)?, sinomo_dfs::DfsStoragePreparation::Ready) {
+            if let DfsStoragePreparationScope::Metadata(shard) = scope
+                && crate::metadata::live_copy_held_by_conversion(root, shard)?
+            {
+                // The conversion that captured this copy owns it until it
+                // installs the copy's image; that conversion's own unit, not
+                // this demand, makes the copy ready.
+                return Ok(sinomo_dfs::DfsStoragePreparation::Pending { processed_records: 0 });
+            }
             return Ok(sinomo_dfs::DfsStoragePreparation::Ready);
         }
         // Fresh native bootstrap belongs to core. Its original commit changes
@@ -707,7 +721,7 @@ impl MigrationOwner {
                 self.advance_content_unit(&scope, &mut reference, &mut byte_progress)
             } else if self.source_kind == crate::metadata::MetadataImportAuthorityKind::Native {
                 match &scope {
-                    DfsStoragePreparationScope::Metadata(shard) => self.queue_filesystem_for_shard(shard),
+                    DfsStoragePreparationScope::Metadata(shard) => self.advance_metadata_unit(&reference.unit, shard),
                     DfsStoragePreparationScope::MetadataGeneration { identity } => self.advance_received_generation(&root, identity, &reference),
                     _ => self.advance_transform(&root, &scope, sinomo_dfs::DFS_STORAGE_PREPARATION_RECORD_BUDGET),
                 }

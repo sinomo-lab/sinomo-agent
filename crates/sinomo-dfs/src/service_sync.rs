@@ -690,10 +690,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut has_projected_local_primary_freeze = false;
         for shard in &projected_shards {
+            let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+            // A copy closed for storage is passed over as a node without it
+            // would be: it has no open instance to rebind until it opens.
             if shard.primary_node_id == self.node_id
-                && backend.metadata_shard_instance_writes_frozen(&DfsMetadataShardId::new(
-                    shard.shard_id.clone(),
-                ))?
+                && !backend.metadata_shard_storage_is_closed(&shard_id)?
+                && backend.metadata_shard_instance_writes_frozen(&shard_id)?
             {
                 has_projected_local_primary_freeze = true;
                 break;
@@ -739,6 +741,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut rebound = 0usize;
         for (active, pending, proof, write_set_shard) in observed {
+            if backend.metadata_shard_storage_is_closed(&DfsMetadataShardId::new(&active.shard_id))? {
+                continue;
+            }
             #[cfg(test)]
             if pending.is_none()
                 && proof.is_some()

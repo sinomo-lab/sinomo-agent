@@ -234,11 +234,25 @@ impl DfsCrossShardNamespaceLockRegistry {
     ) where
         P: IntoCrossShardNamespaceLockPaths,
     {
+        self.replace_jobs_keeping_shards(locks, &BTreeSet::new());
+    }
+
+    /// [`Self::replace_jobs`] for a scan that could not read the `kept`
+    /// shards (their copies are closed for storage): their guards stay as
+    /// replica ingest and snapshot install left them, and every other guard
+    /// is replaced by `locks`.
+    pub(crate) fn replace_jobs_keeping_shards<P>(
+        &self,
+        locks: impl IntoIterator<Item = (Option<DfsMetadataShardId>, String, DfsFileSystemId, P)>,
+        kept: &BTreeSet<DfsMetadataShardId>,
+    ) where
+        P: IntoCrossShardNamespaceLockPaths,
+    {
         let mut current = self
             .locks_by_job
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        current.clear();
+        current.retain(|_, lock| lock.shard_id.as_ref().is_some_and(|shard| kept.contains(shard)));
         current.extend(
             locks
                 .into_iter()

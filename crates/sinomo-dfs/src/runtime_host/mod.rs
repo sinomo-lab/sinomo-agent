@@ -3159,6 +3159,8 @@ pub(crate) struct DaemonDfsMetadataAuthorityPreflight {
 #[derive(Clone)]
 struct DaemonDfsMetadataAuthorityHost {
     data_dir: SinomoDataDir,
+    /// The node whose parked namespace work an activation resumes.
+    local_node_id: Option<NodeId>,
     cluster_paths: ClusterPaths,
     cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     task_owner: Weak<DfsRuntimeHost>,
@@ -3321,11 +3323,26 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
         );
     }
 
-    /// Namespace work parked on a closed shard (a move whose carried alias
-    /// targets it) resumes in a maintenance pass. Wake one now rather than
-    /// leave it to the routine retry of a pass that still has work.
-    fn shard_storage_activated(&self) {
-        notify_daemon_dfs_maintenance_work(&self.data_dir);
+    /// Namespace work parked on an activated shard (a move whose carried
+    /// alias targets it) resumes in a maintenance pass: wake one now rather
+    /// than leave it to the routine retry of a pass that still has work. A
+    /// node with no work parked on these shards runs no pass. A primary copy
+    /// the repair executor left out while closed is gained by its next pass.
+    fn shard_storage_activated(
+        &self,
+        activated: &BTreeSet<sinomo_dfs::DfsMetadataShardStorageKey>,
+    ) {
+        if self.local_node_id.as_ref().is_some_and(|node| {
+            crate::maintenance::storage_waits::take_parked_on_activated_shard_storage(
+                node, activated,
+            )
+        }) {
+            notify_daemon_dfs_maintenance_work(&self.data_dir);
+        }
+        crate::repair_executor::repair_executor_shard_storage_activated(
+            &self.data_dir.root(),
+            activated,
+        );
     }
 }
 
@@ -3337,8 +3354,12 @@ fn daemon_dfs_metadata_authority_host(
     let data_root = cluster_paths.root.parent()?;
     let data_dir = SinomoDataDir::new(data_root);
     let host = dfs_runtime_host(&data_dir).ok()?;
+    let local_node_id = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .ok()
+        .map(|state| state.local_node_id);
     Some(Arc::new(DaemonDfsMetadataAuthorityHost {
         data_dir,
+        local_node_id,
         cluster_paths: cluster_paths.clone(),
         cluster: Arc::clone(&host.cluster),
         task_owner: Arc::downgrade(&host),

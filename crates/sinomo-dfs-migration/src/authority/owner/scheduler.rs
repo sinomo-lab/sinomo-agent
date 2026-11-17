@@ -285,6 +285,16 @@ impl Scheduler {
 
 fn native_dependency(role: &inventory::UnitRole, key: &str) -> bool {
     use inventory::UnitRole;
+    // A converted generation staged on a member waits only on its own
+    // shard's serving, write-set and storage records.
+    if let UnitRole::MetadataGeneration { identity } = role
+        && super::conversion_receiver::conversion_attempt_of(identity).is_some()
+    {
+        let (fs, shard) = (&identity.file_system_id, &identity.shard_id.0);
+        return key == sinomo_dfs::metadata_shard_key(fs, shard)
+            || key == sinomo_dfs::metadata_shard_write_set_key(fs, shard)
+            || key == sinomo_dfs::metadata_shard_storage_key(fs, shard);
+    }
     let Some(tail) = key.strip_prefix("/dfs/filesystems/") else {
         return false;
     };
@@ -341,7 +351,6 @@ impl OwnerWork {
     }
     /// Park `unit` on `nodes` (decision Q2): it waits for one of them to
     /// become reachable instead of retrying on a timer.
-    #[cfg_attr(not(test), allow(dead_code, reason = "consumed by the per-shard conversion driver"))]
     pub(super) fn watch_reachable_nodes(&self, unit: &UnitKey, nodes: BTreeSet<NodeId>) -> Result<()> {
         self.scheduler.lock().map_err(error)?.watch_reachable_nodes(unit, nodes)?;
         self.reachability.notify_one();
@@ -354,5 +363,42 @@ impl OwnerWork {
         self.changed
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         self.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use inventory::UnitRole;
+
+    /// A member's staged converted generation wakes only on its own shard's
+    /// serving, write-set and storage records; a complete-filesystem
+    /// cohort's generation keeps waking on every metadata record of its
+    /// filesystem.
+    #[test]
+    fn a_staged_conversion_wakes_only_on_its_own_shards_records() {
+        let fs = sinomo_dfs::sifs_file_system_id();
+        let converted = sinomo_dfs::metadata_shard_converted_generation(&fs, "users", &"e".repeat(64));
+        let staged = UnitRole::MetadataGeneration { identity: converted.clone() };
+        for key in [
+            sinomo_dfs::metadata_shard_key(&fs, "users"),
+            sinomo_dfs::metadata_shard_write_set_key(&fs, "users"),
+            sinomo_dfs::metadata_shard_storage_key(&fs, "users"),
+        ] {
+            assert!(native_dependency(&staged, &key), "{key}");
+        }
+        for key in [
+            sinomo_dfs::file_system_config_key(&fs),
+            sinomo_dfs::metadata_shard_storage_key(&fs, "services"),
+            sinomo_dfs::metadata_shard_key(&fs, "root"),
+            sinomo_dfs::metadata_shard_membership_handoff_key(&fs, "users"),
+        ] {
+            assert!(!native_dependency(&staged, &key), "{key}");
+        }
+        let mut cohort = converted;
+        cohort.generation = "filesystem-generation".into();
+        let cohort = UnitRole::MetadataGeneration { identity: cohort };
+        assert!(native_dependency(&cohort, &sinomo_dfs::file_system_config_key(&fs)));
+        assert!(native_dependency(&cohort, &sinomo_dfs::metadata_shard_storage_key(&fs, "services")));
     }
 }

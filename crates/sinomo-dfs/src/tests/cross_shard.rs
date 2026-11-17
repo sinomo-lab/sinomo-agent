@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod closed_copies;
 mod namespace_counts;
 mod parent_counts;
 mod parent_supersession_negatives;

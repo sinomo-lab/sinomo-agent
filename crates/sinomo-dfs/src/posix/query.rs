@@ -718,7 +718,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let pairs = crate::metadata_shard_pages::collect_resumed_sharded_page_entries(
-            &shards,
+            shards.iter().map(Ok),
             after,
             after.and_then(|cursor| cursor.shard_id.as_ref()),
             max_entries,

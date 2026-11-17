@@ -1136,6 +1136,23 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         false
     }
 
+    /// The shard copies this backend holds and has found closed for storage:
+    /// opening them was refused because their root awaits storage
+    /// preparation or their storage record names a conversion. After a
+    /// node-wide scan this is every closed copy the backend holds. A node-wide
+    /// pass leaves these out as a node without those copies would, and keeps
+    /// whatever it derived from them until they open. A backend of one shard
+    /// addresses that shard and reports none.
+    fn closed_metadata_shard_ids(&self) -> BTreeSet<DfsMetadataShardId> {
+        BTreeSet::new()
+    }
+
+    /// Whether this backend holds a copy of `shard_id` closed for storage,
+    /// opening a deferred copy to find out.
+    fn metadata_shard_storage_is_closed(&self, _shard_id: &DfsMetadataShardId) -> Result<bool> {
+        Ok(false)
+    }
+
     fn begin_consistent_read_snapshot_on_shard(
         &mut self,
         _shard_id: &DfsMetadataShardId,

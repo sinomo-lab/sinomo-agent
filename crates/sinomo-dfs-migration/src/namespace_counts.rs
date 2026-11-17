@@ -254,34 +254,55 @@ fn preflight_count_input<'a>(
 /// Source admission shared by every count mode: an exact captured identity
 /// with no unfinished conversion and no unsettled original work.
 fn admit_settled_count_source(captured: &CapturedMetadataUnit) -> Result<()> {
+    admit_count_source_identity(captured, captured.has_unresolved_work())?;
+    refuse_unsettled_count_work(captured)
+}
+
+/// An exact captured identity with no unfinished conversion: `unresolved`
+/// says whether original work without a proven outcome remains, and no
+/// original handoff may be in flight.
+fn admit_count_source_identity(captured: &CapturedMetadataUnit, unresolved: bool) -> Result<()> {
     captured.validate()?;
     let cut = &captured.source;
     if cut.source_identity.is_empty()
         || cut.source_snapshot_fingerprint.is_empty()
-        || captured.has_unresolved_work()
+        || unresolved
         || cut.original_handoff.is_some()
     {
         return Err(invalid(
             "namespace-count source identity/catalog is incomplete or has unfinished conversion",
         ));
     }
-    refuse_unsettled_count_work(captured)
+    Ok(())
 }
 
 /// A partial cross-shard saga or write is not a namespace cut: refuse
 /// Prepared V7 operations recovery does not cover, non-Completed namespace
 /// jobs, Pending requests and staging intents.
 fn refuse_unsettled_count_work(captured: &CapturedMetadataUnit) -> Result<()> {
-    let tables = &captured.projected_rows;
-    if tables
-        .prepared_operations_v7
+    if has_unrecovered_preparation(captured) || has_unsettled_namespace_work(&captured.projected_rows) {
+        return Err(invalid(
+            "namespace-count maintenance requires settled original namespace and write operations",
+        ));
+    }
+    Ok(())
+}
+
+/// A Prepared V7 operation the captured recovery does not replay: its
+/// effects on the namespace are not known yet.
+pub(crate) fn has_unrecovered_preparation(captured: &CapturedMetadataUnit) -> bool {
+    captured.projected_rows.prepared_operations_v7.iter().any(|row| {
+        row.status == DfsPreparedOperationStatus::Prepared
+            && !captured.recovery_preparations().contains(row)
+    })
+}
+
+/// Non-Completed namespace jobs, Pending requests and staging intents.
+fn has_unsettled_namespace_work(tables: &sinomo_dfs::DfsMetadataTableSnapshotTables) -> bool {
+    tables
+        .namespace_jobs
         .iter()
-        .any(|row| row.status == DfsPreparedOperationStatus::Prepared
-            && !captured.recovery_preparations().contains(row))
-        || tables
-            .namespace_jobs
-            .iter()
-            .any(|row| row.status != DfsNamespaceJobStatus::Completed)
+        .any(|row| row.status != DfsNamespaceJobStatus::Completed)
         || tables
             .namespace_requests
             .iter()
@@ -292,12 +313,6 @@ fn refuse_unsettled_count_work(captured: &CapturedMetadataUnit) -> Result<()> {
                 DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
             )
         })
-    {
-        return Err(invalid(
-            "namespace-count maintenance requires settled original namespace and write operations",
-        ));
-    }
-    Ok(())
 }
 
 /// The catalog scopes a source's physical shard serves; each must be covered
@@ -341,7 +356,24 @@ fn owned_live_rows<'a>(
     limits: NamespaceCountMaintenanceLimits,
 ) -> Result<Vec<&'a DfsObjectMetadata>> {
     let cut = &captured.source;
-    let tables = &captured.projected_rows;
+    owned_live_rows_in(
+        &cut.physical_shard,
+        &cut.file_system_ids,
+        &captured.projected_rows,
+        native_catalog,
+        limits,
+    )
+}
+
+/// [`owned_live_rows`] over the rows of `physical_shard`, wherever they are
+/// held: a capture or a built image.
+fn owned_live_rows_in<'a>(
+    physical_shard: &DfsMetadataShardId,
+    file_system_ids: &[DfsFileSystemId],
+    tables: &'a sinomo_dfs::DfsMetadataTableSnapshotTables,
+    native_catalog: Option<&[DfsMetadataShardConfig]>,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<Vec<&'a DfsObjectMetadata>> {
     let mut current_paths = BTreeMap::new();
     for row in &tables.paths {
         check_deadline(limits)?;
@@ -366,10 +398,10 @@ fn owned_live_rows<'a>(
         }
         if let Some(catalog) = native_catalog {
             let owner = current_owner(&object.file_system_id, catalog, &object.path)?;
-            if owner.shard_id != cut.physical_shard.0 {
+            if owner.shard_id != physical_shard.0 {
                 continue;
             } // historical physical copy, not an extra link
-        } else if !cut.file_system_ids.contains(&object.file_system_id) {
+        } else if !file_system_ids.contains(&object.file_system_id) {
             return Err(invalid("standalone object is outside captured filesystem coverage"));
         }
         let current_path = current_paths.get(&(
@@ -690,7 +722,7 @@ impl NamespaceCountMaintenancePlan {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sinomo_core::{DfsObjectPolicy, node::NodeId};
     use sinomo_dfs::{
@@ -745,7 +777,7 @@ mod tests {
             })
             .collect()
     }
-    pub(super) fn object(name: &str, path: &str, kind: DfsObjectKind) -> DfsObjectMetadata {
+    pub(crate) fn object(name: &str, path: &str, kind: DfsObjectKind) -> DfsObjectMetadata {
         DfsObjectMetadata {
             object_id: DfsObjectId::from_legacy_named(name).unwrap(),
             file_system_id: sinomo_dfs::sifs_file_system_id(),
@@ -771,7 +803,7 @@ mod tests {
             last_modified_by_event_id: None,
         }
     }
-    pub(super) fn source(
+    pub(crate) fn source(
         root: &std::path::Path,
         catalog: &[DfsMetadataShardConfig],
         shard: &str,

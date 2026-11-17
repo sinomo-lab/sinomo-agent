@@ -1551,6 +1551,11 @@ impl MigrationOwner {
         let pending = || sinomo_dfs::DfsStoragePreparation::Pending {
             processed_records: 0,
         };
+        // A per-shard conversion's generation, staged on this member by the
+        // attempt's primary, activates under its shard's storage record.
+        if let Some(attempt_id) = super::conversion_receiver::conversion_attempt_of(identity) {
+            return self.advance_received_conversion(&reference.unit, identity, attempt_id);
+        }
         let Some(job) = &reference.job else {
             return self.queue_filesystem_for_shard(&identity.shard_id);
         };

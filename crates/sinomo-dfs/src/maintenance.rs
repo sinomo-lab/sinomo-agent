@@ -5,6 +5,7 @@
 //! maintenance tick against configured metadata shards.
 
 mod progress;
+pub(crate) mod storage_waits;
 pub(crate) use progress::DfsMaintenanceProgressState;
 
 use serde::{Deserialize, Serialize};

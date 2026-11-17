@@ -244,6 +244,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        // The scan left closed copies out; their guards, installed earlier by
+        // replica ingest or snapshot install, stay until the shard opens and a
+        // later hydration reads its jobs.
+        let closed = backend.closed_metadata_shard_ids();
         if let Some(replicated) = replicated.as_ref() {
             let sifs = sifs_file_system_id();
             locks.retain(|(shard_id, _, file_system_id, _)| {
@@ -281,7 +285,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(|(_, job_id, file_system_id, paths)| (job_id, file_system_id, paths)),
             );
         } else {
-            self.cross_shard_namespace_locks.replace_jobs(locks);
+            self.cross_shard_namespace_locks
+                .replace_jobs_keeping_shards(locks, &closed);
         }
         Ok(!should_cancel())
     }

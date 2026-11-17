@@ -100,9 +100,12 @@ its activation also makes it primary at the next epoch in the same
 transaction. Other serving changes (takeover, rotation, recruit, removal) never
 write or compare the record. A shard opens only when its local generation
 header matches an Active record, and a Converting record keeps the shard
-closed. A node's closed copy does not stop operations on its other shards;
-work that addresses the closed shard is refused, or parked until the record
-activates. A shard without a record is admitted under the filesystem-level
+closed, as does a root that still awaits storage preparation. A node's closed
+copy does not stop operations or node-wide passes on its other shards: a
+node-wide pass sees the node as one without that copy and deletes nothing of
+it, while work that addresses the closed shard is refused, or parked until its
+storage activates. An activation wakes only the nodes holding work parked on
+that shard. A shard without a record is admitted under the filesystem-level
 storage state.
 
 `sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.

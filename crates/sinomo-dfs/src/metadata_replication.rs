@@ -4495,7 +4495,13 @@ pub(crate) fn prepare_dfs_metadata_journal_publish_with_host_and_execution_exclu
             continue;
         }
 
-        let mut backend = host.open_primary_shard_backend(&shard_id)?;
+        // A primary copy closed for storage has no journal to send until it
+        // opens; the node's other shards still publish.
+        let mut backend = match host.open_primary_shard_backend(&shard_id) {
+            Ok(backend) => backend,
+            Err(error) if crate::error::dfs_error_is_closed_shard_storage(&error) => continue,
+            Err(error) => return Err(error),
+        };
         let (shard_outcomes, shard_targets) =
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut *backend,
@@ -4557,7 +4563,13 @@ fn prepare_dfs_metadata_journal_publish_with_local_backends_and_execution_exclus
         }
 
         let root = local_dfs_metadata_shard_path(data_dir, &shard_id);
-        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root)?;
+        // A primary copy closed for storage has no journal to send until it
+        // opens; the node's other shards still publish.
+        let mut backend = match LocalSobjMetadataBackend::new(shard_id.clone(), root) {
+            Ok(backend) => backend,
+            Err(error) if crate::metadata_sharded_backend::metadata_shard_storage_is_closed(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
         backend.refresh_metadata_shard_durable_view(&shard_id)?;
         let (shard_outcomes, shard_targets) =
             prepare_dfs_metadata_journal_publish_for_primary_shard(
@@ -7196,7 +7208,12 @@ pub fn publish_dfs_metadata_journal_with_host(
             continue;
         }
 
-        let mut backend = host.open_primary_shard_backend(&shard_id)?;
+        // As in `prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions`.
+        let mut backend = match host.open_primary_shard_backend(&shard_id) {
+            Ok(backend) => backend,
+            Err(error) if crate::error::dfs_error_is_closed_shard_storage(&error) => continue,
+            Err(error) => return Err(error),
+        };
         for target_node_id in shard
             .replica_node_ids
             .into_iter()

@@ -634,7 +634,7 @@ fn concurrent_alias_owners_cannot_reserve_the_same_canonical_count_generation() 
 }
 
 /// `shard`'s storage record as the control plane holds it now.
-fn shard_storage_entry(kv: &mut dyn DfsControlPlaneKvClient, shard: &str) -> sinomo_core::kv::KvEntry {
+pub(super) fn shard_storage_entry(kv: &mut dyn DfsControlPlaneKvClient, shard: &str) -> sinomo_core::kv::KvEntry {
     let key = crate::metadata_shard_storage_key(&sifs_file_system_id(), shard);
     kv.get_authoritative_consistent(&[key])
         .unwrap()
@@ -648,7 +648,7 @@ fn shard_storage_entry(kv: &mut dyn DfsControlPlaneKvClient, shard: &str) -> sin
 /// record only closes the shard until the original record is restored. `kv`
 /// is a node's native settings producer, so a node whose configuration is
 /// withheld does not stall the setup.
-fn replace_shard_storage(
+pub(super) fn replace_shard_storage(
     runtime: &crate::test_runtime::DfsTestRuntime,
     kv: &mut dyn DfsControlPlaneKvClient,
     nodes: &[NodeId],
@@ -680,7 +680,7 @@ fn replace_shard_storage(
 
 /// Close `shard` as a conversion does: its Active record turns Converting.
 /// Returns the Active and the Converting record.
-fn close_shard_for_conversion(
+pub(super) fn close_shard_for_conversion(
     runtime: &crate::test_runtime::DfsTestRuntime,
     kv: &mut dyn DfsControlPlaneKvClient,
     nodes: &[NodeId],
@@ -715,7 +715,7 @@ fn close_shard_for_conversion(
 /// A cluster whose root, services and users shards each have one member, so
 /// the root primary that coordinates a move holds no copy of users: users
 /// can be closed for conversion while root and services keep serving.
-fn disjoint_shard_cluster(name: &str) -> (SifsTwoPrimaryCluster, [NodeId; 3]) {
+pub(super) fn disjoint_shard_cluster(name: &str) -> (SifsTwoPrimaryCluster, [NodeId; 3]) {
     let cluster = super::parent_counts::foreign_parent_cluster(name);
     let members = |config: &DfsMetadataShardConfig| {
         std::iter::once(config.primary_node_id.clone())
@@ -871,7 +871,7 @@ fn cross_shard_alias_rename_reads_the_target_record_while_the_target_still_serve
     cluster.close();
 }
 
-fn directory_move_job(
+pub(super) fn directory_move_job(
     runtime: &crate::test_runtime::DfsTestRuntime,
     node: &NodeId,
     from: &str,
@@ -1161,6 +1161,268 @@ fn cross_shard_directory_move_parked_on_a_converting_target_resumes_when_it_acti
         linked.object_id
     );
     assert!(node_store_object_at(&cluster._runtime, &root_node, &alias).is_none());
+    assert!(
+        node_store_object_at(&cluster._runtime, &services_node, &format!("{to}/alias")).is_some()
+    );
+    drop(kv);
+    cluster.close();
+}
+
+/// Each node's full maintenance launches and completions.
+fn maintenance_passes(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    nodes: &[NodeId],
+) -> Vec<(u64, u64)> {
+    use crate::maintenance::phase_runs::{FULL_TICK_COMPLETION, FULL_TICK_LAUNCH, count};
+    nodes
+        .iter()
+        .map(|node| {
+            let root = runtime.data_dir(node).root();
+            (
+                count(&root, FULL_TICK_LAUNCH),
+                count(&root, FULL_TICK_COMPLETION),
+            )
+        })
+        .collect()
+}
+
+/// Wait until no node has a maintenance pass running and none launches for a
+/// few consecutive observations. Returns the settled counts.
+fn settled_maintenance_passes(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    nodes: &[NodeId],
+) -> Vec<(u64, u64)> {
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut previous = maintenance_passes(runtime, nodes);
+    let mut settled_polls = 0;
+    while settled_polls < 5 {
+        assert!(Instant::now() < deadline, "maintenance never settled");
+        std::thread::sleep(Duration::from_millis(20));
+        let current = maintenance_passes(runtime, nodes);
+        let idle = current.iter().all(|(launched, completed)| launched == completed);
+        settled_polls = if current == previous && idle {
+            settled_polls + 1
+        } else {
+            0
+        };
+        previous = current;
+    }
+    previous
+}
+
+#[test]
+fn a_shard_activation_launches_no_maintenance_on_a_node_with_no_parked_work() {
+    let (cluster, nodes) = disjoint_shard_cluster("native-activation-idle-nodes");
+    let root_node = cluster.replica_node.clone();
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    let before = settled_maintenance_passes(&cluster._runtime, &nodes);
+
+    // No node holds work parked on users: its activation is no work anywhere.
+    replace_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        &converting,
+        active.value.clone(),
+    );
+    let window = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < window {
+        assert_eq!(
+            maintenance_passes(&cluster._runtime, &nodes),
+            before,
+            "an activation launched maintenance on a node with no parked work"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(kv);
+    cluster.close();
+}
+
+/// Test setup only: apply one compare-and-write of `shard`'s storage record and
+/// wait until every node in `nodes` publishes it.
+fn write_shard_storage(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    kv: &mut dyn DfsControlPlaneKvClient,
+    nodes: &[NodeId],
+    compare: sinomo_core::kv::KvCompare,
+    write: sinomo_core::kv::KvOp,
+) {
+    let written = kv
+        .txn(KvTxn {
+            compares: vec![compare],
+            success: vec![write],
+            failure: Vec::new(),
+        })
+        .unwrap()
+        .succeeded;
+    assert!(written, "the storage record changed under the test");
+    for node in nodes {
+        runtime.wait_published_configuration_current(node).unwrap();
+    }
+}
+
+/// A target shard with no storage record whose copy refuses to open, as an
+/// unprepared old-format root does, is not Active: a move carrying an alias
+/// that targets it is parked with `Busy` rather than failed, and its storage
+/// activation resumes it.
+#[test]
+fn cross_shard_directory_move_parks_on_an_unprepared_target_without_a_record() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-tree-move-unprepared-target");
+    let root_node = cluster.replica_node.clone();
+    let users_node = cluster.users_primary_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let canonical = "/users/unprepared-target";
+    let from = "/unprepared-tree";
+    let to = "/services/unprepared-tree";
+    let alias = format!("{from}/alias");
+    let options = || DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]);
+    cluster.replica.posix_mkdir_all(from).unwrap();
+    cluster
+        .replica
+        .posix_write_file(canonical, b"unprepared target bytes", options())
+        .unwrap();
+    cluster.replica.posix_hardlink(canonical, &alias).unwrap();
+    let linked = cluster
+        .replica
+        .posix_namespace_lstat_distributed(&alias)
+        .unwrap();
+
+    // The users copy awaits storage preparation, and users has no record.
+    let users_root = crate::local_dfs_metadata_shard_path(
+        cluster._runtime.data_dir(&users_node),
+        &DfsMetadataShardId::new("users"),
+    );
+    let preparation = crate::register_dfs_storage_preparation_provider(
+        users_root,
+        Arc::new(|_, scope, _| {
+            Ok(match scope {
+                crate::DfsStoragePreparationScope::Metadata(shard) if shard.0 == "users" => {
+                    crate::DfsStoragePreparation::Pending {
+                        processed_records: 0,
+                    }
+                }
+                _ => crate::DfsStoragePreparation::Ready,
+            })
+        }),
+        None,
+    )
+    .unwrap();
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let active = shard_storage_entry(kv.as_mut(), "users");
+    write_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        sinomo_core::kv::KvCompare::ValueEquals {
+            key: active.key.clone(),
+            value: active.value.clone(),
+        },
+        sinomo_core::kv::KvOp::Delete {
+            key: active.key.clone(),
+        },
+    );
+
+    let parked = cluster.replica.posix_rename(from, to);
+    assert!(
+        matches!(&parked, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "the move waits on its carried alias's unprepared target shard: {parked:?}"
+    );
+    let root = cluster._runtime.data_dir(&root_node).root();
+    let passes = || {
+        use crate::maintenance::phase_runs::{FULL_TICK_COMPLETION, FULL_TICK_LAUNCH, count};
+        (
+            count(&root, FULL_TICK_LAUNCH),
+            count(&root, FULL_TICK_COMPLETION),
+        )
+    };
+    let settle_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut previous = passes();
+    let mut settled_polls = 0;
+    while settled_polls < 5 {
+        assert!(
+            Instant::now() < settle_deadline,
+            "the coordinator's maintenance never settled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        let current = passes();
+        settled_polls = if current == previous && current.0 == current.1 {
+            settled_polls + 1
+        } else {
+            0
+        };
+        previous = current;
+    }
+    assert_eq!(
+        directory_move_job(&cluster._runtime, &root_node, from).status,
+        DfsNamespaceJobStatus::Running
+    );
+
+    // Its conversion closes the shard with a record and activates it; the
+    // prepared copy then opens. Only the activation wakes the coordinator.
+    drop(preparation);
+    let users = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.shard_id == "users")
+        .unwrap();
+    let converting = sinomo_core::kv::encode_kv_value(
+        &crate::DfsMetadataShardStorage::converting_for_test(&users, 1),
+    )
+    .unwrap();
+    write_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        sinomo_core::kv::KvCompare::Missing {
+            key: active.key.clone(),
+        },
+        sinomo_core::kv::KvOp::Put {
+            key: active.key.clone(),
+            value: converting.clone(),
+            lease_id: None,
+        },
+    );
+    write_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        sinomo_core::kv::KvCompare::ValueEquals {
+            key: active.key.clone(),
+            value: converting,
+        },
+        sinomo_core::kv::KvOp::Put {
+            key: active.key.clone(),
+            value: active.value.clone(),
+            lease_id: None,
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while directory_move_job(&cluster._runtime, &root_node, from).status
+        == DfsNamespaceJobStatus::Running
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the parked move did not resume on the activation: {:?}",
+            directory_move_job(&cluster._runtime, &root_node, from)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        directory_move_job(&cluster._runtime, &root_node, from).status,
+        DfsNamespaceJobStatus::Completed
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_namespace_lstat_distributed(&format!("{to}/alias"))
+            .unwrap()
+            .object_id,
+        linked.object_id
+    );
     assert!(
         node_store_object_at(&cluster._runtime, &services_node, &format!("{to}/alias")).is_some()
     );

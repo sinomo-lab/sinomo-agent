@@ -187,6 +187,53 @@ pub struct DfsMetadataShardResponse {
     pub result: DfsMetadataQueryResult,
 }
 
+/// The shards one fan-out over every shard authority found closed.
+///
+/// A shard whose storage is closed refuses a query addressed to it, locally or
+/// from a remote node. In a fan-out that refusal means that authority cannot
+/// answer now, never that it holds nothing: the fan-out notes the shard and
+/// asks the others. An answer that decides the result on its own stands, such
+/// as the live record of the object in an open shard: a closed shard does not
+/// change while closed, and a move into a closed target waits until it is
+/// Active again, so the closed shard holds no record newer than its closure.
+/// Without a deciding answer the fan-out is undecided, and returns the
+/// retryable `Busy` rather than absence. Every fan-out over the authorities
+/// queries through [`NetworkedDfsService::query_metadata_authority_in_fan_out`].
+#[derive(Debug, Default)]
+pub(crate) struct DfsAuthorityFanOut {
+    closed: Vec<DfsMetadataShardConfig>,
+}
+
+impl DfsAuthorityFanOut {
+    /// The shards that could not answer because their storage is closed.
+    pub(crate) fn closed(&self) -> &[DfsMetadataShardConfig] {
+        &self.closed
+    }
+
+    /// The fan-out found no deciding answer: `none` when every authority
+    /// answered, otherwise `Busy` naming `subject` and the closed shards.
+    pub(crate) fn undecided<R>(&self, subject: impl std::fmt::Display, none: R) -> Result<R, DfsError> {
+        if self.closed.is_empty() {
+            return Ok(none);
+        }
+        Err(self.refusal(subject))
+    }
+
+    /// The retryable refusal of an undecided fan-out, naming `subject` and the
+    /// closed shards.
+    pub(crate) fn refusal(&self, subject: impl std::fmt::Display) -> DfsError {
+        let shards = self
+            .closed
+            .iter()
+            .map(|shard| shard.shard_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        DfsError::Busy {
+            path: format!("{subject} (metadata shard {shards} storage is closed)"),
+        }
+    }
+}
+
 fn error(message: impl Into<String>) -> DfsError {
     DfsError::Metadata {
         message: message.into(),
@@ -1071,6 +1118,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.query_metadata_authority_from_snapshot(shard, selection, None)
     }
 
+    /// One query of a fan-out over every shard authority (see
+    /// [`DfsAuthorityFanOut`]): `None` when `shard` cannot answer now because
+    /// its storage is closed, which `fan_out` notes.
+    pub(crate) fn query_metadata_authority_in_fan_out(
+        &mut self,
+        fan_out: &mut DfsAuthorityFanOut,
+        shard: &DfsMetadataShardConfig,
+        selection: DfsMetadataSelection,
+        snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<Option<DfsMetadataQueryResult>, DfsError> {
+        match self.query_metadata_authority_from_snapshot(shard, selection, snapshot) {
+            Err(error) if crate::error::dfs_error_is_closed_shard_storage(&error) => {
+                if !fan_out.closed.contains(shard) {
+                    fan_out.closed.push(shard.clone());
+                }
+                Ok(None)
+            }
+            queried => queried.map(Some),
+        }
+    }
+
     pub(crate) fn query_metadata_authority_from_snapshot(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -1338,13 +1406,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        let mut fan_out = DfsAuthorityFanOut::default();
         for shard in self.metadata_shard_authorities(file_system_id)? {
-            let result = self.query_metadata_authority_impl(
+            let Some(result) = self.query_metadata_authority_in_fan_out(
+                &mut fan_out,
                 &shard,
                 DfsMetadataSelection::CurrentObject {
                     object_id: object_id.clone(),
                 },
-            )?;
+                None,
+            )?
+            else {
+                continue;
+            };
             let DfsMetadataQueryResult::CurrentObject { object } = result else {
                 return Err(error("version authority returned the wrong query kind"));
             };
@@ -1358,7 +1432,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(Some(*object));
             }
         }
-        Ok(None)
+        fan_out.undecided(format!("object {object_id}"), None)
     }
 
     /// Collect an exact current or explicitly retained version. The supplied
@@ -1518,13 +1592,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         identity: &DfsRevisionReference,
     ) -> Result<Option<DfsRevisionMetadataDescriptor>, DfsError> {
+        let mut fan_out = DfsAuthorityFanOut::default();
         for shard in self.metadata_shard_authorities(&identity.file_system_id)? {
-            match self.query_metadata_authority(
+            let Some(result) = self.query_metadata_authority_in_fan_out(
+                &mut fan_out,
                 &shard,
                 DfsMetadataSelection::RevisionMetadata {
                     identity: identity.clone(),
                 },
-            )? {
+                None,
+            )?
+            else {
+                continue;
+            };
+            match result {
                 DfsMetadataQueryResult::RevisionMetadata {
                     descriptor: Some(descriptor),
                 } => {
@@ -1549,7 +1630,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        Ok(None)
+        fan_out.undecided(format!("object {}", identity.object_id), None)
     }
 
     pub fn resolve_retained_revision(
@@ -1571,15 +1652,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         identity: &DfsRevisionReference,
         allow_current: bool,
     ) -> Result<Option<DfsRetainedRevisionDescriptor>, DfsError> {
+        let mut fan_out = DfsAuthorityFanOut::default();
         for shard in self.metadata_shard_authorities(&identity.file_system_id)? {
-            match self.query_metadata_authority(
+            let Some(result) = self.query_metadata_authority_in_fan_out(
+                &mut fan_out,
                 &shard,
                 DfsMetadataSelection::Version {
                     namespace: None,
                     allow_current,
                     identity: identity.clone(),
                 },
-            )? {
+                None,
+            )?
+            else {
+                continue;
+            };
+            match result {
                 DfsMetadataQueryResult::Version {
                     descriptor: Some(descriptor),
                 } => {
@@ -1598,7 +1686,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 _ => return Err(error("revision authority returned wrong query kind")),
             }
         }
-        Ok(None)
+        fan_out.undecided(format!("object {}", identity.object_id), None)
     }
 }
 

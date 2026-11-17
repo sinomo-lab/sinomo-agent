@@ -13,11 +13,20 @@ use crate::{
     DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsOperatorStatusOmission, DfsVersion,
 };
 
+/// The wording of [`MetadataBackendError::StorageConverting`] that survives a
+/// remote error's conversion to text.
+pub const METADATA_SHARD_STORAGE_CONVERTING_REFUSAL: &str = "metadata shard storage is converting";
+
+/// The wording of [`MetadataBackendError::StoragePreparationPending`] that
+/// survives a remote error's conversion to text.
+pub const METADATA_STORAGE_PREPARATION_PENDING_REFUSAL: &str = "metadata storage preparation at";
+
 /// Error returned by DFS metadata backends and metadata helper modules.
 #[derive(Debug, Error)]
 pub enum MetadataBackendError {
     #[error("io error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
+    /// The message contains [`METADATA_STORAGE_PREPARATION_PENDING_REFUSAL`].
     #[error(
         "metadata storage preparation at {root:?} remains pending after {processed_records} records"
     )]
@@ -27,7 +36,9 @@ pub enum MetadataBackendError {
     },
     /// The shard's storage record names a conversion in progress, so its
     /// slot stays closed until that conversion activates. The message keeps
-    /// the wording callers and operators already see for this refusal.
+    /// the wording callers and operators already see for this refusal, and
+    /// contains [`METADATA_SHARD_STORAGE_CONVERTING_REFUSAL`], by which a
+    /// caller recognizes the refusal once it has crossed a node boundary.
     #[error(
         "metadata serialization error: metadata shard storage is converting; the shard stays closed until its conversion activates"
     )]

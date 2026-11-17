@@ -74,13 +74,36 @@ fn same_ownership(
     Ok(ownership(left)? == ownership(right)?)
 }
 
+/// How an extraction treats the source's own unsettled namespace and write
+/// work: non-Completed jobs, Pending requests and staging intents.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SourceWork {
+    /// Refused, as the census refuses it.
+    Settled,
+    /// Left to the caller, which reports the work that touches the target.
+    /// Other original work without a proven outcome is still refused: its
+    /// effects on the rows are not known.
+    Reported,
+}
+
 /// Admit one captured source against the catalog the counts attribute with.
 fn admit_shard_source(
     captured: &CapturedMetadataUnit,
     catalog: &[DfsMetadataShardConfig],
+    work: SourceWork,
 ) -> Result<()> {
     let scopes = catalog_by_scope(catalog)?;
-    admit_settled_count_source(captured)?;
+    match work {
+        SourceWork::Settled => admit_settled_count_source(captured)?,
+        SourceWork::Reported => {
+            admit_count_source_identity(captured, captured.has_unresolved_work_beside_recorded_rows())?;
+            if has_unrecovered_preparation(captured) {
+                return Err(invalid(
+                    "namespace-count source has a preparation its recovery does not replay",
+                ));
+            }
+        }
+    }
     if !same_ownership(&captured.source.projection_assignments, catalog)? {
         return Err(invalid(
             "namespace-count source catalog assigns paths differently from the count catalog",
@@ -99,6 +122,30 @@ pub(crate) fn contributions_from_captured(
     target_shard: &str,
     limits: NamespaceCountMaintenanceLimits,
 ) -> Result<ShardCountContributions> {
+    extract_contributions(captured, catalog, target_shard, limits, SourceWork::Settled)
+}
+
+/// [`contributions_from_captured`] for a source that may still hold
+/// non-Completed namespace jobs, Pending requests or staging intents. The
+/// rows are read under the same census rules; the caller reports the
+/// unsettled work that touches the target beside them, so a reader never
+/// accepts these contributions while that work is in flight.
+pub(crate) fn contributions_beside_unsettled_work(
+    captured: &CapturedMetadataUnit,
+    catalog: &[DfsMetadataShardConfig],
+    target_shard: &str,
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<ShardCountContributions> {
+    extract_contributions(captured, catalog, target_shard, limits, SourceWork::Reported)
+}
+
+fn extract_contributions(
+    captured: &CapturedMetadataUnit,
+    catalog: &[DfsMetadataShardConfig],
+    target_shard: &str,
+    limits: NamespaceCountMaintenanceLimits,
+    work: SourceWork,
+) -> Result<ShardCountContributions> {
     preflight_count_input(std::iter::once(captured), 0, limits)?;
     let target_shard = DfsMetadataShardId::new(target_shard);
     let source_shard = &captured.source.physical_shard;
@@ -107,7 +154,7 @@ pub(crate) fn contributions_from_captured(
             "namespace-count contribution target must be another catalog shard",
         ));
     }
-    admit_shard_source(captured, catalog)?;
+    admit_shard_source(captured, catalog, work)?;
     // Uniqueness is checked as in the census; the rows themselves stay borrowed.
     let mut owned = CountedRows::default();
     let mut aliases = Vec::new();
@@ -166,7 +213,7 @@ pub(crate) fn plan_shard_namespace_count_maintenance(
             .ok_or_else(|| invalid("namespace census record count overflow"))?;
     }
     preflight_count_input(std::iter::once(target.captured.as_ref()), contributed, limits)?;
-    admit_shard_source(&target.captured, catalog)?;
+    admit_shard_source(&target.captured, catalog, SourceWork::Settled)?;
     let shard = &target.captured.source.physical_shard;
     let mut owned = CountedRows::default();
     for object in owned_live_rows(&target.captured, Some(catalog), limits)? {
@@ -176,6 +223,30 @@ pub(crate) fn plan_shard_namespace_count_maintenance(
     add_contributed_counts(catalog, shard, &owned, contributions, &mut counts, limits)?;
     let updates = verified_count_updates(counts, owned.rows, limits)?;
     finish_count_plan(catalog.to_vec(), std::slice::from_ref(target), updates, limits)
+}
+
+/// Per-shard activation check of a built image of `shard`: every live row
+/// the shard owns under `catalog` carries exactly the count its own rows and
+/// `contributions` give, and none is absent. This checks one shard against
+/// the contributions its conversion sealed; no other shard's rows are read.
+pub(crate) fn validate_shard_image_counts(
+    catalog: &[DfsMetadataShardConfig],
+    shard: &DfsMetadataShardId,
+    file_system_ids: &[DfsFileSystemId],
+    rows: &sinomo_dfs::DfsMetadataTableSnapshotTables,
+    contributions: &[ShardCountContributions],
+    limits: NamespaceCountMaintenanceLimits,
+) -> Result<()> {
+    let mut owned = CountedRows::default();
+    for object in owned_live_rows_in(shard, file_system_ids, rows, Some(catalog), limits)? {
+        owned.insert(shard, object)?;
+    }
+    let mut counts = local_counts(&owned, CountScope::Shard { catalog, shard }, limits)?;
+    add_contributed_counts(catalog, shard, &owned, contributions, &mut counts, limits)?;
+    if !verified_count_updates(counts, owned.rows, limits)?.is_empty() {
+        return Err(invalid("built image leaves a namespace count uninitialized"));
+    }
+    Ok(())
 }
 
 fn add_contributed_counts(
@@ -339,6 +410,51 @@ mod tests {
         state.apply(sinomo_dfs::DfsPreparedMetadataEffect::PutObject { object }).unwrap();
         captured.projected_rows = state.snapshot();
         reseal(source);
+    }
+
+    /// The per-shard activation check accepts an image carrying exactly the
+    /// counts of its own rows and sealed contributions, and refuses one whose
+    /// counts are absent or that a missing contribution would change.
+    #[test]
+    fn a_built_image_is_checked_against_its_own_rows_and_sealed_contributions() {
+        let (_root, catalog, sources) = fixture();
+        for shard in ["root", "services", "users"] {
+            let source = sources
+                .iter()
+                .find(|source| source.captured.source.physical_shard.0 == shard)
+                .unwrap();
+            let contributions = contributions_to(&catalog, &sources, shard).unwrap();
+            let plan = plan_shard_namespace_count_maintenance(&catalog, source, &contributions, limits()).unwrap();
+            let mut image = source.captured.projected_rows.clone();
+            image.objects = plan.counted_objects(source, limits()).unwrap();
+            let id = DfsMetadataShardId::new(shard);
+            let file_systems = &source.captured.source.file_system_ids;
+            validate_shard_image_counts(&catalog, &id, file_systems, &image, &contributions, limits()).unwrap();
+            assert!(
+                validate_shard_image_counts(
+                    &catalog, &id, file_systems, &source.captured.projected_rows, &contributions, limits(),
+                )
+                .is_err(),
+                "an image without its counts is refused"
+            );
+        }
+        // The root shard counts the other shards' roots as its children: an
+        // image built from those contributions disagrees without them.
+        let root = sources.iter().find(|source| source.captured.source.physical_shard.0 == "root").unwrap();
+        let contributions = contributions_to(&catalog, &sources, "root").unwrap();
+        assert!(contributions.iter().any(|contribution| !contribution.child_directories.is_empty()));
+        let plan = plan_shard_namespace_count_maintenance(&catalog, root, &contributions, limits()).unwrap();
+        let mut image = root.captured.projected_rows.clone();
+        image.objects = plan.counted_objects(root, limits()).unwrap();
+        let id = DfsMetadataShardId::new("root");
+        let partial = contributions
+            .iter()
+            .map(|contribution| ShardCountContributions { child_directories: Vec::new(), ..contribution.clone() })
+            .collect::<Vec<_>>();
+        assert!(validate_shard_image_counts(
+            &catalog, &id, &root.captured.source.file_system_ids, &image, &partial, limits(),
+        )
+        .is_err());
     }
 
     #[test]
