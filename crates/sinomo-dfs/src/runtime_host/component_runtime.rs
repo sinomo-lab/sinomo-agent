@@ -694,6 +694,11 @@ pub(super) async fn run_component_maintenance(
                 shutdown.clone(),
             )
             .await;
+            #[cfg(test)]
+            crate::maintenance::phase_runs::record(
+                &data_root,
+                crate::maintenance::phase_runs::FULL_TICK_COMPLETION,
+            );
             let completed = Instant::now();
             match outcome {
                 Ok(outcome) => {

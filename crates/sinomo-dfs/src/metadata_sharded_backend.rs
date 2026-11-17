@@ -398,6 +398,11 @@ struct LocalMetadataShardSlot {
     native_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     initialization: Mutex<()>,
     backend: OnceLock<Box<LocalSobjMetadataBackend>>,
+    /// A global lease's slot whose checkout was refused because the shard's
+    /// storage is closed. The lease owns it unopened. A read routed to the
+    /// shard opens it and meets the same refusal; node-wide scans leave it
+    /// out (see [`LocalShardedMetadataBackend::scanned_slots`]).
+    storage_closed: bool,
 }
 
 /// One resident shard-local backend slot shared by scoped mutation sessions.
@@ -599,6 +604,7 @@ impl ResidentLocalMetadataShardSlot {
             native_catalog,
             initialization: _,
             backend,
+            storage_closed: _,
         } = slot;
         let backend = backend.into_inner();
         let status_snapshot = backend
@@ -699,6 +705,18 @@ impl ResidentLocalMetadataShardSlot {
         self: &Arc<Self>,
         open: &mut dyn FnMut() -> Result<Box<LocalSobjMetadataBackend>>,
     ) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
+        self.try_checkout_with_open_or_reserve(open, false)
+    }
+
+    /// [`Self::try_checkout_with_open`]. With `reserve_closed`, an open
+    /// refused only because the shard's storage is closed
+    /// ([`metadata_shard_storage_is_closed`]) leaves the slot checked out to
+    /// the caller with no backend, and that refusal is returned.
+    fn try_checkout_with_open_or_reserve(
+        self: &Arc<Self>,
+        open: &mut dyn FnMut() -> Result<Box<LocalSobjMetadataBackend>>,
+        reserve_closed: bool,
+    ) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
         let mut state = self.state.lock().map_err(|error| {
             MetadataBackendError::Serde(format!(
                 "resident metadata shard {} state lock failed: {error}",
@@ -744,6 +762,12 @@ impl ResidentLocalMetadataShardSlot {
                         opening.armed = false;
                         Ok(Some(backend))
                     }
+                    Err(error) if reserve_closed && metadata_shard_storage_is_closed(&error) => {
+                        // The caller owns the closed slot, unopened.
+                        *state = ResidentLocalMetadataShardState::CheckedOut;
+                        opening.armed = false;
+                        Err(error)
+                    }
                     Err(error) => {
                         *state = ResidentLocalMetadataShardState::Unopened;
                         self.available.notify_all();
@@ -770,12 +794,44 @@ impl ResidentLocalMetadataShardSlot {
         self.checkout_with_open(&mut || self.open_backend(false))
     }
 
+    /// [`Self::checkout`] for a global lease. A slot whose open is refused
+    /// only because the shard's storage is closed stays checked out to the
+    /// lease with no backend (`Ok(None)`): the lease still owns every slot,
+    /// and releases this one with [`Self::release_closed_reservation`].
+    fn checkout_for_global(self: &Arc<Self>) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
+        match self.checkout_with_open_or_reserve(&mut || self.open_backend(false), true) {
+            Ok(backend) => Ok(Some(backend)),
+            Err(error) if metadata_shard_storage_is_closed(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return a slot that a global lease reserved closed and never opened.
+    fn release_closed_reservation(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(matches!(
+            *state,
+            ResidentLocalMetadataShardState::CheckedOut
+        ));
+        *state = ResidentLocalMetadataShardState::Unopened;
+        self.available.notify_all();
+        self.async_available.notify_waiters();
+    }
+
     fn checkout_with_open(
         self: &Arc<Self>,
         open: &mut dyn FnMut() -> Result<Box<LocalSobjMetadataBackend>>,
     ) -> Result<Box<LocalSobjMetadataBackend>> {
+        self.checkout_with_open_or_reserve(open, false)
+    }
+
+    fn checkout_with_open_or_reserve(
+        self: &Arc<Self>,
+        open: &mut dyn FnMut() -> Result<Box<LocalSobjMetadataBackend>>,
+        reserve_closed: bool,
+    ) -> Result<Box<LocalSobjMetadataBackend>> {
         loop {
-            if let Some(backend) = self.try_checkout_with_open(open)? {
+            if let Some(backend) = self.try_checkout_with_open_or_reserve(open, reserve_closed)? {
                 return Ok(backend);
             }
             let mut state = self.state.lock().map_err(|error| {
@@ -1922,8 +1978,25 @@ impl ResidentLocalShardedMetadataBackend {
 
     /// Check out every shard in canonical shard-id order and reconstruct the
     /// original router around those exact instances.
+    ///
+    /// A slot whose storage is closed (converting, or awaiting preparation)
+    /// is left unopened and reserved to the lease instead of failing it, so a
+    /// closed shard does not stop global operations on the node's other
+    /// shards. A read routed to the closed shard still opens it and meets
+    /// its refusal; node-wide scans see the router as a node without a copy
+    /// of that shard ([`LocalShardedMetadataBackend::scanned_slots`]).
     pub fn checkout_global(&self) -> Result<ResidentLocalShardedMetadataBackendLease> {
+        /// A closed slot reserved to this checkout until the lease owns it.
+        struct ClosedReservation(Option<Arc<ResidentLocalMetadataShardSlot>>);
+        impl Drop for ClosedReservation {
+            fn drop(&mut self) {
+                if let Some(slot) = self.0.take() {
+                    slot.release_closed_reservation();
+                }
+            }
+        }
         let mut leases = Vec::with_capacity(self.inner.shards.len());
+        let mut closed = Vec::new();
         for (shard_id, slot) in &self.inner.shards {
             tracing::trace!(
                 target: "sinomo.dfs.perf",
@@ -1933,15 +2006,20 @@ impl ResidentLocalShardedMetadataBackend {
                 checkpoint = "before-checkout",
                 "resident global metadata checkout"
             );
-            let backend = slot.checkout()?;
+            let backend = slot.checkout_for_global()?;
             tracing::trace!(
                 target: "sinomo.dfs.perf",
                 data_root = %slot.root.display(),
                 fs = %slot.config.file_system_id,
                 shard = %shard_id.0,
                 checkpoint = "after-checkout",
+                storage_closed = backend.is_none(),
                 "resident global metadata checkout"
             );
+            let Some(backend) = backend else {
+                closed.push((shard_id.clone(), ClosedReservation(Some(Arc::clone(slot)))));
+                continue;
+            };
             leases.push((
                 shard_id.clone(),
                 ResidentLocalMetadataShardLease {
@@ -1982,12 +2060,37 @@ impl ResidentLocalShardedMetadataBackend {
                 native_catalog: slot.native_catalog.clone(),
                 initialization: Mutex::new(()),
                 backend: OnceLock::new(),
+                storage_closed: false,
             };
             local_slot
                 .backend
                 .set(backend)
                 .expect("global resident checkout installs exact shard backend");
             shards.insert(shard_id, local_slot);
+        }
+        for (shard_id, mut reservation) in closed {
+            let slot = reservation
+                .0
+                .take()
+                .expect("closed reservation retains its slot until the lease owns it");
+            let config = router
+                .shard_configs
+                .get(&shard_id.0)
+                .cloned()
+                .unwrap_or_else(|| slot.config.clone());
+            shards.insert(
+                shard_id,
+                LocalMetadataShardSlot {
+                    config,
+                    root: slot.root.clone(),
+                    open_mode: slot.effective_open_mode(),
+                    selected_original_data_layout: slot.selected_original_data_layout.clone(),
+                    native_catalog: slot.native_catalog.clone(),
+                    initialization: Mutex::new(()),
+                    backend: OnceLock::new(),
+                    storage_closed: true,
+                },
+            );
         }
         Ok(ResidentLocalShardedMetadataBackendLease {
             resident: self.clone(),
@@ -2073,16 +2176,22 @@ impl Drop for ResidentLocalShardedMetadataBackendLease {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for (shard_id, slot) in shards {
-            let backend = slot
-                .backend
-                .into_inner()
-                .expect("global resident lease returns every checked-out shard backend");
+            let storage_closed = slot.storage_closed;
+            let backend = slot.backend.into_inner();
             let resident_slot = self
                 .resident
                 .inner
                 .shards
                 .get(&shard_id)
                 .expect("global resident lease returns known shard");
+            let Some(backend) = backend else {
+                assert!(
+                    storage_closed,
+                    "global resident lease returns every checked-out shard backend"
+                );
+                resident_slot.release_closed_reservation();
+                continue;
+            };
             let status_config = shard_configs
                 .get(&shard_id.0)
                 .unwrap_or(&resident_slot.config);
@@ -2112,6 +2221,7 @@ impl LocalMetadataShardSlot {
             native_catalog: None,
             initialization: Mutex::new(()),
             backend: OnceLock::new(),
+            storage_closed: false,
         }
     }
 
@@ -2178,6 +2288,17 @@ pub(crate) fn metadata_shard_backend_opens_for_test(root: &Path) -> usize {
         .get(root)
         .copied()
         .unwrap_or_default()
+}
+
+/// Whether a slot's open was refused only because the shard's storage is
+/// closed: its root awaits storage preparation, or its storage record names a
+/// conversion in progress. Any other open failure is not a closed slot.
+fn metadata_shard_storage_is_closed(error: &MetadataBackendError) -> bool {
+    matches!(
+        error,
+        MetadataBackendError::StoragePreparationPending { .. }
+            | MetadataBackendError::StorageConverting
+    )
 }
 
 fn open_local_metadata_shard_backend(
@@ -2618,6 +2739,17 @@ impl LocalShardedMetadataBackend {
         self.shards.keys().cloned().collect()
     }
 
+    /// The slots a node-wide scan reads. A slot a global lease holds closed
+    /// for storage is left out, so the scan sees what a node without a copy
+    /// of that shard sees; a read routed to that shard still opens its slot
+    /// and meets the refusal. Scans that do not use this read every slot and
+    /// fail on a closed one.
+    fn scanned_slots(
+        &self,
+    ) -> impl Iterator<Item = (&DfsMetadataShardId, &LocalMetadataShardSlot)> {
+        self.shards.iter().filter(|(_, slot)| !slot.storage_closed)
+    }
+
     /// Refresh and pin every inspection-only shard without taking writer locks
     /// or running authoritative recovery.
     pub(crate) fn begin_inspection_snapshot(&mut self) -> Result<()> {
@@ -2974,7 +3106,13 @@ impl LocalShardedMetadataBackend {
         index: Option<&DfsObjectShardIndexRecord>,
     ) -> Result<Option<(DfsMetadataShardId, DfsObjectMetadata)>> {
         let mut candidates = Vec::new();
-        for (shard_id, slot) in &self.shards {
+        // The slot the object's hint names is read even when held closed:
+        // there the placement is unknown, not absent, so it meets the shard's
+        // refusal instead of resolving to another shard or to none.
+        let slots = self.shards.iter().filter(|(shard_id, slot)| {
+            !slot.storage_closed || index.is_some_and(|index| index.shard_id == **shard_id)
+        });
+        for (shard_id, slot) in slots {
             let backend = slot.backend()?;
             let Some(object) = backend.get_object(object_id)? else {
                 continue;
@@ -3032,6 +3170,16 @@ impl LocalShardedMetadataBackend {
             for object_id in object_ids {
                 let (existing, rebuild_existing) =
                     read_object_shard_index_for_rebuild(&self.root, object_id)?;
+                // A hint naming a slot held closed stays as it is: this node
+                // holds that shard's copy, which it reads again once the
+                // shard's storage activates.
+                if existing.as_ref().is_some_and(|index| {
+                    self.shards
+                        .get(&index.shard_id)
+                        .is_some_and(|slot| slot.storage_closed)
+                }) {
+                    continue;
+                }
                 let Some((shard_id, object)) =
                     self.authoritative_object_placement_with_index(object_id, existing.as_ref())?
                 else {
@@ -3326,6 +3474,52 @@ mod lazy_replica_slot_tests {
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ]
+    }
+
+    /// A global lease leaves a closed slot out of node-wide scans, but an
+    /// object whose routing hint names that shard is unknown on this node, not
+    /// absent: reconciling it keeps the hint, and resolving it meets the
+    /// shard's refusal.
+    #[test]
+    fn a_global_lease_keeps_the_object_hints_that_name_a_closed_slot() {
+        let root = sinomo_testdir::TestDir::new("dfs-closed-slot-object-hints");
+        let metadata_root = native_metadata_data(root.path());
+        let local = node("closed-slot-local");
+        let mut shards = configs(&local);
+        // The local node is the closed shard's primary, whose open refuses.
+        shards[1].primary_node_id = local.clone();
+        shards[1].replica_node_ids = Vec::new();
+        let fs = crate::sifs_file_system_id();
+        let services_id = DfsMetadataShardId::new("services");
+        let closed = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone(), None)
+            .with_shard_storage_for_test(crate::DfsMetadataShardStorage::converting_for_test(&shards[1], 5));
+        let resident = LocalShardedMetadataBackend::open_with_native_catalog(
+            metadata_root.clone(), shards.clone(), &local, None, &closed,
+        )
+        .unwrap()
+        .into_resident();
+        let object_id = DfsObjectId::from_legacy_named("closed-slot-object").unwrap();
+        let hint = DfsObjectShardIndexRecord {
+            object_id: object_id.clone(),
+            file_system_id: fs.clone(),
+            path: format!("{}/closed-slot-object", crate::SIFS_SERVICES_PATH),
+            shard_id: services_id.clone(),
+        };
+        crate::metadata_io::write_sobj_atomic(
+            &crate::metadata_shard_index::object_shard_index_path(&metadata_root, &object_id),
+            &hint,
+        )
+        .unwrap();
+        let mut lease = resident.checkout_global().unwrap();
+        assert!(lease.shards[&services_id].storage_closed);
+        assert_eq!(lease.read_object_shard_index(&object_id).unwrap().as_ref(), Some(&hint));
+        lease.reconcile_object_shard_indexes([&object_id]).unwrap();
+        assert_eq!(lease.read_object_shard_index(&object_id).unwrap().as_ref(), Some(&hint));
+        let placement = lease.authoritative_object_placement(&object_id);
+        assert!(matches!(placement, Err(MetadataBackendError::StorageConverting)), "{placement:?}");
+        let routed = lease.shard_id_for_object(&object_id);
+        assert!(matches!(routed, Err(MetadataBackendError::StorageConverting)), "{routed:?}");
+        drop(lease);
     }
 
     /// A takeover rebinds a deferred replica slot in place: the new primary and
@@ -4419,11 +4613,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         operation_id: &str,
     ) -> Result<Option<DfsPreparedOperationDigest>> {
         let mut found = None;
-        for shard_id in self.shards.keys() {
-            if let Some(digest) = self
-                .shard_backend(shard_id)?
-                .prepared_operation_digest(operation_id)?
-            {
+        for (_, slot) in self.scanned_slots() {
+            if let Some(digest) = slot.backend()?.prepared_operation_digest(operation_id)? {
                 if found.is_some() {
                     return Err(MetadataBackendError::Serde(
                         "v7 operation identity occurs on multiple shards".into(),
@@ -4557,7 +4748,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
-        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        let shard_ids = self
+            .scanned_slots()
+            .map(|(shard_id, _)| shard_id.clone())
+            .collect::<Vec<_>>();
         self.begin_consistent_read_snapshot_for_shards(&shard_ids)
     }
 
@@ -4616,7 +4810,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn end_consistent_read_snapshot(&mut self) {
-        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        let shard_ids = self
+            .scanned_slots()
+            .map(|(shard_id, _)| shard_id.clone())
+            .collect::<Vec<_>>();
         self.end_consistent_read_snapshot_for_shards(&shard_ids);
     }
 
@@ -4661,7 +4858,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>> {
         let mut file_systems = BTreeMap::<DfsFileSystemId, DfsFileSystem>::new();
-        for slot in self.shards.values() {
+        for (_, slot) in self.scanned_slots() {
             let backend = slot.backend()?;
             for file_system in backend.list_file_systems()? {
                 file_systems.insert(file_system.file_system_id.clone(), file_system);
@@ -5590,7 +5787,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn write_intent_counter_floor(&self) -> Result<u64> {
-        self.shards.values().try_fold(0_u64, |floor, slot| {
+        // An exact lane floors on its own shard alone; likewise a slot held
+        // closed adds nothing, since no intent is minted against it.
+        self.scanned_slots().try_fold(0_u64, |floor, (_, slot)| {
             let backend = slot.backend()?;
             Ok(floor.max(backend.write_intent_counter_floor()?))
         })
@@ -5871,6 +6070,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         self.shard_backend(&query.shard_id)?
             .query_file_history_on_shard(query)
+    }
+
+    /// Rows the catalog gives this shard are also subject to the shard's
+    /// residue hiding: a live row a move left behind is not reported.
+    fn count_contributions_on_shard(
+        &self,
+        query: &crate::DfsMetadataShardQuery,
+        catalog: &[crate::DfsMetadataShardConfig],
+    ) -> Result<crate::DfsMetadataQueryResult> {
+        let backend = self.shard_backend(&query.shard_id)?;
+        let prefix = LocalSobjMetadataBackend::metadata_prefix_proof(backend)?;
+        let tables = backend.current_tables_snapshot()?;
+        crate::count_contributions::query_count_contributions(
+            &tables,
+            query,
+            catalog,
+            prefix,
+            &mut |object| self.object_is_listable_from_shard(object, &query.shard_id),
+        )
     }
 
     fn retained_revision_records_page(
@@ -6215,7 +6433,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         request_id: &str,
     ) -> Result<Option<DfsNamespaceRequestRecord>> {
         let mut found = None;
-        for slot in self.shards.values() {
+        for (_, slot) in self.scanned_slots() {
             let backend = slot.backend()?;
             if let Some(request) = backend.get_namespace_request(requester_node_id, request_id)? {
                 if found.is_some() {
@@ -6235,7 +6453,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         request_id: &str,
     ) -> Result<Option<DfsNamespaceRequestReceipt>> {
         let mut found = None;
-        for slot in self.shards.values() {
+        for (_, slot) in self.scanned_slots() {
             let backend = slot.backend()?;
             if let Some(receipt) =
                 backend.get_namespace_request_receipt(requester_node_id, request_id)?
@@ -6289,6 +6507,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut prepared = None;
         let mut history_expired = false;
         for (history_shard_id, slot) in &mut self.shards {
+            // As in `scanned_slots`: the admission shard itself opened above,
+            // and a request admitted under a closed shard addresses it.
+            if slot.storage_closed {
+                continue;
+            }
             let backend = slot.backend_mut()?;
             let local = backend.namespace_request_admission_snapshot(
                 history_shard_id,
@@ -6505,7 +6728,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         origin: &DfsNamespaceJobOrigin,
     ) -> Result<Option<DfsNamespaceJobReceipt>> {
         let mut found = None;
-        for slot in self.shards.values() {
+        for (_, slot) in self.scanned_slots() {
             let backend = slot.backend()?;
             let Some(receipt) = backend.completed_namespace_job_receipt_for_paths_since(
                 file_system_id,
@@ -6554,7 +6777,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         let mut merged = BTreeMap::<String, DfsNamespaceJobRecord>::new();
         let mut shard_has_more = false;
-        for slot in self.shards.values() {
+        for (_, slot) in self.scanned_slots() {
             let backend = slot.backend()?;
             let page = backend.list_namespace_jobs_page(after, max_entries.saturating_add(1))?;
             shard_has_more |= page.next_cursor.is_some();
@@ -7096,6 +7319,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut statuses = Vec::new();
         for shard in self.shard_configs.values() {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+            // As in `scanned_slots`: a slot held closed reports no status.
+            if self
+                .shards
+                .get(&shard_id)
+                .is_some_and(|slot| slot.storage_closed)
+            {
+                continue;
+            }
             let backend = self.shard_backend(&shard_id)?;
             let journal_last_sequence = backend.journal_last_sequence();
             let journal_next_sequence = journal_last_sequence.saturating_add(1);

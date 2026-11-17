@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 #[cfg(feature = "storage-conversion")]
 mod activation;
+mod record;
+#[cfg(feature = "storage-conversion")]
+mod shard_activation;
 mod standalone;
+pub use record::*;
 #[cfg(feature = "storage-conversion")]
 pub use standalone::{
     DfsStandaloneStorageActivationWitness, activate_standalone_metadata_storage_generation,
@@ -15,6 +19,8 @@ pub use standalone::{
 mod native_tests;
 #[cfg(feature = "storage-conversion")]
 pub use activation::activate_metadata_storage_generation;
+#[cfg(feature = "storage-conversion")]
+pub use shard_activation::activate_metadata_shard_storage;
 
 /// Immutable identity embedded in every current snapshot of a physical unit.
 /// It is DATA, not authorization to install or serve that unit.
@@ -228,27 +234,7 @@ pub(crate) fn stage_native_genesis_storage_generation(
             "fresh storage generation requires the initial singleton assignment".into(),
         ));
     }
-    let identity = DfsMetadataGenerationIdentity {
-        file_system_id: shard.file_system_id.clone(),
-        shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
-        generation: activation
-            .map(|activation| activation.generation.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "native-genesis:{}:{}:{}",
-                    shard.file_system_id,
-                    shard.shard_id,
-                    crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
-                )
-            }),
-        origin: activation
-            .map(
-                |activation| DfsMetadataGenerationOrigin::NativeGenesisInGeneration {
-                    activation: activation.clone(),
-                },
-            )
-            .unwrap_or(DfsMetadataGenerationOrigin::NativeGenesis),
-    };
+    let identity = record::native_genesis_generation_identity(shard, activation);
     let selected_stage = if let Some(layout) = selected_layout {
         #[cfg(any(test, feature = "test-support"))]
         layout.admit_stage(&shard.file_system_id, &identity.shard_id, root)?;

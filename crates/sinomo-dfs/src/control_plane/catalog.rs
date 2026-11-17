@@ -277,6 +277,76 @@ mod tests {
     }
 
     #[test]
+    fn native_birth_waits_while_its_parent_shard_converts() {
+        let (runtime, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+            "native-birth-parent-storage", 1).unwrap();
+        let users = runtime.metadata_shards().unwrap().into_iter()
+            .find(|shard| shard.shard_id == "users").unwrap();
+        let shared = runtime.shared_control_plane().unwrap();
+        shared.with_client(|boxed| {
+            let kv = boxed.as_mut();
+            let read = |kv: &mut dyn DfsControlPlaneKvClient, key: &str| {
+                kv.get_authoritative_consistent(&[key.to_owned()]).unwrap().pop().unwrap()
+            };
+            let captured = current_config(kv).decode::<DfsFileSystemConfig>().unwrap().metadata_storage;
+            let desired = DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(), shard_id: "users-born-child".into(),
+                primary_node_id: nodes[0].clone(), replica_node_ids: Vec::new(), epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix { prefix: "/users/born-child".into() },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            };
+            let desired_key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
+            let desired_storage_key = metadata_shard_storage_key(&desired.file_system_id, &desired.shard_id);
+            let parent_key = metadata_shard_storage_key(&users.file_system_id, &users.shard_id);
+            let active = read(kv, &parent_key).expect("born shards carry a storage record");
+            assert!(active.decode::<crate::DfsMetadataShardStorage>().unwrap().is_active());
+            // Test setup only: the parent's record names a conversion that no
+            // driver runs, so the parent is closed until the record is restored.
+            let replace_parent = |kv: &mut dyn DfsControlPlaneKvClient, expected: &KvEntry, value: Vec<u8>| {
+                assert!(kv.txn(KvTxn {
+                    compares: vec![KvCompare::ValueEquals { key: parent_key.clone(), value: expected.value.clone() }],
+                    success: vec![KvOp::Put { key: parent_key.clone(), value, lease_id: None }],
+                    failure: Vec::new(),
+                }).unwrap().succeeded);
+                runtime.wait_published_configuration_current(&nodes[0]).unwrap();
+                read(kv, &parent_key).unwrap()
+            };
+            let converting = replace_parent(kv, &active, sinomo_core::kv::encode_kv_value(
+                &crate::DfsMetadataShardStorage::converting_for_test(&users, 1)).unwrap());
+            let before = current_config(kv);
+            assert!(!DfsControlPlaneStore::new(kv)
+                .compare_and_put_metadata_shard_for_genesis(&desired, captured.as_ref()).unwrap(),
+                "a birth under a converting parent is refused");
+            let async_refused = runtime.runtime_handle().block_on(async {
+                DfsControlPlaneAsyncStore::new(kv.async_client().expect("native async CP capability"))
+                    .compare_and_put_metadata_shard_for_genesis(&desired, captured.as_ref()).await
+            }).unwrap();
+            assert!(!async_refused, "the async birth compares the same parent record");
+            assert!(read(kv, &desired_key).is_none());
+            assert!(read(kv, &desired_storage_key).is_none());
+            let unchanged = current_config(kv);
+            assert_eq!((unchanged.value, unchanged.modify_revision), (before.value, before.modify_revision));
+
+            replace_parent(kv, &converting, active.value.clone());
+            assert!(DfsControlPlaneStore::new(kv)
+                .compare_and_put_metadata_shard_for_genesis(&desired, captured.as_ref()).unwrap(),
+                "the same birth under the Active parent is published");
+            assert_eq!(read(kv, &desired_key).unwrap().decode::<DfsMetadataShardConfig>().unwrap(), desired);
+            assert!(read(kv, &desired_storage_key).unwrap()
+                .decode::<crate::DfsMetadataShardStorage>().unwrap().is_active());
+            // Retire the unmaterialized test assignment through the catalog guard.
+            let born = current_config(kv);
+            assert!(kv.txn(change_from(&born, vec![
+                KvOp::Delete { key: desired_key.clone() },
+                KvOp::Delete { key: desired_storage_key.clone() },
+            ])).unwrap().succeeded);
+            Ok::<(), KvError>(())
+        }).unwrap();
+        drop(shared);
+        runtime.close().unwrap();
+    }
+
+    #[test]
     fn native_catalog_generation_fences_phantom_insert_remove_rescope_and_races() {
         let (runtime, nodes) =
             crate::test_runtime::DfsTestRuntime::start_cluster("native-catalog-generation", 1)

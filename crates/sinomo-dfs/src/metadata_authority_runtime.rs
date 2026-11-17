@@ -93,6 +93,10 @@ pub trait DfsMetadataAuthorityHost: Send + Sync {
     }
     fn spawn(&self, task: DfsMetadataAuthorityTask);
     fn authority_changed(&self);
+    /// A shard's storage record turned Active, reopening a shard its
+    /// conversion kept closed. Work parked on that shard can resume. A wake
+    /// only: it grants no authority.
+    fn shard_storage_activated(&self) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +154,9 @@ pub struct DfsMetadataAuthorityState {
     generation: u64,
     projection_generation: u64,
     storage_generation: u64,
+    /// Changes that turned a shard's storage record Active from a closing
+    /// record (see `metadata_shard_storage_activated`).
+    shard_storage_activations: u64,
     /// The node whose physical stores the storage generation tracks. With it,
     /// a change to a write-set shard that leaves this node's placement
     /// unchanged rebinds stores in place instead of advancing the storage
@@ -198,6 +205,10 @@ pub struct DfsMetadataAuthorityRuntime {
     refresh_completion: tokio::sync::watch::Sender<u64>,
     refresh_failures: std::sync::atomic::AtomicU32,
     refresh_resend: Mutex<DfsConfigurationRefreshResend>,
+    /// Shard storage activations the last publication carried, and those the
+    /// host was told of.
+    shard_storage_activations_published: AtomicU64,
+    shard_storage_activations_reported: AtomicU64,
     /// Unit fixtures that drive each refresh task by hand opt out of re-sends.
     #[cfg(test)]
     refresh_resend_disabled: AtomicBool,
@@ -350,6 +361,8 @@ impl DfsMetadataAuthorityRuntime {
             refresh_completion: tokio::sync::watch::channel(0).0,
             refresh_failures: std::sync::atomic::AtomicU32::new(0),
             refresh_resend: Mutex::default(),
+            shard_storage_activations_published: AtomicU64::new(0),
+            shard_storage_activations_reported: AtomicU64::new(0),
             #[cfg(test)]
             refresh_resend_disabled: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -621,6 +634,8 @@ impl DfsMetadataAuthorityRuntime {
     /// every writer path before it releases the writer lock. An unchanged
     /// state is not an event.
     fn publish(&self, writer: &DfsConfigurationWriter) {
+        self.shard_storage_activations_published
+            .fetch_max(writer.metadata.shard_storage_activations, Ordering::AcqRel);
         let candidate = writer.snapshot();
         self.published.send_if_modified(|current| {
             if current.same_publication(&candidate) {
@@ -629,6 +644,24 @@ impl DfsMetadataAuthorityRuntime {
             *current = Arc::new(candidate);
             true
         });
+    }
+
+    /// Tell `host` that exact authority changed, and that a shard's storage
+    /// turned Active when a publication since the last report carried one.
+    /// Every such activation changes an authority key, so it reaches the host
+    /// through this report. Callers hold no writer lock.
+    fn report_authority_changed(&self, host: &dyn DfsMetadataAuthorityHost) {
+        host.authority_changed();
+        let published = self
+            .shard_storage_activations_published
+            .load(Ordering::Acquire);
+        if self
+            .shard_storage_activations_reported
+            .fetch_max(published, Ordering::AcqRel)
+            < published
+        {
+            host.shard_storage_activated();
+        }
     }
 
     pub fn install_authoritative_projection(
@@ -650,7 +683,7 @@ impl DfsMetadataAuthorityRuntime {
         if authority_changed {
             self.host()
                 .into_iter()
-                .for_each(|host| host.authority_changed());
+                .for_each(|host| self.report_authority_changed(host.as_ref()));
         }
         true
     }
@@ -808,7 +841,7 @@ impl DfsMetadataAuthorityRuntime {
         if observation.authority_changed || configuration_change {
             self.host()
                 .into_iter()
-                .for_each(|host| host.authority_changed());
+                .for_each(|host| self.report_authority_changed(host.as_ref()));
         }
         if configuration_became_ready && configuration_ready {
             // A coherent pending bundle can finish on a committed delta after
@@ -944,7 +977,7 @@ impl DfsMetadataAuthorityRuntime {
         }
         if observation.authority_changed {
             if let Some(host) = self.host() {
-                host.authority_changed();
+                self.report_authority_changed(host.as_ref());
             }
         }
         self.request_authoritative_refresh();
@@ -1085,7 +1118,7 @@ impl DfsMetadataAuthorityRuntime {
                 invalidated
             };
             if invalidated {
-                host.authority_changed();
+                self.report_authority_changed(host.as_ref());
                 self.request_authoritative_refresh();
             }
             return Err(DfsWriteConfigurationReadError::Pending(DfsError::Network {
@@ -1328,7 +1361,7 @@ impl DfsMetadataAuthorityRuntime {
         }
         .await;
         if authority_changed {
-            host.authority_changed();
+            self.report_authority_changed(host.as_ref());
         }
         match result {
             Ok(revision) => Some(revision),
@@ -1473,7 +1506,7 @@ impl DfsMetadataAuthorityRuntime {
                         };
                         if authority_changed {
                             if let Some(host) = self.host() {
-                                host.authority_changed();
+                                self.report_authority_changed(host.as_ref());
                             }
                         }
                     }
@@ -1566,6 +1599,7 @@ impl DfsMetadataAuthorityState {
             generation: 1,
             projection_generation: 1,
             storage_generation: 1,
+            shard_storage_activations: 0,
             local_node_id: None,
             #[cfg(any(test, feature = "test-support"))]
             projection_rebuild_count: 0,
@@ -1700,6 +1734,23 @@ impl DfsMetadataAuthorityState {
             ) {
                 self.storage_generation = self.storage_generation.saturating_add(1);
             }
+            let previous = |key: &str| {
+                self.entries
+                    .binary_search_by(|entry| entry.key.as_str().cmp(key))
+                    .ok()
+                    .map(|index| &self.entries[index])
+            };
+            if entries.iter().any(|entry| {
+                crate::metadata_authority_projection::dfs_metadata_shard_storage_key_is_exact(
+                    &entry.key,
+                ) && crate::metadata_authority_projection::metadata_shard_storage_activated(
+                    &entry.key,
+                    previous(&entry.key),
+                    Some(entry),
+                )
+            }) {
+                self.shard_storage_activations = self.shard_storage_activations.saturating_add(1);
+            }
         }
         self.revision = Some(revision);
         self.required_revision = revision;
@@ -1813,6 +1864,7 @@ impl DfsMetadataAuthorityState {
         let mut next: Option<Vec<KvEntry>> = None;
         let mut authority_changed = false;
         let mut storage_changed = false;
+        let mut storage_activated = false;
         // A shard change is classified against the whole delta, because a
         // write-set shard's configuration and write-set key change together.
         let mut changed_shard_keys = Vec::new();
@@ -1824,6 +1876,12 @@ impl DfsMetadataAuthorityState {
             let current = next.as_ref().unwrap_or(self.entries.as_ref());
             let position =
                 current.binary_search_by(|entry| entry.key.as_str().cmp(state.key.as_str()));
+            storage_activated |=
+                crate::metadata_authority_projection::metadata_shard_storage_activated(
+                    &state.key,
+                    position.ok().map(|index| &current[index]),
+                    state.entry.as_ref(),
+                );
             if crate::metadata_authority_projection::dfs_metadata_shard_config_key_is_exact(
                 &state.key,
             ) {
@@ -1898,6 +1956,9 @@ impl DfsMetadataAuthorityState {
         }
         if storage_changed {
             self.storage_generation = self.storage_generation.saturating_add(1);
+        }
+        if storage_activated {
+            self.shard_storage_activations = self.shard_storage_activations.saturating_add(1);
         }
         self.revision = Some(delta.revision);
         self.required_revision = delta.revision;

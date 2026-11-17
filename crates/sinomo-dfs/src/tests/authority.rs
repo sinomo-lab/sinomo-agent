@@ -576,6 +576,63 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
 }
 
 #[test]
+fn native_membership_handoff_completion_keeps_the_catalog_generation() {
+    let (runtime, requester, retiring) = crate::test_support::current_native_metadata_service(
+        "native-handoff-keeps-catalog-generation",
+        3,
+        "/services",
+    )
+    .unwrap();
+    drop(requester);
+    let control = runtime.shared_control_plane().unwrap();
+    let configs = runtime.metadata_shards().unwrap();
+    let promoted = retiring.replica_node_ids[0].clone();
+    let catalog_generation = || {
+        control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut()).get_file_system_config(&retiring.file_system_id)
+            })
+            .unwrap()
+            .unwrap()
+            .catalog_generation
+    };
+    let before = catalog_generation();
+    let mut source = runtime.metadata_primary_service("/services").unwrap();
+    let handoff = control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&retiring, &promoted)
+        })
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let explicit = source.reconcile_pending_metadata_shard_membership_handoffs(
+        &configs,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
+    loop {
+        if let Some(active) = runtime
+            .observe_completed_native_handoff(&control, &handoff, deadline)
+            .unwrap()
+        {
+            assert_eq!(active, handoff.desired_shard);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the native handoff must finish within its existing deadline: {explicit:?}"
+        );
+        std::thread::yield_now();
+    }
+    // A primary rotation moves serving authority, not path assignment, so
+    // the catalog generation, which guards path assignment, is unchanged.
+    assert_eq!(catalog_generation(), before);
+    drop(source);
+    drop(control);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_explicit_primary_handoff_preserves_an_unfinished_metadata_prepare() {
     let (mut runtime, requester, retiring) = crate::test_support::current_native_metadata_service(
         "native-handoff-unfinished-prepare",

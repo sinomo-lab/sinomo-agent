@@ -349,6 +349,9 @@ pub struct DfsMetadataShardRecordCut {
     pub operation_floor_value: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_system_config_value: Option<Vec<u8>>,
+    /// The shard's storage record ([`crate::DfsMetadataShardStorage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_value: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<DfsMetadataMemberCapabilityCut>,
 }
@@ -367,6 +370,7 @@ impl DfsMetadataShardRecordCut {
             metadata_shard_head_watermark_key(file_system_id, shard_id),
             metadata_shard_operation_floor_key(file_system_id, shard_id),
             file_system_config_key(file_system_id),
+            crate::metadata_shard_storage_key(file_system_id, shard_id),
         ];
         for node in members {
             keys.push(cluster_member_key(node));
@@ -412,6 +416,7 @@ impl DfsMetadataShardRecordCut {
         let watermark_value = next();
         let operation_floor_value = next();
         let file_system_config_value = next();
+        let storage_value = next();
         let members = members
             .iter()
             .map(|node_id| DfsMetadataMemberCapabilityCut {
@@ -428,6 +433,7 @@ impl DfsMetadataShardRecordCut {
             watermark_value,
             operation_floor_value,
             file_system_config_value,
+            storage_value,
             members,
         }))
     }
@@ -513,15 +519,21 @@ pub fn metadata_write_set_member_capability_compares(
     if record.node_id != member.node_id || !record.state.is_authorized() {
         return Err(refuse("not an authorized cluster member"));
     }
-    let advertises = |capabilities: &[sinomo_core::CapabilityName]| {
-        capabilities
-            .iter()
-            .any(|capability| capability.as_str() == DFS_METADATA_WRITE_SET_V1_CAPABILITY)
+    let has = |capabilities: &[sinomo_core::CapabilityName], wanted: &str| {
+        capabilities.iter().any(|capability| capability.as_str() == wanted)
     };
+    let advertises =
+        |capabilities: &[sinomo_core::CapabilityName]| has(capabilities, DFS_METADATA_WRITE_SET_V1_CAPABILITY);
     if !advertises(&record.capabilities) {
         return Err(refuse(
             "the member does not advertise the write-set capability",
         ));
+    }
+    // Every member of a shard holds its storage under the per-shard storage
+    // record, so a member that cannot read that record is never admitted.
+    let storage = sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY;
+    if !has(&record.capabilities, storage) {
+        return Err(refuse("the member does not advertise the storage generation capability"));
     }
     if let Some(policy_value) = member.policy_value.as_ref() {
         let policy =
@@ -533,6 +545,9 @@ pub fn metadata_write_set_member_capability_compares(
             return Err(refuse(
                 "the capability policy does not allow the write-set capability",
             ));
+        }
+        if !has(&policy.capabilities, storage) {
+            return Err(refuse("the capability policy does not allow the storage generation capability"));
         }
     }
     if cluster_id
@@ -720,14 +735,25 @@ pub fn build_metadata_write_set_switch_with_raised_n(
             "the initial write set must be configured members including the primary",
         ));
     }
-    // A switched shard refuses its storage import, so a switch built before
-    // a storage transition reserved the catalog must not commit after it.
+    // A shard switches only while its storage record is Active: a converting
+    // shard is closed, and its conversion's install rule must not change
+    // under it. The exact record is compared, so a conversion that starts
+    // after the read cannot meet a switch that commits after it. A shard with
+    // no record still has the filesystem-level storage state, whose pending
+    // transition the configuration compare fences.
+    if let Some(value) = cut.storage_value.as_deref() {
+        let record = sinomo_core::kv::decode_kv_value::<crate::DfsMetadataShardStorage>(value)?;
+        if !record.is_active() {
+            return Err(refuse(cut, "the shard's storage is converting"));
+        }
+    }
     let mut compares = vec![
         handoff_missing(cut)?,
         KvCompare::Missing {
             key: cut.key(metadata_shard_operation_floor_key),
         },
         cut.file_system_config_compare(),
+        exact_compare(cut.key(crate::metadata_shard_storage_key), cut.storage_value.as_ref()),
     ];
     let mut cluster_id = None;
     for node in &configured {
@@ -1022,6 +1048,7 @@ struct TakeoverSwapInputs {
     current: DfsMetadataShardWriteSet,
     shard: DfsMetadataShardConfig,
     compares: Vec<KvCompare>,
+    superseded: Vec<KvOp>,
 }
 
 fn takeover_swap_inputs(
@@ -1036,16 +1063,11 @@ fn takeover_swap_inputs(
         ));
     }
     let shard = metadata_shard_primary_handoff_target(&cut.shard, candidate)?;
-    let mut compares = vec![
-        exact_compare(
-            cut.key(metadata_shard_membership_handoff_key),
-            cut.handoff_value.as_ref(),
-        ),
-        exact_compare(
-            cut.key(metadata_shard_head_watermark_key),
-            cut.watermark_value.as_ref(),
-        ),
-    ];
+    let (mut compares, superseded) = metadata_takeover_superseded_keys(
+        &cut.shard,
+        cut.handoff_value.as_ref(),
+        cut.watermark_value.as_ref(),
+    );
     compares.extend(metadata_write_set_member_capability_compares(
         cut.member(candidate)?,
         &mut None,
@@ -1055,7 +1077,62 @@ fn takeover_swap_inputs(
         current,
         shard,
         compares,
+        superseded,
     })
+}
+
+/// The pending handoff and head watermark a takeover supersedes: compares of
+/// both keys' exact bytes or absence, and a delete of each one present. A
+/// takeover swap and a converting takeover's activation both use these.
+pub(crate) fn metadata_takeover_superseded_keys(
+    shard: &DfsMetadataShardConfig,
+    handoff_value: Option<&Vec<u8>>,
+    watermark_value: Option<&Vec<u8>>,
+) -> (Vec<KvCompare>, Vec<KvOp>) {
+    let keys = [
+        (
+            metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id),
+            handoff_value,
+        ),
+        (
+            metadata_shard_head_watermark_key(&shard.file_system_id, &shard.shard_id),
+            watermark_value,
+        ),
+    ];
+    let compares = keys
+        .iter()
+        .map(|(key, value)| exact_compare(key.clone(), *value))
+        .collect();
+    let deletes = keys
+        .into_iter()
+        .filter(|(_, value)| value.is_some())
+        .map(|(key, _)| KvOp::Delete { key })
+        .collect();
+    (compares, deletes)
+}
+
+/// Write-set value after a takeover: `next`'s primary at `next`'s epoch, the
+/// old primary out of the write set, and the epoch starting at `epoch_start`.
+/// The change is named by the takeover's request. A takeover swap and a
+/// converting takeover's activation both use this.
+pub(crate) fn metadata_write_set_after_takeover(
+    current: &DfsMetadataShardWriteSet,
+    previous_primary: &NodeId,
+    next: &DfsMetadataShardConfig,
+    epoch_start: &crate::DfsMetadataPrefixProof,
+    request_id: &KvRequestId,
+) -> Result<DfsMetadataShardWriteSet, KvError> {
+    let mut write_set = current.next(
+        DfsMetadataShardWriteSetChangeKind::Takeover {
+            previous_primary_node_id: previous_primary.clone(),
+        },
+        change_id(request_id),
+    )?;
+    write_set.epoch = next.epoch;
+    write_set.primary_node_id = next.primary_node_id.clone();
+    write_set.write_set.retain(|node| node != previous_primary);
+    write_set.epoch_start = Some(epoch_start.clone());
+    Ok(write_set)
 }
 
 /// Whether a takeover swap can be built from `cut` for `candidate`: every
@@ -1087,6 +1164,7 @@ pub fn build_metadata_takeover_swap(
         current,
         shard,
         compares,
+        superseded,
     } = takeover_swap_inputs(cut, candidate)?;
     if !epoch_start.is_well_formed() {
         return Err(refuse(
@@ -1094,29 +1172,14 @@ pub fn build_metadata_takeover_swap(
             "the epoch start is not a well-formed prefix proof",
         ));
     }
-    let mut next = current.next(
-        DfsMetadataShardWriteSetChangeKind::Takeover {
-            previous_primary_node_id: cut.shard.primary_node_id.clone(),
-        },
-        change_id(request_id),
+    let next = metadata_write_set_after_takeover(
+        &current,
+        &cut.shard.primary_node_id,
+        &shard,
+        epoch_start,
+        request_id,
     )?;
-    next.epoch = shard.epoch;
-    next.primary_node_id = candidate.clone();
-    next.write_set
-        .retain(|node| node != &cut.shard.primary_node_id);
-    next.epoch_start = Some(epoch_start.clone());
-    let mut extra = Vec::new();
-    if cut.handoff_value.is_some() {
-        extra.push(KvOp::Delete {
-            key: cut.key(metadata_shard_membership_handoff_key),
-        });
-    }
-    if cut.watermark_value.is_some() {
-        extra.push(KvOp::Delete {
-            key: cut.key(metadata_shard_head_watermark_key),
-        });
-    }
-    change_request(cut, request_id.clone(), compares, next, Some(shard), extra)
+    change_request(cut, request_id.clone(), compares, next, Some(shard), superseded)
 }
 
 /// Write-set value after a cooperative handoff completes on a switched shard:

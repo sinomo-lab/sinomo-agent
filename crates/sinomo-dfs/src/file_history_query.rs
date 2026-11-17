@@ -86,6 +86,17 @@ pub enum DfsMetadataSelection {
         after: Option<DfsObjectPageCursor>,
         limit: usize,
     },
+    /// The queried shard's contributions to `target_shard`'s maintained
+    /// namespace counts under the serving primary's current catalog. Only the
+    /// shard's current primary answers. A continuation names the prefix of
+    /// its first page; older peers reject this selection.
+    CountContributionsV1 {
+        target_shard: String,
+        #[serde(default)]
+        expected_prefix: Option<DfsMetadataPrefixProof>,
+        #[serde(default)]
+        after: Option<DfsCountContributionCursor>,
+    },
 }
 
 /// Largest subtree object page one authority returns per query.
@@ -158,6 +169,14 @@ pub enum DfsMetadataQueryResult {
     RevisionMetadata {
         descriptor: Option<Box<DfsRevisionMetadataDescriptor>>,
     },
+    CountContributionsV1 {
+        page: DfsCountContributionPage,
+    },
+    /// The continuation's expected prefix is no longer the shard's current
+    /// prefix. A typed refusal, not an empty page; the read restarts.
+    CountContributionsChangedV1 {
+        prefix: DfsMetadataPrefixProof,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -194,6 +213,9 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
         }
         DfsMetadataSelection::StatAtPathV1 { .. } => Err(MetadataBackendError::Serde(
             "stat path requires its authenticated owning service and complete catalog".into(),
+        )),
+        DfsMetadataSelection::CountContributionsV1 { .. } => Err(MetadataBackendError::Serde(
+            "count contributions require the authenticated primary and its current catalog".into(),
         )),
         DfsMetadataSelection::StatObjectV1 { object_id } => {
             let prefix = backend
@@ -605,6 +627,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .ok_or_else(|| error("stat requires its admitted routing projection"))?
                 .shards.clone())
         } else { None };
+        // Contributions attribute every path with the catalog this primary
+        // admitted the query under; the epoch/primary check above binds it.
+        let contribution_catalog =
+            if matches!(query.selection, DfsMetadataSelection::CountContributionsV1 { .. }) {
+                Some(
+                    self.namespace_execution
+                        .context()
+                        .filter(|context| context.file_system_id == query.file_system_id)
+                        .ok_or_else(|| {
+                            error("count contributions require the admitted authority catalog")
+                        })?
+                        .shards
+                        .clone(),
+                )
+            } else {
+                None
+            };
         if let DfsMetadataSelection::StatAtPathV2 { path } = &query.selection {
             self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
             if !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
@@ -848,6 +887,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsMetadataSelection::StatAtPathV2 { .. }
                     | DfsMetadataSelection::StatProjectionV1 { .. }
                     | DfsMetadataSelection::StatObjectV1 { .. }
+                    // Pins the shard's tables together with their prefix.
+                    | DfsMetadataSelection::CountContributionsV1 { .. }
             ) || matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. })
                 && !complete_stat_scope;
         let stat_scope_ids = stat_catalog
@@ -934,7 +975,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 backend.begin_consistent_read_snapshot()?;
             }
-            let result = backend.query_file_history_on_shard(query);
+            let result = match contribution_catalog.as_deref() {
+                Some(catalog) => backend.count_contributions_on_shard(query, catalog),
+                None => backend.query_file_history_on_shard(query),
+            };
             if exact_stat_scope {
                 backend.end_stat_read_snapshot_on_shard(&query.shard_id);
             } else {
@@ -1005,6 +1049,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                 }
             }
+            // Not fenced by in-flight cross-shard paths: the page reports the
+            // Running jobs that hold them, and its consumer accounts for them.
+            DfsMetadataQueryResult::CountContributionsV1 { .. }
+            | DfsMetadataQueryResult::CountContributionsChangedV1 { .. } => {}
             _ => {}
         }
         Ok(DfsMetadataShardResponse {
@@ -1077,6 +1125,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 code: DfsMetadataRejectionCode::PrefixMismatch,
                 message: "authoritative stat generation advanced during collection".into(),
             });
+        }
+        match (&query.selection, &response.result) {
+            (
+                DfsMetadataSelection::CountContributionsV1 {
+                    expected_prefix, ..
+                },
+                DfsMetadataQueryResult::CountContributionsV1 { page },
+            ) => {
+                if page.source_shard != query.shard_id.0
+                    || !page.prefix.is_well_formed()
+                    || expected_prefix
+                        .as_ref()
+                        .is_some_and(|expected| expected != &page.prefix)
+                    || page.complete != page.after.is_none()
+                    || page.entry_count()
+                        > crate::count_contributions::DFS_COUNT_CONTRIBUTION_PAGE_LIMIT
+                {
+                    return Err(error("count contribution page does not match its query"));
+                }
+            }
+            // The refusal is returned typed: the caller restarts its read at
+            // the new prefix rather than treating this as a transport error.
+            (
+                DfsMetadataSelection::CountContributionsV1 {
+                    expected_prefix: Some(expected),
+                    ..
+                },
+                DfsMetadataQueryResult::CountContributionsChangedV1 { prefix },
+            ) => {
+                if !prefix.is_well_formed()
+                    || !expected.is_well_formed()
+                    || prefix.journal_sequence <= expected.journal_sequence
+                {
+                    return Err(error("invalid or non-forward count contribution refusal"));
+                }
+            }
+            (DfsMetadataSelection::CountContributionsV1 { .. }, _)
+            | (
+                _,
+                DfsMetadataQueryResult::CountContributionsV1 { .. }
+                | DfsMetadataQueryResult::CountContributionsChangedV1 { .. },
+            ) => return Err(error("count contribution authority returned the wrong query kind")),
+            _ => {}
         }
         Ok(response.result)
     }

@@ -88,6 +88,23 @@ The table tail log is compacted into a streamed snapshot using storage schema
 version is independent of the V7 operation family. `sinomo-dfs` accepts only
 current storage and wire formats.
 
+Each metadata shard has a storage record beside its configuration and write
+set. It names the current storage generation the shard serves and the evidence
+that activated it. A native birth records it together with the assignment, and
+only the shard's own conversion changes it: the attempt is recorded Converting
+before it reads its inputs, sealed with the converted image, then activated,
+and each configured member activates its staged copy under the Active record.
+When the converting primary is lost, another configured member may take the
+attempt over once every member advertises the storage generation capability;
+its activation also makes it primary at the next epoch in the same
+transaction. Other serving changes (takeover, rotation, recruit, removal) never
+write or compare the record. A shard opens only when its local generation
+header matches an Active record, and a Converting record keeps the shard
+closed. A node's closed copy does not stop operations on its other shards;
+work that addresses the closed shard is refused, or parked until the record
+activates. A shard without a record is admitted under the filesystem-level
+storage state.
+
 `sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.
 
 Operator status includes per-shard journal positions, inbound replay cursors, and configured replica cursor lag so cluster checks can distinguish object-level repair work from metadata replication backlog.
@@ -197,9 +214,11 @@ each member it admits. A shrink, recruit or removal also compares the
 filesystem configuration, whose placement rules give the W floor and N it
 checks, and a switch compares it so that it cannot commit after a storage
 transition has reserved the catalog: a switched shard refuses its storage
-import. No change is built while that reservation holds. No change advances
-the filesystem's catalog generation, which guards path assignment only, so
-changes of different shards never reject each other.
+import. No change is built while that reservation holds. A switch also
+compares the shard's storage record and is refused while the shard converts.
+No change, and no membership handoff, advances the filesystem's catalog
+generation, which guards path assignment only, so changes of different shards
+never reject each other.
 Each change advances the generation, so a transaction built from an
 earlier record can never apply. Transactions carry a stable request id: a
 takeover candidate settles an unknown swap by resubmitting the identical

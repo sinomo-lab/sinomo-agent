@@ -3031,6 +3031,7 @@ pub(crate) mod phase_runs {
     pub(crate) const EXECUTOR_TURN: &str = "executor_turn";
     pub(crate) const MAINTENANCE_LOOP_ITERATION: &str = "maintenance_loop_iteration";
     pub(crate) const FULL_TICK_LAUNCH: &str = "full_tick_launch";
+    pub(crate) const FULL_TICK_COMPLETION: &str = "full_tick_completion";
     pub(crate) const EXECUTOR_TURN_LAUNCH: &str = "executor_turn_launch";
 
     static RUNS: Mutex<BTreeMap<(PathBuf, &'static str), u64>> = Mutex::new(BTreeMap::new());

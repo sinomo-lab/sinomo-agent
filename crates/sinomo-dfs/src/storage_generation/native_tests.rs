@@ -114,3 +114,35 @@ fn native_membership_snapshot_bootstraps_current_replica_generation() {
     assert_eq!(nodes.len(), 3);
     native.close().unwrap();
 }
+
+#[test]
+fn native_genesis_records_each_shards_active_storage_beside_its_assignment() {
+    let (native, nodes) =
+        DfsTestRuntime::start_cluster("native-genesis-shard-storage-record", 1).unwrap();
+    let node = nodes[0].clone();
+    let shards = native.metadata_shards().unwrap();
+    assert!(!shards.is_empty());
+    let shared = native.shared_control_plane().unwrap();
+    for shard in &shards {
+        let id = DfsMetadataShardId::new(&shard.shard_id);
+        let root = crate::local_dfs_metadata_shard_path(native.data_dir(&node), &id);
+        let header = read_generation(&root).unwrap();
+        let key = crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id);
+        let entry = shared
+            .with_client(|kv| kv.as_mut().get(&key))
+            .unwrap()
+            .expect("a native birth records the shard's storage");
+        let record: DfsMetadataShardStorage = entry.decode().unwrap();
+        record.validate_against(shard).unwrap();
+        assert_eq!(record.generation, header.identity);
+        assert_eq!(
+            record.state,
+            DfsMetadataShardStorageState::Active {
+                activation: DfsMetadataShardActivation::NativeGenesis,
+            }
+        );
+        assert!(record.admits_header(&header));
+    }
+    drop(shared);
+    native.close().unwrap();
+}
