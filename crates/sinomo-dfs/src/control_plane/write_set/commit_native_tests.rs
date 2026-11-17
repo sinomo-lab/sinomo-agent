@@ -696,6 +696,39 @@ fn content_write(
         )
 }
 
+// Observe the publication boundary directly while this fixture deliberately
+// suspends its keeper to drive the exact control-plane transitions itself.
+// Main's mounted-call continuation is covered by the partition/cancellation
+// tests; successful exact retries below still use the mounted runtime client.
+fn content_write_at_authority(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    path: &str,
+    w: usize,
+    operation: &str,
+) -> Result<crate::DfsStat, crate::DfsPosixError> {
+    crate::runtime_host::with_daemon_dfs_exact_shard_service(
+        runtime.data_dir(&config.primary_node_id),
+        &runtime.runtime_handle(),
+        config,
+        operation,
+        |service| {
+            service.posix_write_file_with_operation_id(
+                path,
+                format!("{operation} bytes").as_bytes(),
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(w, 3).unwrap(),
+                    replica_candidates: members(config),
+                    wait_for_commit: true,
+                    foreground_replica_repair: false,
+                },
+                operation,
+            )
+        },
+    )
+    .map_err(crate::DfsPosixError::Dfs)?
+}
+
 /// C2 and C9: a write whose own content W exceeds the W the record accepts
 /// stays prepared until the shard's N rises to it; a write whose W exceeds
 /// the live write set stays prepared while W meets the shard floor; a recovery
@@ -711,7 +744,7 @@ fn native_write_set_intent_w_above_the_write_set_waits_for_it() {
     drop(service);
     // W = 2 fits the write set {P, B}, but the record accepts only W = 1:
     // the shard's N must first rise to 2, which the keeper orders in KV.
-    match content_write(
+    match content_write_at_authority(
         &runtime,
         &config,
         "/services/intent-w/two.bin",
@@ -737,7 +770,7 @@ fn native_write_set_intent_w_above_the_write_set_waits_for_it() {
     raise_n(&runtime, &config, 3);
     // W = 3 is accepted but does not fit the write set {P, B}: the change stays
     // prepared, durable on {P, B}.
-    match content_write(
+    match content_write_at_authority(
         &runtime,
         &config,
         "/services/intent-w/three.bin",
@@ -751,6 +784,19 @@ fn native_write_set_intent_w_above_the_write_set_waits_for_it() {
         other => panic!("a write above the live write set stays pending: {other:?}"),
     }
     let mut service = primary(&runtime);
+    assert!(
+        matches!(
+            service.hydrate_from_metadata_backend(),
+            Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+                cause: crate::DfsCommitOutcomeUnknownCause::BelowWriteSetFloor {
+                    write_set: 2,
+                    floor: 3
+                },
+                ..
+            })
+        ),
+        "hydration reports the actual unknown instead of panicking as cancelled"
+    );
     assert!(
         service
             .lookup_sifs_path("/services/intent-w/three.bin")

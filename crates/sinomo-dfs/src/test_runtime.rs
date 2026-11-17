@@ -6516,7 +6516,7 @@ impl DfsTestRuntime {
         Err("member record kept changing while setting the role".into())
     }
 
-    /// The test-support switch for the dormant write-set capability: commit
+    /// The test-support switch for a member's write-set capability: commit
     /// `node`'s actual cluster member record with the capability advertised,
     /// and its derived capability policy record with it, as the cluster
     /// member store does when a node's binary advertises a capability.
@@ -6528,6 +6528,23 @@ impl DfsTestRuntime {
     /// behind the commit, so no authoritative read compares the two at an
     /// equal revision before both carry it.
     pub fn advertise_metadata_write_set_capability(&self, node: &NodeId) -> Result<(), String> {
+        self.set_metadata_write_set_capability(node, true)
+    }
+
+    /// Model an older member through its real advertisement and policy. This
+    /// removes eligibility only; it cannot authorize a write or a switch.
+    pub(crate) fn withhold_metadata_write_set_capability(
+        &self,
+        node: &NodeId,
+    ) -> Result<(), String> {
+        self.set_metadata_write_set_capability(node, false)
+    }
+
+    fn set_metadata_write_set_capability(
+        &self,
+        node: &NodeId,
+        enabled: bool,
+    ) -> Result<(), String> {
         let member_key = sinomo_core::node::cluster_member_key(node);
         let policy_key = sinomo_core::node::cluster_capability_policy_key(node);
         let error = |error: sinomo_core::kv::KvError| error.to_string();
@@ -6546,10 +6563,16 @@ impl DfsTestRuntime {
             let mut member = member_entry
                 .decode::<sinomo_core::ClusterMemberRecord>()
                 .map_err(error)?;
-            if !member.capabilities.contains(&capability) {
+            if !enabled {
+                member.capabilities.retain(|value| value != &capability);
+                member
+                    .allowed_capabilities
+                    .retain(|value| value != &capability);
+            }
+            if enabled && !member.capabilities.contains(&capability) {
                 member.capabilities.push(capability.clone());
             }
-            if !member.allowed_capabilities.contains(&capability) {
+            if enabled && !member.allowed_capabilities.contains(&capability) {
                 member.allowed_capabilities.push(capability.clone());
             }
             let policy = sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member);
@@ -6581,25 +6604,25 @@ impl DfsTestRuntime {
                 })
                 .map_err(error)?;
             if response.succeeded {
-                return self.advertise_in_local_state(node, &capability);
+                return self.set_capability_in_local_state(node, &capability, enabled);
             }
         }
         Err("member record kept changing while advertising the capability".into())
     }
 
-    /// Add `capability` to `node`'s own member record in its local cluster
-    /// state, until a re-read shows it there.
-    fn advertise_in_local_state(
+    /// Match the node-owned advertisement to its committed capability change.
+    fn set_capability_in_local_state(
         &self,
         node: &NodeId,
         capability: &sinomo_core::CapabilityName,
+        enabled: bool,
     ) -> Result<(), String> {
         let paths = ClusterPaths::new(self.data_dir(node));
         let advertised = |state: &sinomo_core::ClusterBootstrapState| {
             state.members.iter().any(|member| {
                 member.node_id == *node
-                    && member.capabilities.contains(capability)
-                    && member.allowed_capabilities.contains(capability)
+                    && member.capabilities.contains(capability) == enabled
+                    && member.allowed_capabilities.contains(capability) == enabled
             })
         };
         for _ in 0..8 {
@@ -6613,10 +6636,16 @@ impl DfsTestRuntime {
                 .iter_mut()
                 .find(|member| member.node_id == *node)
                 .ok_or("native fixture node has no local member record")?;
-            if !member.capabilities.contains(capability) {
+            if !enabled {
+                member.capabilities.retain(|value| value != capability);
+                member
+                    .allowed_capabilities
+                    .retain(|value| value != capability);
+            }
+            if enabled && !member.capabilities.contains(capability) {
                 member.capabilities.push(capability.clone());
             }
-            if !member.allowed_capabilities.contains(capability) {
+            if enabled && !member.allowed_capabilities.contains(capability) {
                 member.allowed_capabilities.push(capability.clone());
             }
             sinomo_core::cluster::write_cluster_state(&paths, &state)

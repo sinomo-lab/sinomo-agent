@@ -49,10 +49,10 @@ fn member(node_id: &NodeId, write_set_capability: bool) -> ClusterMemberRecord {
         time::OffsetDateTime::UNIX_EPOCH,
     );
     record.capabilities = sinomo_core::node::main_daemon_capabilities(&record.role);
-    if write_set_capability {
+    if !write_set_capability {
         record
             .capabilities
-            .push(sinomo_core::CapabilityName::new(DFS_METADATA_WRITE_SET_V1_CAPABILITY).unwrap());
+            .retain(|capability| capability.as_str() != DFS_METADATA_WRITE_SET_V1_CAPABILITY);
     }
     record
 }

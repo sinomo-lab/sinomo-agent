@@ -84,13 +84,18 @@ pub(super) async fn request(
                 // This only requests a guarded handoff. The native reconciler
                 // must supply all actual freeze/prefix/participant/custody proof.
                 // Any error/timeout is uncertain: the parent must not resubmit.
-                let pending = store
+                match store
                     .begin_metadata_shard_membership_handoff(&current, &desired)
                     .await
                     .map_err(|e| invalid(e.to_string()))?
-                    .ok_or_else(|| invalid("fixture topology changed during guarded request"))?;
-                json!({"state":"Requested","mutation_attempted":true,
-                    "current":current,"desired":desired,"pending":pending})
+                {
+                    Some(pending) => json!({"state":"Requested","mutation_attempted":true,
+                        "current":current,"desired":desired,"pending":pending}),
+                    // No transaction applied. The next observation must start
+                    // with the current assignment and any already-pending handoff.
+                    None => json!({"state":"Superseded","mutation_attempted":true,
+                        "current":current,"desired":desired}),
+                }
             }
         }
     } else {
@@ -147,7 +152,7 @@ pub(super) async fn prepare_prefix_baseline(
     let preflight = preflight.for_admission(&admission);
     // No detached task: this driver retains its actual admission and DATA owner
     // through native bounded dispatch and lane restoration, including errors.
-    let value = tokio::task::block_in_place(|| {
+    let value = tokio::task::block_in_place(|| -> Result<_, NetworkError> {
         let mut retained = message_host::take_daemon_dfs_message_mutation_service_for_maintenance(
             &data, &paths, &state, runtime, Some(&preflight),
         ).map_err(|e| invalid(e.to_string()))?;
@@ -159,8 +164,14 @@ pub(super) async fn prepare_prefix_baseline(
             let target = service.capture_metadata_quorum_sync_target(&object).map_err(|e| invalid(e.to_string()))?;
             let members = std::iter::once(target.primary_node_id.clone())
                 .chain(target.replica_node_ids.iter().cloned()).collect::<BTreeSet<_>>();
-            if target.primary_node_id != *source || &members != peers {
-                return Err(invalid("native setup target is not the actual complete fixture assignment"));
+            if target.primary_node_id != *source || !members.is_subset(peers) {
+                return Err(invalid("native setup target is outside the fixture assignment"));
+            }
+            if &members != peers {
+                // A requested membership handoff can still be propagating.
+                // The parent waits on the original startup budget before sync.
+                return Ok(json!({"state":"Waiting", "classification":"fixture-startup-activity-data-only",
+                    "sync_attempted":false,"target":target}));
             }
             let backend = service.metadata_backend().ok_or_else(|| invalid("native setup backend absent"))?;
             let instance_frozen = backend.metadata_shard_instance_writes_frozen(&target.shard_id)
@@ -191,10 +202,11 @@ pub(super) async fn prepare_prefix_baseline(
         let restored = message_host::restore_daemon_dfs_message_mutation_service_after_maintenance(
             &data, &paths, runtime, retained,
         ).map_err(|e| invalid(e.to_string()));
-        let value = result?;
-        if !restored? && value["state"] != "Waiting" {
-            return Err(invalid("native setup lane changed before restoration"));
-        }
+        let mut value = result?;
+        // A generation change can retire this cached service even after all
+        // participants acknowledged. Record its disposition separately from
+        // the sync result. The next PREFIX round must select its own live owner.
+        value["cached_lane_restored"] = json!(restored?);
         Ok(value)
     })?;
     drop(admission);

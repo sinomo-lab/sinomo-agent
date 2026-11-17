@@ -663,6 +663,10 @@ pub(super) fn recover_prior_process_default_dfs_placement_authority_from_observa
         }
     })?;
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    #[cfg(test)]
+    if let Some(hook) = super::message_host::daemon_dfs_pre_dispatch_test_hook(&data_dir) {
+        hook(super::message_host::DaemonDfsPreDispatchTestPoint::PlacementRecoveryOwnerAcquired, None, None)?;
+    }
     let cluster_paths = ClusterPaths::new(&data_dir);
     if !cluster_paths.state.exists() {
         return Ok(false);

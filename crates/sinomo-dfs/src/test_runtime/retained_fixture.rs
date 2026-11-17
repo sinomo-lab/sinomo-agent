@@ -328,16 +328,20 @@ fn observe_healthy_shard(
     shard: &DfsMetadataShardConfig,
     expected_prefix: &DfsMetadataPrefixProof,
     proof: Option<&DfsMetadataShardMembershipHandoffProof>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<RetainedNativeHealthyShard, String> {
     let id = DfsMetadataShardId::new(&shard.shard_id);
     let root = crate::local_dfs_metadata_shard_path(data, &id);
     let identity = retained_native_path_identity(&root, true)?;
     crate::selected_fixture::SelectedOriginalFixtureIdentity::reject_default_root(&root)
         .map_err(|e| e.to_string())?;
-    let _guard = crate::metadata_lock::try_metadata_inspection_lock(
-        root.clone(),
-        crate::metadata_cursor::journal_write_lock_path(&root),
-    )
+    let lock = crate::metadata_cursor::journal_write_lock_path(&root);
+    let _guard = match deadline {
+        Some(deadline) => {
+            crate::metadata_lock::metadata_inspection_lock_until(root.clone(), lock, deadline)
+        }
+        None => crate::metadata_lock::try_metadata_inspection_lock(root.clone(), lock),
+    }
     .map_err(|e| e.to_string())?
     .ok_or("retained healthy shard is busy or lacks its physical writer-lock file")?;
     let mut backend =
@@ -557,8 +561,14 @@ impl DfsTestRuntime {
                 &crate::runtime_host::DfsRuntimePaths::new(data),
             )
             .map_err(|e| e.to_string())?;
-            let observed =
-                observe_healthy_shard(&node.node_id, data, shard, source.prefix(), proof.as_ref())?;
+            let observed = observe_healthy_shard(
+                &node.node_id,
+                data,
+                shard,
+                source.prefix(),
+                proof.as_ref(),
+                Some(round.deadline()),
+            )?;
             if !owner.owns_backend_root(&observed.shard_root)
                 || (node.node_id == shard.primary_node_id
                     && (physical.shard_root != observed.shard_root
@@ -627,6 +637,7 @@ impl DfsTestRuntime {
                 &expected.shard,
                 &expected.prefix,
                 expected.handoff_proof.as_ref(),
+                None,
             )?;
             if observed != *shard {
                 return Err(
@@ -668,6 +679,11 @@ impl DfsTestRuntime {
             crate::service_trace::DfsPhaseTimer::new("retained-native-healthy-restart"),
         );
         if startup.is_ok() {
+            // Required post-startup observation joins a bounded local writer
+            // at its release edge. Offline validation above stays nonwaiting;
+            // neither path creates a writer or changes retained DATA.
+            let inspection_deadline =
+                std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
             let check = (|| {
                 if actual.retained_healthy_control(&expected.shard)? != expected.handoff_proof {
                     return Err("healthy assignment/proof changed during native startup".into());
@@ -698,6 +714,7 @@ impl DfsTestRuntime {
                         &expected.shard,
                         &expected.prefix,
                         expected.handoff_proof.as_ref(),
+                        Some(inspection_deadline),
                     )?;
                     let before = expected
                         .shards

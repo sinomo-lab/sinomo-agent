@@ -655,8 +655,8 @@ fn probe(
                 let data: serde_json::Value =
                     sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
                 assert!(matches!(data["state"].as_str(),
-                    Some("Waiting" | "NotPrimary" | "Requested" | "AlreadyConfigured")));
-                assert_eq!(data["mutation_attempted"], data["state"] == "Requested");
+                    Some("Waiting" | "NotPrimary" | "Requested" | "AlreadyConfigured" | "Superseded")));
+                assert_eq!(data["mutation_attempted"], matches!(data["state"].as_str(), Some("Requested" | "Superseded")));
             }
             ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
                 assert_eq!(reply.route, crate::DFS_STATUS_ROUTE);
@@ -1052,7 +1052,7 @@ fn run_native_process_case(
                     let data: serde_json::Value =
                         sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
                     membership_request_done = match data["state"].as_str() {
-                        Some("Waiting") => false, // Explicit no-effect observation only.
+                        Some("Waiting" | "Superseded") => false, // Definitive no-effect result.
                         Some("AlreadyConfigured" | "Requested") => true,
                         _ => return Err("fixture source is not the actual metadata primary".into()),
                     };

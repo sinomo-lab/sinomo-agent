@@ -1570,7 +1570,7 @@ struct SettledView {
     head: Option<crate::DfsMetadataPrefixProof>,
     original: Option<crate::DfsPreparedOperationStatus>,
     recovery: Option<crate::DfsPreparedOperationStatus>,
-    object: Option<(u32, String)>,
+    object: Option<crate::DfsObjectMetadata>,
     tables: String,
 }
 
@@ -1600,10 +1600,7 @@ fn settled_view(
         head: backend.metadata_prefix_proof().ok(),
         original: status(original),
         recovery: status(recovery),
-        object: backend
-            .get_object(object)
-            .unwrap()
-            .map(|object| (object.mode, digest(format!("{object:?}")))),
+        object: backend.get_object(object).unwrap(),
         tables: digest(format!(
             "{:?}",
             backend
@@ -1650,46 +1647,6 @@ fn assert_one_history(
         Some(crate::DfsPreparedOperationStatus::Committed)
     );
     views.into_iter().next().unwrap()
-}
-
-/// The recovery body of the first `recover:` record in `node`'s journal, and
-/// its original's operation id.
-fn recovered_operation(
-    runtime: &DfsTestRuntime,
-    node: &NodeId,
-    config: &DfsMetadataShardConfig,
-) -> (String, String) {
-    use crate::DfsMetadataBackend as _;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let recovery = loop {
-        let found = crate::LocalSobjMetadataBackend::open_for_inspection(
-            shard_id_of(config),
-            shard_root(runtime, node, config),
-        )
-        .ok()
-        .and_then(|backend| backend.journal_since(0).ok())
-        .and_then(|entries| {
-            entries.into_iter().find_map(|entry| {
-                format!("{:?}", entry.mutation)
-                    .split("operation_id: \"")
-                    .nth(1)
-                    .and_then(|rest| rest.split('"').next())
-                    .filter(|operation| operation.starts_with("recover:"))
-                    .map(str::to_string)
-            })
-        });
-        if let Some(found) = found {
-            break found;
-        }
-        assert!(Instant::now() < deadline, "{node} recovered nothing");
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let original = recovery
-        .strip_prefix("recover:")
-        .and_then(|rest| rest.rsplit_once(':'))
-        .map(|(original, _)| original.to_string())
-        .unwrap();
-    (original, recovery)
 }
 
 /// A change every member stored but whose outcome is unknown when its
@@ -1778,7 +1735,7 @@ fn native_takeover_recovered_change_reaches_one_history_everywhere() {
         &recovery,
         &current.object_id,
     );
-    assert_eq!(view.object.as_ref().map(|(mode, _)| *mode), Some(0o640));
+    assert_eq!(view.object.as_ref().map(|object| object.mode), Some(0o640));
     runtime.stop_node(&c).unwrap();
     runtime.reopen_node(c.clone()).unwrap();
     assert_one_history(
@@ -1816,13 +1773,17 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
     // batch P sends them starts with that commit record: its background
     // publication, and the prepare of the change P makes next to record the
     // write's eventual copies. Holding all of them keeps the commit on P.
+    // Compare the original write on the stopped primary with that same
+    // recovered write. A later N-W repair legitimately adds a location to
+    // the live copies and cannot update the stopped primary until rejoin.
+    let repairs = [&p, &b, &c].map(|node| runtime.hold_repair_executor(node).unwrap());
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     for member in [&b, &c] {
         runtime.install_fault(FaultRule {
             source: Some(p.clone()),
             target: Some(member.clone()),
-            route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+            route: None, // Both authenticated journal carriers can deliver the commit.
             call_id: None,
             origin: None,
             remaining_hits: 8,
@@ -1832,13 +1793,15 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
             },
         });
     }
+    let operation = sinomo_core::Id::generate().to_string();
     let written = runtime
         .client(&p)
         .unwrap()
-        .posix_write_file(
+        .posix_write_file_with_operation_id(
             "/services/own-commit/x.txt",
             b"own commit bytes",
             crate::DfsWriteOptions::replicated_eventual(vec![p.clone(), b.clone(), c.clone()]),
+            &operation,
         )
         .expect("P commits the write");
     let object = written.object_id.clone();
@@ -1854,12 +1817,11 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
     wait_until("a member takes over", &runtime, &[&b, &c], || {
         record_from(&runtime, &config, &b).shard.primary_node_id != p
     });
-    let winner = record_from(&runtime, &config, &b).shard.primary_node_id;
-    let (original, recovery) = recovered_operation(&runtime, &winner, &config);
-    assert!(
-        original.starts_with("write:"),
-        "the successor recovers the write itself, not a later change: {original}"
-    );
+    let successor = record_from(&runtime, &config, &b).shard;
+    let winner = successor.primary_node_id;
+    let intent_id = crate::intent::stable_write_intent_id(&p, &object, &operation);
+    let original = format!("write:{intent_id}");
+    let recovery = format!("recover:{original}:{}", successor.epoch);
     wait_until(
         "the successor commits the recovery",
         &runtime,
@@ -1884,6 +1846,7 @@ fn native_takeover_old_primary_own_commit_record_is_discarded_on_rejoin() {
         "the same object even before P rejoins"
     );
 
+    drop(repairs);
     runtime.reopen_node(p.clone()).unwrap();
     runtime.set_peer_verdict(&winner, &p, PeerPathVerdict::Path, false);
     wait_until("P rejoins", &runtime, &[&b, &c], || {

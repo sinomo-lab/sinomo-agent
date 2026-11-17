@@ -70,7 +70,7 @@ where
         // acquire another permit or require unrelated native owners to be idle.
         #[cfg(test)]
         let admission = Arc::new(admission);
-        let (returned_plan, attempt) = run_owned_metadata_publish_blocking(task_owner, move || {
+        let (returned_plan, attempt) = run_owned_dfs_blocking(task_owner, move || {
             // A cancelled scheduler future cannot release admission while its
             // blocking durable-view refresh is still reading the shard.
             let attempt = plan(&admission);
@@ -107,7 +107,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    run_owned_metadata_publish_blocking(task_owner, move || {
+    run_owned_dfs_blocking(task_owner, move || {
         // Tokio cannot cancel an already-running blocking closure. Retain the
         // host capability until nested async transport/cursor commits finish.
         let result = runtime.block_on(execute);
@@ -121,10 +121,10 @@ where
     })?
 }
 
-/// Keep the actual blocking child in the same host drain as its publisher.
+/// Join the actual blocking child in its component host's shutdown drain.
 /// Cancelling an async caller cannot stop a started blocking closure; its
 /// existing admission and DATA custody must live until that closure finishes.
-pub(crate) async fn run_owned_metadata_publish_blocking<T, F>(
+pub(crate) async fn run_owned_dfs_blocking<T, F>(
     task_owner: &crate::runtime_host::DfsRuntimeHost,
     execute: F,
 ) -> Result<T, tokio::sync::oneshot::error::RecvError>

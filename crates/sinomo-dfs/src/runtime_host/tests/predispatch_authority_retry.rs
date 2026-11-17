@@ -174,7 +174,8 @@ impl RetryFixture {
                     }
                     | DaemonDfsPreDispatchTestPoint::AfterMessageResponse { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeMetadataEffectPrepare { .. } => {}
-                    DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess
+                    DaemonDfsPreDispatchTestPoint::PlacementRecoveryOwnerAcquired
+                    | DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess
                     | DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess
                     | DaemonDfsPreDispatchTestPoint::AfterPreflightFence
                     | DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight

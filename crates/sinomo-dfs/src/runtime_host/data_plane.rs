@@ -345,7 +345,7 @@ where
     let cluster_paths = ClusterPaths::new(data_dir.as_ref());
     let peer_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let Some(peer_snapshot) =
-        read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, runtime, peer_deadline)
+        read_daemon_dfs_replica_owner_snapshot_before(&cluster_paths, runtime, peer_deadline)
             .await?
     else {
         return Err(DaemonError::ClusterOrphan);

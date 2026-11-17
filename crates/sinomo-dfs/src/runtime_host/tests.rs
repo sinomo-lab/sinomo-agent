@@ -8062,7 +8062,7 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
     let fs = root.file_system_id.clone();
     let configs = native.metadata_shards().unwrap();
     drop(service);
-    let mut expected = Vec::new();
+    let mut sources = Vec::new();
     for config in configs
         .iter()
         .filter(|config| matches!(config.shard_id.as_str(), "root" | "services"))
@@ -8075,13 +8075,20 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
         let installed = native
             .reassign_metadata_shard(&fs, &config.shard_id, local.clone(), members)
             .unwrap();
-        let mut source = native
+        let source = native
             .metadata_primary_service(if installed.shard_id == "root" {
                 "/"
             } else {
                 "/services"
             })
             .unwrap();
+        sources.push((source, installed));
+    }
+    // Only this explicit publisher should be able to plan the newly written
+    // suffixes. Earlier native rounds have already selected their frames.
+    let quiet_primary = native.hold_main_mutation_admission(&local).unwrap();
+    let mut expected = Vec::new();
+    for (mut source, installed) in sources {
         late_native_hidden_suffix(&mut source, &installed, 1);
         expected.push(DfsMetadataShardId::new(installed.shard_id));
     }
@@ -8106,6 +8113,7 @@ fn daemon_dfs_metadata_journal_publish_replicates_all_local_primary_shards() {
         late_native_publish_options(),
     )
     .unwrap();
+    drop(quiet_primary);
     for shard in expected {
         assert!(
             sent.lock().unwrap().contains(&shard),
@@ -9359,6 +9367,17 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
         });
         let preflight = warm.for_admission(&admission);
         let selected = (|| -> Result<_, DaemonDfsAuthorityPreExecutionError> {
+            // Own the normal global generation-preparation boundary before
+            // measuring exact-lane reuse. A current preflight alone does not
+            // roll an older resident cache forward; exact selection forbids it.
+            try_daemon_dfs_resident_metadata_backend_after_preflight(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                &preflight,
+                &runtime,
+            )?
+            .expect("actual initialized resident generation");
             let (had_root, had_services, prior_global, prior_exact_count) = {
                 let cache_slot = daemon_dfs_message_service_cache()
                     .root(&data_dir.root())

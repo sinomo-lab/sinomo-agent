@@ -9711,8 +9711,17 @@ impl NetworkedDfsService<DfsNodeTransport> {
         command: DfsMessageCommand,
         preingested_blob: Option<ContentStoreQuarantinedBlob>,
     ) -> DfsMessageProcessReport {
+        self.process_message_command_report_with_continuation(command, preingested_blob, None)
+    }
+
+    pub(crate) fn process_message_command_report_with_continuation(
+        &mut self,
+        command: DfsMessageCommand,
+        preingested_blob: Option<ContentStoreQuarantinedBlob>,
+        prepared: Option<&crate::DfsPreparedOperationDigest>,
+    ) -> DfsMessageProcessReport {
         self.begin_message_committed_work();
-        let outcome = self.process_message_command_inner(command, preingested_blob);
+        let outcome = self.process_message_command_inner(command, preingested_blob, prepared);
         // A completed repair wait's deadline belongs to this re-run only,
         // whether or not it reached the file sync, as after a redirect.
         self.file_sync_wait_deadline = None;
@@ -9778,9 +9787,17 @@ impl NetworkedDfsService<DfsNodeTransport> {
         &mut self,
         command: DfsMessageCommand,
         preingested_blob: Option<ContentStoreQuarantinedBlob>,
+        prepared: Option<&crate::DfsPreparedOperationDigest>,
     ) -> Result<DfsMessageProcessResult, DfsError> {
-        if !matches!(&command.routed_message.message, DfsNetworkMessage::StageBlob(_)) {
-            return self.process_message_with_current_callbacks(command, preingested_blob);
+        if !matches!(
+            &command.routed_message.message,
+            DfsNetworkMessage::StageBlob(_)
+        ) {
+            return self.process_message_with_current_callbacks(
+                command,
+                preingested_blob,
+                prepared,
+            );
         }
         // A prior Routine turn can retain a Fetch response whose receipt needs
         // authority from this Stage sender. It belongs to the same lane's next
@@ -9792,7 +9809,8 @@ impl NetworkedDfsService<DfsNodeTransport> {
         // This synchronous Result boundary includes every typed failure and
         // cancellation. Only current-Stage callbacks enter the ordinary drain
         // and finish; restore the preexisting custody before returning either.
-        let result = self.process_message_with_current_callbacks(command, preingested_blob);
+        let result =
+            self.process_message_with_current_callbacks(command, preingested_blob, prepared);
         self.transport.incoming_messages.extend(incoming);
         if let Some(inbound) = inbound {
             self.transport.served_mut().inbound_messages.extend(inbound);
@@ -9817,12 +9835,30 @@ impl NetworkedDfsService<DfsNodeTransport> {
         &mut self,
         command: DfsMessageCommand,
         preingested_blob: Option<ContentStoreQuarantinedBlob>,
+        prepared: Option<&crate::DfsPreparedOperationDigest>,
     ) -> Result<DfsMessageProcessResult, DfsError> {
         let request_id = command.request_id;
         self.transport
             .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
-        let initial = if let Some(blob) = preingested_blob {
+        let initial = if let Some(prepared) = prepared {
+            match command.routed_message.message {
+                DfsNetworkMessage::DistributedWriteRequest(write)
+                | DfsNetworkMessage::ExclusiveCreateRequest(write)
+                    if preingested_blob.is_none() =>
+                {
+                    self.resume_prepared_routed_write(
+                        command.routed_message.source_node_id,
+                        write,
+                        prepared,
+                    )
+                    .map(|event| vec![event])
+                }
+                _ => Err(DfsError::Metadata {
+                    message: "prepared write continuation used for another message".into(),
+                }),
+            }
+        } else if let Some(blob) = preingested_blob {
             let routed = command.routed_message;
             if routed.target_node_id != self.node_id {
                 Err(DfsError::Network {

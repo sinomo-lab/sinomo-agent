@@ -87,25 +87,25 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
     );
     runtime.checkpoint_rpc_observation_window().unwrap();
     let setup_deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
-    // Inspect the same live shard incrementally while constructing the corpus.
-    // Reopening all shards after each write would replay the entire growing
-    // table log as fixture work. This read-only handle owns no writer authority.
-    let mut setup_inspection = LocalSobjMetadataBackend::open_for_inspection(
-        shard_id.clone(),
-        crate::local_dfs_metadata_shard_path(runtime.data_dir(&source), &shard_id),
-    )
-    .unwrap();
+    // Each ordinary W=1 write appends a prepare and a commit.
+    // Size the setup from the observed starting cut, then verify the actual
+    // final prefix. There is no need to materialize an inspection image after
+    // every intermediate write just to decide whether to write the next one.
+    let shard_root = crate::local_dfs_metadata_shard_path(runtime.data_dir(&source), &shard_id);
+    let initial_sequence =
+        LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &shard_root)
+            .unwrap()
+            .metadata_prefix_proof()
+            .unwrap()
+            .journal_sequence;
+    let limit = DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64;
+    let mutations = limit.saturating_sub(initial_sequence) / 2 + 1;
     writer.set_transport_operation_deadline(Some(setup_deadline));
     let mut last = None;
-    let mut mutations = 0;
-    // This corpus crosses the production suffix bound using normal committed
-    // writes. Its count and setup window are fixed, not a search for a race.
-    for index in 0..=DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT {
+    for index in 0..mutations {
         assert!(
             Instant::now() < setup_deadline,
-            "bounded real journal setup expired after {mutations} writes; current prefix {:?}, required > {}",
-            setup_inspection.metadata_prefix_proof().unwrap(),
-            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
+            "bounded real journal setup expired after {index} of {mutations} writes from prefix {initial_sequence}, required > {limit}"
         );
         last = Some(
             writer
@@ -121,25 +121,31 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
                 )
                 .unwrap(),
         );
-        mutations += 1;
-        if mutations % 4 == 0 {
+        if (index + 1) % 4 == 0 {
             runtime.checkpoint_rpc_observation_window().unwrap();
         }
-        setup_inspection.refresh_for_inspection().unwrap();
-        if setup_inspection.metadata_prefix_proof().unwrap().journal_sequence
-            > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
-        {
-            break;
-        }
     }
-    // Do not carry any setup inspection state across the physical fault or
-    // cold-owner reopen; all subsequent proofs use freshly selected roots.
-    drop(setup_inspection);
+    {
+        let _fence = crate::metadata_lock::metadata_inspection_lock_until(
+            shard_root.clone(),
+            crate::metadata_cursor::journal_write_lock_path(&shard_root),
+            setup_deadline,
+        )
+        .unwrap()
+        .expect("inspect the source prefix within its setup deadline");
+        let prefix = crate::metadata_journal::admission::current_owned_materialized_prefix(
+            &shard_root, &shard_id,
+        )
+        .unwrap()
+        .unwrap_or_else(|| {
+            LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &shard_root)
+                .unwrap()
+                .metadata_prefix_proof()
+                .unwrap()
+        });
+        assert!(prefix.journal_sequence > limit);
+    }
     let last = last.unwrap();
-    assert!(
-        read_prefix(&runtime, &source).journal_sequence
-            > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
-    );
     assert!(Instant::now() < setup_deadline);
     runtime.checkpoint_rpc_observation_window().unwrap();
     let predecessor_operation = sinomo_core::Id::generate().to_string();
@@ -395,6 +401,16 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
         &operation,
     );
     let create_returned = Instant::now();
+    let snapshot_attempts = runtime
+        .rpc_observations()
+        .into_iter()
+        .filter(|event| {
+            event.source == source
+                && event.target == lagging
+                && event.phase == crate::test_runtime::RpcPhase::Constructed
+                && event.route.ends_with("/metadata/snapshot-install")
+        })
+        .count();
     requester.set_transport_operation_deadline(previous_deadline);
     assert_eq!(requester.transport.operation_deadline(), previous_deadline);
     runtime.checkpoint_rpc_observation_window().unwrap();
@@ -426,6 +442,7 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
             "operation": operation, "result": format!("{result:?}"), "preparations": preparations,
             "create_elapsed_ms": create_returned.duration_since(create_started).as_millis(),
             "create_budget_ms": sinomo_core::network::DEFAULT_NETWORK_TIMEOUT.as_millis(),
+            "actual_snapshot_attempts": snapshot_attempts,
             "create_returned_within_original_deadline": create_returned < deadline,
             "prior_transport_deadline_restored": previous_deadline.is_some(),
             "required_shard": active, "missing_commit": commit,
@@ -449,6 +466,10 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
         create_returned < deadline,
         "the one create must return inside its original five-second deadline"
     );
+    assert!(
+        snapshot_attempts <= 1,
+        "the original durability barrier must own repair without duplicate snapshots: {snapshot_attempts}"
+    );
     let proof_dump = runtime
         .data_dir(&source)
         .root()
@@ -468,6 +489,28 @@ fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
                 && event["facts"]["digest"]["operation_id"] == sealed_operation
         })
         .expect("the critical create has its actual durable original commit")["facts"]["digest"];
+    assert!(
+        proof["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "participant-final-result"
+                && event["facts"]["actual_batch_selections"]
+                    .as_array()
+                    .is_some_and(|selections| {
+                        selections.iter().any(|selection| {
+                            selection["replicated_through_sequence"].as_u64() == Some(0)
+                                && selection["target_node_ids"]
+                                    .as_array()
+                                    .is_some_and(|nodes| {
+                                        nodes.contains(&serde_json::json!(&lagging))
+                                    })
+                                && selection["actual_first_selected_sequence"].as_u64()
+                                    == Some(missing_sequence)
+                                && selection["actual_last_selected_sequence"]
+                                    == committed_digest["prepare_sequence"]
+                        })
+                    })
+        }),
+        "the original challenge carries the actual preceding commit despite the lost hint"
+    );
     assert!(
         proof["events"].as_array().unwrap().iter().any(|event| {
             if event["kind"] != "authorization-participants"

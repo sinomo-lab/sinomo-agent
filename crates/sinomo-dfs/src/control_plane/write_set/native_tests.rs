@@ -95,8 +95,14 @@ fn native_dormant_write_set_gate_switch_reduction_and_lost_swap_reply() {
         "replication",
     );
 
-    // Dormant: nothing advertises the capability, so nothing can switch, and
-    // no write-set state exists on any member.
+    // Model the older member advertisements explicitly. Current Main supports
+    // write sets, but a mixed-capability assignment must still refuse switching.
+    for node in members(&config) {
+        runtime
+            .withhold_metadata_write_set_capability(&node)
+            .unwrap();
+    }
+    // No write-set state exists on any member before the guarded switch.
     let dormant = cut(&runtime, &primary, &config);
     assert_eq!(
         dormant.write_set_state(),

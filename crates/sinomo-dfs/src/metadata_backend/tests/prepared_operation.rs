@@ -2650,7 +2650,7 @@ fn native_replay_validation_keeps_mutable_record_checks_and_releases_body_custod
     with_prepared_payload_validation(|| {
         reset_prepared_payload_digest_count();
         actual.validate().unwrap();
-        actual.validate().unwrap();
+        with_prepared_payload_validation(|| actual.validate().unwrap());
         assert_eq!(prepared_payload_digest_count(), 1);
         let mut changed_scope = actual.clone();
         changed_scope.digest.owner_epoch += 1;

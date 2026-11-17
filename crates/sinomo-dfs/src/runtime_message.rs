@@ -1099,6 +1099,7 @@ pub(crate) fn existing_fetch_response_service_lane(
 
 #[derive(Debug)]
 pub(crate) struct DfsRuntimeMessageExecution {
+    pub prepared_write: Option<crate::DfsPreparedOperationDigest>,
     pub remote_namespace_phase: Option<(
         DfsMessageCommand,
         Box<crate::source_adoption::RemoteNamespacePhase>,
@@ -1138,6 +1139,8 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
     stage_shard: Option<ResidentLocalMetadataShardHandle>,
+    prepared: Option<crate::DfsPreparedOperationDigest>,
+    retained_write_command: Option<&DfsMessageCommand>,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError> {
     let completes_fetch = matches!(
         &command.routed_message.message,
@@ -1222,6 +1225,14 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
         crate::DfsNetworkMessage::NamespaceRequest(_)
     )
     .then(|| command.clone());
+    let write_command =
+        retained_write_command.and_then(|command| match &command.routed_message.message {
+            DfsNetworkMessage::DistributedWriteRequest(write)
+            | DfsNetworkMessage::ExclusiveCreateRequest(write) => {
+                Some((&command.routed_message.source_node_id, write))
+            }
+            _ => None,
+        });
     let process_started = std::time::Instant::now();
     let committed_work_tracker = crate::DfsCommittedWorkTracker::new();
     service_lane
@@ -1233,8 +1244,61 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
             .process_verified_blob_fetch_report(command, verified),
         None => service_lane
             .service
-            .process_message_command_report_with_native_return(command, preingested_blob),
+            .process_message_command_report_with_continuation(
+                command,
+                preingested_blob,
+                prepared.as_ref(),
+            ),
     };
+    let prepared_write = write_command.and_then(|(requester, write)| {
+        let (operation_id, cause) = match &process_report.outcome {
+            Err(crate::DfsError::MetadataCommitOutcomeUnknown {
+                operation_id,
+                cause,
+                current_primary_node_id: None,
+                ..
+            }) => (operation_id, cause),
+            Ok(report) => report
+                .response
+                .outbound_messages
+                .iter()
+                .find_map(|message| {
+                    let DfsNetworkMessage::DistributedWriteResponse(response) = &message.message
+                    else {
+                        return None;
+                    };
+                    if message.target_node_id != *requester
+                        || response.request_id != write.request_id
+                        || response.object_id != write.request.object_id
+                    {
+                        return None;
+                    }
+                    match &response.result {
+                        crate::DfsDistributedWriteResult::CommitOutcomeUnknown {
+                            operation_id,
+                            cause,
+                            current_primary_node_id: None,
+                            ..
+                        } => Some((operation_id, cause)),
+                        _ => None,
+                    }
+                })?,
+            _ => return None,
+        };
+        if !matches!(
+            cause,
+            crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing { .. }
+                | crate::DfsCommitOutcomeUnknownCause::BelowWriteSetFloor { .. }
+                | crate::DfsCommitOutcomeUnknownCause::ReplicationBelowIntent { .. }
+        ) {
+            return None;
+        }
+        service_lane
+            .service
+            .prepared_routed_write_continuation(requester, write, operation_id)
+            .ok()
+            .flatten()
+    });
     if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {
         match &process_report.outcome {
             Ok(result) => tracing::trace!(target: "sinomo.dfs.perf",
@@ -1356,6 +1420,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     let process = process_started.elapsed();
     drop(service_lane);
     Ok(DfsRuntimeMessageExecution {
+        prepared_write,
         remote_namespace_phase,
         process_report,
         committed_work,

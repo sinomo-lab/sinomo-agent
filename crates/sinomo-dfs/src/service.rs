@@ -1477,7 +1477,14 @@ impl Service for DfsDataPlaneService {
                         )));
                     }
                     #[cfg(any(test, feature = "test-support"))]
-                    crate::test_runtime::observe_decoded_namespace_call(&command);
+                    {
+                        crate::test_runtime::observe_decoded_namespace_call(&command);
+                        if let crate::DfsNetworkMessage::MetadataJournalBatch(batch) =
+                            &command.routed_message.message
+                        {
+                            crate::test_runtime::pause_decoded_write_commit_publication(batch).await?;
+                        }
+                    }
                     let message_response = service
                         .host
                         .handle_message(command, attachment, traceparent, encoded_value_bytes)
