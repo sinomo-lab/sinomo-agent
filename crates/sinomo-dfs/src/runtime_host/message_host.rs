@@ -3227,6 +3227,8 @@ pub(super) struct DaemonDfsUnexecutedMessage {
     preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", skip_all,
+    fields(stage = "dfs.content.fetch_authorization", view = tracing::field::Empty))]
 pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -3273,9 +3275,35 @@ pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
         DaemonDfsMessageLaneSelection::Ready(lane, _) => lane,
         DaemonDfsMessageLaneSelection::AuthorityPreflightStale(_) => return Ok(None),
     };
+    let key = DaemonDfsMutationLaneKey {
+        file_system_id: stamped.file_system_id.clone(),
+        shard_id: sinomo_dfs::DfsMetadataShardId(stamped.shard_id.clone()),
+    };
+    let resident = daemon_dfs_message_cache_exact_admission_handle(
+        data_dir,
+        cluster_paths,
+        peer,
+        &key,
+        runtime,
+    )?
+    .map(|handle| handle.try_checkout_open())
+    .transpose()?
+    .flatten();
+    tracing::Span::current().record(
+        "view",
+        if resident.is_some() {
+            "resident"
+        } else {
+            "inspection"
+        },
+    );
+    // A maintenance owner may have checked out the shard. Preserve the guarded
+    // inspection path in that case; a content read must not wait for the owner
+    // whose progress can itself require this fetch.
     let verified = match crate::local_state::with_current_owned_dfs_shard_inspection(
         data_dir,
         &sinomo_dfs::DfsMetadataShardId(stamped.shard_id.clone()),
+        resident.as_ref(),
         |backend| {
             let Ok(lane) = lane.try_lock() else {
                 return Ok(None);

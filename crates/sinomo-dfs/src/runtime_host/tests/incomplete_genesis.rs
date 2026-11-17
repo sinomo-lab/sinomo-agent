@@ -786,6 +786,7 @@ fn native_held_genesis_preserves_unrelated_ready_scope_mutation_and_owner_comple
             let observed = crate::local_state::with_current_owned_dfs_shard_inspection(
                 native.data_dir(&primary),
                 &ready_id,
+                None,
                 |backend| {
                     backend
                         .get_object_by_path(&ready.file_system_id, path)
@@ -1415,6 +1416,7 @@ fn native_component_reopen_preserves_held_genesis_until_same_owner_completion() 
             let object = crate::local_state::with_current_owned_dfs_shard_inspection(
                 native.data_dir(&primary),
                 &DfsMetadataShardId::new(&shard.shard_id),
+                None,
                 |backend| {
                     backend
                         .get_object_by_path(&shard.file_system_id, &path)
