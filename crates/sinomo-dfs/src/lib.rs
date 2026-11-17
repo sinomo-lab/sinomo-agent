@@ -64,18 +64,19 @@ mod storage_generation;
 pub use storage_generation::{DfsMetadataGenerationIdentity, DfsMetadataGenerationOrigin, DfsMetadataGenerationSeal};
 pub use storage_generation::{DfsMetadataGenerationHeader, DfsMetadataGenerationState, inspect_metadata_storage_generation};
 pub use storage_generation::{
-    DFS_METADATA_SHARD_STORAGE_FORMAT, DfsMetadataConversionSource, DfsMetadataShardActivation,
-    DfsMetadataShardConversion, DfsMetadataShardStorage, DfsMetadataShardStorageState,
-    metadata_shard_conversion_attempt_id, metadata_shard_converted_generation,
-    metadata_shard_storage_activation_digest,
+    DFS_METADATA_SHARD_STORAGE_FORMAT, DfsMetadataConversionSource, DfsMetadataConversionTakeover,
+    DfsMetadataShardActivation, DfsMetadataShardConversion, DfsMetadataShardStorage,
+    DfsMetadataShardStorageState, metadata_shard_conversion_attempt_id,
+    metadata_shard_converted_generation, metadata_shard_storage_activation_digest,
 };
 #[cfg(feature = "storage-conversion")]
 pub use storage_generation::{
-    DfsMetadataShardStorageCut, build_metadata_shard_storage_activate,
-    build_metadata_shard_storage_converting,
+    DfsMetadataShardStorageCut, DfsMetadataShardStorageMember,
+    build_metadata_shard_storage_activate, build_metadata_shard_storage_converting,
+    build_metadata_shard_storage_seal, build_metadata_shard_storage_takeover_activate,
 };
 #[cfg(feature = "storage-conversion")]
-pub use storage_generation::activate_metadata_storage_generation;
+pub use storage_generation::{activate_metadata_shard_storage, activate_metadata_storage_generation};
 #[cfg(feature = "storage-conversion")]
 pub use storage_generation::{DfsStandaloneStorageActivationWitness, activate_standalone_metadata_storage_generation};
 pub use storage_preparation::{

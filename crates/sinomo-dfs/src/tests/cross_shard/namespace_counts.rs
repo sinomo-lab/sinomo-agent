@@ -991,3 +991,179 @@ fn cross_shard_directory_move_keeps_a_page_whose_alias_target_shard_converts() {
     drop(kv);
     cluster.close();
 }
+
+#[test]
+fn cross_shard_global_operations_serve_beside_a_closed_shard_copy() {
+    // Every node holds a copy of every shard, and root and users share their
+    // primary: that node's global checkout covers both slots.
+    let mut cluster = sifs_two_primary_cluster("native-global-beside-closed-shard");
+    let owner = cluster.users_primary_node.clone();
+    let shards = cluster._runtime.metadata_shards().unwrap();
+    for shard in ["root", "users"] {
+        let config = shards
+            .iter()
+            .find(|config| config.shard_id == shard)
+            .unwrap();
+        assert_eq!(config.primary_node_id, owner, "{shard}");
+        assert_eq!(config.replica_node_ids.len(), 2, "{shard}");
+    }
+    let nodes = [
+        cluster.users_primary_node.clone(),
+        cluster.services_primary_node.clone(),
+        cluster.replica_node.clone(),
+    ];
+    let options = || DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]);
+    let beside = "/beside-closed";
+    let beside_renamed = "/beside-closed-renamed";
+    let closed = "/users/closed-file";
+    let closed_renamed = "/users/closed-file-renamed";
+    cluster
+        .replica
+        .posix_write_file(beside, b"root bytes", options())
+        .unwrap();
+    cluster
+        .replica
+        .posix_write_file(closed, b"users bytes", options())
+        .unwrap();
+
+    let mut kv = cluster._runtime.configuration_publisher(&owner);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    // A rename is globally admitted. This one addresses only root, which the
+    // closed users slot on the same node does not stop.
+    cluster
+        .replica
+        .posix_rename(beside, beside_renamed)
+        .unwrap();
+    assert!(node_store_object_at(&cluster._runtime, &owner, beside_renamed).is_some());
+    assert!(node_store_object_at(&cluster._runtime, &owner, beside).is_none());
+
+    // A globally admitted operation that addresses the closed shard still
+    // meets its storage refusal.
+    let refused = cluster.replica.posix_rename(closed, closed_renamed);
+    assert!(
+        matches!(&refused, Err(error)
+            if error.to_string().contains("metadata shard storage is converting")),
+        "a rename inside the closed shard refuses: {refused:?}"
+    );
+
+    replace_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        &converting,
+        active.value.clone(),
+    );
+    cluster
+        .replica
+        .posix_rename(closed, closed_renamed)
+        .unwrap();
+    assert!(node_store_object_at(&cluster._runtime, &owner, closed_renamed).is_some());
+    assert!(node_store_object_at(&cluster._runtime, &owner, closed).is_none());
+    drop(kv);
+    cluster.close();
+}
+
+#[test]
+fn cross_shard_directory_move_parked_on_a_converting_target_resumes_when_it_activates() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-tree-move-target-activation-wake");
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let canonical = "/users/tree-activation-target";
+    let from = "/activation-tree";
+    let to = "/services/activation-tree";
+    let alias = format!("{from}/alias");
+    let options = || DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]);
+    cluster.replica.posix_mkdir_all(from).unwrap();
+    cluster
+        .replica
+        .posix_write_file(canonical, b"tree target bytes", options())
+        .unwrap();
+    cluster.replica.posix_hardlink(canonical, &alias).unwrap();
+    let linked = cluster
+        .replica
+        .posix_namespace_lstat_distributed(&alias)
+        .unwrap();
+
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let (active, converting) =
+        close_shard_for_conversion(&cluster._runtime, kv.as_mut(), &nodes, "users");
+    let parked = cluster.replica.posix_rename(from, to);
+    assert!(
+        matches!(&parked, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "the move waits on its carried alias's target shard: {parked:?}"
+    );
+    // Every wake the move emitted precedes its reply. Once the coordinator's
+    // maintenance has finished its last pass and launched no other, the
+    // parked job has no earlier wake left: its next routine retry is at least
+    // 5 s out (30 s for a pass that still has work).
+    let root = cluster._runtime.data_dir(&root_node).root();
+    let passes = || {
+        use crate::maintenance::phase_runs::{FULL_TICK_COMPLETION, FULL_TICK_LAUNCH, count};
+        (
+            count(&root, FULL_TICK_LAUNCH),
+            count(&root, FULL_TICK_COMPLETION),
+        )
+    };
+    let settle_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut previous = passes();
+    let mut settled_polls = 0;
+    while settled_polls < 5 {
+        assert!(
+            Instant::now() < settle_deadline,
+            "the coordinator's maintenance never settled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        let current = passes();
+        settled_polls = if current == previous && current.0 == current.1 {
+            settled_polls + 1
+        } else {
+            0
+        };
+        previous = current;
+    }
+    assert_eq!(
+        directory_move_job(&cluster._runtime, &root_node, from).status,
+        DfsNamespaceJobStatus::Running
+    );
+
+    replace_shard_storage(
+        &cluster._runtime,
+        kv.as_mut(),
+        &nodes,
+        &converting,
+        active.value.clone(),
+    );
+    // No maintenance pass is invoked here. The coordinator observing the
+    // record's activation wakes its maintenance, which resumes the job well
+    // before that routine retry.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while directory_move_job(&cluster._runtime, &root_node, from).status
+        == DfsNamespaceJobStatus::Running
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the parked move did not resume on the activation: {:?}",
+            directory_move_job(&cluster._runtime, &root_node, from)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        directory_move_job(&cluster._runtime, &root_node, from).status,
+        DfsNamespaceJobStatus::Completed
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_namespace_lstat_distributed(&format!("{to}/alias"))
+            .unwrap()
+            .object_id,
+        linked.object_id
+    );
+    assert!(node_store_object_at(&cluster._runtime, &root_node, &alias).is_none());
+    assert!(
+        node_store_object_at(&cluster._runtime, &services_node, &format!("{to}/alias")).is_some()
+    );
+    drop(kv);
+    cluster.close();
+}

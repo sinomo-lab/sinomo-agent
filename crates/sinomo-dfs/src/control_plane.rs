@@ -6057,7 +6057,10 @@ async fn metadata_prepared_operation_admission_compares_async(
     Ok(compares)
 }
 
-fn metadata_prepared_operation_member_compares(
+/// One assigned node's exact member and capability-policy compares, refusing
+/// a node that does not advertise and permit `required_capability` and the
+/// storage generation capability.
+pub(crate) fn metadata_prepared_operation_member_compares(
     desired: &DfsMetadataShardConfig,
     node_id: &NodeId,
     member_key: String,
@@ -6461,7 +6464,9 @@ pub(crate) fn topology_preserving_metadata_shard_replicas(
     )
 }
 
-fn metadata_shard_primary_handoff_target(
+/// `retiring` with `new_primary`, an existing member, as primary at the next
+/// epoch and the configured members preserved in ring order.
+pub(crate) fn metadata_shard_primary_handoff_target(
     retiring: &DfsMetadataShardConfig,
     new_primary: &NodeId,
 ) -> Result<DfsMetadataShardConfig, KvError> {

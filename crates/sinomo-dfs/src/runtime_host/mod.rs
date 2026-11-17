@@ -3320,6 +3320,13 @@ impl sinomo_dfs::DfsMetadataAuthorityHost for DaemonDfsMetadataAuthorityHost {
             None,
         );
     }
+
+    /// Namespace work parked on a closed shard (a move whose carried alias
+    /// targets it) resumes in a maintenance pass. Wake one now rather than
+    /// leave it to the routine retry of a pass that still has work.
+    fn shard_storage_activated(&self) {
+        notify_daemon_dfs_maintenance_work(&self.data_dir);
+    }
 }
 
 fn daemon_dfs_metadata_authority_host(

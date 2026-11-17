@@ -25,6 +25,13 @@ pub enum MetadataBackendError {
         root: PathBuf,
         processed_records: usize,
     },
+    /// The shard's storage record names a conversion in progress, so its
+    /// slot stays closed until that conversion activates. The message keeps
+    /// the wording callers and operators already see for this refusal.
+    #[error(
+        "metadata serialization error: metadata shard storage is converting; the shard stays closed until its conversion activates"
+    )]
+    StorageConverting,
     #[error("storage preparation caller budget exhausted during {work}")]
     PreparationBudgetExhausted { work: &'static str },
     #[error("original {family} {identity} has no immutable source custody for {requirement}")]

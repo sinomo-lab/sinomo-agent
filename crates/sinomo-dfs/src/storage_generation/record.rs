@@ -54,17 +54,49 @@ pub enum DfsMetadataShardActivation {
 
 /// One per-shard conversion attempt. Its identity binds the serving record it
 /// runs under, so a takeover or rotation supersedes it.
+///
+/// The attempt is recorded Converting before its image exists, so its target
+/// is fixed before any count contribution is read. The image's seal and the
+/// contributions digest are added together once the image is built
+/// (`build_metadata_shard_storage_seal`); an Active attempt always has both.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DfsMetadataShardConversion {
     pub attempt_id: String,
+    /// Epoch of the serving record the attempt runs under.
     pub epoch: u64,
+    /// The node that converts from its own copy: the shard's primary, or for
+    /// a takeover attempt the member that becomes primary when it activates.
     pub primary_node_id: NodeId,
+    /// Present when a member converts a closed shard whose primary is lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover: Option<DfsMetadataConversionTakeover>,
     pub source: DfsMetadataConversionSource,
     /// The exact current image every holder installs and activates.
-    pub seal: DfsMetadataGenerationSeal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<DfsMetadataGenerationSeal>,
     /// Digest of the count contributions the image was built from.
-    pub contributions_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contributions_digest: Option<String>,
+}
+
+/// A converting takeover: the attempt's converter is a member other than the
+/// primary, and the attempt's activation makes it primary at the next epoch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMetadataConversionTakeover {
+    /// The lost primary: the shard's primary at the attempt's epoch.
+    pub previous_primary: NodeId,
+}
+
+impl DfsMetadataShardConversion {
+    /// The image seal and contributions digest, once the attempt is sealed.
+    pub fn sealed(&self) -> Option<(&DfsMetadataGenerationSeal, &str)> {
+        match (&self.seal, &self.contributions_digest) {
+            (Some(seal), Some(digest)) => Some((seal, digest)),
+            _ => None,
+        }
+    }
 }
 
 /// The source copy one attempt converts. The shard is closed while it
@@ -91,8 +123,10 @@ fn invalid(message: &str) -> MetadataBackendError {
 }
 
 /// Identity of one conversion attempt: the shard's storage identity, the
-/// serving record it runs under and the source copy it converts. A restart on
-/// the same primary at the same epoch derives the same attempt.
+/// serving record it runs under, its converter and the source copy it
+/// converts. A restart on the same primary at the same epoch derives the same
+/// attempt. A takeover attempt also binds the lost primary under its own
+/// domain, so it never equals an attempt of the primary itself.
 pub fn metadata_shard_conversion_attempt_id(
     file_system_id: &DfsFileSystemId,
     shard_id: &str,
@@ -100,18 +134,33 @@ pub fn metadata_shard_conversion_attempt_id(
     epoch: u64,
     primary_node_id: &NodeId,
     source: &DfsMetadataConversionSource,
+    takeover: Option<&DfsMetadataConversionTakeover>,
 ) -> Result<String> {
-    blake3_digest(&(
-        "dfs-shard-conversion-attempt-v1",
-        file_system_id,
-        shard_id,
-        assignment,
-        epoch,
-        primary_node_id,
-        &source.source_identity,
-        source.source_journal_sequence,
-        &source.source_state_fingerprint,
-    ))
+    match takeover {
+        None => blake3_digest(&(
+            "dfs-shard-conversion-attempt-v1",
+            file_system_id,
+            shard_id,
+            assignment,
+            epoch,
+            primary_node_id,
+            &source.source_identity,
+            source.source_journal_sequence,
+            &source.source_state_fingerprint,
+        )),
+        Some(takeover) => blake3_digest(&(
+            "dfs-shard-conversion-takeover-attempt-v1",
+            file_system_id,
+            shard_id,
+            assignment,
+            epoch,
+            primary_node_id,
+            &takeover.previous_primary,
+            &source.source_identity,
+            source.source_journal_sequence,
+            &source.source_state_fingerprint,
+        )),
+    }
 }
 
 /// The generation identity a conversion attempt produces.
@@ -133,11 +182,16 @@ pub fn metadata_shard_converted_generation(
     }
 }
 
-/// Activation digest every holder of a converted generation records.
+/// Activation digest every holder of a converted generation records. It
+/// covers the sealed attempt, so it binds the exact image and contributions;
+/// an unsealed attempt has none.
 pub fn metadata_shard_storage_activation_digest(
     generation: &DfsMetadataGenerationIdentity,
     attempt: &DfsMetadataShardConversion,
 ) -> Result<String> {
+    if attempt.sealed().is_none() {
+        return Err(invalid("an unsealed conversion attempt cannot activate"));
+    }
     Ok(format!(
         "blake3:{}",
         blake3_digest(&("dfs-shard-storage-activation-v1", generation, attempt))?
@@ -193,7 +247,7 @@ impl DfsMetadataShardStorage {
         }
     }
 
-    /// A Converting record for `attempt`, which must already carry its seal.
+    /// A Converting record for `attempt`, sealed or not.
     pub fn converting(
         shard: &DfsMetadataShardConfig,
         attempt: DfsMetadataShardConversion,
@@ -213,8 +267,8 @@ impl DfsMetadataShardStorage {
         }
     }
 
-    /// A Converting record of a well-formed attempt under `shard`'s current
-    /// serving record, for tests.
+    /// A sealed Converting record of a well-formed attempt under `shard`'s
+    /// current serving record, for tests.
     #[cfg(test)]
     pub(crate) fn converting_for_test(shard: &DfsMetadataShardConfig, sequence: u64) -> Self {
         let source = DfsMetadataConversionSource {
@@ -227,15 +281,16 @@ impl DfsMetadataShardStorage {
         };
         let attempt_id = metadata_shard_conversion_attempt_id(
             &shard.file_system_id, &shard.shard_id, &shard.assignment, shard.epoch,
-            &shard.primary_node_id, &source,
+            &shard.primary_node_id, &source, None,
         )
         .expect("serializable attempt");
         Self::converting(shard, DfsMetadataShardConversion {
             attempt_id,
             epoch: shard.epoch,
             primary_node_id: shard.primary_node_id.clone(),
+            takeover: None,
             source,
-            seal: DfsMetadataGenerationSeal {
+            seal: Some(DfsMetadataGenerationSeal {
                 prefix_proof: crate::DfsMetadataPrefixProof {
                     version: 2,
                     journal_sequence: sequence,
@@ -243,8 +298,8 @@ impl DfsMetadataShardStorage {
                 },
                 state_fingerprint: "image-state".into(),
                 file_fingerprint: "image-file".into(),
-            },
-            contributions_digest: "c".repeat(64),
+            }),
+            contributions_digest: Some("c".repeat(64)),
         })
     }
 
@@ -295,6 +350,7 @@ impl DfsMetadataShardStorage {
             attempt.epoch,
             &attempt.primary_node_id,
             &attempt.source,
+            attempt.takeover.as_ref(),
         )?;
         if attempt.attempt_id != expected_attempt
             || self.generation
@@ -303,13 +359,24 @@ impl DfsMetadataShardStorage {
                     &self.shard_id,
                     &attempt.attempt_id,
                 )
-            || attempt.seal.prefix_proof.version != 2
-            || !attempt.seal.prefix_proof.is_well_formed()
-            || attempt.seal.state_fingerprint.is_empty()
-            || attempt.seal.file_fingerprint.is_empty()
-            || attempt.contributions_digest.is_empty()
+            || attempt
+                .takeover
+                .as_ref()
+                .is_some_and(|takeover| takeover.previous_primary == attempt.primary_node_id)
         {
             return Err(invalid("conversion attempt differs from its derived identity"));
+        }
+        // An unsealed attempt is valid only while Converting; the Active
+        // branch above already refused one through its activation digest.
+        match (&attempt.seal, &attempt.contributions_digest) {
+            (None, None) => {}
+            (Some(seal), Some(contributions_digest))
+                if seal.prefix_proof.version == 2
+                    && seal.prefix_proof.is_well_formed()
+                    && !seal.state_fingerprint.is_empty()
+                    && !seal.file_fingerprint.is_empty()
+                    && !contributions_digest.is_empty() => {}
+            _ => return Err(invalid("conversion attempt has a malformed or partial seal")),
         }
         Ok(())
     }
@@ -335,6 +402,21 @@ impl DfsMetadataShardStorage {
         match &self.state {
             DfsMetadataShardStorageState::Converting { attempt } => Some(attempt),
             DfsMetadataShardStorageState::Active { .. } => None,
+        }
+    }
+
+    /// The attempt that activated a converted generation, with its
+    /// activation digest.
+    pub fn converted_activation(&self) -> Option<(&DfsMetadataShardConversion, &str)> {
+        match &self.state {
+            DfsMetadataShardStorageState::Active {
+                activation:
+                    DfsMetadataShardActivation::Converted {
+                        attempt,
+                        activation_digest,
+                    },
+            } => Some((attempt, activation_digest)),
+            _ => None,
         }
     }
 
@@ -397,11 +479,18 @@ pub use transactions::*;
 
 #[cfg(feature = "storage-conversion")]
 mod transactions {
-    //! The two per-shard storage transactions. Each compares only the shard's
-    //! own keys: its serving record, write set, pending handoff and storage
-    //! record, plus the member records the caller admits. Neither compares nor
+    //! The per-shard storage transactions. Each compares only the shard's own
+    //! keys: its serving record, write set, pending handoff and storage
+    //! record, plus the member records the caller admits. None compares or
     //! writes the filesystem configuration or its catalog generation.
+    //!
+    //! An attempt is recorded Converting unsealed, then sealed with its
+    //! image, then activated. A primary's own attempt activates with
+    //! [`build_metadata_shard_storage_activate`]. A takeover attempt activates
+    //! with [`build_metadata_shard_storage_takeover_activate`], which also
+    //! makes its converter primary.
     use super::*;
+    use crate::DfsMetadataShardWriteSetState;
     use sinomo_core::kv::{KvCompare, KvEntry, KvError, KvOp, KvRequestId, KvTxn, KvTxnRequest};
 
     type KvResult<T> = std::result::Result<T, KvError>;
@@ -420,15 +509,42 @@ mod transactions {
         }
     }
 
+    fn value_digest(entry: Option<&KvEntry>) -> Option<String> {
+        entry.map(|entry| blake3::hash(&entry.value).to_hex().to_string())
+    }
+
+    fn extend_unique(compares: &mut Vec<KvCompare>, more: Vec<KvCompare>) {
+        for compare in more {
+            if !compares.contains(&compare) {
+                compares.push(compare);
+            }
+        }
+    }
+
     /// The shard's own keys, read in one exact-key-set authoritative read.
     pub struct DfsMetadataShardStorageCut<'a> {
         pub shard: &'a KvEntry,
         pub write_set: Option<&'a KvEntry>,
         pub handoff: Option<&'a KvEntry>,
+        /// The shard's head watermark. Only a takeover activation reads it:
+        /// it compares and deletes the watermark as a takeover swap does.
+        pub watermark: Option<&'a KvEntry>,
         pub storage: Option<&'a KvEntry>,
         /// Exact member and capability-policy compares for the nodes the
         /// caller admits (install set or acknowledgements).
         pub member_compares: Vec<KvCompare>,
+        /// Records of every configured member. The transactions of a takeover
+        /// attempt check each member's capabilities themselves.
+        pub members: &'a [DfsMetadataShardStorageMember<'a>],
+    }
+
+    /// One member's records, read with the shard's keys.
+    pub struct DfsMetadataShardStorageMember<'a> {
+        pub node_id: NodeId,
+        /// The entry at [`sinomo_core::node::cluster_member_key`].
+        pub member: Option<&'a KvEntry>,
+        /// The entry at [`sinomo_core::node::cluster_capability_policy_key`].
+        pub policy: Option<&'a KvEntry>,
     }
 
     impl DfsMetadataShardStorageCut<'_> {
@@ -468,12 +584,122 @@ mod transactions {
                 })
                 .transpose()
         }
+
+        /// The shard's current write set, `None` while the all-member rule
+        /// applies (no record, or a stale one, as for a handoff).
+        fn switched_write_set(
+            &self,
+            shard: &DfsMetadataShardConfig,
+        ) -> KvResult<Option<crate::DfsMetadataShardWriteSet>> {
+            let key = crate::metadata_shard_write_set_key(&shard.file_system_id, &shard.shard_id);
+            if self.write_set.is_some_and(|entry| entry.key != key) {
+                return Err(refuse("the write-set entry is bound to another key"));
+            }
+            match crate::metadata_shard_write_set_state(shard, self.write_set.map(|entry| entry.value.as_slice())) {
+                DfsMetadataShardWriteSetState::Switched(write_set) => Ok(Some(write_set)),
+                DfsMetadataShardWriteSetState::Unswitched | DfsMetadataShardWriteSetState::Stale { .. } => Ok(None),
+                DfsMetadataShardWriteSetState::Unreadable { reason } => {
+                    Err(refuse(format!("the write-set record is unreadable: {reason}")))
+                }
+            }
+        }
+
+        /// Refuse an attempt that no longer runs under the shard's current
+        /// serving record. A primary's attempt runs under the epoch and
+        /// primary it names. A takeover attempt runs under the epoch whose
+        /// primary it names as lost, while its converter is a configured
+        /// member other than that primary and, on a switched shard, a member
+        /// of the write set.
+        fn attempt_runs_under(
+            &self,
+            shard: &DfsMetadataShardConfig,
+            attempt: &DfsMetadataShardConversion,
+        ) -> KvResult<()> {
+            if attempt.epoch != shard.epoch {
+                return Err(refuse("the attempt was superseded by a serving change"));
+            }
+            let Some(takeover) = &attempt.takeover else {
+                if attempt.primary_node_id != shard.primary_node_id {
+                    return Err(refuse("the attempt was superseded by a serving change"));
+                }
+                return Ok(());
+            };
+            if takeover.previous_primary != shard.primary_node_id {
+                return Err(refuse("the takeover's lost primary is not the shard's primary"));
+            }
+            if attempt.primary_node_id == shard.primary_node_id
+                || !shard.replica_node_ids.contains(&attempt.primary_node_id)
+            {
+                return Err(refuse("the takeover's converter is not a configured member other than the primary"));
+            }
+            if self
+                .switched_write_set(shard)?
+                .is_some_and(|write_set| !write_set.contains(&attempt.primary_node_id))
+            {
+                return Err(refuse("the takeover's converter is not in the shard's write set"));
+            }
+            Ok(())
+        }
+
+        /// Exact compares of every configured member's records, each of which
+        /// must advertise and permit the storage generation capability. A
+        /// takeover attempt is admitted only while no member, the lost primary
+        /// included, can still serve the shard's old format. This is the
+        /// prepared-operation admission check of every assigned node with the
+        /// storage generation capability as its required capability; the
+        /// write-set member check is not used because it also requires the
+        /// write-set capability, which an unswitched shard's members need not
+        /// advertise.
+        fn storage_capable_member_compares(
+            &self,
+            shard: &DfsMetadataShardConfig,
+        ) -> KvResult<Vec<KvCompare>> {
+            let mut cluster_id = None;
+            let mut compares = Vec::new();
+            for node_id in crate::metadata_shard_configured_node_ids(shard) {
+                let records = self
+                    .members
+                    .iter()
+                    .find(|member| member.node_id == node_id)
+                    .ok_or_else(|| refuse(format!("the cut has no records of member {node_id}")))?;
+                let member_key = sinomo_core::node::cluster_member_key(&node_id);
+                let policy_key = sinomo_core::node::cluster_capability_policy_key(&node_id);
+                let member = records
+                    .member
+                    .filter(|entry| entry.key == member_key)
+                    .ok_or_else(|| refuse(format!("member {node_id} has no cluster member record")))?;
+                if records.policy.is_some_and(|entry| entry.key != policy_key) {
+                    return Err(refuse("a capability policy is bound to another key"));
+                }
+                compares.extend(
+                    crate::control_plane::metadata_prepared_operation_member_compares(
+                        shard,
+                        &node_id,
+                        member_key,
+                        member.clone(),
+                        policy_key,
+                        records.policy.cloned(),
+                        &mut cluster_id,
+                        sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY,
+                    )
+                    .map_err(|error| refuse(format!("takeover member {node_id}: {error}")))?,
+                );
+            }
+            Ok(compares)
+        }
     }
 
-    /// Fix one attempt's target in the shard's storage record. The attempt
-    /// must run under the current serving record. It replaces only an absent
-    /// record or a Converting record of a superseded attempt (another epoch or
-    /// primary); the same attempt is idempotent.
+    /// Fix one attempt's target in the shard's storage record before its image
+    /// exists: the record must be an unsealed Converting attempt that runs
+    /// under the current serving record. It replaces an absent record, a
+    /// Converting record of an attempt a serving change superseded, or one of
+    /// another converter at the same epoch (a takeover of a lost primary's
+    /// attempt, or the reverse); never another attempt of the same converter.
+    /// The same attempt is idempotent.
+    ///
+    /// A takeover attempt also compares every configured member's records,
+    /// each of which must advertise the storage generation capability
+    /// ([`DfsMetadataShardStorageCut::members`]).
     pub fn build_metadata_shard_storage_converting(
         cut: &DfsMetadataShardStorageCut<'_>,
         record: &DfsMetadataShardStorage,
@@ -483,9 +709,10 @@ mod transactions {
         let attempt = record
             .converting_attempt()
             .ok_or_else(|| refuse("the record is not a Converting attempt"))?;
-        if attempt.epoch != shard.epoch || attempt.primary_node_id != shard.primary_node_id {
-            return Err(refuse("the attempt does not run under the current serving record"));
+        if attempt.seal.is_some() || attempt.contributions_digest.is_some() {
+            return Err(refuse("an attempt is recorded Converting before its image is sealed"));
         }
+        cut.attempt_runs_under(&shard, attempt)?;
         match cut.current_storage(&shard)? {
             None => {}
             Some(current) if current.is_active() => {
@@ -493,18 +720,26 @@ mod transactions {
             }
             Some(current) => {
                 let previous = current.converting_attempt().expect("not active");
-                let superseded = previous.epoch != shard.epoch
-                    || previous.primary_node_id != shard.primary_node_id;
-                if previous.attempt_id != attempt.attempt_id && !superseded {
-                    return Err(refuse("another attempt converts the shard at this epoch"));
-                }
-                if previous.attempt_id == attempt.attempt_id && current != *record {
-                    return Err(refuse("the attempt changed its fixed target"));
+                if previous.attempt_id == attempt.attempt_id {
+                    if previous.sealed().is_some() {
+                        return Err(refuse("the attempt is already sealed"));
+                    }
+                    if current != *record {
+                        return Err(refuse("the attempt changed its fixed target"));
+                    }
+                } else if cut.attempt_runs_under(&shard, previous).is_ok()
+                    && previous.primary_node_id == attempt.primary_node_id
+                {
+                    return Err(refuse("another attempt of the same converter runs at this epoch"));
                 }
             }
         }
+        let mut compares = cut.compares(&shard)?;
+        if attempt.takeover.is_some() {
+            extend_unique(&mut compares, cut.storage_capable_member_compares(&shard)?);
+        }
         let txn = KvTxn {
-            compares: cut.compares(&shard)?,
+            compares,
             success: vec![KvOp::put_serde(
                 crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id),
                 record,
@@ -512,17 +747,82 @@ mod transactions {
             )?],
             failure: Vec::new(),
         };
-        let identity = serde_json::to_vec(&(&attempt.attempt_id, &attempt.seal))
-            .map_err(refuse)?;
         Ok(KvTxnRequest::new(
-            KvRequestId::derived("dfs-shard-storage-converting-v1", identity),
+            KvRequestId::derived("dfs-shard-storage-converting-v1", attempt.attempt_id.as_bytes()),
             txn,
         ))
     }
 
-    /// Activate the shard's Converting attempt. The caller has established
-    /// that its install rule holds for the current serving record; this
-    /// transaction makes that observation exact.
+    /// Seal the shard's Converting attempt with the image its holders install
+    /// and the contributions it was built from. The attempt must still run
+    /// under the current serving record, and the transaction compares the
+    /// exact current record. Sealing the same image again is idempotent and
+    /// keeps the request identity; another image for a sealed attempt is
+    /// refused.
+    pub fn build_metadata_shard_storage_seal(
+        cut: &DfsMetadataShardStorageCut<'_>,
+        seal: &DfsMetadataGenerationSeal,
+        contributions_digest: &str,
+    ) -> KvResult<(KvTxnRequest, DfsMetadataShardStorage)> {
+        let shard = cut.shard_config()?;
+        let current = cut
+            .current_storage(&shard)?
+            .ok_or_else(|| refuse("the shard has no Converting attempt"))?;
+        let attempt = current
+            .converting_attempt()
+            .ok_or_else(|| refuse("the shard's storage is already active"))?;
+        cut.attempt_runs_under(&shard, attempt)?;
+        match attempt.sealed() {
+            None => {}
+            Some((sealed, digest)) if sealed == seal && digest == contributions_digest => {}
+            Some(_) => return Err(refuse("the attempt is already sealed with another image")),
+        }
+        let identity = serde_json::to_vec(&(&attempt.attempt_id, seal, contributions_digest))
+            .map_err(refuse)?;
+        let mut sealed = current.clone();
+        if let DfsMetadataShardStorageState::Converting { attempt } = &mut sealed.state {
+            attempt.seal = Some(seal.clone());
+            attempt.contributions_digest = Some(contributions_digest.to_owned());
+        }
+        sealed.validate_against(&shard).map_err(refuse)?;
+        let txn = KvTxn {
+            compares: cut.compares(&shard)?,
+            success: vec![KvOp::put_serde(
+                crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id),
+                &sealed,
+                None,
+            )?],
+            failure: Vec::new(),
+        };
+        Ok((
+            KvTxnRequest::new(KvRequestId::derived("dfs-shard-storage-seal-v1", identity), txn),
+            sealed,
+        ))
+    }
+
+    /// The Active record of a sealed attempt.
+    fn activated(
+        current: &DfsMetadataShardStorage,
+        attempt: &DfsMetadataShardConversion,
+    ) -> KvResult<DfsMetadataShardStorage> {
+        if attempt.sealed().is_none() {
+            return Err(refuse("the attempt's image is not sealed"));
+        }
+        let activation_digest =
+            metadata_shard_storage_activation_digest(&current.generation, attempt).map_err(refuse)?;
+        let mut active = current.clone();
+        active.state = DfsMetadataShardStorageState::Active {
+            activation: DfsMetadataShardActivation::Converted {
+                attempt: attempt.clone(),
+                activation_digest,
+            },
+        };
+        Ok(active)
+    }
+
+    /// Activate the shard's sealed Converting attempt of its own primary. The
+    /// caller has established that its install rule holds for the current
+    /// serving record; this transaction makes that observation exact.
     pub fn build_metadata_shard_storage_activate(
         cut: &DfsMetadataShardStorageCut<'_>,
     ) -> KvResult<(KvTxnRequest, DfsMetadataShardStorage)> {
@@ -534,18 +834,11 @@ mod transactions {
             .converting_attempt()
             .ok_or_else(|| refuse("the shard's storage is already active"))?
             .clone();
-        if attempt.epoch != shard.epoch || attempt.primary_node_id != shard.primary_node_id {
-            return Err(refuse("the attempt was superseded by a serving change"));
+        if attempt.takeover.is_some() {
+            return Err(refuse("a takeover attempt activates with its takeover"));
         }
-        let activation_digest =
-            metadata_shard_storage_activation_digest(&current.generation, &attempt).map_err(refuse)?;
-        let mut active = current.clone();
-        active.state = DfsMetadataShardStorageState::Active {
-            activation: DfsMetadataShardActivation::Converted {
-                attempt: attempt.clone(),
-                activation_digest,
-            },
-        };
+        cut.attempt_runs_under(&shard, &attempt)?;
+        let active = activated(&current, &attempt)?;
         active.validate_against(&shard).map_err(refuse)?;
         let txn = KvTxn {
             compares: cut.compares(&shard)?,
@@ -558,12 +851,110 @@ mod transactions {
         };
         let identity = serde_json::to_vec(&(
             &attempt.attempt_id,
-            blake3::hash(&cut.shard.value).to_hex().to_string(),
-            cut.write_set.map(|entry| blake3::hash(&entry.value).to_hex().to_string()),
+            value_digest(Some(cut.shard)),
+            value_digest(cut.write_set),
         ))
         .map_err(refuse)?;
         Ok((
             KvTxnRequest::new(KvRequestId::derived("dfs-shard-storage-activate-v1", identity), txn),
+            active,
+        ))
+    }
+
+    /// Activate a sealed takeover attempt and make its converter primary, in
+    /// one transaction. The shard's configuration moves exactly as a
+    /// cooperative handoff target or a takeover swap moves it: the converter
+    /// is primary at the next epoch with the configured members preserved. On
+    /// a switched shard the write set takes the takeover swap's change, with
+    /// the epoch starting at the sealed image's prefix. A pending handoff and
+    /// a head watermark are superseded as by the swap. Its compares are the
+    /// exact serving record, write set, storage record, handoff and
+    /// watermark, every configured member's capability records and the
+    /// caller's member compares; it neither compares nor writes the
+    /// filesystem configuration or its catalog generation.
+    pub fn build_metadata_shard_storage_takeover_activate(
+        cut: &DfsMetadataShardStorageCut<'_>,
+    ) -> KvResult<(KvTxnRequest, DfsMetadataShardStorage)> {
+        let shard = cut.shard_config()?;
+        let current = cut
+            .current_storage(&shard)?
+            .ok_or_else(|| refuse("the shard has no Converting attempt"))?;
+        let attempt = current
+            .converting_attempt()
+            .ok_or_else(|| refuse("the shard's storage is already active"))?
+            .clone();
+        if attempt.takeover.is_none() {
+            return Err(refuse("the attempt is not a takeover; it activates without a serving change"));
+        }
+        cut.attempt_runs_under(&shard, &attempt)?;
+        let active = activated(&current, &attempt)?;
+        let (seal, _) = attempt.sealed().expect("activated a sealed attempt");
+        let fs = &shard.file_system_id;
+        let key = |key: fn(&DfsFileSystemId, &str) -> String| key(fs, &shard.shard_id);
+        let bound = |entry: Option<&'_ KvEntry>, key: String| -> KvResult<Option<Vec<u8>>> {
+            match entry {
+                Some(entry) if entry.key != key => Err(refuse("an entry is bound to another key")),
+                entry => Ok(entry.map(|entry| entry.value.clone())),
+            }
+        };
+        let handoff = bound(cut.handoff, key(crate::metadata_shard_membership_handoff_key))?;
+        let watermark = bound(cut.watermark, key(crate::metadata_shard_head_watermark_key))?;
+        let identity = serde_json::to_vec(&(
+            &attempt.attempt_id,
+            value_digest(Some(cut.shard)),
+            value_digest(cut.write_set),
+            value_digest(cut.handoff),
+            value_digest(cut.watermark),
+        ))
+        .map_err(refuse)?;
+        let request_id = KvRequestId::derived("dfs-shard-storage-takeover-activate-v1", identity);
+        let next_shard =
+            crate::control_plane::metadata_shard_primary_handoff_target(&shard, &attempt.primary_node_id)?;
+        let next_write_set = cut
+            .switched_write_set(&shard)?
+            .map(|write_set| {
+                crate::control_plane::metadata_write_set_after_takeover(
+                    &write_set,
+                    &shard.primary_node_id,
+                    &next_shard,
+                    &seal.prefix_proof,
+                    &request_id,
+                )
+            })
+            .transpose()?;
+        if let Some(write_set) = &next_write_set {
+            write_set.validate_against(&next_shard).map_err(refuse)?;
+        }
+        active.validate_against(&next_shard).map_err(refuse)?;
+        let (superseded_compares, superseded_deletes) =
+            crate::control_plane::metadata_takeover_superseded_keys(
+                &shard,
+                handoff.as_ref(),
+                watermark.as_ref(),
+            );
+        let mut compares = vec![
+            exact(key(crate::metadata_shard_key), Some(cut.shard))?,
+            exact(key(crate::metadata_shard_write_set_key), cut.write_set)?,
+            exact(key(crate::metadata_shard_storage_key), cut.storage)?,
+        ];
+        compares.extend(superseded_compares);
+        extend_unique(&mut compares, cut.storage_capable_member_compares(&shard)?);
+        extend_unique(&mut compares, cut.member_compares.clone());
+        let mut success = vec![KvOp::put_serde(key(crate::metadata_shard_key), &next_shard, None)?];
+        if let Some(write_set) = &next_write_set {
+            success.push(KvOp::put_serde(key(crate::metadata_shard_write_set_key), write_set, None)?);
+        }
+        success.extend(superseded_deletes);
+        success.push(KvOp::put_serde(key(crate::metadata_shard_storage_key), &active, None)?);
+        Ok((
+            KvTxnRequest::new(
+                request_id,
+                KvTxn {
+                    compares,
+                    success,
+                    failure: Vec::new(),
+                },
+            ),
             active,
         ))
     }
@@ -596,27 +987,53 @@ mod tests {
         }
     }
 
-    pub(super) fn attempt_for(shard: &DfsMetadataShardConfig, sequence: u64) -> DfsMetadataShardConversion {
+    pub(super) fn seal(sequence: u64) -> DfsMetadataGenerationSeal {
+        DfsMetadataGenerationSeal {
+            prefix_proof: crate::DfsMetadataPrefixProof {
+                version: 2,
+                journal_sequence: sequence,
+                digest: format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64)),
+            },
+            state_fingerprint: "image-state".into(),
+            file_fingerprint: "image-file".into(),
+        }
+    }
+
+    /// An unsealed attempt under `shard`: of its primary, or with `converter`
+    /// a takeover of that primary.
+    pub(super) fn unsealed_attempt(
+        shard: &DfsMetadataShardConfig, converter: Option<&str>, sequence: u64,
+    ) -> DfsMetadataShardConversion {
         let source = source(sequence);
+        let takeover = converter.map(|_| DfsMetadataConversionTakeover {
+            previous_primary: shard.primary_node_id.clone(),
+        });
+        let primary_node_id = converter
+            .map(|converter| NodeId::from_legacy_named(converter).unwrap())
+            .unwrap_or_else(|| shard.primary_node_id.clone());
         DfsMetadataShardConversion {
             attempt_id: metadata_shard_conversion_attempt_id(
                 &shard.file_system_id, &shard.shard_id, &shard.assignment, shard.epoch,
-                &shard.primary_node_id, &source,
+                &primary_node_id, &source, takeover.as_ref(),
             ).unwrap(),
             epoch: shard.epoch,
-            primary_node_id: shard.primary_node_id.clone(),
+            primary_node_id,
+            takeover,
             source,
-            seal: DfsMetadataGenerationSeal {
-                prefix_proof: crate::DfsMetadataPrefixProof {
-                    version: 2,
-                    journal_sequence: sequence,
-                    digest: format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64)),
-                },
-                state_fingerprint: "image-state".into(),
-                file_fingerprint: "image-file".into(),
-            },
-            contributions_digest: "c".repeat(64),
+            seal: None,
+            contributions_digest: None,
         }
+    }
+
+    pub(super) fn sealed(mut attempt: DfsMetadataShardConversion, sequence: u64) -> DfsMetadataShardConversion {
+        attempt.seal = Some(seal(sequence));
+        attempt.contributions_digest = Some("c".repeat(64));
+        attempt
+    }
+
+    /// A sealed attempt of `shard`'s primary.
+    pub(super) fn attempt_for(shard: &DfsMetadataShardConfig, sequence: u64) -> DfsMetadataShardConversion {
+        sealed(unsealed_attempt(shard, None, sequence), sequence)
     }
 
     #[test]
@@ -701,13 +1118,86 @@ mod tests {
         };
         assert!(genesis.admits_header(&genesis_header));
     }
+
+    #[test]
+    fn an_attempt_converts_before_its_image_is_sealed_and_activates_only_sealed() {
+        let shard = shard(4, "primary-a");
+        let attempt = unsealed_attempt(&shard, None, 7);
+        let unsealed = DfsMetadataShardStorage::converting(&shard, attempt.clone());
+        unsealed.validate_against(&shard).unwrap();
+        assert!(attempt.sealed().is_none());
+        // An unsealed attempt has no activation digest and never validates Active.
+        assert!(metadata_shard_storage_activation_digest(&unsealed.generation, &attempt).is_err());
+        let mut active = unsealed.clone();
+        active.state = DfsMetadataShardStorageState::Active {
+            activation: DfsMetadataShardActivation::Converted {
+                attempt: attempt.clone(), activation_digest: format!("blake3:{}", "0".repeat(64)),
+            },
+        };
+        assert!(active.validate().is_err());
+        // A seal comes with its contributions digest; sealing keeps the attempt.
+        let mut partial = attempt.clone();
+        partial.seal = Some(seal(7));
+        assert!(DfsMetadataShardStorage::converting(&shard, partial).validate().is_err());
+        let full = sealed(attempt.clone(), 7);
+        assert_eq!(full.attempt_id, attempt.attempt_id);
+        let converting = DfsMetadataShardStorage::converting(&shard, full.clone());
+        assert_eq!(converting.generation, unsealed.generation);
+        converting.validate_against(&shard).unwrap();
+        let mut malformed = full.clone();
+        malformed.seal.as_mut().unwrap().prefix_proof.version = 1;
+        assert!(DfsMetadataShardStorage::converting(&shard, malformed).validate().is_err());
+        // The activation digest covers the seal.
+        let mut other_image = full.clone();
+        other_image.seal.as_mut().unwrap().state_fingerprint.push_str("-fork");
+        assert_ne!(
+            metadata_shard_storage_activation_digest(&converting.generation, &full).unwrap(),
+            metadata_shard_storage_activation_digest(&converting.generation, &other_image).unwrap(),
+        );
+        // Unsealed bytes omit the seal fields; the record round-trips.
+        let bytes = sinomo_core::kv::encode_kv_value(&unsealed).unwrap();
+        assert_eq!(sinomo_core::kv::decode_kv_value::<DfsMetadataShardStorage>(&bytes).unwrap(), unsealed);
+    }
+
+    #[test]
+    fn a_takeover_attempt_binds_its_lost_primary_into_its_identity() {
+        let shard = shard(4, "primary-a");
+        let own = unsealed_attempt(&shard, None, 7);
+        let takeover = unsealed_attempt(&shard, Some("replica-b"), 7);
+        assert_eq!(takeover.epoch, shard.epoch);
+        assert_eq!(takeover.primary_node_id, NodeId::from_legacy_named("replica-b").unwrap());
+        assert_eq!(takeover.takeover, Some(DfsMetadataConversionTakeover {
+            previous_primary: shard.primary_node_id.clone(),
+        }));
+        // The takeover is another attempt than the primary's own, with another target.
+        assert_ne!(takeover.attempt_id, own.attempt_id);
+        let record = DfsMetadataShardStorage::converting(&shard, takeover.clone());
+        record.validate_against(&shard).unwrap();
+        assert_ne!(record.generation, DfsMetadataShardStorage::converting(&shard, own).generation);
+        // The marker is part of the identity: dropping or renaming it is refused.
+        let mut unmarked = takeover.clone();
+        unmarked.takeover = None;
+        assert!(DfsMetadataShardStorage::converting(&shard, unmarked).validate().is_err());
+        let mut renamed = takeover.clone();
+        renamed.takeover = Some(DfsMetadataConversionTakeover {
+            previous_primary: NodeId::from_legacy_named("replica-c").unwrap(),
+        });
+        assert!(DfsMetadataShardStorage::converting(&shard, renamed).validate().is_err());
+        // A converter never takes over from itself.
+        let from_itself = unsealed_attempt(&shard, Some("primary-a"), 7);
+        assert!(DfsMetadataShardStorage::converting(&shard, from_itself).validate().is_err());
+    }
 }
 
 #[cfg(all(test, feature = "storage-conversion"))]
 mod transaction_tests {
-    use super::tests::attempt_for;
+    use super::tests::{attempt_for, seal, sealed, unsealed_attempt};
     use super::*;
-    use sinomo_core::kv::{KvCompare, KvEntry};
+    use sinomo_core::kv::{InProcessKvStore, KvCompare, KvEntry, KvOp, KvTxnRequest};
+
+    fn node(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).unwrap()
+    }
 
     fn entry(key: String, value: &impl Serialize) -> KvEntry {
         KvEntry {
@@ -732,6 +1222,14 @@ mod transaction_tests {
         }
     }
 
+    /// A three-member shard: `primary-a` with replicas `replica-b`, `replica-c`.
+    fn ring(epoch: u64) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            replica_node_ids: vec![node("replica-b"), node("replica-c")],
+            ..shard(epoch, "primary-a")
+        }
+    }
+
     fn shard_entry(shard: &DfsMetadataShardConfig) -> KvEntry {
         entry(crate::metadata_shard_key(&shard.file_system_id, &shard.shard_id), shard)
     }
@@ -740,15 +1238,69 @@ mod transaction_tests {
         entry(crate::metadata_shard_storage_key(&record.file_system_id, &record.shard_id), record)
     }
 
+    fn cut<'a>(shard: &'a KvEntry, storage: Option<&'a KvEntry>) -> DfsMetadataShardStorageCut<'a> {
+        DfsMetadataShardStorageCut {
+            shard, write_set: None, handoff: None, watermark: None, storage,
+            member_compares: Vec::new(), members: &[],
+        }
+    }
+
+    fn member_record(node_id: &NodeId, storage_capable: bool) -> sinomo_core::ClusterMemberRecord {
+        let mut record = sinomo_core::ClusterMemberRecord::local_voter(
+            sinomo_core::Id::from_legacy_named("cluster_shard_storage_tests").unwrap(),
+            node_id.clone(),
+            node_id.to_string(),
+            format!("pk-{node_id}"),
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        record.capabilities = sinomo_core::node::main_daemon_capabilities(&record.role);
+        if !storage_capable {
+            record.capabilities.retain(|capability| {
+                capability.as_str() != sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY
+            });
+        }
+        record
+    }
+
+    fn write_set_for(shard: &DfsMetadataShardConfig, members: &[NodeId]) -> crate::DfsMetadataShardWriteSet {
+        let mut write_set = members.to_vec();
+        write_set.sort();
+        crate::DfsMetadataShardWriteSet {
+            format: crate::DFS_METADATA_SHARD_WRITE_SET_FORMAT,
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard.shard_id.clone(),
+            epoch: shard.epoch,
+            primary_node_id: shard.primary_node_id.clone(),
+            generation: 1,
+            write_set,
+            epoch_start: None,
+            switched_at_epoch: shard.epoch,
+            substitutes: Vec::new(),
+            raised_n: None,
+            last_change: crate::DfsMetadataShardWriteSetChange {
+                kind: crate::DfsMetadataShardWriteSetChangeKind::Switch,
+                change_id: "switch".into(),
+            },
+        }
+    }
+
+    fn excludes_filesystem_config(request: &KvTxnRequest) -> bool {
+        let config = crate::file_system_config_key(&crate::sifs_file_system_id());
+        request.txn.compares.iter().all(|compare| match compare {
+            KvCompare::ValueEquals { key, .. } | KvCompare::Missing { key } => *key != config,
+            _ => true,
+        }) && request.txn.success.iter().all(|op| match op {
+            KvOp::Put { key, .. } | KvOp::Delete { key } => *key != config,
+            _ => true,
+        })
+    }
+
     #[test]
     fn converting_fixes_one_attempt_under_the_current_serving_record() {
         let current = shard(3, "primary-a");
         let shard_kv = shard_entry(&current);
-        let record = DfsMetadataShardStorage::converting(&current, attempt_for(&current, 9));
-        let cut = DfsMetadataShardStorageCut {
-            shard: &shard_kv, write_set: None, handoff: None, storage: None, member_compares: Vec::new(),
-        };
-        let request = build_metadata_shard_storage_converting(&cut, &record).unwrap();
+        let record = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 9));
+        let request = build_metadata_shard_storage_converting(&cut(&shard_kv, None), &record).unwrap();
         let storage_key = crate::metadata_shard_storage_key(&current.file_system_id, &current.shard_id);
         assert!(request.txn.compares.contains(&KvCompare::Missing { key: storage_key.clone() }));
         assert!(request.txn.compares.contains(&KvCompare::ValueEquals {
@@ -759,35 +1311,30 @@ mod transaction_tests {
             _ => true,
         }), "a per-shard storage transaction never compares the filesystem configuration");
         assert_eq!(request.txn.success.len(), 1, "it writes only the shard's storage record");
+        // The target is fixed before the image exists: a sealed record is refused.
+        let presealed = DfsMetadataShardStorage::converting(&current, attempt_for(&current, 9));
+        assert!(build_metadata_shard_storage_converting(&cut(&shard_kv, None), &presealed).is_err());
         // The same attempt is idempotent and keeps its request identity.
         let existing = storage_entry(&record);
-        let again = build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
-            storage: Some(&existing), ..cut
-        }, &record).unwrap();
+        let again = build_metadata_shard_storage_converting(&cut(&shard_kv, Some(&existing)), &record).unwrap();
         assert_eq!(again.request_id, request.request_id);
         // Another attempt at the same epoch and primary is refused.
-        let rival = DfsMetadataShardStorage::converting(&current, attempt_for(&current, 10));
-        assert!(build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
-            shard: &shard_kv, write_set: None, handoff: None, storage: Some(&existing), member_compares: Vec::new(),
-        }, &rival).is_err());
+        let rival = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 10));
+        assert!(build_metadata_shard_storage_converting(&cut(&shard_kv, Some(&existing)), &rival).is_err());
         // An attempt built under an older serving record is refused.
         let successor = shard(4, "replica-b");
         let successor_kv = shard_entry(&successor);
-        assert!(build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
-            shard: &successor_kv, write_set: None, handoff: None, storage: None, member_compares: Vec::new(),
-        }, &record).is_err());
+        assert!(build_metadata_shard_storage_converting(&cut(&successor_kv, None), &record).is_err());
         // A successor's attempt replaces the superseded Converting record.
-        let replacement = DfsMetadataShardStorage::converting(&successor, attempt_for(&successor, 9));
-        let replaced = build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
-            shard: &successor_kv, write_set: None, handoff: None, storage: Some(&existing), member_compares: Vec::new(),
-        }, &replacement).unwrap();
+        let replacement = DfsMetadataShardStorage::converting(&successor, unsealed_attempt(&successor, None, 9));
+        let replaced = build_metadata_shard_storage_converting(&cut(&successor_kv, Some(&existing)), &replacement).unwrap();
         assert!(replaced.txn.compares.contains(&KvCompare::ValueEquals {
             key: storage_key, value: existing.value.clone(),
         }));
-        // A pending handoff refuses both transactions.
+        // A pending handoff refuses it.
         let handoff = entry(crate::metadata_shard_membership_handoff_key(&current.file_system_id, &current.shard_id), &"pending");
         assert!(build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
-            shard: &shard_kv, write_set: None, handoff: Some(&handoff), storage: None, member_compares: Vec::new(),
+            handoff: Some(&handoff), ..cut(&shard_kv, None)
         }, &record).is_err());
     }
 
@@ -798,10 +1345,7 @@ mod transaction_tests {
         let attempt = attempt_for(&current, 9);
         let record = DfsMetadataShardStorage::converting(&current, attempt.clone());
         let existing = storage_entry(&record);
-        let cut = DfsMetadataShardStorageCut {
-            shard: &shard_kv, write_set: None, handoff: None, storage: Some(&existing), member_compares: Vec::new(),
-        };
-        let (request, active) = build_metadata_shard_storage_activate(&cut).unwrap();
+        let (request, active) = build_metadata_shard_storage_activate(&cut(&shard_kv, Some(&existing))).unwrap();
         active.validate_against(&current).unwrap();
         assert!(active.is_active());
         assert!(matches!(&active.state, DfsMetadataShardStorageState::Active {
@@ -814,19 +1358,372 @@ mod transaction_tests {
         let mut recruited = current.clone();
         recruited.replica_node_ids.push(NodeId::from_legacy_named("replica-c").unwrap());
         let recruited_kv = shard_entry(&recruited);
-        let (rebuilt, _) = build_metadata_shard_storage_activate(&DfsMetadataShardStorageCut {
-            shard: &recruited_kv, ..cut
-        }).unwrap();
+        let (rebuilt, _) = build_metadata_shard_storage_activate(&cut(&recruited_kv, Some(&existing))).unwrap();
         assert_ne!(rebuilt.request_id, request.request_id);
         // A takeover supersedes it.
-        let taken_over = shard(4, "replica-b");
-        let taken_over_kv = shard_entry(&taken_over);
-        assert!(build_metadata_shard_storage_activate(&DfsMetadataShardStorageCut {
-            shard: &taken_over_kv, write_set: None, handoff: None, storage: Some(&existing), member_compares: Vec::new(),
-        }).is_err());
+        let taken_over_kv = shard_entry(&shard(4, "replica-b"));
+        assert!(build_metadata_shard_storage_activate(&cut(&taken_over_kv, Some(&existing))).is_err());
         // Nothing to activate without a Converting attempt.
-        assert!(build_metadata_shard_storage_activate(&DfsMetadataShardStorageCut {
-            shard: &shard_kv, write_set: None, handoff: None, storage: None, member_compares: Vec::new(),
+        assert!(build_metadata_shard_storage_activate(&cut(&shard_kv, None)).is_err());
+        // A takeover attempt activates only with its takeover.
+        let takeover = DfsMetadataShardStorage::converting(
+            &current, sealed(unsealed_attempt(&current, Some("replica-b"), 9), 9));
+        let takeover_kv = storage_entry(&takeover);
+        assert!(build_metadata_shard_storage_activate(&cut(&shard_kv, Some(&takeover_kv))).is_err());
+    }
+
+    #[test]
+    fn sealing_moves_one_attempt_from_unsealed_to_sealed() {
+        let current = shard(3, "primary-a");
+        let shard_kv = shard_entry(&current);
+        let unsealed = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 9));
+        let unsealed_kv = storage_entry(&unsealed);
+        let image = seal(9);
+        let contributions = "c".repeat(64);
+        // An unsealed attempt cannot activate.
+        assert!(build_metadata_shard_storage_activate(&cut(&shard_kv, Some(&unsealed_kv))).is_err());
+        let (request, sealed_record) =
+            build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&unsealed_kv)), &image, &contributions).unwrap();
+        let attempt = sealed_record.converting_attempt().expect("still converting");
+        assert_eq!(attempt.attempt_id, unsealed.converting_attempt().unwrap().attempt_id);
+        assert_eq!(attempt.sealed(), Some((&image, contributions.as_str())));
+        assert_eq!(sealed_record.generation, unsealed.generation, "sealing keeps the target generation");
+        assert!(request.txn.compares.contains(&KvCompare::ValueEquals {
+            key: unsealed_kv.key.clone(), value: unsealed_kv.value.clone(),
+        }), "sealing compares the exact unsealed record");
+        assert!(request.txn.compares.contains(&KvCompare::ValueEquals {
+            key: shard_kv.key.clone(), value: shard_kv.value.clone(),
+        }));
+        assert_eq!(request.txn.success, vec![KvOp::put_serde(unsealed_kv.key.clone(), &sealed_record, None).unwrap()]);
+        assert!(excludes_filesystem_config(&request));
+        // The sealed attempt activates, and its activation carries the seal.
+        let sealed_kv = storage_entry(&sealed_record);
+        let (_, active) = build_metadata_shard_storage_activate(&cut(&shard_kv, Some(&sealed_kv))).unwrap();
+        assert!(matches!(active.converted_activation(),
+            Some((activated, _)) if activated.sealed() == Some((&image, contributions.as_str()))));
+        // Sealing the same image again is idempotent and keeps its identity.
+        let (again, again_record) =
+            build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&sealed_kv)), &image, &contributions).unwrap();
+        assert_eq!(again.request_id, request.request_id);
+        assert_eq!(again_record, sealed_record);
+        // Another image, other contributions or a malformed seal are refused.
+        let mut other = image.clone();
+        other.state_fingerprint.push_str("-fork");
+        assert!(build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&sealed_kv)), &other, &contributions).is_err());
+        assert!(build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&sealed_kv)), &image, &"d".repeat(64)).is_err());
+        let mut malformed = image.clone();
+        malformed.file_fingerprint.clear();
+        assert!(build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&unsealed_kv)), &malformed, &contributions).is_err());
+        assert!(build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&unsealed_kv)), &image, "").is_err());
+        // The Converting transaction never rewrites a sealed attempt.
+        assert!(build_metadata_shard_storage_converting(&cut(&shard_kv, Some(&sealed_kv)), &unsealed).is_err());
+        // A serving change supersedes the attempt before it is sealed.
+        let successor_kv = shard_entry(&shard(4, "replica-b"));
+        assert!(build_metadata_shard_storage_seal(&cut(&successor_kv, Some(&unsealed_kv)), &image, &contributions).is_err());
+        // Nothing to seal without a Converting attempt, or once Active.
+        assert!(build_metadata_shard_storage_seal(&cut(&shard_kv, None), &image, &contributions).is_err());
+        let active_kv = storage_entry(&active);
+        assert!(build_metadata_shard_storage_seal(&cut(&shard_kv, Some(&active_kv)), &image, &contributions).is_err());
+        // A pending handoff refuses it.
+        let handoff = entry(crate::metadata_shard_membership_handoff_key(&current.file_system_id, &current.shard_id), &"pending");
+        assert!(build_metadata_shard_storage_seal(&DfsMetadataShardStorageCut {
+            handoff: Some(&handoff), ..cut(&shard_kv, Some(&unsealed_kv))
+        }, &image, &contributions).is_err());
+    }
+
+    #[test]
+    fn a_takeover_attempt_converts_only_from_an_eligible_member_of_a_capable_shard() {
+        let current = ring(3);
+        let shard_kv = shard_entry(&current);
+        let configured = crate::metadata_shard_configured_node_ids(&current);
+        let records = configured.iter()
+            .map(|node_id| (node_id.clone(), entry(sinomo_core::node::cluster_member_key(node_id), &member_record(node_id, true))))
+            .collect::<Vec<_>>();
+        let members = records.iter()
+            .map(|(node_id, record)| DfsMetadataShardStorageMember { node_id: node_id.clone(), member: Some(record), policy: None })
+            .collect::<Vec<_>>();
+        let takeover_cut = |storage, write_set| DfsMetadataShardStorageCut {
+            write_set, members: &members, ..cut(&shard_kv, storage)
+        };
+        let by_b = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-b"), 9));
+        let request = build_metadata_shard_storage_converting(&takeover_cut(None, None), &by_b).unwrap();
+        for (node_id, record) in &records {
+            assert!(request.txn.compares.contains(&KvCompare::ValueEquals {
+                key: sinomo_core::node::cluster_member_key(node_id), value: record.value.clone(),
+            }), "the takeover compares member {node_id}");
+            assert!(request.txn.compares.contains(&KvCompare::Missing {
+                key: sinomo_core::node::cluster_capability_policy_key(node_id),
+            }));
+        }
+        assert!(excludes_filesystem_config(&request));
+        // Every configured member's records must be in the cut.
+        assert!(build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
+            members: &members[..2], ..takeover_cut(None, None)
+        }, &by_b).is_err());
+        // Every member, the lost primary included, must advertise the storage
+        // generation capability.
+        let primary = current.primary_node_id.clone();
+        let incapable = entry(sinomo_core::node::cluster_member_key(&primary), &member_record(&primary, false));
+        let without_capability = members.iter()
+            .map(|member| DfsMetadataShardStorageMember {
+                node_id: member.node_id.clone(),
+                member: if member.node_id == primary { Some(&incapable) } else { member.member },
+                policy: None,
+            })
+            .collect::<Vec<_>>();
+        let refused = build_metadata_shard_storage_converting(&DfsMetadataShardStorageCut {
+            members: &without_capability, ..takeover_cut(None, None)
+        }, &by_b).unwrap_err();
+        assert!(refused.to_string().contains(sinomo_core::node::DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY), "{refused}");
+        // The converter must be a configured member other than the primary.
+        let outsider = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("outsider-d"), 9));
+        assert!(build_metadata_shard_storage_converting(&takeover_cut(None, None), &outsider).is_err());
+        // The lost primary must be the shard's current primary.
+        let rotated = DfsMetadataShardConfig {
+            primary_node_id: node("replica-c"),
+            replica_node_ids: vec![node("primary-a"), node("replica-b")],
+            ..current.clone()
+        };
+        let stale = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&rotated, Some("replica-b"), 9));
+        assert!(build_metadata_shard_storage_converting(&takeover_cut(None, None), &stale).is_err());
+        // On a switched shard the converter must be in the write set.
+        let write_set = entry(
+            crate::metadata_shard_write_set_key(&current.file_system_id, &current.shard_id),
+            &write_set_for(&current, &[primary.clone(), node("replica-b")]),
+        );
+        let by_c = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-c"), 9));
+        assert!(build_metadata_shard_storage_converting(&takeover_cut(None, Some(&write_set)), &by_c).is_err());
+        build_metadata_shard_storage_converting(&takeover_cut(None, Some(&write_set)), &by_b).unwrap();
+        build_metadata_shard_storage_converting(&takeover_cut(None, None), &by_c).unwrap();
+        // A takeover replaces the lost primary's own attempt at the same epoch.
+        let own = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, None, 9));
+        let own_kv = storage_entry(&own);
+        let replaced = build_metadata_shard_storage_converting(&takeover_cut(Some(&own_kv), None), &by_b).unwrap();
+        assert!(replaced.txn.compares.contains(&KvCompare::ValueEquals {
+            key: own_kv.key.clone(), value: own_kv.value.clone(),
+        }));
+        // Another converter's takeover replaces it too, but the same converter
+        // never replaces its own attempt with another one.
+        let by_b_kv = storage_entry(&by_b);
+        build_metadata_shard_storage_converting(&takeover_cut(Some(&by_b_kv), None), &by_c).unwrap();
+        let by_b_again = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-b"), 10));
+        assert!(build_metadata_shard_storage_converting(&takeover_cut(Some(&by_b_kv), None), &by_b_again).is_err());
+        build_metadata_shard_storage_converting(&takeover_cut(Some(&by_b_kv), None), &by_b).unwrap();
+    }
+
+    /// The shard's own keys and its members' records, read from `kv`.
+    struct Read {
+        shard: KvEntry,
+        write_set: Option<KvEntry>,
+        handoff: Option<KvEntry>,
+        watermark: Option<KvEntry>,
+        storage: Option<KvEntry>,
+        members: Vec<(NodeId, Option<KvEntry>)>,
+    }
+
+    impl Read {
+        fn from(kv: &InProcessKvStore, shard: &DfsMetadataShardConfig, nodes: &[NodeId]) -> Self {
+            let (fs, id) = (&shard.file_system_id, shard.shard_id.as_str());
+            Self {
+                shard: kv.get(&crate::metadata_shard_key(fs, id)).cloned().expect("shard"),
+                write_set: kv.get(&crate::metadata_shard_write_set_key(fs, id)).cloned(),
+                handoff: kv.get(&crate::metadata_shard_membership_handoff_key(fs, id)).cloned(),
+                watermark: kv.get(&crate::metadata_shard_head_watermark_key(fs, id)).cloned(),
+                storage: kv.get(&crate::metadata_shard_storage_key(fs, id)).cloned(),
+                members: nodes.iter()
+                    .map(|node_id| (node_id.clone(), kv.get(&sinomo_core::node::cluster_member_key(node_id)).cloned()))
+                    .collect(),
+            }
+        }
+
+        fn members(&self) -> Vec<DfsMetadataShardStorageMember<'_>> {
+            self.members.iter()
+                .map(|(node_id, member)| DfsMetadataShardStorageMember {
+                    node_id: node_id.clone(), member: member.as_ref(), policy: None,
+                })
+                .collect()
+        }
+
+        fn cut<'a>(&'a self, members: &'a [DfsMetadataShardStorageMember<'a>]) -> DfsMetadataShardStorageCut<'a> {
+            DfsMetadataShardStorageCut {
+                shard: &self.shard,
+                write_set: self.write_set.as_ref(),
+                handoff: self.handoff.as_ref(),
+                watermark: self.watermark.as_ref(),
+                storage: self.storage.as_ref(),
+                member_compares: Vec::new(),
+                members,
+            }
+        }
+    }
+
+    fn put(kv: &mut InProcessKvStore, key: String, value: &impl Serialize) {
+        kv.put(key, sinomo_core::kv::encode_kv_value(value).unwrap(), None).unwrap();
+    }
+
+    fn apply(kv: &mut InProcessKvStore, request: &KvTxnRequest) -> bool {
+        kv.txn(request.txn.clone()).unwrap().succeeded
+    }
+
+    /// A ring shard with a sealed Converting takeover attempt by `replica-b`,
+    /// written through the Converting and seal transactions.
+    fn sealed_takeover(switched: bool) -> (InProcessKvStore, DfsMetadataShardConfig, Vec<NodeId>) {
+        let mut kv = InProcessKvStore::new();
+        let current = ring(3);
+        let nodes = vec![node("primary-a"), node("replica-b"), node("replica-c"), node("replica-d")];
+        put(&mut kv, crate::metadata_shard_key(&current.file_system_id, &current.shard_id), &current);
+        if switched {
+            put(&mut kv, crate::metadata_shard_write_set_key(&current.file_system_id, &current.shard_id),
+                &write_set_for(&current, &nodes[..3]));
+        }
+        put(&mut kv, crate::file_system_config_key(&current.file_system_id), &"filesystem configuration");
+        for node_id in &nodes {
+            put(&mut kv, sinomo_core::node::cluster_member_key(node_id), &member_record(node_id, true));
+        }
+        let record = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-b"), 9));
+        let read = Read::from(&kv, &current, &nodes);
+        let members = read.members();
+        let converting = build_metadata_shard_storage_converting(&read.cut(&members), &record).unwrap();
+        assert!(apply(&mut kv, &converting));
+        let read = Read::from(&kv, &current, &nodes);
+        let members = read.members();
+        let (sealing, _) = build_metadata_shard_storage_seal(&read.cut(&members), &seal(9), &"c".repeat(64)).unwrap();
+        assert!(apply(&mut kv, &sealing));
+        (kv, current, nodes)
+    }
+
+    #[test]
+    fn a_takeover_activation_makes_the_converter_primary_in_one_transaction() {
+        let (mut kv, current, nodes) = sealed_takeover(true);
+        let (fs, id) = (current.file_system_id.clone(), current.shard_id.clone());
+        let config_key = crate::file_system_config_key(&fs);
+        let config_before = kv.get(&config_key).cloned().unwrap();
+        // A takeover supersedes a pending handoff and the head watermark.
+        put(&mut kv, crate::metadata_shard_membership_handoff_key(&fs, &id), &"pending");
+        put(&mut kv, crate::metadata_shard_head_watermark_key(&fs, &id), &"watermark");
+        let read = Read::from(&kv, &current, &nodes);
+        let members = read.members();
+        // Only the takeover activation activates a takeover attempt.
+        assert!(build_metadata_shard_storage_activate(&read.cut(&members)).is_err());
+        let (request, active) = build_metadata_shard_storage_takeover_activate(&read.cut(&members)).unwrap();
+        for entry in [&read.shard, read.write_set.as_ref().unwrap(), read.storage.as_ref().unwrap(),
+            read.handoff.as_ref().unwrap(), read.watermark.as_ref().unwrap()]
+        {
+            assert!(request.txn.compares.contains(&KvCompare::ValueEquals {
+                key: entry.key.clone(), value: entry.value.clone(),
+            }), "the activation compares {}", entry.key);
+        }
+        for node_id in &nodes[..3] {
+            assert!(request.txn.compares.iter().any(|compare| matches!(compare,
+                KvCompare::ValueEquals { key, .. } if *key == sinomo_core::node::cluster_member_key(node_id))));
+        }
+        assert!(excludes_filesystem_config(&request), "it neither compares nor writes the filesystem configuration");
+        // A request built before a same-epoch serving change cannot commit.
+        let mut recruited = current.clone();
+        recruited.replica_node_ids.push(nodes[3].clone());
+        put(&mut kv, crate::metadata_shard_key(&fs, &id), &recruited);
+        assert!(!apply(&mut kv, &request), "a stale serving record refuses the activation");
+        let read = Read::from(&kv, &recruited, &nodes);
+        let members = read.members();
+        let (request, rebuilt) = build_metadata_shard_storage_takeover_activate(&read.cut(&members)).unwrap();
+        assert_eq!(rebuilt, active);
+        assert!(apply(&mut kv, &request));
+        let attempt = active.converted_activation().unwrap().0.clone();
+        let seal = attempt.seal.clone().unwrap();
+        let shard: DfsMetadataShardConfig = kv.get(&crate::metadata_shard_key(&fs, &id)).unwrap().decode().unwrap();
+        assert_eq!(shard.primary_node_id, attempt.primary_node_id);
+        assert_eq!(shard.primary_node_id, nodes[1]);
+        assert_eq!(shard.epoch, current.epoch + 1);
+        assert_eq!(crate::metadata_shard_configured_node_ids(&shard),
+            crate::metadata_shard_configured_node_ids(&recruited), "the takeover keeps every configured member");
+        let write_set: crate::DfsMetadataShardWriteSet =
+            kv.get(&crate::metadata_shard_write_set_key(&fs, &id)).unwrap().decode().unwrap();
+        write_set.validate_against(&shard).unwrap();
+        assert_eq!(write_set.last_change.kind, crate::DfsMetadataShardWriteSetChangeKind::Takeover {
+            previous_primary_node_id: current.primary_node_id.clone(),
+        });
+        assert_eq!(write_set.last_change.change_id, request.request_id.as_id().to_string());
+        assert_eq!(write_set.epoch_start, Some(seal.prefix_proof.clone()), "the epoch starts at the sealed image");
+        assert!(!write_set.contains(&current.primary_node_id), "the lost primary leaves the write set");
+        assert_eq!(write_set.generation, 2);
+        let stored: DfsMetadataShardStorage =
+            kv.get(&crate::metadata_shard_storage_key(&fs, &id)).unwrap().decode().unwrap();
+        assert_eq!(stored, active);
+        stored.validate_against(&shard).unwrap();
+        assert!(kv.get(&crate::metadata_shard_membership_handoff_key(&fs, &id)).is_none());
+        assert!(kv.get(&crate::metadata_shard_head_watermark_key(&fs, &id)).is_none());
+        let config_after = kv.get(&config_key).unwrap();
+        assert_eq!((&config_after.value, config_after.modify_revision),
+            (&config_before.value, config_before.modify_revision));
+        // Once Active, nothing activates again; the old epoch's attempt is
+        // superseded for any builder.
+        let read = Read::from(&kv, &shard, &nodes);
+        let members = read.members();
+        assert!(build_metadata_shard_storage_takeover_activate(&read.cut(&members)).is_err());
+    }
+
+    #[test]
+    fn a_takeover_activation_refuses_a_superseded_unsealed_or_ordinary_attempt() {
+        let (mut kv, current, nodes) = sealed_takeover(false);
+        let (fs, id) = (current.file_system_id.clone(), current.shard_id.clone());
+        // An unswitched shard's takeover writes the serving and storage
+        // records only, and compares the write-set key's absence.
+        let read = Read::from(&kv, &current, &nodes);
+        let members = read.members();
+        let (request, active) = build_metadata_shard_storage_takeover_activate(&read.cut(&members)).unwrap();
+        let write_set_key = crate::metadata_shard_write_set_key(&fs, &id);
+        assert!(request.txn.compares.contains(&KvCompare::Missing { key: write_set_key.clone() }));
+        assert_eq!(request.txn.success.len(), 2);
+        // A serving change at a new epoch supersedes the takeover.
+        let rotated = DfsMetadataShardConfig {
+            primary_node_id: node("replica-c"),
+            replica_node_ids: vec![node("primary-a"), node("replica-b")],
+            epoch: current.epoch + 1,
+            ..current.clone()
+        };
+        let rotated_kv = shard_entry(&rotated);
+        assert!(build_metadata_shard_storage_takeover_activate(&DfsMetadataShardStorageCut {
+            shard: &rotated_kv, ..read.cut(&members)
         }).is_err());
+        // The converter must still be eligible: a member that left is refused.
+        let shrunk = DfsMetadataShardConfig {
+            replica_node_ids: vec![node("replica-c")],
+            ..current.clone()
+        };
+        let shrunk_kv = shard_entry(&shrunk);
+        assert!(build_metadata_shard_storage_takeover_activate(&DfsMetadataShardStorageCut {
+            shard: &shrunk_kv, ..read.cut(&members)
+        }).is_err());
+        // A member that stops advertising the storage capability refuses it.
+        let incapable = entry(sinomo_core::node::cluster_member_key(&nodes[2]), &member_record(&nodes[2], false));
+        let without_capability = members.iter()
+            .map(|member| DfsMetadataShardStorageMember {
+                node_id: member.node_id.clone(),
+                member: if member.node_id == nodes[2] { Some(&incapable) } else { member.member },
+                policy: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(build_metadata_shard_storage_takeover_activate(&read.cut(&without_capability)).is_err());
+        // An unsealed takeover attempt cannot activate.
+        let unsealed = DfsMetadataShardStorage::converting(&current, unsealed_attempt(&current, Some("replica-b"), 9));
+        let unsealed_kv = storage_entry(&unsealed);
+        assert!(build_metadata_shard_storage_takeover_activate(&DfsMetadataShardStorageCut {
+            storage: Some(&unsealed_kv), ..read.cut(&members)
+        }).is_err());
+        // The primary's own attempt is not a takeover.
+        let own = DfsMetadataShardStorage::converting(&current, attempt_for(&current, 9));
+        let own_kv = storage_entry(&own);
+        assert!(build_metadata_shard_storage_takeover_activate(&DfsMetadataShardStorageCut {
+            storage: Some(&own_kv), ..read.cut(&members)
+        }).is_err());
+        build_metadata_shard_storage_activate(&DfsMetadataShardStorageCut {
+            storage: Some(&own_kv), ..read.cut(&members)
+        }).unwrap();
+        assert!(apply(&mut kv, &request));
+        let shard: DfsMetadataShardConfig = kv.get(&crate::metadata_shard_key(&fs, &id)).unwrap().decode().unwrap();
+        assert_eq!((shard.primary_node_id.clone(), shard.epoch), (nodes[1].clone(), current.epoch + 1));
+        assert!(kv.get(&write_set_key).is_none(), "an unswitched shard stays unswitched");
+        assert_eq!(kv.get(&crate::metadata_shard_storage_key(&fs, &id)).unwrap()
+            .decode::<DfsMetadataShardStorage>().unwrap(), active);
     }
 }

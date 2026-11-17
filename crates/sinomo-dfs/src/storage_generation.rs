@@ -7,6 +7,8 @@ use std::path::Path;
 #[cfg(feature = "storage-conversion")]
 mod activation;
 mod record;
+#[cfg(feature = "storage-conversion")]
+mod shard_activation;
 mod standalone;
 pub use record::*;
 #[cfg(feature = "storage-conversion")]
@@ -17,6 +19,8 @@ pub use standalone::{
 mod native_tests;
 #[cfg(feature = "storage-conversion")]
 pub use activation::activate_metadata_storage_generation;
+#[cfg(feature = "storage-conversion")]
+pub use shard_activation::activate_metadata_shard_storage;
 
 /// Immutable identity embedded in every current snapshot of a physical unit.
 /// It is DATA, not authorization to install or serve that unit.

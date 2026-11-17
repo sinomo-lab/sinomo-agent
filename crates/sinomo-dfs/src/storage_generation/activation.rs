@@ -11,32 +11,12 @@ pub async fn activate_metadata_storage_generation(
     identity: &DfsMetadataGenerationIdentity,
     seal: &DfsMetadataGenerationSeal,
 ) -> Result<()> {
-    if context.host_role() == sinomo_module::ComponentHostRole::Shadow {
-        return Err(invalid(
-            "shadow context cannot activate owned metadata storage",
-        ));
-    }
-    identity.validate()?;
+    let _owner = require_owned_unit(context, root, identity)?;
     let DfsMetadataGenerationOrigin::StorageTransition { transition_id } = &identity.origin else {
         return Err(invalid(
             "import activation requires a storage transition identity",
         ));
     };
-    let expected_root =
-        crate::local_dfs_metadata_shard_path(context.data_dir(), &identity.shard_id);
-    let actual_root = root.canonicalize().map_err(invalid)?;
-    let data_root = context.data_dir().root().canonicalize().map_err(invalid)?;
-    if actual_root != expected_root.canonicalize().map_err(invalid)?
-        || !actual_root.starts_with(&data_root)
-    {
-        return Err(invalid(
-            "storage activation root differs from the actual component unit",
-        ));
-    }
-    let _owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
-        &crate::runtime_host::DfsRuntimePaths::new(context.data_dir()),
-    )
-    .map_err(invalid)?;
     let cluster = context
         .cluster_access()
         .ok_or_else(|| invalid("storage activation requires native cluster authority"))?;
@@ -56,13 +36,7 @@ pub async fn activate_metadata_storage_generation(
         ])
         .await
         .map_err(invalid)?;
-    match read.authority.basis {
-        sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
-            voter_acks,
-            required_quorum,
-        } if read.authority.term != 0 && required_quorum > 0 && voter_acks >= required_quorum => {}
-        _ => return Err(invalid("storage activation lacks current native authority")),
-    }
+    require_current_authority(&read.authority)?;
     if read.value.len() != 3 {
         return Err(invalid("storage activation exact-set cardinality changed"));
     }
@@ -167,10 +141,53 @@ pub async fn activate_metadata_storage_generation(
     write_generation(root, &envelope)
 }
 
-fn invalid(error: impl std::fmt::Display) -> MetadataBackendError {
+/// The checks every local activation makes before it reads authority: an
+/// owned (not shadow) context, a valid identity whose exact unit root inside
+/// the data directory is `root`, and the live data-owner lock, which the
+/// caller holds for the whole activation.
+pub(super) fn require_owned_unit(
+    context: &sinomo_module::ComponentContext,
+    root: &Path,
+    identity: &DfsMetadataGenerationIdentity,
+) -> Result<impl Sized + use<>> {
+    if context.host_role() == sinomo_module::ComponentHostRole::Shadow {
+        return Err(invalid(
+            "shadow context cannot activate owned metadata storage",
+        ));
+    }
+    identity.validate()?;
+    let expected_root =
+        crate::local_dfs_metadata_shard_path(context.data_dir(), &identity.shard_id);
+    let actual_root = root.canonicalize().map_err(invalid)?;
+    let data_root = context.data_dir().root().canonicalize().map_err(invalid)?;
+    if actual_root != expected_root.canonicalize().map_err(invalid)?
+        || !actual_root.starts_with(&data_root)
+    {
+        return Err(invalid(
+            "storage activation root differs from the actual component unit",
+        ));
+    }
+    crate::runtime_host::require_daemon_dfs_data_owner_lock(
+        &crate::runtime_host::DfsRuntimePaths::new(context.data_dir()),
+    )
+    .map_err(invalid)
+}
+
+/// Require an authoritative read confirmed by a current-term voter quorum.
+pub(super) fn require_current_authority(authority: &sinomo_core::kv::KvAuthorityProof) -> Result<()> {
+    match authority.basis {
+        sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks,
+            required_quorum,
+        } if authority.term != 0 && required_quorum > 0 && voter_acks >= required_quorum => Ok(()),
+        _ => Err(invalid("storage activation lacks current native authority")),
+    }
+}
+
+pub(super) fn invalid(error: impl std::fmt::Display) -> MetadataBackendError {
     MetadataBackendError::Serde(format!("current storage generation activation: {error}"))
 }
-fn entry<'a>(
+pub(super) fn entry<'a>(
     entry: &'a Option<sinomo_core::kv::KvEntry>,
     expected: &str,
 ) -> Result<&'a sinomo_core::kv::KvEntry> {

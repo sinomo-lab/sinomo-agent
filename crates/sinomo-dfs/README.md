@@ -90,11 +90,19 @@ current storage and wire formats.
 
 Each metadata shard has a storage record beside its configuration and write
 set. It names the current storage generation the shard serves and the evidence
-that activated it. A native birth records it together with the assignment, only
-the shard's own conversion changes it, and serving changes (takeover, rotation,
-recruit, removal) never write or compare it. A shard opens only when its local
-generation header matches an Active record, and a Converting record keeps the
-shard closed. A shard without a record is admitted under the filesystem-level
+that activated it. A native birth records it together with the assignment, and
+only the shard's own conversion changes it: the attempt is recorded Converting
+before it reads its inputs, sealed with the converted image, then activated,
+and each configured member activates its staged copy under the Active record.
+When the converting primary is lost, another configured member may take the
+attempt over once every member advertises the storage generation capability;
+its activation also makes it primary at the next epoch in the same
+transaction. Other serving changes (takeover, rotation, recruit, removal) never
+write or compare the record. A shard opens only when its local generation
+header matches an Active record, and a Converting record keeps the shard
+closed. A node's closed copy does not stop operations on its other shards;
+work that addresses the closed shard is refused, or parked until the record
+activates. A shard without a record is admitted under the filesystem-level
 storage state.
 
 `sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.
