@@ -199,7 +199,7 @@ pub(in crate::authority) fn admit_conversion_stage(
             if takeover.previous_primary != shard.primary_node_id || *source != attempt.primary_node_id {
                 return Err(refused("the sender is not the converter of a takeover of the shard's primary"));
             }
-            DfsMetadataShardConversionInstallRule::for_takeover(&shard, write_set, &attempt.primary_node_id)
+            DfsMetadataShardConversionInstallRule::for_takeover(&shard, write_set, &attempt.primary_node_id, takeover)
         }
         None => {
             if *source != shard.primary_node_id || attempt.primary_node_id != shard.primary_node_id {

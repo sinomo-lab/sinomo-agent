@@ -98,18 +98,67 @@ pub(crate) fn fail_directory_move_scan_of(source_path: impl Into<String>) {
     assert!(previous.is_none(), "scan failure hook already installed");
 }
 
-/// The structured failure armed for the scan of `source_path`, once.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+static SCAN_REFUSAL_TEST_HOOK: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Refuses every scan of the moved directory at `source_path` with `Busy`
+/// while it lives. The move stays Running at that scan, as it does for a
+/// scan an open write refuses, and runs it again on a later pass.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct DfsDirectoryMoveScanRefusal {
+    source_path: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DfsDirectoryMoveScanRefusal {
+    pub fn install(source_path: impl Into<String>) -> Self {
+        let source_path = source_path.into();
+        let added = SCAN_REFUSAL_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(source_path.clone());
+        assert!(added, "scan refusal already installed for {source_path}");
+        Self { source_path }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for DfsDirectoryMoveScanRefusal {
+    fn drop(&mut self) {
+        SCAN_REFUSAL_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.source_path);
+    }
+}
+
+/// The failure armed for the scan of `source_path`: a refusal while one is
+/// installed, otherwise a structured failure armed once.
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn directory_move_scan_test_failure(source_path: &str) -> Result<()> {
-    let mut slot = SCAN_FAILURE_TEST_HOOK
+    if SCAN_REFUSAL_TEST_HOOK
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if slot.as_deref() == Some(source_path) {
-        slot.take();
-        return Err(DfsPosixError::Conflict {
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(source_path)
+    {
+        return Err(DfsPosixError::Dfs(DfsError::Busy {
             path: source_path.to_owned(),
-            reason: "injected directory-move scan conflict".into(),
-        });
+        }));
+    }
+    #[cfg(test)]
+    {
+        let mut slot = SCAN_FAILURE_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot.as_deref() == Some(source_path) {
+            slot.take();
+            return Err(DfsPosixError::Conflict {
+                path: source_path.to_owned(),
+                reason: "injected directory-move scan conflict".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -388,10 +437,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // frame; it re-runs once the phase completes.
             Err(error) if self.remote_namespace_phase.is_some() => Err(error),
             Err(error) => {
-                job.pending_frames.push(frame);
+                job.pending_frames.push(frame.clone());
                 job.updated_at = time::OffsetDateTime::now_utc();
                 self.persist_namespace_job(&job)?;
-                Err(error)
+                match self.park_refused_namespace_step(&job, &frame, &error)? {
+                    Some(parked) => Err(parked),
+                    None => Err(error),
+                }
             }
         }
     }

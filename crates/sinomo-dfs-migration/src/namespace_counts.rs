@@ -303,11 +303,23 @@ fn has_unsettled_namespace_work(tables: &sinomo_dfs::DfsMetadataTableSnapshotTab
 }
 
 /// [`has_unsettled_namespace_work`], not counting the non-Completed jobs
-/// `kept` accepts.
+/// `kept` accepts or the Pending outer requests of those jobs.
 fn has_unsettled_namespace_work_beside(
     tables: &sinomo_dfs::DfsMetadataTableSnapshotTables,
     kept: impl Fn(&sinomo_dfs::DfsNamespaceJobRecord) -> bool,
 ) -> bool {
+    let kept_request = |request: &sinomo_dfs::DfsNamespaceRequestRecord| {
+        tables.namespace_jobs.iter().any(|job| {
+            job.status != DfsNamespaceJobStatus::Completed
+                && kept(job)
+                && job.file_system_id == request.file_system_id
+                && job.origin.as_ref().is_some_and(|origin| {
+                    origin.requester_node_id == request.requester_node_id
+                        && origin.request_id == request.request_id
+                        && origin.operation_id == request.operation_id
+                })
+        })
+    };
     tables
         .namespace_jobs
         .iter()
@@ -315,7 +327,7 @@ fn has_unsettled_namespace_work_beside(
         || tables
             .namespace_requests
             .iter()
-            .any(|row| row.status == DfsNamespaceRequestStatus::Pending)
+            .any(|row| row.status == DfsNamespaceRequestStatus::Pending && !kept_request(row))
         || tables.intents.iter().any(|row| {
             matches!(
                 row.status,

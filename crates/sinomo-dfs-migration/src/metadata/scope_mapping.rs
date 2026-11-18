@@ -693,6 +693,84 @@ fn resolve_adoption_work_with_routing(
     Ok((mappings, unresolved))
 }
 
+/// Whether `target` keeps the original request capsule `work` of a copy
+/// whose rows several shards share, by the rule [`resolve_adoption_work`]
+/// applies: a request belongs to its original authority shard, and a pending
+/// adoption also to the current coordinator of its move. `None` for a family
+/// this rule does not attribute; a prepared adoption goes with its prepared
+/// operation, which the caller attributes.
+///
+/// A capsule whose original scope or coordinator cannot be resolved is kept,
+/// so it stays unresolved work rather than being left to no shard.
+pub(super) fn keeps_request_capsule(
+    work: &RequiredNativeWork,
+    tables: &DfsMetadataTableSnapshotTables,
+    assignments: &[DfsMetadataShardConfig],
+    target: &DfsMetadataShardConfig,
+) -> Option<bool> {
+    let routing = ImportedJobRouting::Native { assignments, target };
+    let original = &work.source_row;
+    let attributed = || -> Result<bool> {
+        let declared = crate::legacy_wire::normalize_source_leaf(json!({
+            "file_system_id": original["file_system_id"],
+            "authority_shard_id": original["authority_shard_id"],
+        }))?;
+        let fs: DfsFileSystemId = decode(&declared["file_system_id"])?;
+        let shard: DfsMetadataShardId = decode(&declared["authority_shard_id"])?;
+        let coordinator = match work.family.as_str() {
+            "namespace_requests.old_adoption" => {
+                let job = current_adoption_job_with_routing(original, tables, &routing)?;
+                Some(routing.coordinator(&fs, &job.root_path)?)
+            }
+            _ => None,
+        };
+        routing.retains(&fs, &shard, coordinator.as_ref())
+    };
+    match work.family.as_str() {
+        "namespace_requests.completed_preflight"
+        | "namespace_requests.old_preflight"
+        | "namespace_requests.old_adoption" => Some(attributed().unwrap_or(true)),
+        _ => None,
+    }
+}
+
+/// Retire `target`'s original advisory-lock preflights among `work` as data,
+/// by the rule [`resolve_adoption_work`] applies. Both are outcomes of a
+/// retired protocol with no effect left to run: a completed preflight's
+/// request already has its terminal receipt among the rows, and the capsule
+/// keeps only the auxiliary outcome the current receipt does not carry; a
+/// pending one never had an effect. Returns the retirement mappings and the
+/// other work. Another shard's preflight is that shard's to retire; one that
+/// does not verify stays unresolved.
+pub(super) fn retire_preflights(
+    work: Vec<RequiredNativeWork>,
+    assignments: &[DfsMetadataShardConfig],
+    target: &DfsMetadataShardConfig,
+) -> (Vec<Value>, Vec<RequiredNativeWork>) {
+    let (mut retired, mut rest) = (Vec::new(), Vec::new());
+    for item in work {
+        if !matches!(
+            item.family.as_str(),
+            "namespace_requests.completed_preflight" | "namespace_requests.old_preflight"
+        ) {
+            rest.push(item);
+            continue;
+        }
+        let mut tables = DfsMetadataTableSnapshotTables::default();
+        match resolve_adoption_work(
+            &mut tables,
+            &mut [],
+            vec![item.clone()],
+            assignments,
+            target,
+        ) {
+            Ok((mappings, unresolved)) if unresolved.is_empty() => retired.extend(mappings),
+            _ => rest.push(item),
+        }
+    }
+    (retired, rest)
+}
+
 pub(super) fn map_scope(
     mut tables: DfsMetadataTableSnapshotTables,
     mut pending: Vec<Value>,
@@ -961,6 +1039,14 @@ pub(super) fn map_scope(
     partition!(receipts, |row: &DfsReplicaReceiptRecord| singleton(
         routing.object(&row.receipt.file_system_id, &row.receipt.object_id)
     ));
+    // A withdrawn receipt slot belongs to a live version, so its object
+    // routes it as the receipts it fences.
+    partition!(
+        receipt_withdrawals,
+        |row: &DfsReplicaReceiptWithdrawalRecord| singleton(
+            routing.object(&row.file_system_id, &row.object_id)
+        )
+    );
     partition!(intents, |row: &DfsWriteIntentRecord| singleton(
         routing.object(&row.file_system_id, &row.object_id)
     ));

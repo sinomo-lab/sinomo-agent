@@ -7,8 +7,10 @@ pub(super) mod filesystem;
 pub(super) mod shard_conversion;
 pub(super) mod conversion_receiver;
 mod retained_conversion;
+mod superseded_copy;
 mod scheduler;
 mod source_job_wakes;
+mod source_job_recheck;
 mod discovery;
 mod content_exposure;
 #[cfg(test)]
@@ -259,6 +261,15 @@ impl MigrationOwner {
             }
         }
         if let DfsStoragePreparationScope::Metadata(shard) = scope {
+            if superseded_copy::awaits_snapshot(root, shard)? {
+                // The shard converted without this member: its old copy is
+                // kept aside and the authenticated snapshot repair installs
+                // the activated image.
+                return Err(MetadataBackendError::Rejected {
+                    code: sinomo_dfs::DfsMetadataRejectionCode::ReplicaUnreadable,
+                    message: "metadata replica missed its shard's conversion install; authenticated snapshot repair is required".into(),
+                });
+            }
             if self.work.inventory.read(&key)?.is_none_or(|reference| reference.job.is_none())
                 && crate::metadata::original_unit_absent(root, shard)?
                 && !self.authority.current_receiver_stage_pending(root, shard)? {

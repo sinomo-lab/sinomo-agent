@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 
 type Result<T> = std::result::Result<T, MetadataBackendError>;
 
+mod recheck;
+
 fn node(name: &str) -> NodeId {
     NodeId::from_legacy_named(name).unwrap()
 }
@@ -341,6 +343,7 @@ fn answer(source: &str, aliases: usize, basis: &str) -> SourceContributionRead {
                 })
                 .collect(),
             child_directories: Vec::new(),
+            moving_directories: Vec::new(),
         },
         running_jobs_touching_target: Vec::new(),
         basis: basis.into(),

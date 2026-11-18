@@ -32,7 +32,10 @@ use crate::{
 };
 use sinomo_core::node::NodeId;
 
+mod closed_storage_parks;
 mod destination_reservation;
+#[cfg(any(test, feature = "test-support"))]
+pub use destination_reservation::DfsDirectoryMoveScanRefusal;
 #[cfg(test)]
 pub(crate) use destination_reservation::fail_directory_move_scan_of;
 mod parent_counts;
@@ -777,7 +780,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_path: &str,
         cursor: Option<&DfsDirectoryPageCursor>,
     ) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         destination_reservation::directory_move_scan_test_failure(source_path)?;
         let source_prefix = subtree_prefix(source_path);
         let target_prefix = subtree_prefix(target_path);
@@ -1083,17 +1086,51 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some((path, shards)) = self.hardlink_target_storage_wait(moved)? else {
             return Ok(());
         };
-        self.note_namespace_job_parked(job, frame, &shards);
+        Err(self.park_namespace_step_on_shard_storage(job, frame, shards, path))
+    }
+
+    /// The fence commit of `job` at its next frame `frame`, for the fence on
+    /// `committed_target`: while the shard that holds that fence has a
+    /// storage record naming a conversion, the step is refused with `Busy`
+    /// and the job keeps its frame, as a directory saga waits for a carried
+    /// alias's target shard. The refusal records the shard for this node, so
+    /// its activation wakes this node's maintenance, and records and
+    /// announces the park of `job`. The fence's shard settles the fence from
+    /// the job's reported phase while it converts; the commit that runs once
+    /// it is Active finds the fence Completed.
+    fn park_until_hardlink_fence_storage_active(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+        frame: &DfsNamespaceJobFrame,
+        committed_target: &DfsObjectMetadata,
+    ) -> Result<()> {
+        if self.control_plane.is_none() {
+            return Ok(());
+        }
+        let catalog = self.metadata_shard_authorities(&committed_target.file_system_id)?;
+        let owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &committed_target.file_system_id,
+            &catalog,
+            &committed_target.path,
+        )
+        .map_err(DfsError::from)?;
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        if !self.metadata_shard_storage_is_converting(&owner)? {
+            return Ok(());
+        }
+        self.note_namespace_job_parked(job, frame, std::slice::from_ref(&owner));
         crate::maintenance::storage_waits::record_parked_on_shard_storage(
             &self.node_id,
-            shards.into_iter().map(|shard| {
-                (
-                    shard.file_system_id,
-                    crate::DfsMetadataShardId::new(shard.shard_id),
-                )
-            }),
+            [(
+                owner.file_system_id.clone(),
+                crate::DfsMetadataShardId::new(owner.shard_id.clone()),
+            )],
         );
-        Err(DfsPosixError::Dfs(DfsError::Busy { path }))
+        Err(DfsPosixError::Dfs(DfsError::Busy {
+            path: committed_target.path.clone(),
+        }))
     }
 
     /// The first moved alias whose target's shard is not Active, with the
@@ -2722,6 +2759,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!("hardlink target fence {fence_job_id} does not match its commit"),
             }));
         }
+        // A Completed fence is committed: by an earlier run of this step, or
+        // by its shard's conversion, which settles a fence from its
+        // coordinator's recorded phase. Committing it again changes nothing,
+        // whatever its target has become since.
+        if fence.status == DfsNamespaceJobStatus::Completed {
+            return Ok(());
+        }
         let current = self.lookup_sifs_path(&target_path)?;
         if current.as_ref() != Some(committed_target) {
             if current.as_ref().is_none_or(|target| {
@@ -2893,6 +2937,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let frame = job.pending_frames.pop().expect("nonempty job frames");
             steps = steps.saturating_add(1);
             if matches!(frame, DfsNamespaceJobFrame::CrossShardDirAbort { .. }) {
+                self.park_step_on_converting_shard(&mut job, &frame)?;
                 return self.run_directory_move_abort(job, frame);
             }
             let hardlink_alias_coordination_frame = matches!(
@@ -3017,9 +3062,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // row and propagate its rejection before recapturing that
                     // source or appending a redundant error-only job update.
                     self.namespace_execution.record_job();
+                    // A destination whose storage is closed took no effect:
+                    // the adoption waits there.
+                    let mut durable = job.clone();
+                    durable.pending_frames.push(frame.clone());
+                    if let Some(parked) = self.park_refused_namespace_step(&durable, &frame, &error)? {
+                        return Err(parked);
+                    }
                     return Err(error);
                 }
             }
+            self.park_step_on_converting_shard(&mut job, &frame)?;
             let outcome = match frame.clone() {
                 DfsNamespaceJobFrame::CrossShardAdopt {
                     moved_object,
@@ -3120,13 +3173,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     source_path,
                     expected_target,
                     committed_target,
-                } => self.commit_hardlink_target_fence(
-                    &job,
-                    &fence_job_id,
-                    &source_path,
-                    &expected_target,
-                    &committed_target,
-                ),
+                } => self
+                    .park_until_hardlink_fence_storage_active(&job, &frame, &committed_target)
+                    .and_then(|()| {
+                        self.commit_hardlink_target_fence(
+                            &job,
+                            &fence_job_id,
+                            &source_path,
+                            &expected_target,
+                            &committed_target,
+                        )
+                    }),
                 DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. } => {
                     Err(DfsPosixError::Dfs(DfsError::Metadata {
                         message: format!(
@@ -3204,9 +3261,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error @ (DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_))) => {
                     // Transport or internal failure: the saga stays running
                     // (and the path stays locked) so maintenance resumes it.
-                    job.pending_frames.push(frame);
+                    job.pending_frames.push(frame.clone());
                     job.updated_at = time::OffsetDateTime::now_utc();
                     self.persist_namespace_job(&job)?;
+                    if let Some(parked) = self.park_refused_namespace_step(&job, &frame, &error)? {
+                        return Err(parked);
+                    }
                     return Err(error);
                 }
                 Err(error)

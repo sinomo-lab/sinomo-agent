@@ -62,6 +62,7 @@ use super::contribution_source::{
     SourceJobTouchingTarget, SourceQuestion,
 };
 use super::*;
+use crate::namespace_counts::contributions::NamespaceCountMovingDirectoryContribution;
 use crate::namespace_counts::{
     NamespaceCountAliasContribution, NamespaceCountChildDirectoryContribution,
     ShardCountContributions,
@@ -712,11 +713,15 @@ impl NativeImportAuthority {
         let mut restarted = false;
         let parts = question_parts(question);
         'read: loop {
+            // An old image reports no moving directories: it reports none of
+            // its moves touching the target as parked, so the rounds hold on
+            // them and never count beside one.
             let mut contributions = ShardCountContributions {
                 source_shard: DfsMetadataShardId::new(&state.shard.shard_id),
                 target_shard: DfsMetadataShardId::new(&target.shard_id),
                 aliases: Vec::new(),
                 child_directories: Vec::new(),
+                moving_directories: Vec::new(),
             };
             let mut jobs = Vec::new();
             let mut continuation = None::<extraction::Continuation>;
@@ -877,6 +882,7 @@ impl NativeImportAuthority {
                 target_shard: DfsMetadataShardId::new(&target.shard_id),
                 aliases: Vec::new(),
                 child_directories: Vec::new(),
+                moving_directories: Vec::new(),
             };
             let mut running = Vec::new();
             let mut prefix = None::<DfsMetadataPrefixProof>;
@@ -925,6 +931,17 @@ impl NativeImportAuthority {
                             child_path: child.child_path,
                         }
                     }));
+                contributions
+                    .moving_directories
+                    .extend(page.moving_directories.into_iter().map(|moving| {
+                        NamespaceCountMovingDirectoryContribution {
+                            file_system_id: fs.clone(),
+                            job_id: moving.job_id,
+                            child_object_id: moving.child_object_id,
+                            child_path: moving.child_path,
+                            destination_path: moving.destination_path,
+                        }
+                    }));
                 running.extend(page.running_jobs.into_iter().map(|job| {
                     let parked = job
                         .waiting_for_storage_of
@@ -959,6 +976,7 @@ impl NativeImportAuthority {
                             && page.complete
                             && page.aliases.is_empty()
                             && page.child_directories.is_empty()
+                            && page.moving_directories.is_empty()
                             && page.running_jobs.is_empty() =>
                     {
                         add_holdings(&mut held, page.held);
@@ -1045,6 +1063,11 @@ pub(super) fn finish_answer(
             .then(left.alias_path.cmp(&right.alias_path))
     });
     contributions.child_directories.sort_by(|left, right| {
+        left.child_object_id
+            .cmp(&right.child_object_id)
+            .then(left.child_path.cmp(&right.child_path))
+    });
+    contributions.moving_directories.sort_by(|left, right| {
         left.child_object_id
             .cmp(&right.child_object_id)
             .then(left.child_path.cmp(&right.child_path))

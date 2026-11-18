@@ -43,6 +43,10 @@ use sinomo_dfs::{
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
+mod alias_history;
+mod closed_fences;
+mod closed_pair;
+mod moves;
 mod passive;
 mod takeover;
 

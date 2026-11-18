@@ -176,13 +176,22 @@ fn model_combined_root(native: &DfsTestRuntime, node: &NodeId) -> BTreeMap<PathB
     contents(&combined)
 }
 
-/// A legacy filesystem whose users rows live only in the combined root copy
-/// converts users per shard from that copy while root and services serve:
-/// users' image holds only users' rows, root's conversion moving the copy
-/// under users' attempt does not lose it, and the copy is not changed.
-#[test]
-fn native_a_shard_whose_rows_live_only_in_the_combined_root_converts_per_shard() {
-    let (mut native, nodes) = native_migration_cluster("shard-conversion-combined-root", 3);
+/// A three-node cluster whose root and users shards are modeled as one
+/// released format-3 root copy on every node, with no storage record for
+/// either, while services is current.
+struct CombinedCluster {
+    native: DfsTestRuntime,
+    nodes: Vec<NodeId>,
+    users: sinomo_dfs::DfsMetadataShardConfig,
+    options: sinomo_dfs::DfsWriteOptions,
+    /// Each node's combined copy, as modeled.
+    combined: BTreeMap<NodeId, BTreeMap<PathBuf, Vec<u8>>>,
+    filesystem: KvEntry,
+    services: DfsMetadataShardStorage,
+}
+
+fn combined_cluster(name: &str) -> CombinedCluster {
+    let (mut native, nodes) = native_migration_cluster(name, 3);
     let fs = sinomo_dfs::sifs_file_system_id();
     let mut users = None;
     for (shard, primary, replicas) in [
@@ -203,7 +212,6 @@ fn native_a_shard_whose_rows_live_only_in_the_combined_root_converts_per_shard()
         }
     }
     let users = users.unwrap();
-    let primary = users.primary_node_id.clone();
     let options = sinomo_dfs::DfsWriteOptions {
         policy: sinomo_dfs::DfsReplicationPolicy::new(2, 3).unwrap(),
         replica_candidates: nodes.clone(),
@@ -261,6 +269,42 @@ fn native_a_shard_whose_rows_live_only_in_the_combined_root_converts_per_shard()
         .iter()
         .map(|node| (node.clone(), model_combined_root(&native, node)))
         .collect::<BTreeMap<_, _>>();
+
+    CombinedCluster { native, nodes, users, options, combined, filesystem, services }
+}
+
+/// The paths of the objects in `shard`'s current copy on `node`.
+fn image_paths(native: &DfsTestRuntime, node: &NodeId, shard: &str) -> BTreeSet<String> {
+    let runtime = native.runtime_handle();
+    let _entered = runtime.enter();
+    sinomo_dfs::LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(shard),
+        metadata_dir(native, node).join(shard),
+    )
+    .unwrap()
+    .export_table_snapshot()
+    .unwrap()
+    .tables
+    .objects
+    .iter()
+    .map(|object| object.path.clone())
+    .collect()
+}
+
+fn under_users(path: &str) -> bool {
+    path == "/users" || path.starts_with("/users/")
+}
+
+/// A legacy filesystem whose users rows live only in the combined root copy
+/// converts users per shard from that copy while root and services serve:
+/// users' image holds only users' rows, root's conversion moving the copy
+/// under users' attempt does not lose it, and the copy is not changed.
+#[test]
+fn native_a_shard_whose_rows_live_only_in_the_combined_root_converts_per_shard() {
+    let CombinedCluster { mut native, nodes, users, options, combined, filesystem, services } =
+        combined_cluster("shard-conversion-combined-root");
+    let fs = sinomo_dfs::sifs_file_system_id();
+    let primary = users.primary_node_id.clone();
 
     // Users' floor challenges are refused until the test heals them.
     for receiver in &users.replica_node_ids {
@@ -342,6 +386,26 @@ fn native_a_shard_whose_rows_live_only_in_the_combined_root_converts_per_shard()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+    // Converted first, root's image holds root's rows and none of users'.
+    for node in &nodes {
+        let root_copy = metadata_dir(&native, node).join("root");
+        while !sinomo_dfs::inspect_metadata_storage_generation(&root_copy)
+            .is_ok_and(|header| header.identity == root_record.generation)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{node} did not install root's image: {}",
+                owner_of(node).diagnostic_scheduler()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let paths = image_paths(&native, node, "root");
+        assert!(paths.contains("/root-file"), "{node}: {paths:?}");
+        assert!(
+            !paths.iter().any(|path| under_users(path)),
+            "root's image holds users' rows on {node}: {paths:?}"
+        );
     }
 
     // Root and services serve reads and writes from every node while users
@@ -472,6 +536,186 @@ fn native_a_shard_whose_rows_live_only_in_the_combined_root_converts_per_shard()
             &format!("/users/written-after-conversion-{node}"),
             &options,
         );
+    }
+    drop(owners);
+    native.close().unwrap();
+}
+
+/// The same filesystem converts root last: users converts from the live
+/// combined copy and activates while root parks at its install, then root
+/// converts from that copy too and activates with one replica refusing its
+/// install. Root's first commit repairs that replica by snapshot. On every
+/// member root's image holds root's rows and none of users', and the
+/// combined copy is kept beside it with the bytes it held before.
+#[test]
+fn native_root_converting_after_a_shard_of_its_combined_copy_keeps_only_its_own_rows() {
+    let CombinedCluster { mut native, nodes, users, options, combined, .. } =
+        combined_cluster("shard-conversion-combined-root-last");
+    let fs = sinomo_dfs::sifs_file_system_id();
+    let users_primary = users.primary_node_id.clone();
+    let root_primary = nodes[0].clone();
+
+    // Root's floor challenges are refused until the test heals them.
+    for receiver in &nodes[1..] {
+        native.install_fault(DfsTestFaultRule {
+            source: Some(root_primary.clone()),
+            target: Some(receiver.clone()),
+            route: Some(FLOORS_ROUTE.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: DfsTestFaultAction::BudgetExhausted,
+        });
+    }
+    for node in nodes.clone() {
+        let failure = native
+            .reopen_node_with_startup_action(node, Box::new(|_| Err(PAUSED.into())))
+            .unwrap_err();
+        assert!(failure.contains(PAUSED), "{failure}");
+    }
+    let owners = nodes
+        .iter()
+        .map(|node| canonical_migration_runtime(&native.component_context(node).unwrap()))
+        .collect::<Vec<_>>();
+    let owner_of = |node: &NodeId| {
+        &owners[nodes
+            .iter()
+            .position(|candidate| candidate == node)
+            .unwrap()]
+    };
+    let users_root = metadata_dir(&native, &users_primary).join("users");
+    owner_of(&users_primary)
+        .demand(
+            &users_root,
+            &sinomo_dfs::DfsStoragePreparationScope::Metadata(DfsMetadataShardId::new("users")),
+        )
+        .unwrap();
+
+    // Users activates from the live combined copy while root parks sealed.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let users_record = loop {
+        let active = storage(&owners[0], &fs, "users").filter(DfsMetadataShardStorage::is_active);
+        let root_sealed = storage(&owners[0], &fs, "root")
+            .and_then(|record| record.converting_attempt().cloned())
+            .is_some_and(|attempt| attempt.sealed().is_some());
+        if let Some(active) = active
+            && root_sealed
+        {
+            break active;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "users did not activate while root parked sealed: users {:?}, root {:?}, scheduler {}",
+            storage(&owners[0], &fs, "users"),
+            storage(&owners[0], &fs, "root"),
+            owner_of(&users_primary).diagnostic_scheduler()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    while !sinomo_dfs::inspect_metadata_storage_generation(&users_root)
+        .is_ok_and(|header| header.identity == users_record.generation)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the primary did not activate users: {}",
+            owner_of(&users_primary).diagnostic_scheduler()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let paths = image_paths(&native, &users_primary, "users");
+    assert!(paths.contains("/users/combined-doc"), "{paths:?}");
+    assert!(paths.iter().all(|path| under_users(path)), "{paths:?}");
+    assert!(storage(&owners[0], &fs, "root").is_some_and(|record| !record.is_active()));
+    for (node, before) in &combined {
+        assert_eq!(
+            contents(&metadata_dir(&native, node).join("root")),
+            *before,
+            "{node}'s combined copy changed while users converted"
+        );
+    }
+
+    // Healed toward users' primary only, root installs there and activates
+    // with its primary and that majority of its members. The third member
+    // misses the install and keeps the combined legacy copy.
+    native.clear_faults();
+    let missed = nodes[1].clone();
+    native.install_fault(DfsTestFaultRule {
+        source: Some(root_primary.clone()),
+        target: Some(missed.clone()),
+        route: Some(FLOORS_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: DfsTestFaultAction::BudgetExhausted,
+    });
+    owner_of(&root_primary).work.notify();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let root_record = loop {
+        if let Some(record) =
+            storage(&owners[0], &fs, "root").filter(DfsMetadataShardStorage::is_active)
+        {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "root did not activate: {}",
+            owner_of(&root_primary).diagnostic_scheduler()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    native.clear_faults();
+    let (root_attempt, _) = root_record.converted_activation().unwrap();
+    let retained = format!(
+        ".metadata-retained/shard-conversion-{}",
+        root_attempt.attempt_id
+    );
+
+    // Root is on the all-member commit rule, so its first commit repairs
+    // the member that missed the install by snapshot, once that member's
+    // unit has kept its combined copy aside.
+    await_startup(&native);
+    write_and_read(&native, &root_primary, "/first-root-commit", &options);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    for node in &nodes {
+        let root_copy = metadata_dir(&native, node).join("root");
+        while !sinomo_dfs::inspect_metadata_storage_generation(&root_copy)
+            .is_ok_and(|header| header.identity == root_record.generation)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{node} did not install root's image: {}",
+                owner_of(node).diagnostic_scheduler()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let paths = image_paths(&native, node, "root");
+        assert!(paths.contains("/root-file"), "{node}: {paths:?}");
+        assert!(
+            !paths.iter().any(|path| under_users(path)),
+            "root's image holds users' rows on {node}: {paths:?}"
+        );
+        // Every member keeps its combined copy beside root's image, the
+        // repaired one included.
+        let retained = metadata_dir(&native, node).join(&retained);
+        assert_eq!(contents(&retained), combined[node], "{node}'s combined copy changed");
+    }
+
+    await_startup(&native);
+    for node in &nodes {
+        let mut client = native.client(node).unwrap();
+        assert_eq!(
+            client
+                .posix_read_file_distributed("/users/combined-doc")
+                .unwrap(),
+            b"users bytes in the combined root"
+        );
+        assert_eq!(
+            client.posix_read_file_distributed("/root-file").unwrap(),
+            b"root bytes"
+        );
+        drop(client);
+        write_and_read(&native, node, &format!("/users/written-after-root-{node}"), &options);
+        write_and_read(&native, node, &format!("/written-after-root-{node}"), &options);
     }
     drop(owners);
     native.close().unwrap();

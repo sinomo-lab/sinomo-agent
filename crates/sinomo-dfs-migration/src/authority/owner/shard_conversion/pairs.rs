@@ -9,7 +9,9 @@
 //! - a hardlink job of T whose only step left commits a fence another shard
 //!   holds;
 //! - a parent-count participant T holds, Reserved, for another shard's
-//!   directory move.
+//!   directory move;
+//! - a legacy cross-shard hardlink creation of T whose alias another shard
+//!   owns.
 //!
 //! T asks every other shard about these in its contribution rounds
 //! ([`RoundQuestions`]) and decides them on the accepted round
@@ -22,14 +24,17 @@
 //! - a parent its owner does not hold as a live directory stops T;
 //! - a fence T holds for another shard's job settles from the phase the job's
 //!   coordinator recorded: a job whose next step is the fence commit has made
-//!   its alias change durable, so T applies the committed target and drops
-//!   the fence; any other phase, or no reported job, keeps the fence, and T's
-//!   counts are those from before it;
+//!   its alias change durable, so T applies the committed target and records
+//!   the fence Completed, as its commit would; any other phase, or no
+//!   reported job, keeps the fence, and T's counts are those from before it;
 //! - a fence-commit-only job settles forward once its fence's shard no longer
-//!   holds the fence. While that shard is closed and holds it, T waits for its
-//!   conversion, which settles the fence from this job's phase. When that
-//!   shard is current and holds it, releasing it needs a fence-release step
-//!   that does not exist, so T stops;
+//!   holds the fence. While that shard is closed and holds it, the job stays
+//!   Running in T's image: that shard's conversion applies the fence from
+//!   this job's phase, and the job's commit, which runs once both are open,
+//!   finds the fence committed ([`closed`]). T waits only for that shard to
+//!   record its conversion. When that shard is current and holds the fence,
+//!   releasing it needs a fence-release step that does not exist, so T
+//!   stops;
 //! - a parent-count participant T holds settles from the plan phase its
 //!   coordinating move recorded (DESIGN-BD C.4): a plan Issued or Settling
 //!   has made the move's effect on the parent forward-only, so T applies the
@@ -39,7 +44,12 @@
 //!   made the effect T's other count inputs show, so T keeps the
 //!   participant, as for a plan Preparing or Aborting or a coordinator that
 //!   reports no phase: T keeps the count before the delta and the
-//!   reservation, and the coordinator applies or aborts it after T opens.
+//!   reservation, and the coordinator applies or aborts it after T opens;
+//! - a legacy creation of T settles from the live aliases its alias shard
+//!   reports ([`closed`]).
+//!
+//! A job another closed shard's own conversion settles from its rows does
+//! not hold T's rounds ([`closed`]).
 //!
 //! T's own hardlink work is settled from T's rows before the rounds
 //! ([`OwnPairWork`]): a fence-commit-only job whose canonical target is
@@ -56,6 +66,8 @@ use sinomo_dfs::{
     DfsNamespaceResult, DfsObjectMetadata,
 };
 use time::OffsetDateTime;
+
+pub(super) mod closed;
 
 /// The phase tag of a hardlink job whose next step is its fence commit.
 const FENCE_COMMIT_PHASE: &str = "cross-shard-hardlink-target-fence-commit";
@@ -297,6 +309,8 @@ pub(super) struct OwnPairWork<'a> {
     fences: Vec<&'a DfsNamespaceJobRecord>,
     commits: Vec<&'a DfsNamespaceJobRecord>,
     participants: Vec<&'a DfsNamespaceJobRecord>,
+    /// Legacy creations whose alias another shard owns.
+    creations: Vec<&'a DfsNamespaceJobRecord>,
 }
 
 impl<'a> OwnPairWork<'a> {
@@ -312,6 +326,7 @@ impl<'a> OwnPairWork<'a> {
             fences: Vec::new(),
             commits: Vec::new(),
             participants: Vec::new(),
+            creations: Vec::new(),
         }
     }
 
@@ -334,6 +349,10 @@ impl<'a> OwnPairWork<'a> {
             }
             participant.validate_declaration()?;
             self.participants.push(job);
+            return Ok(true);
+        }
+        if closed::remote_legacy_creation_shard(self.catalog, self.shard, job).is_some() {
+            self.creations.push(job);
             return Ok(true);
         }
         Ok(false)
@@ -402,9 +421,10 @@ impl<'a> OwnPairWork<'a> {
         }
         // A participant's coordinator is another shard's move; its phase
         // comes from the rounds.
-        for participant in &self.participants {
-            namespace_jobs.push((*participant).clone());
-            pending_pairs.push(participant.job_id.clone());
+        // A remote legacy creation settles from its alias shard's rows.
+        for job in self.participants.iter().chain(&self.creations) {
+            namespace_jobs.push((*job).clone());
+            pending_pairs.push(job.job_id.clone());
         }
         let mut requests = Vec::new();
         for (job_id, outcome) in &settled {
@@ -455,18 +475,21 @@ pub(super) struct RoundQuestions {
     commits: Vec<RemoteFenceCommit>,
     /// Parent-count participants the shard holds for other shards' moves.
     participants: Vec<sinomo_dfs::DfsParentCountParticipant>,
+    creations: Vec<closed::RemoteLegacyCreation>,
 }
 
 impl RoundQuestions {
     /// Whether this shard settles `job`'s effect on it per pair: the job's
     /// recorded phase names a fence this shard holds for it, so the fence's
     /// outcome is decided from that phase ([`settle_target_fence`]) and the
-    /// job does not hold the rounds.
+    /// job does not hold the rounds. So is a job its closed source's own
+    /// conversion settles ([`closed`]).
     pub(super) fn settles_per_pair(&self, job: &SourceJobTouchingTarget) -> bool {
-        self.fences.iter().any(|fence| {
-            let marker = format!("fence={}", fence.fence_job_id);
-            job.phase.split(';').skip(1).any(|part| part == marker)
-        })
+        closed::marked_settled_by_own_conversion(job)
+            || self.fences.iter().any(|fence| {
+                let marker = format!("fence={}", fence.fence_job_id);
+                job.phase.split(';').skip(1).any(|part| part == marker)
+            })
     }
 
     /// The questions from the shard's settled capture: every other shard is
@@ -517,6 +540,7 @@ impl RoundQuestions {
                 .push(parent.parent_path.clone());
         }
         let (mut fences, mut commits, mut participants) = (Vec::new(), Vec::new(), Vec::new());
+        let mut creations = Vec::new();
         for job_id in &settled.pending_pairs {
             let job = settled
                 .namespace_jobs
@@ -545,9 +569,11 @@ impl RoundQuestions {
                     fence_job_id: fence_job_id.to_owned(),
                     fence_shard,
                 });
+            } else if let Some(alias_shard) = closed::remote_legacy_creation_shard(catalog, shard, job) {
+                creations.push(closed::RemoteLegacyCreation { job: job.clone(), alias_shard });
             } else {
                 return Err(error(
-                    "a job kept for per-pair settlement is neither a fence, a fence commit nor a parent participant",
+                    "a job kept for per-pair settlement is neither a fence, a fence commit, a parent participant nor a legacy creation",
                 ));
             }
         }
@@ -564,6 +590,7 @@ impl RoundQuestions {
             fences,
             commits,
             participants,
+            creations,
         })
     }
 
@@ -735,6 +762,8 @@ pub(super) struct PairSettlement {
     completed: BTreeSet<String>,
     /// Held parent participants, by participant id.
     participants: BTreeMap<String, ParticipantOutcome>,
+    /// Remote legacy creations, by job id.
+    creations: BTreeMap<String, closed::CreationOutcome>,
 }
 
 /// What an accepted round decides for the shard's pairs.
@@ -807,12 +836,20 @@ pub(super) fn settle_pairs(
                 fence_shard: commit.fence_shard.clone(),
             }
             .into());
-        } else {
+        } else if !closed::old_image_records_conversion(answer) {
             return Ok(PairDecision::Wait(format!(
-                "fence {} of job {} settles when shard {} converts",
+                "fence {} of job {} is held by shard {}, which has not recorded its conversion",
                 commit.fence_job_id, commit.job_id, commit.fence_shard
             )));
         }
+        // Otherwise the job stays Running in the image ([`closed`]).
+    }
+    for creation in &questions.creations {
+        let answer = round.get(&creation.alias_shard).ok_or_else(|| {
+            error(format!("the round has no answer from alias shard {}", creation.alias_shard))
+        })?;
+        let outcome = closed::settle_remote_legacy_creation(creation, answer)?;
+        settlement.creations.insert(creation.job.job_id.clone(), outcome);
     }
     Ok(PairDecision::Settled(settlement))
 }
@@ -868,6 +905,7 @@ pub(super) fn with_pair_settlement(
                 FenceOutcome::Apply => {
                     check_fence_target(&rows, &job.job_id, &fence.expected, &fence.committed)?;
                     objects.push(fence.committed.clone());
+                    jobs.push(closed::committed_fence(job, at));
                 }
                 FenceOutcome::Drop => {}
                 FenceOutcome::Keep => jobs.push(job.clone()),
@@ -877,6 +915,14 @@ pub(super) fn with_pair_settlement(
         if settlement.completed.contains(&job.job_id) {
             requests.extend(settled_request(&rows, job, true, at));
             jobs.push(completed(job, at));
+            continue;
+        }
+        if let Some(outcome) = settlement.creations.get(&job.job_id) {
+            let completes = *outcome == closed::CreationOutcome::Completed;
+            requests.extend(settled_request(&rows, job, completes, at));
+            if completes {
+                jobs.push(completed(job, at));
+            }
             continue;
         }
         jobs.push(job.clone());

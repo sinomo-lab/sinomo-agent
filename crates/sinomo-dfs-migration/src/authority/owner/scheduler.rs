@@ -34,6 +34,9 @@ pub(super) struct Scheduler {
     verdict_watch_nodes: BTreeMap<String, BTreeSet<NodeId>>,
     // Nodes whose verdict changed during a running step.
     verdicts_changed_while_running: BTreeMap<String, BTreeSet<NodeId>>,
+    // The re-send fallback of units parked on other shards' jobs, whose
+    // events are best effort; it arms their re-checks in `retry_at`.
+    source_job_rechecks: super::source_job_recheck::SourceJobRechecks,
     content_verified: BTreeMap<String, (String, String)>,
 }
 impl Scheduler {
@@ -53,6 +56,7 @@ impl Scheduler {
             reachable_while_running: BTreeMap::new(),
             verdict_watch_nodes: BTreeMap::new(),
             verdicts_changed_while_running: BTreeMap::new(),
+            source_job_rechecks: Default::default(),
             content_verified: BTreeMap::new(),
         }
     }
@@ -116,6 +120,7 @@ impl Scheduler {
         self.running.insert(id.clone(), false);
         self.reachable_while_running.insert(id.clone(), BTreeSet::new());
         self.verdicts_changed_while_running.insert(id.clone(), BTreeSet::new());
+        self.source_job_rechecks.started(&id);
         Some((id.clone(), self.units[&id].clone()))
     }
     pub fn finish(&mut self, id: &str, reference: UnitReference) -> bool {
@@ -136,6 +141,10 @@ impl Scheduler {
         );
         let rerun =
             changed_while_running && matches!(reference.state, ObservedState::Waiting { .. });
+        let waiting = matches!(reference.state, ObservedState::Waiting { .. }) && !rerun;
+        if let Some(delay) = self.source_job_rechecks.finished(id, waiting) {
+            self.retry_at.insert(id.to_owned(), std::time::Instant::now() + delay);
+        }
         if matches!(reference.state, ObservedState::VerifiedCurrent | ObservedState::RetainedOriginal | ObservedState::Blocked { .. }) {
             self.native_watch_keys.remove(id);
             self.reachability_watch_nodes.remove(id);
@@ -149,7 +158,9 @@ impl Scheduler {
         readiness_changed
     }
     /// Timers belong only to an attempted operation that returned a retryable
-    /// error, never to a successfully parked dependency or retained archive.
+    /// error and to the re-check of a wait on other shards' jobs
+    /// ([`Self::recheck_source_jobs`]), never to another parked dependency
+    /// or a retained archive.
     pub fn retry_failed(&mut self, id: &str) {
         if self.queued.contains(id) {
             return;
@@ -204,6 +215,7 @@ impl Scheduler {
         let changed = !ids.is_empty();
         for id in ids {
             self.retry_at.remove(&id);
+            self.source_job_rechecks.woken(&id);
             if let Some(changed) = self.running.get_mut(&id) {
                 *changed = true;
             } else {
@@ -255,6 +267,15 @@ impl Scheduler {
             *changed = true;
         }
         self.reachability_watch_nodes.insert(id, nodes);
+        Ok(())
+    }
+    /// The running step of `unit` parks on other shards' jobs, whose events
+    /// are best effort: re-check it on the re-send fallback
+    /// ([`super::source_job_recheck`]) until a step no longer parks so.
+    pub fn recheck_source_jobs(&mut self, unit: &UnitKey) -> Result<()> {
+        let id = unit.id()?;
+        if !self.units.contains_key(&id) { return Err(error("source-job wait has no existing work owner")); }
+        self.source_job_rechecks.parked(id);
         Ok(())
     }
     /// Requeue `unit` on any change of how this node judges one of `nodes`.

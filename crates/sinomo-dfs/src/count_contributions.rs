@@ -3,10 +3,11 @@
 //! A directory counts 2 plus its child directories; a canonical object counts
 //! 1 plus its hardlink aliases. Shard T converting from an older format reads
 //! from every other shard S the live aliases S owns, the live directories S
-//! owns whose parent path T owns, and S's Running namespace jobs, so T can
-//! account for moves that are still in flight. This is read data from S's
-//! current primary, bound to one exact metadata prefix; it grants no write or
-//! publication authority.
+//! owns whose parent path T owns, the live directories S's Running
+//! cross-shard directory moves still have to place under a parent T owns, and
+//! S's Running namespace jobs, so T can account for moves that are still in
+//! flight. This is read data from S's current primary, bound to one exact
+//! metadata prefix; it grants no write or publication authority.
 //!
 //! The same read answers T's question about what S holds: which object ids
 //! are live canonical rows S owns, which paths are live directories S owns,
@@ -19,8 +20,8 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 use std::ops::Bound::{Excluded, Unbounded};
 
-/// Largest number of reported entries (aliases, child directories and jobs
-/// together) one contribution page carries.
+/// Largest number of reported entries (aliases, child and moving directories
+/// and jobs together) one contribution page carries.
 pub(crate) const DFS_COUNT_CONTRIBUTION_PAGE_LIMIT: usize = 512;
 
 /// Largest number of entries (objects, directories and jobs together) one
@@ -131,6 +132,27 @@ pub struct DfsChildDirectoryContribution {
     pub child_path: String,
 }
 
+/// A live directory the source shard owns strictly under the source root of
+/// one of its Running cross-shard directory moves, whose parent at the path
+/// the move places it the target owns.
+///
+/// A moved directory carries the count its source gave it, which includes
+/// its child directories the move has not adopted yet. Those are still live
+/// rows here, at their old paths. The target counts each one toward its
+/// destination parent when the target already holds that parent; while the
+/// parent is not adopted either, the child counts toward its parent here.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMovingDirectoryContribution {
+    /// The move's coordinator job.
+    pub job_id: String,
+    pub child_object_id: DfsObjectId,
+    /// The directory's path on the source shard.
+    pub child_path: String,
+    /// The path the move places it at.
+    pub destination_path: String,
+}
+
 /// A Running namespace job recorded on the source shard. `carried` holds the
 /// objects its pending frames move: the `moved_object` of `CrossShardAdopt`
 /// and `CrossShardComplete`, and the `alias` of `CrossShardHardlinkAdopt`,
@@ -167,6 +189,9 @@ pub struct DfsCountContributionPage {
     pub prefix: DfsMetadataPrefixProof,
     pub aliases: Vec<DfsAliasContribution>,
     pub child_directories: Vec<DfsChildDirectoryContribution>,
+    /// Read in the directories section, beside `child_directories`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moving_directories: Vec<DfsMovingDirectoryContribution>,
     pub running_jobs: Vec<DfsRunningJobContribution>,
     /// A page may report nothing and still advance `after`, when its visit
     /// budget ran out on unreported rows.
@@ -180,8 +205,54 @@ pub struct DfsCountContributionPage {
 
 impl DfsCountContributionPage {
     pub(crate) fn entry_count(&self) -> usize {
-        self.aliases.len() + self.child_directories.len() + self.running_jobs.len()
+        self.aliases.len()
+            + self.child_directories.len()
+            + self.moving_directories.len()
+            + self.running_jobs.len()
     }
+}
+
+/// The coordinator job, source root and target root of each Running
+/// cross-shard directory move `tables` records, with normalized roots.
+fn running_directory_moves(
+    tables: &crate::metadata_tables::DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+) -> Vec<(String, String, String)> {
+    tables
+        .namespace_jobs
+        .values()
+        .filter(|job| {
+            job.kind == DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                && job.status == DfsNamespaceJobStatus::Running
+                && job.file_system_id == *file_system_id
+        })
+        .filter_map(|job| {
+            let target = job.target_path.as_deref()?;
+            Some((
+                job.job_id.clone(),
+                crate::metadata_keys::normalize_posix_path(&job.root_path),
+                crate::metadata_keys::normalize_posix_path(target),
+            ))
+        })
+        .collect()
+}
+
+/// The move of `moves` whose source root `path` is strictly under, with the
+/// path that move places it at. Cross-shard moves hold their source subtrees
+/// exclusively, so at most one applies.
+fn moving_destination<'a>(
+    moves: &'a [(String, String, String)],
+    path: &str,
+) -> Option<(&'a str, String)> {
+    moves.iter().find_map(|(job_id, source_root, target_root)| {
+        let suffix = path.strip_prefix(&crate::posix_path::subtree_prefix(source_root))?;
+        (!suffix.is_empty()).then(|| {
+            (
+                job_id.as_str(),
+                crate::posix_path::join_posix_path(target_root, suffix),
+            )
+        })
+    })
 }
 
 /// What the serving primary recorded about a Running job's next step: the
@@ -389,6 +460,7 @@ pub(crate) fn count_contributions_page(
         prefix,
         aliases: Vec::new(),
         child_directories: Vec::new(),
+        moving_directories: Vec::new(),
         running_jobs: Vec::new(),
         after: None,
         complete: false,
@@ -461,6 +533,7 @@ pub(crate) fn count_contributions_page(
             }
             _ => Unbounded,
         };
+        let moves = running_directory_moves(tables, file_system_id);
         for (object_id, object) in tables.objects.range((start, Unbounded)) {
             visit!(DfsCountContributionCursor::Directories {
                 object_id: object_id.clone(),
@@ -481,10 +554,29 @@ pub(crate) fn count_contributions_page(
             let Some(parent_path) = crate::posix_path::parent_posix_path(&child_path) else {
                 continue;
             };
-            if owner(&child_path)?.as_deref() != Some(source_shard)
-                || owner(&parent_path)?.as_deref() != Some(target_shard)
-                || !listable(object)?
-            {
+            if owner(&child_path)?.as_deref() != Some(source_shard) {
+                continue;
+            }
+            // While a move runs, the directory's parent is the one at the
+            // path the move places it; its source parent is under the same
+            // source root, which this shard owns.
+            if let Some((job_id, destination_path)) = moving_destination(&moves, &child_path) {
+                let destination_parent = crate::posix_path::parent_posix_path(&destination_path);
+                if let Some(destination_parent) = destination_parent
+                    && owner(&destination_parent)?.as_deref() == Some(target_shard)
+                    && listable(object)?
+                {
+                    page.moving_directories
+                        .push(DfsMovingDirectoryContribution {
+                            job_id: job_id.to_owned(),
+                            child_object_id: object_id.clone(),
+                            child_path,
+                            destination_path,
+                        });
+                }
+                continue;
+            }
+            if owner(&parent_path)?.as_deref() != Some(target_shard) || !listable(object)? {
                 continue;
             }
             page.child_directories.push(DfsChildDirectoryContribution {
@@ -811,6 +903,106 @@ mod tests {
         .unwrap();
         assert_eq!(hidden.aliases.len(), 1);
         assert_eq!(hidden.aliases[0].alias_path, "/users/remote-link");
+    }
+
+    /// The directories a Running cross-shard directory move has not placed
+    /// yet are reported to the shard that owns their destination parents,
+    /// with the path the move places them at, and never as children of the
+    /// parents they still have here.
+    #[test]
+    fn page_reports_the_directories_a_running_move_still_has_to_place() {
+        let (mut tables, _) = users_tables();
+        for (name, path, kind) in [
+            (
+                "obj_count_tree_sub",
+                "/users/tree/sub",
+                DfsObjectKind::Directory,
+            ),
+            (
+                "obj_count_tree_deep",
+                "/users/tree/sub/deep",
+                DfsObjectKind::Directory,
+            ),
+            (
+                "obj_count_tree_file",
+                "/users/tree/file",
+                DfsObjectKind::File,
+            ),
+            (
+                "obj_count_beside",
+                "/users/beside/dir",
+                DfsObjectKind::Directory,
+            ),
+        ] {
+            put(&mut tables, &object(name, path, kind, None));
+        }
+        let mut moving = job(
+            "job-count-tree",
+            DfsNamespaceJobStatus::Running,
+            "/users/tree",
+            "/services/tree",
+            Vec::new(),
+        );
+        moving.kind = DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries;
+        tables.apply(DfsMetadataTableOp::PutNamespaceJob {
+            job: moving.clone(),
+        });
+        let to_services =
+            read_page(&tables, "services", None, DFS_COUNT_CONTRIBUTION_PAGE_LIMIT).unwrap();
+        let placed = |name: &str, path: &str, destination: &str| DfsMovingDirectoryContribution {
+            job_id: "job-count-tree".into(),
+            child_object_id: id(name),
+            child_path: path.into(),
+            destination_path: destination.into(),
+        };
+        let mut reported = to_services.moving_directories.clone();
+        reported.sort_by(|left, right| left.child_path.cmp(&right.child_path));
+        assert_eq!(
+            reported,
+            vec![
+                placed(
+                    "obj_count_tree_sub",
+                    "/users/tree/sub",
+                    "/services/tree/sub"
+                ),
+                placed(
+                    "obj_count_tree_deep",
+                    "/users/tree/sub/deep",
+                    "/services/tree/sub/deep"
+                ),
+            ]
+        );
+        assert!(to_services.child_directories.is_empty());
+        assert!(
+            read_page(&tables, "root", None, DFS_COUNT_CONTRIBUTION_PAGE_LIMIT)
+                .unwrap()
+                .moving_directories
+                .is_empty(),
+            "no destination parent of the move is the root shard's"
+        );
+        // The backend's residue rule applies to them as to every row.
+        let hidden = count_contributions_page(
+            &tables,
+            &sifs_file_system_id(),
+            "users",
+            &catalog(),
+            "services",
+            None,
+            DFS_COUNT_CONTRIBUTION_PAGE_LIMIT,
+            prefix(),
+            &mut |object| Ok(object.object_id != id("obj_count_tree_deep")),
+        )
+        .unwrap();
+        assert_eq!(hidden.moving_directories.len(), 1);
+        // Once the move ends, they are ordinary rows of their parents here.
+        moving.status = DfsNamespaceJobStatus::Completed;
+        tables.apply(DfsMetadataTableOp::PutNamespaceJob { job: moving });
+        assert!(
+            read_page(&tables, "services", None, DFS_COUNT_CONTRIBUTION_PAGE_LIMIT)
+                .unwrap()
+                .moving_directories
+                .is_empty()
+        );
     }
 
     #[test]

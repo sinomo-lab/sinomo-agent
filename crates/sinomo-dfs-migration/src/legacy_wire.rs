@@ -1638,7 +1638,11 @@ fn job_frame_wire(mut value: Value) -> Result<Value> {
             DfsHardlinkTargetFence::from_job(fence.into_job()?).and_then(encoded)
         }
     })?;
-    field(&mut value, "state", content_copy_state_wire)?;
+    // Only a content copy's `state` is a copy state; a parent-count
+    // participant's is its recorded phase.
+    if value.get("type").and_then(Value::as_str) == Some("content-copy") {
+        field(&mut value, "state", content_copy_state_wire)?;
+    }
     encoded(decode::<DfsNamespaceJobFrame>(value)?)
 }
 pub(crate) fn normalize_namespace_job(mut value: Value) -> Result<DfsNamespaceJobRecord> {
@@ -3657,6 +3661,41 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
         ],
         "verify-object-family-adoption" => &["object", "source_path", "pin_transfer_id"],
         "adopt-hardlink-alias" => &["alias", "source_path"],
+        // Routed operations and coordination results a shard records in its
+        // requests while it serves.
+        "parent-count-participant" => &["coordinator_job", "participant", "action"],
+        "release-directory-move-destination" => &["reservation"],
+        "record-access" => &["path", "object_id"],
+        "abort-pending-write" => &[
+            "path",
+            "object_id",
+            "target_version",
+            "intent_id",
+            "write_operation_id",
+        ],
+        "mkdir-at-no-links-with-attrs" => &[
+            "path",
+            "expected_parent_object_id",
+            "expected_parent_version",
+            "attrs",
+        ],
+        "aborted-write-intent" => &[
+            "publication",
+            "intent_id",
+            "file_system_id",
+            "object_id",
+            "base_version",
+            "target_version",
+            "requesting_node_id",
+            "operation_id",
+            "operation_order_token",
+            "owner_epoch",
+            "desired_replica_nodes",
+            "policy",
+            "touch_parent_on_create",
+            "create_predecessor_object_id",
+            "state",
+        ],
         "install-hardlink-target-fence" => &["fence", "source_path"],
         "commit-hardlink-target-fence" => &[
             "fence_job_id",
@@ -3701,6 +3740,12 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
         "job-frame/cross-shard-hardlink-complete" => &["target_object_id"],
         "job-frame/cross-shard-hardlink-target-fence-install" => &["fence", "source_path"],
         "job-frame/cross-shard-hardlink-alias-commit" => &["transaction"],
+        "job-frame/cross-shard-hardlink-alias-commit-with-read-set-v1" => &[
+            "transaction",
+            "shard_id",
+            "expected_object_versions",
+            "expected_path_occupants",
+        ],
         "job-frame/cross-shard-hardlink-target-fence-commit" => &[
             "fence_job_id",
             "source_path",
@@ -3712,7 +3757,42 @@ fn original_fields(schema: &str) -> Option<&'static [&'static str]> {
         }
         "job-frame/cross-shard-dir-start" => &["source_object_id", "source_root", "target_root"],
         "job-frame/cross-shard-dir-scan" => &["source_path", "target_path", "cursor"],
-        "job-frame/cross-shard-dir-finish" => &["source_root"],
+        "job-frame/cross-shard-dir-finish" => &["source_root", "count_plan"],
+        "directory-move-counts" => &[
+            "parent_participants",
+            "expected_destination",
+            "source_parent_delta",
+            "target_parent_delta",
+        ],
+        "parent-count-plan" => &["participants", "phase", "confirmed", "rejection"],
+        "parent-count-declaration" => &[
+            "participant_id",
+            "binding",
+            "parent_scope",
+            "expected",
+            "successor",
+            "delta",
+        ],
+        "parent-count-binding" => &[
+            "job_id",
+            "file_system_id",
+            "root_path",
+            "target_path",
+            "coordinator_scope",
+            "source",
+            "expected_destination",
+            "origin",
+            "created_at",
+        ],
+        // Frames of rows a shard holds while it serves: a parent-count
+        // participant another shard's directory move reserves on it, the
+        // destination reservation of a move into it, and the abort of a move
+        // it coordinates. None carries a module payload beyond its objects.
+        "job-frame/parent-count-participant" => &["participant", "state"],
+        "job-frame/directory-move-destination-reservation" => {
+            &["coordinator_job_id", "source_root", "target_root"]
+        }
+        "job-frame/cross-shard-dir-abort" => &["failure_reason"],
         "directory-cursor" => &["path", "object_id", "dentry", "shard_id"],
         "dentry-cursor" => &["dirfrag_id", "name_hash", "name"],
         "copy-state" => &[
@@ -4497,7 +4577,11 @@ fn original_child(schema: &str, key: &str) -> &'static str {
             "provenance",
         ) => "change-provenance",
         ("commit-local-eventual-batch", "transaction")
-        | ("job-frame/cross-shard-hardlink-alias-commit", "transaction") => "transaction",
+        | (
+            "job-frame/cross-shard-hardlink-alias-commit"
+            | "job-frame/cross-shard-hardlink-alias-commit-with-read-set-v1",
+            "transaction",
+        ) => "transaction",
         ("commit-local-eventual-batch", "writes") => "list/local-write-proof",
         ("local-write-proof", "receipt") => "replica-receipt",
         ("replica-receipt", "receipt") => "write-receipt",
@@ -4548,7 +4632,20 @@ fn original_child(schema: &str, key: &str) -> &'static str {
         )
         | ("job-frame/cross-shard-adopt" | "job-frame/cross-shard-complete", "moved_object")
         | ("job-frame/cross-shard-hardlink-adopt", "alias") => "object",
-        ("job", "origin") => "job-origin",
+        ("job", "origin") | ("parent-count-binding", "origin") => "job-origin",
+        ("job-frame/cross-shard-dir-finish", "count_plan") => "directory-move-counts",
+        ("directory-move-counts", "parent_participants") => "parent-count-plan",
+        ("parent-count-plan", "participants") => "list/parent-count-declaration",
+        ("job-frame/parent-count-participant" | "parent-count-participant", "participant") => {
+            "parent-count-declaration"
+        }
+        ("parent-count-participant", "coordinator_job")
+        | ("release-directory-move-destination", "reservation") => "job",
+        ("parent-count-declaration", "binding") => "parent-count-binding",
+        ("parent-count-declaration", "expected" | "successor")
+        | ("parent-count-binding", "source") => "object",
+        ("aborted-write-intent", "publication") => "publication",
+        ("aborted-write-intent", "policy") => "replication-policy",
         ("job", "kind") => "job-kind",
         ("job", "pending_frames") => "list/job-frame",
         ("job-frame/file-history-restore", "state") => "copy-state",

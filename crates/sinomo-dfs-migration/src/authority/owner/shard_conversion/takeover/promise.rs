@@ -1,18 +1,19 @@
-//! Promises of a converting takeover, keyed by the shard, its epoch and its
-//! lost primary.
+//! Promises of a converting takeover, keyed by the shard, its epoch, its
+//! lost primary and the takeover round.
 //!
-//! A candidate asks each member of its quorum on `dfs-migration` object RPC
-//! (and itself, locally) to promise it. A member answers from one exact-set
-//! read of the shard's serving, write-set and storage records, its members'
-//! records and its own verdicts:
+//! A candidate asks each member of its round's quorum on `dfs-migration`
+//! object RPC (and itself, locally) to promise it. A member answers from one
+//! exact-set read of the shard's serving, write-set and storage records, its
+//! members' records and its own verdicts:
 //!
 //! - it refuses while the records no longer name the request's epoch and
-//!   lost primary, the storage is Active, or the candidate or this member is
-//!   not one the shard's quorum admits;
-//! - once a takeover attempt is recorded at the epoch it promises only that
-//!   attempt's converter;
-//! - it vetoes while it does not judge the primary lost: it still reaches it,
-//!   or its verdict is not settled;
+//!   lost primary, the storage is Active, the request is not the round the
+//!   records admit next ([`super::takeover_round`]), or the candidate or this
+//!   member is outside that round's quorum;
+//! - once a round is recorded it promises that round's converter, and
+//!   refuses the next round while it does not judge that converter lost;
+//! - in the first round it vetoes while it does not judge the primary lost:
+//!   it still reaches it, or its verdict is not settled;
 //! - otherwise it promises the best-ranked candidate it knows of that is not
 //!   lost, itself included once it has ranked its own copy, and refuses every
 //!   other, naming the one that outranks it. Until it has captured its own
@@ -21,21 +22,29 @@
 //! What a member learns (candidates and their ranks, its own rank, the
 //! candidate it promises) is persisted under
 //! `dfs/migration-owner/shard-takeovers/<fs>/<shard>.json` before it
-//! replies; a new epoch or lost primary starts a new record. When an answer
-//! changes that record the member wakes its own `Metadata{shard}` unit, which
-//! may itself be the best-ranked candidate; repeating a question wakes
-//! nobody.
+//! replies; a new epoch, lost primary or round starts a new record. When an
+//! answer changes that record the member wakes its own `Metadata{shard}`
+//! unit, which may itself be the best-ranked candidate; repeating a question
+//! wakes nobody.
 //!
-//! **Exclusivity and release.** A member promises one candidate at a time.
-//! Its promise moves only to a candidate ranked above the one it promised, or
-//! away from one it judges lost; without a loss the moves only go up a total
-//! order of finitely many candidates, so they end. A candidate that dies
-//! before its takeover is recorded is released this way. A stale quorum can
-//! still write: two candidates that both counted one member's promise both
-//! submit, the storage record's exact compare commits one of them, and the
-//! builder never lets a recorded takeover be replaced at its epoch. So at most
-//! one takeover attempt is recorded per epoch, attempts do not replace each
-//! other, and promising for the epoch ends there.
+//! **Exclusivity and release.** A member promises one candidate per round
+//! at a time. Its promise moves only to a candidate ranked above the one it
+//! promised, or away from one it judges lost; without a loss the moves only
+//! go up a total order of finitely many candidates, so they end. A candidate
+//! that dies before its round is recorded is released this way. A stale
+//! quorum can still write: two candidates that both counted one member's
+//! promise both submit, the storage record's exact compare commits one of
+//! them, and the builder lets a recorded round be replaced only by the next
+//! one. So each round is recorded at most once, with one converter, and
+//! promising for that round ends there.
+//!
+//! **Rounds.** A member moves to the next round only once it judges the
+//! recorded converter lost, by the same verdicts, so a converter its quorum
+//! still reaches is never replaced; rounds only increase, since each next
+//! round is derived from the recorded one and the builder accepts nothing
+//! else. A converter alive but unreached that still completes its round
+//! races the next round on the storage record's exact compare: exactly one
+//! of the two commits.
 use super::*;
 use sinomo_core::node::NodeId;
 use std::cmp::Ordering;
@@ -43,7 +52,7 @@ use std::cmp::Ordering;
 pub(in crate::authority) const ROUTE: &str = "/dfs-migration/shard-takeover-promise-v1";
 pub(in crate::authority) const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REPLY_BYTES: usize = 64 * 1024;
-const STATE_VERSION: u16 = 1;
+const STATE_VERSION: u16 = 2;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 
 /// This node's settled verdict of its path to a peer, as the write-set
@@ -98,9 +107,14 @@ pub(in crate::authority) enum TakeoverQuorum {
 }
 
 impl TakeoverQuorum {
+    /// The quorum of a round that counts `lost_converters` lost. On a
+    /// switched shard, where every candidate must promise, they are no
+    /// candidates of it; a majority of an unswitched shard never needs any
+    /// one member, and asks them like any other.
     pub(in crate::authority) fn for_shard(
         shard: &DfsMetadataShardConfig,
         write_set: Option<&KvEntry>,
+        lost_converters: &[NodeId],
     ) -> Result<Self> {
         Ok(
             match DfsMetadataShardConversionInstallRule::for_shard(shard, write_set)
@@ -108,6 +122,7 @@ impl TakeoverQuorum {
             {
                 DfsMetadataShardConversionInstallRule::WriteSet { mut required } => {
                     required.remove(&shard.primary_node_id);
+                    required.retain(|node| !lost_converters.contains(node));
                     Self::WriteSet { members: required }
                 }
                 DfsMetadataShardConversionInstallRule::PrimaryAndMajority { .. } => {
@@ -159,7 +174,22 @@ pub(in crate::authority) struct PromiseRequest {
     pub shard_id: String,
     pub epoch: u64,
     pub lost_primary: NodeId,
+    /// The round the candidate runs, and the earlier converters it counts
+    /// lost ([`DfsMetadataConversionTakeover`]).
+    pub round: u64,
+    pub lost_converters: Vec<NodeId>,
     pub candidate: TakeoverRank,
+}
+
+impl PromiseRequest {
+    /// The takeover round the request asks a promise for.
+    pub(in crate::authority) fn takeover(&self) -> DfsMetadataConversionTakeover {
+        DfsMetadataConversionTakeover {
+            previous_primary: self.lost_primary.clone(),
+            round: self.round,
+            lost_converters: self.lost_converters.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -167,6 +197,7 @@ pub(in crate::authority) struct PromiseRequest {
 pub(in crate::authority) struct PromiseResponse {
     pub member: NodeId,
     pub epoch: u64,
+    pub round: u64,
     pub candidate: NodeId,
     pub answer: PromiseAnswer,
 }
@@ -188,7 +219,8 @@ pub(in crate::authority) enum Refusal {
     PrimaryUnsettled,
     /// The shard's records do not admit this takeover now.
     Stale { reason: String },
-    /// A takeover attempt is recorded at this epoch; its converter is final.
+    /// A takeover round is recorded at this epoch, and the member does not
+    /// judge its converter lost.
     TakeoverRecorded { converter: NodeId },
     /// The member has not ranked its own copy yet.
     Unranked,
@@ -246,13 +278,15 @@ impl From<PromiseAnswer> for PromiseReply {
     }
 }
 
-/// What one member knows of one takeover key.
+/// What one member knows of one takeover key: a round of a takeover of one
+/// lost primary at one epoch.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(in crate::authority) struct PromiseState {
     pub version: u16,
     pub epoch: u64,
     pub lost_primary: Option<NodeId>,
+    pub round: u64,
     /// This member's own rank, once it captured its own copy.
     pub own: Option<u64>,
     /// Every other candidate it heard from, with its rank.
@@ -262,11 +296,18 @@ pub(in crate::authority) struct PromiseState {
 }
 
 impl PromiseState {
-    /// This state if it is for `epoch` and `lost_primary`, or a new one.
-    pub(in crate::authority) fn for_key(self, epoch: u64, lost_primary: &NodeId) -> Self {
+    /// This state if it is for `epoch`, `lost_primary` and `round`, or a
+    /// new one.
+    pub(in crate::authority) fn for_key(
+        self,
+        epoch: u64,
+        lost_primary: &NodeId,
+        round: u64,
+    ) -> Self {
         if self.version == STATE_VERSION
             && self.epoch == epoch
             && self.lost_primary.as_ref() == Some(lost_primary)
+            && self.round == round
         {
             return self;
         }
@@ -274,6 +315,7 @@ impl PromiseState {
             version: STATE_VERSION,
             epoch,
             lost_primary: Some(lost_primary.clone()),
+            round,
             ..Self::default()
         }
     }
@@ -378,15 +420,22 @@ fn write_state(path: &Path, state: &PromiseState) -> Result<()> {
     .map_err(error)
 }
 
-/// The member records of `nodes`, by node, for loss verdicts.
-struct MemberRecords(BTreeMap<NodeId, Option<sinomo_core::ClusterMemberRecord>>);
+/// The member entries of `nodes`, by node, for loss verdicts.
+struct MemberRecords(BTreeMap<NodeId, Option<KvEntry>>);
 
 impl MemberRecords {
+    /// The write-set keeper's departed verdict
+    /// ([`DfsMetadataShardStorageMember::departed`]); a node without an
+    /// entry here is not a configured member and counts as departed.
     fn departed(&self, node: &NodeId) -> bool {
-        self.0
-            .get(node)
-            .and_then(Option::as_ref)
-            .is_none_or(|record| record.node_id != *node || !record.state.is_authorized())
+        self.0.get(node).is_none_or(|entry| {
+            DfsMetadataShardStorageMember {
+                node_id: node.clone(),
+                member: entry.as_ref(),
+                policy: None,
+            }
+            .departed()
+        })
     }
 }
 
@@ -443,7 +492,9 @@ impl NativeImportAuthority {
         let path = state_path(&self.data_root, &request.file_system_id, &request.shard_id)?;
         let _guard = PROMISES.lock().map_err(error)?;
         let before = read_state(&path)?;
-        let mut state = before.clone().for_key(request.epoch, &request.lost_primary);
+        let mut state = before
+            .clone()
+            .for_key(request.epoch, &request.lost_primary, request.round);
         state.own = Some(request.candidate.source_journal_sequence);
         if state != before {
             write_state(&path, &state)?;
@@ -518,46 +569,20 @@ impl NativeImportAuthority {
         {
             return stale("the shard's storage is active");
         }
-        let quorum = TakeoverQuorum::for_shard(&shard, write_set)?;
-        let members = quorum.members();
-        if !members.contains(&request.candidate.node_id) || !members.contains(local) {
-            return stale("the candidate or this member is outside the shard's takeover quorum");
-        }
-        if let Some(recorded) = super::recorded_takeover(&shard, write_set, storage.as_ref()) {
-            return if recorded.primary_node_id == request.candidate.node_id {
-                Ok(PromiseAnswer::Promised)
-            } else {
-                refused(Refusal::TakeoverRecorded {
-                    converter: recorded.primary_node_id.clone(),
-                })
-            };
-        }
         let configured = configured_members(&shard).into_iter().collect::<Vec<_>>();
         let member_keys = configured
             .iter()
             .map(sinomo_core::node::cluster_member_key)
             .collect::<Vec<_>>();
-        let (records, _) = self.read_exact(&member_keys)?;
+        let (rows, _) = self.read_exact(&member_keys)?;
         let records = MemberRecords(
             configured
                 .into_iter()
-                .zip(records)
-                .map(|(node, row)| {
-                    let record = row
-                        .entry
-                        .as_ref()
-                        .map(|entry| {
-                            entry
-                                .decode::<sinomo_core::ClusterMemberRecord>()
-                                .map_err(error)
-                        })
-                        .transpose()?;
-                    Ok((node, record))
-                })
-                .collect::<Result<_>>()?,
+                .zip(rows)
+                .map(|(node, row)| (node, row.entry))
+                .collect(),
         );
-        // A candidate the shard no longer admits counts as lost; the
-        // verdicts are read before the promise records are locked.
+        // The verdicts are read before the promise records are locked.
         let judged_lost = records
             .0
             .keys()
@@ -567,33 +592,79 @@ impl NativeImportAuthority {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
-        let lost = |node: &NodeId| {
-            node != local && (!members.contains(node) || judged_lost.contains(node))
-        };
-        let primary_reach = self.takeover_reach(&shard.primary_node_id);
-        let primary_lost =
-            records.departed(&shard.primary_node_id) || primary_reach == PeerReach::NoPath;
-        if !primary_lost {
-            self.verify_takeover_peer(&shard.primary_node_id);
-        }
-        let (changed, decision) = {
-            let _guard = PROMISES.lock().map_err(error)?;
-            let before = read_state(&path)?;
-            let mut state = before.clone().for_key(request.epoch, &request.lost_primary);
-            let decision = if primary_lost {
-                decide_promise(&mut state, local, &request.candidate, lost)
-            } else {
-                if request.candidate.node_id != *local {
-                    state.known.insert(
-                        request.candidate.node_id.clone(),
-                        request.candidate.source_journal_sequence,
-                    );
+        let candidate = &request.candidate.node_id;
+        let (takeover, first_round) =
+            match super::takeover_round(&shard, write_set, storage.as_ref(), candidate, |node| {
+                judged_lost.contains(node)
+            }) {
+                super::TakeoverRound::Continue(recorded) => {
+                    return if recorded.takeover.as_ref() == Some(&request.takeover()) {
+                        Ok(PromiseAnswer::Promised)
+                    } else {
+                        stale("the request is not the shard's recorded takeover round")
+                    };
                 }
-                Err(if primary_reach == PeerReach::Path {
+                super::TakeoverRound::Recorded(recorded) => {
+                    // This member does not judge the recorded converter lost; a
+                    // verdict from edges that have not aged out is re-verified.
+                    if recorded.primary_node_id != *local {
+                        self.verify_takeover_peer(&recorded.primary_node_id);
+                    }
+                    return refused(Refusal::TakeoverRecorded {
+                        converter: recorded.primary_node_id.clone(),
+                    });
+                }
+                super::TakeoverRound::First(takeover) => (takeover, true),
+                super::TakeoverRound::Next { takeover, .. } => (takeover, false),
+            };
+        if request.takeover() != takeover {
+            return stale("the request is not the shard's next takeover round");
+        }
+        let quorum = TakeoverQuorum::for_shard(&shard, write_set, &takeover.lost_converters)?;
+        let members = quorum.members();
+        if !members.contains(candidate) || !members.contains(local) {
+            return stale("the candidate or this member is outside the round's takeover quorum");
+        }
+        // A candidate the shard no longer admits counts as lost.
+        let candidates = TakeoverQuorum::for_shard(&shard, write_set, &[])?.members();
+        let lost = |node: &NodeId| {
+            node != local && (!candidates.contains(node) || judged_lost.contains(node))
+        };
+        // The first round rests on the primary's loss; a later round rests on
+        // its replaced converter's, which the round itself established.
+        let veto = if first_round {
+            let primary_reach = self.takeover_reach(&shard.primary_node_id);
+            if records.departed(&shard.primary_node_id) || primary_reach == PeerReach::NoPath {
+                None
+            } else {
+                self.verify_takeover_peer(&shard.primary_node_id);
+                Some(if primary_reach == PeerReach::Path {
                     Refusal::ReachesPrimary
                 } else {
                     Refusal::PrimaryUnsettled
                 })
+            }
+        } else {
+            None
+        };
+        let (changed, decision) = {
+            let _guard = PROMISES.lock().map_err(error)?;
+            let before = read_state(&path)?;
+            let mut state =
+                before
+                    .clone()
+                    .for_key(request.epoch, &request.lost_primary, request.round);
+            let decision = match veto {
+                None => decide_promise(&mut state, local, &request.candidate, lost),
+                Some(refusal) => {
+                    if request.candidate.node_id != *local {
+                        state.known.insert(
+                            request.candidate.node_id.clone(),
+                            request.candidate.source_journal_sequence,
+                        );
+                    }
+                    Err(refusal)
+                }
             };
             let changed = state != before;
             if changed {
@@ -622,6 +693,7 @@ impl NativeImportAuthority {
         Ok(PromiseResponse {
             member: local,
             epoch: request.epoch,
+            round: request.round,
             candidate: request.candidate.node_id,
             answer,
         })
@@ -659,6 +731,7 @@ impl NativeImportAuthority {
             Ok(response)
                 if response.member == *member
                     && response.epoch == request.epoch
+                    && response.round == request.round
                     && response.candidate == request.candidate.node_id =>
             {
                 response.answer.into()

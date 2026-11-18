@@ -996,7 +996,7 @@ pub use file_history_query::{
 pub use count_contributions::{
     DFS_COUNT_CONTRIBUTION_QUESTION_LIMIT, DfsAliasContribution, DfsChildDirectoryContribution,
     DfsCountContributionCursor, DfsCountContributionHoldings, DfsCountContributionPage,
-    DfsCountContributionQuestion, DfsRunningJobContribution,
+    DfsCountContributionQuestion, DfsMovingDirectoryContribution, DfsRunningJobContribution,
 };
 pub use namespace_job_events::{
     DFS_NAMESPACE_JOB_COMPLETED_EVENT_KIND, DFS_NAMESPACE_JOB_EVENT_SCHEMA_ID,

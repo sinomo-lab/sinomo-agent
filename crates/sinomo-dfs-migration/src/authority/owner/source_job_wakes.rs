@@ -8,7 +8,9 @@
 //! `dfs.namespace.job.completed`, naming the shards it touched
 //! (`sinomo_dfs::DfsNamespaceJobEvent`). The owner listens on its node and
 //! requeues the waiting `Metadata{T}` unit of each touched shard T, which
-//! reads its sources again. Nothing here polls or keeps a timer.
+//! reads its sources again. Nothing here polls or keeps a timer; delivery is
+//! best effort, and the owner's re-check (`source_job_recheck`) covers a
+//! lost event.
 use super::inventory::UnitRole;
 use super::scheduler::Scheduler;
 use super::*;
@@ -115,7 +117,7 @@ mod tests {
             assert!(scheduler.next().is_none(), "both units are parked");
             assert!(
                 scheduler.next_retry().is_none(),
-                "a parked conversion owns no timer"
+                "a unit that asked no re-check owns no timer"
             );
             assert!(
                 !source_job_changed(&mut scheduler, &event(kind, "services")),
@@ -166,7 +168,7 @@ mod tests {
         assert!(scheduler.next().is_none(), "the unit stays parked");
         assert!(
             scheduler.next_retry().is_none(),
-            "a parked conversion owns no timer"
+            "a unit that asked no re-check owns no timer"
         );
     }
 }

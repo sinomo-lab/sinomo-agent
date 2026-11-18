@@ -339,7 +339,7 @@ pub(super) fn capture_projected_source(
     let mut operations = session.projection.pending_operations()?;
     let mut required_work = session.projection.required_native_work();
     if super::combined_root::combined_source_capture(&session.destination_root, shard)? {
-        // A combined copy of other shards: only this shard's rows.
+        // A copy that can hold other shards' rows: only this shard's rows.
         (projected_rows, operations, required_work) = super::combined_root::partition_capture(
             projected_rows,
             operations,
@@ -349,8 +349,14 @@ pub(super) fn capture_projected_source(
             shard,
         )?;
     }
-    let (original_outcomes, proven_v7_terminals, unresolved) =
-        collect_original_outcomes(&projected_rows, &operations, required_work)?;
+    let (original_outcomes, proven_v7_terminals, unresolved) = capture_outcomes(
+        &projected_rows,
+        &operations,
+        required_work,
+        &facts.projection_assignments,
+        &facts.file_system_ids,
+        shard,
+    )?;
     // Settled bodies remain archived. Do not retain their decoded JSON while
     // binding the capture and the small set of eligible original reservations.
     operations.retain(|operation| operation["status"] == "prepared"
@@ -537,6 +543,76 @@ pub(crate) fn decode_captured_unit(
     }
     unit.validate()?;
     Ok(unit)
+}
+
+/// The original outcomes, proven V7 terminals and unresolved work of a
+/// capture of `shard`. The shard's own retired advisory-lock preflights are
+/// outcomes, not work ([`super::scope_mapping::retire_preflights`]); every
+/// other original preparation without a proven outcome, native work item,
+/// non-Completed job, Pending request and staging intent stays unresolved.
+fn capture_outcomes(
+    rows: &DfsMetadataTableSnapshotTables,
+    operations: &[Value],
+    required: Vec<super::scope_mapping::RequiredNativeWork>,
+    assignments: &[DfsMetadataShardConfig],
+    file_system_ids: &[DfsFileSystemId],
+    shard: &DfsMetadataShardId,
+) -> Result<(
+    Vec<OpaqueOriginalOutcomeRef>,
+    Vec<DfsPreparedOperationEviction>,
+    Vec<OriginalWorkRef>,
+)> {
+    let target = assignments.iter().find(|config| {
+        config.shard_id == shard.0 && file_system_ids.contains(&config.file_system_id)
+    });
+    let (retired, required) = match target {
+        Some(target) => super::scope_mapping::retire_preflights(required, assignments, target),
+        None => (Vec::new(), required),
+    };
+    let (mut outcomes, terminals, unresolved) =
+        collect_original_outcomes(rows, operations, required)?;
+    for mapping in retired {
+        let row = &mapping["source_row"];
+        outcomes.push(OpaqueOriginalOutcomeRef {
+            family: "namespace_requests.retired_preflight".into(),
+            original_id: row["request_id"]
+                .as_str()
+                .ok_or_else(|| error("retired preflight has no request identity"))?
+                .to_owned(),
+            original_digest: mapping["capsule_digest"].as_str().map(str::to_owned),
+            original_status: row["status"]
+                .as_str()
+                .ok_or_else(|| error("retired preflight has no status"))?
+                .to_owned(),
+        });
+    }
+    Ok((outcomes, terminals, unresolved))
+}
+
+/// The original work a capture of `rows`, `operations` and `required` from
+/// `source` leaves unresolved beside its own recorded jobs: what stops a
+/// per-shard conversion before it settles those jobs. Empty when it goes on.
+#[cfg(test)]
+pub(super) fn unresolved_beside_recorded_jobs_for_test(
+    source: CapturedMetadataSource,
+    rows: DfsMetadataTableSnapshotTables,
+    operations: &[Value],
+    required: Vec<super::scope_mapping::RequiredNativeWork>,
+) -> Result<Vec<OriginalWorkRef>> {
+    let (outcomes, terminals, unresolved) = capture_outcomes(
+        &rows,
+        operations,
+        required,
+        &source.projection_assignments,
+        &source.file_system_ids,
+        &source.physical_shard,
+    )?;
+    let unit = CapturedMetadataUnit::bind_projection(source, rows, outcomes, terminals, unresolved)?;
+    Ok(if unit.has_unresolved_work_beside_recorded_jobs() {
+        unit.unresolved
+    } else {
+        Vec::new()
+    })
 }
 
 fn collect_original_outcomes(

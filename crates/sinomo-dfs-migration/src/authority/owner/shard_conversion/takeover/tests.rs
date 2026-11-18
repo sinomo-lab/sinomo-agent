@@ -1,5 +1,5 @@
-//! Ranking, quorum and promise decisions of a converting takeover, and the
-//! stage admission of a takeover attempt.
+//! Ranking, quorum, round and promise decisions of a converting takeover,
+//! and the stage admission of a takeover attempt.
 use super::promise::*;
 use super::*;
 use crate::authority::staged_service::conversion_install::{StagedAttempt, admit_conversion_stage};
@@ -71,7 +71,7 @@ fn set(names: &[&str]) -> BTreeSet<NodeId> {
 
 /// A member's state with its own copy ranked at `own`.
 fn ranked(own: u64) -> PromiseState {
-    let mut state = PromiseState::default().for_key(3, &node("primary-p"));
+    let mut state = PromiseState::default().for_key(3, &node("primary-p"), 1);
     state.own = Some(own);
     state
 }
@@ -107,7 +107,7 @@ fn ranking_prefers_the_most_advanced_copy_then_the_smaller_node_id() {
 fn a_switched_shard_ranks_within_its_write_set_and_needs_every_member_of_it() {
     let shard = shard("primary-p", &["a", "b", "c"], 3);
     let switched = write_set(&shard, &["primary-p", "a", "b"]);
-    let quorum = TakeoverQuorum::for_shard(&shard, Some(&switched)).unwrap();
+    let quorum = TakeoverQuorum::for_shard(&shard, Some(&switched), &[]).unwrap();
     assert_eq!(
         quorum.members(),
         set(&["a", "b"]),
@@ -124,7 +124,7 @@ fn a_switched_shard_ranks_within_its_write_set_and_needs_every_member_of_it() {
     );
     // A write set of the primary alone has no candidate.
     let alone =
-        TakeoverQuorum::for_shard(&shard, Some(&write_set(&shard, &["primary-p"]))).unwrap();
+        TakeoverQuorum::for_shard(&shard, Some(&write_set(&shard, &["primary-p"])), &[]).unwrap();
     assert!(alone.members().is_empty());
     assert!(!alone.satisfied(&BTreeSet::new()));
 }
@@ -132,7 +132,7 @@ fn a_switched_shard_ranks_within_its_write_set_and_needs_every_member_of_it() {
 #[test]
 fn an_unswitched_shard_needs_a_majority_of_its_configured_members() {
     let five = shard("primary-p", &["a", "b", "c", "d"], 3);
-    let quorum = TakeoverQuorum::for_shard(&five, None).unwrap();
+    let quorum = TakeoverQuorum::for_shard(&five, None, &[]).unwrap();
     assert_eq!(quorum.members(), set(&["a", "b", "c", "d"]));
     assert!(
         quorum.satisfied(&set(&["a", "b", "c"])),
@@ -144,13 +144,13 @@ fn an_unswitched_shard_needs_a_majority_of_its_configured_members() {
         "the lost primary never counts"
     );
     let three = shard("primary-p", &["a", "b"], 3);
-    let quorum = TakeoverQuorum::for_shard(&three, None).unwrap();
+    let quorum = TakeoverQuorum::for_shard(&three, None, &[]).unwrap();
     assert!(quorum.satisfied(&set(&["a", "b"])));
     assert!(!quorum.satisfied(&set(&["a"])));
     // A write set bound to an older serving record leaves the all-member rule.
     let stale = write_set(&shard("primary-p", &["a", "b"], 2), &["primary-p", "a"]);
     assert!(matches!(
-        TakeoverQuorum::for_shard(&three, Some(&stale)).unwrap(),
+        TakeoverQuorum::for_shard(&three, Some(&stale), &[]).unwrap(),
         TakeoverQuorum::Majority { .. }
     ));
 }
@@ -162,7 +162,7 @@ fn a_member_promises_one_candidate_the_best_ranked_one_it_knows() {
     let local = node("m");
     let never_lost = |_: &NodeId| false;
     // Until it ranks its own copy it promises nobody, but learns the asker.
-    let mut state = PromiseState::default().for_key(3, &node("primary-p"));
+    let mut state = PromiseState::default().for_key(3, &node("primary-p"), 1);
     assert_eq!(
         decide_promise(&mut state, &local, &rank("a", 9), never_lost),
         Err(Refusal::Unranked)
@@ -269,18 +269,212 @@ fn without_a_loss_a_promise_only_moves_up_and_settles_on_the_best() {
 }
 
 #[test]
-fn a_new_epoch_or_lost_primary_starts_a_new_promise_record() {
+fn a_new_epoch_lost_primary_or_round_starts_a_new_promise_record() {
     let mut state = ranked(5);
     decide_promise(&mut state, &node("m"), &rank("b", 9), |_| false).unwrap();
-    assert_eq!(state.clone().for_key(3, &node("primary-p")), state);
-    for (epoch, primary) in [(4, "primary-p"), (3, "other")] {
-        let fresh = state.clone().for_key(epoch, &node(primary));
+    assert_eq!(state.clone().for_key(3, &node("primary-p"), 1), state);
+    for (epoch, primary, round) in [(4, "primary-p", 1), (3, "other", 1), (3, "primary-p", 2)] {
+        let fresh = state.clone().for_key(epoch, &node(primary), round);
         assert_eq!(
             (fresh.own, fresh.promised.clone(), fresh.known.len()),
             (None, None, 0),
-            "{epoch} {primary}"
+            "{epoch} {primary} {round}"
         );
     }
+}
+
+/// A member promises one candidate per round: a promise of one round never
+/// carries into another, so the next round starts with nobody promised and
+/// nobody ranked, and a member's promise in it moves by the same rule.
+#[test]
+fn promises_are_kept_per_round() {
+    let local = node("m");
+    let mut first = ranked(5);
+    decide_promise(&mut first, &local, &rank("b", 9), |_| false).unwrap();
+    assert_eq!(first.promised, Some(node("b")));
+    // Round 2, once b is lost: a fresh record, which ranks again.
+    let mut second = first.clone().for_key(3, &node("primary-p"), 2);
+    assert_eq!(
+        (second.round, &second.promised, second.own),
+        (2, &None, None)
+    );
+    assert_eq!(
+        decide_promise(&mut second, &local, &rank("c", 7), |_| false),
+        Err(Refusal::Unranked),
+        "the member ranks its own copy again in the new round"
+    );
+    second.own = Some(5);
+    assert_eq!(
+        decide_promise(&mut second, &local, &rank("c", 7), |_| false),
+        Ok(())
+    );
+    assert_eq!(
+        decide_promise(&mut second, &local, &rank("d", 6), |_| false),
+        Err(Refusal::Outranked { by: rank("c", 7) }),
+        "one promise per round"
+    );
+    assert_eq!(
+        first.promised,
+        Some(node("b")),
+        "round 1's record is untouched"
+    );
+    // A request of another round never reuses this round's record.
+    let back = second.clone().for_key(3, &node("primary-p"), 1);
+    assert_eq!((back.round, back.promised), (1, None));
+}
+
+fn storage_record(
+    shard: &DfsMetadataShardConfig,
+    converter: Option<&str>,
+    takeover: Option<DfsMetadataConversionTakeover>,
+) -> DfsMetadataShardStorage {
+    let mut attempt = takeover_attempt(shard, converter.unwrap_or("unused"));
+    attempt.seal = None;
+    attempt.contributions_digest = None;
+    attempt.takeover = takeover;
+    attempt.primary_node_id = converter.map_or_else(|| shard.primary_node_id.clone(), node);
+    attempt.attempt_id = sinomo_dfs::metadata_shard_conversion_attempt_id(
+        &shard.file_system_id,
+        &shard.shard_id,
+        &shard.assignment,
+        shard.epoch,
+        &attempt.primary_node_id,
+        &attempt.source,
+        attempt.takeover.as_ref(),
+    )
+    .unwrap();
+    let record = DfsMetadataShardStorage::converting(shard, attempt);
+    record.validate_against(shard).unwrap();
+    record
+}
+
+/// A member moves to the next takeover round only once it judges the
+/// recorded converter lost, or the serving record no longer admits it; a
+/// live converter continues its round and is never replaced. The next round
+/// is the recorded one plus one, counting every earlier converter but its
+/// own lost.
+#[test]
+fn a_member_moves_to_the_next_round_only_once_the_recorded_converter_is_lost() {
+    let current = shard("primary-p", &["a", "b", "c"], 3);
+    let first = DfsMetadataConversionTakeover::first_round(node("primary-p"));
+    let lost = |names: &'static [&'static str]| {
+        move |candidate: &NodeId| names.iter().any(|name| node(name) == *candidate)
+    };
+    let round =
+        |record: Option<&DfsMetadataShardStorage>, at: &str, judged: &'static [&'static str]| {
+            match takeover_round(&current, None, record, &node(at), lost(judged)) {
+                TakeoverRound::First(takeover) => ("first", Some(takeover)),
+                TakeoverRound::Continue(attempt) => ("continue", attempt.takeover.clone()),
+                TakeoverRound::Next { takeover, replaced } => {
+                    assert_eq!(
+                        Some(&replaced.primary_node_id),
+                        record
+                            .and_then(|r| r.converting_attempt())
+                            .map(|a| &a.primary_node_id)
+                    );
+                    ("next", Some(takeover))
+                }
+                TakeoverRound::Recorded(attempt) => ("recorded", attempt.takeover.clone()),
+            }
+        };
+    // Nothing recorded at the epoch, or only the primary's own attempt: the
+    // first round, resting on the primary's loss.
+    assert_eq!(round(None, "a", &[]), ("first", Some(first.clone())));
+    let own = storage_record(&current, None, None);
+    assert_eq!(
+        round(Some(&own), "a", &["primary-p"]),
+        ("first", Some(first.clone()))
+    );
+    // Round 1 by a: a continues it; b parks while a is live to it.
+    let by_a = storage_record(&current, Some("a"), Some(first.clone()));
+    assert_eq!(
+        round(Some(&by_a), "a", &["a"]),
+        ("continue", Some(first.clone()))
+    );
+    assert_eq!(
+        round(Some(&by_a), "b", &["primary-p"]),
+        ("recorded", Some(first.clone()))
+    );
+    // Once b judges a lost, b runs round 2, counting a lost.
+    let second = first.next_round(&node("a"), &node("b"));
+    assert_eq!(
+        round(Some(&by_a), "b", &["a"]),
+        ("next", Some(second.clone()))
+    );
+    assert_eq!(
+        (second.round, second.lost_converters.clone()),
+        (2, vec![node("a")])
+    );
+    // A converter the serving record no longer admits is lost to everyone.
+    let without_a = shard("primary-p", &["b", "c"], 3);
+    match takeover_round(&without_a, None, Some(&by_a), &node("b"), |_| false) {
+        TakeoverRound::Next { takeover, .. } => assert_eq!(takeover, second),
+        other => panic!("{other:?}"),
+    }
+    match takeover_round(&without_a, None, Some(&by_a), &node("a"), |_| false) {
+        TakeoverRound::Recorded(_) => {}
+        other => panic!("a converter no longer admitted runs nothing: {other:?}"),
+    }
+    let switched = write_set(&current, &["primary-p", "b", "c"]);
+    match takeover_round(&current, Some(&switched), Some(&by_a), &node("c"), |_| {
+        false
+    }) {
+        TakeoverRound::Next { takeover, .. } => {
+            assert_eq!(takeover, first.next_round(&node("a"), &node("c")))
+        }
+        other => panic!("a converter outside the write set is lost: {other:?}"),
+    }
+    // Round 2 by b: a returned converter of round 1 runs round 3 without
+    // counting itself lost; c counts both lost.
+    let by_b = storage_record(&current, Some("b"), Some(second.clone()));
+    assert_eq!(
+        round(Some(&by_b), "a", &[]),
+        ("recorded", Some(second.clone()))
+    );
+    let (_, from_a) = round(Some(&by_b), "a", &["b"]);
+    assert_eq!(
+        from_a.map(|t| (t.round, t.lost_converters)),
+        Some((3, vec![node("b")]))
+    );
+    let (_, from_c) = round(Some(&by_b), "c", &["b"]);
+    let mut both = vec![node("a"), node("b")];
+    both.sort();
+    assert_eq!(
+        from_c.map(|t| (t.round, t.lost_converters)),
+        Some((3, both))
+    );
+    // A serving change ends the epoch's takeover: the next epoch starts over.
+    let moved = shard("b", &["primary-p", "a", "c"], 4);
+    match takeover_round(&moved, None, Some(&by_b), &node("a"), |_| true) {
+        TakeoverRound::First(takeover) => assert_eq!(
+            takeover,
+            DfsMetadataConversionTakeover::first_round(node("b"))
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// On a switched shard, where every candidate must promise, a round's
+/// quorum leaves out the earlier converters it counts lost; an unswitched
+/// shard's majority never needs any one member.
+#[test]
+fn a_round_quorum_does_not_wait_for_the_converters_it_counts_lost() {
+    let current = shard("primary-p", &["a", "b", "c"], 3);
+    let switched = write_set(&current, &["primary-p", "a", "b"]);
+    let lost_a = [node("a")];
+    let quorum = TakeoverQuorum::for_shard(&current, Some(&switched), &lost_a).unwrap();
+    assert_eq!(quorum.members(), set(&["b"]));
+    assert!(
+        quorum.satisfied(&set(&["b"])),
+        "the lost converter is not needed"
+    );
+    let majority = TakeoverQuorum::for_shard(&current, None, &lost_a).unwrap();
+    assert_eq!(
+        majority,
+        TakeoverQuorum::for_shard(&current, None, &[]).unwrap()
+    );
+    assert!(majority.satisfied(&set(&["b", "c", "a"])));
+    assert!(!majority.satisfied(&set(&["b"])));
 }
 
 /// A sealed takeover attempt of `converter` under `shard`.
@@ -293,9 +487,7 @@ fn takeover_attempt(shard: &DfsMetadataShardConfig, converter: &str) -> DfsMetad
         source_cut_digest: "a".repeat(64),
         pending_mapping_digest: "b".repeat(64),
     };
-    let takeover = DfsMetadataConversionTakeover {
-        previous_primary: shard.primary_node_id.clone(),
-    };
+    let takeover = DfsMetadataConversionTakeover::first_round(shard.primary_node_id.clone());
     DfsMetadataShardConversion {
         attempt_id: sinomo_dfs::metadata_shard_conversion_attempt_id(
             &shard.file_system_id,

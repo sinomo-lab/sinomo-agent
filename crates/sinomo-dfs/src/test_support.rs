@@ -73,6 +73,7 @@ pub use crate::native_shard_trace::{
     NativeShardTraceCapture, NativeShardTraceRequest, NativeTraceArtifactBindingV1,
     capture_native_shard_trace, request_native_shard_trace,
 };
+pub use crate::posix::DfsDirectoryMoveScanRefusal;
 pub use crate::source_adoption_test::{
     DfsSourcePausePoint as DfsTestSourcePausePoint,
     DfsSourcePreparationCapture as DfsTestSourcePreparationCapture,

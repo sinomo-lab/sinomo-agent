@@ -490,3 +490,172 @@ fn standalone_owned_candidate_resumes_before_cut_and_new_root_refuses_install() 
     drop(owner);
     runtime.close().unwrap();
 }
+
+/// The jobs a shard can hold while it serves, one per frame the original
+/// source reader declares for current rows: a Reserved parent-count
+/// participant another shard's directory move reserves on it, the
+/// destination reservation of a move into it, a move it coordinates that
+/// holds its parent-count plan and its abort frame, and an alias commit with
+/// its read set.
+fn current_frame_jobs(
+    fs: &sinomo_dfs::DfsFileSystem,
+    objects: &[DfsObjectMetadata],
+) -> Vec<sinomo_dfs::DfsNamespaceJobRecord> {
+    use sinomo_dfs::{DfsNamespaceJobFrame as Frame, DfsNamespaceJobKind as Kind};
+    let at = time::OffsetDateTime::UNIX_EPOCH;
+    let shard = sinomo_dfs::DfsMetadataShardConfig {
+        file_system_id: fs.file_system_id.clone(),
+        shard_id: "root".into(),
+        primary_node_id: objects[0].owner_node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: sinomo_dfs::DfsMetadataShardAssignment::Root,
+        default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+    };
+    let mut parent = objects[1].clone();
+    parent.namespace_link_count = Some(2);
+    let mut successor = parent.clone();
+    successor.namespace_link_count = Some(3);
+    successor.version = sinomo_dfs::DfsVersion::from_legacy_named("version-child-successor").unwrap();
+    let mut moved = objects[1].clone();
+    moved.object_id = sinomo_dfs::DfsObjectId::from_legacy_named("moved").unwrap();
+    moved.path = "/elsewhere/moved".into();
+    let participant = sinomo_dfs::DfsParentCountParticipant {
+        participant_id: String::new(),
+        binding: sinomo_dfs::DfsParentCountBinding {
+            job_id: "current-frame-move".into(),
+            file_system_id: fs.file_system_id.clone(),
+            root_path: "/elsewhere/moved".into(),
+            target_path: "/child/moved".into(),
+            coordinator_scope: shard.clone(),
+            source: moved,
+            expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+            origin: None,
+            created_at: at,
+        },
+        parent_scope: shard,
+        expected: parent,
+        successor,
+        delta: 1,
+    }
+    .with_derived_id_for_test()
+    .unwrap();
+    let job = |job_id: &str, kind, root_path: &str, target_path: Option<&str>, pending_frames| {
+        sinomo_dfs::DfsNamespaceJobRecord {
+            job_id: job_id.into(),
+            file_system_id: fs.file_system_id.clone(),
+            origin: None,
+            kind,
+            status: sinomo_dfs::DfsNamespaceJobStatus::Running,
+            root_path: root_path.into(),
+            target_path: target_path.map(str::to_owned),
+            pending_frames,
+            processed_object_count: 0,
+            created_at: at,
+            updated_at: at,
+            completed_at: None,
+            failure_reason: None,
+        }
+    };
+    vec![
+        participant.recorded_job(sinomo_dfs::DfsParentCountState::Reserved, at),
+        job(
+            "current-frame-reservation",
+            Kind::DirectoryMoveDestinationReservation,
+            "/child/moved",
+            None,
+            vec![Frame::DirectoryMoveDestinationReservation {
+                coordinator_job_id: "current-frame-move".into(),
+                source_root: "/elsewhere/moved".into(),
+                target_root: "/child/moved".into(),
+            }],
+        ),
+        job(
+            "current-frame-move",
+            Kind::RenameDirectoryAcrossShardPrimaries,
+            "/elsewhere/moved",
+            Some("/child/moved"),
+            vec![
+                Frame::CrossShardDirFinish {
+                    source_root: "/elsewhere/moved".into(),
+                    count_plan: Some(sinomo_dfs::DfsDirectoryMoveCounts {
+                        parent_participants: Some(sinomo_dfs::DfsParentCountPlan {
+                            participants: vec![participant],
+                            phase: sinomo_dfs::DfsParentCountPhase::Issued,
+                            confirmed: 1,
+                            rejection: None,
+                        }),
+                        expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+                        source_parent_delta: 0,
+                        target_parent_delta: 1,
+                    }),
+                },
+                Frame::CrossShardDirAbort {
+                    failure_reason: "the move's scan failed".into(),
+                },
+            ],
+        ),
+        job(
+            "current-frame-alias-commit",
+            Kind::HardlinkAliasMutationAcrossShardPrimaries,
+            "/alias",
+            None,
+            vec![Frame::CrossShardHardlinkAliasCommit {
+                transaction: sinomo_dfs::DfsNamespaceTransaction {
+                    content_reference_identity: None,
+                    contribution_digest: None,
+                    extension_expectations: Vec::new(),
+                    transaction_id: "current-frame-alias-transaction".into(),
+                    file_system_id: fs.file_system_id.clone(),
+                    objects: vec![objects[3].clone()],
+                    versions: Vec::new(),
+                    file_version_pins: None,
+                    advisory_lock_states: Vec::new(),
+                    created_at: at,
+                },
+                shard_id: sinomo_dfs::DfsMetadataShardId::new("root"),
+                expected_object_versions: Vec::new(),
+                expected_path_occupants: Vec::new(),
+            }],
+        ),
+    ]
+}
+
+/// A capture of a shard holding rows of every current job frame its
+/// original source reader declares reads them as they are.
+#[test]
+fn capture_reads_the_current_job_frames_a_serving_shard_holds() {
+    let (runtime, context, root, _) = local_context("capture-current-job-frames");
+    let owner = StandaloneDataOwnerFixture::acquire(&context).unwrap();
+    let factory = ExplicitStandaloneSourceFactory::from_context(&context).unwrap();
+    let (fs, objects) = source_rows(&factory.node_id);
+    let mut jobs = current_frame_jobs(&fs, &objects);
+    let document = sinomo_core::object::serde_ext::to_bytes(
+        &serde_json::json!({
+            "format_version": 2,
+            "tables": {"file_systems": [fs], "objects": objects, "namespace_jobs": jobs},
+        }),
+        1,
+        sinomo_core::object::LengthMode::U32,
+    )
+    .unwrap();
+    std::fs::write(root.join("records/tables/snapshot.sobj"), &document).unwrap();
+    let authority = Arc::new(StandaloneImportAuthority { factory });
+    let converter = crate::metadata::MetadataConverter::with_authority(authority.clone());
+    let shard = sinomo_dfs::DfsMetadataShardId::new("root");
+    let capture = (0..16)
+        .find_map(|_| {
+            converter
+                .capture_metadata_unit(&root, &root, &shard, 256)
+                .unwrap()
+        })
+        .expect("bounded original source capture");
+    let mut captured = capture.projected_rows.namespace_jobs.clone();
+    captured.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    assert_eq!(captured, jobs);
+    drop(converter);
+    drop(authority);
+    drop(owner);
+    runtime.close().unwrap();
+}

@@ -1,6 +1,7 @@
 //! Converting takeover across native nodes: a closed shard whose primary is
 //! lost is converted by the first-ranked member of a promise quorum, whose
-//! activation also makes it primary at the next epoch.
+//! activation also makes it primary at the next epoch; a lost converter is
+//! replaced by the next round.
 //!
 //! Node 0 holds cluster KV, so the lost primary is always another node. A
 //! node's verdict of its peers is set through the takeover's test verdicts.
@@ -61,6 +62,37 @@ fn switch_write_set_to(cluster: &Cluster, shard: &str, members: &[usize]) {
 fn stop(cluster: &mut Cluster, index: usize) {
     let node = cluster.nodes[index].clone();
     cluster.native.stop_node(&node).unwrap();
+}
+
+/// Stop node `index` and commit its member record as the cluster records a
+/// node that left it: no longer authorized. Stopped, it does not publish its
+/// own record again.
+fn depart(cluster: &mut Cluster, index: usize) {
+    stop(cluster, index);
+    let owner = owner_of(cluster, 0);
+    let key = sinomo_core::node::cluster_member_key(&cluster.nodes[index]);
+    let before = entry(&owner, key.clone()).expect("a member record");
+    let mut record: sinomo_core::ClusterMemberRecord = before.decode().unwrap();
+    record.state = sinomo_core::ClusterMemberState::Removed;
+    let committed = owner
+        .authority
+        .commit(KvTxnRequest::new(
+            KvRequestId::generate(),
+            KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: before.value,
+                }],
+                success: vec![KvOp::Put {
+                    key,
+                    value: sinomo_core::kv::encode_kv_value(&record).unwrap(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+        ))
+        .unwrap();
+    NativeImportAuthority::require_committed(&committed).unwrap();
 }
 
 /// Reopen node `index` with ordinary opens of the held shards still held.
@@ -212,6 +244,47 @@ fn step_on(
     );
     let progress = settle(&env, &cluster.fs, shard);
     (progress, env.submitted.into_inner())
+}
+
+/// Step every candidate in turn, as in [`converge`], each halting before it
+/// would submit an activation, as a node that dies there; the candidate that
+/// halts.
+fn converge_until_activation(cluster: &Cluster, candidates: &[usize], shard: &str) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        for index in candidates {
+            let owner = owner_of(cluster, *index);
+            let unit = metadata_unit(&owner, shard);
+            let env = Observed::new(
+                OwnerConversionEnv::new(
+                    &owner,
+                    &unit,
+                    NativeContributionSource::new(Arc::clone(&owner.authority)),
+                ),
+                true,
+            );
+            loop {
+                match advance_shard_conversion(&env, &cluster.fs, shard) {
+                    _ if env.halted.get() => return *index,
+                    Ok(ConversionProgress::Pending { .. }) => {}
+                    Ok(ConversionProgress::Ready) => panic!("node {index} activated {shard}"),
+                    Ok(_) => break,
+                    Err(failure) if retryable(&failure) => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(failure) => panic!("{shard} conversion step on {index} failed: {failure}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{shard} conversion on {index} kept advancing"
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no candidate reached its activation of {shard}"
+        );
+    }
 }
 
 /// Step every candidate in turn, as each one's unit runs when a promise
@@ -725,5 +798,226 @@ fn native_a_member_that_reaches_the_primary_vetoes_the_takeover() {
     let (attempt, _) = record.converted_activation().unwrap();
     assert!(attempt.takeover.is_none());
     assert_eq!(attempt.primary_node_id, cluster.nodes[1]);
+    cluster.native.close().unwrap();
+}
+
+/// Whether `request` compares `key` exactly with `value`.
+fn compares_exactly(request: &KvTxnRequest, key: &str, value: &[u8]) -> bool {
+    request.txn.compares.contains(&KvCompare::ValueEquals {
+        key: key.to_owned(),
+        value: value.to_vec(),
+    })
+}
+
+/// Whether `request` compares `key` at all.
+fn compares_key(request: &KvTxnRequest, key: &str) -> bool {
+    request.txn.compares.iter().any(|compare| match compare {
+        KvCompare::ValueEquals { key: compared, .. } | KvCompare::Missing { key: compared } => {
+            compared == key
+        }
+        _ => false,
+    })
+}
+
+/// A closed shard whose primary left the cluster. The departed primary no
+/// longer counts against the takeover's capability gate: the Converting and
+/// activation transactions compare its member record exactly as it stands
+/// instead of its capabilities, and nothing is installed on it. The
+/// first-ranked member of a majority takes over on the departure alone,
+/// with no network verdict of the primary, and the members that hold the
+/// image activate it under the new serving record. (No client reads follow:
+/// the fixture's client waits for every mounted node's default
+/// reconciliation, which a member record turned Removed leaves pending.)
+#[test]
+fn native_a_takeover_proceeds_with_its_primary_departed() {
+    let mut cluster = start(
+        "shard-takeover-departed",
+        3,
+        &[
+            ("root", 0, &[1, 2]),
+            ("services", 0, &[1, 2]),
+            ("users", 1, &[0, 2]),
+        ],
+    );
+    write_namespace(&cluster);
+    hold(&mut cluster, &["users"]);
+    let fs = cluster.fs.clone();
+    close(&owner_of(&cluster, 0), &fs, "users");
+    let before = shard_config(&owner_of(&cluster, 0), &fs, "users");
+    depart(&mut cluster, 1);
+    // The members reach each other; neither has a verdict of the primary.
+    judge(&cluster, &[0], 2, PeerReach::Path);
+    judge(&cluster, &[2], 0, PeerReach::Path);
+    let departed_key = sinomo_core::node::cluster_member_key(&cluster.nodes[1]);
+    let departed = entry(&owner_of(&cluster, 0), departed_key.clone()).unwrap();
+
+    let (converter, submitted) = converge(&cluster, &[0, 2], "users");
+    assert_eq!(converter, first_ranked(&cluster, &[0, 2], "users"));
+    let recorded = recorded_takeovers(&submitted);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    let committed = submitted
+        .iter()
+        .filter(|(_, _, outcome)| *outcome == Submitted::Committed)
+        .map(|(_, request, _)| request)
+        .collect::<Vec<_>>();
+    let shard_key = sinomo_dfs::metadata_shard_key(&fs, "users");
+    let gated = committed
+        .iter()
+        .filter(|request| {
+            recorded_takeovers(&[(converter, (**request).clone(), Submitted::Committed)]).len() == 1
+                || request
+                    .txn
+                    .success
+                    .iter()
+                    .any(|op| matches!(op, KvOp::Put { key, .. } if *key == shard_key))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gated.len(),
+        2,
+        "one Converting and one activation: {gated:?}"
+    );
+    let policy_key = sinomo_core::node::cluster_capability_policy_key(&cluster.nodes[1]);
+    for request in gated {
+        assert!(
+            compares_exactly(request, &departed_key, &departed.value),
+            "the departed member's record is compared as it stands"
+        );
+        assert!(
+            !compares_key(request, &policy_key),
+            "its capabilities are not"
+        );
+    }
+    assert_taken_over(&cluster, "users", &before, converter);
+    await_activated_at(&cluster, &[0, 2], "users");
+    cluster.native.close().unwrap();
+}
+
+/// A converting takeover whose converter records, seals and installs its
+/// attempt and dies before activating it. While the converter is live to
+/// it, the other write-set member parks behind its round; once it judges the
+/// converter lost it runs round 2 in its place. That round's quorum and
+/// install do not wait for the lost converter, its Converting transaction
+/// replaces exactly the recorded round, and its activation makes it primary.
+/// The first converter returns superseded: it hands over, nothing is left of
+/// its attempt, and its copy is not admitted.
+#[test]
+fn native_a_lost_converter_is_replaced_by_the_next_round() {
+    let mut cluster = start(
+        "shard-takeover-next-round",
+        4,
+        &[
+            ("root", 0, &[1, 2, 3]),
+            ("services", 0, &[1, 2, 3]),
+            ("users", 1, &[0, 2, 3]),
+        ],
+    );
+    write_namespace(&cluster);
+    switch_write_set_to(&cluster, "users", &[1, 2, 3]);
+    hold(&mut cluster, &["users"]);
+    let fs = cluster.fs.clone();
+    close(&owner_of(&cluster, 0), &fs, "users");
+    let before = shard_config(&owner_of(&cluster, 0), &fs, "users");
+    stop(&mut cluster, 1);
+    judge(&cluster, &[0, 2, 3], 1, PeerReach::NoPath);
+
+    // Round 1 stops right before its activation.
+    let first = converge_until_activation(&cluster, &[2, 3], "users");
+    let survivor = if first == 2 { 3 } else { 2 };
+    let round_one = storage(&owner_of(&cluster, 0), &fs, "users").unwrap();
+    let lost = round_one.converting_attempt().unwrap().clone();
+    assert_eq!(lost.primary_node_id, cluster.nodes[first]);
+    assert_eq!(
+        lost.takeover,
+        Some(sinomo_dfs::DfsMetadataConversionTakeover::first_round(
+            cluster.nodes[1].clone()
+        ))
+    );
+    assert!(lost.sealed().is_some());
+    let survivor_stage = stage_root(
+        &owner_of(&cluster, survivor),
+        &fs,
+        "users",
+        &lost.attempt_id,
+    );
+    assert!(survivor_stage.join("staged.json").is_file());
+    let (waiting, decided) = step_on(&cluster, survivor, "users");
+    assert!(
+        matches!(&waiting, ConversionProgress::Parked { evidence } if evidence.contains("runs round 1")),
+        "a live converter is not replaced: {waiting:?}"
+    );
+    assert!(decided.is_empty());
+    stop(&mut cluster, first);
+    judge(&cluster, &[0, survivor], first, PeerReach::NoPath);
+
+    let (converter, submitted) = converge(&cluster, &[survivor], "users");
+    assert_eq!(converter, survivor);
+    let recorded = recorded_takeovers(&submitted);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    let (_, attempt, replaced) = &recorded[0];
+    assert_eq!(
+        attempt.takeover,
+        Some(sinomo_dfs::DfsMetadataConversionTakeover {
+            previous_primary: cluster.nodes[1].clone(),
+            round: 2,
+            lost_converters: vec![cluster.nodes[first].clone()],
+        })
+    );
+    assert_eq!(
+        replaced.as_ref(),
+        Some(&round_one),
+        "round 2 replaced exactly the recorded round"
+    );
+    let (after, record) = assert_taken_over(&cluster, "users", &before, survivor);
+    let (activated, _) = record.converted_activation().unwrap();
+    assert_eq!(activated.attempt_id, attempt.attempt_id);
+    // The activation's write set drops only the lost primary; the lost
+    // converter, which never received the image, repairs by snapshot or is
+    // removed by the keeper.
+    let write_set_key = sinomo_dfs::metadata_shard_write_set_key(&fs, "users");
+    let written = submitted
+        .iter()
+        .filter(|(_, _, outcome)| *outcome == Submitted::Committed)
+        .find_map(|(_, request, _)| {
+            request.txn.success.iter().find_map(|op| match op {
+                KvOp::Put { key, value, .. } if *key == write_set_key => Some(
+                    sinomo_core::kv::decode_kv_value::<sinomo_dfs::DfsMetadataShardWriteSet>(value)
+                        .unwrap(),
+                ),
+                _ => None,
+            })
+        })
+        .expect("the activation writes the write set");
+    written.validate_against(&after).unwrap();
+    let mut expected = vec![
+        cluster.nodes[first].clone(),
+        cluster.nodes[survivor].clone(),
+    ];
+    expected.sort();
+    assert_eq!(written.write_set, expected);
+    assert_eq!(
+        written.last_change.kind,
+        sinomo_dfs::DfsMetadataShardWriteSetChangeKind::Takeover {
+            previous_primary_node_id: cluster.nodes[1].clone()
+        }
+    );
+    await_activated_at(&cluster, &[survivor], "users");
+    await_unstaged_at(&cluster, &[survivor], "users", &lost.attempt_id);
+
+    // The first converter returns superseded.
+    reopen(&mut cluster, first);
+    let (returned, decided) = step_on(&cluster, first, "users");
+    assert_eq!(returned, ConversionProgress::Handover);
+    assert!(decided.is_empty(), "the first converter submits nothing");
+    let old = owner_of(&cluster, first);
+    assert!(!attempt_dir(&old, &fs, "users", &lost.attempt_id).exists());
+    assert!(header(&old, "users").is_none_or(|header| !record.admits_header(&header)));
+    drop(old);
+    release(
+        &cluster,
+        &owners_at(&cluster, &[0, first, survivor]),
+        "users",
+    );
+    await_serving(&cluster, survivor, &after, "/users/doc");
     cluster.native.close().unwrap();
 }

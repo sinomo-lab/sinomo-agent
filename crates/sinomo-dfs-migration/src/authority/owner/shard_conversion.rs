@@ -12,7 +12,9 @@
 //!
 //! Every step is bounded and resumes from the attempt's files. A step that
 //! cannot advance parks the unit on the KV keys and nodes it waits for and
-//! returns; nothing here owns a timer. Every transaction request is saved
+//! returns; nothing here owns a timer. A wait on other shards' jobs, whose
+//! events are best effort, also has the owner re-check the unit
+//! (`source_job_recheck`). Every transaction request is saved
 //! before it is submitted and is resubmitted byte for byte, because its
 //! request identity is derived from the attempt: a lost outcome is settled by
 //! the same request, and a definite rejection re-reads the shard's keys and
@@ -45,7 +47,11 @@ use sinomo_dfs::{
 };
 use std::future::Future;
 
+mod move_reservations;
 mod pairs;
+
+/// The hook a closed shard's old-image answer marks its own settled work with.
+pub(in crate::authority) use pairs::closed::mark_settled_by_own_conversion;
 
 pub(in crate::authority) mod takeover;
 
@@ -85,7 +91,8 @@ pub(in crate::authority) enum ConversionProgress {
 
 /// The unit state one step leaves, as the owner records it: a parked
 /// conversion waits on the keys and nodes it registered and owns no retry
-/// timer; only an error from a step takes the owner's bounded retry.
+/// timer; only an error from a step takes the owner's bounded retry, and
+/// only a wait on source jobs its re-check (`source_job_recheck`).
 #[cfg(test)]
 pub(super) fn observed_state(progress: &ConversionProgress) -> inventory::ObservedState {
     use inventory::ObservedState;
@@ -111,8 +118,9 @@ pub(in crate::authority) enum ConversionStop {
     SourceChangedUnderAttempt { attempt_id: String },
     /// The captured image still has original work no current family owns.
     UnresolvedOriginalWork { references: Vec<String> },
-    /// A legacy cross-shard hardlink job of this shard whose alias another
-    /// shard owns: the existing settlement reads the alias shard's rows.
+    /// A legacy cross-shard hardlink job of this shard whose alias path no
+    /// shard owns, so no rows can settle it. One whose alias another shard
+    /// owns settles per pair from that shard's live aliases.
     LegacyHardlinkNeedsAliasShard { job_id: String, alias_shard: String },
     /// A legacy cross-shard hardlink job whose recorded rows settle it in
     /// neither direction.
@@ -130,6 +138,14 @@ pub(in crate::authority) enum ConversionStop {
     /// A hardlink job of this shard whose only step left commits a target
     /// fence that a current shard still holds: releasing it needs a
     /// fence-release step.
+    ///
+    /// Only damaged or altered data reaches this. The job's alias change is
+    /// durable, so it settles forward, never as aborted. Every copy is legacy
+    /// when the cluster upgrades, so the fence's shard became current through
+    /// its own conversion, which read this shard closed, with the job frozen
+    /// at the fence commit, and so applied the commit and dropped the fence
+    /// (`pairs::settle_target_fence`). A closed coordinator runs no frame, so
+    /// no current shard installs a fence for it afterwards.
     TargetFenceNeedsRelease { job_id: String, fence_job_id: String, fence_shard: String },
 }
 
@@ -248,10 +264,25 @@ pub(in crate::authority) trait ShardConversionEnv {
         record: &DfsMetadataShardStorage,
         image: &Path,
     ) -> Result<()>;
+    /// The shard's storage is Active under an attempt this node does not
+    /// hold: a member left without its image hands its copy to snapshot
+    /// repair (`superseded_copy`).
+    fn supersede_local_copy(
+        &self,
+        _shard: &DfsMetadataShardConfig,
+        _record: &DfsMetadataShardStorage,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Wake the unit when any of `keys` changes.
     fn watch_keys(&self, keys: BTreeSet<String>) -> Result<()>;
     /// Wake the unit when any of `nodes` becomes reachable.
     fn watch_nodes(&self, nodes: BTreeSet<NodeId>) -> Result<()>;
+    /// The step parks on other shards' jobs, whose events are best effort:
+    /// the owner re-checks the unit until a step no longer parks so.
+    fn recheck_source_jobs(&self) -> Result<()> {
+        Ok(())
+    }
     /// This node's converting-takeover facilities: its verdicts of its peers
     /// and its members' promises. Without them only the primary converts.
     fn takeover(&self) -> Option<&dyn takeover::TakeoverEnv> {
@@ -760,11 +791,13 @@ fn finish_active<E: ShardConversionEnv>(
         .filter(|attempt| attempt.primary_node_id == *local);
     let Some(attempt) = ours else {
         shard_files.remove_except(None)?;
+        env.supersede_local_copy(&keys.shard, active)?;
         return Ok(Step::Done(ConversionProgress::Handover));
     };
     let files = shard_files.attempt(&attempt.attempt_id)?;
     if files.read::<AttemptRecord>("attempt.json")?.is_none() {
         shard_files.remove_except(None)?;
+        env.supersede_local_copy(&keys.shard, active)?;
         return Ok(Step::Done(ConversionProgress::Handover));
     }
     env.activate_local(&keys.shard, active, &files.image())?;
@@ -1104,13 +1137,15 @@ fn contribution_round<E: ShardConversionEnv>(
         // Such a job keeps the rounds from agreeing until it parks on this
         // shard or ends. Its coordinator's `dfs.namespace.job.parked` and
         // `dfs.namespace.job.completed` events wake this unit
-        // (`source_job_wakes`), as do the source's keys.
+        // (`source_job_wakes`), as do the source's keys; a lost event is
+        // covered by the owner's re-check.
         files.write(
             "round-state.json",
             &RoundState::Parked {
                 evidence: format!("jobs of shards {} touch this shard", touching.join(", ")),
             },
         )?;
+        env.recheck_source_jobs()?;
         return Ok(None);
     }
     if previous.as_ref() != Some(&round) {
@@ -1165,6 +1200,10 @@ fn settle_own_jobs(
         }
         // Target fences and fence-commit-only hardlink jobs.
         if own.claim(job)? {
+            continue;
+        }
+        if move_reservations::keeps(job) {
+            namespace_jobs.push(job.clone());
             continue;
         }
         let legacy_hardlink = job.kind == DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
@@ -1455,6 +1494,13 @@ impl<C: ContributionSource> ShardConversionEnv for OwnerConversionEnv<'_, C> {
             ),
         )
     }
+    fn supersede_local_copy(
+        &self,
+        shard: &DfsMetadataShardConfig,
+        record: &DfsMetadataShardStorage,
+    ) -> Result<()> {
+        super::superseded_copy::supersede(self.owner, shard, record).map(|_| ())
+    }
     fn watch_keys(&self, keys: BTreeSet<String>) -> Result<()> {
         let mut watched = self.keys.borrow_mut();
         watched.extend(keys);
@@ -1464,6 +1510,9 @@ impl<C: ContributionSource> ShardConversionEnv for OwnerConversionEnv<'_, C> {
         let mut watched = self.nodes.borrow_mut();
         watched.extend(nodes);
         self.owner.work.watch_reachable_nodes(self.unit, watched.clone())
+    }
+    fn recheck_source_jobs(&self) -> Result<()> {
+        self.owner.work.scheduler.lock().map_err(error)?.recheck_source_jobs(self.unit)
     }
     fn takeover(&self) -> Option<&dyn takeover::TakeoverEnv> {
         Some(self)

@@ -14,7 +14,9 @@
 //! non-Completed namespace jobs, Pending requests and staging intents that
 //! touch T are reported beside them with their recorded phase, in the format
 //! the current-table answer uses, including the fences and parent
-//! participants a job names; S's other work is ignored.
+//! participants a job names; S's other work is ignored. A job S's own
+//! conversion settles from its rows is marked so, and its Pending outer
+//! request is left to it (`shard_conversion::mark_settled_by_own_conversion`).
 //!
 //! The answer is paged and bound to a basis: S's serving epoch, its storage
 //! record, the captured source identity and fingerprints and the catalog it
@@ -478,6 +480,12 @@ impl NativeImportAuthority {
             target,
         };
         let work = scope.unsettled_work(&captured.projected_rows)?;
+        let work = super::owner::shard_conversion::mark_settled_by_own_conversion(
+            &captured.projected_rows,
+            catalog,
+            &shard.0,
+            work,
+        )?;
         let answer = super::contribution_sources::finish_answer(contributions, work, String::new());
         let mut entries = Vec::with_capacity(
             answer.contributions.aliases.len()

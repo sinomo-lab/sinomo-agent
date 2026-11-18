@@ -202,6 +202,7 @@ fn answer(
             target_shard: DfsMetadataShardId::new("users"),
             aliases: Vec::new(),
             child_directories: Vec::new(),
+            moving_directories: Vec::new(),
         },
         running_jobs_touching_target: jobs,
         basis: basis.into(),
@@ -526,10 +527,14 @@ fn a_remote_coordinators_phase_applies_or_keeps_the_fence() {
             .iter()
             .find(|object| object.object_id == doc.object_id)
             .unwrap();
+        // An applied fence is recorded Completed, as its commit records it.
+        let fence = rows
+            .namespace_jobs
+            .iter()
+            .find(|job| job.job_id == held.job_id)
+            .unwrap();
         assert_eq!(
-            rows.namespace_jobs
-                .iter()
-                .any(|job| job.job_id == held.job_id),
+            fence.status == DfsNamespaceJobStatus::Running,
             !applied,
             "{phase}"
         );
@@ -547,6 +552,7 @@ fn a_remote_coordinators_phase_applies_or_keeps_the_fence() {
                     target_object_id: doc.object_id.clone(),
                 }],
                 child_directories: Vec::new(),
+                moving_directories: Vec::new(),
             })
             .into_iter()
             .collect::<Vec<_>>();
@@ -668,8 +674,9 @@ fn a_local_fence_commit_settles_forward_in_the_image() {
 
 /// An alias job whose only step left commits a fence another shard holds
 /// settles forward once that shard no longer holds the fence; while a closed
-/// shard holds it the round waits, and while a current shard holds it the
-/// conversion stops, since releasing it needs a fence-release step.
+/// shard that has not recorded its conversion holds it the round waits, and
+/// while a current shard holds it the conversion stops, since releasing it
+/// needs a fence-release step.
 #[test]
 fn a_remote_fence_commit_settles_when_its_fence_is_released() {
     let root = sinomo_testdir::TestDir::new("pairs-remote-commit");
@@ -726,7 +733,7 @@ fn a_remote_fence_commit_settles_when_its_fence_is_released() {
     );
     assert!(matches!(
         settle_pairs(&questions, &round(&questions, &holding, OLD)).unwrap(),
-        PairDecision::Wait(evidence) if evidence.contains("settles when shard services converts")
+        PairDecision::Wait(evidence) if evidence.contains("services, which has not recorded its conversion")
     ));
     let released = round(
         &questions,
@@ -888,6 +895,7 @@ fn projects_contribution(moved: bool) -> ShardCountContributions {
             })
             .into_iter()
             .collect(),
+        moving_directories: Vec::new(),
     }
 }
 

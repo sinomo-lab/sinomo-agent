@@ -559,6 +559,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if current.shard_id != participant.parent_scope.shard_id {
                 return Err(invalid("declared parent moved to another physical shard"));
             }
+            // A participant on a parent shard whose storage is closed waits
+            // there before any effect (see `closed_storage_parks`).
+            let next_frame = job.pending_frames.last().cloned();
+            if let Some(frame) = &next_frame
+                && !self.is_namespace_job_coordinator_shard(job, &current)
+                && self.metadata_shard_storage_is_converting(&current)?
+            {
+                return Err(self.park_namespace_step_on_shard_storage(
+                    job,
+                    frame,
+                    vec![current],
+                    participant.expected.path.clone(),
+                ));
+            }
             let command = DfsNamespaceOperation::ParentCountParticipant {
                 coordinator_job: Box::new(job.clone()),
                 participant: Box::new(participant.clone()),
@@ -570,13 +584,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.route_cross_shard_job_phase_with_result(
                     Some(job),
                     &participant.operation_id(&action),
-                    current.primary_node_id,
+                    current.primary_node_id.clone(),
                     command,
                 )
             };
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
+                    // A parent shard whose storage is closed took no effect:
+                    // the phase waits there.
+                    if let Some(frame) = &next_frame
+                        && super::closed_storage_parks::posix_error_is_closed_shard_storage(&error)
+                    {
+                        return Err(self.park_namespace_step_on_shard_storage(
+                            job,
+                            frame,
+                            vec![current],
+                            participant.expected.path.clone(),
+                        ));
+                    }
                     // Preparing is durable proof that no child effect was
                     // issued. Unknown reservation delivery is safe to abort
                     // only through terminal withdrawals of every declaration.

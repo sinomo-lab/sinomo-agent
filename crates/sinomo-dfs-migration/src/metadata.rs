@@ -6439,8 +6439,8 @@ impl MetadataConverter {
     ///
     /// `source` is the copy the capture reads: the shard's own copy at
     /// `destination`, or the legacy combined `root` copy that holds the
-    /// shard's rows ([`combined_root`]), of which the capture keeps only the
-    /// shard's rows.
+    /// shard's rows ([`combined_root`]). A capture of the combined copy, and
+    /// every capture of `root`, keeps only the shard's rows.
     pub(crate) fn capture_shard_conversion_source(
         &self, destination: &Path, source: &Path, shard: &DfsMetadataShardId, file_system_id: &DfsFileSystemId,
         reservations: &[RetainedPlacementReservation], budget: usize,
@@ -6470,7 +6470,7 @@ impl MetadataConverter {
         }
         write_count_cohort_checkpoint(&evidence, &reservations)?;
         write_count_cohort_checkpoint(&stage.join(SHARD_CONVERSION_CAPTURE), file_system_id)?;
-        if source != destination {
+        if combined_root::capture_keeps_only_own_rows(&source, &destination, shard) {
             combined_root::record_combined_source_capture(&destination, shard, file_system_id)?;
         }
         self.capture_metadata_unit_progress(&destination, &source, shard, budget)

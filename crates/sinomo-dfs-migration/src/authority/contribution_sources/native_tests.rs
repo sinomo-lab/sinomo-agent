@@ -579,7 +579,8 @@ fn native_old_source_reports_only_its_jobs_touching_the_target() {
             vec![SourceJobTouchingTarget {
                 job_id: job_id.into(),
                 family: "hardlink-across-shard-primaries".into(),
-                phase: "cross-shard-hardlink-adopt".into(),
+                // S's own conversion settles a legacy creation.
+                phase: "cross-shard-hardlink-adopt;settled-by-own-conversion".into(),
             }],
             "only the job whose alias path {target} owns is reported"
         );

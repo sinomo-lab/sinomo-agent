@@ -18,6 +18,10 @@
 //!   shard cannot detect an alias whose target no shard holds.
 //! - A contributed child directory must name a parent path T owns, and that
 //!   parent must be a live directory in T, or the plan fails closed.
+//! - A directory that a source's Running cross-shard directory move has not
+//!   placed yet counts toward the parent at the path the move places it, when
+//!   T holds that parent: the directory the move adopted there carries a
+//!   count that includes it ([`moving`]).
 //! - Aliases are deduplicated by alias object id and child directories by
 //!   child object id, across T's own rows and every contribution: an entry
 //!   that moved between shards can appear in two of them and counts once. The
@@ -33,6 +37,10 @@
 use super::*;
 use sinomo_dfs::DfsMetadataShardAssignment;
 use std::collections::btree_map::Entry;
+
+mod moving;
+pub(crate) use moving::is_kept_destination_reservation;
+pub use moving::NamespaceCountMovingDirectoryContribution;
 
 /// One live alias its source shard owns. Its target may be owned by any shard.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -63,6 +71,10 @@ pub struct ShardCountContributions {
     pub target_shard: DfsMetadataShardId,
     pub aliases: Vec<NamespaceCountAliasContribution>,
     pub child_directories: Vec<NamespaceCountChildDirectoryContribution>,
+    /// Directories the source's Running cross-shard directory moves still
+    /// have to place under a parent the target owns ([`moving`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moving_directories: Vec<NamespaceCountMovingDirectoryContribution>,
 }
 
 fn same_ownership(
@@ -86,7 +98,10 @@ enum SourceWork {
     Settled,
     /// Refused, except the rows the shard keeps for another shard's job
     /// through its conversion: target fences ([`is_kept_target_fence`]) and
-    /// Reserved parent-count participants ([`is_kept_parent_participant`]).
+    /// Reserved parent-count participants ([`is_kept_parent_participant`]);
+    /// destination reservations ([`is_kept_destination_reservation`]); and its
+    /// own hardlink jobs whose only step left commits a fence another shard
+    /// holds ([`is_kept_fence_commit`]), with their Pending outer requests.
     SettledKeepingPairRows,
     /// Left to the caller, which reports the work that touches the target.
     /// Other original work without a proven outcome is still refused: its
@@ -107,7 +122,10 @@ fn admit_shard_source(
             admit_count_source_identity(captured, captured.has_unresolved_work())?;
             if has_unrecovered_preparation(captured)
                 || has_unsettled_namespace_work_beside(&captured.projected_rows, |job| {
-                    is_kept_target_fence(job) || is_kept_parent_participant(job)
+                    is_kept_target_fence(job)
+                        || is_kept_parent_participant(job)
+                        || is_kept_destination_reservation(job)
+                        || is_kept_fence_commit(job)
                 })
             {
                 return Err(invalid(
@@ -212,6 +230,7 @@ fn extract_contributions(
         target_shard,
         aliases,
         child_directories,
+        moving_directories: Vec::new(),
     })
 }
 
@@ -240,7 +259,8 @@ pub(crate) fn plan_shard_namespace_count_maintenance(
         owned.insert(shard, object)?;
     }
     let mut counts = local_counts(&owned, CountScope::Shard { catalog, shard }, limits)?;
-    add_contributed_counts(catalog, shard, &owned, contributions, &mut counts, limits)?;
+    let moves = moving::KeptMoves::new(&target.captured.projected_rows.namespace_jobs);
+    add_contributed_counts(catalog, shard, &owned, &moves, contributions, &mut counts, limits)?;
     let updates = verified_count_updates(counts, owned.rows, limits)?;
     finish_count_plan(catalog.to_vec(), std::slice::from_ref(target), updates, limits)
 }
@@ -262,7 +282,8 @@ pub(crate) fn validate_shard_image_counts(
         owned.insert(shard, object)?;
     }
     let mut counts = local_counts(&owned, CountScope::Shard { catalog, shard }, limits)?;
-    add_contributed_counts(catalog, shard, &owned, contributions, &mut counts, limits)?;
+    let moves = moving::KeptMoves::new(&rows.namespace_jobs);
+    add_contributed_counts(catalog, shard, &owned, &moves, contributions, &mut counts, limits)?;
     if !verified_count_updates(counts, owned.rows, limits)?.is_empty() {
         return Err(invalid("built image leaves a namespace count uninitialized"));
     }
@@ -279,6 +300,22 @@ pub(crate) fn is_kept_target_fence(job: &sinomo_dfs::DfsNamespaceJobRecord) -> b
         && matches!(
             job.pending_frames.as_slice(),
             [sinomo_dfs::DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }]
+        )
+}
+
+/// A Running hardlink job of the shard whose only step left commits a target
+/// fence another shard holds, kept through the shard's conversion while that
+/// shard is closed: its alias change is durable in the shard's rows, so none
+/// of its counts wait for it, and its commit runs once both shards are open.
+pub(crate) fn is_kept_fence_commit(job: &sinomo_dfs::DfsNamespaceJobRecord) -> bool {
+    matches!(
+        job.kind,
+        sinomo_dfs::DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | sinomo_dfs::DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+    ) && job.status == DfsNamespaceJobStatus::Running
+        && matches!(
+            job.pending_frames.as_slice(),
+            [sinomo_dfs::DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }]
         )
 }
 
@@ -438,6 +475,7 @@ fn add_contributed_counts(
     catalog: &[DfsMetadataShardConfig],
     shard: &DfsMetadataShardId,
     owned: &CountedRows,
+    moves: &moving::KeptMoves,
     contributions: &[ShardCountContributions],
     counts: &mut BTreeMap<ObjectKey, u64>,
     limits: NamespaceCountMaintenanceLimits,
@@ -539,6 +577,50 @@ fn add_contributed_counts(
                 .paths
                 .get(&(child.file_system_id.clone(), child.parent_path.clone()))
                 .ok_or_else(|| invalid("live namespace object parent is absent from its owner"))?;
+            if owned.rows[parent_key].1.kind != DfsObjectKind::Directory {
+                return Err(invalid("live namespace object parent is not a directory"));
+            }
+            increment_count(counts, parent_key)?;
+        }
+        for placing in &contribution.moving_directories {
+            check_deadline(limits)?;
+            source_owns(&placing.file_system_id, &placing.child_path)?;
+            let Some(placed) = moves.placement(placing)? else {
+                continue; // the move has placed nothing in this shard yet
+            };
+            if current_owner(&placing.file_system_id, catalog, placed.parent_path)?.shard_id
+                != shard.0
+            {
+                return Err(invalid(
+                    "moving directory names a destination parent outside the target shard",
+                ));
+            }
+            let key = (placing.file_system_id.clone(), placing.child_object_id.clone());
+            match children.entry(key.clone()) {
+                Entry::Occupied(seen) => {
+                    if seen.get() != placed.parent_path {
+                        return Err(invalid("namespace directory identity has two parents"));
+                    }
+                    continue; // the same directory already adopted here counts once
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(placed.parent_path.to_owned());
+                }
+            }
+            if owned.rows.contains_key(&key) || aliases.contains_key(&key) {
+                return Err(invalid("namespace directory identity is another object"));
+            }
+            let Some(parent_key) = owned
+                .paths
+                .get(&(placing.file_system_id.clone(), placed.parent_path.to_owned()))
+            else {
+                if placed.move_root {
+                    return Err(invalid(
+                        "a kept directory move's root is absent from the shard",
+                    ));
+                }
+                continue; // its parent is not adopted either and counts it in the source
+            };
             if owned.rows[parent_key].1.kind != DfsObjectKind::Directory {
                 return Err(invalid("live namespace object parent is not a directory"));
             }

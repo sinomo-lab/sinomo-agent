@@ -12,14 +12,24 @@
 //! source fence, writes nothing into it, and keeps only T's rows: the
 //! session's projection of the whole copy is partitioned by the scope
 //! mapping ([`partition_capture`]), so the rows of `root` and of every other
-//! shard stay in the copy for their own conversions. T's installed image
-//! becomes T's own copy; the combined copy is left as it is.
+//! shard stay in the copy for their own conversions. The copy's in-flight
+//! work is split the same way: T keeps the original native work and the
+//! unsettled operations it owns and leaves the rest to their owners
+//! ([`attribution`]). T's installed image becomes T's own copy; the combined
+//! copy is left as it is.
 //!
-//! `root` converts independently. Its activation can move the live combined
-//! copy to its retained place while T's conversion still reads it, so T
-//! resolves the copy's current place at each use ([`current_location`]).
+//! `root` converts independently, before or after T, from the same copy,
+//! partitioned the same way ([`capture_keeps_only_own_rows`]): `root`'s
+//! image holds only `root`'s rows and the work `root` owns, so a shard's
+//! rows reach only that shard's image. `root`'s activation can move the live
+//! combined copy to its retained place while T's conversion still reads it,
+//! so T resolves the copy's current place at each use ([`current_location`]).
 use super::scope_mapping::RequiredNativeWork;
 use super::*;
+
+mod attribution;
+#[cfg(test)]
+mod tests;
 
 /// The legacy combined `root` copy beside `metadata_root`'s shard copies
 /// that can hold rows and floors of `shard`: the live `root` copy while it
@@ -104,12 +114,25 @@ pub(crate) fn current_location(recorded: &Path, shard: &DfsMetadataShardId) -> R
     Ok(legacy_combined_root(metadata_root, shard)?.unwrap_or_else(|| recorded.to_owned()))
 }
 
-/// The stage intent naming a capture whose source is the combined copy of
-/// another shard.
+/// The stage intent naming a capture whose source can hold other shards'
+/// rows.
 const COMBINED_SOURCE_CAPTURE: &str = "shard-conversion-combined-source.json";
 
-/// Record, once, that the capture of `shard` at `destination` reads a
-/// combined copy, so its projection keeps only the shard's rows.
+/// Whether the per-shard capture of `shard` from `source`, for its copy at
+/// `destination`, keeps only the shard's rows: a capture of the combined
+/// copy of another shard, and every capture of `root`, whose own legacy copy
+/// is the combined copy of the shards whose rows live only there.
+pub(crate) fn capture_keeps_only_own_rows(
+    source: &Path,
+    destination: &Path,
+    shard: &DfsMetadataShardId,
+) -> bool {
+    source != destination || shard.0 == "root"
+}
+
+/// Record, once, that the capture of `shard` at `destination` reads a copy
+/// that can hold other shards' rows, so its projection keeps only the
+/// shard's rows.
 pub(super) fn record_combined_source_capture(
     destination: &Path,
     shard: &DfsMetadataShardId,
@@ -121,7 +144,8 @@ pub(super) fn record_combined_source_capture(
     )
 }
 
-/// Whether the capture of `shard` at `destination` reads a combined copy.
+/// Whether the capture of `shard` at `destination` keeps only the shard's
+/// rows of its copy.
 pub(super) fn combined_source_capture(
     destination: &Path,
     shard: &DfsMetadataShardId,
@@ -132,18 +156,31 @@ pub(super) fn combined_source_capture(
         .map_err(error)
 }
 
-/// The rows and original operations of `shard` in the projection of a
-/// combined copy, by the scope mapping over the capture's complete catalog.
+/// The rows, original operations and original native work of `shard` in the
+/// projection of a combined copy, by the scope mapping over the capture's
+/// complete catalog and the rules of [`attribution`].
 ///
 /// Every row the mapping attributes to the shard is kept, and every other
 /// row is left to its own shard. A directory fragment record whose entries
-/// several shards own is derived again over the shard's own entries. Any
-/// other row the mapping cannot attribute to exactly one shard becomes
-/// unresolved work of this capture, so the conversion stops rather than
-/// guess. An original operation is kept when the mapping
+/// several shards own is derived again over the shard's own entries, and a
+/// retry floor or outcome receipt of an object no captured row places is
+/// kept by every shard. An original operation is kept when the mapping
 /// attributes it to the shard (its original rows, not the mapping's
-/// rewritten form, so its outcome and any recovery are judged as recorded);
-/// one the shard's rows cannot depend on is left to its own shard.
+/// rewritten form, so its outcome and any recovery are judged as recorded),
+/// unless it is unsettled and another shard owns it; one the shard's rows
+/// cannot depend on is left to its own shard. Native work is kept when the
+/// shard owns it.
+///
+/// A row these rules cannot attribute becomes unresolved work of this
+/// capture, so the conversion stops rather than guess. With ordinary data
+/// none remains: the other object-keyed rows (inodes, versions, pins,
+/// replica receipts and write intents) keep their object's row, live or
+/// tombstone, because tombstone compaction waits for the object's versions,
+/// receipts and intents and removes its inode with it, and path-keyed rows
+/// always route.
+/// Such a row without a witness, a request or receipt whose recorded
+/// identity disagrees with itself, and an operation or native work whose
+/// owner the copy does not name come only from damaged or altered data.
 pub(super) fn partition_capture(
     rows: sinomo_dfs::DfsMetadataTableSnapshotTables,
     mut operations: Vec<Value>,
@@ -168,6 +205,10 @@ pub(super) fn partition_capture(
         ));
     };
     let prepared = rows.prepared_operations_v7.clone();
+    let jobs = sinomo_dfs::DfsMetadataTableSnapshotTables {
+        namespace_jobs: rows.namespace_jobs.clone(),
+        ..Default::default()
+    };
     let mapped = scope_mapping::map_scope(rows, operations.clone(), assignments, target)?;
     let operation_key = |row: &Value| {
         let payload = row.get("source_payload").or_else(|| row.get("payload"))?;
@@ -176,12 +217,28 @@ pub(super) fn partition_capture(
             payload.get("operation_id")?.as_str()?.to_owned(),
         ))
     };
-    let kept = mapped
-        .operation_mappings
-        .iter()
-        .filter_map(operation_key)
-        .collect::<std::collections::BTreeSet<_>>();
+    let owned_elsewhere = |row: &Value| {
+        attribution::unsettled_operation_owner(row, assignments).is_some_and(|owner| {
+            owner.file_system_id != target.file_system_id || owner.shard_id != target.shard_id
+        })
+    };
+    let (mut kept, mut left) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
+    for row in &mapped.operation_mappings {
+        if let Some(key) = operation_key(row) {
+            if owned_elsewhere(row) {
+                left.insert(key);
+            } else {
+                kept.insert(key);
+            }
+        }
+    }
     operations.retain(|row| operation_key(row).is_some_and(|key| kept.contains(&key)));
+    required.retain(|work| {
+        attribution::keeps_native_work(work, &jobs, assignments, target, &operations)
+    });
     let mut tables = mapped.tables;
     // The mapping moves the original V7 records into its operation map;
     // the kept ones stay rows of this capture as the source recorded them.
@@ -197,9 +254,20 @@ pub(super) fn partition_capture(
     // fragment of the combined copy whose entries several shards own becomes,
     // in this shard's rows, the record over the entries this shard keeps, as
     // the shard's own store records it; one holding none of them is another
-    // shard's to index. Every other row the mapping cannot attribute stays
+    // shard's to index. A floor or receipt of an object no row places is
+    // every shard's, and an unsettled operation another shard owns is left to
+    // that shard, routed or not. Every other row the mapping cannot attribute stays
     // unresolved.
     for work in mapped.required_native_work {
+        if attribution::keep_shared_row(&mut tables, &work, target)? {
+            continue;
+        }
+        if work.family == "prepared_operations"
+            && (operation_key(&work.source_row).is_some_and(|key| left.contains(&key))
+                || owned_elsewhere(&work.source_row))
+        {
+            continue;
+        }
         if work.family != "dirfrags" {
             required.push(work);
             continue;
