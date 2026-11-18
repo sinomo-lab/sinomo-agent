@@ -335,10 +335,6 @@ module dfs_whole_shard {
       if (promote) s.profile.initialMembers else s.profile.replacementMembers,
       "handoff-pending"),
   }
-  /// Same-topology StorageImport is current epoch transition data. Source-cut,
-  /// image and pending mapping identity are certified opaque native inputs;
-  /// this model contains no format decoder or conversion implementation.
-  action beginStorageImport = beginHandoffTarget(s.primary, s.members, "storage-import-pending")
   /// Publication guard serializes this durable freeze with every canonical commit.
   action freezeRetiring = all {
     s.pending, not(s.frozen), s.online.contains(1), s.guardOp == 0,
@@ -433,7 +429,7 @@ module dfs_whole_shard {
       acknowledgePrepare(op, node), admitCommit(op), commit(op, digest(op, 1), flag),
       replay(op, digest(op, 1)), observeReply(op, flag), observeActivationReply(flag),
       releasePublicationGuard(op), rejectChangedRetry(op), rejectMinority(op), rejectPartial(op),
-      beginHandoff(flag), beginStorageImport, freezeRetiring, persistPromotionMarker,
+      beginHandoff(flag), freezeRetiring, persistPromotionMarker,
       acknowledgeHandoff(node), rejectPartialActivation, activate(flag), bindSuccessor,
       restart(node), rejectStaleEpoch(op), rejectFrozenWriter(op),
       rejectWrongCommitDigest(op), rejectDivergentPrefix(op, node), stutter,

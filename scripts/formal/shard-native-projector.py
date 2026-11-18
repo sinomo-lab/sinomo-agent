@@ -1636,22 +1636,7 @@ class NativeProjectorV1:
             cause = native.get('cause')
             if not isinstance(cause, dict):
                 raise Unavailable('actual typed handoff cause is missing')
-            if cause.get('kind') == 'storage-import':
-                if set(cause) != {'kind', 'cut'} or promote or old_members != new_members:
-                    raise Rejected('StorageImport changes the actual primary or membership')
-                cut = cause['cut']
-                fields = {'source_cut_digest', 'source_journal_sequence', 'source_state_fingerprint',
-                          'target_prefix', 'converted_image_fingerprint', 'pending_mapping_digest'}
-                if set(cut) != fields or any(not isinstance(cut[field], str) or not cut[field]
-                        for field in fields - {'source_journal_sequence', 'target_prefix'}):
-                    raise Rejected('StorageImport omits its exact native cut/image/mapping identity')
-                u64(cut['source_journal_sequence'], 'original source sequence')
-                target = cut['target_prefix']
-                if target.get('version') != 2 or not isinstance(target.get('digest'), str) or not target['digest']:
-                    raise Rejected('StorageImport target prefix is not current exact-frame evidence')
-                u64(target['journal_sequence'], 'target image sequence')
-                mapping[kind] = ('beginStorageImport', [], 'storage-import-pending')
-            elif cause == {'kind': 'membership'}:
+            if cause == {'kind': 'membership'}:
                 if promote and old_members != new_members or not promote and old_members == new_members:
                     raise Rejected('ordinary membership cause does not describe a supported topology change')
                 mapping[kind] = ('beginHandoff', [promote], 'handoff-pending')

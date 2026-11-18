@@ -12,6 +12,7 @@ run_seed="${QUINT_RUN_SEED:-0x51a0f04d20260710}"
 run_backend="${QUINT_RUN_BACKEND:-rust}"
 case_filter="${QUINT_CASE_FILTER:-}"
 case_timeout_seconds="${QUINT_CASE_TIMEOUT_SECONDS:-300}"
+deep_case_timeout_seconds="${QUINT_DEEP_CASE_TIMEOUT_SECONDS:-3600}"
 expected_quint_version="${QUINT_EXPECTED_VERSION:-0.32.0}"
 apalache_version="${QUINT_APALACHE_VERSION:-0.56.1}"
 apalache_server_endpoint="${QUINT_APALACHE_SERVER_ENDPOINT:-localhost:8822}"
@@ -49,6 +50,9 @@ register_case membership-raft-config specs/quint/checks/membership/raft_config_t
 register_case dfs-metadata specs/quint/checks/dfs/metadata_safety.qnt dfs_metadata_safety "$verify_steps"
 register_case dfs-whole-shard specs/quint/checks/dfs/whole_shard_safety.qnt dfs_whole_shard_safety "${QUINT_DFS_WHOLE_SHARD_VERIFY_MAX_STEPS:-8}" apalache step step deep "witnessMinorityRejected witnessPartialRejected witnessChangedRetryRejected witnessPartialActivationRejected witnessWrongDigestRejected witnessDivergentPrefixRejected witnessFrozenWriterRejected"
 register_case dfs-metadata-write-set-takeover specs/quint/checks/dfs/metadata_write_set_takeover_safety.qnt dfs_metadata_write_set_takeover_safety "${QUINT_DFS_METADATA_WRITE_SET_TAKEOVER_VERIFY_MAX_STEPS:-6}" apalache coverageStep step deep "witnessCommitAtFloor witnessPromiseReleased witnessFollowerDropsTail witnessFollowerAligns"
+register_case dfs-converting-takeover specs/quint/checks/dfs/converting_takeover_safety.qnt dfs_converting_takeover_safety "${QUINT_DFS_CONVERTING_TAKEOVER_VERIFY_MAX_STEPS:-10}" apalache step step deep "witnessPrimaryConversionActivates witnessTakeoverActivates witnessLaterRoundRecorded witnessTakeoverReplacesPrimaryAttempt"
+register_case dfs-shard-storage-record specs/quint/checks/dfs/shard_storage_record_safety.qnt dfs_shard_storage_record_safety "${QUINT_DFS_SHARD_STORAGE_RECORD_VERIFY_MAX_STEPS:-10}" apalache step step deep "witnessGenesisServes witnessConvertedServes witnessMajorityActivation witnessSupersededAttemptReplaced witnessActivatedAcrossCatalogChange witnessRepairedBySnapshot"
+register_case dfs-count-contributions specs/quint/checks/dfs/count_contributions_safety.qnt dfs_count_contributions_safety "${QUINT_DFS_COUNT_CONTRIBUTIONS_VERIFY_MAX_STEPS:-9}" apalache step step fast "witnessRoundHeldByRunningJob witnessActivatedWithParkedJob witnessConvertedWithContribution"
 register_case dfs-content-binding-publication specs/quint/checks/dfs/content_binding_publication_safety.qnt dfs_content_binding_publication_safety "${QUINT_DFS_CONTENT_BINDING_PUBLICATION_VERIFY_MAX_STEPS:-8}" apalache coverageStep step fast "witnessOneSyncExactPublication witnessLostReplyCrashReconstructsBinding witnessIndexLossRebuildsManifestAndRoot witnessSyncFailureCacheDoesNotAuthorizeReceipt witnessRetrySynchronizesUncertainRecord witnessTornTailReopenPreservesAcknowledgedPrefix witnessCompleteMalformedRecordFailsClosed witnessConflictingTupleRejected witnessQuotaRejectsSecondLiveTuple witnessPostCutRenewalBlocksNegativeRelease witnessForeignCutBlocksNegativeRelease witnessOlderReservationCanRelease witnessPositiveReleaseKeepsCanonicalManifest"
 register_case dfs-content-binding-lifecycle specs/quint/checks/dfs/content_binding_lifecycle_safety.qnt dfs_content_binding_lifecycle_safety "${QUINT_DFS_CONTENT_BINDING_LIFECYCLE_VERIFY_MAX_STEPS:-10}" apalache coverageStep step fast "witnessActivationWaitsForOldOperation witnessActivationCarriesDrainedLegacyBaseline witnessStaleHandleCannotWriteNewLayout witnessCompactionKeepsBindingAndReader witnessCompactionReclaimsAfterReaderRelease witnessCrashBeforeDirectorySyncCanSelectOldGeneration"
 register_case dfs-requester-prestage-binding specs/quint/checks/dfs/requester_prestage_binding_safety.qnt dfs_requester_prestage_binding_safety "${QUINT_DFS_REQUESTER_PRESTAGE_BINDING_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessUnchangedCreateUsesRequesterWithoutStage witnessVersionRebaseSuppressesLegacyCredit witnessObjectRebaseSuppressesLegacyCredit witnessExcludedRequesterNeedsSelectedReplica witnessRebasedTupleBoundBeforeCommit witnessLostReplyCrashRetainsCanonicalBinding witnessRestartNeedsNoPostReplyBinding witnessCancelledCallerCannotUndoDurableBinding witnessWAloneCannotPublish witnessRemovedParentCannotPublish witnessExclusiveRaceCannotPublish witnessChangedRetryDoesNotChangeBinding"
@@ -128,6 +132,9 @@ Environment:
   QUINT_REQUIRE_WITNESSES=1       Fail when a registered witness is not reached.
   QUINT_COVERAGE_MAX_SAMPLES=n    Samples for focused witness coverage (default: 5000).
   QUINT_CASE_TIMEOUT_SECONDS=n    Bound each Quint command (default: 300).
+  QUINT_DEEP_CASE_TIMEOUT_SECONDS=n
+                                  Bound each deep-tier symbolic check instead
+                                  (default: 3600).
   QUINT_EXPECTED_VERSION=x.y.z    Required Quint CLI version (default: 0.32.0).
   QUINT_APALACHE_VERSION=x.y.z    Pinned Apalache version (default: 0.56.1).
   QUINT_WHOLE_SHARD_MAX_SAMPLES=n Samples for whole-shard mode (default: 1000).
@@ -141,8 +148,14 @@ case_selected() {
 }
 
 run_with_timeout() {
+  run_with_timeout_seconds "$case_timeout_seconds" "$@"
+}
+
+run_with_timeout_seconds() {
+  local seconds="$1"
+  shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout --foreground "${case_timeout_seconds}s" "$@"
+    timeout --foreground "${seconds}s" "$@"
   else
     "$@"
   fi
@@ -326,7 +339,7 @@ run_canonical_write_scenarios() {
 run_whole_shard_scenarios() {
   case_selected dfs-whole-shard || return 0
   local name
-  for name in healthy partial_unavailable membership promotion frozen_writer wrong_digest_prefix captured_prefix_handoff one_voter storage_import standalone; do
+  for name in healthy partial_unavailable membership promotion frozen_writer wrong_digest_prefix captured_prefix_handoff one_voter standalone; do
     run_scenario \
       "dfs-whole-shard-$name" \
       "specs/quint/scenarios/dfs/whole_shard_$name.qnt" \
@@ -365,9 +378,80 @@ run_write_set_takeover_scenarios() {
   done
 }
 
+run_converting_takeover_scenarios() {
+  case_selected dfs-converting-takeover || return 0
+  local row name steps
+  for row in \
+    primary_conversion_scenario:6 \
+    takeover_scenario:6 \
+    later_rounds_scenario:11 \
+    primary_replaces_takeover_counterexample:3 \
+    round_not_derived_counterexample:4 \
+    no_loss_verdict_counterexample:1 \
+    activation_keeps_serving_record_counterexample:6 \
+    activate_without_install_counterexample:4 \
+    converter_outside_write_set_counterexample:6; do
+    name="${row%%:*}"
+    steps="${row##*:}"
+    run_scenario \
+      "dfs-converting-takeover-${name//_/-}" \
+      specs/quint/scenarios/dfs/converting_takeover.qnt \
+      "dfs_converting_takeover_${name}" \
+      "$steps" \
+      1 \
+      terminalWitness
+  done
+}
+
+run_shard_storage_record_scenarios() {
+  case_selected dfs-shard-storage-record || return 0
+  local row name steps
+  for row in \
+    conversion_scenario:12 \
+    superseded_scenario:15 \
+    convert_active_counterexample:2 \
+    no_supersession_counterexample:6 \
+    activate_without_install_counterexample:3 \
+    activation_advances_catalog_counterexample:5; do
+    name="${row%%:*}"
+    steps="${row##*:}"
+    run_scenario \
+      "dfs-shard-storage-record-${name//_/-}" \
+      specs/quint/scenarios/dfs/shard_storage_record.qnt \
+      "dfs_shard_storage_record_${name}" \
+      "$steps" \
+      1 \
+      terminalWitness
+  done
+}
+
+run_count_contribution_scenarios() {
+  case_selected dfs-count-contributions || return 0
+  local row name steps
+  for row in \
+    conversion_scenario:16 \
+    moves_ignore_closed_target_counterexample:14 \
+    move_while_closed_counterexample:3 \
+    unlink_while_closed_accepted_counterexample:8 \
+    unlink_while_closed_count_counterexample:9; do
+    name="${row%%:*}"
+    steps="${row##*:}"
+    run_scenario \
+      "dfs-count-contributions-${name//_/-}" \
+      specs/quint/scenarios/dfs/count_contributions.qnt \
+      "dfs_count_contributions_${name}" \
+      "$steps" \
+      1 \
+      terminalWitness
+  done
+}
+
 run_smoke_scenarios() {
   run_whole_shard_scenarios
   run_write_set_takeover_scenarios
+  run_converting_takeover_scenarios
+  run_shard_storage_record_scenarios
+  run_count_contribution_scenarios
   run_canonical_write_scenarios
   run_scenario \
     dfs-pending-read-identity \
@@ -468,6 +552,11 @@ verify_check() {
   local steps="$4"
   local backend="$5"
   local step="$6"
+  local tier="${7:-fast}"
+  local seconds="$case_timeout_seconds"
+  if [[ "$tier" == "deep" ]]; then
+    seconds="$deep_case_timeout_seconds"
+  fi
   local -a args=(
     quint verify "$file"
     "--main=$main"
@@ -481,7 +570,7 @@ verify_check() {
   )
 
   echo "==> verify $id ($backend, $steps steps)"
-  run_with_timeout env NO_COLOR=1 "${args[@]}"
+  run_with_timeout_seconds "$seconds" env NO_COLOR=1 "${args[@]}"
 }
 
 verify_cases() {
@@ -501,7 +590,7 @@ verify_cases() {
   for row in "${cases[@]}"; do
     IFS='|' read -r id file main steps backend run_step verify_step tier witnesses <<<"$row"
     if case_selected "$id" && [[ "$requested_tier" == "all" || "$tier" == "$requested_tier" ]]; then
-      verify_check "$id" "$file" "$main" "$steps" "$backend" "$verify_step"
+      verify_check "$id" "$file" "$main" "$steps" "$backend" "$verify_step" "$tier"
     fi
   done
 
@@ -556,7 +645,8 @@ verify_cases() {
       dfs_posix_cross_shard_retry_exhaustion_scenario \
       10 \
       apalache \
-      step
+      step \
+      deep
   fi
   if case_selected dfs-local-first-file; then
     verify_check \
@@ -588,7 +678,8 @@ verify_cases() {
       dfs_local_first_namespace_safety \
       10 \
       apalache \
-      namespaceReconcileFullSafetyStep
+      namespaceReconcileFullSafetyStep \
+      deep
   fi
   if case_selected dfs-local-first-namespace-durability; then
     verify_check \
@@ -668,56 +759,64 @@ verify_cases() {
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayConvergedFullSafetyStep
+      namespaceGatewayConvergedFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-conflict-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayConflictFullSafetyStep
+      namespaceGatewayConflictFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-superseded-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewaySupersededFullSafetyStep
+      namespaceGatewaySupersededFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-create-child-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayCreateChildFullSafetyStep
+      namespaceGatewayCreateChildFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-mkdir-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayMkdirFullSafetyStep
+      namespaceGatewayMkdirFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-rmdir-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayRmdirFullSafetyStep
+      namespaceGatewayRmdirFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-rename-file-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayRenameFileFullSafetyStep
+      namespaceGatewayRenameFileFullSafetyStep \
+      deep
     verify_check \
       dfs-local-first-namespace-gateway-composition-rename-directory-full-safety \
       specs/quint/checks/dfs/local_first_namespace_gateway_composition_safety.qnt \
       dfs_local_first_namespace_gateway_composition_safety \
       11 \
       apalache \
-      namespaceGatewayRenameDirectoryFullSafetyStep
+      namespaceGatewayRenameDirectoryFullSafetyStep \
+      deep
   fi
 
   if [[ -n "$verify_lock_fd" ]]; then
@@ -768,6 +867,9 @@ case "$mode" in
     fi
     run_whole_shard_scenarios
     run_write_set_takeover_scenarios
+    run_converting_takeover_scenarios
+    run_shard_storage_record_scenarios
+    run_count_contribution_scenarios
     ;;
   whole-shard)
     if [[ -n "$case_filter" && "$case_filter" != dfs-whole-shard ]]; then

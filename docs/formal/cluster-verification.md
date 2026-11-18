@@ -67,6 +67,8 @@ The model inventory is split by subsystem:
     `metadata_ack_floor_log`, `authored_journal_batch`,
     `initial_prepare_batch`, `metadata_routing_hint_recovery`,
     `packed_index_append_batching`, and `metadata_checkpoint_fanout`;
+  - per-shard storage conversion: `shard_storage_record`,
+    `converting_takeover` and `count_contributions`;
   - shard handoff and replica catch-up: `metadata_handoff_union_sync`,
     `metadata_handoff_desired_catchup`, `metadata_handoff_maintenance_trigger`,
     `metadata_handoff_lane_rebind`, `metadata_handoff_probe_backend_selection`,
@@ -103,8 +105,9 @@ The model inventory is split by subsystem:
 
   Each model has a matching `checks/dfs/<stem>_safety.qnt` invariant suite.
   `scenarios/dfs/` holds deterministic canonical-write handoff and
-  historical canonical-write traces, the ten registered whole-shard scenarios,
-  write-set takeover traces and counterexamples,
+  historical canonical-write traces, the nine registered whole-shard scenarios,
+  write-set takeover traces and counterexamples, storage-record,
+  converting-takeover and count-contribution traces and counterexamples,
   pending-read identity, advisory-lock fencing, file-sync and
   directory-generation recovery, complete-holder/quorum-repair partitions,
   cross-shard retry exhaustion, local-first file/namespace reconciliation,
@@ -532,10 +535,10 @@ quorum-backed decision and activation contract, without modeling Raft election
 or adding another consensus mechanism. Handoff activation additionally needs
 majorities of both metadata assignments, acknowledgements from both primaries,
 and the exact retiring frozen prefix. Promotion requires its durable marker.
-StorageImport may preserve primary and member sets while advancing the epoch;
-its source cut, converted image and current target prefix remain independently
-validated native inputs. Historical source ACK constraints are separate migration
-obligations and are not ordinary publication grants.
+Storage conversion is not a handoff and is outside this model; the
+[per-shard storage record](#per-shard-storage-record-and-conversion) case covers
+it. Historical source ACK constraints are separate migration obligations and are
+not ordinary publication grants.
 
 Run the bounded simulations, deterministic witnesses and sensitivity controls
 with:
@@ -544,7 +547,7 @@ with:
 QUINT_RUN_SEED=0x51a020261006 bash scripts/formal/check-quint.sh whole-shard
 ```
 
-The harness pins Quint 0.32.0 and uses 1,000 random traces of 40 steps, plus ten
+The harness pins Quint 0.32.0 and uses 1,000 random traces of 40 steps, plus nine
 deterministic scenarios. They cover healthy all-assigned publication, explicit
 standalone ownership, majority/minority denial with sufficient content `W`,
 late-write capture, joint activation with an offline member, promotion/rebind,
@@ -555,7 +558,9 @@ assignment, joint certificate, freeze or digest gates and must reach invariant
 violations; disabled/truncated exploration is not a counterexample.
 
 The symbolic case remains deep-tier at depth eight with the repository's
-Apalache 0.56.1 pin. Simulation, reachability, bounded symbolic proof and native
+Apalache 0.56.1 pin. At that depth it runs longer than the deep-tier hour on a
+developer workstation, so a deliberate run raises
+`QUINT_DEEP_CASE_TIMEOUT_SECONDS`. Simulation, reachability, bounded symbolic proof and native
 conformance are separate evidence classes. This model omits scheduling,
 storage-byte barriers, wire validation, election and unbounded liveness.
 
@@ -583,6 +588,171 @@ The older canonical-write and union-sync slices described adjacent to this
 section retain historical target assumptions, including degraded KV coupling.
 They are not current ordinary-publication conformance evidence. This bounded
 correction does not silently relabel those older models as implemented behavior.
+
+### Per-shard storage record and conversion
+
+The `dfs-shard-storage-record` case is an **abstract contract** of the storage
+record each metadata shard keeps
+(`crates/sinomo-dfs/src/storage_generation/record.rs`); no Rust conformance test
+replays its traces. State and actions live in
+`models/dfs/shard_storage_record.qnt`, invariants and witnesses in
+`checks/dfs/shard_storage_record_safety.qnt`, and deterministic traces in
+`scenarios/dfs/shard_storage_record.qnt`.
+
+It isolates the record's lifecycle on a primary-driven conversion: the open
+gate, supersession by a serving change, the install rules and independence from
+the catalog generation. Data, journals, count contributions and the converting
+takeover are abstracted away. The bound is one shard with three configured
+members, two captures per converter, three epochs and three catalog
+generations. A switched shard's write set starts as two members, and a serving
+change adds its new primary; an unswitched shard uses the primary-and-majority
+rule. The record is absent for old storage, Converting with one attempt that is
+sealed later, or Active by native genesis or by a converted attempt. An attempt
+binds the epoch and primary it runs under and the source its converter captured.
+Storage transactions compare the shard's own keys exactly and write only the
+storage record, so each is one atomic action. Members stage a sealed image,
+possibly a stale one, beside their own copy, activate it once the record names
+it, or repair by snapshot from the serving primary. Serving changes and catalog
+changes are environment actions enabled at any time.
+
+`safety` combines these properties, each with a counterexample that enables one
+broken variant:
+
+- an open slot's header matches an Active record, so every open slot serves the
+  same generation (broken: an Active record may convert again);
+- an Active record is final (same broken variant);
+- an attempt activates only under the serving record it started under, so an
+  attempt a serving change superseded never activates (broken: activation
+  without that check);
+- an activation was sealed and met the install rule (broken: activation without
+  staging);
+- the catalog generation moves only with catalog changes (broken: activation
+  advances it).
+
+Two deterministic traces cover the design: a switched shard converted on its
+primary while the catalog generation advances, after which the write set opens
+on its activated copies and the third member repairs by snapshot; and an
+unswitched shard whose first attempt a serving change supersedes, the next
+primary's attempt activating with a majority that includes it, and the member
+left with a stale staged image repairing by snapshot.
+
+The deep-tier symbolic check runs at depth ten. Any activation needs its Converting
+write, the seal, at most two stages and the activation: five steps. One
+superseding serving change adds the superseded attempt's write and seal, a
+stale stage and the change, so the replacing attempt activates by step nine.
+A converted slot opens two steps after its activation, by step seven without a
+supersession and by step ten with one. Every counterexample reaches its
+violation within six steps.
+
+### Converting takeover
+
+The `dfs-converting-takeover` case is an **abstract contract** of the
+converting takeover (`crates/sinomo-dfs/src/storage_generation/record.rs` and
+the migration owner's takeover driver); no Rust conformance test replays its
+traces. State and actions live in `models/dfs/converting_takeover.qnt`,
+invariants and witnesses in `checks/dfs/converting_takeover_safety.qnt`, and
+deterministic traces in `scenarios/dfs/converting_takeover.qnt`.
+
+It isolates who may record and activate a conversion of a closed switched
+shard: the primary's own attempt, takeover rounds, the install rule and the
+serving change a takeover activation makes. The bound is write set M1, M2 and
+M3 with M1 primary, M4 a configured recruit outside the write set, and at most
+three rounds. The state is the serving record (epoch, primary, write set), the
+storage record, each member's staged image, the loss verdicts and whether each
+member's own copy holds the committed history. Every write-set member's copy
+does, which the write-set takeover model establishes; the recruit's does not. A
+closed shard commits nothing, so copies do not change. Journals, open stores,
+local activation and count contributions belong to the other models. Loss
+verdicts are inputs that may be wrong. The takeover's promises only rank
+candidates and are not modeled, so any write-set member may race for a round.
+
+`safety` combines these properties, each with a counterexample that enables one
+broken variant:
+
+- the primary's own attempt never replaces a takeover recorded at its epoch
+  (broken: it may);
+- a first round replaces at most the lost primary's own attempt, and a later
+  round replaces exactly the recorded round before it, with another converter
+  and every earlier converter but its own counted as lost, so each round has one
+  converter (broken: every takeover runs round one);
+- a takeover replaces a converter only once it is judged lost (broken: no loss
+  verdict);
+- an attempt activates under the serving record of its own epoch; the primary's
+  own attempt changes no serving record, and a takeover's activation makes its
+  converter primary at the next epoch with the lost primary out of the write
+  set (broken: the activation keeps the serving record);
+- an activation's image was staged on every member of its install rule
+  (broken: activation without staging);
+- the activated image, the converter's own copy, holds the committed history
+  (broken: the recruit outside the write set may convert).
+
+Three deterministic traces cover the design: the primary converting on the
+whole write set; M2 taking over from lost M1, staging on M2 and M3 and becoming
+primary at epoch 2; and three rounds, the first replacing M1's own attempt and
+the third run by M2 again once it is reachable and M3 is judged lost, staged on
+M2 alone.
+
+The deep-tier symbolic check runs at depth ten. Recording a round needs one loss verdict
+for the converter it replaces and the round's write; the third round, run by an
+earlier converter reachable again, also needs the verdict that clears it, so it
+is recorded at step seven. Activation adds the seal, one stage per install-set
+member (three for the primary's attempt, two for the first round, one for the
+second and third) and the activation, so the primary's attempt and the first
+round activate by step six, the second by step seven and the third by step ten.
+Every counterexample reaches its violation within six steps.
+
+### Count contributions during conversion
+
+The `dfs-count-contributions` case is an **abstract contract** of how a
+converting shard reads what the other shards contribute to its namespace
+counts (`crates/sinomo-dfs-migration/src/authority/contribution_source.rs`); no
+Rust conformance test replays its traces. State and actions live in
+`models/dfs/count_contributions.qnt`, invariants and witnesses in
+`checks/dfs/count_contributions_safety.qnt`, and deterministic traces in
+`scenarios/dfs/count_contributions.qnt`.
+
+It isolates contribution freezing and acceptance. The bound is one canonical
+object owned by target shard T, two names whose rows live in T or in the source
+shards S1 and S2, and one rename job per name; storage transactions, serving
+records and the takeover are abstracted away. T starts Active or as old
+storage. Linking or unlinking a name needs T's canonical object and waits while
+T is not Active. A cross-shard rename of a name between the sources is a job
+coordinated by the name's shard: it can start at any time, the step that moves
+the row checks in the same transaction that T is Active, and while T is not
+Active the coordinator records the job parked on T. T records Converting before
+it reads anything, then reads each source's contribution and the jobs it
+coordinates that touch T, one source at a time and interleaved with the other
+shards' steps. It accepts the contributions only after two consecutive complete
+rounds agree and no answer names a job touching T that is not parked on T, and
+activates with its own rows plus the accepted contributions.
+
+`safety` combines these properties, each with a counterexample that enables one
+broken variant:
+
+- while T converts, every shard's contribution to it, T's own rows included,
+  is what it was when T recorded Converting (broken: a rename moves a row while
+  T is closed);
+- accepted contributions are the sources' actual contributions (broken: an
+  unlink does not wait for T);
+- while T is Active its maintained count equals the number of names (same
+  broken variant).
+
+One deterministic trace converts T while a rename that started before T closed
+first holds a round and then parks; T activates with the rename still parked,
+and the rename, a later unlink and a later link keep the count exact. A further
+counterexample lets renames move rows while T is closed: T reads the name in
+both sources in two agreeing rounds with no rename running when either source
+is read, and activates with a count one too high. Agreeing rounds therefore do
+not replace the freezing.
+
+The fast-tier symbolic check runs at depth nine. T accepts after its Converting write and
+two rounds of two reads and a completion each, at step seven, and activates at
+step eight. Every step that can change a contribution or T's own rows is enabled
+either whenever T is Converting or never, so a change during conversion has a
+witness right after the Converting write, a change between acceptance and
+activation one at step eight, and the activation that would expose a wrong
+count follows at step nine. Jobs only hold or release rounds. The short
+counterexamples reach their violations within nine steps.
 
 ### Shard write sets and automatic takeover
 
@@ -2144,7 +2314,12 @@ QUINT_CASE_FILTER=raft-kv,raft-protocol,membership-raft-config,dfs-posix-cross-s
 ```
 
 Per-command timeouts default to 300 seconds and can be changed with
-`QUINT_CASE_TIMEOUT_SECONDS`. Formal verification is intentionally run on
+`QUINT_CASE_TIMEOUT_SECONDS`. Deep-tier symbolic checks, which only `all` and
+`verify-full` run, are bounded at one hour each by
+`QUINT_DEEP_CASE_TIMEOUT_SECONDS` (default 3600). A concern whose symbolic check
+needs longer is split into a smaller isolated model with its own registered
+case, rather than given a longer budget or a shallower depth than its scenarios
+need. Formal verification is intentionally run on
 demand with the local harness rather than in GitLab CI: symbolic exploration is
 too computationally expensive to repeat for every commit. Use the smallest
 focused mode that covers the changed proof boundary, and reserve the full tier
