@@ -114,20 +114,30 @@ fn a_node_holding_a_closed_shard_copy_serves_every_node_wide_path() {
         },
     );
 
-    // A repair of root: a copy for services_node is refused, so the write
-    // commits below its desired copies with a repair need that the owner's
-    // executor serves once the route works again.
-    cluster
-        ._runtime
-        .install_fault(crate::test_support::DfsTestFaultRule {
-            source: None,
-            target: Some(services_node.clone()),
-            route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
-            call_id: None,
-            origin: None,
-            remaining_hits: 32,
-            action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
-        });
+    // A repair of root: every copy for services_node is refused until the
+    // faults clear, so the write commits below its desired copies with a
+    // repair need that the owner's executor serves once the routes work
+    // again. The repair route is refused as well, so the need is still
+    // there when it is read. A rule refuses at most 32 calls, so each route
+    // gets several.
+    for route in [
+        crate::DFS_DATA_STAGE_BLOB_ROUTE,
+        crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+    ] {
+        for _ in 0..4 {
+            cluster
+                ._runtime
+                .install_fault(crate::test_support::DfsTestFaultRule {
+                    source: None,
+                    target: Some(services_node.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+                });
+        }
+    }
     let below_n = cluster
         .replica
         .posix_write_file(
@@ -135,21 +145,28 @@ fn a_node_holding_a_closed_shard_copy_serves_every_node_wide_path() {
             &(0..48 * 1024 + 5)
                 .map(|index| (index % 251) as u8)
                 .collect::<Vec<_>>(),
+            // Every node is a candidate and N counts all three, so with
+            // services_node refused at most two copies exist wherever the
+            // write places them.
             DfsWriteOptions {
-                replica_candidates: vec![replica_node.clone(), services_node.clone()],
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                replica_candidates: vec![
+                    replica_node.clone(),
+                    services_node.clone(),
+                    owner.clone(),
+                ],
+                policy: DfsReplicationPolicy::new(1, 3).unwrap(),
                 wait_for_commit: true,
                 foreground_replica_repair: false,
             },
         )
         .unwrap();
-    cluster._runtime.clear_faults();
     let need = repair_needs(&cluster._runtime, &owner, "root")
         .into_iter()
         .find(|(object_id, version, _)| {
             *object_id == below_n.object_id && *version == below_n.version
         })
         .expect("the write left a root repair need");
+    cluster._runtime.clear_faults();
     sifs_two_primary_publish_until(&mut cluster, "the root need is repaired", |cluster| {
         !repair_needs(&cluster._runtime, &cluster.users_primary_node, "root").contains(&need)
     });

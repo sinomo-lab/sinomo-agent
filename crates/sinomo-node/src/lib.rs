@@ -267,7 +267,10 @@ mod tests {
         assert!(voter_capabilities.iter().any(|capability| {
             capability.as_str() == DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY
         }));
-        for capability in [DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY] {
+        for capability in [
+            DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY,
+            DFS_METADATA_WRITE_SET_V1_CAPABILITY,
+        ] {
             assert!(
                 voter_capabilities
                     .iter()
@@ -279,14 +282,6 @@ mod tests {
                     .any(|candidate| candidate.as_str() == capability)
             );
         }
-        // The write-set protocol is not advertised until nodes implement
-        // its whole member-side contract.
-        assert!(
-            voter_capabilities
-                .iter()
-                .chain(&learner_capabilities)
-                .all(|capability| capability.as_str() != DFS_METADATA_WRITE_SET_V1_CAPABILITY)
-        );
         assert!(
             voter_capabilities
                 .iter()

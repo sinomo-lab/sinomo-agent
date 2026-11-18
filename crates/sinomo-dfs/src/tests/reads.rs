@@ -3154,7 +3154,7 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     placement.required_node_ids = holders.clone();
     placement.forbidden_node_ids = vec![cluster.observer_node.clone()];
-    cluster
+    let applied = cluster
         ._runtime
         .apply_placement_policy(
             &cluster.primary_node,
@@ -3163,8 +3163,13 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
             placement,
         )
         .unwrap();
-    // Open the ordinary requester after the committed policy change so its
-    // retained native projection describes this fixture's real holder contract.
+    super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &applied);
+    cluster
+        ._runtime
+        .wait_published_configuration_current(&cluster.writer_node)
+        .unwrap();
+    // Open the requester after its own native publication includes the completed
+    // Apply, so holder selection uses this fixture's actual policy contract.
     cluster.writer = cluster._runtime.client(&cluster.writer_node).unwrap();
     let (_, _, replication) = cluster
         .writer

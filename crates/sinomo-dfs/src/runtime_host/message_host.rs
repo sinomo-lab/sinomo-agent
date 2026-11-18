@@ -1,10 +1,22 @@
 use super::*;
 
-fn open_daemon_native_content_store(data_dir: &SinomoDataDir) -> Result<LocalContentStore, crate::DfsError> {
+mod stage_answer;
+mod write_continuation;
+
+fn open_daemon_native_content_store(
+    data_dir: &SinomoDataDir,
+) -> Result<LocalContentStore, crate::DfsError> {
     crate::runtime_host::open_dfs_runtime_content_store(data_dir).map_err(|error| match error {
-        DfsRuntimeError::StoragePreparationPending { root, processed_records } =>
-            crate::DfsError::StoragePreparationPending { root, processed_records },
-        error => crate::DfsError::Metadata { message: error.to_string() },
+        DfsRuntimeError::StoragePreparationPending {
+            root,
+            processed_records,
+        } => crate::DfsError::StoragePreparationPending {
+            root,
+            processed_records,
+        },
+        error => crate::DfsError::Metadata {
+            message: error.to_string(),
+        },
     })
 }
 
@@ -21,6 +33,8 @@ pub(crate) enum DaemonDfsPublishPlanningAttemptOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     ContentStoreCacheAccess,
+    #[cfg(test)]
+    PlacementRecoveryOwnerAcquired,
     #[cfg(test)]
     LocalPlacementAuthorityAcquired {
         job_id: &'a str,
@@ -545,7 +559,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
         signature.metadata_storage_generation,
     )?;
     if let Some(scope) = lane.resident_metadata_scope.clone() {
-        scope.attach(&mut lane.service)?;
+        lane.attach_metadata_scope(&scope)?;
     }
     daemon_dfs_require_retained_authority(
         &metadata_authority_generation,
@@ -1440,6 +1454,48 @@ fn peer_snapshot_from_configuration_entries(
     })
 }
 
+/// Replica ingest and replay select physical storage, never outbound peers.
+/// Reuse the existing resident owner's identity and routing DATA on that path;
+/// its caller still performs the current authority/context/storage checks.
+/// A cold owner uses the ordinary native routing read before initialization.
+pub(super) async fn read_daemon_dfs_replica_owner_snapshot_before(
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    deadline: tokio::time::Instant,
+) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
+    let state =
+        match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths) {
+            Ok(state) => state,
+            Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
+            Err(error) => return Err(sinomo_dfs::DfsError::from_network(error)),
+        };
+    if let Some(root) = cluster_paths.root.parent() {
+        let data_dir = SinomoDataDir::new(root);
+        let live_host = registered_dfs_runtime_host(&data_dir)
+            .map_err(|error| sinomo_dfs::DfsError::Network {
+                message: error.to_string(),
+            })?
+            .is_some_and(|host| !host.shutting_down.is_cancelled());
+        if live_host
+            && let Some(slot) =
+                daemon_dfs_message_service_cache().existing_root(&data_dir.root())?
+            && let Ok(cache) = slot.try_lock()
+            && let Some(entry) = cache.as_ref()
+            && entry.resident_metadata_initialized
+            && entry.signature.cluster_id == state.cluster_id
+            && entry.signature.local_node_id == state.local_node_id
+            && tokio::time::Instant::now() < deadline
+        {
+            return Ok(Some(DaemonDfsMessagePeerSnapshot {
+                cluster_id: entry.signature.cluster_id.clone(),
+                local_node_id: entry.signature.local_node_id.clone(),
+                peer_node_ids: entry.peer_node_ids.clone(),
+            }));
+        }
+    }
+    read_daemon_dfs_message_peer_snapshot_before(cluster_paths, runtime, deadline).await
+}
+
 /// Join only the actual native owner's routing projection before DFS admission.
 /// Both bounded prefixes come from one resident borrow. They grant no publication
 /// authority; the same retained authority preflight follows before admission.
@@ -1751,6 +1807,7 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
             service,
             peer_node_ids,
             resident_metadata_scope,
+            needs_global_hydration: false,
         },
         detached_send_runtime,
     )))
@@ -1780,6 +1837,7 @@ pub(crate) fn open_daemon_dfs_message_content_read_lane_with_content(
             service: NetworkedDfsService::new(transport, content),
             peer_node_ids,
             resident_metadata_scope: None,
+            needs_global_hydration: false,
         },
         detached_send_runtime,
     )))
@@ -3212,9 +3270,9 @@ pub(crate) fn daemon_dfs_message_content_store(
     Ok(entry.content_store.clone())
 }
 
-/// Only this pre-execution variant returns an owned command for another
-/// admission attempt. The exact shard/epoch/operation and quarantine capability
-/// are preserved unchanged; service outcomes (including late errors) are final.
+/// Pre-execution replans retain the unexecuted command and quarantine capability.
+/// A prepared write continuation instead retains its exact native digest and
+/// unknown result; it can only resume recovery after a committed write-set change.
 pub(super) enum DaemonDfsMessageDispatchAttempt {
     Complete(Option<DaemonDfsMessageCommandProcessResult>),
     RemoteNamespacePhase(
@@ -3222,6 +3280,12 @@ pub(super) enum DaemonDfsMessageDispatchAttempt {
         Box<crate::source_adoption::RemoteNamespacePhase>,
     ),
     AuthorityPreflightStale(Box<DaemonDfsUnexecutedMessage>),
+    WriteSetPending {
+        command: Box<DfsMessageCommand>,
+        prepared: crate::DfsPreparedOperationDigest,
+        write_set: crate::DfsMetadataShardWriteSet,
+        result: Result<Box<DaemonDfsMessageCommandProcessResult>, crate::DfsError>,
+    },
 }
 
 // Only the rare retry path allocates this owned payload. Healthy dispatch does
@@ -3232,6 +3296,8 @@ pub(super) struct DaemonDfsUnexecutedMessage {
     preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
 }
 
+#[tracing::instrument(target = "sinomo.perf", level = "trace", skip_all,
+    fields(stage = "dfs.content.fetch_authorization", view = tracing::field::Empty))]
 pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -3278,9 +3344,35 @@ pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
         DaemonDfsMessageLaneSelection::Ready(lane, _) => lane,
         DaemonDfsMessageLaneSelection::AuthorityPreflightStale(_) => return Ok(None),
     };
+    let key = DaemonDfsMutationLaneKey {
+        file_system_id: stamped.file_system_id.clone(),
+        shard_id: sinomo_dfs::DfsMetadataShardId(stamped.shard_id.clone()),
+    };
+    let resident = daemon_dfs_message_cache_exact_admission_handle(
+        data_dir,
+        cluster_paths,
+        peer,
+        &key,
+        runtime,
+    )?
+    .map(|handle| handle.try_checkout_open())
+    .transpose()?
+    .flatten();
+    tracing::Span::current().record(
+        "view",
+        if resident.is_some() {
+            "resident"
+        } else {
+            "inspection"
+        },
+    );
+    // A maintenance owner may have checked out the shard. Preserve the guarded
+    // inspection path in that case; a content read must not wait for the owner
+    // whose progress can itself require this fetch.
     let verified = match crate::local_state::with_current_owned_dfs_shard_inspection(
         data_dir,
         &sinomo_dfs::DfsMetadataShardId(stamped.shard_id.clone()),
+        resident.as_ref(),
         |backend| {
             let Ok(lane) = lane.try_lock() else {
                 return Ok(None);
@@ -3340,6 +3432,9 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         runtime,
         traceparent,
         None,
+        None,
+        None,
+        false,
     )
 }
 
@@ -3359,6 +3454,9 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    stage_shard: Option<ResidentLocalMetadataShardHandle>,
+    prepared_write: Option<crate::DfsPreparedOperationDigest>,
+    retain_write: bool,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     match reject_daemon_dfs_incomplete_genesis_before_effects(
@@ -3536,6 +3634,14 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             .map_err(sinomo_dfs::DfsError::from)
         })
         .transpose()?;
+    let write_attempt = retain_write
+        .then(|| {
+            metadata_authority_preflight
+                .as_ref()
+                .and_then(|preflight| write_continuation::candidate(&preflight.authority, &command))
+                .map(|write_set| (command.clone(), write_set))
+        })
+        .flatten();
     let execution = crate::runtime_message::execute_runtime_message_command_with_verified_fetch(
         &service_lane_handle,
         peer_node_ids,
@@ -3548,12 +3654,16 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
         publication_provider,
         completed_phase,
+        stage_shard,
+        prepared_write,
+        write_attempt.as_ref().map(|(command, _)| command),
     );
     if let Some(scope) = publication_scope.take() {
         scope.finish()?;
     }
     drop(publication_scope);
     let sinomo_dfs::DfsRuntimeMessageExecution {
+        prepared_write,
         remote_namespace_phase,
         process_report,
         committed_work,
@@ -3691,6 +3801,19 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         Ok(None) => None,
         Err(error) => Some(error),
     };
+    if let (Err(error), Some(prepared), Some((command, write_set))) =
+        (&process_report.outcome, &prepared_write, &write_attempt)
+        && deferred_work_error.is_none()
+        && exact_projection_release_error.is_none()
+        && resident_backend_release_error.is_none()
+    {
+        return Ok(DaemonDfsMessageDispatchAttempt::WriteSetPending {
+            command: Box::new(command.clone()),
+            prepared: prepared.clone(),
+            write_set: write_set.clone(),
+            result: Err(error.clone()),
+        });
+    }
     let DfsMessageProcessResult {
         response,
         attachment,
@@ -3723,13 +3846,20 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             metadata_authority_preflight.as_ref(),
         )?;
     }
-    Ok(DaemonDfsMessageDispatchAttempt::Complete(Some(
-        DaemonDfsMessageCommandProcessResult {
-            response,
-            attachment,
-            committed_edges,
-        },
-    )))
+    let result = DaemonDfsMessageCommandProcessResult {
+        response,
+        attachment,
+        committed_edges,
+    };
+    if let (Some(prepared), Some((command, write_set))) = (prepared_write, write_attempt) {
+        return Ok(DaemonDfsMessageDispatchAttempt::WriteSetPending {
+            command: Box::new(command),
+            prepared,
+            write_set,
+            result: Ok(Box::new(result)),
+        });
+    }
+    Ok(DaemonDfsMessageDispatchAttempt::Complete(Some(result)))
 }
 
 /// Emit retained work produced by a durably processed DFS mutation scope.
@@ -4505,8 +4635,13 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         .await?;
     // Keep the existing outer RPC future and cancellation/timeout scope. This
     // function receives no caller deadline and starts no new request deadline.
-    // Only typed rejection before execution permits at most two async refreshes,
-    // including any already spent by genesis preparation above.
+    // Typed rejection before execution permits at most two async refreshes.
+    // Prepared write continuations wait in this same cancellable request after
+    // releasing every borrowed mutation owner; they never get a fresh budget.
+    let mut prepared_write = None;
+    let mut last_unknown: Option<
+        Result<Box<DaemonDfsMessageCommandProcessResult>, crate::DfsError>,
+    > = None;
     let mut completed_remote_phase: Option<
         Box<crate::source_adoption::CompletedRemoteNamespacePhase>,
     > = None;
@@ -4542,6 +4677,19 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         } else {
             None
         };
+        let stage_answer = stage_answer::prepare_stage_answer(
+            &data_dir,
+            &peer_snapshot,
+            &command,
+            metadata_authority_preflight.as_ref(),
+            Arc::clone(&data_owner_lock),
+            runtime,
+        )
+        .await?;
+        let (stage_scope, process_stage_shard, stage_admission) = match stage_answer {
+            Some((scope, shard, admission)) => (Some(scope), Some(shard), Some(admission)),
+            None => (None, None, None),
+        };
         let uses_content_read_lane = verified_fetch.is_some() || uses_content_read_lane;
         let request_id = command.request_id.clone();
         let source_node_id = command.routed_message.source_node_id.clone();
@@ -4549,7 +4697,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let frame_id = command.routed_message.frame_id;
         let message_id = command.routed_message.message_id;
         let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
-        let execution_scope = dfs_message_execution_scope(&command);
+        let execution_scope = stage_scope.unwrap_or_else(|| dfs_message_execution_scope(&command));
         let execution_scope_label = match &execution_scope {
             DfsMessageExecutionScope::ReadOnly => "read-only".to_string(),
             DfsMessageExecutionScope::ExactShard {
@@ -4576,6 +4724,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let process_metadata_authority_preflight = metadata_authority_preflight.take();
         let process_completed_phase = completed_remote_phase.take();
         let process_preingested_blob = preingested_blob.take();
+        let process_prepared_write = prepared_write.clone();
         let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
         let exact_service_lane_candidate = daemon_dfs_message_supports_exact_service_lane(&command)
             && DaemonDfsMutationLaneKey::from_scope(&execution_scope).is_some();
@@ -4631,11 +4780,15 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let scheduler_started = admission_trace.start();
         let preempt_maintenance =
             daemon_dfs_message_preempts_maintenance(&command.routed_message.message);
-        let admitted = tracing::Instrument::instrument(
-            admit_daemon_dfs_message(&scheduler, &admission_scope, preempt_maintenance),
-            admission_trace.span("initial-scheduler"),
-        )
-        .await;
+        let admitted = if let Some(admission) = stage_admission {
+            Ok(admission)
+        } else {
+            tracing::Instrument::instrument(
+                admit_daemon_dfs_message(&scheduler, &admission_scope, preempt_maintenance),
+                admission_trace.span("initial-scheduler"),
+            )
+            .await
+        };
         admission_trace.record(
             "initial-scheduler",
             if admitted.is_ok() {
@@ -4810,6 +4963,9 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     &process_runtime,
                     process_traceparent.clone(),
                     process_completed_phase.map(|completed| *completed),
+                    process_stage_shard,
+                    process_prepared_write,
+                    true,
                 )
             });
             // A blocking task keeps running when its async JoinHandle is dropped.
@@ -4843,8 +4999,43 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             address: "DFS message".to_string(),
             detail: format!("DFS message task failed: {source}"),
         })?;
-        let result = match result? {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => match last_unknown.take() {
+                Some(Ok(result)) => DaemonDfsMessageDispatchAttempt::Complete(Some(*result)),
+                Some(Err(unknown)) => return Err(unknown.into()),
+                None => return Err(error.into()),
+            },
+        };
+        let result = match result {
             DaemonDfsMessageDispatchAttempt::Complete(result) => result,
+            DaemonDfsMessageDispatchAttempt::WriteSetPending {
+                command: original,
+                prepared,
+                write_set,
+                result,
+            } => {
+                let authority = daemon_dfs_metadata_authority_generation_for_identity(
+                    &cluster_paths,
+                    &peer_snapshot.cluster_id,
+                    &peer_snapshot.local_node_id,
+                    Some(runtime),
+                )?;
+                let host = registered_dfs_runtime_host(&data_dir)?;
+                if let Some(host) = host
+                    && write_continuation::wait(&authority, &original, &write_set, &host).await
+                {
+                    last_unknown = Some(result);
+                    command = *original;
+                    prepared_write = Some(prepared);
+                    metadata_authority_preflight = Some(DaemonDfsMetadataAuthorityPreflight {
+                        generation: authority.generation(),
+                        authority,
+                    });
+                    continue;
+                }
+                Some(*result?)
+            }
             DaemonDfsMessageDispatchAttempt::RemoteNamespacePhase(original, phase) => {
                 // The selected service mutex, checkout and mutation admission
                 // have all ended. Only the actual source fences/owner remain.
@@ -5172,8 +5363,12 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         runtime,
         None,
         None,
-    )?{
+        None,
+        None,
+        false,
+    )? {
         DaemonDfsMessageDispatchAttempt::Complete(result) => result,
+        DaemonDfsMessageDispatchAttempt::WriteSetPending { result, .. } => Some(*result?),
         DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(retry) => {
             return Err(retry.stale.into_dfs_error().into());
         }

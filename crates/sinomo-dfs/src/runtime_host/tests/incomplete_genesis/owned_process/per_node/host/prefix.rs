@@ -137,6 +137,7 @@ fn select(
             let observation = crate::local_state::with_current_owned_dfs_shard_inspection(
                 data,
                 &id,
+                None,
                 |backend| {
                     let record = backend.prepared_operation_record(&operation)?;
                     if let Some(record) = &record {

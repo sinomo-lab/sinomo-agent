@@ -186,11 +186,7 @@ pub struct SifsFileRead {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SifsPlacementUpdateOutcome {
-    pub preview: SifsPlacementPreview,
-    pub reconciliation: SifsPlacementReconciliationJob,
-}
+pub type SifsPlacementUpdateOutcome = sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateResponse;
 
 pub struct SifsBrowser {
     address: String,
@@ -804,12 +800,10 @@ impl SifsBrowser {
                 policy,
                 scope,
                 expected_preview_token,
+                timeout_millis: Some(self.timeout.as_millis().min(u64::MAX as u128) as u64),
             },
         )?;
-        Ok(SifsPlacementUpdateOutcome {
-            preview: response.preview,
-            reconciliation: response.reconciliation,
-        })
+        Ok(response)
     }
 
     pub fn placement_progress(

@@ -84,6 +84,7 @@ impl RacingPlacementKv {
             DfsControlPlaneStore::new(&mut self.inner)
                 .compare_and_put_placement_update(&self.expected, &self.expected, &background)
                 .unwrap()
+                .is_some()
         );
         self.background_ids.push(background.job_id);
     }
@@ -104,9 +105,11 @@ impl RacingPlacementKv {
                     DfsControlPlaneAsyncStore::new(self)
                         .compare_and_put_placement_update(&expected, desired, &job),
                 )
+                .map(|committed| committed.is_some())
         } else {
             DfsControlPlaneStore::new(self)
                 .compare_and_put_placement_update(&expected, desired, &job)
+                .map(|committed| committed.is_some())
         }
     }
 }
@@ -242,6 +245,50 @@ fn placement_publication_retries_queue_and_activity_races_without_losing_backgro
         assert_eq!(
             committed.accepted_config,
             scoped_placement_config_for_job(&desired, &kv.job)
+        );
+    }
+}
+
+#[test]
+fn placement_publication_returns_the_exact_job_and_native_commit_revision() {
+    for asynchronous in [false, true] {
+        let (mut kv, desired) = RacingPlacementKv::new(Injection::Bookkeeping { remaining: 0 });
+        let expected = kv.expected.clone();
+        let job = kv.job.clone();
+        let result = if asynchronous {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(
+                    DfsControlPlaneAsyncStore::new(&mut kv)
+                        .compare_and_put_placement_update(&expected, &desired, &job),
+                )
+        } else {
+            DfsControlPlaneStore::new(&mut kv)
+                .compare_and_put_placement_update(&expected, &desired, &job)
+        };
+        let committed = result.unwrap().expect("actual successful transaction");
+        let key = placement_reconciliation_key(&desired.file_system_id, &job.job_id);
+        assert!(
+            kv.get(&key).unwrap().is_none(),
+            "the retained observation still precedes this commit"
+        );
+        let stored = kv.inner.get(&key).unwrap();
+        assert_eq!(committed.revision, kv.inner.snapshot().unwrap().revision);
+        assert!(committed.revision >= stored.modify_revision);
+        assert_eq!(
+            committed.reconciliation,
+            stored.decode::<DfsPlacementReconciliationJob>().unwrap()
+        );
+        assert_eq!(
+            committed.reconciliation.accepted_config,
+            scoped_placement_config_for_job(&desired, &job)
+        );
+        assert_eq!(kv.publication_attempts, 1);
+        assert_eq!(
+            kv.authoritative_refreshes, 0,
+            "no readback is needed to return the accepted job"
         );
     }
 }
@@ -1031,6 +1078,7 @@ fn native_placement_supersession_rejects_changed_classifying_configuration() {
                 store
                     .compare_and_put_placement_update(&current, &accepted, &job)
                     .unwrap()
+                    .is_some()
             );
             let mut changed = accepted.clone();
             crate::upsert_placement_rule(

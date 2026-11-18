@@ -648,6 +648,7 @@ fn with_cached_dfs_metadata_inspection<T>(
 pub(crate) fn with_current_owned_dfs_shard_inspection<T>(
     data_dir: &SinomoDataDir,
     shard_id: &DfsMetadataShardId,
+    resident: Option<&crate::ResidentLocalMetadataShardLease>,
     inspect: impl FnOnce(&dyn DfsMetadataBackend) -> Result<T, DfsError>,
 ) -> Result<Option<T>, DfsError> {
     let root = default_dfs_metadata_shards_root(data_dir)
@@ -667,6 +668,20 @@ pub(crate) fn with_current_owned_dfs_shard_inspection<T>(
     // This exact physical shard never follows or refreshes the global object
     // index. The writer fence remains held through authorization and opening
     // the reader, so the observational image cannot grant a stale permission.
+    if let Some(resident) = resident {
+        if resident.shard_root() != root.as_path() || resident.shard_id() != shard_id {
+            return Err(metadata_inspection_cache_error(
+                "resident inspection names another physical shard",
+            ));
+        }
+        let backend: &dyn DfsMetadataBackend = &**resident;
+        if backend.metadata_prefix_proof(shard_id)?.as_ref() != Some(&prefix) {
+            return Ok(None);
+        }
+        // The same physical fence makes these ordinary validated getters one
+        // coherent cut. No cloned backend, new read cache or writer is needed.
+        return inspect(backend).map(Some);
+    }
     with_cached_dfs_metadata_inspection(
         root.clone(),
         || {

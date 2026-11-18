@@ -450,21 +450,21 @@ pub(super) async fn recover_prior_process_default_dfs_placement_authority_async_
     runtime: &tokio::runtime::Handle,
     refresh_latest: bool,
 ) -> Result<bool, DaemonError> {
+    let host = dfs_runtime_host(&paths.data_dir()?)?;
     let task_paths = paths.clone();
     let task_runtime = runtime.clone();
-    runtime
-        .spawn_blocking(move || {
-            recover_prior_process_default_dfs_placement_authority_from_observation(
-                &task_paths,
-                &task_runtime,
-                refresh_latest,
-            )
-        })
-        .await
-        .map_err(|source| DaemonError::Network {
-            address: "default DFS placement-authority recovery".to_string(),
-            detail: format!("default DFS recovery task failed: {source}"),
-        })?
+    crate::runtime_publish::run_owned_dfs_blocking(&host, move || {
+        recover_prior_process_default_dfs_placement_authority_from_observation(
+            &task_paths,
+            &task_runtime,
+            refresh_latest,
+        )
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "default DFS placement-authority recovery".to_string(),
+        detail: format!("default DFS recovery task failed: {source}"),
+    })?
 }
 
 fn daemon_default_dfs_reconciliation_retry_delay(failure_streak: u32) -> Duration {

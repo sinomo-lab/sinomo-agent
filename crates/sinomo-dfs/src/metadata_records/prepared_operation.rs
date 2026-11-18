@@ -266,9 +266,9 @@ fn deserialize_journal_sequence_precondition<'de, D: serde::Deserializer<'de>>(
     Option::<u64>::deserialize(deserializer)
 }
 
-// A replay owns its decoded table image until it returns. Keep only one
+// Ingest and replay own their decoded input until they return. Keep only one
 // successful immutable-body observation in that scope, never an authority,
-// terminal-state result or strong payload reference. Outside replay every
+// terminal-state result or strong payload reference. Outside these scopes every
 // public validation still hashes normally and leaves Arc uniqueness unchanged.
 struct PreparedPayloadValidation {
     last: Option<(std::sync::Weak<DfsPreparedOperationPayload>, String)>,
@@ -278,6 +278,15 @@ thread_local! {
 }
 
 pub(crate) fn with_prepared_payload_validation<R>(read: impl FnOnce() -> R) -> R {
+    // Nested projection/apply helpers borrow the same immutable body owner.
+    // Keep its one weak observation until the outer operation returns; mutable
+    // record fields and the digest's complete scope are still checked each time.
+    if PREPARED_PAYLOAD_VALIDATION
+        .try_with(|slot| slot.borrow().is_some())
+        .unwrap_or(false)
+    {
+        return read();
+    }
     struct Restore(Option<PreparedPayloadValidation>);
     impl Drop for Restore {
         fn drop(&mut self) {

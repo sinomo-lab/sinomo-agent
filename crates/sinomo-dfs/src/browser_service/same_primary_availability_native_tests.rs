@@ -85,8 +85,16 @@ mod filesystem_projection;
 
 #[test]
 fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
-    let (native, nodes) =
-        DfsTestRuntime::start_cluster("native-same-primary-follower-baseline", 3).unwrap();
+    same_primary_follower_partition("native-same-primary-follower-baseline", true);
+}
+
+#[test]
+fn native_write_set_continuation_expires_with_the_original_caller() {
+    same_primary_follower_partition("native-write-set-continuation-cancel", false);
+}
+
+fn same_primary_follower_partition(name: &str, settle_verdict: bool) {
+    let (native, nodes) = DfsTestRuntime::start_cluster(name, 3).unwrap();
     let assignment = native
         .metadata_shards()
         .unwrap()
@@ -249,6 +257,46 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
             .iter()
             .any(|object| object.path == PATH)
     );
+    // Run the production keeper after qualifying the same native participants.
+    // Network verdicts are conditions only; switching and commits still require
+    // the real durable prefix/ACK protocol from those members.
+    for node in nodes.iter().filter(|node| **node != primary) {
+        native.set_peer_verdict(
+            &primary,
+            node,
+            sinomo_core::network::PeerPathVerdict::Path,
+            false,
+        );
+    }
+    native.enable_write_set_keeping(&primary);
+    let switch_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let mut client = native.configuration_publisher(&primary);
+        let cut = DfsControlPlaneStore::new(client.as_mut())
+            .read_metadata_shard_record_cut(
+                &assignment.file_system_id,
+                &assignment.shard_id,
+                &nodes,
+            )
+            .unwrap()
+            .unwrap();
+        if let Some(write_set) = cut.write_set_state().switched() {
+            assert_eq!(
+                write_set.write_set.iter().cloned().collect::<BTreeSet<_>>(),
+                expected_nodes
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < switch_deadline,
+            "native keeper did not switch: {:?}",
+            native.write_set_keeping_failures(&primary)
+        );
+        std::thread::yield_now();
+    }
+    for node in &nodes {
+        native.wait_published_configuration_current(node).unwrap();
+    }
     let operation = format!("same-primary-offline-{}", sinomo_core::Id::generate());
     let expected_object = crate::intent::stable_create_object_id(&primary, PATH, &operation);
     let expected_version =
@@ -273,30 +321,77 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
     // EXACTLY ONE fresh semantic create, AFTER partition. Its options are read
     // from the same production coherent view, never supplied candidate hints.
     // ConfigurationPending/error is retained; there is no post-effect replan.
-    let result =
-        backend.try_with_configured_mutation_service(&[PATH], (), |service, configuration, ()| {
-            let options =
-                backend.write_options_for_path_with_configuration(service, PATH, configuration)?;
-            if options.policy.min_commit_replicas != 2
-                || options.policy.desired_replicas != 3
-                || options
-                    .replica_candidates
-                    .iter()
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-                    != expected_nodes
-            {
-                return Err(dfs_browser_service_error(
-                    "original W2/N3 named provider projection changed before dispatch",
-                ));
-            }
-            let actual_options = (options.policy.clone(), options.replica_candidates.clone());
-            let previous = service.set_transport_operation_deadline(Some(deadline));
-            let outcome =
-                service.posix_create_file_with_operation_id(PATH, BYTES, options, &operation);
-            service.set_transport_operation_deadline(previous);
-            Ok((actual_options, outcome))
+    let result = std::thread::scope(|scope| {
+        let write = scope.spawn(|| {
+            backend.try_with_configured_mutation_service(
+                &[PATH],
+                (),
+                |service, configuration, ()| {
+                    let options = backend.write_options_for_path_with_configuration(
+                        service,
+                        PATH,
+                        configuration,
+                    )?;
+                    if options.policy.min_commit_replicas != 2
+                        || options.policy.desired_replicas != 3
+                        || options
+                            .replica_candidates
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                            != expected_nodes
+                    {
+                        return Err(dfs_browser_service_error(
+                            "original W2/N3 named provider projection changed before dispatch",
+                        ));
+                    }
+                    let actual_options =
+                        (options.policy.clone(), options.replica_candidates.clone());
+                    let previous = service.set_transport_operation_deadline(Some(deadline));
+                    let outcome = service
+                        .posix_create_file_with_operation_id(PATH, BYTES, options, &operation);
+                    service.set_transport_operation_deadline(previous);
+                    Ok((actual_options, outcome))
+                },
+            )
         });
+        // Settle the negative reachability verdict only after this original
+        // failed authority attempt asked the existing network verifier.
+        while !native
+            .peer_verification_requests(&primary)
+            .contains(&follower)
+        {
+            if write.is_finished() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        if native
+            .peer_verification_requests(&primary)
+            .contains(&follower)
+        {
+            let scheduler =
+                crate::runtime_host::daemon_dfs_mutation_scheduler(native.data_dir(&primary))
+                    .unwrap();
+            native.runtime_handle().block_on(async {
+                let admission = tokio::time::timeout_at(
+                    deadline.into(),
+                    scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive),
+                )
+                .await
+                .expect("continuation releases actual global/shard admission")
+                .unwrap();
+                drop(admission);
+            });
+            native.set_peer_verdict(
+                &primary,
+                &follower,
+                sinomo_core::network::PeerPathVerdict::NoPath,
+                !settle_verdict,
+            );
+        }
+        write.join().unwrap()
+    });
     let original_elapsed = started.elapsed();
     // Capture all genuine durable state and the original error BEFORE asserting
     // success. A current-V7 failure is the wanted baseline, not fixture PASS.
@@ -577,6 +672,47 @@ fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
         }),
         "actual original authority carrier to the isolated follower must join the exact native body/frame and its own terminal; no background-fault substitution"
     );
+    if !settle_verdict {
+        let (_, failed) = match result {
+            Ok(DfsBrowserMutationAttempt::Complete(actual)) => actual,
+            other => panic!("original call did not reach its native owner: {other:#?}"),
+        };
+        assert!(
+            failed.is_err(),
+            "an unsettled unreachable member cannot be waived"
+        );
+        let after = after.unwrap();
+        assert!(
+            !after
+                .tables
+                .objects
+                .iter()
+                .any(|object| object.path == PATH)
+        );
+        assert!(
+            own_prepared_pipeline
+                .unwrap()
+                .iter()
+                .any(|record| record.status == DfsPreparedOperationStatus::Prepared)
+        );
+        let mut client = native.configuration_publisher(&primary);
+        let cut = DfsControlPlaneStore::new(client.as_mut())
+            .read_metadata_shard_record_cut(
+                &assignment.file_system_id,
+                &assignment.shard_id,
+                &nodes,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cut.write_set_state().switched().unwrap().write_set.len(), 3);
+        drop(client);
+        drop(partition);
+        drop(backend);
+        // Normal shutdown must drain the cancelled wait, not strand a service
+        // or a request owner until a later configuration mutation.
+        native.close().unwrap();
+        return;
+    }
     let (_, created) = match result {
         Ok(DfsBrowserMutationAttempt::Complete(actual)) => actual,
         other => panic!("original never completed; actual stage exported: {other:#?}"),

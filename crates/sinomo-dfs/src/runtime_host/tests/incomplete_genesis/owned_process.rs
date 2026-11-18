@@ -893,6 +893,7 @@ fn default_prepared_genesis_survives_owned_sigkill_and_same_fixture_reconstructi
                     let value = crate::local_state::with_current_owned_dfs_shard_inspection(
                         native.data_dir(&expected.primary),
                         &shard_id,
+                        None,
                         |backend| {
                             backend
                                 .get_object_by_path(&expected.shard.file_system_id, path)

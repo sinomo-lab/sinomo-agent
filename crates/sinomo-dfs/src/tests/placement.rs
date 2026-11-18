@@ -625,13 +625,17 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
     // candidate hint does not pin the native placement decision.
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
     placement.required_node_ids = vec![replica_node.clone()];
-    _runtime
+    let accepted = _runtime
         .apply_placement_policy(
             &services_primary_node,
             "/services/origin.txt",
             DfsPlacementScope::Subtree,
             placement,
         )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&_runtime, &accepted);
+    _runtime
+        .wait_published_configuration_current(&replica_node)
         .unwrap();
     // Open the caller after fixture configuration so its retained write
     // projection contains this policy, then pass those exact constraints.
@@ -1027,6 +1031,7 @@ fn placement_reconciliation_resumes_durable_phase_and_updates_existing_file() {
             store
                 .compare_and_put_placement_update(&expected, &desired, &job)
                 .expect("publish placement and job")
+                .is_some()
         );
         job
     });

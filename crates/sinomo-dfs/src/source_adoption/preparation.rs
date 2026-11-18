@@ -1537,6 +1537,14 @@ mod genuine_source_first_tests {
         );
         drop(seed);
         let (coordinator, target) = source_first_coordinator_and_target(&native, &nested, &nodes);
+        let _diagnostic = crate::native_boundary_diagnostics::capture(
+            native
+                .data_dir(&coordinator)
+                .root()
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        );
         assert!(nested.primary_node_id < coordinator);
         let mut requester = native.client(&nodes[0]).unwrap();
         let source_pause = native
@@ -2004,6 +2012,13 @@ mod genuine_source_first_tests {
             source_path.clone(),
         );
         let denied = coordinator_reader.query_metadata_authority_impl(&nested, source_read.clone());
+        let absent_read = crate::DfsMetadataSelection::CurrentObjectForNamespaceJob {
+            job: Box::new(captured_job.clone()),
+            source_path: format!("{source_path}/absent-source-read"),
+            object_id: sinomo_core::Id::generate(),
+        };
+        let absent_denied =
+            coordinator_reader.query_metadata_authority_impl(&nested, absent_read.clone());
         registry.remove_job("negative-other-job");
         assert!(
             denied
@@ -2011,6 +2026,19 @@ mod genuine_source_first_tests {
                 .to_string()
                 .contains("moving between metadata shards")
         );
+        assert!(
+            absent_denied
+                .unwrap_err()
+                .to_string()
+                .contains("moving between metadata shards"),
+            "an absent source still respects another job's reservation"
+        );
+        assert!(matches!(
+            coordinator_reader
+                .query_metadata_authority_impl(&nested, absent_read)
+                .unwrap(),
+            crate::DfsMetadataQueryResult::CurrentObject { object: None }
+        ));
         let page = coordinator_reader
             .query_metadata_authority_impl(&nested, source_read)
             .unwrap();

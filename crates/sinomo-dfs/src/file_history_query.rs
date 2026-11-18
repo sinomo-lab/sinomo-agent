@@ -400,6 +400,21 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
             let object = backend.get_object(object_id)?.filter(|object| {
                 object.file_system_id == query.file_system_id && object.path == *source_path
             });
+            // An absent identity is not proof that its old path is vacant.
+            // Read both from this same physical snapshot, including when the
+            // original job is corroborating an already-retired source.
+            if backend
+                .get_object_by_path_on_shard(&query.shard_id, &query.file_system_id, source_path)?
+                .is_some_and(|occupant| {
+                    occupant.kind != DfsObjectKind::Tombstone
+                        && occupant.tombstone_provenance.is_none()
+                        && occupant.object_id != *object_id
+                })
+            {
+                return Err(MetadataBackendError::Serde(
+                    "namespace job source path names another live object".into(),
+                ));
+            }
             Ok(DfsMetadataQueryResult::CurrentObject {
                 object: object.map(Box::new),
             })
@@ -781,6 +796,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         moved_object,
                         old_path,
                         ..
+                    }
+                    | DfsNamespaceJobFrame::CrossShardComplete {
+                        moved_object,
+                        old_path,
                     } => moved_object.object_id == *object_id && old_path == source_path,
                     DfsNamespaceJobFrame::CrossShardDirScan {
                         source_path: parent,
@@ -924,8 +943,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Ok(())
         };
-        if let DfsMetadataSelection::DirectoryPageForNamespaceJob { path, .. } = &query.selection {
-            ensure_read(&query.file_system_id, path)?;
+        match &query.selection {
+            DfsMetadataSelection::DirectoryPageForNamespaceJob { path, .. }
+            | DfsMetadataSelection::CurrentObjectForNamespaceJob {
+                source_path: path, ..
+            } => ensure_read(&query.file_system_id, path)?,
+            _ => {}
         }
         let backend = self
             .metadata_backend

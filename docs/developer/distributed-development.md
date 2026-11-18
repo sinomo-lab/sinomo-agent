@@ -192,12 +192,8 @@ Historical bridge instructions, model choices and resource exceptions are not
 permanent repository policy.
 
 During autonomous work, make scope changes visible before they accumulate.
-Distinguish requested work, necessary support and additional improvements; state
-whether each preserves, restores or changes the contract. An extra improvement
-can be worthwhile without being part of the original request. The
-[change-scope workflow](../../.agents/skills/sinomo-change-scope/SKILL.md) binds
-these declarations to the actual diff and invalidates stale or incomplete reviews.
-It supports explicit decisions rather than a blanket ban on additional work.
+State material changes to requirements before depending on them and keep
+additional improvements independently reviewable.
 
 Serialize the scarce resource. Agree on a bounded build/test slot and cache
 ownership without freezing unrelated development. Keep normal Cargo scheduling

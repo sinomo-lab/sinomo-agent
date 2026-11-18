@@ -274,30 +274,48 @@ impl DfsMutationScheduler {
             return Ok(admission);
         };
 
-        // Reserve the exact shard before joining the global read side. A
-        // same-shard backlog therefore waits without holding read guards, so
-        // Tokio's write-preferring RwLock can admit a queued global mutation
-        // after only the currently active exact owners finish.
+        // Wait for the shard without retaining a global read guard. A same-
+        // shard backlog must not prevent a queued global writer from running.
         let Some(shard_gate) = self.shard_gate(&key)? else {
             let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
             let admission = self.admit_global().await;
             trace_dfs_admission_gate(self, scope, "global-write", gate_started);
             return Ok(admission);
         };
-        let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
-        let shard = shard_gate
-            .acquire_owned()
-            .await
-            .map_err(|_| DfsError::Network {
-                message: format!(
-                    "DFS mutation scheduler closed the {}:{} shard gate",
-                    key.file_system_id, key.shard_id.0
-                ),
-            })?;
-        trace_dfs_admission_gate(self, scope, "shard-semaphore", gate_started);
-        let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
-        let global = Arc::clone(&self.global).read_owned().await;
-        trace_dfs_admission_gate(self, scope, "global-read", gate_started);
+        let closed = || DfsError::Network {
+            message: format!(
+                "DFS mutation scheduler closed the {}:{} shard gate",
+                key.file_system_id, key.shard_id.0
+            ),
+        };
+        let (shard, global) = loop {
+            let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+            let shard = Arc::clone(&shard_gate)
+                .acquire_owned()
+                .await
+                .map_err(|_| closed())?;
+            trace_dfs_admission_gate(self, scope, "shard-semaphore", gate_started);
+            let gate_started = crate::dfs_perf_trace_enabled().then(Instant::now);
+            if let Ok(global) = Arc::clone(&self.global).try_read_owned() {
+                trace_dfs_admission_gate(self, scope, "global-read", gate_started);
+                break (shard, global);
+            }
+            // A waiting global writer may depend on a peer whose ACK needs
+            // this shard. Release it before joining the ordinary read queue so
+            // that admit_answer can pass the waiting writer on its own gate.
+            drop(shard);
+            let global = Arc::clone(&self.global).read_owned().await;
+            trace_dfs_admission_gate(self, scope, "global-read", gate_started);
+            match Arc::clone(&shard_gate).try_acquire_owned() {
+                Ok(shard) => break (shard, global),
+                Err(tokio::sync::TryAcquireError::Closed) => return Err(closed()),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    // An answer or another exact operation won the shard.
+                    // Never wait for it while retaining the global read side.
+                    drop(global);
+                }
+            }
+        };
         Ok(DfsMutationAdmission::ExactShard {
             _scheduler: Arc::clone(self),
             _global: DfsExactGlobalAdmission::Read(global),
@@ -769,6 +787,107 @@ mod tests {
                 .expect("writer admission");
             assert!(held.is_global());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_materialization_does_not_reserve_the_lane_needed_by_a_peer_answer() {
+        let writer_node = Arc::new(DfsMutationScheduler::new());
+        let placement_node = Arc::new(DfsMutationScheduler::new());
+        let services = scope("publication-placement-cycle", "services");
+        let users = scope("publication-placement-cycle", "users");
+        let writer = writer_node
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let placement = placement_node.admit(&users).await.unwrap();
+        let mut global = Box::pin(placement_node.admit(&DfsMessageExecutionScope::GlobalExclusive));
+        std::future::poll_fn(|cx| {
+            assert!(global.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut materialization = Box::pin(placement_node.admit(&services));
+        std::future::poll_fn(|cx| {
+            assert!(materialization.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // Publication on the first node needs this services answer before it
+        // can release its global writer. The queued materializer must not own
+        // services merely because it is waiting for the global read side.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            placement_node.admit_answer(&services),
+        )
+        .await
+        .expect("peer answer passes queued materialization and global work")
+        .unwrap();
+        drop(answer);
+        drop(writer);
+        let answer = writer_node.admit_answer(&users).await.unwrap();
+        drop(answer);
+        drop(placement);
+        let global = tokio::time::timeout(Duration::from_secs(1), global)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(global.is_global());
+        std::future::poll_fn(|cx| {
+            assert!(materialization.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(global);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), materialization)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_exact()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_reacquisition_does_not_hold_global_read_while_an_answer_owns_the_shard() {
+        let node = Arc::new(DfsMutationScheduler::new());
+        let lane = scope("answer-reacquisition", "services");
+        let global = node
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await
+            .unwrap();
+        let mut ordinary = Box::pin(node.admit(&lane));
+        std::future::poll_fn(|cx| {
+            assert!(ordinary.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut answer = Box::pin(node.admit_answer(&lane));
+        std::future::poll_fn(|cx| {
+            assert!(answer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(global);
+        std::future::poll_fn(|cx| {
+            assert!(ordinary.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // The answer owns only its shard reservation until polled again. The
+        // ordinary contender must have dropped the global read it just won.
+        drop(
+            node.try_admit_global()
+                .expect("no global read retained while waiting for a shard"),
+        );
+        drop(answer.await.unwrap());
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), ordinary)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(node.try_admit_global().is_some());
     }
 
     /// An answer never runs while a global writer holds the node, and a

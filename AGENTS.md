@@ -7,18 +7,12 @@
 
 ## Change scope
 
-- Keep requirements distinct from the implementation plan. Classify edits as
-  requested work, necessary support, additional improvements or external work.
+- Keep requirements distinct from the implementation plan.
   Preserve valid wording/behavior unless there is a stated reason to change it.
 - Additional improvements can be useful. Make their value and impact explicit
   and independently reviewable; do not hide them in a larger required change.
   Surface changes to intent or contracts before depending on them, honoring
   decisions already made instead of repeatedly asking for routine approval.
-- For extended autonomous work, refactors and cross-boundary fixes, use
-  [sinomo-change-scope](.agents/skills/sinomo-change-scope/SKILL.md): capture the
-  starting state and requirements, then check the actual diff before handoff.
-  Missing or stale scope accounting is not a completed review. The check enforces
-  disclosure, not semantic correctness or authorization.
 
 ## Architecture invariants
 

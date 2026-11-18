@@ -182,6 +182,7 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &job)
             .unwrap()
+            .is_some()
     }));
     let read_original = || {
         control.with_client(|kv| {
@@ -246,6 +247,7 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &newer)
             .unwrap()
+            .is_some()
     }));
     let selected = control.with_client(|kv| {
         DfsControlPlaneStore::new(kv.as_mut())

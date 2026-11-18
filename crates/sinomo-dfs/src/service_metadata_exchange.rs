@@ -897,14 +897,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     verified_prefix_only: response.verified_prefix_only,
                 })
             }
-            DfsMetadataJournalBatchResult::Rejected { reason, code } => {
-                if code.allows_snapshot_repair() && !pending.verify_prefix_only {
-                    self.send_metadata_snapshot_repair(
-                        &source_node_id,
-                        &response.shard_id,
-                        reason.clone(),
-                    )?;
-                }
+            DfsMetadataJournalBatchResult::Rejected { reason, .. } => {
+                // Tracked journal requests are issued by the durability
+                // barrier. It owns the frozen checkpoint and its repair
+                // policy, including exact-prefix calls that forbid snapshots.
+                // Let that owner process the rejection before dispatching a
+                // repair; doing it here also sends duplicate full images.
                 Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
                     request_id: response.request_id,
                     source_node_id,
@@ -2103,6 +2101,96 @@ mod response_bookkeeping_tests {
 
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("test node id")
+    }
+
+    #[test]
+    fn tracked_journal_rejection_leaves_snapshot_dispatch_to_its_barrier() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (runtime, requester, config) = crate::test_support::current_native_metadata_service(
+            "native-tracked-repair-owner",
+            3,
+            "/services",
+        )
+        .unwrap();
+        drop(requester);
+        let mut service = runtime.metadata_primary_service("/services").unwrap();
+        service.posix_mkdir_all("/services/repair-owner").unwrap();
+        let shard = DfsMetadataShardId::new(&config.shard_id);
+        let sequence = service
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&shard)
+            .unwrap()
+            .unwrap()
+            .journal_sequence;
+        let target = config.replica_node_ids[0].clone();
+        let snapshot_id = format!(
+            "dfs_meta_snapshot_{}_{}_{}",
+            config.primary_node_id, target, sequence
+        );
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&snapshots);
+        let expected_shard = shard.clone();
+        let hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            runtime.data_dir(&target),
+            Arc::new(move |point, command, _| {
+                if matches!(point, crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. })
+                    && command.is_some_and(|command| matches!(&command.routed_message.message,
+                        DfsNetworkMessage::MetadataSnapshotInstall(install)
+                            if install.request_id == snapshot_id && install.shard_id == expected_shard))
+                { observed.fetch_add(1, Ordering::SeqCst); }
+                Ok(())
+            }),
+        );
+        let admission = runtime
+            .hold_main_mutation_admission(&config.primary_node_id)
+            .unwrap();
+        let request = format!("dfs_sync_catchup_{}", sinomo_core::Id::generate());
+        // Negative-only response bookkeeping: no ACK or publication proof is
+        // supplied. Real native snapshot ingress is observed if the handler
+        // incorrectly acts before its barrier receives this rejection.
+        service.replication.pending_metadata_replications.insert(
+            request.clone(),
+            pending_replication(
+                target.clone(),
+                shard.clone(),
+                sequence,
+                PendingMetadataReplicationResponseKind::JournalBatch,
+                false,
+                Some("original-barrier-confirmation"),
+            ),
+        );
+        let event = service
+            .handle_metadata_journal_batch_response(
+                target.clone(),
+                DfsMetadataJournalBatchResponse {
+                    request_id: request.clone(),
+                    shard_id: shard,
+                    next_after_sequence: sequence,
+                    applied_entries: 0,
+                    verified_prefix_only: false,
+                    verified_authority_probe_id: None,
+                    result: DfsMetadataJournalBatchResult::Rejected {
+                        reason: "negative control: exact prefix requires repair".into(),
+                        code: DfsMetadataRejectionCode::PrefixMismatch,
+                    },
+                    member_view: None,
+                    member_record: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(event, Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected { request_id, source_node_id, .. })
+            if request_id == request && source_node_id == target)
+        );
+        assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+        drop(admission);
+        drop(hook);
+        drop(service);
+        runtime.close().unwrap();
     }
 
     fn pending_replication(

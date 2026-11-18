@@ -421,6 +421,59 @@ fn run_healthy(cut: Cut) {
     saved.unwrap();
 }
 #[test]
+fn retained_healthy_capture_waits_for_its_actual_writer() {
+    let (native, _) = DfsTestRuntime::start_cluster("retained-healthy-live-writer", 3).unwrap();
+    let shard = native.root_shard().unwrap();
+    let mut client = native.client(&shard.primary_node_id).unwrap();
+    client.posix_mkdir(SEED).unwrap();
+    drop(client);
+    let round = capture_actual_round(&native, true).unwrap();
+    let root = crate::local_dfs_metadata_shard_path(
+        native.data_dir(&shard.primary_node_id),
+        &DfsMetadataShardId::new(&shard.shard_id),
+    );
+    let held = crate::metadata_lock::metadata_write_lock(
+        root.clone(),
+        crate::metadata_cursor::journal_write_lock_path(&root),
+    )
+    .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let deadline = round.deadline();
+    let (native, waited, result) = std::thread::scope(|threads| {
+        let capture = threads.spawn(move || {
+            entered_tx.send(()).unwrap();
+            done_tx
+                .send(native.capture_retained_healthy_fixture(&round))
+                .unwrap();
+            native
+        });
+        entered_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        let waited = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        drop(held);
+        let result = match early {
+            Ok(result) => result,
+            Err(_) => done_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap(),
+        };
+        (capture.join().unwrap(), waited, result)
+    });
+    native.close().unwrap();
+    assert!(
+        waited,
+        "required capture must wait for its actual physical writer: {result:?}"
+    );
+    assert!(
+        result.is_ok(),
+        "same native cut must remain observable after release: {result:?}"
+    );
+}
+
+#[test]
 fn retained_healthy_full3_survives_owned_sigkill_with_fresh_native_proof() {
     run_healthy(Cut::Returned);
 }

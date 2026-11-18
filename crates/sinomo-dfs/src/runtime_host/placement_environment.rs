@@ -562,8 +562,9 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
     node_resources: Option<sinomo_device::NodeResourceSnapshot>,
     sample_storage: bool,
 ) -> Result<bool, DaemonError> {
+    let host = dfs_runtime_host(&paths.data_dir()?)?;
     let prepare_paths = paths.clone();
-    let Some(prepared) = tokio::task::spawn_blocking(move || {
+    let Some(prepared) = crate::runtime_publish::run_owned_dfs_blocking(&host, move || {
         prepare_daemon_dfs_storage_environment_refresh(
             &prepare_paths,
             node_resources,
@@ -603,7 +604,7 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
     let update_data_dir = data_dir.clone();
     let update_cluster_paths = cluster_paths.clone();
     let update_local_node_id = local_node_id.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::runtime_publish::run_owned_dfs_blocking(&host, move || {
         let (generation, advertisements) =
             with_placement_environment(&update_data_dir, &update_local_node_id, |environment| {
                 environment

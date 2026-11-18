@@ -1323,6 +1323,20 @@ impl ResidentLocalMetadataShardHandle {
         })
     }
 
+    /// Borrow an already-open owner for an observational read. A cold or busy
+    /// slot stays unavailable; this path cannot initialize or recover storage.
+    pub(crate) fn try_checkout_open(&self) -> Result<Option<ResidentLocalMetadataShardLease>> {
+        match self.slot.try_checkout_if_open()? {
+            ResidentSlotRebindAccess::Open(backend) => Ok(Some(ResidentLocalMetadataShardLease {
+                file_system_id: self.file_system_id.clone(),
+                shard_id: self.shard_id.clone(),
+                slot: Arc::clone(&self.slot),
+                backend: Some(backend),
+            })),
+            ResidentSlotRebindAccess::Unopened | ResidentSlotRebindAccess::Busy => Ok(None),
+        }
+    }
+
     /// Wait asynchronously until a checkout can be retried without retaining
     /// a shard lease or another subsystem's admission guard.
     pub async fn wait_until_checkout_available(&self) -> Result<()> {

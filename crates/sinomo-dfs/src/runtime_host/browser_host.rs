@@ -105,6 +105,33 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
             Ok(())
         })
     }
+    fn placement_configuration_published<'a>(
+        &'a self,
+        revision: sinomo_core::kv::KvRevision,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), sinomo_core::service::ServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let authority = self.metadata_authority.as_ref().ok_or_else(|| {
+                sinomo_core::service::ServiceError::Service(
+                    "daemon configuration owner is unavailable".into(),
+                )
+            })?;
+            tokio::select! {
+                result = authority.ready_configuration_snapshot_at_least_async(revision) => {
+                    result.map(|_| ()).map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+                }
+                () = self.task_owner.wait_for_shutdown() => {
+                    Err(sinomo_core::service::ServiceError::Service("DFS component is stopping".into()))
+                }
+            }
+        })
+    }
+
     fn operation_guard(
         &self,
     ) -> Result<Option<Arc<dyn Send + Sync>>, sinomo_core::service::ServiceError> {

@@ -23,6 +23,9 @@ use crate::*;
 #[cfg(test)]
 mod fresh_admission_native_tests;
 
+#[cfg(test)]
+mod prestage_native_tests;
+
 /// Internal write execution choices. Content identity and the consumed input
 /// remain explicit parameters of the byte, reader and manifest entry points.
 #[derive(Clone, Debug, Default)]
@@ -2366,11 +2369,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if shard.primary_node_id != self.node_id
                     || self.transport.delegates_local_namespace_authority() =>
             {
-                // When the requester is already a selected content replica and
-                // W=1, make that copy durable here. Sending the bytes to a
-                // metadata primary outside the selected set otherwise leaves
-                // zero usable receipts and forces another transfer back to a
-                // selected replica before publication.
+                // A tentative local plan can prefer this requester while the
+                // primary's independent plan excludes it. Only pre-stage when
+                // policy requires this copy; otherwise stream the original
+                // input through the existing primary-owned ingest path.
                 // Creating a local content reservation does not publish a
                 // namespace object. The primary still owns parent/exclusive
                 // admission and final placement, and suppresses this initial
@@ -2388,6 +2390,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 .contains(&object.object_id)))
                     && request.requesting_node_id == self.node_id
                     && desired_replica_nodes.contains(&self.node_id)
+                    && (policy.required_node_ids.contains(&self.node_id)
+                        || (object.policy == DfsObjectPolicy::LocalOwned
+                            && object.owner_node_id == self.node_id))
                 {
                     let manifest = self.content.put_object_version(
                         request.object_id.as_str(),

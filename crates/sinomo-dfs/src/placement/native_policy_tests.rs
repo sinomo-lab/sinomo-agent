@@ -307,6 +307,7 @@ fn native_manual_clear_keeps_its_reviewed_default_plan() {
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&expected, &cleared, &manual)
             .unwrap()
+            .is_some()
     }));
     let planned = service.reconciliation_placement_for_object_with_pins(
         &manual.accepted_config,
@@ -670,6 +671,7 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &prior)
             .unwrap()
+            .is_some()
     }));
     let prior_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     loop {
@@ -759,6 +761,7 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &job)
             .unwrap()
+            .is_some()
     }));
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     while !interruption.reached() {

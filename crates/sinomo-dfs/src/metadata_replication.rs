@@ -7269,7 +7269,9 @@ pub fn process_dfs_metadata_journal_batch(
     context: Option<&DfsMetadataReplicaShardContext>,
     command: DfsMetadataJournalBatchCommand,
 ) -> DfsMetadataJournalBatchResponse {
-    let mut response = process_dfs_metadata_journal_batch_inner(backend, context, command);
+    let mut response = crate::metadata_records::with_prepared_payload_validation(|| {
+        process_dfs_metadata_journal_batch_inner(backend, context, command)
+    });
     // The backend's typed refusals (a fenced epoch, a required alignment)
     // carry this member's record view like the source checks' do.
     if response.member_record.is_none()

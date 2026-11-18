@@ -540,13 +540,15 @@ impl LocalSobjMetadataBackend {
         table_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<(usize, u64)> {
-        for entry in entries {
-            self.materialize_replayed_journal_entry_into_batch(entry, table_ops, rollback)?;
-        }
-        Ok((
-            entries.len(),
-            entries.last().map_or(0, |entry| entry.sequence),
-        ))
+        crate::metadata_records::with_prepared_payload_validation(|| {
+            for entry in entries {
+                self.materialize_replayed_journal_entry_into_batch(entry, table_ops, rollback)?;
+            }
+            Ok((
+                entries.len(),
+                entries.last().map_or(0, |entry| entry.sequence),
+            ))
+        })
     }
 
     pub(super) fn plan_written_journal_entries_table_ops(
@@ -563,7 +565,7 @@ impl LocalSobjMetadataBackend {
     ) -> Result<PlannedWrittenJournalTableOps> {
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-        let plan = (|| {
+        let plan = crate::metadata_records::with_prepared_payload_validation(|| {
             for entry in entries {
                 if let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &entry.mutation
                     && source_epoch == Some(record.owner_epoch)
@@ -579,10 +581,17 @@ impl LocalSobjMetadataBackend {
                         .map_err(|error| MetadataBackendError::prefix_mismatch(format!(
                             "counted metadata snapshot required before current-epoch ingress: {error}")))?;
                 }
-                self.materialize_replayed_journal_entry_into_batch(entry, &mut table_ops, &mut rollback)?;
+                self.materialize_replayed_journal_entry_into_batch(
+                    entry,
+                    &mut table_ops,
+                    &mut rollback,
+                )?;
             }
-            Ok((entries.len(), entries.last().map_or(0, |entry| entry.sequence)))
-        })();
+            Ok((
+                entries.len(),
+                entries.last().map_or(0, |entry| entry.sequence),
+            ))
+        });
         let (applied, last_materialized_sequence) = match plan {
             Ok(result) => result,
             Err(error) => {
@@ -637,10 +646,12 @@ impl LocalSobjMetadataBackend {
         table_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<()> {
-        let op = crate::metadata_replay::table_op_for_native_journal_entry(entry)?;
-        self.tables
-            .apply_checked_with_rollback(op.clone(), rollback)?;
-        table_ops.push(op);
-        Ok(())
+        crate::metadata_records::with_prepared_payload_validation(|| {
+            let op = crate::metadata_replay::table_op_for_native_journal_entry(entry)?;
+            self.tables
+                .apply_checked_with_rollback(op.clone(), rollback)?;
+            table_ops.push(op);
+            Ok(())
+        })
     }
 }

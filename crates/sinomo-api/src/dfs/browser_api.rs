@@ -758,12 +758,49 @@ pub struct DaemonDfsBrowserPlacementUpdateV2Request {
     #[serde(default)]
     pub scope: crate::dfs::DfsPlacementScope,
     pub expected_preview_token: crate::dfs::DfsPlacementPreviewToken,
+    /// Remaining caller budget when sent. The receiver captures one deadline
+    /// at request ingress; committing does not start a new visibility timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_millis: Option<u64>,
+}
+
+/// Configuration visibility is separate from the accepted reconciliation job.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum DfsPlacementConfigurationVisibility {
+    Published,
+    /// The policy is committed. Observe its job/revision; do not apply it again.
+    Pending {
+        detail: String,
+    },
+}
+
+impl DfsPlacementConfigurationVisibility {
+    pub fn is_published(&self) -> bool {
+        matches!(self, Self::Published)
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserPlacementUpdateResponse {
     pub preview: crate::dfs::DfsPlacementPreview,
     pub reconciliation: crate::dfs::DfsPlacementReconciliationJob,
+    pub committed_revision: u64,
+    pub visibility: DfsPlacementConfigurationVisibility,
+}
+
+impl DaemonDfsBrowserPlacementUpdateResponse {
+    /// Callers that need the new policy immediately must distinguish a known
+    /// commit awaiting visibility from a rejected Apply. This is not retryable.
+    pub fn require_published(&self) -> Result<(), String> {
+        match &self.visibility {
+            DfsPlacementConfigurationVisibility::Published => Ok(()),
+            DfsPlacementConfigurationVisibility::Pending { detail } => Err(format!(
+                "placement policy committed as job {} at revision {}, but configuration visibility is pending: {detail}; do not submit Apply again",
+                self.reconciliation.job_id, self.committed_revision,
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

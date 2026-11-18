@@ -625,6 +625,11 @@ fn native_keeper_switch_keeps_every_member_for_content_of_unrecorded_w() {
 #[test]
 fn native_keeper_holds_no_reachability_subscription_without_a_switched_shard() {
     let (runtime, config) = unswitched("native-keeper-no-subscription", 3, (1, 3));
+    for member in configured(&config) {
+        runtime
+            .withhold_metadata_write_set_capability(&member)
+            .unwrap();
+    }
     let primary = config.primary_node_id.clone();
     runtime.enable_write_set_keeping(&primary);
     wait_for("the keeper evaluates", || {

@@ -69,9 +69,7 @@ Most bug fixes restore the existing design and need no architecture edit. Follow
 [documentation boundaries](docs/README.md#document-status-rules): no development
 logs in docs, and preserve valid text outside the requested correction.
 
-For extended autonomous work or cross-boundary changes, use the
-[change-scope workflow](.agents/skills/sinomo-change-scope/SKILL.md). Review the
-actual diff against captured requirements and disclose additional improvements
+Review the actual diff against the request and disclose additional improvements
 and contract changes separately. A useful extra change needs a visible reason;
 a passing test suite is not evidence that it was requested.
 

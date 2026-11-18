@@ -3088,6 +3088,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     moved_object,
                     old_path,
                 } => self.complete_cross_shard_move_locally(
+                    &job,
                     &moved_object,
                     &old_path,
                     job.kind != DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
@@ -3323,6 +3324,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// touch the source parent. Idempotent so crash recovery can re-run it.
     fn complete_cross_shard_move_locally(
         &mut self,
+        job: &DfsNamespaceJobRecord,
         moved_object: &DfsObjectMetadata,
         old_path: &str,
         touch_parent: bool,
@@ -3414,19 +3416,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // before advancing this durable completion frame. On resume,
             // corroborate source invisibility and the exact finalized target;
             // the coordinator must never author a replica-side tombstone.
-            let current = self.query_metadata_authority_impl(
+            let recorded = self.namespace_job(&job.job_id)?.ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "source retirement read has no original durable namespace job".into(),
+                })
+            })?;
+            // The original job still reserves this source path. Its scoped
+            // read checks both physical identity and path occupancy without
+            // treating the coordinator as an unrelated public reader.
+            let current = self.namespace_job_source_object(
                 source,
-                crate::DfsMetadataSelection::CurrentObject {
-                    object_id: moved_object.object_id.clone(),
-                },
+                &recorded,
+                &moved_object.object_id,
+                &old_path,
             )?;
-            let at_source = self.lookup_sifs_path_direct_distributed_synced(&old_path)?;
-            if !matches!(
-                current,
-                crate::DfsMetadataQueryResult::CurrentObject { object: None }
-            ) || at_source
+            if current
                 .as_ref()
-                .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
+                .is_some_and(|object| object.tombstone_provenance.is_none())
             {
                 return Err(DfsPosixError::Conflict {
                     path: old_path,
@@ -3434,7 +3440,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .into(),
                 });
             }
-            self.verify_cross_shard_adoption_finalized(moved_object, &old_path, None)?;
+            self.verify_cross_shard_adoption_finalized(moved_object, &old_path, Some(&recorded))?;
             self.apply_metadata_object_to_service_state(moved_object.clone())?;
             self.clear_metadata_lookup_cache();
             if touch_parent {

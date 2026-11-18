@@ -1798,6 +1798,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if original_after <= replicated_through_sequence {
             return Ok(None);
         }
+        // A peer can have acknowledged the preceding prepare without yet
+        // receiving its commit. After losing an outgoing hint, carry that
+        // actual commit with this challenge when the bounded suffix reaches
+        // the captured cut. The receiver still verifies the complete prefix;
+        // selecting these frames does not advance or certify a peer cursor.
+        if original_after > 0 {
+            let before_predecessor = original_after - 1;
+            let predecessor = backend.journal_batch_for_shard_since_limited(
+                &prepared_batch.shard_id,
+                before_predecessor,
+                1,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )?;
+            if predecessor.as_ref().is_some_and(|batch| {
+                batch.entries.len() == 1
+                    && batch.entries[0].sequence == original_after
+                    && matches!(
+                        batch.entries[0].mutation,
+                        DfsMetadataMutation::CommitPreparedOperationV7 { .. }
+                    )
+            }) && let Some(batch) = backend
+                .journal_batch_for_shard_since_limited(
+                    &prepared_batch.shard_id,
+                    before_predecessor,
+                    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                    DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+                )?
+                .filter(|batch| batch.next_after_sequence == current_cut_sequence)
+            {
+                return Ok(Some(batch));
+            }
+        }
         if prepared_batch_covers_cut {
             return Ok(Some(prepared_batch.clone()));
         }

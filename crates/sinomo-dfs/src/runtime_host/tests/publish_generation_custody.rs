@@ -261,3 +261,74 @@ fn native_publish_lane_generation_child_belongs_to_actual_host_drain() {
 fn native_publish_idle_generation_child_belongs_to_actual_host_drain() {
     generation_child_is_owned("idle");
 }
+
+#[test]
+fn cancelled_placement_recovery_drains_the_actual_data_owner_before_reopen() {
+    let root = temp_root("placement-recovery-worker-drain");
+    let data = SinomoDataDir::new(root.path());
+    let paths = DfsRuntimePaths::new(&data);
+    let owner = Arc::new(DfsDataOwnerLock::acquire(&paths).unwrap());
+    register_daemon_dfs_data_owner_lock(&paths, &owner).unwrap();
+    let host = test_dfs_runtime_host(&data);
+    register_dfs_runtime_host(&data, &host).unwrap();
+    let runtime = build_daemon_async_runtime("placement-recovery-drain").unwrap();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, released) = std::sync::mpsc::channel();
+    let released = Mutex::new(released);
+    let _hook = install_daemon_dfs_pre_dispatch_test_hook(
+        &data,
+        Arc::new(move |point, _, _| {
+            if matches!(
+                point,
+                DaemonDfsPreDispatchTestPoint::PlacementRecoveryOwnerAcquired
+            ) {
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Ok(())
+        }),
+    );
+    runtime.block_on(async {
+        let worker_paths = paths.clone();
+        let worker_runtime = runtime.handle().clone();
+        let caller = runtime.spawn(async move {
+            recover_prior_process_default_dfs_placement_authority_async_on_runtime(
+                &worker_paths,
+                &worker_runtime,
+                false,
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, started)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        drop(owner);
+        assert!(matches!(
+            DfsDataOwnerLock::acquire(&paths),
+            Err(DfsRuntimeError::AlreadyRunning { .. })
+        ));
+
+        let mut drain = Box::pin(host.shutdown_and_wait(deadline));
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(drain.as_mut(), cx))
+        })
+        .await;
+        release.send(()).unwrap();
+        assert!(
+            first.is_pending(),
+            "shutdown returned while the actual DATA owner was held"
+        );
+        drain.await.unwrap();
+        drop(DfsDataOwnerLock::acquire(&paths).expect("physical owner released at drain"));
+    });
+    unregister_dfs_runtime_host(&data);
+}

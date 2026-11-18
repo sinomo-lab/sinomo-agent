@@ -1270,7 +1270,91 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requester_node_id,
             command,
             None,
+            false,
         )
+    }
+
+    /// Bind a continuation to the real immutable prepare and original request.
+    /// This grants no authority; recovery rechecks the current publication fence.
+    pub(crate) fn prepared_routed_write_continuation(
+        &self,
+        requester: &NodeId,
+        command: &DfsDistributedWriteCommand,
+        operation_id: &str,
+    ) -> Result<Option<crate::DfsPreparedOperationDigest>, DfsError> {
+        if command.patch.is_some() || !command.publication.is_current() {
+            return Ok(None);
+        }
+        let Some(record) = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.prepared_operation_record(operation_id))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        record.validate()?;
+        let intent_id =
+            stable_write_intent_id(requester, &command.request.object_id, &command.request_id);
+        let Some(intent) =
+            prepared_intent_for_write(&record, &command.request.object_id, &intent_id)
+        else {
+            return Ok(None);
+        };
+        let Some(shard) = command.authority_shard.as_ref() else {
+            return Ok(None);
+        };
+        let hash = routed_write_command_content_hash(command);
+        if requester != &command.request.requesting_node_id
+            || record.digest.file_system_id != command.request.file_system_id
+            || record.digest.shard_id.0 != shard.shard_id
+            || record.digest.owner_epoch != shard.epoch
+            || shard.primary_node_id != self.node_id
+            || intent.operation_id.as_deref() != Some(command.request_id.as_str())
+            || intent.policy != command.policy
+            || intent
+                .desired_replica_node_ids
+                .iter()
+                .collect::<BTreeSet<_>>()
+                != command
+                    .desired_replica_nodes
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+            || intent.touch_parent_on_create != command.touch_parent_on_create
+            || command
+                .expected_base_version
+                .as_ref()
+                .is_some_and(|base| intent.base_version.as_ref() != Some(base))
+            || !stable_write_intent_record_matches_routed_write_command(
+                intent, requester, command, &hash,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(record.digest))
+    }
+
+    pub(crate) fn resume_prepared_routed_write(
+        &mut self,
+        requester: NodeId,
+        command: DfsDistributedWriteCommand,
+        prepared: &crate::DfsPreparedOperationDigest,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        if self
+            .prepared_routed_write_continuation(&requester, &command, &prepared.operation_id)?
+            .as_ref()
+            != Some(prepared)
+        {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: command.request_id,
+                object_id: command.request.object_id,
+                reason: "write continuation lost its original immutable prepare".into(),
+            });
+        }
+        // The ordinary replay path checks content, base predicates and authority.
+        // Its absence can never fall through to rebase or a fresh write.
+        self.handle_distributed_write_request_with_preingested_blob(requester, command, None, true)
     }
 
     fn prepare_routed_patch_command(
@@ -1481,6 +1565,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requester_node_id,
             command,
             Some(blob),
+            false,
         )
     }
 
@@ -1489,6 +1574,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         mut command: DfsDistributedWriteCommand,
         mut preingested_blob: Option<ContentStoreQuarantinedBlob>,
+        replay_only: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
         let object_id = command.request.object_id.clone();
@@ -1584,6 +1670,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         {
             replayed_result
+        } else if replay_only {
+            DfsDistributedWriteResult::ReconciliationRequired {
+                operation_id: request_id.clone(),
+                reason: "retained write continuation no longer has an exact replayable outcome"
+                    .into(),
+            }
         } else {
             let authority_validation =
                 if command.publication.is_default_current() && command.patch.is_none() {
