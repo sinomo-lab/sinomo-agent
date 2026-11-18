@@ -108,7 +108,7 @@ where
             .transport
             .send_routed_call_async(
                 target_node_id,
-                crate::message_transport::native_snapshot_routed_call(routed_message)?,
+                crate::message_transport::routed_call_with_content(routed_message)?,
             )
             .await
         {

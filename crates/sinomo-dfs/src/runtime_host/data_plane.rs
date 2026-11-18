@@ -1918,6 +1918,79 @@ impl DfsPeerTransport for DaemonDfsPeerTransport {
         super::native_prefix_return::call_native_prefix_probe(context,&self.host,attempt,options)
     }
 
+    fn call_local_owner_write(
+        &self,
+        command: &DfsMessageCommand,
+        options: DfsObjectRpcSendOptions,
+    ) -> Option<Result<DfsMessageResponse, DfsPeerTransportError>> {
+        let context = self.native_prefix.as_ref()?;
+        let current = registered_dfs_runtime_host(&context.data_dir).ok()??;
+        if !Arc::ptr_eq(&self.host, &current) {
+            return None;
+        }
+        let paths = DaemonPaths::new(&context.data_dir);
+        let owner = daemon_dfs_data_owner_lock(&paths).ok()??;
+        let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(
+            &ClusterPaths::new(&context.data_dir),
+        )
+        .ok()?;
+        let local = &state.local_node_id;
+        if command.routed_message.source_node_id != *local
+            || command.routed_message.target_node_id != *local
+            || !matches!(&command.routed_message.message,DfsNetworkMessage::NamespaceRequest(ns) if ns.requesting_node_id == *local && matches!(ns.operation, crate::DfsNamespaceOperation::WriteFile {..}))
+        {
+            return None;
+        }
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+        }) {
+            return None;
+        }
+        let adapter = DaemonDfsDataPlaneHost {
+            paths,
+            runtime: context.runtime.clone(),
+            event_client: self.host.event_client.clone(),
+            live_owner: Some(Arc::downgrade(&self.host)),
+        };
+        let run = || {
+            context.runtime.block_on(async {
+                let _owner = owner;
+                let call = adapter.handle_message(
+                    command.clone(),
+                    None,
+                    crate::current_dfs_traceparent(),
+                    None,
+                );
+                let reply = match options.overall_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, call).await.map_err(|e| {
+                        DfsPeerTransportError::with_delivery_state(
+                            e.to_string(),
+                            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                        )
+                    })?,
+                    None => call.await,
+                }
+                .map_err(|e| {
+                    DfsPeerTransportError::with_delivery_state(
+                        e.to_string(),
+                        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                    )
+                })?;
+                if reply.attachment.is_some() {
+                    return Err(DfsPeerTransportError::new(
+                        "local path write returned an unexpected attachment",
+                    ));
+                }
+                Ok(reply.response)
+            })
+        };
+        Some(if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(run)
+        } else {
+            run()
+        })
+    }
+
     fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
         Some(Arc::clone(&self.host.response_delivery))
     }

@@ -521,7 +521,7 @@ pub struct DfsNamespaceLookupRangeRequest {
     pub max_bytes: usize,
 }
 
-pub(crate) const DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES: usize = 64 * 1024;
 
 /// Attributed direct-child creation bound to one actual opened parent.
 /// The distinct closed payload prevents an old receiver from ignoring attrs.
@@ -534,9 +534,40 @@ pub struct DfsMkdirAtNoLinksWithAttrs {
     pub attrs: DfsPosixCreateAttrs,
 }
 
+/// File bytes in a path write. A descriptor is never a content receipt and
+/// can only be executed with the matching receiver-owned staged attachment.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsOwnerWriteContent {
+    Inline(bytes::Bytes),
+    Attachment {
+        content_hash: String,
+        size_bytes: u64,
+    },
+}
+
+impl DfsOwnerWriteContent {
+    pub(crate) fn identity(&self) -> (String, u64) {
+        match self {
+            Self::Inline(bytes) => (crate::content_hash(bytes), bytes.len() as u64),
+            Self::Attachment {
+                content_hash,
+                size_bytes,
+            } => (content_hash.clone(), *size_bytes),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
+    /// Whole-file write resolved against the stamped owner's current namespace.
+    WriteFile {
+        path: String,
+        bytes: DfsOwnerWriteContent,
+        #[serde(deserialize_with = "required_optional")]
+        expected: Option<DfsNamespaceObjectPrecondition>,
+    },
     BeginContentCopy {
         path: String,
         request: crate::DfsContentCopyRequest,
@@ -864,7 +895,7 @@ impl DfsNamespaceOperation {
         match self {
             Self::ParentCountParticipant { participant, .. } => Some(&participant.expected.path),
             Self::ReleaseDirectoryMoveDestination { reservation } => Some(&reservation.root_path),
-            Self::BeginContentCopy { path, .. } => Some(path),
+            Self::WriteFile { path, .. } | Self::BeginContentCopy { path, .. } => Some(path),
             Self::ContentReference { request } => Some(&request.path),
             Self::MetadataQuery { .. } => None,
             // A subtree root does not identify one feed authority: nested
@@ -928,7 +959,7 @@ impl DfsNamespaceOperation {
         match self {
             Self::ParentCountParticipant { participant, .. } => vec![&participant.expected.path],
             Self::ReleaseDirectoryMoveDestination { reservation } => vec![&reservation.root_path],
-            Self::BeginContentCopy { path, .. } => vec![path],
+            Self::WriteFile { path, .. } | Self::BeginContentCopy { path, .. } => vec![path],
             // The locator belongs to the immutable operation digest. It may
             // differ from the stable object's current authority after rename.
             // Unstamped callers therefore use the conservative global lane;
@@ -1117,6 +1148,10 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
+    FileWritten(crate::DaemonDfsBrowserWriteReceipt),
+    /// No effect has started. The caller must resolve a cross-authority path
+    /// or prepare a missing parent using the ordinary namespace protocol.
+    FileWriteNeedsPathResolution,
     /// The exact Main-produced durable aborted intent, not a success-derived claim.
     AbortedWriteIntent(Box<crate::DistributedWriteIntent>),
     MetadataQuery(DfsMetadataShardResponse),

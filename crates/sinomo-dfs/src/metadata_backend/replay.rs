@@ -416,16 +416,40 @@ impl LocalSobjMetadataBackend {
         let journal_started = Instant::now();
         let frame_pairs = batch.entries.iter().zip(frames).collect::<Vec<_>>();
         crate::metadata_journal::admission::mark_uncertain(&self.root)?;
-        let persisted = match persist_replayed_journal_frames(
-            &self.root,
-            &frame_pairs,
-            persisted_through_sequence,
-        ) {
-            Ok(persisted) => persisted,
-            Err(error) => {
-                return Err(self.recover_after_replayed_journal_persistence_error(error));
-            }
-        };
+        use crate::metadata_journal::ack::JournalAck;
+        let journal_ack = if expected_operation.is_some() && batch.entries.last().is_some_and(|entry|
+            matches!(&entry.mutation, DfsMetadataMutation::PrepareOperationV7 { record, .. } if
+                Some(&record.digest) == namespace_authority_proof.as_ref() && record.digest.prepare_sequence == target_sequence))
+        {
+            Some(JournalAck::Authority(crate::DfsMetadataAuthorityAckFloor {
+                shard_id: batch.shard_id.clone(), journal_sequence: target_sequence,
+                durable_prefix_proof: target_prefix.clone(), authority_epoch: permit.floor_authority_epoch(),
+            }))
+        } else if permit.acknowledge_replication {
+            Some(JournalAck::Prefix(crate::DfsMetadataPrefixAckFloor {
+                shard_id: batch.shard_id.clone(), journal_sequence: target_sequence, state_fingerprint: String::new(),
+                durable_prefix_proof: target_prefix.clone(), authority_epoch: permit.floor_authority_epoch(),
+            }))
+        } else { None };
+        let witness = journal_ack.map(|ack| crate::metadata_journal::ack::JournalWitness {
+            ack,
+            file_system_id: permit.file_system_id().clone(),
+            primary: permit.source_node_id().clone(),
+            epoch: permit.source_epoch(),
+            write_set_generation: permit.write_set_generation,
+        });
+        let (persisted, ack_certified) =
+            match crate::metadata_journal::persist_replayed_journal_frames_with_ack(
+                &self.root,
+                &frame_pairs,
+                persisted_through_sequence,
+                witness.as_ref(),
+            ) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    return Err(self.recover_after_replayed_journal_persistence_error(error));
+                }
+            };
         if let Some(max_sequence) = persisted
             && let Err(error) = self.advance_journal_head_after_replayed_entry(max_sequence)
         {
@@ -450,7 +474,7 @@ impl LocalSobjMetadataBackend {
         let materialization_ms = materialization_started.elapsed().as_millis();
         self.replica_progress.publish(permit, &target_prefix, false);
         let materialization_pending = target_sequence > self.materialized_through_sequence;
-        let report = DfsMetadataReplicaApplyReport::with_durable_ingest(
+        let mut report = DfsMetadataReplicaApplyReport::with_durable_ingest(
             newly_persisted,
             namespace_authority_proof,
             target_prefix,
@@ -464,6 +488,7 @@ impl LocalSobjMetadataBackend {
             newly_persisted,
             trace_started.elapsed().as_millis(),
         ));
+        report.journal_ack = witness.filter(|_| ack_certified).map(|w| w.ack);
         Ok(report)
     }
 

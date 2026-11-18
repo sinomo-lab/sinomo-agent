@@ -168,6 +168,7 @@ impl RetryFixture {
                     }
                     | DaemonDfsPreDispatchTestPoint::PublishGenerationWorkerStarted { .. }
                     | DaemonDfsPreDispatchTestPoint::AfterReport { .. }
+                    | DaemonDfsPreDispatchTestPoint::PlacementPermitQuorum { .. }
                     | DaemonDfsPreDispatchTestPoint::LocalPlacementAuthorityAcquired { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeLocalPlacementIntentPublication {
                         ..

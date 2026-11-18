@@ -1914,6 +1914,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         crate::write_precondition::bind_guard(condition, &mut expected_object_versions,
                             &mut expected_path_occupants).map_err(|message| DfsError::Metadata { message })?;
                     }
+                    let completion = crate::posix::owner_write::completion(
+                        self.namespace_execution.request(),
+                        &intent_record,
+                        &committed_object,
+                        &transaction,
+                    );
                     self.publish_prepared_operation_with_file_system(
                         DfsPreparedOperationPayload::for_namespace_transaction(
                             DfsPreparedOperationScope {
@@ -1930,7 +1936,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             Some(intent_record.clone()),
                             durable_nodes.iter().cloned().collect(),
                             None,
-                            None,
+                            completion,
                         )?,
                         configured_file_system.as_ref(),
                     )?

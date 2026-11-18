@@ -406,6 +406,8 @@ fn check_handoff_layout_path(layout: &DfsSelectedOriginalDataLayout, path: &std:
 /// that source-validation boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataReplicaIngestPermit {
+    pub(crate) acknowledge_replication: bool,
+    pub(crate) write_set_generation: Option<u64>,
     namespace_catalog: Option<crate::DfsMetadataNamespaceCatalog>,
     file_system_id: DfsFileSystemId,
     shard_id: DfsMetadataShardId,
@@ -452,6 +454,7 @@ pub struct DfsMetadataReplicaApplyReport {
     namespace_authority_proof: Option<DfsPreparedOperationDigest>,
     durable_prefix_proof: Option<DfsMetadataPrefixProof>,
     materialization_pending: bool,
+    pub(crate) journal_ack: Option<crate::metadata_journal::ack::JournalAck>,
 }
 
 impl DfsMetadataReplicaApplyReport {
@@ -463,10 +466,23 @@ impl DfsMetadataReplicaApplyReport {
     ) -> Self {
         Self {
             applied_entries,
+            journal_ack: None,
             namespace_authority_proof,
             durable_prefix_proof: Some(durable_prefix_proof),
             materialization_pending,
         }
+    }
+
+    pub(crate) fn persist_authority_ack(
+        &self,
+        backend: &mut dyn DfsMetadataBackend,
+        floor: &DfsMetadataAuthorityAckFloor,
+    ) -> Result<()> {
+        if matches!(&self.journal_ack, Some(crate::metadata_journal::ack::JournalAck::Authority(ack)) if ack == floor)
+        {
+            return Ok(());
+        }
+        backend.put_metadata_authority_ack_floor(floor)
     }
 
     pub(crate) fn applied_entries(&self) -> usize {
@@ -540,6 +556,8 @@ impl DfsMetadataReplicaIngestPermit {
             source_node_id,
             source_epoch,
             namespace_catalog: None,
+            acknowledge_replication: false,
+            write_set_generation: None,
             pending_primary_handoff_id: None,
             floor_epoch_scope: None,
             epoch_start: None,
@@ -563,6 +581,8 @@ impl DfsMetadataReplicaIngestPermit {
             source_node_id,
             source_epoch,
             namespace_catalog: None,
+            acknowledge_replication: false,
+            write_set_generation: None,
             pending_primary_handoff_id: Some(handoff_id),
             floor_epoch_scope: None,
             epoch_start: None,

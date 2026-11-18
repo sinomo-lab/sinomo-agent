@@ -50,12 +50,31 @@ impl DfsRoutedCall {
     }
 }
 
-/// Preserve the same normal message route while moving a native snapshot's
-/// captured file resource into its streaming body. Data heads never restore a
-/// body by guessing a path or deserializing a full-table image.
-pub(crate) fn native_snapshot_routed_call(
-    message: DfsRoutedMessage,
+/// Keep the semantic route and transfer bulk file content or a pinned native
+/// snapshot through the existing streaming attachment transport.
+pub(crate) fn routed_call_with_content(
+    mut message: DfsRoutedMessage,
 ) -> Result<DfsRoutedCall, crate::DfsError> {
+    if let crate::DfsNetworkMessage::NamespaceRequest(ns) = &mut message.message
+        && let crate::DfsNamespaceOperation::WriteFile { bytes, .. } = &mut ns.operation
+        && let crate::protocol::DfsOwnerWriteContent::Inline(payload) = bytes
+        && payload.len() > crate::protocol::DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES
+    {
+        let (content_hash, size_bytes) = (crate::content_hash(payload), payload.len() as u64);
+        let source = ObjectRpcBodySource::shared_bytes(std::mem::take(payload));
+        let descriptor = DfsRpcAttachmentDescriptor {
+            total_size_bytes: size_bytes,
+            content_hash: Some(content_hash.clone()),
+        };
+        *bytes = crate::protocol::DfsOwnerWriteContent::Attachment {
+            content_hash,
+            size_bytes,
+        };
+        return Ok(DfsRoutedCall::with_attachment(
+            message,
+            DfsOutboundAttachment { descriptor, source },
+        ));
+    }
     if let crate::DfsNetworkMessage::MetadataSnapshotInstall(command) = &message.message {
         let image = command.image()?;
         let attachment = DfsOutboundAttachment {

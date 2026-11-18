@@ -31,7 +31,8 @@ fn dfs_error(error: DfsPosixError) -> DfsError {
 fn reserved_mutation_paths(operation: &DfsNamespaceOperation) -> Vec<&str> {
     use DfsNamespaceOperation as Op;
     match operation {
-        Op::Mkdir { .. }
+        Op::WriteFile { .. }
+        | Op::Mkdir { .. }
         | Op::MkdirWithAttrs { .. }
         | Op::MkdirAtNoLinks { .. }
         | Op::MkdirAtNoLinksWithAttrs(_)
