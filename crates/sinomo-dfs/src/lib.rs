@@ -133,6 +133,8 @@ pub use metadata_candidate::{
 };
 #[cfg(feature = "storage-conversion")]
 pub use metadata_cursor::read_current_metadata_acknowledgement_floors;
+#[cfg(feature = "storage-conversion")]
+pub use metadata_journal::original_metadata_journal_document;
 #[cfg(any(test, feature = "storage-conversion"))]
 pub use metadata_records::DfsMetadataTableOp as DfsMetadataCandidateRow;
 mod metadata_summary;
@@ -810,16 +812,17 @@ pub use protocol::{
     DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,
     DfsCommitVersionResponse, DfsDirectReadRequest, DfsDistributedWriteCommand,
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
-    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof, DfsMessageCommand, DfsMessageResponse,
-    DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataDurableReplication,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsMetadataMemberAckView, DfsMetadataMemberRecordView,
-    DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMkdirAtNoLinksWithAttrs, DfsNamespaceChangePollRequest, DfsNamespaceChangePollResponse,
-    DfsNamespaceCommand, DfsNamespaceDestinationPrecondition, DfsNamespaceObjectPrecondition,
-    DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
-    DfsNamespaceShardCursor, DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
+    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof,
+    DfsMessageCommand, DfsMessageResponse, DfsOwnerWriteContent, DfsMetadataAuthorityOperation,
+    DfsMetadataAuthorityProbe, DfsMetadataDurableReplication, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataMemberAckView,
+    DfsMetadataMemberRecordView, DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsMkdirAtNoLinksWithAttrs, DfsNamespaceChangePollRequest,
+    DfsNamespaceChangePollResponse, DfsNamespaceCommand, DfsNamespaceDestinationPrecondition,
+    DfsNamespaceObjectPrecondition, DfsNamespaceOperation, DfsNamespacePosixError,
+    DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor, DfsNetworkMessage,
+    DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
     DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsRoutedMessage,
     DfsStableNamespaceOperationReceipt,
     DfsStableNamespaceOperationReconciliation, DfsStableNamespaceReconciliationRequest,

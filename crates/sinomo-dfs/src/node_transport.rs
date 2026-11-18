@@ -426,6 +426,16 @@ pub trait DfsPeerTransport: Send + Sync {
         None
     }
 
+    /// A colocated registered Main may execute its own authenticated path
+    /// write through its resident data-plane handler. Other clients use RPC.
+    fn call_local_owner_write(
+        &self,
+        _command: &DfsMessageCommand,
+        _options: DfsObjectRpcSendOptions,
+    ) -> Option<Result<DfsMessageResponse, DfsPeerTransportError>> {
+        None
+    }
+
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
@@ -839,6 +849,14 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
     Arc::new(move |target_node_id, command, options| {
+        if &command.routed_message.source_node_id == target_node_id
+            && &command.routed_message.target_node_id == target_node_id
+            && matches!(&command.routed_message.message, DfsNetworkMessage::NamespaceRequest(ns)
+                if &ns.requesting_node_id == target_node_id && matches!(ns.operation, crate::DfsNamespaceOperation::WriteFile {..}))
+            && let Some(result) = peer_transport.call_local_owner_write(command, options)
+        {
+            return result;
+        }
         let call = dfs_message_rpc_call(command)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         #[cfg(any(test, feature = "test-support"))]
@@ -9854,6 +9872,17 @@ impl NetworkedDfsService<DfsNodeTransport> {
                     )
                     .map(|event| vec![event])
                 }
+                DfsNetworkMessage::NamespaceRequest(ns)
+                    if matches!(ns.operation, crate::DfsNamespaceOperation::WriteFile { .. })
+                        && preingested_blob.is_none() =>
+                {
+                    self.resume_browser_write_command(
+                        command.routed_message.source_node_id,
+                        ns,
+                        prepared,
+                    )
+                    .map(|event| vec![event])
+                }
                 _ => Err(DfsError::Metadata {
                     message: "prepared write continuation used for another message".into(),
                 }),
@@ -9869,6 +9898,15 @@ impl NetworkedDfsService<DfsNodeTransport> {
                 })
             } else {
                 match routed.message {
+                    DfsNetworkMessage::NamespaceRequest(ns)
+                        if matches!(
+                            ns.operation,
+                            crate::DfsNamespaceOperation::WriteFile { .. }
+                        ) =>
+                    {
+                        self.handle_staged_browser_write(routed.source_node_id, ns, blob)
+                            .map(|event| vec![event])
+                    }
                     DfsNetworkMessage::StageBlob(command) => self
                         .handle_preingested_stage_blob(routed.source_node_id, command, blob)
                         .map(|event| vec![event]),

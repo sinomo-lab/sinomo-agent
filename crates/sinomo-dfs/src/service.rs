@@ -1467,7 +1467,12 @@ impl Service for DfsDataPlaneService {
                         )?;
                         if matches!(
                             &head.command.routed_message.message,
-                            crate::DfsNetworkMessage::StageBlob(_)
+                            crate::DfsNetworkMessage::NamespaceRequest(
+                                crate::DfsNamespaceCommand {
+                                    operation: crate::DfsNamespaceOperation::WriteFile { .. },
+                                    ..
+                                }
+                            ) | crate::DfsNetworkMessage::StageBlob(_)
                                 | crate::DfsNetworkMessage::MetadataSnapshotInstall(_)
                                 | crate::DfsNetworkMessage::StageRetainedBlob(_)
                                 | crate::DfsNetworkMessage::RepairRetainedBlob(_)

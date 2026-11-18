@@ -2373,6 +2373,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_node_ids: &[NodeId],
     ) -> Result<(), DfsError> {
         let file_system_id = crate::sifs_file_system_id();
+        self.with_authoritative_placement_reconciliation(
+            &file_system_id,
+            job_id,
+            Some(path),
+            1,
+            |service, job, config| {
+                service.apply_admitted_placement(
+                    job,
+                    config,
+                    path,
+                    object_id,
+                    expected_version,
+                    object_policy,
+                    replication_policy,
+                    desired_replica_node_ids,
+                )
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_admitted_placement(
+        &mut self,
+        job: &DfsPlacementReconciliationJob,
+        accepted_config: &DfsFileSystemConfig,
+        path: &str,
+        object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        object_policy: DfsObjectPolicy,
+        replication_policy: DfsReplicationPolicy,
+        desired_replica_node_ids: &[NodeId],
+    ) -> Result<(), DfsError> {
+        let file_system_id = crate::sifs_file_system_id();
         // Only this semantic local ReconcilePlacement entry borrows its
         // receiver-validated namespace planning cut. General authority reads
         // and repair-replacement callbacks do not inherit that operation.
@@ -2392,37 +2425,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
             })
             .transpose()?;
-        self.with_authoritative_placement_reconciliation(
-            &file_system_id,
-            job_id,
-            Some(path),
-            1,
-            |service, job, accepted_config| {
-                #[cfg(test)]
-                service.local_placement_planning_test_point(
-                    crate::runtime_host::DaemonDfsPreDispatchTestPoint::LocalPlacementAuthorityAcquired {
-                        job_id: &job.job_id,
-                        path,
-                        namespace_shards: service.namespace_execution.context()
-                            .filter(|context| context.file_system_id == file_system_id)
-                            .map(|context| context.shards.as_slice()),
-                    },
-                )?;
-                service.reconcile_object_placement_under_authority(
-                    job,
-                    accepted_config,
-                    path,
-                    object_id,
-                    expected_version,
-                    object_policy,
-                    replication_policy,
-                    desired_replica_node_ids,
-                    None,
-                    planning_shard.as_ref(),
-                )
+        #[cfg(test)]
+        self.local_placement_planning_test_point(
+            crate::runtime_host::DaemonDfsPreDispatchTestPoint::LocalPlacementAuthorityAcquired {
+                job_id: &job.job_id,
+                path,
+                namespace_shards: self
+                    .namespace_execution
+                    .context()
+                    .filter(|context| context.file_system_id == file_system_id)
+                    .map(|context| context.shards.as_slice()),
             },
         )?;
-        Ok(())
+        self.reconcile_object_placement_under_authority(
+            job,
+            accepted_config,
+            path,
+            object_id,
+            expected_version,
+            object_policy,
+            replication_policy,
+            desired_replica_node_ids,
+            None,
+            planning_shard.as_ref(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3949,68 +3975,154 @@ pub(crate) fn current_placement_repair_owner_matches_identity(
         })
 }
 
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    fn authoritative_placement_reconciliation_for_path(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        job_id: &str,
-        path: Option<&str>,
-    ) -> Result<
-        Option<(
-            DfsPlacementReconciliationJob,
-            DfsFileSystemConfig,
-            DfsFileSystemConfig,
-        )>,
-        DfsError,
-    > {
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            // Managed placement jobs are cluster-owned. Fail closed if their
-            // authority cannot be checked; ordinary writes never enter here.
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "cannot verify placement reconciliation job {job_id}: control plane unavailable"
-                ),
-            });
-        };
-        let store = DfsControlPlaneStore::new(control_plane.as_mut());
-        let Some(job) = store.placement_reconciliation(file_system_id, job_id)? else {
-            return Err(DfsError::Distributed {
-                message: format!("cannot verify missing placement reconciliation job {job_id}"),
-            });
-        };
-        if !job.supports_snapshot_reconciliation() {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "cannot verify placement reconciliation job {job_id}: unsupported or incomplete durable schema"
-                ),
-            });
-        }
-        if job.file_system_id != *file_system_id
-            || job.state == DfsPlacementReconciliationState::Failed
-            || path.is_some_and(|path| !placement_job_matches(&job, path))
-        {
-            return Ok(None);
-        }
-        let accepted_config = job.accepted_config.clone();
-        if job.candidate_snapshot.is_empty() {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "cannot verify placement reconciliation job {job_id} without its accepted candidate snapshot"
-                ),
-            });
-        }
-        let current_config = store
-            .get_file_system_config(file_system_id)?
-            .ok_or_else(|| DfsError::UnknownFileSystem {
-                file_system_id: file_system_id.clone(),
-            })?;
-        if !placement_config_remains_authoritative_for_job(&accepted_config, &current_config, &job)
-        {
-            return Ok(None);
-        }
-        Ok(Some((job, accepted_config, current_config)))
-    }
+/// Local execution evidence for this exact authenticated reconciliation request.
+#[derive(Debug)]
+pub(crate) struct AdmittedPlacement {
+    pub(crate) command: crate::DfsNamespaceCommand,
+    pub(crate) job: Result<Option<(DfsPlacementReconciliationJob, DfsFileSystemConfig)>, DfsError>,
+}
 
+fn missing_placement_control() -> DfsError {
+    DfsError::Distributed {
+        message: "placement reconciliation control plane unavailable".into(),
+    }
+}
+
+fn authoritative_placement_reconciliation_for_path(
+    control: &mut dyn DfsControlPlaneKvClient,
+    file_system_id: &DfsFileSystemId,
+    job_id: &str,
+    path: Option<&str>,
+) -> Result<
+    Option<(
+        DfsPlacementReconciliationJob,
+        DfsFileSystemConfig,
+        DfsFileSystemConfig,
+    )>,
+    DfsError,
+> {
+    let store = DfsControlPlaneStore::new(control);
+    let Some(job) = store.placement_reconciliation(file_system_id, job_id)? else {
+        return Err(DfsError::Distributed {
+            message: format!("cannot verify missing placement reconciliation job {job_id}"),
+        });
+    };
+    if !job.supports_snapshot_reconciliation() {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "cannot verify placement reconciliation job {job_id}: unsupported or incomplete durable schema"
+            ),
+        });
+    }
+    if job.file_system_id != *file_system_id
+        || job.state == DfsPlacementReconciliationState::Failed
+        || path.is_some_and(|path| !placement_job_matches(&job, path))
+    {
+        return Ok(None);
+    }
+    let accepted_config = job.accepted_config.clone();
+    if job.candidate_snapshot.is_empty() {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "cannot verify placement reconciliation job {job_id} without its accepted candidate snapshot"
+            ),
+        });
+    }
+    let current_config = store
+        .get_file_system_config(file_system_id)?
+        .ok_or_else(|| DfsError::UnknownFileSystem {
+            file_system_id: file_system_id.clone(),
+        })?;
+    if !placement_config_remains_authoritative_for_job(&accepted_config, &current_config, &job) {
+        return Ok(None);
+    }
+    Ok(Some((job, accepted_config, current_config)))
+}
+
+/// sinomo:kv-consistency: Order repair against Apply using the existing process-owned permit.
+pub(crate) fn acquire_placement_permit(
+    control: &mut dyn DfsControlPlaneKvClient,
+    local: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    job_id: &str,
+    path: Option<&str>,
+    #[cfg(test)] mut observation: Option<crate::test_runtime::PlacementAuthorityCallObservation>,
+) -> Result<
+    Option<(
+        DfsPlacementReconciliationJob,
+        DfsFileSystemConfig,
+        DfsPlacementAuthorityPermit,
+    )>,
+    DfsError,
+> {
+    for attempt in 0..PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
+        let Some((job, accepted_config, current_config)) =
+            authoritative_placement_reconciliation_for_path(control, file_system_id, job_id, path)?
+        else {
+            return Ok(None);
+        };
+        let holder_process = control
+            .placement_authority_process_identity()
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!(
+                    "cannot acquire placement reconciliation job {job_id}: missing process session"
+                ),
+            })?;
+        let permit = {
+            DfsControlPlaneStore::new(control).try_acquire_placement_authority_permit(
+                &job,
+                &current_config,
+                local,
+                &holder_process,
+            )?
+        };
+        if let Some(permit) = permit {
+            #[cfg(test)]
+            let permit = permit.with_native_observation(observation.take(), job.state.clone());
+            return Ok(Some((job, accepted_config, permit)));
+        }
+        if attempt + 1 < PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
+            control.refresh_latest()?;
+        }
+    }
+    Err(DfsError::Distributed {
+        message: format!(
+            "placement reconciliation job {job_id} is busy behind an active metadata mutation permit; automatic expiry is unsafe without metadata fencing; restart the owning daemon for guarded recovery, while a permanently removed node requires operator intervention after member revocation"
+        ),
+    })
+}
+
+/// sinomo:kv-consistency: Release the exact held placement permit after the shard mutation has finished.
+pub(crate) fn release_placement_permit(
+    control: &mut dyn DfsControlPlaneKvClient,
+    permit: &mut DfsPlacementAuthorityPermit,
+) -> Result<(), DfsError> {
+    let mut last_error = None;
+    for attempt in 0..PLACEMENT_AUTHORITY_RELEASE_RETRIES {
+        let result = DfsControlPlaneStore::new(control)
+            .release_placement_authority_permit(permit)
+            .map_err(DfsError::from);
+        #[cfg(test)]
+        permit.observe_native_release(result.is_ok());
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < PLACEMENT_AUTHORITY_RELEASE_RETRIES {
+                    let _ = control.refresh_latest();
+                }
+            }
+        }
+    }
+    Err(DfsError::Distributed {
+        message: format!(
+            "placement authority permit release failed after {PLACEMENT_AUTHORITY_RELEASE_RETRIES} attempts; the exact permit is retained by the daemon process for safe retry from a fresh service instance: {}",
+            last_error.expect("release loop records an error")
+        ),
+    })
+}
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn acquire_authoritative_placement_reconciliation_for_path(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -4025,21 +4137,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         DfsError,
     > {
         self.acquire_authoritative_placement_reconciliation(file_system_id, job_id, Some(path))
-    }
-
-    /// sinomo:kv-configuration: Read the existing native host/process identity; this performs no KV request and grants no placement permit.
-    fn current_placement_process_identity(
-        &self,
-        job_id: &str,
-    ) -> Result<crate::DfsPlacementAuthorityProcessIdentity, DfsError> {
-        self.control_plane
-            .as_ref()
-            .and_then(|control| control.placement_authority_process_identity())
-            .ok_or_else(|| DfsError::Distributed {
-                message: format!(
-                    "cannot acquire placement reconciliation job {job_id}: this control-plane host has no daemon placement-authority session"
-                ),
-            })
     }
 
     /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
@@ -4057,91 +4154,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         DfsError,
     > {
         #[cfg(test)]
-        let mut observation =
+        let observation =
             self.native_publication_owner_for_observation()
                 .and_then(|(root, owner)| {
                     crate::test_runtime::observe_placement_authority_call(
                         &root, &owner, job_id, path,
                     )
                 });
-        for attempt in 0..PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
-            let Some((job, accepted_config, current_config)) =
-                self.authoritative_placement_reconciliation_for_path(file_system_id, job_id, path)?
-            else {
-                return Ok(None);
-            };
-            let holder_process = self.current_placement_process_identity(job_id)?;
-            let permit = {
-                let Some(control_plane) = self.control_plane.as_mut() else {
-                    return Err(DfsError::Distributed {
-                        message: format!(
-                            "cannot acquire placement reconciliation job {job_id}: control plane unavailable"
-                        ),
-                    });
-                };
-                DfsControlPlaneStore::new(control_plane.as_mut())
-                    .try_acquire_placement_authority_permit(
-                        &job,
-                        &current_config,
-                        &self.node_id,
-                        &holder_process,
-                    )?
-            };
-            if let Some(permit) = permit {
-                #[cfg(test)]
-                let permit = permit.with_native_observation(observation.take(), job.state.clone());
-                return Ok(Some((job, accepted_config, permit)));
-            }
-            if attempt + 1 < PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
-                let Some(control_plane) = self.control_plane.as_mut() else {
-                    return Err(DfsError::Distributed {
-                        message: format!(
-                            "cannot refresh placement reconciliation job {job_id}: control plane unavailable"
-                        ),
-                    });
-                };
-                control_plane.refresh_latest()?;
-            }
-        }
-        Err(DfsError::Distributed {
-            message: format!(
-                "placement reconciliation job {job_id} is busy behind an active metadata mutation permit; automatic expiry is unsafe without metadata fencing; restart the owning daemon for guarded recovery, while a permanently removed node requires operator intervention after member revocation"
-            ),
-        })
+        acquire_placement_permit(
+            self.control_plane
+                .as_deref_mut()
+                .ok_or_else(missing_placement_control)?,
+            &self.node_id,
+            file_system_id,
+            job_id,
+            path,
+            #[cfg(test)]
+            observation,
+        )
     }
 
     fn release_placement_authority_permit(
         &mut self,
         permit: &mut DfsPlacementAuthorityPermit,
     ) -> Result<(), DfsError> {
-        let mut last_error = None;
-        for attempt in 0..PLACEMENT_AUTHORITY_RELEASE_RETRIES {
-            let result = match self.control_plane.as_mut() {
-                Some(control_plane) => DfsControlPlaneStore::new(control_plane.as_mut())
-                    .release_placement_authority_permit(permit)
-                    .map_err(DfsError::from),
-                None => Err(DfsError::Distributed {
-                    message: "control plane unavailable".to_string(),
-                }),
-            };
-            #[cfg(test)]
-            permit.observe_native_release(result.is_ok());
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error);
-                    if attempt + 1 < PLACEMENT_AUTHORITY_RELEASE_RETRIES {
-                        let _ = self.refresh_control_plane_latest();
-                    }
-                }
-            }
-        }
-        Err(DfsError::Distributed {
-            message: format!(
-                "placement authority permit release failed after {PLACEMENT_AUTHORITY_RELEASE_RETRIES} attempts; the exact permit is retained by the daemon process for safe retry from a fresh service instance: {}",
-                last_error.expect("release loop records an error")
-            ),
-        })
+        release_placement_permit(
+            self.control_plane
+                .as_deref_mut()
+                .ok_or_else(missing_placement_control)?,
+            permit,
+        )
     }
 
     pub(crate) fn with_authoritative_placement_reconciliation<R>(

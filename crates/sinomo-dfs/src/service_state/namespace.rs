@@ -122,6 +122,7 @@ pub(crate) struct NamespaceDurability {
 
 #[derive(Debug, Default)]
 pub(crate) struct DfsNamespaceExecution {
+    pub(crate) placement: Option<crate::placement::AdmittedPlacement>,
     context: Option<DfsNamespaceOperationContext>,
     request: Option<DfsNamespaceRequestRecord>,
     durability: NamespaceDurability,

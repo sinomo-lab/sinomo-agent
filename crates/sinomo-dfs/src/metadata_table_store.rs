@@ -1362,6 +1362,7 @@ pub(crate) fn metadata_tables_from_snapshot(
 }
 
 pub(crate) fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
+    crate::metadata_journal::ack::checkpoint(root)?;
     let mut archived = false;
     let archive_root = root.join("replica-repair-archives").join(format!(
         "{}",

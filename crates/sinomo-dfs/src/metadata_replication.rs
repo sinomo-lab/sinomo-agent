@@ -7247,20 +7247,25 @@ pub(crate) fn persist_durable_metadata_replication_ack(
                 command.batch.shard_id.0, command.batch.next_after_sequence
             )
         })?;
-    backend
-        .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
-            shard_id: command.batch.shard_id.clone(),
-            journal_sequence: command.batch.next_after_sequence,
-            state_fingerprint: String::new(),
-            durable_prefix_proof: durable_prefix,
-            authority_epoch,
-        })
-        .map_err(|error| {
+    let floor = crate::DfsMetadataPrefixAckFloor {
+        shard_id: command.batch.shard_id.clone(),
+        journal_sequence: command.batch.next_after_sequence,
+        state_fingerprint: String::new(),
+        durable_prefix_proof: durable_prefix,
+        authority_epoch,
+    };
+    if apply_report.journal_ack.as_ref()
+        != Some(&crate::metadata_journal::ack::JournalAck::Prefix(
+            floor.clone(),
+        ))
+    {
+        backend.put_metadata_prefix_ack_floor(&floor).map_err(|error| {
             format!(
                 "persist ordinary metadata replication prefix floor for shard {} sequence {}: {error}",
                 command.batch.shard_id.0, command.batch.next_after_sequence
             )
         })?;
+    }
     Ok(Some(replication.confirmation_id.clone()))
 }
 
@@ -7472,7 +7477,7 @@ fn process_dfs_metadata_journal_batch_inner(
         };
     }
     let context = context.expect("validated metadata replica ingest has a shard context");
-    let permit = DfsMetadataReplicaIngestPermit::new_validated(
+    let mut permit = DfsMetadataReplicaIngestPermit::new_validated(
         context.shard.file_system_id.clone(),
         shard_id.clone(),
         context.shard.primary_node_id.clone(),
@@ -7480,6 +7485,8 @@ fn process_dfs_metadata_journal_batch_inner(
     )
     .with_floor_epoch_scope(context.floor_epoch_scope())
     .with_epoch_start(context.epoch_start().cloned());
+    permit.acknowledge_replication = command.durable_replication.is_some();
+    permit.write_set_generation = context.write_set.as_ref().map(|w| w.generation);
     #[cfg(any(test, feature = "test-support"))]
     let mut native_trace = crate::native_shard_trace::current_boundary_interest();
     #[cfg(any(test, feature = "test-support"))]
@@ -7563,8 +7570,9 @@ fn process_dfs_metadata_journal_batch_inner(
                         "authority acknowledgement has no exact durable prefix",
                     );
                 };
-                if let Err(error) =
-                    backend.put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
+                if let Err(error) = apply_report.persist_authority_ack(
+                    backend,
+                    &crate::DfsMetadataAuthorityAckFloor {
                         shard_id: command.batch.shard_id.clone(),
                         journal_sequence: command.batch.next_after_sequence,
                         durable_prefix_proof,

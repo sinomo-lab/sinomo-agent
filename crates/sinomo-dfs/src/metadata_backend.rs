@@ -30,9 +30,8 @@ use crate::metadata_io::create_dir_all;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch,
     journal_entries_since_limited_with_next_sequence, metadata_prefix_proof_after_exact_frame,
-    persist_replayed_journal_frames, read_next_journal_sequence_lenient,
-    read_segmented_journal_frame_at_sequence, read_segmented_journal_frames_at_sequences,
-    write_local_journal_frame_with_bytes,
+    read_next_journal_sequence_lenient, read_segmented_journal_frame_at_sequence,
+    read_segmented_journal_frames_at_sequences, write_local_journal_frame_with_bytes,
 };
 use crate::metadata_keys::{
     directory_page_cursor_with_dentry, normalize_path, path_record_for_object,

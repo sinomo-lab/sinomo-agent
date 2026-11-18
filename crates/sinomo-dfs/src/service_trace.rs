@@ -119,6 +119,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
     operation: &DfsNamespaceOperation,
 ) -> &'static str {
     match operation {
+        DfsNamespaceOperation::WriteFile { .. } => "write-file",
         DfsNamespaceOperation::BeginContentCopy { .. } => "file-history-restore-begin",
         DfsNamespaceOperation::ContentReference { .. } => "file-history-pin",
         DfsNamespaceOperation::MetadataQuery { .. } => "file-history-query",

@@ -79,6 +79,30 @@ pub(crate) fn attach_dfs_message_request_attachment(
                 "native snapshot images require the owned streamed attachment path",
             ));
         }
+        DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(&command.operation, DfsNamespaceOperation::WriteFile { .. }) =>
+        {
+            let DfsNamespaceOperation::WriteFile { bytes: content, .. } = &mut command.operation
+            else {
+                unreachable!()
+            };
+            let crate::protocol::DfsOwnerWriteContent::Attachment {
+                content_hash,
+                size_bytes,
+            } = content
+            else {
+                return Err(serialization_error("path write has two byte carriers"));
+            };
+            if head.attachment.content_hash.as_ref() != Some(content_hash)
+                || *size_bytes != bytes.len() as u64
+                || crate::content_hash(&bytes) != *content_hash
+            {
+                return Err(serialization_error(
+                    "path write attachment mismatches its command",
+                ));
+            }
+            *content = crate::protocol::DfsOwnerWriteContent::Inline(bytes.into());
+        }
         DfsNetworkMessage::NamespaceRequest(command) => {
             let DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } =
                 &mut command.operation

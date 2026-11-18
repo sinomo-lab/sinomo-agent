@@ -333,7 +333,8 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
-                DfsNamespaceOperation::Unlink { .. }
+                DfsNamespaceOperation::WriteFile { .. }
+                    | DfsNamespaceOperation::Unlink { .. }
                     | DfsNamespaceOperation::ConditionalUnlink { .. }
                     | DfsNamespaceOperation::Rename { .. }
                     | DfsNamespaceOperation::ConditionalRename { .. }

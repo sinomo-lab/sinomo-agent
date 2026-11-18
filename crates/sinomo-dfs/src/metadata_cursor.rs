@@ -270,7 +270,17 @@ pub(crate) fn metadata_prefix_ack_floor(
     root: &Path,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataPrefixAckFloor>> {
-    crate::metadata_ack_floor_log::read(&metadata_prefix_ack_floor_path(root, shard_id), shard_id)
+    let journal =
+        crate::metadata_journal::ack::floor(root, false)?;
+    let compact = crate::metadata_ack_floor_log::read(
+        &metadata_prefix_ack_floor_path(root, shard_id),
+        shard_id,
+    )?;
+    let Some(crate::metadata_journal::ack::JournalAck::Prefix(floor)) = journal
+    else {
+        return Ok(compact);
+    };
+    combine_floor(shard_id, compact, floor)
 }
 
 /// Read only the current typed ledger through the ordinary floor reader.
@@ -336,6 +346,20 @@ pub(crate) fn put_metadata_prefix_ack_floor(
     root: &Path,
     floor: &DfsMetadataPrefixAckFloor,
 ) -> Result<()> {
+    use crate::metadata_ack_floor_log::AckFloor;
+    let journal = crate::metadata_journal::ack::floor(root, false)?;
+    let merged;
+    let floor = if let Some(crate::metadata_journal::ack::JournalAck::Prefix(stored)) = journal {
+        if stored.shard_id != floor.shard_id {
+            return Err(MetadataBackendError::replica_diverged(
+                "journal ACK belongs to another shard".into(),
+            ));
+        }
+        merged = DfsMetadataPrefixAckFloor::merge(&stored, floor)?;
+        &merged
+    } else {
+        floor
+    };
     crate::metadata_ack_floor_log::put(
         &metadata_prefix_ack_floor_path(root, &floor.shard_id),
         floor,
@@ -420,16 +444,53 @@ pub(crate) fn metadata_authority_ack_floor(
     root: &Path,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataAuthorityAckFloor>> {
-    crate::metadata_ack_floor_log::read(
+    let journal =
+        crate::metadata_journal::ack::floor(root, true)?;
+    let compact = crate::metadata_ack_floor_log::read(
         &metadata_authority_ack_floor_path(root, shard_id),
         shard_id,
-    )
+    )?;
+    let Some(crate::metadata_journal::ack::JournalAck::Authority(floor)) = journal
+    else {
+        return Ok(compact);
+    };
+    combine_floor(shard_id, compact, floor)
+}
+
+fn combine_floor<T: crate::metadata_ack_floor_log::AckFloor>(
+    shard: &DfsMetadataShardId,
+    compact: Option<T>,
+    floor: T,
+) -> Result<Option<T>> {
+    if floor.shard() != shard {
+        return Err(MetadataBackendError::replica_diverged(
+            "journal ACK belongs to another shard".into(),
+        ));
+    }
+    Ok(Some(match compact {
+        Some(old) => T::merge(&old, &floor)?,
+        None => floor,
+    }))
 }
 
 pub(crate) fn put_metadata_authority_ack_floor(
     root: &Path,
     floor: &DfsMetadataAuthorityAckFloor,
 ) -> Result<()> {
+    use crate::metadata_ack_floor_log::AckFloor;
+    let journal = crate::metadata_journal::ack::floor(root, true)?;
+    let merged;
+    let floor = if let Some(crate::metadata_journal::ack::JournalAck::Authority(stored)) = journal {
+        if stored.shard_id != floor.shard_id {
+            return Err(MetadataBackendError::replica_diverged(
+                "journal ACK belongs to another shard".into(),
+            ));
+        }
+        merged = DfsMetadataAuthorityAckFloor::merge(&stored, floor)?;
+        &merged
+    } else {
+        floor
+    };
     crate::metadata_ack_floor_log::put(
         &metadata_authority_ack_floor_path(root, &floor.shard_id),
         floor,

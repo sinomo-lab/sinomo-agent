@@ -145,7 +145,7 @@ pub(crate) struct CanonicalCurrentWriteCompletion {
 }
 
 impl CanonicalCurrentWriteCompletion {
-    fn from_current_publication(
+    pub(crate) fn from_current_publication(
         publication: Option<&DfsWritePublication>,
         object: &DfsObjectMetadata,
         version: &DfsVersion,
@@ -169,6 +169,13 @@ impl CanonicalCurrentWriteCompletion {
                 extents: Vec::new(),
             },
         })
+    }
+
+    pub(crate) fn publish(&self, content: &crate::LocalContentStore) -> Result<ContentManifest, crate::ContentStoreError> {
+        if let Some(live) = content.try_complete_canonical_current_inline_manifest(self)? {
+            return Ok(live);
+        }
+        content.put_blob_only_manifest(&self.manifest.object_id,&self.manifest.version,&self.manifest.content_hash,self.manifest.size_bytes)
     }
 
     pub(crate) fn manifest(&self) -> &ContentManifest {
@@ -1222,7 +1229,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }))
     }
 
-    fn replayed_routed_write_outcome_for_intent(
+    pub(crate) fn replayed_routed_write_outcome_for_intent(
         &mut self,
         intent: &DistributedWriteIntent,
         content_hash: &str,
@@ -3236,12 +3243,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object.object_id)
             .unwrap_or_else(|| publication_object_id.clone());
         let published = (|| {
-            if let Some(completion) = completion.as_ref()
-                && let Some(manifest) = self
-                    .content
-                    .try_complete_canonical_current_inline_manifest(completion)?
-            {
-                return Ok(manifest);
+            if let Some(completion) = completion.as_ref() {
+                return completion.publish(&self.content);
             }
             self.content.put_blob_only_manifest(
                 object_id.as_str(),

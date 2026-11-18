@@ -36,6 +36,10 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     #[cfg(test)]
     PlacementRecoveryOwnerAcquired,
     #[cfg(test)]
+    PlacementPermitQuorum {
+        releasing: bool,
+    },
+    #[cfg(test)]
     LocalPlacementAuthorityAcquired {
         job_id: &'a str,
         path: &'a str,
@@ -3434,6 +3438,7 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         None,
         None,
         None,
+        None,
         false,
     )
 }
@@ -3456,6 +3461,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
     stage_shard: Option<ResidentLocalMetadataShardHandle>,
     prepared_write: Option<crate::DfsPreparedOperationDigest>,
+    placement: Option<crate::placement::AdmittedPlacement>,
     retain_write: bool,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
@@ -3654,6 +3660,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
         publication_provider,
         completed_phase,
+        placement,
         stage_shard,
         prepared_write,
         write_attempt.as_ref().map(|(command, _)| command),
@@ -4716,6 +4723,16 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 ),
             );
         }
+        let mut placement = placement_admission::acquire(
+            &data_dir,
+            &cluster_paths,
+            &peer_snapshot,
+            &command,
+            metadata_authority_preflight.as_ref(),
+            &data_owner_lock,
+            runtime,
+        )
+        .await?;
         let process_data_dir = data_dir.clone();
         let process_cluster_paths = cluster_paths.clone();
         let process_peer_snapshot = peer_snapshot.clone();
@@ -4965,6 +4982,9 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     process_completed_phase.map(|completed| *completed),
                     process_stage_shard,
                     process_prepared_write,
+                    placement
+                        .as_mut()
+                        .and_then(placement_admission::PlacementDispatch::take_cut),
                     true,
                 )
             });
@@ -4992,6 +5012,10 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 }
             }
             drop(mutation_admission);
+            let release = placement
+                .map(placement_admission::PlacementDispatch::release)
+                .transpose();
+            let result = result.and_then(|outcome| release.map(|_| outcome));
             (result, blocking_queue, blocking_started.elapsed())
         })
         .await
@@ -5365,6 +5389,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         None,
         None,
         None,
+        None,
         false,
     )? {
         DaemonDfsMessageDispatchAttempt::Complete(result) => result,
@@ -5393,3 +5418,5 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
 
 #[cfg(test)]
 mod genesis_cache_lookup_tests;
+
+mod placement_admission;
