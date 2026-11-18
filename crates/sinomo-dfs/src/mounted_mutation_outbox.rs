@@ -91,7 +91,7 @@ pub struct MountedSifsMutationOrigin {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(from = "MountedSifsMutationCapturedWorkWire")]
+#[serde(deny_unknown_fields)]
 pub struct MountedSifsMutationCapturedWork {
     pub committed_work: DfsCommittedWork,
 }
@@ -99,23 +99,6 @@ pub struct MountedSifsMutationCapturedWork {
 impl MountedSifsMutationCapturedWork {
     pub fn new(committed_work: DfsCommittedWork) -> Self {
         Self { committed_work }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MountedSifsMutationCapturedWorkWire {
-    committed_work: DfsCommittedWork,
-    /// Rows of the removed node-local repair queue in captures written
-    /// before its removal: accepted and dropped. The shard tables' repair
-    /// index carries that work.
-    #[serde(default, rename = "committed_repair_records")]
-    _removed_repair_records: Option<serde::de::IgnoredAny>,
-}
-
-impl From<MountedSifsMutationCapturedWorkWire> for MountedSifsMutationCapturedWork {
-    fn from(wire: MountedSifsMutationCapturedWorkWire) -> Self {
-        Self::new(wire.committed_work)
     }
 }
 

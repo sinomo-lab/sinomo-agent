@@ -1218,6 +1218,7 @@ pub fn inspect_dfs_status_from_resident_snapshot(
             .map(|state| state.local_node_id.clone());
     let mut status = project_dfs_status_from_resident_snapshot(local_node_id.as_ref(), snapshot);
     attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
+    attach_metadata_shard_storage_migrations(&mut status, data_dir, cluster_paths);
     Ok(status)
 }
 
@@ -1337,6 +1338,7 @@ fn finalize_dfs_status_projection(
 ) -> Result<(), DfsError> {
     attach_primary_owned_operational_status(status, primary_summary);
     attach_cluster_aware_dfs_maintenance_observations(status, data_dir)?;
+    attach_metadata_shard_storage_migrations(status, data_dir, cluster_paths);
     if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) {
         for shard in &mut status.metadata_shards {
             if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
@@ -1376,6 +1378,150 @@ fn attach_cluster_aware_dfs_maintenance_observations(
         DFS_OPERATOR_STATUS_REPAIR_ATTEMPT_SAMPLE,
     );
     Ok(())
+}
+
+/// The storage conversion state of every metadata shard in this node's
+/// observed catalog, from the shards' storage records. A closed shard whose
+/// copy this node holds also reports a stop: the storage preparation owner of
+/// that copy refuses it with the stop's reason, as it refuses an open.
+fn attach_metadata_shard_storage_migrations(
+    status: &mut DfsOperatorStatus,
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) {
+    let projection = match DfsClusterTopologyProjection::observed_local_topology(
+        cluster_paths,
+        |key| {
+            dfs_metadata_shard_config_key_is_exact(key)
+                || dfs_metadata_shard_storage_key_is_exact(key)
+        },
+    ) {
+        Ok(projection) => projection,
+        Err(error) => {
+            status.incomplete_reasons.push(format!(
+                "metadata shard storage observation unavailable: {error}"
+            ));
+            return;
+        }
+    };
+    let local_node_id = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .ok()
+        .map(|state| state.local_node_id);
+    let shards = match projection.all_metadata_shards() {
+        Ok(shards) => shards,
+        Err(error) => {
+            status.incomplete_reasons.push(format!(
+                "metadata shard storage observation unavailable: {error}"
+            ));
+            return;
+        }
+    };
+    let mut migrations = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let key = crate::metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id);
+        let record = match projection
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.decode::<crate::DfsMetadataShardStorage>())
+            .transpose()
+        {
+            Ok(record) => record,
+            Err(error) => {
+                status.incomplete_reasons.push(format!(
+                    "metadata shard {} storage record is unreadable: {error}",
+                    shard.shard_id
+                ));
+                continue;
+            }
+        };
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let holds_copy = local_node_id.as_ref().is_some_and(|local| {
+            shard.primary_node_id == *local || shard.replica_node_ids.contains(local)
+        });
+        let stop = (holds_copy && !record.as_ref().is_some_and(|record| record.is_active()))
+            .then(|| metadata_shard_conversion_stop(data_dir, &shard_id))
+            .flatten();
+        let attempt = record.as_ref().and_then(|record| match &record.state {
+            crate::DfsMetadataShardStorageState::Converting { attempt } => Some(attempt),
+            crate::DfsMetadataShardStorageState::Active {
+                activation: crate::DfsMetadataShardActivation::Converted { attempt, .. },
+            } => Some(attempt),
+            crate::DfsMetadataShardStorageState::Active {
+                activation: crate::DfsMetadataShardActivation::NativeGenesis,
+            } => None,
+        });
+        let attempt_id = attempt.map(|attempt| attempt.attempt_id.clone());
+        let takeover_round = attempt.and_then(|attempt| attempt.takeover.as_ref().map(|takeover| takeover.round));
+        let state = match (stop, record.as_ref()) {
+            (Some(reason), _) => crate::DfsMetadataShardStorageMigrationState::Stopped {
+                attempt_id,
+                takeover_round,
+                reason,
+            },
+            (None, None) => crate::DfsMetadataShardStorageMigrationState::Old,
+            (None, Some(record)) if record.is_active() => {
+                crate::DfsMetadataShardStorageMigrationState::Active { attempt_id, takeover_round }
+            }
+            (None, Some(_)) => crate::DfsMetadataShardStorageMigrationState::Converting {
+                attempt_id: attempt_id.unwrap_or_default(),
+                takeover_round,
+            },
+        };
+        migrations.push(crate::DfsMetadataShardStorageMigration {
+            file_system_id: shard.file_system_id,
+            shard_id,
+            state,
+        });
+    }
+    status.storage_migrations = migrations;
+}
+
+/// The refusal the storage preparation owner gives this node's closed copy
+/// of `shard_id` for a reason other than waiting: a conversion stopped for
+/// operator repair.
+fn metadata_shard_conversion_stop(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> Option<String> {
+    let root = local_dfs_metadata_shard_path(data_dir, shard_id);
+    match crate::storage_preparation::prepare_storage_root_before_open(
+        &root,
+        &crate::DfsStoragePreparationScope::Metadata(shard_id.clone()),
+    ) {
+        Ok(())
+        | Err(MetadataBackendError::StoragePreparationPending { .. })
+        | Err(MetadataBackendError::StorageConverting)
+        | Err(MetadataBackendError::Rejected {
+            code: crate::DfsMetadataRejectionCode::ReplicaUnreadable,
+            ..
+        }) => None,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+fn dfs_metadata_shard_storage_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-storage"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
 }
 
 pub fn inspect_cluster_aware_dfs(
@@ -2081,10 +2227,9 @@ mod tests {
         // Filesystem publication belongs to the store-backed owning service.
         let mut writer = runtime.metadata_primary_service("/").unwrap();
         writer.add_file_system(changed.clone()).unwrap();
-        // Ordinary publication preserves catalog/storage authority from the
-        // actual native configuration, even if the old metadata row predates it.
+        // Ordinary publication preserves the catalog generation of the actual
+        // native configuration, even if the old metadata row predates it.
         changed.catalog_generation = authority_config.catalog_generation;
-        changed.metadata_storage = authority_config.metadata_storage;
         for _ in 0..2 {
             let actual =
                 with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {

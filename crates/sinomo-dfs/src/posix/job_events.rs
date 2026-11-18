@@ -117,7 +117,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|shard| candidates.contains(&shard.shard_id))
         {
             if self
-                .metadata_shard_storage_is_converting(shard)
+                .shard_storage_record_is_closed(shard)
                 .unwrap_or(false)
             {
                 touched.push(DfsMetadataShardId::new(&shard.shard_id));

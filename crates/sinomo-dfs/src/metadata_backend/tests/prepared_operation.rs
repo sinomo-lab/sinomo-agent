@@ -1,6 +1,6 @@
 //! Native PreparedV7 kernel regressions; author guards come from real hosted services.
 mod immutable_payload;
-mod genesis_activation;
+mod genesis_eviction;
 mod conditional_current;
 mod checkpoint_cache;
 mod owned_namespace_plan;

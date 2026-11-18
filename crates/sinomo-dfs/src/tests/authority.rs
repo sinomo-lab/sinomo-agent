@@ -673,7 +673,7 @@ fn native_explicit_primary_handoff_preserves_an_unfinished_metadata_prepare() {
     // authority probe, handoff proof or persisted packet is supplied by the test.
     let execution = source.acquire_prepared_execution(&scope).unwrap();
     let digest = source
-        .prepare_payload_for_publication(payload.clone())
+        .prepare_payload_for_publication_with_file_system(payload.clone(), None)
         .unwrap();
     drop(execution);
     let original = source
@@ -5287,7 +5287,7 @@ fn stored_prepare_retry_observes_commit_before_its_execution_admission() {
     .unwrap();
     let execution = source.acquire_prepared_execution(&scope).unwrap();
     let digest = source
-        .prepare_payload_for_publication(payload.clone())
+        .prepare_payload_for_publication_with_file_system(payload.clone(), None)
         .unwrap();
     drop(execution);
     let original = source

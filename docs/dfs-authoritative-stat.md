@@ -102,11 +102,19 @@ writers that do not share the count contract are unsupported.
 
 ## Existing metadata
 
-Count initialization belongs to the single migration owner and native import
-mechanisms. Background discovery covers cold metadata; demand can prioritize
-the same conversion without computing counts inside stat. Initialization requires
-a complete stable authoritative namespace cut,
-not an independent count of each shard's local copies. Current assignments
+Count initialization belongs to the single migration owner and runs inside each
+shard's own conversion. Background discovery covers cold metadata; demand can
+prioritize the same conversion without computing counts inside stat. A
+converting shard initializes its counts from its own rows plus what every other
+shard contributes to them, read per shard pair, not from an independent count
+of each shard's local copies. Those contributions are frozen while the shard is
+closed: a count change needs the target's canonical object, a cross-shard
+rename of a name whose canonical object the shard owns waits until the shard is
+Active, and so does each such name a subtree move carries; no shard is born
+from a closed parent shard. The shard accepts
+the contributions only after two consecutive complete rounds agree and no job
+touching it is still running other than one parked on it. A contributing shard
+that cannot answer is waited for, never counted as empty. Current assignments
 identify contributing entries; stale ancestor copies and physical source-eviction
 records must not be counted again.
 
@@ -116,11 +124,11 @@ its owning recovery protocol. Neither stat nor an ordinary mutation can guess
 an initial count. Installation and readiness require actual native source and
 activation evidence; a computed census is conversion data, not authority.
 
-Conversion stages and fences the complete authoritative shard set before any
-member activates. Ordinary writes remain unavailable until every member has
-activated count-aware storage. Partial failure retains the original fences and
-conversion identities for forward recovery; restarting an installed member
-does not independently release this maintenance barrier.
+A shard is closed for its whole conversion: its ordinary reads and writes are
+unavailable until its storage record is Active, while other shards keep
+serving. Partial failure retains the attempt and its conversion identities for
+forward recovery; restarting a member that installed the image does not open
+the shard before its storage record is Active.
 
 ## Dispatch, cancellation and bounds
 

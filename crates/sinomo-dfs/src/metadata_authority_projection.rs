@@ -109,10 +109,9 @@ pub(crate) fn metadata_storage_configuration_changed(
             let crate::DfsFileSystemConfig {
                 file_system_id,
                 owner_node_id,
-                metadata_storage,
                 ..
             } = config;
-            (file_system_id, owner_node_id, metadata_storage)
+            (file_system_id, owner_node_id)
         })
     };
     match (previous, current) {
@@ -436,7 +435,7 @@ pub fn metadata_replica_context_matches_authority_entries(
     let matches = shard_matches && handoff_matches && catalog_matches;
     if !matches && tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE) {
         // Observe the contexts already decoded for this exact comparison. The
-        // fixed field set omits member arrays, paths, and storage-import payloads.
+        // fixed field set omits member arrays and paths.
         // No new projection read, authorization decision, or authority cache is
         // introduced by these diagnostics.
         let expected_handoff = context.pending_membership_handoff.as_ref();

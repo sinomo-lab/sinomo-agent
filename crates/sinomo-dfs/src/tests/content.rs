@@ -57,7 +57,6 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
     };
     let file_system = DfsFileSystemConfig {
         catalog_generation: 0,
-        metadata_storage: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),

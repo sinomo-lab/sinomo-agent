@@ -826,13 +826,6 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         })
     }
 
-    #[cfg(feature = "storage-conversion")]
-    fn storage_import_placement_snapshot(&self) -> Option<Arc<sinomo_dfs::DfsPlacementSnapshot>> {
-        let _owner = self.data_owner_lock()?;
-        let data_dir = self.cluster_paths.root.parent().map(SinomoDataDir::new)?;
-        super::placement_environment::retained_storage_import_placement_snapshot(&data_dir)
-    }
-
     fn authorizes_prior_process_placement_authority_recovery(
         &self,
         local_node_id: &NodeId,

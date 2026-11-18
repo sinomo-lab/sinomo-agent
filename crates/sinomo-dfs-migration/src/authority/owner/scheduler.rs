@@ -243,11 +243,9 @@ impl Scheduler {
             KvCommittedObservationValue::Snapshot(_)
             | KvCommittedObservationValue::Discontinuity(_) => matches!(
                 unit.role,
-                inventory::UnitRole::FileSystem { .. }
-                    | inventory::UnitRole::Metadata { .. }
+                inventory::UnitRole::Metadata { .. }
                     | inventory::UnitRole::MetadataGeneration { .. }
                     | inventory::UnitRole::MetadataRouting
-                    | inventory::UnitRole::PlacementGoals
             ),
         })
     }
@@ -343,9 +341,7 @@ fn native_dependency(role: &inventory::UnitRole, key: &str) -> bool {
     use inventory::UnitRole;
     // A converted generation staged on a member waits only on its own
     // shard's serving, write-set and storage records.
-    if let UnitRole::MetadataGeneration { identity } = role
-        && super::conversion_receiver::conversion_attempt_of(identity).is_some()
-    {
+    if let UnitRole::MetadataGeneration { identity } = role {
         let (fs, shard) = (&identity.file_system_id, &identity.shard_id.0);
         return key == sinomo_dfs::metadata_shard_key(fs, shard)
             || key == sinomo_dfs::metadata_shard_write_set_key(fs, shard)
@@ -354,22 +350,16 @@ fn native_dependency(role: &inventory::UnitRole, key: &str) -> bool {
     let Some(tail) = key.strip_prefix("/dfs/filesystems/") else {
         return false;
     };
-    let Some((filesystem, record)) = tail.split_once('/') else {
+    let Some((_, record)) = tail.split_once('/') else {
         return false;
     };
-    let relevant = record == "config"
-        || record.starts_with("metadata-")
-        || record.starts_with("placement-reconciliation");
+    let relevant = record == "config" || record.starts_with("metadata-");
     relevant
         && match role {
-            UnitRole::FileSystem { file_system_id, .. } => filesystem == file_system_id.to_string(),
-            UnitRole::MetadataGeneration { identity } => {
-                filesystem == identity.file_system_id.to_string()
-            }
             UnitRole::Metadata { shard } => {
                 record == "config" || record.rsplit('/').next() == Some(&shard.0)
             }
-            UnitRole::MetadataRouting | UnitRole::PlacementGoals => true,
+            UnitRole::MetadataRouting => true,
             _ => false,
         }
 }
@@ -437,9 +427,7 @@ mod wake_tests {
     use inventory::UnitRole;
 
     /// A member's staged converted generation wakes only on its own shard's
-    /// serving, write-set and storage records; a complete-filesystem
-    /// cohort's generation keeps waking on every metadata record of its
-    /// filesystem.
+    /// serving, write-set and storage records.
     #[test]
     fn a_staged_conversion_wakes_only_on_its_own_shards_records() {
         let fs = sinomo_dfs::sifs_file_system_id();
@@ -460,10 +448,5 @@ mod wake_tests {
         ] {
             assert!(!native_dependency(&staged, &key), "{key}");
         }
-        let mut cohort = converted;
-        cohort.generation = "filesystem-generation".into();
-        let cohort = UnitRole::MetadataGeneration { identity: cohort };
-        assert!(native_dependency(&cohort, &sinomo_dfs::file_system_config_key(&fs)));
-        assert!(native_dependency(&cohort, &sinomo_dfs::metadata_shard_storage_key(&fs, "services")));
     }
 }

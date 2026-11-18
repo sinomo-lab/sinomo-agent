@@ -138,7 +138,7 @@ pub(super) fn record_combined_source_capture(
     shard: &DfsMetadataShardId,
     file_system_id: &DfsFileSystemId,
 ) -> Result<()> {
-    write_count_cohort_checkpoint(
+    write_immutable_checkpoint(
         &conversion_stage_base_path(destination, shard)?.join(COMBINED_SOURCE_CAPTURE),
         file_system_id,
     )

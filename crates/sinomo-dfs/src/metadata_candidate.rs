@@ -20,9 +20,9 @@ pub struct DfsMetadataCandidateIdentity {
     pub prefix_proof: DfsMetadataPrefixProof,
 }
 
-/// Fully decoded candidate DATA retained for one publication turn. This has no
-/// writer or authority capability and cannot be restored from an untrusted
-/// descriptor. Every reuse checks the entire actual framed stream and raw hash.
+/// Fully decoded candidate DATA: the identity and prepared reservations of one
+/// unmounted current image. This has no writer or authority capability and
+/// cannot be restored from an untrusted descriptor.
 pub struct DfsMetadataCandidateInspection {
     descriptor: crate::DfsMetadataSnapshotImageDescriptor,
     identity: DfsMetadataCandidateIdentity,
@@ -62,7 +62,6 @@ impl DfsMetadataCandidateInspection {
     }
 
     pub fn identity(&self) -> &DfsMetadataCandidateIdentity { &self.identity }
-    pub fn has_prepared_bodies(&self) -> bool { self.prepared_body_count != 0 }
 
     /// Current-format DATA validation only. Native activation separately proves
     /// that every inherited reservation belongs to a retired authority epoch.
@@ -85,24 +84,6 @@ impl DfsMetadataCandidateInspection {
             return Err(MetadataBackendError::Serde("inherited preparation is not fenced by the retiring native assignment".into()));
         }
         Ok(())
-    }
-
-    pub fn verify(&self, root: &Path) -> Result<DfsMetadataCandidateIdentity> {
-        if crate::storage_generation::read_generation(root)?.identity != self.descriptor.generation {
-            return Err(MetadataBackendError::Serde("candidate generation changed after full validation".into()));
-        }
-        let path = metadata_table_snapshot_path(root);
-        let file = File::open(&path).map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        crate::metadata_snapshot::verify_snapshot_stream_identity(file, &self.descriptor)?;
-        if candidate_file_fingerprint(root)? != self.identity.file_fingerprint {
-            return Err(MetadataBackendError::Serde(
-                "candidate physical bytes changed after full validation".into(),
-            ));
-        }
-        Ok(self.identity.clone())
     }
 }
 
@@ -210,9 +191,6 @@ impl DfsMetadataCandidateWriter {
         let mut envelope = crate::storage_generation::read_generation(&self.root)?;
         match envelope.identity.origin {
             crate::DfsMetadataGenerationOrigin::StorageTransition { .. } => inspection.validate_prepared_reservations()?,
-            crate::DfsMetadataGenerationOrigin::StandaloneOwned { .. } if inspection.has_prepared_bodies() => {
-                return Err(MetadataBackendError::Serde("standalone generation cannot inherit native preparations".into()));
-            }
             _ => {}
         }
         let crate::storage_generation::GenerationState::Staged { seal } = &mut envelope.state else {

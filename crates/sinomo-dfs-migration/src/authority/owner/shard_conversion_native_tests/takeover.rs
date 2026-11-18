@@ -152,9 +152,6 @@ impl<C: ContributionSource> ShardConversionEnv for Observed<'_, C> {
         self.submitted.borrow_mut().push((request.clone(), outcome));
         Ok(outcome)
     }
-    fn local_copy_current(&self, shard: &DfsMetadataShardConfig) -> Result<bool> {
-        self.inner.local_copy_current(shard)
-    }
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         self.inner.capture(shard)
     }

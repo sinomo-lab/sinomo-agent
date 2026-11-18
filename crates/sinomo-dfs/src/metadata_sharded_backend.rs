@@ -1238,11 +1238,9 @@ impl ResidentLocalMetadataShardHandle {
                     original.begin_consistent_read_snapshot()?;
                     original.end_consistent_read_snapshot();
                     if let Some(Some(record)) = original.read_certified_prepared_record_for_ingress(operation_id)? {
-                        catalog.validate_native_genesis_preparation(&record)?;
-                        let original_fs = crate::default_cluster::genesis::original_genesis_file_system(&record, expected)
+                        crate::default_cluster::genesis::original_genesis_file_system(&record, expected)
                             .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
-                        if generation.identity.matches_native_file_system_storage(original_fs.metadata_storage.as_ref())
-                            && record.status == crate::DfsPreparedOperationStatus::Prepared {
+                        if record.status == crate::DfsPreparedOperationStatus::Prepared {
                             return Ok(Some(Some(record)));
                         }
                     }
@@ -2346,12 +2344,12 @@ fn open_local_metadata_shard_backend(
         }
         if root.join("metadata-generation.sobj").exists() {
             let admission = crate::storage_generation::read_generation(root)
-                .and_then(|generation| catalog.validate_read_generation(&generation));
+                .and_then(|generation| catalog.validate_read_generation(root, &generation));
             if let Err(failure) = admission {
                 if open_mode == LocalMetadataShardOpenMode::ReplicaRepair
                     && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&failure) {
-                    // A replica that missed the storage import still has an
-                    // older Active envelope. It cannot serve that generation,
+                    // A replica that missed its shard's conversion still has
+                    // an older Active envelope. It cannot serve that generation,
                     // but the authenticated current snapshot receiver must be
                     // able to archive and replace it through repair-only ingress.
                     return LocalSobjMetadataBackend::open_for_replica_repair_with_layout(
@@ -3498,7 +3496,7 @@ mod lazy_replica_slot_tests {
         shards[1].replica_node_ids = Vec::new();
         let fs = crate::sifs_file_system_id();
         let services_id = DfsMetadataShardId::new("services");
-        let closed = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone(), None)
+        let closed = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone())
             .with_shard_storage_for_test(crate::DfsMetadataShardStorage::converting_for_test(&shards[1], 5));
         let resident = LocalShardedMetadataBackend::open_with_native_catalog(
             metadata_root.clone(), shards.clone(), &local, None, &closed,
@@ -3543,7 +3541,7 @@ mod lazy_replica_slot_tests {
         shards[1].replica_node_ids = Vec::new();
         let fs = crate::sifs_file_system_id();
         let services_id = DfsMetadataShardId::new("services");
-        let open = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone(), None);
+        let open = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone());
         let closed = open
             .clone()
             .with_shard_storage_for_test(crate::DfsMetadataShardStorage::converting_for_test(
@@ -3615,7 +3613,7 @@ mod lazy_replica_slot_tests {
         let shards = configs(&local);
         let fs = crate::sifs_file_system_id();
         let services_id = DfsMetadataShardId::new("services");
-        let admitted = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone(), None);
+        let admitted = crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), shards.clone());
         let resident = LocalShardedMetadataBackend::open_with_native_catalog(
             metadata_root.clone(), shards.clone(), &local, None, &admitted,
         )
@@ -3641,7 +3639,7 @@ mod lazy_replica_slot_tests {
         let mut current_shards = shards.clone();
         current_shards[1] = taken_over.clone();
         let current =
-            crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), current_shards.clone(), None);
+            crate::DfsMetadataNamespaceCatalog::for_test(fs.clone(), current_shards.clone());
         let slot = Arc::clone(&handle.slot);
         drop(handle);
         let reconfigured = resident

@@ -6,11 +6,11 @@ use std::path::PathBuf;
 fn native_read_admission_unavailable_preserves_pending_and_real_recovery() {
     use sinomo_core::{network::NetworkError, service::ServiceError};
     use sinomo_dfs::MetadataBackendError;
-    let (native, nodes) = crate::authority::placement_work::native_tests::native_migration_cluster(
+    let (native, nodes) = crate::authority::native_fixtures::native_migration_cluster(
         "migration-native-read-admission", 1,
     );
     let context = native.component_context(&nodes[0]).unwrap();
-    let owner = crate::authority::placement_work::native_tests::canonical_migration_runtime(&context);
+    let owner = crate::authority::native_fixtures::canonical_migration_runtime(&context);
     let keys = [sinomo_dfs::file_system_config_key(&native.file_system().file_system_id)];
     let (original, _) = owner.authority.read_exact(&keys).unwrap();
     // Inject only a failed read. No test-supplied success, proof, or effect can

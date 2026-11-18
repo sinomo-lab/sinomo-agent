@@ -351,19 +351,6 @@ pub(crate) fn completed_metadata_handoff_evidence(
     let marker_matches_active_epoch = freeze
         .activated_epoch
         .is_none_or(|activated_epoch| activated_epoch == active.epoch);
-    let proof_matches_target = match &proof.cause {
-        crate::DfsMetadataShardHandoffCause::Membership => {
-            proof.state_fingerprint == freeze.state_fingerprint
-        }
-        crate::DfsMetadataShardHandoffCause::StorageImport { cut } => {
-            cut.target_prefix.version == 2
-                && cut.target_prefix.is_well_formed()
-                && !cut.converted_image_fingerprint.is_empty()
-                && cut.target_prefix.journal_sequence == freeze.journal_sequence
-                && cut.target_prefix.digest == freeze.state_fingerprint
-                && proof.state_fingerprint == cut.converted_image_fingerprint
-        }
-    };
     let proof_matches_marker_and_active = proof.handoff_id == freeze.handoff_id
         && proof.retiring_shard.file_system_id == active.file_system_id
         && proof.retiring_shard.shard_id == active.shard_id
@@ -375,7 +362,7 @@ pub(crate) fn completed_metadata_handoff_evidence(
                 desired == *active
             }))
         && proof.journal_sequence == freeze.journal_sequence
-        && proof_matches_target
+        && proof.state_fingerprint == freeze.state_fingerprint
         && proof.acknowledged_node_ids.contains(local_node_id);
     if exact_successor_epoch != Some(active.epoch)
         || !marker_matches_active_epoch
@@ -416,24 +403,6 @@ fn rebind_completed_metadata_shard_membership_handoff_once(
         .as_ref()
         .and_then(|_| backend.native_held_snapshot_for_scope(&active.file_system_id, &shard_id));
     if active.primary_node_id == *local_node_id {
-        if let crate::DfsMetadataShardHandoffCause::StorageImport { cut } = &proof.cause {
-            // A new physical image has a new native journal clock. Its actual
-            // import ACKs can restore the minimum delivery cursor after cold
-            // open/loss of the non-durable hint; they never authorize a prepare.
-            // Unacknowledged replicas still require ordinary actual catch-up.
-            for peer in &active.replica_node_ids {
-                if proof.acknowledged_node_ids.contains(peer)
-                    && backend.metadata_replication_cursor(peer, &shard_id)?
-                        < cut.target_prefix.journal_sequence
-                {
-                    backend.put_metadata_replication_cursor(
-                        peer,
-                        &shard_id,
-                        cut.target_prefix.journal_sequence,
-                    )?;
-                }
-            }
-        }
         #[cfg(test)]
         if let Some(before_lock) = BEFORE_REBIND_WRITER_LOCK.with(|hook| hook.borrow_mut().take()) {
             before_lock();
@@ -4069,133 +4038,6 @@ mod tests {
         );
         drop(cold);
         runtime.close().unwrap();
-    }
-
-    #[cfg(feature = "storage-conversion")]
-    #[test]
-    fn storage_import_rebind_checks_target_prefix_and_separate_image_identity() {
-        let name = "native-import-target-prefix-rebind";
-        let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 1);
-        let fixture = configured_normal_sync_fixture(name, Vec::new());
-        let handle = fixture.runtime.runtime_handle();
-        let _entered = handle.enter();
-        let dir = sinomo_testdir::TestDir::new(name);
-        let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
-        crate::test_runtime::copy_native_genesis_data(dir.path(), &shard.0);
-        let mut backend = LocalSobjMetadataBackend::new(shard.clone(), dir.path()).unwrap();
-        let identity = inspect_metadata_candidate(dir.path()).unwrap();
-        let freeze = backend
-            .freeze_metadata_shard_for_membership_handoff(&shard, name, fixture.shard.epoch)
-            .unwrap()
-            .unwrap();
-        let active = DfsMetadataShardConfig {
-            epoch: fixture.shard.epoch + 1,
-            ..fixture.shard.clone()
-        };
-        backend
-            .mark_metadata_shard_membership_handoff_activated(&shard, name, active.epoch)
-            .unwrap();
-        // Local rebind contract test only: the production caller obtains this
-        // exact completion from its fresh native configuration read.
-        let proof = DfsMetadataShardMembershipHandoffProof {
-            cause: DfsMetadataShardHandoffCause::StorageImport {
-                cut: DfsMetadataStorageImportCut {
-                    storage_transition_id: None,
-                    source_cut_digest: name.into(),
-                    source_journal_sequence: freeze.journal_sequence,
-                    source_state_fingerprint: freeze.state_fingerprint.clone(),
-                    target_prefix: identity.prefix_proof.clone(),
-                    converted_image_fingerprint: identity.state_fingerprint.clone(),
-                    pending_mapping_digest: name.into(),
-                },
-            },
-            handoff_id: name.into(),
-            retiring_shard: fixture.shard.clone(),
-            desired_shard: active.clone(),
-            journal_sequence: freeze.journal_sequence,
-            state_fingerprint: identity.state_fingerprint.clone(),
-            acknowledged_node_ids: vec![nodes[0].clone()],
-        };
-        assert_ne!(proof.state_fingerprint, freeze.state_fingerprint);
-        for invalidity in ["prefix", "image", "ack", "membership"] {
-            let mut changed = proof.clone();
-            match invalidity {
-                "prefix" => {
-                    if let DfsMetadataShardHandoffCause::StorageImport { cut } = &mut changed.cause
-                    {
-                        cut.target_prefix.digest.push('0');
-                    }
-                }
-                "image" => changed.state_fingerprint.push('0'),
-                "ack" => changed.acknowledged_node_ids.clear(),
-                "membership" => changed.cause = DfsMetadataShardHandoffCause::Membership,
-                _ => unreachable!(),
-            }
-            assert!(
-                !rebind_completed_metadata_shard_membership_handoff(
-                    &mut backend,
-                    &nodes[0],
-                    &active,
-                    None,
-                    Some(&changed),
-                )
-                .unwrap(),
-                "{invalidity}"
-            );
-        }
-        assert!(
-            !rebind_completed_metadata_shard_membership_handoff(
-                &mut backend,
-                &nodes[0],
-                &active,
-                None,
-                None,
-            )
-            .unwrap()
-        );
-        assert!(
-            backend
-                .metadata_shard_instance_writes_frozen(&shard)
-                .unwrap()
-        );
-        assert!(
-            rebind_completed_metadata_shard_membership_handoff(
-                &mut backend,
-                &nodes[0],
-                &active,
-                None,
-                Some(&proof),
-            )
-            .unwrap()
-        );
-        assert!(
-            !backend
-                .metadata_shard_instance_writes_frozen(&shard)
-                .unwrap()
-        );
-        drop(backend);
-        let mut cold = LocalSobjMetadataBackend::new(shard.clone(), dir.path()).unwrap();
-        assert!(cold.metadata_shard_instance_writes_frozen(&shard).unwrap());
-        assert!(
-            rebind_completed_metadata_shard_membership_handoff(
-                &mut cold,
-                &nodes[0],
-                &active,
-                None,
-                Some(&proof),
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            cold.metadata_shard_write_freeze(&shard)
-                .unwrap()
-                .unwrap()
-                .rebind_prefix_proof,
-            identity.prefix_proof
-        );
-        drop(cold);
-        drop(_entered);
-        fixture.finish();
     }
 
     #[test]

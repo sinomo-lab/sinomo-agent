@@ -2,7 +2,6 @@
 //! record. Any configured member, primary or replica, activates its staged
 //! copy once the record is Active for that generation; the record carries the
 //! activation evidence, so no handoff proof or filesystem state is read.
-use super::activation::{entry, invalid, require_current_authority, require_owned_unit};
 use super::*;
 
 /// Activate this holder's staged copy of `identity`, the converted generation
@@ -88,7 +87,6 @@ pub(super) fn activate_shard_storage_header(
     }
     let active = GenerationState::Active {
         activation_digest: activation_digest.to_owned(),
-        standalone_seal: None,
     };
     match &envelope.state {
         state if state == &active => return Ok(()),
@@ -117,6 +115,62 @@ pub(super) fn activate_shard_storage_header(
     }
     envelope.state = active;
     write_generation(root, &envelope)
+}
+
+/// The checks [`activate_metadata_shard_storage`] makes before it reads authority: an
+/// owned (not shadow) context, a valid identity whose exact unit root inside
+/// the data directory is `root`, and the live data-owner lock, which the
+/// caller holds for the whole activation.
+fn require_owned_unit(
+    context: &sinomo_module::ComponentContext,
+    root: &Path,
+    identity: &DfsMetadataGenerationIdentity,
+) -> Result<impl Sized + use<>> {
+    if context.host_role() == sinomo_module::ComponentHostRole::Shadow {
+        return Err(invalid(
+            "shadow context cannot activate owned metadata storage",
+        ));
+    }
+    identity.validate()?;
+    let expected_root =
+        crate::local_dfs_metadata_shard_path(context.data_dir(), &identity.shard_id);
+    let actual_root = root.canonicalize().map_err(invalid)?;
+    let data_root = context.data_dir().root().canonicalize().map_err(invalid)?;
+    if actual_root != expected_root.canonicalize().map_err(invalid)?
+        || !actual_root.starts_with(&data_root)
+    {
+        return Err(invalid(
+            "storage activation root differs from the actual component unit",
+        ));
+    }
+    crate::runtime_host::require_daemon_dfs_data_owner_lock(
+        &crate::runtime_host::DfsRuntimePaths::new(context.data_dir()),
+    )
+    .map_err(invalid)
+}
+
+/// Require an authoritative read confirmed by a current-term voter quorum.
+fn require_current_authority(authority: &sinomo_core::kv::KvAuthorityProof) -> Result<()> {
+    match authority.basis {
+        sinomo_core::kv::KvAuthorityBasis::CurrentTermQuorum {
+            voter_acks,
+            required_quorum,
+        } if authority.term != 0 && required_quorum > 0 && voter_acks >= required_quorum => Ok(()),
+        _ => Err(invalid("storage activation lacks current native authority")),
+    }
+}
+
+fn invalid(error: impl std::fmt::Display) -> MetadataBackendError {
+    MetadataBackendError::Serde(format!("current storage generation activation: {error}"))
+}
+fn entry<'a>(
+    entry: &'a Option<sinomo_core::kv::KvEntry>,
+    expected: &str,
+) -> Result<&'a sinomo_core::kv::KvEntry> {
+    entry
+        .as_ref()
+        .filter(|entry| entry.key == expected)
+        .ok_or_else(|| invalid("native activation entry is missing or misbound"))
 }
 
 #[cfg(test)]
@@ -315,7 +369,6 @@ mod tests {
         assert!(matches!(
             &header.state,
             GenerationState::Active {
-                standalone_seal: None,
                 ..
             }
         ));

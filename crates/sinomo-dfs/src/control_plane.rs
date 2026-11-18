@@ -34,8 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 mod catalog;
-pub use catalog::{metadata_catalog_generation_update, metadata_catalog_generation_successor, metadata_storage_pending_transition_update};
-use catalog::{append_catalog_generation_update, catalog_handoff_guard, catalog_handoff_successor};
+use catalog::append_catalog_generation_update;
 
 mod write_set;
 pub use write_set::*;
@@ -468,28 +467,17 @@ fn merge_file_system_config_publication(
     merged.subtree_policies = current.subtree_policies.clone();
     merged.retention_policies = current.retention_policies.clone();
     merged.module_metadata = current.module_metadata.clone();
-    merged.metadata_storage = current.metadata_storage.clone();
     merged.catalog_generation = current.catalog_generation;
     merged
 }
 
-fn validate_ordinary_metadata_storage(
+fn validate_ordinary_catalog_generation(
     expected: Option<&DfsFileSystemConfig>, desired: &DfsFileSystemConfig,
 ) -> Result<(), KvError> {
     if desired.catalog_generation != expected.map_or(0, |config| config.catalog_generation) {
         return Err(KvError::Serialization {
             detail: "catalog generation is authored only with its metadata-shard catalog mutation".into(),
         });
-    }
-    if expected.and_then(|config| config.metadata_storage.as_ref())
-        != desired.metadata_storage.as_ref()
-    {
-        return Err(KvError::Serialization {
-            detail: "metadata storage generation is authored only by the native generation transition transaction".into(),
-        });
-    }
-    if let Some(activation) = &desired.metadata_storage {
-        activation.validate_at_catalog_generation(desired.catalog_generation).map_err(|detail| KvError::Serialization { detail })?;
     }
     Ok(())
 }
@@ -627,9 +615,9 @@ pub fn build_placement_reconciliation_job(
     Ok(job)
 }
 
-/// The normal adaptive producer and source conversion share this same job
-/// factory. All observations/configuration are supplied current DATA; budgets
-/// remain exact per-tick constraints and spent bytes remain cumulative DATA.
+/// The normal adaptive producer's job factory. All observations/configuration
+/// are supplied current DATA; budgets remain exact per-tick constraints and
+/// spent bytes remain cumulative DATA.
 #[allow(clippy::too_many_arguments)]
 pub fn build_adaptive_placement_reconciliation_job(
     job_id: String,
@@ -1083,27 +1071,13 @@ struct DfsMetadataShardOperationFloor {
     permit_id: String,
 }
 
-/// The current handoff protocol also certifies storage representation changes.
-/// The DFS runtime compares opaque source identity; legacy decoding stays in
-/// the migration component. None of these values grants author permission.
+/// Why a cooperative handoff runs: a membership or primary-role change of
+/// one shard. Storage changes never run as a handoff; a shard converts under
+/// its own storage record ([`crate::DfsMetadataShardStorage`]).
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DfsMetadataShardHandoffCause {
     Membership,
-    StorageImport { cut: DfsMetadataStorageImportCut },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct DfsMetadataStorageImportCut {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_transition_id: Option<String>,
-    pub source_cut_digest: String,
-    pub source_journal_sequence: u64,
-    pub source_state_fingerprint: String,
-    pub target_prefix: crate::DfsMetadataPrefixProof,
-    pub converted_image_fingerprint: String,
-    pub pending_mapping_digest: String,
 }
 
 /// Quorum-committed fence separating a retiring metadata assignment from a
@@ -1317,14 +1291,6 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     /// cluster-bound process session and the in-process test store supplies an
     /// isolated embedded session.
     fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
-        None
-    }
-
-    /// Borrow only a snapshot already published by the normal host environment.
-    /// Source restoration waits without sampling, opening DFS or creating a
-    /// cache/registry when this retained observation is unavailable.
-    #[cfg(feature = "storage-conversion")]
-    fn storage_import_placement_snapshot(&self) -> Option<Arc<crate::DfsPlacementSnapshot>> {
         None
     }
 
@@ -1971,7 +1937,7 @@ impl<'a> PlacementUpdatePublication<'a> {
         desired: &'a DfsFileSystemConfig,
         job: &DfsPlacementReconciliationJob,
     ) -> Result<Self, KvError> {
-        validate_ordinary_metadata_storage(Some(expected), desired)?;
+        validate_ordinary_catalog_generation(Some(expected), desired)?;
         let mut durable_job = job.clone();
         durable_job.accepted_config = scoped_placement_config_for_job(desired, job);
         validate_v1_placement_reconciliation_job(&durable_job)?;
@@ -2126,117 +2092,6 @@ impl<'a> PlacementUpdatePublication<'a> {
             success,
             failure: Vec::new(),
         })
-    }
-}
-
-/// Pure current publication planning for the owned storage converter. Captured
-/// entries are DATA; only the caller's real native commit can establish effect
-/// authority. No reader, recovery owner or queue engine is created here.
-#[cfg(feature = "storage-conversion")]
-pub struct DfsPlacementUpdatePlan<'a> {
-    publication: PlacementUpdatePublication<'a>,
-}
-#[cfg(feature = "storage-conversion")]
-impl<'a> DfsPlacementUpdatePlan<'a> {
-    pub fn new(
-        expected: &'a DfsFileSystemConfig,
-        desired: &'a DfsFileSystemConfig,
-        job: &DfsPlacementReconciliationJob,
-    ) -> Result<Self, KvError> {
-        if expected.file_system_id != desired.file_system_id
-            || job.file_system_id != expected.file_system_id
-        {
-            return Err(KvError::Serialization {
-                detail: "placement input plan changes its filesystem identity".into(),
-            });
-        }
-        Ok(Self {
-            publication: PlacementUpdatePublication::new(expected, desired, job)?,
-        })
-    }
-    /// Config, new job, new activity, queue, activity index and permit, in order.
-    pub fn keys(&self) -> &[String] {
-        &self.publication.keys
-    }
-    fn checked_inputs(
-        &self,
-        entries: Vec<Option<KvEntry>>,
-    ) -> Result<Option<PlacementUpdateInputs>, KvError> {
-        if entries.len() != self.keys().len()
-            || entries
-                .iter()
-                .zip(self.keys())
-                .any(|(entry, key)| entry.as_ref().is_some_and(|entry| &entry.key != key))
-        {
-            return Err(KvError::Serialization {
-                detail: "placement input plan has incomplete or differently scoped native entries"
-                    .into(),
-            });
-        }
-        if entries.last().is_some_and(Option::is_some) {
-            return Err(KvError::Busy {
-                path: self.keys()[5].clone(),
-            });
-        }
-        self.publication.inputs(entries)
-    }
-    pub fn queued_job_keys(
-        &self,
-        entries: Vec<Option<KvEntry>>,
-    ) -> Result<Option<Vec<String>>, KvError> {
-        let Some(inputs) = self.checked_inputs(entries)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.publication
-                .queued_job_keys(&inputs)?
-                .unwrap_or_default(),
-        ))
-    }
-    /// Build the existing normal transaction from complete ordered read images.
-    /// Missing queued rows are explicit; present rows cannot be omitted or renamed.
-    pub fn transaction(
-        &self,
-        entries: Vec<Option<KvEntry>>,
-        queued_entries: Vec<Option<KvEntry>>,
-    ) -> Result<Option<KvTxn>, KvError> {
-        let Some(inputs) = self.checked_inputs(entries)? else {
-            return Ok(None);
-        };
-        let keys = self
-            .publication
-            .queued_job_keys(&inputs)?
-            .unwrap_or_default();
-        if queued_entries.len() != keys.len() {
-            return Err(KvError::Serialization {
-                detail: "placement input plan omitted a queued native identity".into(),
-            });
-        }
-        let mut jobs = Vec::with_capacity(queued_entries.len());
-        for (key, entry) in keys.iter().zip(queued_entries) {
-            if let Some(entry) = entry {
-                let job = entry.decode::<DfsPlacementReconciliationJob>()?;
-                validate_v1_placement_reconciliation_job(&job)?;
-                if entry.key != *key
-                    || job.file_system_id != self.publication.job.file_system_id
-                    || placement_reconciliation_key(&job.file_system_id, &job.job_id) != *key
-                {
-                    return Err(KvError::Serialization {
-                        detail: "placement input plan changed a queued job's exact identity".into(),
-                    });
-                }
-                jobs.push(entry);
-            }
-        }
-        self.publication
-            .transaction(
-                inputs,
-                jobs,
-                KvCompare::Missing {
-                    key: self.keys()[5].clone(),
-                },
-            )
-            .map(Some)
     }
 }
 
@@ -2407,7 +2262,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                     .to_string(),
             });
         }
-        validate_ordinary_metadata_storage(expected, desired)?;
+        validate_ordinary_catalog_generation(expected, desired)?;
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get(&key)?;
         let creating = expected.is_none() && current_entry.is_none();
@@ -2531,33 +2386,6 @@ impl<'a> DfsControlPlaneStore<'a> {
                 placement_authority_permit_key(file_system_id)
             ),
         })
-    }
-
-    /// Storage conversion uses the same exact pending-release and actual-host
-    /// prior-process recovery as ordinary placement. DATA cannot grant custody.
-    /// sinomo:kv-consistency: Recover only the exact normal placement latch before a source-import retirement CAS.
-    #[cfg(feature = "storage-conversion")]
-    pub fn prepare_storage_import_placement_retirement(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        local_node_id: &NodeId,
-    ) -> Result<KvCompare, KvError> {
-        // First reconcile the normal exact in-process release handle.
-        match self.placement_authority_permit_missing_compare(file_system_id) {
-            Ok(compare) => return Ok(compare),
-            Err(KvError::Busy { .. }) => {}
-            Err(failed) => return Err(failed),
-        }
-        self.kv.refresh_latest()?;
-        if let Some(process) = self.kv.placement_authority_process_identity() {
-            self.recover_prior_process_placement_authority_permit_for_local_node(
-                file_system_id,
-                local_node_id,
-                &process,
-            )?;
-        }
-        // A current/foreign/unidentified live holder remains typed Busy.
-        self.placement_authority_permit_missing_compare(file_system_id)
     }
 
     /// Inspect the current placement mutation permit without exposing its
@@ -3379,6 +3207,9 @@ impl<'a> DfsControlPlaneStore<'a> {
         Ok(self.kv.txn(txn)?.succeeded)
     }
 
+    /// Create an absent shard, with the storage record its native birth
+    /// writes, or keep the exact same value. A birth under a closed parent
+    /// shard is busy; any other change of a shard needs its handoff.
     pub fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), KvError> {
         let key = metadata_shard_key(&shard.file_system_id, &shard.shard_id);
         for _ in 0..METADATA_MEMBERSHIP_HANDOFF_RETRIES {
@@ -3403,8 +3234,15 @@ impl<'a> DfsControlPlaneStore<'a> {
                 )?);
             }
             let mut success = vec![KvOp::put_serde(key.clone(), shard, None)?];
+            let filesystem_entry = self.kv.get(&file_system_config_key(&shard.file_system_id))?;
+            if current_entry.is_none() {
+                let parent = self.metadata_shard_birth_parent_storage(shard)?;
+                if !append_metadata_shard_birth_storage(shard, parent, &mut compares, &mut success)? {
+                    return Err(KvError::Busy { path: key });
+                }
+            }
             append_catalog_generation_update(
-                self.kv.get(&file_system_config_key(&shard.file_system_id))?, &shard.file_system_id, &mut compares, &mut success,
+                filesystem_entry, &shard.file_system_id, &mut compares, &mut success,
             )?;
             if self
                 .kv
@@ -3423,6 +3261,10 @@ impl<'a> DfsControlPlaneStore<'a> {
 
     /// Create an absent shard or idempotently replace the exact same value.
     ///
+    /// A birth writes the shard's native-genesis storage record with its
+    /// configuration; it is refused while the shard that owns a path-prefix
+    /// shard's parent path is closed.
+    ///
     /// A changed assignment or primary role is deliberately *not* activated here.
     /// It must use [`Self::begin_metadata_shard_membership_handoff`] followed by
     /// [`Self::complete_metadata_shard_membership_handoff`] so a committed
@@ -3431,27 +3273,6 @@ impl<'a> DfsControlPlaneStore<'a> {
         &mut self,
         expected: Option<&DfsMetadataShardConfig>,
         desired: &DfsMetadataShardConfig,
-    ) -> Result<bool, KvError> {
-        self.compare_and_put_metadata_shard_inner(expected, desired, None)
-    }
-
-    /// Publish an absent native birth only while its original captured storage
-    /// binding still matches the exact filesystem entry advanced by this CAS.
-    /// A path-prefix birth also compares the storage record of the shard that
-    /// owns its parent path, and is refused while that shard is converting.
-    pub fn compare_and_put_metadata_shard_for_genesis(
-        &mut self,
-        desired: &DfsMetadataShardConfig,
-        expected_storage: Option<&crate::DfsMetadataStorageState>,
-    ) -> Result<bool, KvError> {
-        self.compare_and_put_metadata_shard_inner(None, desired, Some(expected_storage))
-    }
-
-    fn compare_and_put_metadata_shard_inner(
-        &mut self,
-        expected: Option<&DfsMetadataShardConfig>,
-        desired: &DfsMetadataShardConfig,
-        genesis_binding: Option<Option<&crate::DfsMetadataStorageState>>,
     ) -> Result<bool, KvError> {
         validate_metadata_shard_cas_identity(expected, desired)?;
         let key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
@@ -3502,27 +3323,17 @@ impl<'a> DfsControlPlaneStore<'a> {
         }
         let mut success = vec![KvOp::put_serde(key, desired, None)?];
         if expected.is_none() {
-            let filesystem_entry = self.kv.get(&file_system_config_key(&desired.file_system_id))?;
-            if let Some(captured) = genesis_binding {
-                let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
-                let actual: DfsFileSystemConfig = entry.decode()?;
-                if actual.metadata_storage.as_ref() != captured { return Ok(false); }
-                // Read after the filesystem entry whose catalog generation this
-                // transaction compares: a later birth, removal or rescope of a
-                // shard fails the transaction.
-                let shards = self.list_metadata_shards(&desired.file_system_id)?;
-                if let Some(parent) = metadata_shard_birth_parent(desired, &shards)? {
-                    let key = metadata_shard_storage_key(&parent.file_system_id, &parent.shard_id);
-                    let parent_storage = self.kv.get(&key)?;
-                    let Some(compare) = metadata_shard_birth_parent_storage_compare(key, parent_storage)? else {
-                        return Ok(false);
-                    };
-                    compares.push(compare);
-                }
-                append_native_genesis_shard_storage(desired, captured, &mut compares, &mut success)?;
+            let Some(filesystem_entry) =
+                self.kv.get(&file_system_config_key(&desired.file_system_id))?
+            else {
+                return Ok(false);
+            };
+            let parent = self.metadata_shard_birth_parent_storage(desired)?;
+            if !append_metadata_shard_birth_storage(desired, parent, &mut compares, &mut success)? {
+                return Ok(false);
             }
             append_catalog_generation_update(
-                filesystem_entry, &desired.file_system_id, &mut compares, &mut success,
+                Some(filesystem_entry), &desired.file_system_id, &mut compares, &mut success,
             )?;
         }
         Ok(self
@@ -3533,6 +3344,22 @@ impl<'a> DfsControlPlaneStore<'a> {
                 failure: Vec::new(),
             })?
             .succeeded)
+    }
+
+    /// The storage record of the shard that owns a birth's parent path, keyed
+    /// and read after the filesystem entry whose catalog generation the
+    /// birth compares: a later birth, removal or rescope of a shard fails it.
+    fn metadata_shard_birth_parent_storage(
+        &mut self,
+        desired: &DfsMetadataShardConfig,
+    ) -> Result<Option<(String, Option<KvEntry>)>, KvError> {
+        let shards = self.list_metadata_shards(&desired.file_system_id)?;
+        let Some(parent) = metadata_shard_birth_parent(desired, &shards)? else {
+            return Ok(None);
+        };
+        let key = metadata_shard_storage_key(&parent.file_system_id, &parent.shard_id);
+        let entry = self.kv.get(&key)?;
+        Ok(Some((key, entry)))
     }
 
     /// Request a topology-preserving primary transfer. This creates a handoff
@@ -3561,19 +3388,6 @@ impl<'a> DfsControlPlaneStore<'a> {
         retiring: &DfsMetadataShardConfig,
         desired: &DfsMetadataShardConfig,
     ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
-        self.begin_metadata_shard_handoff_with_cause(
-            retiring,
-            desired,
-            DfsMetadataShardHandoffCause::Membership,
-        )
-    }
-
-    pub fn begin_metadata_shard_handoff_with_cause(
-        &mut self,
-        retiring: &DfsMetadataShardConfig,
-        desired: &DfsMetadataShardConfig,
-        cause: DfsMetadataShardHandoffCause,
-    ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
         validate_metadata_shard_cas_identity(Some(retiring), desired)?;
         if retiring == desired {
             return Err(KvError::Serialization {
@@ -3583,7 +3397,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 ),
             });
         }
-        validate_metadata_shard_handoff_cause(retiring, desired, &cause)?;
+        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
         let shard_key = metadata_shard_key(&retiring.file_system_id, &retiring.shard_id);
         let floor_key =
             metadata_shard_operation_floor_key(&retiring.file_system_id, &retiring.shard_id);
@@ -3598,14 +3412,14 @@ impl<'a> DfsControlPlaneStore<'a> {
             if shard_entry.decode::<DfsMetadataShardConfig>()? != *retiring {
                 return Ok(None);
             }
-            let (catalog_compares, _) = catalog_handoff_guard(
-                self.kv.get(&file_system_config_key(&retiring.file_system_id))?, self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?, retiring, desired, &cause,
+            let proof_compare = previous_handoff_proof_compare(
+                retiring,
+                self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?,
             )?;
             if let Some(entry) = self.kv.get(&handoff_key)? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
-                    && handoff.desired_shard == *desired
-                    && handoff.cause == cause)
+                    && handoff.desired_shard == *desired)
                     .then_some(handoff));
             }
             let write_set_entry = self.kv.get(&metadata_shard_write_set_key(
@@ -3615,7 +3429,6 @@ impl<'a> DfsControlPlaneStore<'a> {
             let (write_set_compare, _) = metadata_handoff_write_set_ops(
                 retiring,
                 desired,
-                &cause,
                 write_set_entry.as_ref(),
                 None,
             )?;
@@ -3647,21 +3460,8 @@ impl<'a> DfsControlPlaneStore<'a> {
                 .unwrap_or(0)
                 .max(floor_sequence);
             let handoff = DfsMetadataShardMembershipHandoff {
-                cause: cause.clone(),
-                handoff_id: match &cause {
-                    DfsMetadataShardHandoffCause::Membership => sinomo_core::Id::generate(),
-                    DfsMetadataShardHandoffCause::StorageImport { cut } => {
-                        sinomo_core::Id::derived(
-                            "dfs-storage-import-handoff-v7",
-                            serde_json::to_vec(&(retiring, desired, cut)).map_err(|e| {
-                                KvError::Serialization {
-                                    detail: e.to_string(),
-                                }
-                            })?,
-                        )
-                    }
-                }
-                .to_string(),
+                cause: DfsMetadataShardHandoffCause::Membership,
+                handoff_id: sinomo_core::Id::generate().to_string(),
                 retiring_shard: retiring.clone(),
                 desired_shard: desired.clone(),
                 required_prepared_sequence,
@@ -3701,7 +3501,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             compares.extend(metadata_prepared_operation_admission_compares(
                 self.kv, desired,
             )?);
-            compares.extend(catalog_compares);
+            compares.push(proof_compare);
             let response = self.kv.txn(KvTxn {
                 compares,
                 success: vec![KvOp::put_serde(handoff_key.clone(), &handoff, None)?],
@@ -3807,7 +3607,6 @@ impl<'a> DfsControlPlaneStore<'a> {
         if metadata_handoff_write_set_ops(
             retiring,
             &handoff.desired_shard,
-            &handoff.cause,
             write_set_entry.as_ref(),
             None,
         )
@@ -3904,7 +3703,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             return Ok(false);
         };
         let handoff = handoff_entry.decode::<DfsMetadataShardMembershipHandoff>()?;
-        validate_metadata_shard_handoff_cause(retiring, desired, &handoff.cause)?;
+        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
         if handoff.retiring_shard != *retiring || handoff.desired_shard != *desired {
             return Ok(false);
         }
@@ -3927,7 +3726,6 @@ impl<'a> DfsControlPlaneStore<'a> {
         let (write_set_compare, write_set_put) = metadata_handoff_write_set_ops(
             retiring,
             desired,
-            &handoff.cause,
             write_set_entry.as_ref(),
             Some(&proof),
         )?;
@@ -3970,7 +3768,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         compares.extend(metadata_prepared_operation_admission_compares(
             self.kv, desired,
         )?);
-        let mut success: Vec<KvOp> = vec![
+        let success: Vec<KvOp> = vec![
                     KvOp::put_serde(shard_key, desired, None)?,
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
                     KvOp::put_serde(proof_key, &proof, None)?,
@@ -3979,17 +3777,12 @@ impl<'a> DfsControlPlaneStore<'a> {
                 .into_iter()
                 .chain(write_set_put)
                 .collect();
-        let (catalog_compares, catalog_config) = catalog_handoff_guard(
-            self.kv.get(&file_system_config_key(&retiring.file_system_id))?, self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?, retiring, desired, &handoff.cause,
-        )?;
-        compares.extend(catalog_compares);
         // A membership handoff changes serving authority, not path
-        // assignment, so it does not advance the catalog generation. Only
-        // the filesystem-wide storage import still counts its activations
-        // in that generation, until that mechanism is removed.
-        if matches!(handoff.cause, DfsMetadataShardHandoffCause::StorageImport { .. }) {
-            success.push(catalog_handoff_successor(&catalog_config)?);
-        }
+        // assignment, so it does not advance the catalog generation.
+        compares.push(previous_handoff_proof_compare(
+            retiring,
+            self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?,
+        )?);
         Ok(self
             .kv
             .txn(KvTxn {
@@ -4646,7 +4439,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     .to_string(),
             });
         }
-        validate_ordinary_metadata_storage(expected, desired)?;
+        validate_ordinary_catalog_generation(expected, desired)?;
         let key = file_system_config_key(&desired.file_system_id);
         let current_entry = self.kv.get_async(&key).await?;
         let creating = expected.is_none() && current_entry.is_none();
@@ -4824,6 +4617,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         })
     }
 
+    /// Async [`DfsControlPlaneStore::put_metadata_shard`].
     pub async fn put_metadata_shard(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -4851,8 +4645,16 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 );
             }
             let mut success = vec![KvOp::put_serde(key.clone(), shard, None)?];
+            let filesystem_entry =
+                self.kv.get_async(&file_system_config_key(&shard.file_system_id)).await?;
+            if current_entry.is_none() {
+                let parent = self.metadata_shard_birth_parent_storage(shard).await?;
+                if !append_metadata_shard_birth_storage(shard, parent, &mut compares, &mut success)? {
+                    return Err(KvError::Busy { path: key });
+                }
+            }
             append_catalog_generation_update(
-                self.kv.get_async(&file_system_config_key(&shard.file_system_id)).await?, &shard.file_system_id, &mut compares, &mut success,
+                filesystem_entry, &shard.file_system_id, &mut compares, &mut success,
             )?;
             if self
                 .kv
@@ -4870,33 +4672,13 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         Err(KvError::Busy { path: key })
     }
 
-    /// Async create/idempotent compare-and-put. Changed assignments or primary
-    /// roles require the explicit two-phase handoff API.
+    /// Async create/idempotent compare-and-put, as
+    /// [`DfsControlPlaneStore::compare_and_put_metadata_shard`]. Changed
+    /// assignments or primary roles require the explicit two-phase handoff API.
     pub async fn compare_and_put_metadata_shard(
         &mut self,
         expected: Option<&DfsMetadataShardConfig>,
         desired: &DfsMetadataShardConfig,
-    ) -> Result<bool, KvError> {
-        self.compare_and_put_metadata_shard_inner(expected, desired, None).await
-    }
-
-    /// Publish an absent native birth only while its original captured storage
-    /// binding still matches the exact filesystem entry advanced by this CAS.
-    /// A path-prefix birth also compares the storage record of the shard that
-    /// owns its parent path, and is refused while that shard is converting.
-    pub async fn compare_and_put_metadata_shard_for_genesis(
-        &mut self,
-        desired: &DfsMetadataShardConfig,
-        expected_storage: Option<&crate::DfsMetadataStorageState>,
-    ) -> Result<bool, KvError> {
-        self.compare_and_put_metadata_shard_inner(None, desired, Some(expected_storage)).await
-    }
-
-    async fn compare_and_put_metadata_shard_inner(
-        &mut self,
-        expected: Option<&DfsMetadataShardConfig>,
-        desired: &DfsMetadataShardConfig,
-        genesis_binding: Option<Option<&crate::DfsMetadataStorageState>>,
     ) -> Result<bool, KvError> {
         validate_metadata_shard_cas_identity(expected, desired)?;
         let key = metadata_shard_key(&desired.file_system_id, &desired.shard_id);
@@ -4947,27 +4729,19 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         }
         let mut success = vec![KvOp::put_serde(key, desired, None)?];
         if expected.is_none() {
-            let filesystem_entry = self.kv.get_async(&file_system_config_key(&desired.file_system_id)).await?;
-            if let Some(captured) = genesis_binding {
-                let Some(entry) = filesystem_entry.as_ref() else { return Ok(false); };
-                let actual: DfsFileSystemConfig = entry.decode()?;
-                if actual.metadata_storage.as_ref() != captured { return Ok(false); }
-                // Read after the filesystem entry whose catalog generation this
-                // transaction compares: a later birth, removal or rescope of a
-                // shard fails the transaction.
-                let shards = self.list_metadata_shards(&desired.file_system_id).await?;
-                if let Some(parent) = metadata_shard_birth_parent(desired, &shards)? {
-                    let key = metadata_shard_storage_key(&parent.file_system_id, &parent.shard_id);
-                    let parent_storage = self.kv.get_async(&key).await?;
-                    let Some(compare) = metadata_shard_birth_parent_storage_compare(key, parent_storage)? else {
-                        return Ok(false);
-                    };
-                    compares.push(compare);
-                }
-                append_native_genesis_shard_storage(desired, captured, &mut compares, &mut success)?;
+            let Some(filesystem_entry) = self
+                .kv
+                .get_async(&file_system_config_key(&desired.file_system_id))
+                .await?
+            else {
+                return Ok(false);
+            };
+            let parent = self.metadata_shard_birth_parent_storage(desired).await?;
+            if !append_metadata_shard_birth_storage(desired, parent, &mut compares, &mut success)? {
+                return Ok(false);
             }
             append_catalog_generation_update(
-                filesystem_entry, &desired.file_system_id, &mut compares, &mut success,
+                Some(filesystem_entry), &desired.file_system_id, &mut compares, &mut success,
             )?;
         }
         Ok(self
@@ -4979,6 +4753,20 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             })
             .await?
             .succeeded)
+    }
+
+    /// Async [`DfsControlPlaneStore::metadata_shard_birth_parent_storage`].
+    async fn metadata_shard_birth_parent_storage(
+        &mut self,
+        desired: &DfsMetadataShardConfig,
+    ) -> Result<Option<(String, Option<KvEntry>)>, KvError> {
+        let shards = self.list_metadata_shards(&desired.file_system_id).await?;
+        let Some(parent) = metadata_shard_birth_parent(desired, &shards)? else {
+            return Ok(None);
+        };
+        let key = metadata_shard_storage_key(&parent.file_system_id, &parent.shard_id);
+        let entry = self.kv.get_async(&key).await?;
+        Ok(Some((key, entry)))
     }
 
     pub async fn request_metadata_shard_primary_handoff(
@@ -4996,20 +4784,6 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         retiring: &DfsMetadataShardConfig,
         desired: &DfsMetadataShardConfig,
     ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
-        self.begin_metadata_shard_handoff_with_cause(
-            retiring,
-            desired,
-            DfsMetadataShardHandoffCause::Membership,
-        )
-        .await
-    }
-
-    pub async fn begin_metadata_shard_handoff_with_cause(
-        &mut self,
-        retiring: &DfsMetadataShardConfig,
-        desired: &DfsMetadataShardConfig,
-        cause: DfsMetadataShardHandoffCause,
-    ) -> Result<Option<DfsMetadataShardMembershipHandoff>, KvError> {
         validate_metadata_shard_cas_identity(Some(retiring), desired)?;
         if retiring == desired {
             return Err(KvError::Serialization {
@@ -5019,7 +4793,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 ),
             });
         }
-        validate_metadata_shard_handoff_cause(retiring, desired, &cause)?;
+        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
         let shard_key = metadata_shard_key(&retiring.file_system_id, &retiring.shard_id);
         let floor_key =
             metadata_shard_operation_floor_key(&retiring.file_system_id, &retiring.shard_id);
@@ -5034,14 +4808,14 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             if shard_entry.decode::<DfsMetadataShardConfig>()? != *retiring {
                 return Ok(None);
             }
-            let (catalog_compares, _) = catalog_handoff_guard(
-                self.kv.get_async(&file_system_config_key(&retiring.file_system_id)).await?, self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?, retiring, desired, &cause,
+            let proof_compare = previous_handoff_proof_compare(
+                retiring,
+                self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?,
             )?;
             if let Some(entry) = self.kv.get_async(&handoff_key).await? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
-                    && handoff.desired_shard == *desired
-                    && handoff.cause == cause)
+                    && handoff.desired_shard == *desired)
                     .then_some(handoff));
             }
             let write_set_entry = self
@@ -5054,7 +4828,6 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             let (write_set_compare, _) = metadata_handoff_write_set_ops(
                 retiring,
                 desired,
-                &cause,
                 write_set_entry.as_ref(),
                 None,
             )?;
@@ -5086,21 +4859,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 .unwrap_or(0)
                 .max(floor_sequence);
             let handoff = DfsMetadataShardMembershipHandoff {
-                cause: cause.clone(),
-                handoff_id: match &cause {
-                    DfsMetadataShardHandoffCause::Membership => sinomo_core::Id::generate(),
-                    DfsMetadataShardHandoffCause::StorageImport { cut } => {
-                        sinomo_core::Id::derived(
-                            "dfs-storage-import-handoff-v7",
-                            serde_json::to_vec(&(retiring, desired, cut)).map_err(|e| {
-                                KvError::Serialization {
-                                    detail: e.to_string(),
-                                }
-                            })?,
-                        )
-                    }
-                }
-                .to_string(),
+                cause: DfsMetadataShardHandoffCause::Membership,
+                handoff_id: sinomo_core::Id::generate().to_string(),
                 retiring_shard: retiring.clone(),
                 desired_shard: desired.clone(),
                 required_prepared_sequence,
@@ -5140,7 +4900,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             compares.extend(
                 metadata_prepared_operation_admission_compares_async(self.kv, desired).await?,
             );
-            compares.extend(catalog_compares);
+            compares.push(proof_compare);
             let response = self
                 .kv
                 .txn_async(KvTxn {
@@ -5196,7 +4956,6 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         if metadata_handoff_write_set_ops(
             retiring,
             &handoff.desired_shard,
-            &handoff.cause,
             write_set_entry.as_ref(),
             None,
         )
@@ -5291,7 +5050,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             return Ok(false);
         };
         let handoff = handoff_entry.decode::<DfsMetadataShardMembershipHandoff>()?;
-        validate_metadata_shard_handoff_cause(retiring, desired, &handoff.cause)?;
+        validate_metadata_shard_cas_reconfiguration(retiring, desired)?;
         if handoff.retiring_shard != *retiring || handoff.desired_shard != *desired {
             return Ok(false);
         }
@@ -5317,7 +5076,6 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         let (write_set_compare, write_set_put) = metadata_handoff_write_set_ops(
             retiring,
             desired,
-            &handoff.cause,
             write_set_entry.as_ref(),
             Some(&proof),
         )?;
@@ -5359,7 +5117,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         ];
         compares
             .extend(metadata_prepared_operation_admission_compares_async(self.kv, desired).await?);
-        let mut success: Vec<KvOp> = vec![
+        let success: Vec<KvOp> = vec![
                     KvOp::put_serde(shard_key, desired, None)?,
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
                     KvOp::put_serde(proof_key, &proof, None)?,
@@ -5368,17 +5126,12 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 .into_iter()
                 .chain(write_set_put)
                 .collect();
-        let (catalog_compares, catalog_config) = catalog_handoff_guard(
-            self.kv.get_async(&file_system_config_key(&retiring.file_system_id)).await?, self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?, retiring, desired, &handoff.cause,
-        )?;
-        compares.extend(catalog_compares);
         // A membership handoff changes serving authority, not path
-        // assignment, so it does not advance the catalog generation. Only
-        // the filesystem-wide storage import still counts its activations
-        // in that generation, until that mechanism is removed.
-        if matches!(handoff.cause, DfsMetadataShardHandoffCause::StorageImport { .. }) {
-            success.push(catalog_handoff_successor(&catalog_config)?);
-        }
+        // assignment, so it does not advance the catalog generation.
+        compares.push(previous_handoff_proof_compare(
+            retiring,
+            self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?,
+        )?);
         Ok(self
             .kv
             .txn_async(KvTxn {
@@ -5688,28 +5441,36 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     }
 }
 
-/// A native birth records the shard's storage at the same time as its
-/// assignment: the generation genesis stages, Active through its own committed
-/// genesis. The record must be absent, so a retained record is never replaced
-/// by a birth.
-fn append_native_genesis_shard_storage(
+/// A birth records the shard's storage at the same time as its assignment:
+/// the generation genesis stages, Active through its own committed genesis.
+/// The record must be absent, so a retained record is never replaced by a
+/// birth. A path-prefix birth also compares the storage record of the shard
+/// that owns its parent path, read as `parent`
+/// ([`metadata_shard_birth_parent_storage_compare`]); `false` refuses the
+/// birth.
+fn append_metadata_shard_birth_storage(
     desired: &DfsMetadataShardConfig,
-    captured: Option<&crate::DfsMetadataStorageState>,
+    parent: Option<(String, Option<KvEntry>)>,
     compares: &mut Vec<KvCompare>,
     success: &mut Vec<KvOp>,
-) -> Result<(), KvError> {
+) -> Result<bool, KvError> {
+    if let Some((key, entry)) = parent {
+        let Some(compare) = metadata_shard_birth_parent_storage_compare(key, entry)? else {
+            return Ok(false);
+        };
+        compares.push(compare);
+    }
     let key = metadata_shard_storage_key(&desired.file_system_id, &desired.shard_id);
-    let activation = captured.and_then(|storage| storage.active_descriptor());
     let record = crate::DfsMetadataShardStorage::native_genesis(
         desired,
-        crate::storage_generation::native_genesis_generation_identity(desired, activation.as_ref()),
+        crate::storage_generation::native_genesis_generation_identity(desired),
     );
     record
         .validate_against(desired)
         .map_err(|error| KvError::Serialization { detail: error.to_string() })?;
     compares.push(KvCompare::Missing { key: key.clone() });
     success.push(KvOp::put_serde(key, &record, None)?);
-    Ok(())
+    Ok(true)
 }
 
 /// The shard a native birth adds its root directory under: the owner of the
@@ -5740,15 +5501,16 @@ fn metadata_shard_birth_parent(
 }
 
 /// The compare a birth adds on its parent shard's storage record, read as
-/// `entry` at `key`: the exact Active record, or its absence while the parent
-/// is still admitted without one. `None` refuses the birth: a Converting
-/// parent is closed, and its contributions stay fixed until it is Active.
+/// `entry` at `key`: the exact Active record. `None` refuses the birth: a
+/// parent with no record holds storage that migration has yet to convert, a
+/// Converting parent is closed, and either one's contributions stay fixed
+/// until it is Active.
 fn metadata_shard_birth_parent_storage_compare(
     key: String,
     entry: Option<KvEntry>,
 ) -> Result<Option<KvCompare>, KvError> {
     let Some(entry) = entry else {
-        return Ok(Some(KvCompare::Missing { key }));
+        return Ok(None);
     };
     if !entry.decode::<crate::DfsMetadataShardStorage>()?.is_active() {
         return Ok(None);
@@ -5773,56 +5535,37 @@ fn validate_metadata_shard_cas_identity(
     Ok(())
 }
 
-/// Validate a proof-carrying metadata handoff configuration delta.
-///
-/// A handoff is either a same-primary membership or persisted-codec upgrade, or
-/// a pure role rotation over the exact existing member ring. Assignment and
-/// policy changes are separate administrative decisions. Mixing a primary move
-/// with a membership change would make the promoted-prefix proof ambiguous, so
-/// it is rejected.
-///
-/// Packed-v1 activation is intentionally one-way for now. A rollback also
-/// needs a canonical snapshot/replay floor beyond every packed record before an
-/// older binary may reopen the shard. The current handoff proof does not carry
-/// that stronger evidence, so accepting a packed-to-legacy transition would
-/// advertise a downgrade that is not actually restart-safe.
-fn validate_metadata_shard_handoff_cause(
+/// The compare a handoff transaction makes on the shard's last completed
+/// handoff proof, as read before it: the exact bytes, or the absence. A
+/// handoff that completes in between fails the transaction.
+fn previous_handoff_proof_compare(
     retiring: &DfsMetadataShardConfig,
-    desired: &DfsMetadataShardConfig,
-    cause: &DfsMetadataShardHandoffCause,
-) -> Result<(), KvError> {
-    match cause {
-        DfsMetadataShardHandoffCause::Membership => {
-            validate_metadata_shard_cas_reconfiguration(retiring, desired)
-        }
-        DfsMetadataShardHandoffCause::StorageImport { cut } => {
-            let mut next = retiring.clone();
-            next.epoch = retiring
-                .epoch
-                .checked_add(1)
-                .ok_or_else(|| KvError::Serialization {
-                    detail: "storage import owner epoch is exhausted".into(),
-                })?;
-            let digest = |value: &str| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-            };
-            if cut.storage_transition_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 1024 || id.contains('\0'))
-                || *desired != next
-                || !digest(&cut.source_cut_digest)
-                || !digest(&cut.pending_mapping_digest)
-                || cut.source_state_fingerprint.is_empty()
-                || cut.converted_image_fingerprint.is_empty()
-                || cut.target_prefix.version != 2
-                || !cut.target_prefix.is_well_formed()
-                || cut.target_prefix.journal_sequence < cut.source_journal_sequence
-            {
-                return Err(KvError::Serialization { detail: "storage import requires an exact next epoch, unchanged assignment and complete source/image/pending cut".into() });
-            }
-            Ok(())
-        }
+    previous: Option<KvEntry>,
+) -> Result<KvCompare, KvError> {
+    let key =
+        metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id);
+    let Some(previous) = previous else {
+        return Ok(KvCompare::Missing { key });
+    };
+    if previous.key != key {
+        return Err(KvError::Serialization {
+            detail: "metadata handoff returned foreign completed proof".into(),
+        });
     }
+    previous.decode::<DfsMetadataShardMembershipHandoffProof>()?;
+    Ok(KvCompare::ValueEquals {
+        key,
+        value: previous.value,
+    })
 }
 
+/// Validate a proof-carrying metadata handoff configuration delta.
+///
+/// A handoff is either a same-primary membership change or a pure role
+/// rotation over the exact existing member ring. Assignment and policy changes
+/// are separate administrative decisions. Mixing a primary move with a
+/// membership change would make the promoted-prefix proof ambiguous, so it is
+/// rejected.
 fn validate_metadata_shard_cas_reconfiguration(
     expected: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
@@ -6335,27 +6078,9 @@ fn normalize_metadata_shard_membership_handoff_proof(
             ),
         });
     };
-    let expected_target = match &handoff.cause {
-        DfsMetadataShardHandoffCause::Membership => (
-            retiring_fence.journal_sequence,
-            retiring_fence.state_fingerprint.as_str(),
-        ),
-        DfsMetadataShardHandoffCause::StorageImport { cut } => {
-            if retiring_fence.journal_sequence != cut.source_journal_sequence
-                || retiring_fence.state_fingerprint != cut.source_state_fingerprint
-            {
-                return Err(KvError::Serialization {
-                    detail: "storage import retiring fence differs from its captured source cut"
-                        .into(),
-                });
-            }
-            (
-                cut.target_prefix.journal_sequence,
-                cut.converted_image_fingerprint.as_str(),
-            )
-        }
-    };
-    if proof.journal_sequence != expected_target.0 || proof.state_fingerprint != expected_target.1 {
+    if proof.journal_sequence != retiring_fence.journal_sequence
+        || proof.state_fingerprint != retiring_fence.state_fingerprint
+    {
         return Err(KvError::Serialization {
             detail: format!(
                 "metadata shard {} membership handoff proof does not carry the exact retiring-primary fenced head",
@@ -7049,7 +6774,6 @@ mod tests {
         ] {
             let config = DfsFileSystemConfig {
                 catalog_generation: 0,
-                metadata_storage: None,
                 file_system_id: DfsFileSystemId::generate(),
                 display_name: "structural-policy-DATA".into(),
                 owner_node_id: owner.clone(),
@@ -7413,7 +7137,6 @@ mod tests {
     ) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -7967,112 +7690,6 @@ mod tests {
         copy_native_member_fixture_data(kv, node_ids.into_iter().cloned().collect());
     }
 
-    #[cfg(feature = "storage-conversion")]
-    #[test]
-    fn converter_placement_plan_is_the_normal_native_publication_transaction() {
-        let (native, service, shard) = crate::test_support::current_native_metadata_service(
-            "native-placement-input-plan",
-            1,
-            "/",
-        )
-        .unwrap();
-        let control = native.shared_control_plane().unwrap();
-        let candidates = control
-            .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut()).cluster_view())
-            .unwrap()
-            .content_nodes;
-        assert!(
-            !candidates.is_empty(),
-            "the mounted normal content advertisement must exist"
-        );
-        let config = control
-            .with_client(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut()).get_file_system_config(&shard.file_system_id)
-            })
-            .unwrap()
-            .unwrap();
-        // Complete the normal empty-queue initialization before capturing the
-        // publication DATA baseline. The same maintenance producer can do this
-        // concurrently; its legitimate CAS retry is not another publication.
-        control.with_client(|kv| {
-            let mut store = DfsControlPlaneStore::new(kv.as_mut());
-            assert!(
-                store
-                    .next_placement_reconciliation(&shard.file_system_id, &config)
-                    .unwrap()
-                    .is_none()
-            );
-            let entry = store
-                .kv
-                .get(&placement_reconciliation_queue_key(&shard.file_system_id))
-                .unwrap()
-                .unwrap();
-            let queue: DfsPlacementReconciliationQueue = entry.decode().unwrap();
-            assert_eq!(
-                queue.schema_version,
-                PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION
-            );
-            assert!(queue.job_ids.is_empty());
-        });
-        let now = crate::dfs_now_unix_nanos();
-        let job = build_placement_reconciliation_job(
-            sinomo_core::Id::generate().to_string(),
-            &config,
-            "/services".into(),
-            crate::DfsPlacementScope::SelfOnly,
-            BTreeSet::new(),
-            candidates,
-            None,
-            now,
-        )
-        .unwrap();
-        let plan = DfsPlacementUpdatePlan::new(&config, &config, &job).unwrap();
-        let entries = control
-            .with_client(|kv| kv.get_consistent(plan.keys()))
-            .unwrap();
-        let queued_keys = plan.queued_job_keys(entries.clone()).unwrap().unwrap();
-        let queued = control
-            .with_client(|kv| kv.get_consistent(&queued_keys))
-            .unwrap();
-        let expected = plan.transaction(entries.clone(), queued).unwrap().unwrap();
-        let submitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let copied = std::sync::Arc::clone(&submitted);
-        let job_key = placement_reconciliation_key(&job.file_system_id, &job.job_id);
-        let hook = native
-            .native_kv_request_hook(&shard.primary_node_id, move |request| {
-                if request.txn.success.iter().any(|op| {
-                    matches!(op,
-                KvOp::Put { key, .. } if key == &job_key)
-                }) {
-                    copied.lock().unwrap().push(request.txn.clone());
-                }
-                Ok(())
-            })
-            .unwrap();
-        assert!(
-            control
-                .with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
-                    .compare_and_put_placement_update(&config, &config, &job))
-                .unwrap()
-        );
-        assert_eq!(submitted.lock().unwrap().as_slice(), &[expected]);
-        drop(hook);
-        let mut wrong_scope = entries.clone();
-        wrong_scope[0].as_mut().unwrap().key.push_str("-unrelated");
-        assert!(plan.transaction(wrong_scope, Vec::new()).is_err());
-        let mut present_permit = entries;
-        let mut actual_entry = present_permit[0].as_ref().unwrap().clone();
-        actual_entry.key = plan.keys()[5].clone();
-        present_permit[5] = Some(actual_entry);
-        assert!(
-            plan.transaction(present_permit, Vec::new()).is_err(),
-            "data planning cannot relax the normal Missing permit predicate"
-        );
-        drop(service);
-        drop(control);
-        native.close().unwrap();
-    }
-
     #[test]
     fn current_placement_job_requires_exact_config_and_candidate_fields() {
         let owner = node("required-current-placement-fields");
@@ -8131,7 +7748,6 @@ mod tests {
         let file_system_id = file_system_id();
         let expected = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8400,7 +8016,6 @@ mod tests {
         let owner = node("placement-activity-monotonic-partial-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id.clone(),
@@ -8758,7 +8373,6 @@ mod tests {
         store
             .put_file_system_config(&DfsFileSystemConfig {
                 catalog_generation: 0,
-                metadata_storage: None,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: custom.file_system_id.clone(),
@@ -8777,7 +8391,6 @@ mod tests {
 
         let defaults = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: custom.file_system_id.clone(),
@@ -8818,7 +8431,6 @@ mod tests {
         let owner = node("placement-publication-deleted-policy-owner");
         let deleted = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -8925,7 +8537,6 @@ mod tests {
         let owner = node("placement-permit-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9024,7 +8635,6 @@ mod tests {
         let owner = node("placement-stale-observed-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9107,7 +8717,6 @@ mod tests {
         let owner = node("placement-permanent-permit-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9216,7 +8825,6 @@ mod tests {
         let owner = node("placement-release-recovery-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9297,7 +8905,6 @@ mod tests {
         let owner = node("placement-ambiguous-acquisition-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9419,7 +9026,6 @@ mod tests {
         let owner = node("placement-prior-process-owner");
         let base = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9887,7 +9493,6 @@ mod tests {
         copy_native_member_fixture_data(&mut kv, vec![node("node_owner"), node("node_replica")]);
         let file_system = DfsFileSystem {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: file_system_id(),
@@ -9923,7 +9528,7 @@ mod tests {
             control
                 .get_file_system_config(&file_system.file_system_id)
                 .expect("get filesystem config"),
-            Some(metadata_catalog_generation_successor(&file_system_config).unwrap())
+            Some(catalog::metadata_catalog_generation_successor(&file_system_config).unwrap())
         );
         assert_eq!(
             control
@@ -10603,30 +10208,6 @@ mod tests {
         })
         .join()
         .expect("actual native control-plane DATA producer")
-    }
-
-    #[test]
-    fn ordinary_filesystem_updates_preserve_and_cannot_author_count_activation() {
-        // Configuration DATA only; these comparisons grant no maintenance CAS.
-        let mut current = DfsFileSystemConfig::from(&crate::DfsFileSystem::sifs(node("count-config-owner")));
-        current.metadata_storage = Some(crate::DfsMetadataStorageState::Active {
-            generation: "original-generation".into(), target_format: 12, catalog_generation: 0,
-            activation_digest: format!("blake3:{}", "a".repeat(64)),
-        });
-        let mut ordinary = current.clone();
-        ordinary.metadata_storage = None;
-        ordinary.display_name = "renamed".into();
-        let merged = merge_file_system_config_publication(Some(&current), &ordinary);
-        assert_eq!(merged.metadata_storage, current.metadata_storage);
-        assert_eq!(merged.display_name, "renamed");
-        assert_eq!(merge_file_system_config_defaults(Some(&current), &ordinary).metadata_storage,
-            current.metadata_storage);
-        assert!(validate_ordinary_metadata_storage(Some(&current), &merged).is_ok());
-        assert!(validate_ordinary_metadata_storage(None, &current).is_err());
-        assert!(validate_ordinary_metadata_storage(Some(&current), &ordinary).is_err());
-        let mut replacement = current.clone();
-        if let Some(crate::DfsMetadataStorageState::Active { generation, .. }) = replacement.metadata_storage.as_mut() { *generation = "another-generation".into(); }
-        assert!(validate_ordinary_metadata_storage(Some(&current), &replacement).is_err());
     }
 
     fn seed_catalog_fixture_config(kv: &mut InProcessKvStore) {
@@ -12320,7 +11901,7 @@ mod tests {
         };
         let active = crate::DfsMetadataShardStorage::native_genesis(
             &users,
-            crate::storage_generation::native_genesis_generation_identity(&users, None),
+            crate::storage_generation::native_genesis_generation_identity(&users),
         );
         assert_eq!(
             metadata_shard_birth_parent_storage_compare(key.clone(), Some(entry(&active))).unwrap(),
@@ -12331,8 +11912,8 @@ mod tests {
         );
         assert_eq!(
             metadata_shard_birth_parent_storage_compare(key.clone(), None).unwrap(),
-            Some(KvCompare::Missing { key: key.clone() }),
-            "a parent still admitted without a record keeps that absence"
+            None,
+            "a parent without a record holds storage migration has yet to convert"
         );
         let converting = crate::DfsMetadataShardStorage::converting_for_test(&users, 3);
         assert_eq!(

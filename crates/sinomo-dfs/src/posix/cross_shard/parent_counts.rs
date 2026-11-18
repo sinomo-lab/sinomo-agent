@@ -564,7 +564,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let next_frame = job.pending_frames.last().cloned();
             if let Some(frame) = &next_frame
                 && !self.is_namespace_job_coordinator_shard(job, &current)
-                && self.metadata_shard_storage_is_converting(&current)?
+                && self.shard_storage_record_is_closed(&current)?
             {
                 return Err(self.park_namespace_step_on_shard_storage(
                     job,

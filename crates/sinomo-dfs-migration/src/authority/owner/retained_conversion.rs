@@ -5,8 +5,7 @@
 //! `.metadata-retained/shard-conversion-<attempt>` and puts the image in its
 //! place. That copy is the shard's retained original. It is recorded as a
 //! `RetainedOriginal` artifact once the shard's storage record is Active for
-//! that attempt and the local copy holds that attempt's activated generation;
-//! the decision reads the shard's storage record, not a filesystem cohort.
+//! that attempt and the local copy holds that attempt's activated generation.
 //! Recording grants no serving or collection permit.
 use super::*;
 use sinomo_dfs::{DfsMetadataGenerationHeader, DfsMetadataShardStorage};
@@ -97,15 +96,16 @@ impl MigrationOwner {
     }
 
     /// Record the retained original beside `destination` when its copy holds
-    /// an activated per-shard conversion. Returns whether it does.
-    pub(super) fn record_shard_conversion_original(&self, destination: &Path) -> Result<bool> {
+    /// an activated per-shard conversion: the old copy the conversion kept,
+    /// as a retained original of that activated generation.
+    pub(super) fn record_shard_conversion_original(&self, destination: &Path) -> Result<()> {
         let Some((header, attempt_id)) = self.retained_conversion_of(destination)? else {
-            return Ok(false);
+            return Ok(());
         };
         let retained = self.retained_conversion_root(&attempt_id);
         if !retained.is_dir() {
             // This copy kept no old copy, as a member without one does.
-            return Ok(true);
+            return Ok(());
         }
         let job = job_reference(self, destination, &header)?;
         let unit = inventory::UnitKey {
@@ -137,7 +137,7 @@ impl MigrationOwner {
             .lock()
             .map_err(error)?
             .finish(&unit.id()?, reference);
-        Ok(true)
+        Ok(())
     }
 
     /// Whether `reference` is the retained original of a per-shard
@@ -282,7 +282,6 @@ mod tests {
                 state: if activated {
                     sinomo_dfs::DfsMetadataGenerationState::Active {
                         activation_digest: "f".repeat(64),
-                        standalone_seal: None,
                     }
                 } else {
                     sinomo_dfs::DfsMetadataGenerationState::Staged {

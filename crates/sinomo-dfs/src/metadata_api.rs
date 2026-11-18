@@ -269,10 +269,7 @@ impl DfsSelectedOriginalDataLayout {
 /// may mutate; independently opened stale instances remain fenced. Read,
 /// snapshot, prefix-proof, and replication-cursor operations remain usable.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-#[serde(
-    into = "DfsMetadataShardWriteFreezeWire",
-    try_from = "DfsMetadataShardWriteFreezeWire"
-)]
+#[serde(deny_unknown_fields)]
 pub struct DfsMetadataShardWriteFreeze {
     pub handoff_id: String,
     pub retiring_epoch: u64,
@@ -339,63 +336,9 @@ impl DfsMetadataShardWriteFreeze {
     }
 }
 
-// The current producer emits the unwrapped cooperative marker. Historical
-// repair-custody envelopes are decoded only by the migration owner.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-enum DfsMetadataShardWriteFreezeWire {
-    // A local recovery fence envelope is never a cooperative marker. Its
-    // recognition fails the read closed, even for a malformed or mixed payload
-    // that another envelope would otherwise accept.
-    LocalRecoveryV1 {
-        selected_local_recovery_fence_v1: LocalRecoveryFenceTag,
-    },
-    SelectedOriginalDataV2 {
-        selected_original_data_v2: DfsMetadataShardWriteFreezePayload,
-    },
-    Current(DfsMetadataShardWriteFreezePayload),
-}
-
-struct LocalRecoveryFenceTag;
-impl<'de> serde::Deserialize<'de> for LocalRecoveryFenceTag {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        let _ = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self)
-    }
-}
-impl serde::Serialize for LocalRecoveryFenceTag {
-    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        Err(serde::ser::Error::custom("local recovery recognition cannot serialize a cooperative marker"))
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DfsMetadataShardWriteFreezePayload {
-    handoff_id: String,
-    retiring_epoch: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    activated_epoch: Option<u64>,
-    journal_sequence: u64,
-    state_fingerprint: String,
-    rebind_prefix_proof: crate::DfsMetadataPrefixProof,
-}
-
-impl From<DfsMetadataShardWriteFreeze> for DfsMetadataShardWriteFreezeWire {
-    fn from(value: DfsMetadataShardWriteFreeze) -> Self {
-        Self::Current(DfsMetadataShardWriteFreezePayload {
-            handoff_id: value.handoff_id,
-            retiring_epoch: value.retiring_epoch,
-            activated_epoch: value.activated_epoch,
-            journal_sequence: value.journal_sequence,
-            state_fingerprint: value.state_fingerprint,
-            rebind_prefix_proof: value.rebind_prefix_proof,
-        })
-    }
-}
-
-/// Explicit selected-owner codec. The ordinary Deserialize above deliberately
-/// rejects this envelope; callers cannot select this reader from wire contents.
+/// Read a shard's freeze marker. A selected layout reads it only from its
+/// admitted stage; without one, a root of a selected layout is refused. The
+/// caller selects the layout; the marker's contents never do.
 pub(crate) fn read_handoff_freeze_with_layout(
     path: &std::path::Path,
     layout: Option<&DfsSelectedOriginalDataLayout>,
@@ -449,29 +392,6 @@ fn check_handoff_layout_path(layout: &DfsSelectedOriginalDataLayout, path: &std:
     let stage = stages.values().find(|stage| stage.root() == root)
         .ok_or_else(|| selected_layout_rejection("selected freeze has no admitted physical stage"))?;
     stage.check().map_err(|error| selected_layout_rejection(error.to_string()))
-}
-
-impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
-    type Error = &'static str;
-    fn try_from(wire: DfsMetadataShardWriteFreezeWire) -> std::result::Result<Self, Self::Error> {
-        let payload = match wire {
-            DfsMetadataShardWriteFreezeWire::LocalRecoveryV1 { .. } => {
-                return Err("selected local recovery fence is not a cooperative handoff");
-            }
-            DfsMetadataShardWriteFreezeWire::SelectedOriginalDataV2 {
-                selected_original_data_v2: payload,
-            }
-            | DfsMetadataShardWriteFreezeWire::Current(payload) => payload,
-        };
-        Ok(Self {
-            handoff_id: payload.handoff_id,
-            retiring_epoch: payload.retiring_epoch,
-            activated_epoch: payload.activated_epoch,
-            journal_sequence: payload.journal_sequence,
-            state_fingerprint: payload.state_fingerprint,
-            rebind_prefix_proof: payload.rebind_prefix_proof,
-        })
-    }
 }
 
 /// Capability for one replica ingest from an already validated active source.
@@ -677,7 +597,6 @@ impl DfsMetadataReplicaIngestPermit {
             identity: identity.clone(),
             state: crate::storage_generation::GenerationState::Active {
                 activation_digest: catalog.generation_activation_digest(identity, tables)?,
-                standalone_seal: None,
             },
         })
     }
@@ -702,14 +621,14 @@ impl DfsMetadataReplicaIngestPermit {
         self.epoch_start.as_ref()
     }
 
-    pub(crate) fn snapshot_replaces_imported_prefix(
+    pub(crate) fn snapshot_replaces_converted_prefix(
         &self, original: &DfsMetadataPrefixProof, snapshot: &crate::DfsMetadataSnapshotImageDescriptor,
     ) -> bool {
         snapshot.generation.shard_id == self.shard_id
             && self.namespace_catalog.as_ref().is_some_and(|catalog|
                 catalog.matches_ingress_scope(&self.file_system_id, &self.shard_id,
                     &self.source_node_id, self.source_epoch)
-                    && catalog.snapshot_replaces_imported_prefix(original, snapshot))
+                    && catalog.snapshot_replaces_converted_prefix(original, snapshot))
     }
 
     /// Epoch to record in a floor acknowledged under this permit: the source

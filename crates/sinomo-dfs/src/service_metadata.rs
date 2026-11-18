@@ -821,7 +821,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut matching = None;
         for record in backend.prepared_operation_reservations(proposed)? {
             let original = record.payload.as_ref();
-            // prepare_payload_for_publication can append this captured row
+            // prepare_payload_for_publication_with_file_system can append this captured row
             // after the producer's receipt/location payload was constructed.
             // No explicitly requested filesystem effect is ignored: proposed
             // is restricted to the receipt-producer shapes above.
@@ -1103,11 +1103,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(kv) = self.control_plane.as_mut() {
             let mut store = DfsControlPlaneStore::new(kv.as_mut());
             let current = store.get_file_system_config(&file_system.file_system_id)?;
-            let activation = current.as_ref().and_then(|config| config.metadata_storage.clone());
-            if file_system.metadata_storage.as_ref().is_some_and(|claimed| Some(claimed) != activation.as_ref()) {
-                return Err(DfsError::Metadata { message: "ordinary filesystem publication cannot author metadata storage generation".into() });
-            }
-            file_system.metadata_storage = activation;
             file_system.catalog_generation = current.as_ref().map_or(0, |config| config.catalog_generation);
             let config = DfsFileSystemConfig::from(&file_system);
             if current.as_ref().is_none_or(|current| {
@@ -1127,12 +1122,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         } else {
-            let activation = self.metadata.filesystems.get(&file_system.file_system_id)
-                .and_then(|current| current.metadata_storage.clone());
-            if file_system.metadata_storage.as_ref().is_some_and(|claimed| Some(claimed) != activation.as_ref()) {
-                return Err(DfsError::Metadata { message: "ordinary filesystem publication cannot author metadata storage generation".into() });
-            }
-            file_system.metadata_storage = activation;
             file_system.catalog_generation = self.metadata.filesystems.get(&file_system.file_system_id)
                 .map_or(0, |current| current.catalog_generation);
             scopes.push(DfsPreparedOperationScope {
@@ -3142,7 +3131,6 @@ mod filesystem_preparation_recovery_tests {
                 .get_file_system_config(&shard.file_system_id).unwrap().unwrap()
         });
         requested.catalog_generation = current.catalog_generation;
-        requested.metadata_storage = current.metadata_storage;
         requested.display_name = "actual independent filesystem requests".into();
         // Filesystem publication belongs to the store-backed owning service.
         let mut requester = native.metadata_primary_service("/").unwrap();

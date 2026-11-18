@@ -32,9 +32,6 @@ impl ShardConversionEnv for Owned<'_> {
     fn submit(&self, request: &KvTxnRequest) -> Result<Submitted> {
         self.env.submit(request)
     }
-    fn local_copy_current(&self, shard: &DfsMetadataShardConfig) -> Result<bool> {
-        self.env.local_copy_current(shard)
-    }
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         self.env.capture(shard)
     }

@@ -5,6 +5,7 @@ use super::*;
 mod closed_copies;
 mod destination_reservation;
 mod fence_commit;
+mod finish_after_birth;
 mod job_events;
 mod namespace_counts;
 mod parent_counts;

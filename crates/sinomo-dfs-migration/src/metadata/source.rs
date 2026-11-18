@@ -34,15 +34,6 @@ pub(super) struct SourceFile {
     pub identity: Option<(u64, u64)>,
     kind: Kind,
 }
-impl SourceFile {
-    /// Immutable journal frames and the sequence cursor are DATA. Physical
-    /// writer freezes, admission bindings and acknowledgements stay with their
-    /// actual source owner and are never copied as target authority.
-    pub(super) fn is_native_journal_data(&self) -> bool {
-        matches!(self.kind, Kind::JournalSegment | Kind::JournalLoose)
-            || self.relative == Path::new("journal/head.sobj")
-    }
-}
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct SourceInventory {
     pub files: Vec<SourceFile>,
@@ -88,22 +79,6 @@ pub(crate) enum SourceRecord {
         relative: PathBuf,
         value: Value,
     },
-}
-impl SourceRecord {
-    pub(crate) fn raw_document_context(
-        &self,
-    ) -> Result<Option<super::source_document::SourceDocumentContext<'_>>> {
-        use SourceRecord::*;
-        match self {
-            SnapshotRow { raw_document, .. }
-            | LooseRow { raw_document, .. }
-            | TableBatch { raw_document, .. } => raw_document.context().map(Some),
-            JournalFrame { exact_bytes, .. } => {
-                super::source_document::SourceDocumentContext::new(exact_bytes, "").map(Some)
-            }
-            SnapshotHeader(_) | Evidence { .. } => Ok(None),
-        }
-    }
 }
 fn invalid(message: impl std::fmt::Display) -> MetadataBackendError {
     MetadataBackendError::Serde(message.to_string())
@@ -335,8 +310,8 @@ impl SourceCursor {
             ..Default::default()
         }
     }
-    /// Persist only decoder position; source inventory is independently rebuilt
-    /// from the held source when a membership witness is checked.
+    /// Only the decoder position, without the source inventory: what a source
+    /// event records and its replay compares against the actual decoder.
     pub(super) fn point(&self) -> Self {
         Self {
             inventory: None,
@@ -356,66 +331,6 @@ impl SourceCursor {
         self.plain = None;
         self.stream = None;
         self.header_delivered = false;
-    }
-}
-/// A decoder boundary captured by an actual sequential source read. This is
-/// never serialized into unsigned stage evidence; its owning membership keeps
-/// the same source writer and immutable inventory alive.
-#[derive(Clone, Debug)]
-pub(super) struct VerifiedRecordPoint {
-    point: SourceCursor,
-}
-impl VerifiedRecordPoint {
-    pub(super) fn key(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&self.point).map_err(invalid)
-    }
-    pub(super) fn read(&self, root: &Path, inventory: &SourceInventory) -> Result<SourceRecord> {
-        // Retain the complete actual source mutation check. Only reconstruction
-        // of preceding decoder boundaries is shared with the verified replay.
-        inventory.verify(root)?;
-        let mut cursor = self.point.clone();
-        cursor.inventory = Some(inventory.clone());
-        next(root, &mut cursor)?
-            .ok_or_else(|| invalid("verified source boundary is beyond its immutable cut"))
-    }
-}
-pub(super) fn next_verified(
-    root: &Path,
-    cursor: &mut SourceCursor,
-) -> Result<Option<(VerifiedRecordPoint, SourceRecord)>> {
-    let point = cursor.point();
-    Ok(next(root, cursor)?.map(|record| (VerifiedRecordPoint { point }, record)))
-}
-
-pub(super) fn read_at_point(root: &Path, point: &SourceCursor) -> Result<SourceRecord> {
-    let inventory = discover(root)?;
-    if point.file_index >= inventory.files.len() {
-        return Err(invalid("source membership point is beyond its cut"));
-    }
-    // A serialized decoder position is a hint, not a structural certificate.
-    // In particular its table label/row kind must not relabel opaque bytes as
-    // a version row. Reconstruct that state from the actual file boundary.
-    let mut cursor = SourceCursor::new(inventory);
-    cursor.file_index = point.file_index;
-    loop {
-        if cursor.file_index != point.file_index {
-            return Err(invalid(
-                "source membership point is not an actual record boundary",
-            ));
-        }
-        if cursor.offset == point.offset
-            && cursor.header_delivered == point.header_delivered
-            && serde_json::to_value((&cursor.plain, &cursor.stream)).map_err(invalid)?
-                == serde_json::to_value((&point.plain, &point.stream)).map_err(invalid)?
-        {
-            return next(root, &mut cursor)?
-                .ok_or_else(|| invalid("source membership point is beyond its cut"));
-        }
-        if next(root, &mut cursor)?.is_none() {
-            return Err(invalid(
-                "source membership point is not an actual record boundary",
-            ));
-        }
     }
 }
 impl SourceInventory {
@@ -791,31 +706,6 @@ fn next_inner(root: &Path, cursor: &mut SourceCursor) -> Result<Option<SourceRec
     }
 }
 
-/// Read only known original journal families for a modeled-source fixture.
-/// The complete captured donor inventory is still verified on both sides; this
-/// decoder subset is observation DATA and is never a source-authority claim.
-#[cfg(test)]
-pub(super) fn fixture_journal_frames(root: &Path) -> Result<Vec<SourceRecord>> {
-    let captured = discover(root)?;
-    captured.verify(root)?;
-    let mut journal = captured.clone();
-    journal
-        .files
-        .retain(|file| matches!(file.kind, Kind::JournalSegment | Kind::JournalLoose));
-    let mut cursor = SourceCursor::new(journal);
-    let mut frames = Vec::new();
-    while let Some(record) = next(root, &mut cursor)? {
-        if !matches!(record, SourceRecord::JournalFrame { .. }) {
-            return Err(invalid(
-                "original fixture journal decoder returned another family",
-            ));
-        }
-        frames.push(record);
-    }
-    captured.verify(root)?;
-    Ok(frames)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,7 +921,7 @@ mod tests {
             {
                 let decoded: Value = raw_document.decoded_value().unwrap();
                 assert_eq!(&decoded, row);
-                assert!(matches!(record.raw_document_context().unwrap().unwrap()
+                assert!(matches!(raw_document.context().unwrap()
                     .raw_payload_wire("/module_metadata/module/payload").unwrap(),
                     super::super::source_document::SourcePayloadWire::CanonicalBytes(value) if value==b"null"));
             }

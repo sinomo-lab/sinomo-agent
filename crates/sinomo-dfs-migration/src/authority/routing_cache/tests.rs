@@ -1,6 +1,6 @@
 use super::actual_docker_fixture::ORIGINAL;
 use super::*;
-use crate::authority::placement_work::native_tests::{native_migration_cluster, canonical_migration_runtime};
+use crate::authority::native_fixtures::{native_migration_cluster, canonical_migration_runtime};
 use sinomo_dfs::DfsStoragePreparationScope;
 
 fn archive(authority: &NativeImportAuthority, bytes: &[u8]) -> PathBuf {

@@ -871,6 +871,98 @@ fn cross_shard_alias_rename_reads_the_target_record_while_the_target_still_serve
     cluster.close();
 }
 
+/// A shard with no storage record holds storage that migration has yet to
+/// convert, so it is closed as a converting shard is: the coordinator reads
+/// the target's record, finds none, and refuses the move even while the
+/// target's own node still answers for the target.
+#[test]
+fn cross_shard_alias_rename_waits_while_its_target_shard_has_no_storage_record() {
+    let (mut cluster, nodes) = disjoint_shard_cluster("native-alias-rename-target-unrecorded");
+    let users_node = cluster.users_primary_node.clone();
+    let root_node = cluster.replica_node.clone();
+    let services_node = cluster.services_primary_node.clone();
+    let canonical = "/users/unrecorded-target";
+    let alias = "/unrecorded-alias";
+    let moved = "/services/unrecorded-alias";
+    cluster
+        .replica
+        .posix_write_file(
+            canonical,
+            b"unrecorded target bytes",
+            DfsWriteOptions::replicated_eventual(vec![cluster.replica_node.clone()]),
+        )
+        .unwrap();
+    cluster.replica.posix_hardlink(canonical, alias).unwrap();
+    let linked = cluster.replica.posix_namespace_lstat_distributed(alias).unwrap();
+
+    // The target's own node has not yet observed its record's removal and
+    // still answers for the target; the coordinator has.
+    let key = crate::metadata_shard_storage_key(&sifs_file_system_id(), "users");
+    let gap = cluster
+        ._runtime
+        .lose_configuration_delta_and_pause_rebuild(&users_node, key.clone())
+        .unwrap();
+    let observers = [root_node.clone(), services_node.clone()];
+    let mut kv = cluster._runtime.configuration_publisher(&root_node);
+    let active = shard_storage_entry(kv.as_mut(), "users");
+    // Test setup only: the record is removed, as for old storage that
+    // migration has yet to convert, and restored below; no conversion runs.
+    let set_record = |kv: &mut dyn DfsControlPlaneKvClient, value: Option<Vec<u8>>| {
+        let (compare, op) = match value {
+            Some(value) => (
+                sinomo_core::kv::KvCompare::Missing { key: key.clone() },
+                sinomo_core::kv::KvOp::Put { key: key.clone(), value, lease_id: None },
+            ),
+            None => (
+                sinomo_core::kv::KvCompare::ValueEquals { key: key.clone(), value: active.value.clone() },
+                sinomo_core::kv::KvOp::Delete { key: key.clone() },
+            ),
+        };
+        assert!(kv
+            .txn(KvTxn { compares: vec![compare], success: vec![op], failure: Vec::new() })
+            .unwrap()
+            .succeeded);
+        for node in &observers {
+            cluster._runtime.wait_published_configuration_current(node).unwrap();
+        }
+    };
+    set_record(kv.as_mut(), None);
+    assert!(
+        gap.dropped_delta()
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.key == key),
+        "the target's node withheld the record change"
+    );
+    let refused = cluster.replica.posix_rename(alias, moved);
+    assert!(
+        matches!(&refused, Err(DfsPosixError::Dfs(DfsError::Busy { .. }))),
+        "a target shard with no storage record is closed: {refused:?}"
+    );
+    assert_eq!(
+        node_store_object_at(&cluster._runtime, &root_node, alias).map(|object| object.object_id),
+        Some(linked.object_id.clone())
+    );
+    assert!(node_store_object_at(&cluster._runtime, &services_node, moved).is_none());
+
+    set_record(kv.as_mut(), Some(active.value.clone()));
+    gap.wait_rebuild(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    gap.release();
+    drop(gap);
+    for node in &nodes {
+        cluster._runtime.wait_published_configuration_current(node).unwrap();
+    }
+    cluster.replica.posix_rename(alias, moved).unwrap();
+    assert_eq!(
+        cluster.replica.posix_namespace_lstat_distributed(moved).unwrap().object_id,
+        linked.object_id
+    );
+    drop(kv);
+    cluster.close();
+}
+
 pub(super) fn directory_move_job(
     runtime: &crate::test_runtime::DfsTestRuntime,
     node: &NodeId,

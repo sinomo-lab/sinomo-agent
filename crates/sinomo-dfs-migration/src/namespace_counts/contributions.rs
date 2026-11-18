@@ -3,19 +3,19 @@
 //! A shard T is converted on its own. Its counts are its own owned rows plus
 //! what every other shard S contributes to them: live aliases S owns that
 //! name T's canonical objects, and live directories S owns whose parent path
-//! T owns. This is conversion DATA under the census rules, not authority;
-//! the caller keeps each source settled and fenced while its contribution is
-//! in use.
+//! T owns. This is conversion DATA under the count rules of
+//! [`super`], not authority; the caller keeps each source settled and fenced
+//! while its contribution is in use.
 //!
 //! Attribution rules:
-//! - Rows are attributed to the current catalog owner of their path, as in
-//!   the census. Ownership is compared by assignment only, so a takeover that
+//! - Rows are attributed to the current catalog owner of their path.
+//!   Ownership is compared by assignment only, so a takeover that
 //!   changes a shard's primary or epoch does not invalidate a contribution.
 //! - S reports every live alias it owns, whatever the target: S cannot tell
 //!   which shard holds a target object id. T counts an alias exactly when its
 //!   target id is one of T's live canonical rows; an alias naming any other id
-//!   is left to the shard that holds it. So, unlike the complete census, one
-//!   shard cannot detect an alias whose target no shard holds.
+//!   is left to the shard that holds it. So one shard's counts cannot detect
+//!   an alias whose target no shard holds.
 //! - A contributed child directory must name a parent path T owns, and that
 //!   parent must be a live directory in T, or the plan fails closed.
 //! - A directory that a source's Running cross-shard directory move has not
@@ -94,7 +94,7 @@ fn same_ownership(
 /// work: non-Completed jobs, Pending requests and staging intents.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SourceWork {
-    /// Refused, as the census refuses it.
+    /// Refused.
     Settled,
     /// Refused, except the rows the shard keeps for another shard's job
     /// through its conversion: target fences ([`is_kept_target_fence`]) and
@@ -152,8 +152,8 @@ fn admit_shard_source(
 }
 
 /// Extract S's contributions to `target_shard` from S's captured image, under
-/// the census rules for a single source. A source with unsettled work is
-/// refused exactly as the census refuses it.
+/// the count rules for a single source. A source with unsettled work is
+/// refused.
 pub(crate) fn contributions_from_captured(
     captured: &CapturedMetadataUnit,
     catalog: &[DfsMetadataShardConfig],
@@ -165,7 +165,7 @@ pub(crate) fn contributions_from_captured(
 
 /// [`contributions_from_captured`] for a source that may still hold
 /// non-Completed namespace jobs, Pending requests or staging intents. The
-/// rows are read under the same census rules; the caller reports the
+/// rows are read under the same count rules; the caller reports the
 /// unsettled work that touches the target beside them, so a reader never
 /// accepts these contributions while that work is in flight.
 pub(crate) fn contributions_beside_unsettled_work(
@@ -193,11 +193,11 @@ fn extract_contributions(
         ));
     }
     admit_shard_source(captured, catalog, work)?;
-    // Uniqueness is checked as in the census; the rows themselves stay borrowed.
+    // Uniqueness is checked as for the shard's own rows; the rows themselves stay borrowed.
     let mut owned = CountedRows::default();
     let mut aliases = Vec::new();
     let mut child_directories = Vec::new();
-    for object in owned_live_rows(captured, Some(catalog), limits)? {
+    for object in owned_live_rows(captured, catalog, limits)? {
         owned.insert(source_shard, object)?;
         match object.kind {
             DfsObjectKind::Hardlink => aliases.push(NamespaceCountAliasContribution {
@@ -237,7 +237,7 @@ fn extract_contributions(
 /// Counts for the one shard `target` captures: its own rows give base counts
 /// and local increments; `contributions`, one per other shard, give the
 /// foreign increments. Existing initialized counts are verified and only
-/// absent ones filled, as in the census.
+/// absent ones filled.
 pub(crate) fn plan_shard_namespace_count_maintenance(
     catalog: &[DfsMetadataShardConfig],
     target: &NamespaceCountMaintenanceSource,
@@ -255,14 +255,14 @@ pub(crate) fn plan_shard_namespace_count_maintenance(
     admit_shard_source(&target.captured, catalog, SourceWork::SettledKeepingPairRows)?;
     let shard = &target.captured.source.physical_shard;
     let mut owned = CountedRows::default();
-    for object in owned_live_rows(&target.captured, Some(catalog), limits)? {
+    for object in owned_live_rows(&target.captured, catalog, limits)? {
         owned.insert(shard, object)?;
     }
-    let mut counts = local_counts(&owned, CountScope::Shard { catalog, shard }, limits)?;
+    let mut counts = local_counts(&owned, CountScope { catalog, shard }, limits)?;
     let moves = moving::KeptMoves::new(&target.captured.projected_rows.namespace_jobs);
     add_contributed_counts(catalog, shard, &owned, &moves, contributions, &mut counts, limits)?;
     let updates = verified_count_updates(counts, owned.rows, limits)?;
-    finish_count_plan(catalog.to_vec(), std::slice::from_ref(target), updates, limits)
+    finish_count_plan(catalog.to_vec(), std::slice::from_ref(target), updates)
 }
 
 /// Per-shard activation check of a built image of `shard`: every live row
@@ -272,16 +272,15 @@ pub(crate) fn plan_shard_namespace_count_maintenance(
 pub(crate) fn validate_shard_image_counts(
     catalog: &[DfsMetadataShardConfig],
     shard: &DfsMetadataShardId,
-    file_system_ids: &[DfsFileSystemId],
     rows: &sinomo_dfs::DfsMetadataTableSnapshotTables,
     contributions: &[ShardCountContributions],
     limits: NamespaceCountMaintenanceLimits,
 ) -> Result<()> {
     let mut owned = CountedRows::default();
-    for object in owned_live_rows_in(shard, file_system_ids, rows, Some(catalog), limits)? {
+    for object in owned_live_rows_in(shard, rows, catalog, limits)? {
         owned.insert(shard, object)?;
     }
-    let mut counts = local_counts(&owned, CountScope::Shard { catalog, shard }, limits)?;
+    let mut counts = local_counts(&owned, CountScope { catalog, shard }, limits)?;
     let moves = moving::KeptMoves::new(&rows.namespace_jobs);
     add_contributed_counts(catalog, shard, &owned, &moves, contributions, &mut counts, limits)?;
     if !verified_count_updates(counts, owned.rows, limits)?.is_empty() {
@@ -353,7 +352,7 @@ pub(crate) struct ForeignParent {
 }
 
 /// What the shard `captured` holds refers to in other shards, under the
-/// census rules: aliases whose target it does not hold, and non-directory
+/// count rules: aliases whose target it does not hold, and non-directory
 /// rows whose parent path another shard owns. Each is in path order.
 pub(crate) fn foreign_references(
     captured: &CapturedMetadataUnit,
@@ -362,7 +361,7 @@ pub(crate) fn foreign_references(
 ) -> Result<(Vec<ForeignAliasTarget>, Vec<ForeignParent>)> {
     let shard = &captured.source.physical_shard;
     let mut owned = CountedRows::default();
-    for object in owned_live_rows(captured, Some(catalog), limits)? {
+    for object in owned_live_rows(captured, catalog, limits)? {
         owned.insert(shard, object)?;
     }
     let (mut aliases, mut parents) = (Vec::new(), Vec::new());
@@ -399,7 +398,7 @@ pub(crate) fn foreign_references(
 }
 
 /// What one captured shard holds under a catalog: its live canonical
-/// (non-alias) rows and live directories, by the census rules, and its
+/// (non-alias) rows and live directories, by the count rules, and its
 /// Running namespace jobs.
 #[derive(Default)]
 pub(crate) struct ShardHoldings {
@@ -450,7 +449,7 @@ pub(crate) fn shard_holdings(
     limits: NamespaceCountMaintenanceLimits,
 ) -> Result<ShardHoldings> {
     let mut holdings = ShardHoldings::default();
-    for object in owned_live_rows(captured, Some(catalog), limits)? {
+    for object in owned_live_rows(captured, catalog, limits)? {
         let key = (object.file_system_id.clone(), object.object_id.clone());
         match object.kind {
             DfsObjectKind::Hardlink => {}
@@ -695,11 +694,10 @@ mod tests {
             let mut image = source.captured.projected_rows.clone();
             image.objects = plan.counted_objects(source, limits()).unwrap();
             let id = DfsMetadataShardId::new(shard);
-            let file_systems = &source.captured.source.file_system_ids;
-            validate_shard_image_counts(&catalog, &id, file_systems, &image, &contributions, limits()).unwrap();
+            validate_shard_image_counts(&catalog, &id, &image, &contributions, limits()).unwrap();
             assert!(
                 validate_shard_image_counts(
-                    &catalog, &id, file_systems, &source.captured.projected_rows, &contributions, limits(),
+                    &catalog, &id, &source.captured.projected_rows, &contributions, limits(),
                 )
                 .is_err(),
                 "an image without its counts is refused"
@@ -719,36 +717,116 @@ mod tests {
             .map(|contribution| ShardCountContributions { child_directories: Vec::new(), ..contribution.clone() })
             .collect::<Vec<_>>();
         assert!(validate_shard_image_counts(
-            &catalog, &id, &root.captured.source.file_system_ids, &image, &partial, limits(),
+            &catalog, &id, &image, &partial, limits(),
         )
         .is_err());
     }
 
+    /// Each shard's plan counts its own rows plus the other shards'
+    /// contributions: together they cover every object once, with the root
+    /// counting the other shards' roots and the file counting the alias the
+    /// users shard owns, and no source's original rows change.
     #[test]
-    fn per_shard_counts_equal_the_complete_census_on_the_same_cut() {
+    fn per_shard_counts_cover_cross_shard_aliases_and_children_without_touching_original_bodies() {
         let (_root, catalog, sources) = fixture();
-        let census = plan_namespace_count_maintenance(&catalog, &sources, limits()).unwrap();
-        let mut expected = BTreeMap::new();
-        for update in census.updates {
-            expected.insert((update.shard_id.0.clone(), update.original.object_id.clone()), update);
-        }
-        let mut actual = BTreeMap::new();
+        let before = sources
+            .iter()
+            .map(|source| serde_json::to_vec(&source.captured.projected_rows).unwrap())
+            .collect::<Vec<_>>();
+        let mut counts = BTreeMap::new();
         for shard in ["root", "services", "users"] {
-            let source = sources.iter().find(|source| source.captured.source.physical_shard.0 == shard).unwrap();
-            let plan = plan_shard_namespace_count_maintenance(
-                &catalog, source, &contributions_to(&catalog, &sources, shard).unwrap(), limits(),
-            ).unwrap();
-            for update in plan.updates {
-                assert!(actual.insert((update.shard_id.0.clone(), update.original.object_id.clone()), update).is_none());
+            for (path, count) in shard_counts(&catalog, &sources, shard).unwrap() {
+                assert!(counts.insert(path, count).is_none(), "an object counted by two shards");
             }
         }
-        assert_eq!(actual, expected);
-        let counts = actual.values().map(|update| (update.original.path.as_str(), update.namespace_link_count))
-            .collect::<BTreeMap<_, _>>();
-        // The root counts the two foreign shard roots; the file counts the
-        // alias the users shard owns.
         assert_eq!(counts["/"], 4);
+        assert_eq!(counts["/services"], 3);
+        assert_eq!(counts["/users"], 2);
         assert_eq!(counts["/services/file"], 2);
+        assert_eq!(counts["/services/sub"], 2);
+        assert_eq!(counts["/users/text"], 1);
+        assert!(!counts.contains_key("/users/alias"));
+        for (source, bytes) in sources.iter().zip(before) {
+            assert_eq!(serde_json::to_vec(&source.captured.projected_rows).unwrap(), bytes);
+        }
+    }
+
+    /// A source whose identity no longer matches its capture, or that still
+    /// holds original work, never yields counts.
+    #[test]
+    fn a_corrupt_or_unresolved_source_never_produces_shard_counts() {
+        let (_root, catalog, mut sources) = fixture();
+        Arc::make_mut(&mut sources[1].captured).source.source_identity = "corrupt".into();
+        assert!(shard_counts(&catalog, &sources, "services").is_err());
+        reseal(&mut sources[1]);
+        sources[1].captured = Arc::new(
+            sources[1]
+                .captured
+                .with_original_work_for_test(vec![crate::metadata::canonical_generation::OriginalWorkRef {
+                    family: "prepared".into(),
+                    original_id: "pending-original".into(),
+                    original_digest: None,
+                    reason: "original remains pending".into(),
+                }])
+                .unwrap(),
+        );
+        sources[1].captured.validate().unwrap();
+        assert!(shard_counts(&catalog, &sources, "services").is_err());
+    }
+
+    /// An unfinished prepared operation in the shard's own rows prevents its
+    /// counts.
+    #[test]
+    fn an_unfinished_prepare_prevents_shard_counts() {
+        let (_root, catalog, mut sources) = fixture();
+        let record = &mut Arc::make_mut(&mut sources[1].captured).projected_rows.prepared_operations_v7[0];
+        record.status = sinomo_dfs::DfsPreparedOperationStatus::Prepared;
+        record.committed_entry = None;
+        reseal(&mut sources[1]);
+        assert!(shard_counts(&catalog, &sources, "services").is_err());
+    }
+
+    /// A deadline is a budget result, not corrupt data; without one the plan
+    /// is the same, and the encoded-input bound still holds.
+    #[test]
+    fn a_shard_plan_deadline_is_a_budget_result_not_corrupt_data() {
+        let (_root, catalog, sources) = fixture();
+        let services = &sources[1];
+        let contributions = contributions_to(&catalog, &sources, "services").unwrap();
+        let mut bounded = limits();
+        bounded.deadline = Some(std::time::Instant::now());
+        let error = plan_shard_namespace_count_maintenance(&catalog, services, &contributions, bounded).err().unwrap();
+        assert!(matches!(error, MetadataBackendError::PreparationBudgetExhausted { .. }), "{error}");
+        bounded.deadline = None;
+        let background = plan_shard_namespace_count_maintenance(&catalog, services, &contributions, bounded).unwrap();
+        let timed = plan_shard_namespace_count_maintenance(&catalog, services, &contributions, limits()).unwrap();
+        assert_eq!(background.updates, timed.updates);
+        bounded.max_encoded_bytes = 1;
+        assert!(
+            matches!(
+                plan_shard_namespace_count_maintenance(&catalog, services, &contributions, bounded),
+                Err(MetadataBackendError::Serde(_))
+            ),
+            "background work keeps its hard input-size bound"
+        );
+    }
+
+    /// The input budget is checked before the source's identity is.
+    #[test]
+    fn shard_input_budgets_precede_source_identity_validation() {
+        let (_root, catalog, mut sources) = fixture();
+        // If identity validation ran first, this invalid source would report
+        // its fingerprint failure instead.
+        Arc::make_mut(&mut sources[1].captured).source.source_identity = "invalid-identity".into();
+        let error = plan_shard_namespace_count_maintenance(
+            &catalog,
+            &sources[1],
+            &[],
+            NamespaceCountMaintenanceLimits { max_objects: 1, ..limits() },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("object budget exhausted"), "{error}");
     }
 
     #[test]
@@ -829,8 +907,6 @@ mod tests {
         for shard in ["root", "services", "users"] {
             shard_counts(&catalog, &sources, shard).unwrap();
         }
-        assert!(plan_namespace_count_maintenance(&catalog, &sources, limits()).is_err(),
-            "only the complete census can see that no shard holds the target");
     }
 
     #[test]

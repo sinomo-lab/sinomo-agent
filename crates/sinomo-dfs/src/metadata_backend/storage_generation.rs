@@ -60,7 +60,6 @@ impl LocalSobjMetadataBackend {
         )?;
         let active = crate::storage_generation::GenerationState::Active {
             activation_digest,
-            standalone_seal: None,
         };
         if envelope.state == active {
             return Ok(());

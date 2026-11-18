@@ -479,9 +479,9 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         if original.status != crate::DfsPreparedOperationStatus::Prepared {
             return Err(DfsError::Metadata { message: "missing initial assignment cannot re-seed a terminal genesis".into() });
         }
-        let captured_storage = genesis::original_genesis_file_system(&original, desired)?.metadata_storage.clone();
+        genesis::original_genesis_file_system(&original, desired)?;
         if !DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
-            .compare_and_put_metadata_shard_for_genesis(desired, captured_storage.as_ref())
+            .compare_and_put_metadata_shard(None, desired)
             .await?
         {
             return Err(DfsError::Distributed {

@@ -4,7 +4,7 @@
 //! Converting, with ordinary opens held so only migration reads its copy;
 //! its capture is taken the way its own conversion takes it.
 use super::*;
-use crate::authority::placement_work::native_tests::canonical_migration_runtime;
+use crate::authority::native_fixtures::canonical_migration_runtime;
 use crate::metadata::canonical_generation::CapturedMetadataUnit;
 use crate::namespace_counts::NamespaceCountMaintenanceLimits;
 use sinomo_dfs::test_support::DfsTestRuntime;
@@ -215,7 +215,7 @@ fn close(owner: &MigrationOwner, fs: &DfsFileSystemId, shard_id: &str) {
 
 /// The converter's bounded capture of `shard_id`'s local copy, step by step,
 /// into the stage its conversion reads. The copy is current-format, so the
-/// explicit count capture asks the converter to treat it as a source.
+/// per-shard capture intent asks the converter to treat it as a source.
 fn capture(
     owner: &MigrationOwner,
     fs: &DfsFileSystemId,
@@ -223,18 +223,14 @@ fn capture(
 ) -> Arc<CapturedMetadataUnit> {
     let root = owner.metadata_root.join(shard_id);
     let id = DfsMetadataShardId::new(shard_id);
-    let catalog = owner
-        .authority
-        .assignments(std::slice::from_ref(fs))
-        .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let (progress, source) = owner
+        let (progress, captured) = owner
             .metadata
-            .capture_namespace_count_source(&root, &id, &catalog, &[], 256)
+            .capture_shard_conversion_source(&root, &root, &id, fs, &[], 256)
             .unwrap();
-        if let Some(source) = source {
-            return source.captured;
+        if let Some(captured) = captured {
+            return captured;
         }
         assert!(
             std::time::Instant::now() < deadline,

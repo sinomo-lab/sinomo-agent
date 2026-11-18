@@ -659,7 +659,7 @@ fn metadata_exact_frame_prefix_digest(parts: &[&[u8]]) -> String {
 }
 
 /// Genesis is valid only for a genuinely new empty current shard. Existing
-/// storage must arrive with an externally certified exact-frame import cut.
+/// storage arrives only through its shard's conversion, as a sealed image.
 pub(crate) fn dfs_metadata_prefix_proof_genesis(
     shard: &DfsMetadataShardId,
 ) -> DfsMetadataPrefixProof {

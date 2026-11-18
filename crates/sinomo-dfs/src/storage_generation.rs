@@ -4,21 +4,12 @@ use crate::metadata_error::{MetadataBackendError, Result};
 use crate::{DfsFileSystemId, DfsMetadataShardId};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-#[cfg(feature = "storage-conversion")]
-mod activation;
 mod record;
 #[cfg(feature = "storage-conversion")]
 mod shard_activation;
-mod standalone;
 pub use record::*;
-#[cfg(feature = "storage-conversion")]
-pub use standalone::{
-    DfsStandaloneStorageActivationWitness, activate_standalone_metadata_storage_generation,
-};
 #[cfg(test)]
 mod native_tests;
-#[cfg(feature = "storage-conversion")]
-pub use activation::activate_metadata_storage_generation;
 #[cfg(feature = "storage-conversion")]
 pub use shard_activation::activate_metadata_shard_storage;
 
@@ -37,40 +28,14 @@ pub struct DfsMetadataGenerationIdentity {
 #[serde(deny_unknown_fields)]
 pub enum DfsMetadataGenerationOrigin {
     NativeGenesis,
-    NativeGenesisInGeneration {
-        activation: crate::DfsMetadataStorageActivation,
-    },
     StorageTransition {
         transition_id: String,
-    },
-    StandaloneOwned {
-        owner_node_id: sinomo_core::node::NodeId,
-        source_binding: String,
     },
 }
 
 impl DfsMetadataGenerationIdentity {
     pub(crate) fn is_native_genesis(&self) -> bool {
-        matches!(
-            self.origin,
-            DfsMetadataGenerationOrigin::NativeGenesis
-                | DfsMetadataGenerationOrigin::NativeGenesisInGeneration { .. }
-        )
-    }
-    pub(crate) fn matches_native_file_system_storage(
-        &self,
-        storage: Option<&crate::DfsMetadataStorageState>,
-    ) -> bool {
-        match &self.origin {
-            DfsMetadataGenerationOrigin::NativeGenesis => storage.is_none(),
-            DfsMetadataGenerationOrigin::NativeGenesisInGeneration { activation } => {
-                storage
-                    .and_then(|storage| storage.active_descriptor())
-                    .as_ref()
-                    == Some(activation)
-            }
-            _ => false,
-        }
+        matches!(self.origin, DfsMetadataGenerationOrigin::NativeGenesis)
     }
     pub fn validate(&self) -> Result<()> {
         fn valid_id(value: &str) -> bool {
@@ -79,31 +44,19 @@ impl DfsMetadataGenerationIdentity {
         if !valid_id(&self.generation)
             || !valid_id(&self.shard_id.0)
             || matches!(&self.origin, DfsMetadataGenerationOrigin::StorageTransition { transition_id } if !valid_id(transition_id))
-            || matches!(&self.origin, DfsMetadataGenerationOrigin::StandaloneOwned { source_binding, .. } if !valid_id(source_binding))
         {
             return Err(MetadataBackendError::Serde(
                 "invalid current metadata generation identity".into(),
             ));
-        }
-        if let DfsMetadataGenerationOrigin::NativeGenesisInGeneration { activation } = &self.origin
-        {
-            activation.validate().map_err(MetadataBackendError::Serde)?;
-            if activation.generation != self.generation
-                || activation.target_format
-                    != u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
-            {
-                return Err(MetadataBackendError::Serde(
-                    "native birth names a different current storage activation".into(),
-                ));
-            }
         }
         Ok(())
     }
 }
 
 /// The current root's admission envelope. Staging survives restart without
-/// conferring serving authority. Active receipts are installed only by the
-/// native genesis or storage-import owner after its actual authorization.
+/// conferring serving authority. Active receipts are installed only by native
+/// genesis or a per-shard conversion's activation, each after its own
+/// authorization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DfsMetadataGenerationHeader {
@@ -120,8 +73,6 @@ pub enum DfsMetadataGenerationState {
     },
     Active {
         activation_digest: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        standalone_seal: Option<DfsMetadataGenerationSeal>,
     },
 }
 pub(crate) type GenerationEnvelope = DfsMetadataGenerationHeader;
@@ -183,30 +134,6 @@ pub(crate) fn read_generation(root: &Path) -> Result<GenerationEnvelope> {
             "invalid metadata generation activation digest".into(),
         ));
     }
-    if let GenerationState::Active {
-        activation_digest,
-        standalone_seal,
-    } = &envelope.state
-    {
-        match &envelope.identity.origin {
-            DfsMetadataGenerationOrigin::StandaloneOwned { .. } => {
-                let seal = standalone_seal.as_ref().ok_or_else(|| {
-                    MetadataBackendError::Serde(
-                        "standalone generation has no retained activation seal".into(),
-                    )
-                })?;
-                if standalone::standalone_receipt(&envelope.identity, seal)? != *activation_digest {
-                    return Err(MetadataBackendError::Serde("standalone generation receipt differs from its retained source/image binding".into()));
-                }
-            }
-            _ if standalone_seal.is_some() => {
-                return Err(MetadataBackendError::Serde(
-                    "native generation cannot borrow standalone activation evidence".into(),
-                ));
-            }
-            _ => {}
-        }
-    }
     Ok(envelope)
 }
 
@@ -226,7 +153,6 @@ pub(crate) fn write_generation(root: &Path, envelope: &GenerationEnvelope) -> Re
 pub(crate) fn stage_native_genesis_storage_generation(
     root: &Path,
     shard: &crate::DfsMetadataShardConfig,
-    activation: Option<&crate::DfsMetadataStorageActivation>,
     selected_layout: Option<&crate::DfsSelectedOriginalDataLayout>,
 ) -> Result<()> {
     if shard.epoch != 1 || !shard.replica_node_ids.is_empty() {
@@ -234,7 +160,7 @@ pub(crate) fn stage_native_genesis_storage_generation(
             "fresh storage generation requires the initial singleton assignment".into(),
         ));
     }
-    let identity = record::native_genesis_generation_identity(shard, activation);
+    let identity = record::native_genesis_generation_identity(shard);
     let selected_stage = if let Some(layout) = selected_layout {
         #[cfg(any(test, feature = "test-support"))]
         layout.admit_stage(&shard.file_system_id, &identity.shard_id, root)?;
@@ -282,29 +208,23 @@ fn native_genesis_terminal(
     tables: &crate::metadata_tables::DfsMetadataTables,
 ) -> Result<crate::DfsPreparedOperationEviction> {
     identity.validate()?;
-    let expected_binding = match &identity.origin {
-        DfsMetadataGenerationOrigin::NativeGenesis => {
-            if identity.generation
-                != format!(
-                    "native-genesis:{}:{}:{}",
-                    identity.file_system_id,
-                    identity.shard_id.0,
-                    crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
-                )
-            {
-                return Err(MetadataBackendError::Serde(
-                    "native generation differs from its original fresh genesis".into(),
-                ));
-            }
-            None
-        }
-        DfsMetadataGenerationOrigin::NativeGenesisInGeneration { activation } => Some(activation),
-        _ => {
-            return Err(MetadataBackendError::Serde(
-                "generation is not a native birth".into(),
-            ));
-        }
-    };
+    if !identity.is_native_genesis() {
+        return Err(MetadataBackendError::Serde(
+            "generation is not a native birth".into(),
+        ));
+    }
+    if identity.generation
+        != format!(
+            "native-genesis:{}:{}:{}",
+            identity.file_system_id,
+            identity.shard_id.0,
+            crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
+        )
+    {
+        return Err(MetadataBackendError::Serde(
+            "native generation differs from its original fresh genesis".into(),
+        ));
+    }
     let operation = format!(
         "genesis:{}:{}:1",
         identity.file_system_id, identity.shard_id.0
@@ -324,10 +244,9 @@ fn native_genesis_terminal(
         || terminal.digest.owner_epoch != 1
         || terminal.status != crate::DfsPreparedOperationStatus::Committed
         || terminal.committed_entry.is_none()
-        || terminal.genesis_storage_activation.as_ref() != expected_binding
     {
         return Err(MetadataBackendError::Serde(
-            "native generation differs from its original committed storage binding".into(),
+            "native generation differs from its original committed genesis".into(),
         ));
     }
     Ok(terminal)
@@ -348,14 +267,8 @@ pub(crate) fn native_genesis_activation_digest(
     tables: &crate::metadata_tables::DfsMetadataTables,
 ) -> Result<String> {
     let terminal = native_genesis_terminal(identity, tables)?;
-    // Preserve the original unbound native receipt encoding. A generation-bound
-    // birth additionally binds its exact retained terminal activation witness.
-    let bytes = if let Some(binding) = &terminal.genesis_storage_activation {
-        serde_json::to_vec(&(&terminal.digest, terminal.committed_entry.as_ref(), binding))
-    } else {
-        serde_json::to_vec(&(&terminal.digest, terminal.committed_entry.as_ref()))
-    }
-    .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+    let bytes = serde_json::to_vec(&(&terminal.digest, terminal.committed_entry.as_ref()))
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
     Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
 }
 
@@ -490,7 +403,7 @@ mod tests {
             assignment: crate::DfsMetadataShardAssignment::Root,
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
-        stage_native_genesis_storage_generation(root.path(), &shard, None, None).unwrap();
+        stage_native_genesis_storage_generation(root.path(), &shard, None).unwrap();
         let mut backend = crate::LocalSobjMetadataBackend::open_staged_native_genesis(
             &shard,
             root.path().to_owned(),
@@ -509,37 +422,28 @@ mod tests {
             GenerationState::Staged { .. }
         ));
     }
-    fn generation_bound_birth_data(
+    fn native_birth_data(
         root: &Path,
     ) -> (
         DfsMetadataGenerationIdentity,
         crate::metadata_tables::DfsMetadataTables,
         crate::DfsPreparedOperationDigest,
     ) {
-        let activation = crate::DfsMetadataStorageActivation {
-            generation: "bound-generation-a".into(),
-            target_format: u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-            catalog_generation: 7,
-            activation_digest: format!("blake3:{}", "a".repeat(64)),
-        };
+        let shard_id = DfsMetadataShardId::new("new-scope");
         let identity = DfsMetadataGenerationIdentity {
             file_system_id: crate::sifs_file_system_id(),
-            shard_id: DfsMetadataShardId::new("new-scope"),
-            generation: activation.generation.clone(),
-            origin: DfsMetadataGenerationOrigin::NativeGenesisInGeneration {
-                activation: activation.clone(),
-            },
+            generation: format!(
+                "native-genesis:{}:{}:{}",
+                crate::sifs_file_system_id(),
+                shard_id.0,
+                crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
+            ),
+            shard_id,
+            origin: DfsMetadataGenerationOrigin::NativeGenesis,
         };
-        let mut fs = crate::DfsFileSystem::sifs(
+        let fs = crate::DfsFileSystem::sifs(
             sinomo_core::node::NodeId::from_legacy_named("birth-data-only").unwrap(),
         );
-        fs.catalog_generation = 8;
-        fs.metadata_storage = Some(crate::DfsMetadataStorageState::Active {
-            generation: activation.generation,
-            target_format: activation.target_format,
-            catalog_generation: activation.catalog_generation,
-            activation_digest: activation.activation_digest,
-        });
         let payload = crate::DfsPreparedOperationPayload::for_metadata_effects(
             crate::DfsPreparedOperationScope {
                 file_system_id: identity.file_system_id.clone(),
@@ -577,20 +481,13 @@ mod tests {
     }
 
     #[test]
-    fn birth_binding_data_survives_checked_eviction_and_rejects_restamped_identity() {
+    fn native_birth_digest_survives_checked_eviction_and_rejects_restamped_identity() {
         // These are DATA codec/validator controls, not a claimed native birth.
         let root = sinomo_testdir::TestDir::new("birth-binding-compaction-data");
-        let (identity, mut tables, digest) = generation_bound_birth_data(root.path());
+        let (identity, mut tables, digest) = native_birth_data(root.path());
         let original = native_genesis_activation_digest(&identity, &tables).unwrap();
         let mut restamped = identity.clone();
-        let DfsMetadataGenerationOrigin::NativeGenesisInGeneration { activation } =
-            &mut restamped.origin
-        else {
-            unreachable!()
-        };
-        activation.generation = "bound-generation-b".into();
-        activation.activation_digest = format!("blake3:{}", "b".repeat(64));
-        restamped.generation = activation.generation.clone();
+        restamped.generation.push_str("-restamped");
         assert!(native_genesis_activation_digest(&restamped, &tables).is_err());
         tables
             .apply_checked(crate::metadata_records::DfsMetadataTableOp::RemovePreparedOperation {
@@ -602,11 +499,7 @@ mod tests {
                 .prepared_operations_v7
                 .contains_key(&digest.operation_id)
         );
-        assert!(
-            tables.prepared_operation_evictions[&digest.operation_id]
-                .genesis_storage_activation
-                .is_some()
-        );
+        assert!(tables.prepared_operation_evictions.contains_key(&digest.operation_id));
         assert_eq!(
             native_genesis_activation_digest(&identity, &tables).unwrap(),
             original
@@ -615,16 +508,12 @@ mod tests {
             native_genesis_activation_digest(&restamped, &tables).is_err(),
             "restamping cannot replace the original retained witness"
         );
-        let unbound = DfsMetadataGenerationIdentity {
-            generation: format!(
-                "native-genesis:{}:{}:{}",
-                identity.file_system_id,
-                identity.shard_id.0,
-                crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
-            ),
-            origin: DfsMetadataGenerationOrigin::NativeGenesis,
+        let converted = DfsMetadataGenerationIdentity {
+            origin: DfsMetadataGenerationOrigin::StorageTransition {
+                transition_id: "attempt".into(),
+            },
             ..identity
         };
-        assert!(native_genesis_activation_digest(&unbound, &tables).is_err());
+        assert!(native_genesis_activation_digest(&converted, &tables).is_err());
     }
 }

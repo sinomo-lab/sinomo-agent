@@ -170,7 +170,7 @@ fn settled_legacy_proof(
             != sinomo_dfs::DfsMetadataShardHandoffCause::Membership
         {
             return Err(error(
-                "native storage-import proof requires its existing source installation reconciliation",
+                "historical handoff proof names a cause other than a membership change",
             ));
         }
     }
@@ -467,85 +467,6 @@ impl NativeImportAuthority {
         }
         Ok(original)
     }
-    pub(crate) fn required_original_metadata_sources(
-        &self,
-    ) -> Result<Vec<crate::metadata::OriginalMetadataHandoffReservation>> {
-        let read = self.read_native(
-            self.cluster()?
-                .kv_range_prefix_complete_authoritative_async(PREFIX.into()),
-        )?;
-        current_authority(&read.authority)?;
-        let mut required = Vec::new();
-        for entry in read.value {
-            if !matches!(record_kind(&entry.key), Some(RecordKind::Handoff)) {
-                continue;
-            }
-            if !current_record(&entry, RecordKind::Handoff)? {
-                required.push(original_reservation(&entry)?);
-                continue;
-            }
-            let handoff: sinomo_dfs::DfsMetadataShardMembershipHandoff =
-                entry.decode().map_err(error)?;
-            if !matches!(
-                handoff.cause,
-                sinomo_dfs::DfsMetadataShardHandoffCause::StorageImport { .. }
-            ) {
-                continue;
-            }
-            let fs = &handoff.retiring_shard.file_system_id;
-            let shard = sinomo_dfs::DfsMetadataShardId::new(&handoff.retiring_shard.shard_id);
-            let destination = sinomo_dfs::local_dfs_metadata_shard_path(
-                &sinomo_core::local::SinomoDataDir::new(&self.data_root),
-                &shard,
-            );
-            let retained = crate::metadata::retained_native_import_plan(
-                &destination,
-                fs,
-                &shard,
-                &handoff.handoff_id,
-            )?;
-            let plan = match retained {
-                Some((plan, _actual_plan_root)) => plan,
-                None => {
-                    let received = self.receiver_root_for(fs, &shard.0, &handoff.handoff_id)?;
-                    let path = received.join("native-import-plan.json");
-                    if !path.exists() {
-                        return Err(MetadataBackendError::StoragePreparationPending {
-                            root: destination.clone(),
-                            processed_records: 0,
-                        });
-                    }
-                    serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?
-                }
-            };
-            Self::validate_plan(&plan)?;
-            let source_fence = sinomo_dfs::DfsMetadataShardMembershipHandoffFence {
-                handoff_id: plan.expected_handoff.handoff_id.clone(),
-                primary_node_id: plan.expected_handoff.retiring_shard.primary_node_id.clone(),
-                journal_sequence: plan.source_cut.source_journal_sequence,
-                state_fingerprint: plan.source_cut.source_state_fingerprint.clone(),
-            };
-            if !Self::content_handoff_matches_plan(&handoff, &plan.expected_handoff, &source_fence)
-            {
-                return Err(error(
-                    "retained native plan differs from live exact StorageImport",
-                ));
-            }
-            let replay = self.observe_original_import_commit(&plan, plan.stage_request.clone())?;
-            Self::require_committed(&replay)?;
-            let (after, _) = self.read_exact(&[entry.key.clone()])?;
-            if after[0].entry.as_ref() != Some(&entry) {
-                return Err(error(
-                    "current StorageImport changed while its original stage receipt was observed",
-                ));
-            }
-            if let Some(original) = &plan.source_cut.original_handoff {
-                required.push(original.clone());
-            }
-        }
-        required.sort_by(|left, right| left.entry.key.cmp(&right.entry.key));
-        Ok(required)
-    }
     /// sinomo:kv-configuration: Normalize raw schema and current bootstrap
     /// policy inputs from one owned native authority cut before DFS readiness.
     pub(super) fn prepare_configuration_records(
@@ -561,7 +482,7 @@ impl NativeImportAuthority {
         std::fs::create_dir_all(&archive).map_err(error)?;
         // The existing native prefix API inventories compact control-plane rows.
         // This budget bounds conversion/CAS work, not that API's prefix response.
-        let client = self.control_client(&archive)?;
+        let client = self.control_client();
         // One actual native ReadIndex binds configuration and member inputs.
         // This does not wait for this factory's later v7 service advertisement.
         let native = self.read_native(
@@ -788,7 +709,7 @@ impl NativeImportAuthority {
             KvRequestId::derived("dfs-configuration-shape-import-v7", binding.as_bytes()),
             submitted,
         );
-        let committed = self.blueprint_commit(&archive, request)?;
+        let committed = self.commit(request)?;
         if !committed
             .result
             .txn_response

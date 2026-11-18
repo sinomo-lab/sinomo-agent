@@ -699,16 +699,8 @@ mod verified_copy_tests {
                 image.descriptor().semantic_state_fingerprint
             );
             assert_eq!(identity.prefix_proof, proof);
-            let retained = crate::DfsMetadataCandidateInspection::capture(&fresh).unwrap();
-            assert_eq!(retained.verify(&fresh).unwrap(), identity);
-            let renamed = directory.join("published-candidate-copy");
-            fs::rename(&fresh, &renamed).unwrap();
-            assert!(
-                retained.verify(&fresh).is_err(),
-                "missing original path is not data custody"
-            );
-            assert_eq!(retained.verify(&renamed).unwrap(), identity);
-            let actual = metadata_table_snapshot_path(&renamed);
+            assert_eq!(crate::inspect_metadata_candidate(&fresh).unwrap(), identity);
+            let actual = metadata_table_snapshot_path(&fresh);
             for variant in 0..4 {
                 let mut changed = original_bytes.clone();
                 match variant {
@@ -725,18 +717,8 @@ mod verified_copy_tests {
                     _ => changed.push(0),
                 }
                 fs::write(&actual, &changed).unwrap();
-                assert!(
-                    retained.verify(&renamed).is_err(),
-                    "changed current bytes cannot reuse validation"
-                );
-                assert!(crate::DfsMetadataCandidateInspection::capture(&renamed).is_err());
+                assert!(crate::DfsMetadataCandidateInspection::capture(&fresh).is_err());
             }
-            fs::remove_file(&actual).unwrap();
-            assert!(retained.verify(&renamed).is_err());
-            fs::write(&actual, &original_bytes).unwrap();
-            assert_eq!(retained.verify(&renamed).unwrap(), identity);
-            let restarted = crate::DfsMetadataCandidateInspection::capture(&renamed).unwrap();
-            assert_eq!(restarted.verify(&renamed).unwrap(), identity);
         }
         let expected = copied.image_descriptor();
         for variant in 0..3 {

@@ -2015,30 +2015,6 @@ impl LocalContentStore {
         )
     }
 
-    /// Bind verified bytes only while both the captured source identity and
-    /// canonical destination remain unretired. Source and native authorization
-    /// are caller obligations; this guard supplies no publication permission.
-    pub fn bind_quarantined_blob_from_unretired_source(
-        &self,
-        source_object_id: &str,
-        source_version: &str,
-        object_id: &str,
-        version: &str,
-        blob: ContentStoreQuarantinedBlob,
-    ) -> Result<ContentManifest> {
-        self.prepare_version_if_missing(source_object_id, source_version)?;
-        self.prepare_version_if_missing(object_id, version)?;
-        let _owner = self.content_mutation_guard()?;
-        if self.object_version_is_deleted(source_object_id, source_version)?
-            || self.object_version_is_deleted(object_id, version)?
-        {
-            return Err(ContentStoreError::InvalidContentLayout {
-                message: "retained source or canonical identity was explicitly collected".into(),
-            });
-        }
-        self.bind_current_quarantined_blob(object_id, version, blob)
-    }
-
     /// Stores one already-materialized DFS value after validating its expected
     /// application digest. Eligible small values use the existing inline binding
     /// durability boundary without first persisting an anonymous quarantine.

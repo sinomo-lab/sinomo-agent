@@ -111,10 +111,6 @@ pub struct DfsPreparedOperationRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DfsPreparedOperationEviction {
-    /// Original committed generation-bound birth evidence, never reconstructed
-    /// from mutable filesystem rows after the immutable body is collected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub genesis_storage_activation: Option<crate::DfsMetadataStorageActivation>,
     pub digest: DfsPreparedOperationDigest,
     pub status: DfsPreparedOperationStatus,
     pub committed_entry: Option<Box<DfsPreparedOperationCommitReference>>,
@@ -188,8 +184,9 @@ impl DfsPreparedOperationEviction {
     /// This constructor supplies no native publication or storage authority.
     pub fn from_terminal_record(record: &DfsPreparedOperationRecord) -> Result<Self> {
         record.validate()?;
-        let genesis_storage_activation = if record.status == DfsPreparedOperationStatus::Committed
+        if record.status == DfsPreparedOperationStatus::Committed
             && is_exact_genesis_digest(&record.digest) {
+            // A committed genesis binds exactly its own filesystem.
             let mut filesystems = record.metadata_effects.iter().filter_map(|effect| match effect {
                 crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } => Some(file_system),
                 _ => None,
@@ -199,18 +196,8 @@ impl DfsPreparedOperationEviction {
             if filesystems.next().is_some() || file_system.file_system_id != record.digest.file_system_id {
                 return Err(MetadataBackendError::Serde("committed genesis has contradictory filesystem bindings".into()));
             }
-            match &file_system.metadata_storage {
-                None => None,
-                Some(state @ crate::DfsMetadataStorageState::Active { .. }) => {
-                    state.validate_at_catalog_generation(file_system.catalog_generation)
-                        .map_err(MetadataBackendError::Serde)?;
-                    state.active_descriptor()
-                }
-                Some(crate::DfsMetadataStorageState::PendingTransition { .. }) =>
-                    return Err(MetadataBackendError::Serde("committed genesis cannot bind a pending storage transition".into())),
-            }
-        } else { None };
-        let terminal = Self { genesis_storage_activation, digest: record.digest.clone(),
+        }
+        let terminal = Self { digest: record.digest.clone(),
             status: record.status, committed_entry: record.committed_entry.clone() };
         terminal.validate()?;
         Ok(terminal)
@@ -218,7 +205,7 @@ impl DfsPreparedOperationEviction {
 
     pub fn validate_against_record(&self, record: &DfsPreparedOperationRecord) -> Result<()> {
         if *self != Self::from_terminal_record(record)? {
-            return Err(MetadataBackendError::Serde("terminal eviction changes its original body or generation witness".into()));
+            return Err(MetadataBackendError::Serde("terminal eviction changes its original body".into()));
         }
         Ok(())
     }
@@ -246,12 +233,6 @@ impl DfsPreparedOperationEviction {
         }
         if let Some(entry) = &self.committed_entry {
             entry.validate(&self.digest)?;
-        }
-        if let Some(activation) = &self.genesis_storage_activation {
-            if self.status != DfsPreparedOperationStatus::Committed || !is_exact_genesis_digest(&self.digest) {
-                return Err(MetadataBackendError::Serde("generation witness does not name committed exact genesis".into()));
-            }
-            activation.validate().map_err(MetadataBackendError::Serde)?;
         }
         Ok(())
     }

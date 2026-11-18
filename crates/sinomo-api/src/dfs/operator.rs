@@ -189,11 +189,55 @@ impl std::fmt::Display for DfsOperatorStatusOmission {
     }
 }
 
+/// One metadata shard's storage conversion: the state its storage record
+/// names, or the stop this node's conversion of the shard reached.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataShardStorageMigration {
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: DfsMetadataShardId,
+    #[serde(flatten)]
+    pub state: DfsMetadataShardStorageMigrationState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum DfsMetadataShardStorageMigrationState {
+    /// The shard has no storage record: its copies are old storage that
+    /// migration converts.
+    Old,
+    /// An attempt is recorded Converting; the shard stays closed until it
+    /// activates.
+    Converting {
+        attempt_id: String,
+        /// The round of a converting takeover of a lost primary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        takeover_round: Option<u64>,
+    },
+    /// The shard serves current storage, born current or activated by
+    /// `attempt_id`.
+    Active {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        takeover_round: Option<u64>,
+    },
+    /// This node's conversion of the closed shard stopped for operator
+    /// repair; `reason` is the conversion's refusal.
+    Stopped {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        takeover_round: Option<u64>,
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsOperatorStatus {
-    /// Node-local physical migrations; counts describe metadata records, not files.
+    /// The storage conversion state of every metadata shard in the observed
+    /// catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub storage_migrations: Vec<sinomo_core::storage::migration::MigrationJob>,
+    pub storage_migrations: Vec<DfsMetadataShardStorageMigration>,
     /// Errors that prevent a complete, authoritative observation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete_reasons: Vec<String>,

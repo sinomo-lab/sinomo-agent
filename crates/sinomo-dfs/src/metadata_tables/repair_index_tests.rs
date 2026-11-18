@@ -44,7 +44,6 @@ fn version(name: &str) -> DfsVersion {
 fn file_system() -> DfsFileSystem {
     DfsFileSystem {
         catalog_generation: 0,
-        metadata_storage: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: file_system_id(),

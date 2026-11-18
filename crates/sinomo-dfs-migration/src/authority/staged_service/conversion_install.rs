@@ -57,6 +57,7 @@ use sinomo_core::node::NodeId;
 use sinomo_dfs::{
     DfsFileSystemId, DfsMetadataGenerationSeal, DfsMetadataShardConversion,
     DfsMetadataShardConversionInstallRule, DfsMetadataShardId, DfsMetadataShardStorage,
+    DfsMetadataSnapshotInstallCommand,
 };
 
 pub(in crate::authority) const FLOORS_ROUTE: &str = "/dfs-migration/shard-conversion-floors-v1";
@@ -234,7 +235,6 @@ fn ancestry_cut(attempt: &DfsMetadataShardConversion, cut: &ConversionSourceCut)
     }
     Ok(MetadataSourceCut {
         retained_placement_reservations: source.retained_placement_reservations.clone(),
-        namespace_count_cohort: None,
         source_root: source.actual_source_root.clone(),
         source_identity: source.source_identity.clone(),
         scope_shard: source.physical_shard.clone(),

@@ -299,7 +299,6 @@ mod tests {
         validate_shard_image_counts(
             &catalog,
             &DfsMetadataShardId::new("services"),
-            &services.captured.source.file_system_ids,
             &image,
             &contributions(placing.clone()),
             limits(),

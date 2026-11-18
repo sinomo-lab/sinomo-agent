@@ -93,7 +93,7 @@ fn managed_background_content(name: &str, expected: &[u8]) {
     ]).unwrap();
     native.start_nodes().unwrap();
     let context = native.component_context(&node).unwrap();
-    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let owner = native_fixtures::canonical_migration_runtime(&context);
     let mut changed = owner.binding().readiness;
     let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     block_native(&native.runtime_handle(), async {
@@ -175,7 +175,7 @@ fn managed_waiter_deadline_does_not_cancel_owned_source_relocation() {
     observed.recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).unwrap();
     assert!(first_wait.is_err(), "held source relocation must not satisfy ordinary startup");
     let context = native.component_context(&node).unwrap();
-    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let owner = native_fixtures::canonical_migration_runtime(&context);
     assert!(owner.work.active.load(std::sync::atomic::Ordering::Acquire) > 0);
     assert!(!*owner.lifecycle.borrow(), "caller deadline cancelled the actual owner");
     assert!(!live.exists());
@@ -228,7 +228,7 @@ fn managed_version_demand_completes_while_global_source_inventory_is_held() {
     ]).unwrap();
     native.start_nodes().unwrap();
     let context = native.component_context(&node).unwrap();
-    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let owner = native_fixtures::canonical_migration_runtime(&context);
     let mut changed = owner.binding().readiness;
     let store = LocalContentStore::new(&live).unwrap();
     let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
@@ -287,7 +287,7 @@ fn managed_owner_restart_recovers_missing_live_original_publication() {
     native.reopen_node(node.clone()).unwrap();
     native.wait_startup_completion().unwrap();
     let context = native.component_context(&node).unwrap();
-    let owner = placement_work::native_tests::canonical_migration_runtime(&context);
+    let owner = native_fixtures::canonical_migration_runtime(&context);
     let mut changed = owner.binding().readiness;
     let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     block_native(&native.runtime_handle(), async {

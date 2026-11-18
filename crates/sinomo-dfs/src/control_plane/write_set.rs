@@ -602,17 +602,16 @@ fn switched_write_set(
 }
 
 /// Whether `cut` admits a write-set change at all: its filesystem
-/// configuration is captured, belongs to the shard's filesystem and reserves
-/// no catalog for a pending storage transition. Every builder applies it.
-/// The catalog generation is not read: it guards path assignment, which no
-/// write-set change alters.
+/// configuration is captured and belongs to the shard's filesystem. Every
+/// builder applies it. The catalog generation is not read: it guards path
+/// assignment, which no write-set change alters.
 fn write_set_change_admitted(cut: &DfsMetadataShardRecordCut) -> Result<(), KvError> {
     let config = cut.file_system_config()?.ok_or_else(||
         refuse(cut, "write-set change requires the captured filesystem configuration"))?;
     if config.file_system_id != cut.shard.file_system_id {
         return Err(refuse(cut, "write-set change has a foreign filesystem configuration"));
     }
-    super::catalog::validate_catalog_transition(&config, None)
+    Ok(())
 }
 
 fn change_request(
@@ -737,23 +736,22 @@ pub fn build_metadata_write_set_switch_with_raised_n(
     }
     // A shard switches only while its storage record is Active: a converting
     // shard is closed, and its conversion's install rule must not change
-    // under it. The exact record is compared, so a conversion that starts
-    // after the read cannot meet a switch that commits after it. A shard with
-    // no record still has the filesystem-level storage state, whose pending
-    // transition the configuration compare fences.
-    if let Some(value) = cut.storage_value.as_deref() {
-        let record = sinomo_core::kv::decode_kv_value::<crate::DfsMetadataShardStorage>(value)?;
-        if !record.is_active() {
-            return Err(refuse(cut, "the shard's storage is converting"));
-        }
+    // under it, and a shard with no record holds storage that migration has
+    // yet to convert. The exact record is compared, so a conversion that
+    // starts after the read cannot meet a switch that commits after it.
+    let Some(storage_value) = cut.storage_value.as_ref() else {
+        return Err(refuse(cut, "the shard has no storage record"));
+    };
+    let record = sinomo_core::kv::decode_kv_value::<crate::DfsMetadataShardStorage>(storage_value)?;
+    if !record.is_active() {
+        return Err(refuse(cut, "the shard's storage is converting"));
     }
     let mut compares = vec![
         handoff_missing(cut)?,
         KvCompare::Missing {
             key: cut.key(metadata_shard_operation_floor_key),
         },
-        cut.file_system_config_compare(),
-        exact_compare(cut.key(crate::metadata_shard_storage_key), cut.storage_value.as_ref()),
+        exact_compare(cut.key(crate::metadata_shard_storage_key), Some(storage_value)),
     ];
     let mut cluster_id = None;
     for node in &configured {
@@ -1217,13 +1215,11 @@ pub(crate) fn metadata_write_set_after_handoff(
 }
 
 /// A switched shard admits a cooperative handoff only as a primary rotation
-/// over the same ring. Replica changes use recruit and remove, and storage
-/// import does not apply to a shard already on the current protocol.
-pub(crate) fn metadata_write_set_admits_handoff(
+/// over the same ring. Replica changes use recruit and remove.
+fn metadata_write_set_admits_handoff(
     write_set_value: Option<&[u8]>,
     retiring: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
-    cause: &DfsMetadataShardHandoffCause,
 ) -> Result<(), KvError> {
     match metadata_shard_write_set_state(retiring, write_set_value) {
         DfsMetadataShardWriteSetState::Unswitched | DfsMetadataShardWriteSetState::Stale { .. } => {
@@ -1239,7 +1235,7 @@ pub(crate) fn metadata_write_set_admits_handoff(
             let rotation = retiring.primary_node_id != desired.primary_node_id
                 && metadata_shard_configured_node_ids(retiring)
                     == metadata_shard_configured_node_ids(desired);
-            if matches!(cause, DfsMetadataShardHandoffCause::Membership) && rotation {
+            if rotation {
                 Ok(())
             } else {
                 Err(KvError::Serialization {
@@ -1566,12 +1562,11 @@ impl DfsMetadataTakeoverEvent {
 pub(super) fn metadata_handoff_write_set_ops(
     retiring: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
-    cause: &DfsMetadataShardHandoffCause,
     write_set_entry: Option<&KvEntry>,
     proof: Option<&DfsMetadataShardMembershipHandoffProof>,
 ) -> Result<(KvCompare, Option<KvOp>), KvError> {
     let value = write_set_entry.map(|entry| entry.value.as_slice());
-    metadata_write_set_admits_handoff(value, retiring, desired, cause)?;
+    metadata_write_set_admits_handoff(value, retiring, desired)?;
     let key = metadata_shard_write_set_key(&retiring.file_system_id, &retiring.shard_id);
     let compare = exact_compare(key.clone(), write_set_entry.map(|entry| &entry.value));
     let put = match (proof, metadata_shard_write_set_state(retiring, value)) {

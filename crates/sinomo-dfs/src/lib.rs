@@ -76,9 +76,7 @@ pub use storage_generation::{
     build_metadata_shard_storage_seal, build_metadata_shard_storage_takeover_activate,
 };
 #[cfg(feature = "storage-conversion")]
-pub use storage_generation::{activate_metadata_shard_storage, activate_metadata_storage_generation};
-#[cfg(feature = "storage-conversion")]
-pub use storage_generation::{DfsStandaloneStorageActivationWitness, activate_standalone_metadata_storage_generation};
+pub use storage_generation::activate_metadata_shard_storage;
 pub use storage_preparation::{
     DFS_STORAGE_PREPARATION_RECORD_BUDGET, DfsStoragePreparation, DfsStoragePreparationProvider,
     DfsStoragePreparationProviderBuilder, DfsStoragePreparationProviderBinding,
@@ -159,11 +157,7 @@ mod performance_metrics;
 mod placement;
 
 #[cfg(feature = "storage-conversion")]
-pub use control_plane::{
-    metadata_catalog_generation_update, metadata_catalog_generation_successor, metadata_storage_pending_transition_update,
-    DfsPlacementUpdatePlan, build_adaptive_placement_reconciliation_job,
-    build_placement_reconciliation_job,
-};
+pub use control_plane::build_placement_reconciliation_job;
 mod live_advertisement;
 mod placement_environment;
 mod posix;
@@ -173,7 +167,6 @@ mod posix_path;
 mod protocol;
 mod renewable_lease;
 mod repair;
-mod legacy_repair_state;
 mod repair_executor;
 #[cfg(any(test, feature = "test-support"))]
 pub use repair_executor::DfsRepairExecutorTestHold;
@@ -398,7 +391,7 @@ pub use control_plane::{
     DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardHandoffCause, DfsMetadataShardHeadWatermark,
     DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
-    DfsMetadataShardMembershipHandoffProof, DfsMetadataStorageImportCut, DfsNativeTxnCommit,
+    DfsMetadataShardMembershipHandoffProof, DfsNativeTxnCommit,
     DfsPlacementAuthorityPermitStatus, DfsPlacementAuthorityProcessIdentity,
     DfsPlacementAuthorityRecoveryOutcome, DfsPlacementAuthorityRecoveryRefusal,
     DfsWriteConfigurationReadiness, SharedDfsControlPlaneKvClient, file_system_config_key,
@@ -650,7 +643,6 @@ pub use metadata_replication::{
     DfsMetadataJournalReplicationTransportFuture, DfsMetadataNodeTransport,
     DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext, DfsMetadataNamespaceCatalog,
-    metadata_shard_storage_scope_matches,
     DfsMetadataSnapshotInstallSender, DfsPreparedClusterMetadataJournalPublish,
     LocalDfsMetadataJournalPublisherHost, cluster_dfs_metadata_replica_shard_context,
     dfs_events_advance_metadata_replica, dfs_events_should_publish_metadata,
@@ -692,7 +684,6 @@ pub use metadata_sharded_backend::{
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
     discard_local_metadata_shard_copies,
 };
-pub use sinomo_api::dfs::model::{DfsMetadataStorageState, DfsMetadataStorageActivation};
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPlacementScope, DfsPolicyViolation, DfsSubtreePolicy, DfsTombstoneProvenance, ReadRoute,
@@ -770,7 +761,8 @@ pub use node_transport::{
 pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
 pub use operator::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
-    DfsAgentObjectState, DfsAgentObjectSummary, DfsOperatorFileSystemView,
+    DfsAgentObjectState, DfsAgentObjectSummary, DfsMetadataShardStorageMigration,
+    DfsMetadataShardStorageMigrationState, DfsOperatorFileSystemView,
     DfsOperatorInspectionCursor, DfsOperatorInspectionItemCursor, DfsOperatorInspector,
     DfsOperatorObjectView, DfsOperatorRepairPage, DfsOperatorRepairView, DfsOperatorStatus,
     DfsOperatorStatusMetric, DfsOperatorStatusOmission, DfsPinAddRequest, DfsPinMode, DfsPinRecord,

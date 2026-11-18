@@ -4,14 +4,7 @@ use super::*;
 /// Preserve every configuration field while advancing the complete catalog.
 /// The result is DATA: its exact predecessor comparison and admitted catalog
 /// mutation must be in the same authoritative transaction.
-pub fn metadata_catalog_generation_successor(
-    expected: &DfsFileSystemConfig,
-) -> Result<DfsFileSystemConfig, KvError> {
-    validate_catalog_transition(expected, None)?;
-    catalog_generation_successor_unchecked(expected)
-}
-
-fn catalog_generation_successor_unchecked(
+pub(super) fn metadata_catalog_generation_successor(
     expected: &DfsFileSystemConfig,
 ) -> Result<DfsFileSystemConfig, KvError> {
     let mut successor = expected.clone();
@@ -25,153 +18,10 @@ fn catalog_generation_successor_unchecked(
     Ok(successor)
 }
 
-pub(super) fn validate_catalog_transition(
-    config: &DfsFileSystemConfig,
-    transition: Option<&str>,
-) -> Result<(), KvError> {
-    match (&config.metadata_storage, transition) {
-        (
-            Some(crate::DfsMetadataStorageState::PendingTransition { transition_id, .. }),
-            Some(actual),
-        ) if transition_id == actual => Ok(()),
-        (Some(crate::DfsMetadataStorageState::PendingTransition { .. }), _) => {
-            Err(KvError::Serialization {
-                detail: "metadata catalog is reserved by its pending storage transition".into(),
-            })
-        }
-        (_, None) => Ok(()),
-        (_, Some(_)) => Err(KvError::Serialization {
-            detail: "storage handoff has no matching pending filesystem transition".into(),
-        }),
-    }
-}
-
-/// Validate generic handoff admission using current filesystem and previous
-/// completed proof DATA. The caller includes every returned comparison in its
-/// existing native handoff transaction; validation alone grants no authority.
-pub(super) fn catalog_handoff_guard(
-    config_entry: Option<KvEntry>,
-    previous_proof: Option<KvEntry>,
-    retiring: &DfsMetadataShardConfig,
-    desired: &DfsMetadataShardConfig,
-    cause: &DfsMetadataShardHandoffCause,
-) -> Result<(Vec<KvCompare>, DfsFileSystemConfig), KvError> {
-    let entry = config_entry.ok_or_else(|| KvError::Serialization {
-        detail: "metadata handoff requires filesystem catalog configuration".into(),
-    })?;
-    let config = entry.decode::<DfsFileSystemConfig>()?;
-    if entry.key != file_system_config_key(&retiring.file_system_id)
-        || config.file_system_id != retiring.file_system_id
-    {
-        return Err(KvError::Serialization {
-            detail: "metadata handoff has foreign filesystem configuration".into(),
-        });
-    }
-    let transition = match cause {
-        DfsMetadataShardHandoffCause::Membership => None,
-        DfsMetadataShardHandoffCause::StorageImport { cut } => cut.storage_transition_id.as_deref(),
-    };
-    validate_catalog_transition(&config, transition)?;
-    validate_metadata_shard_handoff_cause(retiring, desired, cause)?;
-    let proof_key =
-        metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id);
-    let proof_compare = match previous_proof {
-        Some(previous) => {
-            if previous.key != proof_key {
-                return Err(KvError::Serialization {
-                    detail: "metadata handoff returned foreign completed proof".into(),
-                });
-            }
-            let proof: DfsMetadataShardMembershipHandoffProof = previous.decode()?;
-            if transition.is_some()
-                && matches!(&proof.cause,
-                DfsMetadataShardHandoffCause::StorageImport { cut } if cut.storage_transition_id.as_deref() == transition)
-            {
-                return Err(KvError::Serialization {
-                    detail: "storage transition already activated this scope; observe its original native outcome".into(),
-                });
-            }
-            KvCompare::ValueEquals {
-                key: proof_key,
-                value: previous.value,
-            }
-        }
-        None => KvCompare::Missing { key: proof_key },
-    };
-    Ok((
-        vec![
-            KvCompare::ValueEquals {
-                key: entry.key,
-                value: entry.value,
-            },
-            proof_compare,
-        ],
-        config,
-    ))
-}
-
-pub(super) fn catalog_handoff_successor(config: &DfsFileSystemConfig) -> Result<KvOp, KvError> {
-    let successor = catalog_generation_successor_unchecked(config)?;
-    KvOp::put_serde(
-        file_system_config_key(&config.file_system_id),
-        &successor,
-        None,
-    )
-}
-
-/// Build Pending from exact predecessor bytes, retaining its entire Active
-/// descriptor. The migration owner must also fence its complete catalog in the
-/// same native transaction; this builder does not certify that catalog.
-pub fn metadata_storage_pending_transition_update(
-    expected: &KvEntry,
-    transition_id: String,
-    target_generation: String,
-    target_format: u32,
-    expected_catalog_digest: String,
-) -> Result<(KvCompare, KvOp), KvError> {
-    let mut successor = expected.decode::<DfsFileSystemConfig>()?;
-    if expected.key != file_system_config_key(&successor.file_system_id) {
-        return Err(KvError::Serialization {
-            detail: "storage transition has foreign filesystem predecessor".into(),
-        });
-    }
-    if matches!(
-        successor.metadata_storage,
-        Some(crate::DfsMetadataStorageState::PendingTransition { .. })
-    ) {
-        return Err(KvError::Serialization {
-            detail: "storage transition must resume its original pending identity".into(),
-        });
-    }
-    let source_activation = successor
-        .metadata_storage
-        .as_ref()
-        .and_then(|state| state.active_descriptor());
-    let pending = crate::DfsMetadataStorageState::PendingTransition {
-        source_activation,
-        transition_id,
-        source_catalog_generation: successor.catalog_generation,
-        target_generation,
-        target_format,
-        expected_catalog_digest,
-    };
-    pending
-        .validate_at_catalog_generation(successor.catalog_generation)
-        .map_err(|detail| KvError::Serialization { detail })?;
-    successor.metadata_storage = Some(pending);
-    Ok((
-        KvCompare::ValueEquals {
-            key: expected.key.clone(),
-            value: expected.value.clone(),
-        },
-        KvOp::put_serde(expected.key.clone(), &successor, expected.lease_id)?,
-    ))
-}
-
 /// Plan one real catalog change from exact captured filesystem bytes. The
 /// caller must publish this pair atomically with its admitted shard mutation.
 /// This does not authorize that mutation or certify a catalog read.
-pub fn metadata_catalog_generation_update(
+pub(super) fn metadata_catalog_generation_update(
     expected: &KvEntry,
 ) -> Result<(KvCompare, KvOp), KvError> {
     let successor =
@@ -213,7 +63,6 @@ pub(super) fn append_catalog_generation_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DfsMetadataBackend;
 
     fn current_config(kv: &mut dyn DfsControlPlaneKvClient) -> KvEntry {
         kv.get_authoritative_consistent(&[file_system_config_key(&sifs_file_system_id())])
@@ -234,42 +83,63 @@ mod tests {
         }
     }
 
+    /// Every way a shard is born records its storage with its assignment:
+    /// default setup's split, a later prefix birth through the default
+    /// setup host, and the store's raw and compare-and-put creation, sync and
+    /// async. No born shard is left without a record, which would close it.
     #[test]
-    fn native_genesis_birth_refuses_changed_captured_storage_before_assignment() {
+    fn every_shard_birth_writes_an_active_native_genesis_storage_record() {
         let (runtime, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
-            "native-genesis-storage-binding-cas", 1).unwrap();
+            "native-birth-storage-records", 1).unwrap();
+        runtime.bootstrap_empty_metadata_prefix("born-prefix", "/born-prefix").unwrap();
         let shared = runtime.shared_control_plane().unwrap();
         shared.with_client(|boxed| {
             let kv = boxed.as_mut();
-            let before = current_config(kv);
-            let captured = before.decode::<DfsFileSystemConfig>().unwrap();
-            assert!(captured.metadata_storage.is_none());
-            let desired = DfsMetadataShardConfig {
-                file_system_id: sifs_file_system_id(), shard_id: "guarded-birth".into(),
+            let assert_born = |kv: &mut dyn DfsControlPlaneKvClient, shard: &DfsMetadataShardConfig| {
+                let key = metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id);
+                let record = kv.get_authoritative_consistent(&[key]).unwrap().pop().unwrap()
+                    .unwrap_or_else(|| panic!("shard {} was born without a storage record", shard.shard_id))
+                    .decode::<crate::DfsMetadataShardStorage>().unwrap();
+                record.validate_against(shard).unwrap();
+                assert_eq!(record.state, crate::DfsMetadataShardStorageState::Active {
+                    activation: crate::DfsMetadataShardActivation::NativeGenesis,
+                }, "shard {}", shard.shard_id);
+                assert_eq!(record.generation,
+                    crate::storage_generation::native_genesis_generation_identity(shard));
+            };
+            let setup = runtime.metadata_shards().unwrap();
+            let mut ids = setup.iter().map(|shard| shard.shard_id.as_str()).collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(ids, ["born-prefix", "root", "services", "users"]);
+            for shard in &setup {
+                assert_born(kv, shard);
+            }
+            let birth = |shard_id: &str| DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(), shard_id: shard_id.into(),
                 primary_node_id: nodes[0].clone(), replica_node_ids: Vec::new(), epoch: 1,
-                assignment: DfsMetadataShardAssignment::PathPrefix { prefix: "/guarded-birth".into() },
+                assignment: DfsMetadataShardAssignment::PathPrefix { prefix: format!("/{shard_id}") },
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             };
-            let mut changed = captured.clone();
-            // Negative admission setup only: actual authoritative configuration
-            // changes after capture. No generation image is activated by this.
-            changed.metadata_storage = Some(crate::DfsMetadataStorageState::Active {
-                generation: "later-storage-binding".into(), target_format: 12,
-                catalog_generation: captured.catalog_generation,
-                activation_digest: format!("blake3:{}", "a".repeat(64)),
+            let (raw, cas, raw_async, cas_async) =
+                (birth("raw-birth"), birth("cas-birth"), birth("raw-async-birth"), birth("cas-async-birth"));
+            DfsControlPlaneStore::new(kv).put_metadata_shard(&raw).unwrap();
+            assert!(DfsControlPlaneStore::new(kv).compare_and_put_metadata_shard(None, &cas).unwrap());
+            runtime.runtime_handle().block_on(async {
+                let client = kv.async_client().expect("native async CP capability");
+                DfsControlPlaneAsyncStore::new(&mut *client).put_metadata_shard(&raw_async).await.unwrap();
+                assert!(DfsControlPlaneAsyncStore::new(client)
+                    .compare_and_put_metadata_shard(None, &cas_async).await.unwrap());
             });
-            assert!(kv.txn(KvTxn {
-                compares: vec![KvCompare::ValueEquals { key: before.key.clone(), value: before.value.clone() }],
-                success: vec![KvOp::put_serde(before.key.clone(), &changed, None).unwrap()],
-                failure: Vec::new(),
-            }).unwrap().succeeded);
-            let changed_entry = current_config(kv);
-            assert!(!DfsControlPlaneStore::new(kv)
-                .compare_and_put_metadata_shard_for_genesis(&desired, captured.metadata_storage.as_ref()).unwrap());
-            assert!(kv.get(&metadata_shard_key(&desired.file_system_id, &desired.shard_id)).unwrap().is_none());
-            let after = current_config(kv);
-            assert_eq!(after.value, changed_entry.value);
-            assert_eq!(after.modify_revision, changed_entry.modify_revision);
+            for shard in [&raw, &cas, &raw_async, &cas_async] {
+                assert_born(kv, shard);
+            }
+            // Retire the unmaterialized test assignments through the catalog guard.
+            let born = current_config(kv);
+            let retire = [&raw, &cas, &raw_async, &cas_async].into_iter().flat_map(|shard| [
+                KvOp::Delete { key: metadata_shard_key(&shard.file_system_id, &shard.shard_id) },
+                KvOp::Delete { key: metadata_shard_storage_key(&shard.file_system_id, &shard.shard_id) },
+            ]).collect();
+            assert!(kv.txn(change_from(&born, retire)).unwrap().succeeded);
             Ok::<(), KvError>(())
         }).unwrap();
         drop(shared);
@@ -277,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn native_birth_waits_while_its_parent_shard_converts() {
+    fn native_birth_waits_while_its_parent_shard_is_closed() {
         let (runtime, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
             "native-birth-parent-storage", 1).unwrap();
         let users = runtime.metadata_shards().unwrap().into_iter()
@@ -288,7 +158,6 @@ mod tests {
             let read = |kv: &mut dyn DfsControlPlaneKvClient, key: &str| {
                 kv.get_authoritative_consistent(&[key.to_owned()]).unwrap().pop().unwrap()
             };
-            let captured = current_config(kv).decode::<DfsFileSystemConfig>().unwrap().metadata_storage;
             let desired = DfsMetadataShardConfig {
                 file_system_id: sifs_file_system_id(), shard_id: "users-born-child".into(),
                 primary_node_id: nodes[0].clone(), replica_node_ids: Vec::new(), epoch: 1,
@@ -301,35 +170,48 @@ mod tests {
             let active = read(kv, &parent_key).expect("born shards carry a storage record");
             assert!(active.decode::<crate::DfsMetadataShardStorage>().unwrap().is_active());
             // Test setup only: the parent's record names a conversion that no
-            // driver runs, so the parent is closed until the record is restored.
-            let replace_parent = |kv: &mut dyn DfsControlPlaneKvClient, expected: &KvEntry, value: Vec<u8>| {
-                assert!(kv.txn(KvTxn {
-                    compares: vec![KvCompare::ValueEquals { key: parent_key.clone(), value: expected.value.clone() }],
-                    success: vec![KvOp::Put { key: parent_key.clone(), value, lease_id: None }],
-                    failure: Vec::new(),
-                }).unwrap().succeeded);
+            // driver runs, or is absent, as for old storage that migration has
+            // yet to convert, so the parent is closed until the record is restored.
+            let replace_parent = |kv: &mut dyn DfsControlPlaneKvClient, expected: Option<&KvEntry>, value: Option<Vec<u8>>| {
+                let compare = match expected {
+                    Some(expected) => KvCompare::ValueEquals { key: parent_key.clone(), value: expected.value.clone() },
+                    None => KvCompare::Missing { key: parent_key.clone() },
+                };
+                let op = match value {
+                    Some(value) => KvOp::Put { key: parent_key.clone(), value, lease_id: None },
+                    None => KvOp::Delete { key: parent_key.clone() },
+                };
+                assert!(kv.txn(KvTxn { compares: vec![compare], success: vec![op], failure: Vec::new() })
+                    .unwrap().succeeded);
                 runtime.wait_published_configuration_current(&nodes[0]).unwrap();
-                read(kv, &parent_key).unwrap()
+                read(kv, &parent_key)
             };
-            let converting = replace_parent(kv, &active, sinomo_core::kv::encode_kv_value(
-                &crate::DfsMetadataShardStorage::converting_for_test(&users, 1)).unwrap());
-            let before = current_config(kv);
-            assert!(!DfsControlPlaneStore::new(kv)
-                .compare_and_put_metadata_shard_for_genesis(&desired, captured.as_ref()).unwrap(),
-                "a birth under a converting parent is refused");
-            let async_refused = runtime.runtime_handle().block_on(async {
-                DfsControlPlaneAsyncStore::new(kv.async_client().expect("native async CP capability"))
-                    .compare_and_put_metadata_shard_for_genesis(&desired, captured.as_ref()).await
-            }).unwrap();
-            assert!(!async_refused, "the async birth compares the same parent record");
-            assert!(read(kv, &desired_key).is_none());
-            assert!(read(kv, &desired_storage_key).is_none());
-            let unchanged = current_config(kv);
-            assert_eq!((unchanged.value, unchanged.modify_revision), (before.value, before.modify_revision));
+            let refused = |kv: &mut dyn DfsControlPlaneKvClient, closed: &str| {
+                let before = current_config(kv);
+                assert!(!DfsControlPlaneStore::new(kv)
+                    .compare_and_put_metadata_shard(None, &desired).unwrap(),
+                    "a birth under the {closed} parent is refused");
+                let async_refused = runtime.runtime_handle().block_on(async {
+                    DfsControlPlaneAsyncStore::new(kv.async_client().expect("native async CP capability"))
+                        .compare_and_put_metadata_shard(None, &desired).await
+                }).unwrap();
+                assert!(!async_refused, "the async birth compares the same parent record");
+                assert!(matches!(DfsControlPlaneStore::new(kv).put_metadata_shard(&desired),
+                    Err(KvError::Busy { .. })), "a raw birth under the {closed} parent is busy");
+                assert!(read(kv, &desired_key).is_none());
+                assert!(read(kv, &desired_storage_key).is_none());
+                let unchanged = current_config(kv);
+                assert_eq!((unchanged.value, unchanged.modify_revision), (before.value, before.modify_revision));
+            };
+            let converting = replace_parent(kv, Some(&active), Some(sinomo_core::kv::encode_kv_value(
+                &crate::DfsMetadataShardStorage::converting_for_test(&users, 1)).unwrap())).unwrap();
+            refused(kv, "converting");
+            assert!(replace_parent(kv, Some(&converting), None).is_none());
+            refused(kv, "unconverted");
 
-            replace_parent(kv, &converting, active.value.clone());
+            replace_parent(kv, None, Some(active.value.clone()));
             assert!(DfsControlPlaneStore::new(kv)
-                .compare_and_put_metadata_shard_for_genesis(&desired, captured.as_ref()).unwrap(),
+                .compare_and_put_metadata_shard(None, &desired).unwrap(),
                 "the same birth under the Active parent is published");
             assert_eq!(read(kv, &desired_key).unwrap().decode::<DfsMetadataShardConfig>().unwrap(), desired);
             assert!(read(kv, &desired_storage_key).unwrap()
@@ -483,167 +365,6 @@ mod tests {
     }
 
     #[test]
-    fn native_pending_catalog_transition_blocks_unrelated_mutations_and_binds_handoff() {
-        let (runtime, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
-            "native-catalog-transition-guard",
-            1,
-        )
-        .unwrap();
-        let shard = runtime.root_shard().unwrap();
-        let prefix = runtime
-            .node_metadata(&nodes[0])
-            .unwrap()
-            .metadata_prefix_proof(&crate::DfsMetadataShardId::new("root"))
-            .unwrap()
-            .unwrap();
-        let shared = runtime.shared_control_plane().unwrap();
-        shared
-            .with_client(|boxed| {
-                let kv = boxed.as_mut();
-                let before = current_config(kv);
-                let stale_change = change_from(&before, Vec::new());
-                let mut pending = before.decode::<DfsFileSystemConfig>().unwrap();
-                pending.metadata_storage =
-                    Some(crate::DfsMetadataStorageState::PendingTransition {
-                        source_activation: None,
-                        transition_id: "exact-native-transition".into(),
-                        source_catalog_generation: pending.catalog_generation,
-                        target_generation: "target-generation".into(),
-                        target_format: 12,
-                        expected_catalog_digest: format!("blake3:{}", "a".repeat(64)),
-                    });
-                // Authoritative native test setup for guard admission only. This
-                // writes no converted generation and supplies no activation proof.
-                assert!(
-                    kv.txn(KvTxn {
-                        compares: vec![KvCompare::ValueEquals {
-                            key: before.key.clone(),
-                            value: before.value.clone()
-                        }],
-                        success: vec![KvOp::put_serde(before.key.clone(), &pending, None).unwrap()],
-                        failure: Vec::new(),
-                    })
-                    .unwrap()
-                    .succeeded
-                );
-                assert!(!kv.txn(stale_change).unwrap().succeeded);
-                let mut extra = shard.clone();
-                extra.shard_id = "blocked-extra".into();
-                extra.assignment = DfsMetadataShardAssignment::PathPrefix {
-                    prefix: "/blocked-extra".into(),
-                };
-                assert!(
-                    matches!(DfsControlPlaneStore::new(kv).put_metadata_shard(&extra),
-                Err(KvError::Serialization { detail }) if detail.contains("reserved"))
-                );
-                let active_entry = current_config(kv);
-                assert!(metadata_catalog_generation_update(&active_entry).is_err());
-                let mut changed = pending.clone();
-                changed.metadata_storage = None;
-                assert!(
-                    DfsControlPlaneStore::new(kv)
-                        .compare_and_put_file_system_config(Some(&pending), &changed)
-                        .is_err()
-                );
-                changed = pending.clone();
-                changed.display_name = "ordinary edit during transition".into();
-                assert!(
-                    DfsControlPlaneStore::new(kv)
-                        .compare_and_put_file_system_config(Some(&pending), &changed)
-                        .unwrap()
-                );
-                assert_eq!(
-                    current_config(kv)
-                        .decode::<DfsFileSystemConfig>()
-                        .unwrap()
-                        .metadata_storage,
-                    pending.metadata_storage
-                );
-
-                let mut membership = shard.clone();
-                membership.epoch += 1;
-                membership.replica_node_ids.push(NodeId::generate());
-                assert!(matches!(DfsControlPlaneStore::new(kv).begin_metadata_shard_membership_handoff(&shard, &membership),
-                    Err(KvError::Serialization { detail }) if detail.contains("reserved")));
-                let mut desired = shard.clone();
-                desired.epoch += 1;
-                let mut cut = DfsMetadataStorageImportCut {
-                    storage_transition_id: Some("wrong-transition".into()),
-                    source_cut_digest: "a".repeat(64),
-                    source_journal_sequence: prefix.journal_sequence,
-                    source_state_fingerprint: "native-source".into(),
-                    target_prefix: prefix.clone(),
-                    converted_image_fingerprint: "test-only-unpublished-target".into(),
-                    pending_mapping_digest: "b".repeat(64),
-                };
-                assert!(
-                    DfsControlPlaneStore::new(kv)
-                        .begin_metadata_shard_handoff_with_cause(
-                            &shard,
-                            &desired,
-                            DfsMetadataShardHandoffCause::StorageImport { cut: cut.clone() }
-                        )
-                        .is_err()
-                );
-                assert!(
-                    DfsControlPlaneStore::new(kv)
-                        .get_metadata_shard_membership_handoff(
-                            &shard.file_system_id,
-                            &shard.shard_id
-                        )
-                        .unwrap()
-                        .is_none()
-                );
-                cut.storage_transition_id = Some("exact-native-transition".into());
-                let cause = DfsMetadataShardHandoffCause::StorageImport { cut };
-                let current = current_config(kv);
-                assert!(
-                    catalog_handoff_guard(Some(current.clone()), None, &shard, &desired, &cause)
-                        .is_ok(),
-                    "structural admission is not a native activation certificate"
-                );
-                let previous = DfsMetadataShardMembershipHandoffProof {
-                    cause: cause.clone(),
-                    handoff_id: "prior-step-data".into(),
-                    retiring_shard: shard.clone(),
-                    desired_shard: desired.clone(),
-                    journal_sequence: prefix.journal_sequence,
-                    state_fingerprint: "prior-image".into(),
-                    acknowledged_node_ids: nodes.clone(),
-                };
-                let mut proof_entry = current.clone();
-                proof_entry.key = metadata_shard_membership_handoff_proof_key(
-                    &shard.file_system_id,
-                    &shard.shard_id,
-                );
-                proof_entry.value = sinomo_core::kv::encode_kv_value(&previous).unwrap();
-                let mut second = desired.clone();
-                second.epoch += 1;
-                assert!(
-                    catalog_handoff_guard(
-                        Some(current),
-                        Some(proof_entry),
-                        &desired,
-                        &second,
-                        &cause
-                    )
-                    .is_err(),
-                    "isolated proof DATA cannot authorize a second same-scope step"
-                );
-                assert_eq!(
-                    DfsControlPlaneStore::new(kv)
-                        .get_metadata_shard(&shard.file_system_id, &shard.shard_id)
-                        .unwrap(),
-                    Some(shard.clone())
-                );
-                Ok::<(), KvError>(())
-            })
-            .unwrap();
-        drop(shared);
-        runtime.close().unwrap();
-    }
-
-    #[test]
     fn catalog_generation_ordinary_writers_preserve_and_cannot_author_or_overflow() {
         let mut current =
             DfsFileSystemConfig::from(&crate::DfsFileSystem::sifs(NodeId::generate()));
@@ -658,65 +379,10 @@ mod tests {
             merge_file_system_config_defaults(Some(&current), &proposed).catalog_generation,
             7
         );
-        assert!(validate_ordinary_metadata_storage(Some(&current), &merged).is_ok());
-        assert!(validate_ordinary_metadata_storage(Some(&current), &proposed).is_err());
-        assert!(validate_ordinary_metadata_storage(None, &current).is_err());
-        current.metadata_storage = Some(crate::DfsMetadataStorageState::Active {
-            generation: "prior-generation".into(),
-            target_format: 12,
-            catalog_generation: 6,
-            activation_digest: format!("blake3:{}", "b".repeat(64)),
-        });
-        let mut data = InProcessKvStore::new();
-        data
-            .put(
-                file_system_config_key(&current.file_system_id),
-                sinomo_core::kv::encode_kv_value(&current).unwrap(),
-                None,
-            )
-            .unwrap();
-        let entry = data.get(&file_system_config_key(&current.file_system_id)).unwrap();
-        let (_, pending_put) = metadata_storage_pending_transition_update(
-            &entry,
-            "next-transition".into(),
-            "next-generation".into(),
-            12,
-            format!("blake3:{}", "c".repeat(64)),
-        )
-        .unwrap();
-        let KvOp::Put { value, .. } = pending_put else {
-            unreachable!()
-        };
-        let pending: DfsFileSystemConfig = sinomo_core::kv::decode_kv_value(&value).unwrap();
-        let Some(crate::DfsMetadataStorageState::PendingTransition {
-            source_activation,
-            source_catalog_generation,
-            ..
-        }) = &pending.metadata_storage
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            *source_activation,
-            current
-                .metadata_storage
-                .as_ref()
-                .unwrap()
-                .active_descriptor()
-        );
-        assert_eq!(*source_catalog_generation, current.catalog_generation);
-        assert_eq!(pending.display_name, current.display_name);
-        assert!(
-            metadata_storage_pending_transition_update(
-                &entry,
-                "next-transition".into(),
-                "prior-generation".into(),
-                12,
-                format!("blake3:{}", "c".repeat(64))
-            )
-            .is_err(),
-            "a new target cannot reuse the source identity"
-        );
+        assert!(validate_ordinary_catalog_generation(Some(&current), &merged).is_ok());
+        assert!(validate_ordinary_catalog_generation(Some(&current), &proposed).is_err());
+        assert!(validate_ordinary_catalog_generation(None, &current).is_err());
+        assert_eq!(metadata_catalog_generation_successor(&current).unwrap().catalog_generation, 8);
         current.catalog_generation = u64::MAX;
         assert!(metadata_catalog_generation_successor(&current).is_err());
     }

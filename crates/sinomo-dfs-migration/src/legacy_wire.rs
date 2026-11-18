@@ -252,52 +252,6 @@ pub(crate) fn normalize_intent_retention_wire(mut value: Value) -> Result<Value>
     }
     Ok(value)
 }
-pub(crate) fn source_content_identity(
-    value: &Value,
-) -> Result<
-    Option<(
-        DfsFileSystemId,
-        DfsObjectId,
-        DfsVersion,
-        crate::MetadataSourceContentLocator,
-    )>,
-> {
-    let (Some(fs), Some(object), Some(version)) = (
-        value.get("file_system_id"),
-        value.get("object_id"),
-        value.get("version"),
-    ) else {
-        return Ok(None);
-    };
-    let locator = crate::MetadataSourceContentLocator {
-        object_id: object
-            .as_str()
-            .ok_or_else(|| invalid("source content object locator is not text"))?
-            .to_owned(),
-        version: version
-            .as_str()
-            .ok_or_else(|| invalid("source content version locator is not text"))?
-            .to_owned(),
-        content_version: value
-            .get("content_durability")
-            .filter(|plan| !plan.is_null())
-            .map(|plan| {
-                plan.get("source_version")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        invalid("actual source content-durability generation is not text")
-                    })
-            })
-            .transpose()?,
-    };
-    Ok(Some((
-        decode(source_fs_id(fs.clone())?)?,
-        decode(source_object_id(object.clone())?)?,
-        decode(source_version_id(version.clone())?)?,
-        locator,
-    )))
-}
 /// Original length-framed caller provenance, interpreted only during import.
 /// The entire original operation key remains in source digest/archive evidence.
 pub(crate) fn source_journal_operation_id(operation_id: &str) -> Option<String> {
@@ -618,17 +572,6 @@ fn validate_original_count_activation(value: &Value) -> Result<()> {
         return Err(invalid("original namespace-count activation is malformed"));
     }
     Ok(())
-}
-
-/// Generation11 source DATA projects its retired activation into the archive,
-/// never into current metadata_storage. Other original filesystem fields keep
-/// their exact values; this reader does not choose new placement defaults.
-pub(crate) fn native11_file_system_data(mut value: Value) -> Result<DfsFileSystem> {
-    let fields = value.as_object_mut().ok_or_else(|| invalid("native11 filesystem is not a record"))?;
-    if let Some(activation) = fields.remove("namespace_count_activation").filter(|value| !value.is_null()) {
-        validate_original_count_activation(&activation)?;
-    }
-    serde_json::from_value(value).map_err(invalid)
 }
 
 /// A missing old count remains unchanged in the retained source archive.
@@ -1646,6 +1589,8 @@ fn job_frame_wire(mut value: Value) -> Result<Value> {
     encoded(decode::<DfsNamespaceJobFrame>(value)?)
 }
 pub(crate) fn normalize_namespace_job(mut value: Value) -> Result<DfsNamespaceJobRecord> {
+    // A legacy alias-commit job is not decoded: its shard's capture fails, which
+    // stops that shard's conversion for operator repair. No fence-release frame exists.
     if value
         .get("pending_frames")
         .and_then(Value::as_array)
@@ -1886,67 +1831,6 @@ struct GenerationRouted<'a> {
     value: &'a Value,
     schema: &'a str,
     generation: SourceGeneration,
-}
-/// Exact generation-8 job serializer, used only for ORIGINAL image inspection.
-pub(crate) struct Native8Job<'a>(pub(crate) &'a Value);
-impl Serialize for Native8Job<'_> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        GenerationRouted {
-            value: self.0,
-            schema: "job",
-            generation: SourceGeneration::CanonicalTags,
-        }
-        .serialize(serializer)
-    }
-}
-/// Original native envelopes keep their original payload digest in source DATA.
-/// Canonical target construction never relabels these historical bodies.
-pub(crate) struct Native8Prepare<'a>(pub(crate) &'a Value);
-pub(crate) struct Native11FileSystem<'a>(pub(crate) &'a Value);
-impl Serialize for Native11FileSystem<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        GenerationRouted { value: self.0, schema: "namespaced-file-system", generation: SourceGeneration::CanonicalTags }
-            .serialize(serializer)
-    }
-}
-impl Serialize for Native8Prepare<'_> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::{Error, SerializeMap};
-        let row = self.0;
-        let digest: DfsPreparedOperationDigest =
-            serde_json::from_value(row["digest"].clone()).map_err(S::Error::custom)?;
-        let status: sinomo_dfs::DfsPreparedOperationStatus =
-            serde_json::from_value(row["status"].clone()).map_err(S::Error::custom)?;
-        let committed: Option<sinomo_dfs::DfsPreparedOperationCommitReference> =
-            serde_json::from_value(row.get("committed_entry").cloned().unwrap_or(Value::Null))
-                .map_err(S::Error::custom)?;
-        let payload = row
-            .get("payload")
-            .ok_or_else(|| S::Error::custom("native8 preparation omits body"))?;
-        let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("digest", &digest)?;
-        map.serialize_entry(
-            "payload",
-            &OriginalV7Payload {
-                generation: SourceGeneration::CanonicalTags,
-                payload,
-                had_sequence: true,
-                had_effects: true,
-                had_provenance: true,
-            },
-        )?;
-        map.serialize_entry("status", &status)?;
-        if let Some(committed) = committed {
-            map.serialize_entry("committed_entry", &committed)?;
-        }
-        map.end()
-    }
 }
 struct OriginalV7Payload<'a> {
     generation: SourceGeneration,
@@ -2283,13 +2167,6 @@ fn original_native9_alias_payload(raw: &Value) -> Result<Option<OriginalNative9P
     }
     Ok(Some(payload))
 }
-#[cfg(test)]
-pub(crate) fn original_native9_alias_payload_digest(raw: &Value) -> Result<String> {
-    original_native9_alias_payload(raw)?
-        .ok_or_else(|| invalid("not an exact native9 alias preimage"))?
-        .hash()
-}
-
 pub(crate) fn validate_original_source_job(raw: &Value) -> Result<()> {
     if let Ok(current) = serde_json::from_value::<DfsNamespaceJobRecord>(raw.clone()) {
         if serde_json::to_value(&current).map_err(invalid)? == *raw {
@@ -2944,15 +2821,6 @@ mod source_identifier_tests {
             tx.versions[0].module_metadata["vendor.example"].payload,
             opaque
         );
-        let (_, object, rev, locator) = source_content_identity(
-            &json!({"file_system_id":"old-fs","object_id":"old-object","version":"old-version"}),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(object, tx.objects[0].object_id);
-        assert_eq!(rev, tx.objects[0].version);
-        assert_eq!(locator.object_id, "old-object");
-        assert_eq!(locator.version, "old-version");
     }
     #[test]
     fn retired_exact_opaque_intent_ids_become_conservative_current_object_roots() {

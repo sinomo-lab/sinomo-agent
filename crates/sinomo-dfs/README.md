@@ -83,8 +83,8 @@ automatically recovering state rather than an operator action.
 
 Metadata journal replication is bounded by both entry count and encoded batch size. Oversized single entries still advance by themselves so a large namespace operation cannot stall a follower cursor forever. Daemon maintenance drains multiple bounded batches per publish call, with a cap that keeps each maintenance pass finite while avoiding one-batch-per-interval convergence for large metadata backlogs.
 
-The table tail log is compacted into a streamed snapshot using storage schema
-9, bounding reopen cost by the latest checkpoint and recent writes. Its storage
+The table tail log is compacted into a streamed snapshot using storage format
+12, bounding reopen cost by the latest checkpoint and recent writes. Its storage
 version is independent of the V7 operation family. `sinomo-dfs` accepts only
 current storage and wire formats.
 
@@ -92,15 +92,18 @@ Each metadata shard has a storage record beside its configuration and write
 set. It names the current storage generation the shard serves and the evidence
 that activated it. A native birth records it together with the assignment, and
 only the shard's own conversion changes it: the attempt is recorded Converting
-before it reads its inputs, sealed with the converted image, then activated,
-and each configured member activates its staged copy under the Active record.
-When the converting primary is lost, another configured member may take the
-attempt over once every member advertises the storage generation capability;
+before it reads its inputs, sealed with the converted image, installed on the
+members the shard's install rule names, then activated, and each member
+activates its staged copy under the Active record. When the converting primary
+is lost, another configured member may take the attempt over once every member
+that has not left the cluster advertises the storage generation capability;
 its activation also makes it primary at the next epoch in the same
 transaction. Other serving changes (takeover, rotation, recruit, removal) never
-write or compare the record. A shard opens only when its local generation
-header matches an Active record, and a Converting record keeps the shard
-closed, as does a root that still awaits storage preparation. A node's closed
+write or compare the record, and no conversion transaction writes or compares
+the filesystem configuration or its catalog generation. A shard opens only
+when its local generation header matches an Active record, and a Converting
+record keeps the shard closed, as does a root that still awaits storage
+preparation. A node's closed
 copy does not stop operations or node-wide passes on its other shards: a
 node-wide pass sees the node as one without that copy and deletes nothing of
 it, while work that addresses the closed shard is refused, or parked until its
@@ -110,8 +113,9 @@ count-contribution pages report the shards it waits on. The coordinator
 announces the park, and the job's end while a shard it touched converts, as
 typed `dfs.namespace.job.parked` and `dfs.namespace.job.completed` events
 naming the filesystem, coordinator shard, job and touched shards; a
-conversion waiting on the job wakes on them. A shard without a record is
-admitted under the filesystem-level storage state.
+conversion waiting on the job wakes on them. A shard without a record is old
+storage that `sinomo-dfs-migration` owns: it stays closed until its conversion
+activates a record.
 
 `sinomo-dfs-migration` owns incremental, on-demand conversion of retained storage. The Main or Embedded component supplies its cold-open provider; original source digests, archived bytes, restart progress and native installation authority remain explicit. Incompatible peer versions must be upgraded.
 
@@ -220,10 +224,8 @@ guarded transaction built from one exact-key-set read. It compares the exact byt
 both keys, the pending handoff, and the member and capability-policy records of
 each member it admits. A shrink, recruit or removal also compares the
 filesystem configuration, whose placement rules give the W floor and N it
-checks, and a switch compares it so that it cannot commit after a storage
-transition has reserved the catalog: a switched shard refuses its storage
-import. No change is built while that reservation holds. A switch also
-compares the shard's storage record and is refused while the shard converts.
+checks. A switch compares the shard's storage record and is refused unless it
+is Active, so a converting shard's install rule cannot change under it.
 No change, and no membership handoff, advances the filesystem's catalog
 generation, which guards path assignment only, so changes of different shards
 never reject each other.
@@ -441,9 +443,9 @@ them.
   record must still name the judged primary at the attempt's epoch with this
   node in the write set, and must admit this node's swap
   (`check_metadata_takeover_swap`): the swap is built from the same record only
-  after the promise, so a record that cannot build it, such as one whose
-  filesystem configuration reserves the catalog for a pending storage
-  transition, promises nothing. The promise captures the materialized journal head as
+  after the promise, so a record that cannot build it, such as one under
+  which this node's member record no longer admits it, promises nothing.
+  The promise captures the materialized journal head as
   epoch start and fences the read epoch under the writer lock
   (`promise_metadata_takeover`). The swap (`build_metadata_takeover_swap`) is
   submitted and settled by its own outcome

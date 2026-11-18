@@ -370,7 +370,6 @@ mod tests {
     fn cut(stage: &Path, head: &DfsMetadataPrefixProof) -> MetadataSourceCut {
         MetadataSourceCut {
             retained_placement_reservations: Vec::new(),
-            namespace_count_cohort: None,
             source_root: stage.join("primary-source"),
             source_identity: "primary-source".into(),
             scope_shard: DfsMetadataShardId::new("users"),

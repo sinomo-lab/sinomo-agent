@@ -628,7 +628,6 @@ mod retention_metadata_tests {
             );
             let fs = DfsFileSystem {
                 catalog_generation: 0,
-                metadata_storage: None,
                 file_system_id: version.file_system_id.clone(),
                 display_name: "current".into(),
                 owner_node_id: version.locations[0].clone(),

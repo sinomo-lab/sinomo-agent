@@ -8,8 +8,7 @@
 //! - Original native work goes with the shard that owns it
 //!   ([`keeps_native_work`]). A request belongs to its original authority
 //!   shard and a pending adoption also to the current coordinator of its
-//!   move, as the complete-filesystem mapping attributes them; a prepared
-//!   adoption goes with its prepared operation.
+//!   move; a prepared adoption goes with its prepared operation.
 //! - An unsettled original operation belongs to the shard that owns it
 //!   ([`unsettled_operation_owner`]): only that shard's authority commits or
 //!   aborts it, and it applies the outcome to that shard's own rows, so

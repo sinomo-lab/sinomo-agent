@@ -92,7 +92,7 @@ impl StagedConversion {
 }
 
 /// The attempt a converted generation belongs to, or `None` for any other
-/// generation (native genesis, or a complete-filesystem cohort's).
+/// generation.
 pub(in crate::authority) fn conversion_attempt_of(
     identity: &DfsMetadataGenerationIdentity,
 ) -> Option<&str> {
@@ -609,9 +609,9 @@ mod tests {
         let converted =
             sinomo_dfs::metadata_shard_converted_generation(&shard.file_system_id, &shard.shard_id, &attempt_id);
         assert_eq!(conversion_attempt_of(&converted), Some(attempt_id.as_str()));
-        let mut cohort = converted.clone();
-        cohort.generation = "filesystem-generation".into();
-        assert_eq!(conversion_attempt_of(&cohort), None);
+        let mut other = converted.clone();
+        other.generation = "another-generation".into();
+        assert_eq!(conversion_attempt_of(&other), None);
         let root = Path::new("/receivers");
         assert!(conversion_stage_root(root, &shard.file_system_id, "users", &attempt_id).is_ok());
         assert!(conversion_stage_root(root, &shard.file_system_id, "../users", &attempt_id).is_err());

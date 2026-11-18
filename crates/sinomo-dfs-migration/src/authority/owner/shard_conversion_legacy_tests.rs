@@ -19,7 +19,7 @@
 //! is woken, installs on both receivers, and the shard activates on every
 //! member, each receiver keeping its legacy copy beside the image.
 use super::*;
-use crate::authority::placement_work::native_tests::{
+use crate::authority::native_fixtures::{
     canonical_migration_runtime, native_migration_cluster,
 };
 use crate::authority::staged_service::conversion_install::{

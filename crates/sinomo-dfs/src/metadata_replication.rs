@@ -505,7 +505,7 @@ pub async fn execute_prepared_cluster_dfs_metadata_publish_with_async_peer_trans
 /// placement policy are serving authority, which a takeover, rotation, recruit
 /// or removal changes while the store, its storage generation and the
 /// evidence that activated it stay the same.
-pub fn metadata_shard_storage_scope_matches(
+pub(crate) fn metadata_shard_storage_scope_matches(
     left: &DfsMetadataShardConfig,
     right: &DfsMetadataShardConfig,
 ) -> bool {
@@ -524,14 +524,13 @@ pub fn metadata_shard_storage_scope_matches(
 /// configuration, so a slot opened under this catalog stays admitted across an
 /// in-place rebind, and another shard's conversion leaves it admitted.
 ///
-/// A shard with no storage record keeps the filesystem-level storage state and
-/// import proofs as its admission until that mechanism is removed.
+/// A shard with no storage record holds storage that migration has yet to
+/// convert: nothing of it is admitted, and its slot stays closed as while its
+/// storage preparation is pending.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataNamespaceCatalog {
     file_system_id: DfsFileSystemId,
     shards: Vec<DfsMetadataShardConfig>,
-    storage: Option<crate::DfsMetadataStorageState>,
-    storage_imports: Vec<crate::DfsMetadataShardMembershipHandoffProof>,
     shard_storage: BTreeMap<String, crate::DfsMetadataShardStorage>,
 }
 impl DfsMetadataNamespaceCatalog {
@@ -551,54 +550,35 @@ impl DfsMetadataNamespaceCatalog {
         }
         Ok(records)
     }
-    fn imports_from_entries(entries: &[sinomo_core::kv::KvEntry], shards: &[DfsMetadataShardConfig])
-        -> Result<Vec<crate::DfsMetadataShardMembershipHandoffProof>, DfsError>
-    {
-        let mut imports = Vec::new();
-        for shard in shards {
-            let key = crate::metadata_shard_membership_handoff_proof_key(&shard.file_system_id, &shard.shard_id);
-            if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
-                let proof: crate::DfsMetadataShardMembershipHandoffProof = entry.decode()
-                    .map_err(|error| DfsError::Metadata { message: error.to_string() })?;
-                // The import stays the shard's activation evidence after a
-                // later serving change rewrites the shard's configuration.
-                if metadata_shard_storage_scope_matches(&proof.desired_shard, shard)
-                    && matches!(proof.cause, crate::DfsMetadataShardHandoffCause::StorageImport { .. }) {
-                    imports.push(proof);
-                }
-            }
-        }
-        Ok(imports)
-    }
-    fn storage_from_entries(entries: &[sinomo_core::kv::KvEntry], file_system_id: &DfsFileSystemId)
-        -> Result<Option<crate::DfsMetadataStorageState>, DfsError>
-    {
-        let key = crate::file_system_config_key(file_system_id);
-        let config: crate::DfsFileSystemConfig = entries.iter().find(|entry| entry.key == key)
-            .ok_or_else(|| DfsError::Metadata { message: "native namespace catalog has no filesystem configuration".into() })?
-            .decode().map_err(|error| DfsError::Metadata { message: error.to_string() })?;
-        if config.file_system_id != *file_system_id {
-            return Err(DfsError::Metadata { message: "native namespace catalog filesystem is misbound".into() });
-        }
-        if let Some(storage) = &config.metadata_storage {
-            storage.validate_at_catalog_generation(config.catalog_generation)
-                .map_err(|error| DfsError::Metadata { message: error.to_string() })?;
-        }
-        Ok(config.metadata_storage)
-    }
-    /// A catalog over exact test DATA, with no completeness certificate.
+    /// A catalog over exact test DATA, with no completeness certificate: every
+    /// shard holds the storage record a native birth writes.
     #[cfg(test)]
     pub(crate) fn for_test(
         file_system_id: DfsFileSystemId,
         shards: Vec<DfsMetadataShardConfig>,
-        storage: Option<crate::DfsMetadataStorageState>,
     ) -> Self {
-        Self { file_system_id, shards, storage, storage_imports: Vec::new(), shard_storage: BTreeMap::new() }
+        let shard_storage = shards
+            .iter()
+            .map(|shard| {
+                let record = crate::DfsMetadataShardStorage::native_genesis(
+                    shard,
+                    crate::storage_generation::native_genesis_generation_identity(shard),
+                );
+                (shard.shard_id.clone(), record)
+            })
+            .collect();
+        Self { file_system_id, shards, shard_storage }
     }
-    /// [`Self::for_test`] with per-shard storage records.
+    /// [`Self::for_test`] with `record` as its shard's storage record.
     #[cfg(test)]
     pub(crate) fn with_shard_storage_for_test(mut self, record: crate::DfsMetadataShardStorage) -> Self {
         self.shard_storage.insert(record.shard_id.clone(), record);
+        self
+    }
+    /// [`Self::for_test`] with no storage record for `shard_id`.
+    #[cfg(test)]
+    pub(crate) fn without_shard_storage_for_test(mut self, shard_id: &str) -> Self {
+        self.shard_storage.remove(shard_id);
         self
     }
     pub(crate) fn capture(
@@ -612,17 +592,15 @@ impl DfsMetadataNamespaceCatalog {
         if shards.is_empty() {
             return Err(DfsError::Metadata { message: "namespace count catalog has no assignments".into() });
         }
-        let storage = Self::storage_from_entries(projection.entries(), file_system_id)?;
-        let storage_imports = Self::imports_from_entries(projection.entries(), &shards)?;
         let shard_storage = Self::shard_storage_from_entries(projection.entries(), &shards)?;
-        Ok(Self { file_system_id: file_system_id.clone(), shards, storage, storage_imports, shard_storage })
+        Ok(Self { file_system_id: file_system_id.clone(), shards, shard_storage })
     }
     /// Whether `entries` still describe this catalog: every shard's storage
-    /// identity (its path assignment), the storage state and the import
-    /// proofs. The catalog generation and the shards' serving fields are not
-    /// compared. A takeover, rotation, recruit or removal of one shard changes
-    /// neither path ownership nor any storage admission, and a context holding
-    /// this catalog matches its own shard's serving configuration itself.
+    /// identity (its path assignment) and storage record. The catalog
+    /// generation and the shards' serving fields are not compared. A
+    /// takeover, rotation, recruit or removal of one shard changes neither
+    /// path ownership nor any storage admission, and a context holding this
+    /// catalog matches its own shard's serving configuration itself.
     pub(crate) fn matches_entries(&self, entries: &[sinomo_core::kv::KvEntry]) -> Result<bool, DfsError> {
         let current = crate::metadata_authority_projection::metadata_shards_from_authority_entries(
             entries, &self.file_system_id,
@@ -631,194 +609,99 @@ impl DfsMetadataNamespaceCatalog {
             && current.iter().zip(&self.shards)
                 .all(|(current, captured)| metadata_shard_storage_scope_matches(current, captured));
         Ok(same_assignment
-            && Self::storage_from_entries(entries, &self.file_system_id)? == self.storage
-            && Self::imports_from_entries(entries, &self.shards)? == self.storage_imports
             && Self::shard_storage_from_entries(entries, &self.shards)? == self.shard_storage)
     }
-    /// How the shard's own storage record decides `identity`: `Some(true)` when
-    /// the record is Active for exactly this generation, `Some(false)` when it
-    /// is Converting (the shard is closed) or activated a converted generation
-    /// other than this one, and `None` when the shard has no record or its
-    /// native-genesis record names another generation, so the filesystem-level
-    /// rule still decides. That fallback is the temporary dual acceptance that
-    /// phase D removes; a converted record names the only generation its shard
-    /// serves.
-    fn shard_storage_decides(&self, identity: &crate::DfsMetadataGenerationIdentity) -> Option<bool> {
-        let record = self.shard_storage.get(&identity.shard_id.0)?;
-        if record.converting_attempt().is_some() {
-            return Some(false);
-        }
-        if record.generation == *identity {
-            return Some(true);
-        }
-        record.converted_activation().is_some().then_some(false)
-    }
+    /// The shard's own storage record decides `identity`: it must be Active
+    /// for exactly this generation. A Converting record keeps the shard
+    /// closed, and a shard with no record holds storage that migration has
+    /// yet to convert.
     pub(crate) fn validate_generation(&self, identity: &crate::DfsMetadataGenerationIdentity) -> crate::metadata_error::Result<()> {
         identity.validate()?;
-        match self.shard_storage_decides(identity) {
-            Some(true) if identity.file_system_id == self.file_system_id => return Ok(()),
-            Some(_) => return Err(MetadataBackendError::Serde("current image generation is not active in its shard storage record".into())),
-            None => {}
+        if identity.file_system_id != self.file_system_id
+            || !self.shards.iter().any(|shard| shard.shard_id == identity.shard_id.0)
+        {
+            return Err(MetadataBackendError::Serde("current image generation names a shard outside its captured catalog".into()));
         }
-        let valid = identity.file_system_id == self.file_system_id
-            && self.shards.iter().any(|shard| shard.shard_id == identity.shard_id.0)
-            && match (&self.storage, &identity.origin) {
-                (None, crate::DfsMetadataGenerationOrigin::NativeGenesis) => true,
-                (Some(crate::DfsMetadataStorageState::Active { generation, target_format, .. }), crate::DfsMetadataGenerationOrigin::StorageTransition { .. }) =>
-                    generation == &identity.generation && *target_format == u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-                (Some(storage @ crate::DfsMetadataStorageState::Active { .. }), crate::DfsMetadataGenerationOrigin::NativeGenesisInGeneration { activation }) =>
-                    storage.active_descriptor().as_ref() == Some(activation),
-                _ => false,
-            };
-        if !valid { return Err(MetadataBackendError::Serde("current image generation is not active in its captured native filesystem".into())); }
-        Ok(())
+        match self.shard_storage.get(&identity.shard_id.0) {
+            Some(record) if record.is_active() && record.generation == *identity => Ok(()),
+            Some(_) => Err(MetadataBackendError::Serde("current image generation is not active in its shard storage record".into())),
+            None => Err(MetadataBackendError::Serde("current image generation has no shard storage record; migration has yet to convert its storage".into())),
+        }
     }
     pub(crate) fn generation_activation_digest(&self, identity: &crate::DfsMetadataGenerationIdentity, tables: &crate::metadata_tables::DfsMetadataTables) -> crate::metadata_error::Result<String> {
         self.validate_generation(identity)?;
-        if self.shard_storage_decides(identity) == Some(true) {
-            let record = self.shard_storage.get(&identity.shard_id.0).expect("decided by its record");
-            return record.activation_digest(tables);
-        }
-        if identity.is_native_genesis() { return crate::storage_generation::native_genesis_activation_digest(identity, tables); }
-        match &self.storage {
-            Some(crate::DfsMetadataStorageState::Active { activation_digest, .. }) => Ok(activation_digest.clone()),
-            None => crate::storage_generation::native_genesis_activation_digest(identity, tables),
-            _ => Err(MetadataBackendError::Serde("metadata generation transition remains pending".into())),
-        }
+        self.shard_storage
+            .get(&identity.shard_id.0)
+            .expect("validated against its record")
+            .activation_digest(tables)
     }
-    /// A completed native storage cut binds two different exact clocks. This
-    /// qualifies only that original pair, not an arbitrary newer snapshot.
-    ///
-    /// When the shard's storage record activated the snapshot's converted
-    /// generation, that record's attempt is the cut: its source names the
-    /// original prefix and its seal the converted image. The record binds the
-    /// shard's storage identity, not its serving configuration, so it stays
-    /// the evidence after a later takeover or rotation. Otherwise the import
-    /// proof of the filesystem-level mechanism decides.
-    pub(crate) fn snapshot_replaces_imported_prefix(
+    /// A completed per-shard conversion binds two different exact clocks: its
+    /// attempt's source names the original prefix and its seal the converted
+    /// image. This qualifies only that original pair, not an arbitrary newer
+    /// snapshot. The shard's storage record binds the shard's storage
+    /// identity, not its serving configuration, so it stays the evidence
+    /// after a later takeover or rotation.
+    pub(crate) fn snapshot_replaces_converted_prefix(
         &self, original: &crate::DfsMetadataPrefixProof, snapshot: &crate::DfsMetadataSnapshotImageDescriptor,
     ) -> bool {
         if !original.is_well_formed() || original.version != 2
             || snapshot.validate().is_err() || self.validate_generation(&snapshot.generation).is_err() {
             return false;
         }
-        if let Some(record) = self.shard_storage.get(&snapshot.generation.shard_id.0)
-            && record.generation == snapshot.generation
-            && let Some((attempt, _)) = record.converted_activation()
-        {
-            return attempt.sealed().is_some_and(|(seal, _)|
-                original.journal_sequence == attempt.source.source_journal_sequence
-                    && original.digest == attempt.source.source_state_fingerprint
-                    && snapshot.prefix_proof == seal.prefix_proof
-                    && snapshot.semantic_state_fingerprint == seal.state_fingerprint);
-        }
-        let crate::DfsMetadataGenerationOrigin::StorageTransition { transition_id } = &snapshot.generation.origin
-        else { return false; };
-        self.storage_imports.iter().any(|proof| {
-            let crate::DfsMetadataShardHandoffCause::StorageImport { cut } = &proof.cause else { return false; };
-            self.admits_storage_of(&proof.desired_shard)
-                && proof.desired_shard.shard_id == snapshot.generation.shard_id.0
-                && cut.storage_transition_id.as_ref() == Some(transition_id)
-                && original.journal_sequence == cut.source_journal_sequence
-                && original.digest == cut.source_state_fingerprint
-                && snapshot.prefix_proof == cut.target_prefix
-                && snapshot.semantic_state_fingerprint == cut.converted_image_fingerprint
-        })
+        let Some((attempt, _)) = self
+            .shard_storage
+            .get(&snapshot.generation.shard_id.0)
+            .and_then(|record| record.converted_activation())
+        else {
+            return false;
+        };
+        attempt.sealed().is_some_and(|(seal, _)|
+            original.journal_sequence == attempt.source.source_journal_sequence
+                && original.digest == attempt.source.source_state_fingerprint
+                && snapshot.prefix_proof == seal.prefix_proof
+                && snapshot.semantic_state_fingerprint == seal.state_fingerprint)
     }
-    pub(crate) fn validate_read_generation(&self, envelope: &crate::storage_generation::GenerationEnvelope) -> crate::metadata_error::Result<()> {
+    /// Admit the physical header of `root`'s slot: the shard's storage record
+    /// is Active and admits the header ([`crate::DfsMetadataShardStorage::admits_header`]).
+    /// A Converting record and a missing record both keep the slot closed;
+    /// with no record the slot waits as for pending storage preparation,
+    /// since migration owns that storage until it records a conversion.
+    pub(crate) fn validate_read_generation(
+        &self,
+        root: &std::path::Path,
+        envelope: &crate::storage_generation::GenerationEnvelope,
+    ) -> crate::metadata_error::Result<()> {
         envelope.identity.validate()?;
-        let crate::storage_generation::GenerationState::Active { activation_digest, .. } = &envelope.state else {
+        if !matches!(envelope.state, crate::storage_generation::GenerationState::Active { .. }) {
             return Err(MetadataBackendError::Serde("staged metadata generation cannot serve reads".into()));
-        };
-        if let Some(record) = self.shard_storage.get(&envelope.identity.shard_id.0)
-            && envelope.identity.file_system_id == self.file_system_id {
-            if record.converting_attempt().is_some() {
-                return Err(MetadataBackendError::StorageConverting);
-            }
-            if record.admits_header(envelope) {
-                return Ok(());
-            }
-            if record.converted_activation().is_some() {
-                return Err(MetadataBackendError::Serde("physical metadata generation is not the one its shard storage record activated".into()));
-            }
         }
-        if let Some(crate::DfsMetadataStorageState::PendingTransition { source_activation, transition_id, .. }) = &self.storage {
-            let identity = &envelope.identity;
-            let target_already_activated = self.storage_imports.iter().any(|proof|
-                proof.desired_shard.shard_id == identity.shard_id.0
-                    && matches!(&proof.cause, crate::DfsMetadataShardHandoffCause::StorageImport { cut }
-                        if cut.storage_transition_id.as_ref() == Some(transition_id)));
-            let source_matches = match (source_activation, &identity.origin) {
-                (None, crate::DfsMetadataGenerationOrigin::NativeGenesis) => true,
-                (Some(prior), crate::DfsMetadataGenerationOrigin::StorageTransition { .. }) =>
-                    prior.generation == identity.generation
-                        && prior.target_format == u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)
-                        && prior.activation_digest == *activation_digest,
-                (Some(prior), crate::DfsMetadataGenerationOrigin::NativeGenesisInGeneration { activation }) => prior == activation,
-                _ => false,
-            };
-            if !target_already_activated && source_matches
-                && identity.file_system_id == self.file_system_id
-                && self.shards.iter().any(|shard| shard.shard_id == identity.shard_id.0) {
-                return Ok(());
-            }
-            return Err(MetadataBackendError::Serde("pending storage transition does not authorize this physical source generation".into()));
+        if envelope.identity.file_system_id != self.file_system_id {
+            return Err(MetadataBackendError::Serde("physical metadata generation belongs to another filesystem".into()));
         }
-        self.validate_generation(&envelope.identity)?;
-        if let Some(crate::DfsMetadataStorageState::Active { activation_digest: expected, .. }) = &self.storage
-            && !envelope.identity.is_native_genesis()
-            && activation_digest != expected {
-            return Err(MetadataBackendError::Serde("physical metadata activation differs from captured filesystem generation".into()));
+        match self.shard_storage.get(&envelope.identity.shard_id.0) {
+            None => Err(MetadataBackendError::StoragePreparationPending {
+                root: root.to_owned(),
+                processed_records: 0,
+            }),
+            Some(record) if record.converting_attempt().is_some() => Err(MetadataBackendError::StorageConverting),
+            Some(record) if record.admits_header(envelope) => Ok(()),
+            Some(_) => Err(MetadataBackendError::Serde("physical metadata generation is not the one its shard storage record activated".into())),
         }
-        Ok(())
     }
-    pub(crate) fn validate_native_genesis_preparation(&self, record: &crate::DfsPreparedOperationRecord) -> crate::metadata_error::Result<()> {
-        record.validate()?;
-        let filesystems = record.payload.metadata_effects.iter().filter_map(|effect|
-            if let crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } = effect { Some(file_system) } else { None })
-            .collect::<Vec<_>>();
-        let [original] = filesystems.as_slice() else {
-            return Err(MetadataBackendError::Serde("native genesis has no unique original filesystem binding".into()));
-        };
-        if original.file_system_id != self.file_system_id || original.metadata_storage != self.storage
-            || matches!(self.storage, Some(crate::DfsMetadataStorageState::PendingTransition { .. })) {
-            return Err(MetadataBackendError::Serde("native genesis filesystem storage binding changed before publication".into()));
-        }
-        Ok(())
-    }
-    /// Compare only the facts consumed when opening this physical slot. The
-    /// complete fresh catalog still belongs to routing and replica ingress;
-    /// another shard's routing change cannot create a second checkout owner,
-    /// and a serving change of this shard keeps its storage admission.
+    /// Compare only the facts consumed when opening this physical slot: the
+    /// shard's storage identity and its own storage record, never another
+    /// shard's. The complete fresh catalog still belongs to routing and
+    /// replica ingress; another shard's routing change or conversion cannot
+    /// create a second checkout owner, and a serving change of this shard
+    /// keeps its storage admission.
     pub(crate) fn has_same_storage_admission_for(
         &self,
         other: &Self,
         shard: &DfsMetadataShardConfig,
     ) -> bool {
-        let imports = |catalog: &'_ Self| catalog.storage_imports.iter()
-            .filter(|proof| metadata_shard_storage_scope_matches(&proof.desired_shard, shard))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !self.admits_storage_of(shard) || !other.admits_storage_of(shard) {
-            return false;
-        }
-        // Only this shard's own storage record is compared, never another
-        // shard's: a sibling's per-shard conversion keeps this slot. The
-        // filesystem-level state and import proofs still apply while that
-        // mechanism exists.
-        let own_record = match (
-            self.shard_storage.get(&shard.shard_id),
-            other.shard_storage.get(&shard.shard_id),
-        ) {
-            (Some(previous), Some(current)) => previous == current,
-            (None, None) => true,
-            // A record appears Active only together with the native birth
-            // the slot already holds, so it keeps that admission. A record
-            // that appears Converting closes the shard.
-            (None, Some(current)) => current.is_active(),
-            (Some(_), None) => false,
-        };
-        own_record && self.storage == other.storage && imports(self) == imports(other)
+        self.admits_storage_of(shard)
+            && other.admits_storage_of(shard)
+            && self.shard_storage.get(&shard.shard_id) == other.shard_storage.get(&shard.shard_id)
     }
 
     /// Whether this catalog admits the physical store of `shard`: its
@@ -990,81 +873,7 @@ mod namespace_catalog_storage_tests {
     use super::*;
 
     #[test]
-    fn snapshot_replacement_requires_the_exact_completed_storage_cut() {
-        // Comparison DATA only. Native receiver tests exercise actual authority,
-        // old floor preservation, installation and post-repair writes.
-        let shard = DfsMetadataShardConfig {
-            file_system_id: crate::sifs_file_system_id(), shard_id: "root".into(), epoch: 2,
-            primary_node_id: NodeId::from_legacy_named("snapshot-cut-owner").unwrap(), replica_node_ids: Vec::new(),
-            assignment: crate::DfsMetadataShardAssignment::Root,
-            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-        };
-        let prefix = |digit: &str| crate::DfsMetadataPrefixProof { version: 2, journal_sequence: 8,
-            digest: format!("dfs-metadata-prefix-v2:blake3:{}", digit.repeat(64)) };
-        let original = prefix("1");
-        let snapshot = crate::DfsMetadataSnapshotImageDescriptor {
-            format_version: crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
-            generation: crate::DfsMetadataGenerationIdentity {
-                file_system_id: shard.file_system_id.clone(), shard_id: DfsMetadataShardId::new("root"),
-                generation: "target-generation".into(),
-                origin: crate::DfsMetadataGenerationOrigin::StorageTransition { transition_id: "original-transition".into() },
-            },
-            materialized_through_sequence: 8, prefix_proof: prefix("2"),
-            semantic_state_fingerprint: "converted-state".into(), total_size_bytes: 40,
-            stream_record_count: 0, stream_digest: "3".repeat(64),
-        };
-        let proof = crate::DfsMetadataShardMembershipHandoffProof {
-            handoff_id: "original-import".into(),
-            retiring_shard: DfsMetadataShardConfig { epoch: 1, ..shard.clone() },
-            desired_shard: shard.clone(), journal_sequence: 8,
-            state_fingerprint: snapshot.semantic_state_fingerprint.clone(),
-            acknowledged_node_ids: vec![shard.primary_node_id.clone()],
-            cause: crate::DfsMetadataShardHandoffCause::StorageImport { cut: crate::DfsMetadataStorageImportCut {
-                storage_transition_id: Some("original-transition".into()), source_cut_digest: "cut".into(),
-                source_journal_sequence: 8, source_state_fingerprint: original.digest.clone(),
-                target_prefix: snapshot.prefix_proof.clone(), converted_image_fingerprint: snapshot.semantic_state_fingerprint.clone(),
-                pending_mapping_digest: "mapping".into(),
-            } },
-        };
-        let catalog = DfsMetadataNamespaceCatalog {
-            file_system_id: shard.file_system_id.clone(), shards: vec![shard], storage_imports: vec![proof],
-            shard_storage: BTreeMap::new(),
-            storage: Some(crate::DfsMetadataStorageState::Active {
-                generation: "target-generation".into(), target_format: u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-                catalog_generation: 2, activation_digest: "activation".into(),
-            }),
-        };
-        assert!(catalog.snapshot_replaces_imported_prefix(&original, &snapshot));
-        assert!(!catalog.snapshot_replaces_imported_prefix(&prefix("4"), &snapshot));
-        for change in 0..6 {
-            let mut changed = snapshot.clone();
-            match change {
-                0 => changed.prefix_proof = prefix("4"),
-                1 => changed.semantic_state_fingerprint.push_str("-fork"),
-                2 => changed.generation.generation.push_str("-foreign"),
-                3 => changed.generation.shard_id = DfsMetadataShardId::new("users"),
-                4 => changed.generation.origin = crate::DfsMetadataGenerationOrigin::StorageTransition { transition_id: "foreign".into() },
-                _ => { changed.prefix_proof.journal_sequence += 1; changed.materialized_through_sequence += 1; }
-            }
-            assert!(!catalog.snapshot_replaces_imported_prefix(&original, &changed), "change {change}");
-        }
-        let mut absent = catalog.clone();
-        absent.storage_imports.clear();
-        assert!(!absent.snapshot_replaces_imported_prefix(&original, &snapshot));
-        // A later serving change of the shard (a takeover moves the primary
-        // and the epoch) keeps the import as its activation evidence.
-        let mut taken_over = catalog.clone();
-        taken_over.shards[0].epoch += 1;
-        taken_over.shards[0].primary_node_id = NodeId::from_legacy_named("snapshot-cut-successor").unwrap();
-        assert!(taken_over.snapshot_replaces_imported_prefix(&original, &snapshot));
-        // Another storage identity does not: a different path assignment.
-        let mut reassigned = catalog.clone();
-        reassigned.shards[0].assignment = crate::DfsMetadataShardAssignment::PathPrefix { prefix: "/other".into() };
-        assert!(!reassigned.snapshot_replaces_imported_prefix(&original, &snapshot));
-    }
-
-    #[test]
-    fn slot_admission_ignores_serving_changes_but_rejects_storage_and_own_scope_changes() {
+    fn slot_admission_ignores_serving_changes_but_rejects_own_scope_changes() {
         // Comparison DATA only; these values never enter publication authority.
         let root = DfsMetadataShardConfig {
             file_system_id: crate::sifs_file_system_id(),
@@ -1078,13 +887,10 @@ mod namespace_catalog_storage_tests {
         let mut services = root.clone();
         services.shard_id = "services".into();
         services.assignment = crate::DfsMetadataShardAssignment::PathPrefix { prefix: "/services".into() };
-        let original = DfsMetadataNamespaceCatalog {
-            file_system_id: root.file_system_id.clone(),
-            shards: vec![root.clone(), services.clone()],
-            storage: None,
-            storage_imports: Vec::new(),
-            shard_storage: BTreeMap::new(),
-        };
+        let original = DfsMetadataNamespaceCatalog::for_test(
+            root.file_system_id.clone(),
+            vec![root.clone(), services.clone()],
+        );
         // Serving changes, of another shard or of this one (a takeover's new
         // primary and epoch, a recruit's replica), keep storage admission.
         let mut unrelated = original.clone();
@@ -1101,65 +907,6 @@ mod namespace_catalog_storage_tests {
         let mut own_changed = original.clone();
         own_changed.shards[0].assignment = crate::DfsMetadataShardAssignment::PathPrefix { prefix: "/root".into() };
         assert!(!original.has_same_storage_admission_for(&own_changed, &root));
-        let mut pending = original.clone();
-        pending.storage = Some(crate::DfsMetadataStorageState::PendingTransition {
-            source_activation: None,
-            transition_id: "slot-transition".into(),
-            source_catalog_generation: 2,
-            target_generation: "slot-target".into(),
-            target_format: u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-            expected_catalog_digest: format!("blake3:{}", "1".repeat(64)),
-        });
-        assert!(!original.has_same_storage_admission_for(&pending, &root));
-        let proof = |shard: &DfsMetadataShardConfig| crate::DfsMetadataShardMembershipHandoffProof {
-            cause: crate::DfsMetadataShardHandoffCause::StorageImport {
-                cut: crate::DfsMetadataStorageImportCut {
-                    storage_transition_id: Some("slot-transition".into()),
-                    source_cut_digest: "original-cut".into(),
-                    source_journal_sequence: 2,
-                    source_state_fingerprint: "original-state".into(),
-                    target_prefix: crate::metadata_records::dfs_metadata_prefix_proof_genesis(
-                        &DfsMetadataShardId::new(&shard.shard_id)),
-                    converted_image_fingerprint: "target-state".into(),
-                    pending_mapping_digest: "mapping".into(),
-                },
-            },
-            handoff_id: format!("slot-import-{}", shard.shard_id),
-            retiring_shard: shard.clone(),
-            desired_shard: shard.clone(),
-            journal_sequence: 2,
-            state_fingerprint: "target-state".into(),
-            acknowledged_node_ids: vec![shard.primary_node_id.clone()],
-        };
-        let mut other_import = pending.clone();
-        other_import.storage_imports.push(proof(&services));
-        assert!(pending.has_same_storage_admission_for(&other_import, &root));
-        let mut own_import = pending.clone();
-        own_import.storage_imports.push(proof(&root));
-        assert!(!pending.has_same_storage_admission_for(&own_import, &root));
-        let mut replaced_proof = own_import.clone();
-        replaced_proof.storage_imports[0].handoff_id.push_str("-changed");
-        assert!(!own_import.has_same_storage_admission_for(&replaced_proof, &root));
-        // The shard's own import stays its admission when a takeover later
-        // rewrites the shard's serving configuration.
-        let mut own_import_taken_over = own_import.clone();
-        own_import_taken_over.shards[0].epoch += 1;
-        own_import_taken_over.shards[0].primary_node_id =
-            NodeId::from_legacy_named("slot-admission-successor").unwrap();
-        assert!(own_import.has_same_storage_admission_for(&own_import_taken_over, &root));
-        let mut active = original.clone();
-        active.storage = Some(crate::DfsMetadataStorageState::Active {
-            generation: "slot-target".into(),
-            target_format: u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-            catalog_generation: 2,
-            activation_digest: "activation".into(),
-        });
-        assert!(!pending.has_same_storage_admission_for(&active, &root));
-        let mut replacement = active.clone();
-        if let Some(crate::DfsMetadataStorageState::Active { generation, .. }) = &mut replacement.storage {
-            generation.push_str("-replacement");
-        }
-        assert!(!active.has_same_storage_admission_for(&replacement, &root));
     }
 }
 
@@ -8404,7 +8151,7 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
     // re-checks the same rule under the writer lock.
     let floor_epoch_scope = permit.and_then(DfsMetadataReplicaIngestPermit::floor_epoch_scope);
     let replaced = |prefix: &crate::DfsMetadataPrefixProof| permit.is_some_and(|permit|
-        permit.snapshot_replaces_imported_prefix(prefix, &command.snapshot));
+        permit.snapshot_replaces_converted_prefix(prefix, &command.snapshot));
     let relation = |floor_epoch: Option<u64>| {
         command.authority_epoch.map_or(
             crate::metadata_records::DfsMetadataAckFloorRelation::Binds,
@@ -10976,53 +10723,43 @@ mod shard_storage_admission_tests {
         let root = shard("root", crate::DfsMetadataShardAssignment::Root);
         let users = shard("users", crate::DfsMetadataShardAssignment::PathPrefix { prefix: "/users".into() });
         let shards = vec![root.clone(), users.clone()];
-        let identity = crate::storage_generation::native_genesis_generation_identity(&root, None);
+        let slot = std::path::Path::new("/shard-root");
+        let identity = crate::storage_generation::native_genesis_generation_identity(&root);
         let header = crate::storage_generation::GenerationEnvelope {
             format_version: crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             identity: identity.clone(),
             state: crate::storage_generation::GenerationState::Active {
                 activation_digest: format!("blake3:{}", "d".repeat(64)),
-                standalone_seal: None,
             },
         };
-        // Under a filesystem-level generation the native birth is not admitted.
-        let filesystem_active = Some(crate::DfsMetadataStorageState::Active {
-            generation: "filesystem-generation".into(),
-            target_format: u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-            catalog_generation: 0,
-            activation_digest: format!("blake3:{}", "e".repeat(64)),
-        });
-        let legacy = DfsMetadataNamespaceCatalog::for_test(
-            root.file_system_id.clone(), shards.clone(), filesystem_active,
-        );
-        assert!(legacy.validate_read_generation(&header).is_err());
-        // The shard's own Active record admits it, whatever the filesystem state.
-        let own = legacy.clone().with_shard_storage_for_test(
-            crate::DfsMetadataShardStorage::native_genesis(&root, identity.clone()),
-        );
-        own.validate_read_generation(&header).unwrap();
+        // The shard's own Active record admits its native birth.
+        let own = DfsMetadataNamespaceCatalog::for_test(root.file_system_id.clone(), shards);
+        own.validate_read_generation(slot, &header).unwrap();
         own.validate_generation(&identity).unwrap();
-        // A Converting record closes the shard even where the filesystem
-        // rule alone would admit it.
-        let plain = DfsMetadataNamespaceCatalog::for_test(root.file_system_id.clone(), shards, None);
-        plain.validate_read_generation(&header).unwrap();
-        let closed = plain.clone().with_shard_storage_for_test(converting(&root));
-        assert!(closed.validate_read_generation(&header).is_err());
+        // With no record, migration owns the storage: the slot waits as for
+        // pending storage preparation, and no generation of it is admitted.
+        let unconverted = own.clone().without_shard_storage_for_test(&root.shard_id);
+        assert!(matches!(
+            unconverted.validate_read_generation(slot, &header),
+            Err(MetadataBackendError::StoragePreparationPending { root, processed_records: 0 }) if root == slot
+        ));
+        assert!(unconverted.validate_generation(&identity).is_err());
+        // A Converting record closes the shard.
+        let closed = own.clone().with_shard_storage_for_test(converting(&root));
+        assert!(matches!(
+            closed.validate_read_generation(slot, &header),
+            Err(MetadataBackendError::StorageConverting)
+        ));
         assert!(closed.validate_generation(&identity).is_err());
         // Slot admission compares only the shard's own record: a sibling's
         // conversion keeps it; its own does not.
         let sibling_converting = own.clone().with_shard_storage_for_test(converting(&users));
         assert!(own.has_same_storage_admission_for(&sibling_converting, &root));
         assert!(!own.has_same_storage_admission_for(&sibling_converting, &users));
-        let own_converting = own.clone().with_shard_storage_for_test(converting(&root));
-        assert!(!own.has_same_storage_admission_for(&own_converting, &root));
-        // A record that appears with the native birth the slot holds keeps
-        // its admission; one that appears Converting closes it.
-        let born = plain.clone().with_shard_storage_for_test(
-            crate::DfsMetadataShardStorage::native_genesis(&root, identity.clone()),
-        );
-        assert!(plain.has_same_storage_admission_for(&born, &root));
-        assert!(!plain.has_same_storage_admission_for(&closed, &root));
+        assert!(!own.has_same_storage_admission_for(&closed, &root));
+        // A record that appears reopens the slot its absence kept closed.
+        assert!(!unconverted.has_same_storage_admission_for(&own, &root));
+        assert!(!unconverted.has_same_storage_admission_for(&closed, &root));
     }
 
     fn active_converted(root: &DfsMetadataShardConfig) -> crate::DfsMetadataShardStorage {
@@ -11058,44 +10795,37 @@ mod shard_storage_admission_tests {
         let root = shard("root", crate::DfsMetadataShardAssignment::Root);
         let users = shard("users", crate::DfsMetadataShardAssignment::PathPrefix { prefix: "/users".into() });
         let shards = vec![root.clone(), users.clone()];
+        let slot = std::path::Path::new("/shard-root");
         let header = |identity: crate::DfsMetadataGenerationIdentity, activation_digest: String| crate::storage_generation::GenerationEnvelope {
             format_version: crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, identity,
-            state: crate::storage_generation::GenerationState::Active { activation_digest, standalone_seal: None },
+            state: crate::storage_generation::GenerationState::Active { activation_digest },
         };
         let active = active_converted(&root);
         let crate::DfsMetadataShardStorageState::Active {
             activation: crate::DfsMetadataShardActivation::Converted { activation_digest, .. },
         } = &active.state else { unreachable!() };
-        let stale = crate::storage_generation::native_genesis_generation_identity(&root, None);
+        let stale = crate::storage_generation::native_genesis_generation_identity(&root);
         let stale_header = header(stale.clone(), format!("blake3:{}", "d".repeat(64)));
-        let pending = Some(crate::DfsMetadataStorageState::PendingTransition {
-            source_activation: None,
-            transition_id: "filesystem-transition".into(),
-            source_catalog_generation: 0,
-            target_generation: "filesystem-target".into(),
-            target_format: u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION),
-            expected_catalog_digest: format!("blake3:{}", "1".repeat(64)),
-        });
-        for storage in [None, pending] {
-            let plain = DfsMetadataNamespaceCatalog::for_test(root.file_system_id.clone(), shards.clone(), storage);
-            // Without the record the filesystem-level rule admits the native birth.
-            plain.validate_read_generation(&stale_header).unwrap();
-            let converted = plain.with_shard_storage_for_test(active.clone());
-            assert!(converted.validate_generation(&stale).is_err());
-            assert!(converted.validate_read_generation(&stale_header).is_err());
-            // The converted generation itself, with the activated digest, serves.
-            let current = header(active.generation.clone(), activation_digest.clone());
-            converted.validate_generation(&active.generation).unwrap();
-            converted.validate_read_generation(&current).unwrap();
-            // The sibling without a record still follows the filesystem rule.
-            let sibling = crate::storage_generation::native_genesis_generation_identity(&users, None);
-            converted.validate_read_generation(&header(sibling, format!("blake3:{}", "d".repeat(64)))).unwrap();
-        }
+        let converted = DfsMetadataNamespaceCatalog::for_test(root.file_system_id.clone(), shards)
+            .with_shard_storage_for_test(active.clone());
+        assert!(converted.validate_generation(&stale).is_err());
+        assert!(converted.validate_read_generation(slot, &stale_header).is_err());
+        // The converted generation itself, with the activated digest, serves.
+        let current = header(active.generation.clone(), activation_digest.clone());
+        converted.validate_generation(&active.generation).unwrap();
+        converted.validate_read_generation(slot, &current).unwrap();
+        // A different digest under the same generation does not.
+        assert!(converted
+            .validate_read_generation(slot, &header(active.generation.clone(), format!("blake3:{}", "e".repeat(64))))
+            .is_err());
+        // The sibling keeps its own native-genesis record.
+        let sibling = crate::storage_generation::native_genesis_generation_identity(&users);
+        converted.validate_read_generation(slot, &header(sibling, format!("blake3:{}", "d".repeat(64)))).unwrap();
     }
 
     #[test]
     fn an_active_conversion_record_names_the_prefix_its_snapshot_replaces() {
-        // Comparison DATA only, with no filesystem-level state or import proof.
+        // Comparison DATA only.
         let root = shard("root", crate::DfsMetadataShardAssignment::Root);
         let users = shard("users", crate::DfsMetadataShardAssignment::PathPrefix { prefix: "/users".into() });
         let prefix = |digit: &str, journal_sequence| crate::DfsMetadataPrefixProof { version: 2, journal_sequence,
@@ -11132,15 +10862,18 @@ mod shard_storage_admission_tests {
             stream_record_count: 0, stream_digest: "3".repeat(64),
         };
         let catalog = |shards: Vec<DfsMetadataShardConfig>, record: Option<crate::DfsMetadataShardStorage>| {
-            let catalog = DfsMetadataNamespaceCatalog::for_test(root.file_system_id.clone(), shards, None);
-            match record { Some(record) => catalog.with_shard_storage_for_test(record), None => catalog }
+            let catalog = DfsMetadataNamespaceCatalog::for_test(root.file_system_id.clone(), shards);
+            match record {
+                Some(record) => catalog.with_shard_storage_for_test(record),
+                None => catalog.without_shard_storage_for_test(&root.shard_id),
+            }
         };
         let activated = catalog(vec![root.clone(), users.clone()], Some(active.clone()));
-        assert!(activated.snapshot_replaces_imported_prefix(&original, &snapshot),
+        assert!(activated.snapshot_replaces_converted_prefix(&original, &snapshot),
             "the Active record alone qualifies its own source prefix");
         // Only the attempt's source prefix, and only its sealed image.
-        assert!(!activated.snapshot_replaces_imported_prefix(&prefix("4", 8), &snapshot));
-        assert!(!activated.snapshot_replaces_imported_prefix(&prefix("1", 7), &snapshot));
+        assert!(!activated.snapshot_replaces_converted_prefix(&prefix("4", 8), &snapshot));
+        assert!(!activated.snapshot_replaces_converted_prefix(&prefix("1", 7), &snapshot));
         for change in 0..3 {
             let mut changed = snapshot.clone();
             match change {
@@ -11148,20 +10881,19 @@ mod shard_storage_admission_tests {
                 1 => changed.semantic_state_fingerprint.push_str("-fork"),
                 _ => changed.generation.generation.push_str("-foreign"),
             }
-            assert!(!activated.snapshot_replaces_imported_prefix(&original, &changed), "change {change}");
+            assert!(!activated.snapshot_replaces_converted_prefix(&original, &changed), "change {change}");
         }
         // A shard still converting is closed and replaces nothing.
         let closed = catalog(vec![root.clone(), users.clone()], Some(converting));
-        assert!(!closed.snapshot_replaces_imported_prefix(&original, &snapshot));
+        assert!(!closed.snapshot_replaces_converted_prefix(&original, &snapshot));
         // A takeover after activation keeps the record as the evidence.
         let mut taken_over = root.clone();
         taken_over.epoch += 1;
         taken_over.primary_node_id = NodeId::from_legacy_named("storage-admission-successor").unwrap();
         taken_over.replica_node_ids.push(root.primary_node_id.clone());
         let after_takeover = catalog(vec![taken_over, users.clone()], Some(active));
-        assert!(after_takeover.snapshot_replaces_imported_prefix(&original, &snapshot));
-        // Without the record the filesystem-level rule decides, and this
-        // catalog has no filesystem generation or import proof for it.
-        assert!(!catalog(vec![root.clone(), users], None).snapshot_replaces_imported_prefix(&original, &snapshot));
+        assert!(after_takeover.snapshot_replaces_converted_prefix(&original, &snapshot));
+        // Without the record nothing qualifies.
+        assert!(!catalog(vec![root.clone(), users], None).snapshot_replaces_converted_prefix(&original, &snapshot));
     }
 }

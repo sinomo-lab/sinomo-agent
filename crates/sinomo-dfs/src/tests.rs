@@ -567,7 +567,6 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
 fn file_system(owner: NodeId) -> DfsFileSystem {
     DfsFileSystem {
         catalog_generation: 0,
-        metadata_storage: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),

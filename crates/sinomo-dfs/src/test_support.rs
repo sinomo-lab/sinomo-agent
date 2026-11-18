@@ -7,47 +7,12 @@ pub use native_trace_artifact::NativeShardTraceArtifactSession;
 /// Bounded observations of actual metadata publication and replica responses.
 /// This handle grants no authority and uses the existing packet/byte limits.
 pub struct DfsTestMetadataBoundaryCapture {
-    root: std::path::PathBuf,
     capture: crate::native_boundary_diagnostics::Capture,
 }
 
 impl DfsTestMetadataBoundaryCapture {
     pub fn checkpoint(&self, label: &str) {
         self.capture.checkpoint(label);
-    }
-
-    pub fn dump_replication_failure(
-        &self,
-        label: &str,
-        assignment: &crate::DfsMetadataShardConfig,
-        error: &str,
-        observations: &[DfsTestRpcObservation],
-    ) {
-        crate::native_boundary_diagnostics::record(
-            &self.root,
-            "replication-failure-context",
-            || serde_json::json!({"assignment":assignment,"error":error}),
-            false,
-        );
-        for (ordinal, call) in observations.iter().enumerate() {
-            crate::native_boundary_diagnostics::record(
-                &self.root,
-                "rpc-observation-at-failure",
-                || {
-                    serde_json::json!({
-                        "ordinal":ordinal,"source":call.source,"target":call.target,
-                        "route":call.route,"call_id":call.call_id,
-                        "phase":format!("{:?}",call.phase),"origin":format!("{:?}",call.origin),
-                        "error":call.outcome_error,"frame_id":call.dfs_frame_id,
-                        "intent_id":call.dfs_intent_id,"file_system_id":call.dfs_file_system_id,
-                        "object_id":call.dfs_object_id,"version":call.dfs_version,
-                        "time_qualification":"dumped at failure; original RPC timestamps unavailable",
-                    })
-                },
-                false,
-            );
-        }
-        self.capture.dump(label, serde_json::Value::Null);
     }
 }
 
@@ -64,8 +29,7 @@ pub fn capture_metadata_operation_boundaries(
     root: std::path::PathBuf,
 ) -> DfsTestMetadataBoundaryCapture {
     DfsTestMetadataBoundaryCapture {
-        capture: crate::native_boundary_diagnostics::capture_all_operations(root.clone()),
-        root,
+        capture: crate::native_boundary_diagnostics::capture_all_operations(root),
     }
 }
 
@@ -241,33 +205,6 @@ pub fn stable_write_intent_id(requester: &NodeId, object: &DfsObjectId, operatio
 }
 pub fn now_unix_nanos() -> u64 {
     crate::metadata_records::dfs_now_unix_nanos()
-}
-
-impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    /// Retain the actual opened backend while releasing its normal service,
-    /// provider and data-owner capabilities. This binds no epoch or authority.
-    pub fn test_into_retained_metadata_backend(
-        mut self,
-    ) -> Result<Box<dyn DfsMetadataBackend>, DfsError> {
-        if self.publication_execution.current().is_some() {
-            return Err(DfsError::Metadata {
-                message: "cannot detach a backend during actual publication execution".into(),
-            });
-        }
-        let backend = self
-            .metadata_backend
-            .take()
-            .ok_or_else(|| DfsError::Metadata {
-                message: "normal service has no actual metadata backend to retain".into(),
-            })?;
-        let crate::service_state::DfsMetadataBackendOwner::Owned(backend) = backend else {
-            return Err(DfsError::Metadata {
-                message: "retained backend fixture requires an independently owned backend, not a resident runtime lease".into(),
-            });
-        };
-        drop(self);
-        Ok(backend)
-    }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -616,26 +553,6 @@ pub fn native_replica_journal_command(
         frames,
         false,
     )
-}
-
-/// Actual local OS data-owner lease for explicit standalone component tests.
-/// This registers only the existing weak owner slot: no native host, cluster
-/// client, preparation result, source certificate or storage authority is made.
-pub struct StandaloneDataOwnerFixture {
-    _owner: std::sync::Arc<crate::runtime_host::DfsDataOwnerLock>,
-}
-impl StandaloneDataOwnerFixture {
-    pub fn acquire(context: &sinomo_module::ComponentContext) -> Result<Self, String> {
-        if context.cluster_access().is_some()
-            || context.host_role() == sinomo_module::ComponentHostRole::Shadow
-            || crate::runtime_host::registered_component_cluster(context).map_err(|e| e.to_string())?.is_some() {
-            return Err("standalone owner fixture requires an actual non-native context".into());
-        }
-        let paths = crate::runtime_host::DfsRuntimePaths::for_host_role(context.data_dir(), context.host_role());
-        let owner = std::sync::Arc::new(crate::runtime_host::DfsDataOwnerLock::acquire(&paths).map_err(|e| e.to_string())?);
-        crate::runtime_host::register_daemon_dfs_data_owner_lock(&paths, &owner).map_err(|e| e.to_string())?;
-        Ok(Self { _owner: owner })
-    }
 }
 
 /// Announce a namespace job event from `node`, as its coordinator's step

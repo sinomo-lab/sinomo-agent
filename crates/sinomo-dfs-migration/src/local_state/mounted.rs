@@ -138,9 +138,9 @@ fn captured(value: &mut Value) -> Result<()> {
     if !matches!(field(row, "committed_repair_records"), Some(Value::List(_))) {
         return Err(error("original capture omits its typed retry inventory"));
     }
-    // Keep original canonical retry rows unchanged. The independent existing
-    // retry source converter owns any separately proven old identity generation.
-
+    // The current capture holds only its committed work: the shard tables'
+    // repair index carries the removed node-local repair queue's work.
+    row.fields.retain(|field| field.key != "committed_repair_records");
     Ok(())
 }
 fn marker(value: &mut Value) -> Result<()> {

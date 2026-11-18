@@ -4268,7 +4268,6 @@ fn install_test_metadata_replica_shard(
 fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
         catalog_generation: 0,
-        metadata_storage: None,
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: shard.file_system_id.clone(),

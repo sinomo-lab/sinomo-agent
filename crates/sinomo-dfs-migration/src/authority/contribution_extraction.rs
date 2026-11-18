@@ -437,7 +437,7 @@ impl NativeImportAuthority {
             MAX_CAPTURE_BYTES as u64,
         )
         .map_err(error)?;
-        let mut captured = crate::metadata::canonical_generation::decode_captured_unit(
+        let captured = crate::metadata::canonical_generation::decode_captured_unit(
             &bytes,
             MAX_CAPTURE_BYTES,
             MAX_CAPTURE_RECORDS,
@@ -446,7 +446,6 @@ impl NativeImportAuthority {
         if captured.source.physical_shard != *shard {
             return Err(error("retained capture names another physical shard"));
         }
-        captured.load_recovery_evidence(path)?;
         // The capture names the exact source files it was read from; a copy
         // that no longer has them is not the image S converts from.
         captured.verify_retained_source()?;

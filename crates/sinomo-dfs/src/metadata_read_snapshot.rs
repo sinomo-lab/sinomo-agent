@@ -712,7 +712,6 @@ mod tests {
     fn file_system(label: &str, display_name_bytes: usize) -> DfsFileSystem {
         DfsFileSystem {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named(format!("fs_{label}"))

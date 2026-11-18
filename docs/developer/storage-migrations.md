@@ -115,19 +115,31 @@ completed inventory in addition to their existing native catalog and retention
 proofs. Inventory completion alone never authorizes deletion.
 
 Metadata generations bind their exact filesystem, shard, and native origin.
-A private staged generation cannot serve ordinary operations merely because a
-provider reports readiness. Native genesis or certified storage-import
-publication must establish its activation. Shards created after conversion bind
-the active filesystem generation through their original native genesis;
-compacting that prepare body must retain the exact activation evidence. A
-retired pre-conversion root cannot qualify by adopting a newer header.
-A filesystem-wide conversion captures
-the complete authoritative catalog and its monotonic generation before fencing
-writers. Every participant must stage and activate count-aware storage before
-the filesystem releases the transition. Catalog changes cannot race that release;
-partial failure retains the fences and resumes the same transition. Unrelated
-ready storage remains available, and a previously active current-format source
-can remain readable under its retained authority while its writes are fenced.
+Each metadata shard has a storage record naming the generation it serves and
+the evidence that activated it: its native genesis, or a conversion attempt
+with that attempt's activation digest. A shard opens only when its local
+generation header matches an Active record. A Converting record keeps it
+closed, and a shard with no record is old storage that the migration owner
+must convert before it opens. A private staged generation cannot serve
+ordinary operations merely because a provider reports readiness. A shard born
+current records its Active record together with its assignment; its own
+committed genesis certifies that activation, so compacting the genesis prepare
+body must retain the exact genesis evidence. A retired pre-conversion root
+cannot qualify by adopting a newer header.
+
+Each shard converts on its own, from its primary's own copy. The primary
+captures that copy and records the attempt Converting before it reads what the
+other shards contribute to its counts. It then builds and seals the image,
+installs it under the shard's install rule (the write set of a switched shard,
+otherwise the primary and a majority of the configured members) and activates
+it with one transaction on the shard's own keys. Members then activate their
+staged copies. A serving change supersedes an attempt, and the shard's next primary
+starts a new one from its own copy. When a closed shard's primary is lost, a
+member converts from its own copy in its place, and that activation also
+makes it primary at the next epoch. Conversion never writes the filesystem
+configuration or advances its catalog generation, which guards path
+assignment only. Only the converting shard is closed: a node's closed copy
+never blocks its other shards.
 
 A contended destination remains pending without waiting on its active
 preparation session. Physical aliases share one stable slot. The owner retains
@@ -145,42 +157,21 @@ suffix, and reconstructs the acknowledged prefix under the same record limit.
 A synchronized event tail without a published cursor is not acknowledged work;
 an empty stream header is not a completed conversion or publication seal.
 
-Finalization returns to the same lifecycle after recording the verified candidate
-source cut and again after recording its import proposal. The same slot retains
-the physical source lock and the typed checkpoint across these yields. Each
-continuation checks the exact retained checkpoint bytes, source inventory and
-current owner before advancing. A completed checkpoint counts as one durable
-record of progress; contention and dependencies that have not advanced report
-zero. Neither checkpoint reports `Ready` or contains a reusable certificate.
+Once the replay covers the whole source and its journal tail, the capture
+records the facts of the copy it captured: source identity, snapshot, journal
+head, filesystem, assignments and any original handoff reservation. A later
+turn or a restart must find exactly those facts, or the capture fails. The
+captured unit then stays in the same slot, under the same physical source lock,
+for the shard's conversion to build its image from. A completed capture does
+not report `Ready` and grants no authority; the shard's storage record and its
+own transactions decide activation.
 
-The migration component retains at most one decoded native plan between calls.
-Every reuse reads and compares the complete current file bytes against the bytes
-that passed full plan validation. A different file body is parsed and validated
-again; missing or truncated files fail normally. This retains immutable DATA
-only: source custody, current assignment, native receipts, participant proof and
-installed-image checks still run at their original boundaries. A new component
-owner starts with no retained plan, and no parsed plan is an authority token.
-
-Within that component, pure plan validation can reuse this same single entry
-when every typed field matches. Opaque JSON numbers and original path spelling
-are compared exactly, including distinctions that ordinary numeric or path
-equality normalizes. This avoids repeatedly serializing an unchanged plan during
-one bounded publication turn. Changed data earns full validation again. Reads
-of retained files still check their entire current contents, and every native
-scope, source, receipt, floor and publication check remains independent of this
-data reuse.
-
-During preparation and installation, a current candidate's complete native row
-decoder supplies a private inspection value. The component retains at most one
-candidate inspection and one decoded ancestry challenge alongside its existing
-single decoded plan entry. Challenge reuse reads and compares all current file
-bytes; its source custody, floors and authority are checked afresh by the caller.
-Each subsequent candidate check reads
-the entire physical stream again, including the header, every framed record,
-record count, stream chain and terminal EOF, then compares the raw file hash.
-Only identical bytes reuse the decoded semantic result. This value grants no
-writer permission, survives no process restart, and does not replace source or
-target fences. The same checks apply after the candidate's root is renamed.
+Every check of a staged image reads the entire physical stream again, including
+the header, every framed record, record count, stream chain and terminal EOF,
+then compares the raw file hash. A member keeps the floors and captures it
+recorded with an attempt's ancestry challenge, and a retry that finds them
+changed fails. Nothing decoded from an image grants writer permission, survives
+a process restart, or replaces source or target fences.
 
 Retained raw journal copies are checkpointed within the existing bounded source
 turn. New copies stay in uniquely named private files until every file has been
@@ -197,53 +188,31 @@ A commit still requires its exact durable prepare frame. The separately written
 journal head uses the existing derived-hint API; lost, stale or corrupt hints
 are recovered from the actual durable tail rather than authorizing a sequence.
 
-Source-version lookup hints are derived from the verified source projection.
-Their publication consumes the existing preparation record budget, retaining a
-cursor in the same fenced session between calls. Each hint is atomically
-replaced using the normal hint writer. The source event ledger, progress,
-captured cuts, proposals and installation records retain their durability
-barriers; hint files never supply those guarantees or native authority.
-
-A fresh owner first validates source custody and replays the durable event
-checkpoint under the same record budget, then reconstructs the hints. No saved
-hint cursor or hint file can replace this replay. Missing hints remain
-unavailable until reconstructed; malformed or foreign hints still fail source
-validation. Every lookup checks current membership, original source bytes and
-row provenance. Losing these derived files across cancellation or restart cannot
-make incomplete preparation Ready or change the native publication checks.
-
 Cancellation between calls preserves this pending state. A process restart
-reconstructs the source projection under the original record budget, verifies
-the staged candidate and reuses the retained native plan and request identities.
-Certification and installation remain one publication turn: they obtain actual
-native receipts and full participant proof, recheck the source/image, retain the
-target writer fence, and use the existing durable installation intent before
-exchange. Interrupted installation reobserves native authority and exact bytes;
-saved JSON alone cannot establish readiness. The candidate/proposal restart
-tests stop the real disposable native owner at each checkpoint and require
-eventual native readiness, unchanged source data and exact checkpoint replay.
+reconstructs the source projection under the original record budget and resumes
+the attempt from its files. Each transaction request is saved before it is
+submitted and resubmitted byte for byte, so a lost outcome settles under the
+same request identity. Installation obtains actual native receipts from the
+members the shard's install rule names, rechecks the source and image, and
+keeps the shard closed under its Converting record until activation. An
+interrupted installation reobserves native authority and exact bytes; saved
+JSON alone cannot establish readiness.
 
 The converter retains original source bytes and digests, synchronizes output
 before progress, and discards only an uncheckpointed staging suffix on restart.
 Its hidden canonical candidate contains current rows and proven compact terminal
-outcomes. Native conversion may also retain exact current V7 preparations for
-count-neutral metadata updates to existing canonical objects that leave their
-content and placement unchanged. These reservations
-keep their original body, digest, slot and epoch. Separately bound recovery
-evidence leaves the original capture unchanged and can be reconstructed only
-from its fenced replay. Native activation must fence the original epoch; the
-existing recovery owner publishes the actual successor and atomically supersedes
-the original. Unsupported namespace, parent, count, content and completion work
-remains a migration blocker. Standalone conversion requires settled originals.
+outcomes. No original preparation crosses into it: the converted journal starts
+at the conversion's own base and holds no frame to recover one from. A V7
+prepare whose outcome the copy does not record, a count-neutral metadata update
+included, is the shard's own crash-left work. Like unsupported namespace,
+parent, count, content and completion work, it stops that shard's conversion
+with a typed reason for operator repair, and the shard stays closed.
 Original bytes and historical journal frames remain in the source archive;
 conversion never relabels an old protocol body or invents a terminal outcome.
-Installation binds the captured source cut, current configuration, physical
-storage ownership, and exact KV
-comparisons through native authority; standalone stores use explicit local
-ownership evidence. Standalone count initialization also requires complete local
-source coverage under the retained data owner and unique canonical ownership.
-The migration owner must recheck that coverage and the original source identities
-before publication; ambiguous roots cannot supply counts. Old reservations,
+Installation binds the captured source cut, the attempt's serving record,
+physical storage ownership, and exact comparisons of the shard's own keys
+through native authority. The migration owner must recheck the original source
+identities before publication. Old reservations,
 jobs, and proofs remain conversion data until current authority establishes their
 replacements; they never grant publication authority.
 
@@ -252,9 +221,12 @@ mixed-version writer path: an incompatible daemon must be upgraded before it
 joins. [DFS metadata authority](../dfs-architecture.md#metadata-authority) owns
 the current format and authority rules.
 
-`sinomo dfs status --json` still carries a `storage_migrations` list of
-`MigrationJob` records, but current DFS status leaves it empty; conversion
-progress is not reported there.
+`sinomo dfs status --json` lists each metadata shard's storage conversion in
+`storage_migrations`, from the shard's storage record: `old` when the shard has
+no record, `converting` with its attempt, or `active`, with the attempt that
+activated it when the shard was converted. A takeover attempt also reports its
+round. On a node that holds a closed shard's copy, a conversion stopped for
+operator repair reports `stopped` with its attempt and reason.
 
 ## Verification
 

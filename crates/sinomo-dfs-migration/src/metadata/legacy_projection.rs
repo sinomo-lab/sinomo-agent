@@ -2361,6 +2361,207 @@ mod tests {
         );
         assert!(untouched.required_native_work().is_empty());
     }
+    fn current_frame_source_rows(
+        node: &sinomo_core::node::NodeId,
+    ) -> (sinomo_dfs::DfsFileSystem, Vec<sinomo_dfs::DfsObjectMetadata>) {
+        let fs = sinomo_dfs::DfsFileSystem::sifs(node.clone());
+        let mut rows = Vec::new();
+        for (name, path, kind) in [
+            ("root", "/", sinomo_dfs::DfsObjectKind::Directory),
+            ("child", "/child", sinomo_dfs::DfsObjectKind::Directory),
+            ("file", "/file", sinomo_dfs::DfsObjectKind::File),
+            ("alias", "/alias", sinomo_dfs::DfsObjectKind::Hardlink),
+        ] {
+            rows.push(sinomo_dfs::DfsObjectMetadata {
+                object_id: sinomo_dfs::DfsObjectId::from_legacy_named(name).unwrap(),
+                file_system_id: fs.file_system_id.clone(),
+                path: path.into(),
+                kind,
+                namespace_link_count: None,
+                tombstone_provenance: None,
+                owner_node_id: node.clone(),
+                current_locations: Vec::new(),
+                content_hash: None,
+                content_size_bytes: None,
+                link_target_object_id: if name == "alias" {
+                    Some(sinomo_dfs::DfsObjectId::from_legacy_named("file").unwrap())
+                } else {
+                    None
+                },
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: sinomo_dfs::DfsVersion::from_legacy_named(format!("version-{name}")).unwrap(),
+                policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            });
+        }
+        (fs, rows)
+    }
+    /// The jobs a shard can hold while it serves, one per frame the original
+    /// source reader declares for current rows: a Reserved parent-count
+    /// participant another shard's directory move reserves on it, the
+    /// destination reservation of a move into it, a move it coordinates that
+    /// holds its parent-count plan and its abort frame, and an alias commit with
+    /// its read set.
+    fn current_frame_jobs(
+        fs: &sinomo_dfs::DfsFileSystem,
+        objects: &[sinomo_dfs::DfsObjectMetadata],
+    ) -> Vec<sinomo_dfs::DfsNamespaceJobRecord> {
+        use sinomo_dfs::{DfsNamespaceJobFrame as Frame, DfsNamespaceJobKind as Kind};
+        let at = time::OffsetDateTime::UNIX_EPOCH;
+        let shard = sinomo_dfs::DfsMetadataShardConfig {
+            file_system_id: fs.file_system_id.clone(),
+            shard_id: "root".into(),
+            primary_node_id: objects[0].owner_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: sinomo_dfs::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut parent = objects[1].clone();
+        parent.namespace_link_count = Some(2);
+        let mut successor = parent.clone();
+        successor.namespace_link_count = Some(3);
+        successor.version = sinomo_dfs::DfsVersion::from_legacy_named("version-child-successor").unwrap();
+        let mut moved = objects[1].clone();
+        moved.object_id = sinomo_dfs::DfsObjectId::from_legacy_named("moved").unwrap();
+        moved.path = "/elsewhere/moved".into();
+        let participant = sinomo_dfs::DfsParentCountParticipant {
+            participant_id: String::new(),
+            binding: sinomo_dfs::DfsParentCountBinding {
+                job_id: "current-frame-move".into(),
+                file_system_id: fs.file_system_id.clone(),
+                root_path: "/elsewhere/moved".into(),
+                target_path: "/child/moved".into(),
+                coordinator_scope: shard.clone(),
+                source: moved,
+                expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+                origin: None,
+                created_at: at,
+            },
+            parent_scope: shard,
+            expected: parent,
+            successor,
+            delta: 1,
+        }
+        .with_derived_id_for_test()
+        .unwrap();
+        let job = |job_id: &str, kind, root_path: &str, target_path: Option<&str>, pending_frames| {
+            sinomo_dfs::DfsNamespaceJobRecord {
+                job_id: job_id.into(),
+                file_system_id: fs.file_system_id.clone(),
+                origin: None,
+                kind,
+                status: sinomo_dfs::DfsNamespaceJobStatus::Running,
+                root_path: root_path.into(),
+                target_path: target_path.map(str::to_owned),
+                pending_frames,
+                processed_object_count: 0,
+                created_at: at,
+                updated_at: at,
+                completed_at: None,
+                failure_reason: None,
+            }
+        };
+        vec![
+            participant.recorded_job(sinomo_dfs::DfsParentCountState::Reserved, at),
+            job(
+                "current-frame-reservation",
+                Kind::DirectoryMoveDestinationReservation,
+                "/child/moved",
+                None,
+                vec![Frame::DirectoryMoveDestinationReservation {
+                    coordinator_job_id: "current-frame-move".into(),
+                    source_root: "/elsewhere/moved".into(),
+                    target_root: "/child/moved".into(),
+                }],
+            ),
+            job(
+                "current-frame-move",
+                Kind::RenameDirectoryAcrossShardPrimaries,
+                "/elsewhere/moved",
+                Some("/child/moved"),
+                vec![
+                    Frame::CrossShardDirFinish {
+                        source_root: "/elsewhere/moved".into(),
+                        count_plan: Some(sinomo_dfs::DfsDirectoryMoveCounts {
+                            parent_participants: Some(sinomo_dfs::DfsParentCountPlan {
+                                participants: vec![participant],
+                                phase: sinomo_dfs::DfsParentCountPhase::Issued,
+                                confirmed: 1,
+                                rejection: None,
+                            }),
+                            expected_destination: sinomo_dfs::DfsNamespaceDestinationPrecondition::Absent,
+                            source_parent_delta: 0,
+                            target_parent_delta: 1,
+                        }),
+                    },
+                    Frame::CrossShardDirAbort {
+                        failure_reason: "the move's scan failed".into(),
+                    },
+                ],
+            ),
+            job(
+                "current-frame-alias-commit",
+                Kind::HardlinkAliasMutationAcrossShardPrimaries,
+                "/alias",
+                None,
+                vec![Frame::CrossShardHardlinkAliasCommit {
+                    transaction: sinomo_dfs::DfsNamespaceTransaction {
+                        content_reference_identity: None,
+                        contribution_digest: None,
+                        extension_expectations: Vec::new(),
+                        transaction_id: "current-frame-alias-transaction".into(),
+                        file_system_id: fs.file_system_id.clone(),
+                        objects: vec![objects[3].clone()],
+                        versions: Vec::new(),
+                        file_version_pins: None,
+                        advisory_lock_states: Vec::new(),
+                        created_at: at,
+                    },
+                    shard_id: sinomo_dfs::DfsMetadataShardId::new("root"),
+                    expected_object_versions: Vec::new(),
+                    expected_path_occupants: Vec::new(),
+                }],
+            ),
+        ]
+    }
+
+    /// A shard's original source can hold rows of every current job frame its
+    /// reader declares, as a shard that served before its conversion does.
+    /// The reader takes them as they are.
+    #[test]
+    fn current_job_frames_are_read_as_they_are() {
+        let node = NodeId::from_legacy_named("projection-owner").unwrap();
+        let (fs, objects) = current_frame_source_rows(&node);
+        let mut jobs = current_frame_jobs(&fs, &objects);
+        let mut projection = LegacyProjection::default();
+        projection.bind_scope(DfsMetadataShardId::new("root")).unwrap();
+        projection
+            .push_snapshot_row("file_systems", serde_json::to_value(&fs).unwrap())
+            .unwrap();
+        for object in &objects {
+            projection
+                .push_snapshot_row("objects", serde_json::to_value(object).unwrap())
+                .unwrap();
+        }
+        for job in &jobs {
+            projection
+                .push_snapshot_row("namespace_jobs", serde_json::to_value(job).unwrap())
+                .unwrap();
+        }
+        let mut read = projection.current_tables().unwrap().namespace_jobs;
+        read.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        assert_eq!(read, jobs);
+    }
+
     #[test]
     fn old_running_adoption_job_restores_current_data_for_normal_resume() {
         let request = old_adoption_request(false);

@@ -1,6 +1,6 @@
 //! Admission checks for newly authored maintained-count metadata. Current
 //! immutable prepared bodies retain their original digest. Legacy
-//! conversion and its count-cohort evidence belong to sinomo-dfs-migration.
+//! conversion and count initialization belong to sinomo-dfs-migration.
 use crate::*;
 
 pub(crate) fn validate_new_counted_publication(

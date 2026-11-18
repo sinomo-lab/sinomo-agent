@@ -117,6 +117,10 @@ pub(in crate::authority) enum ConversionStop {
     /// The captured source changed under a recorded attempt of this primary.
     SourceChangedUnderAttempt { attempt_id: String },
     /// The captured image still has original work no current family owns.
+    /// The shard's own crash-left work stops here for operator repair: a V7
+    /// prepare whose outcome the copy does not record (count-neutral ones
+    /// included, since the converted journal has no frame to recover it
+    /// from), staging writes and pending adoptions.
     UnresolvedOriginalWork { references: Vec<String> },
     /// A legacy cross-shard hardlink job of this shard whose alias path no
     /// shard owns, so no rows can settle it. One whose alias another shard
@@ -227,16 +231,11 @@ pub(in crate::authority) trait ShardConversionEnv {
     fn catalog(&self, file_system_id: &DfsFileSystemId) -> Result<Vec<DfsMetadataShardConfig>>;
     /// Submit `request` exactly as given.
     fn submit(&self, request: &KvTxnRequest) -> Result<Submitted>;
-    /// Whether the local copy of `shard` is already current format: an Active
-    /// current header, or a copy born native genesis. A shard without a
-    /// storage record whose copy is current has nothing to convert.
-    fn local_copy_current(&self, shard: &DfsMetadataShardConfig) -> Result<bool>;
     /// Capture the local copy of `shard` with the converter session, under
     /// its source fence, binding the shard's [`Self::placement_evidence`].
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress>;
     /// The shard's share of its filesystem's original placement goals, which
-    /// its capture binds as the complete-filesystem capture binds its share;
-    /// `None` while the goals are still being captured.
+    /// its capture binds; `None` while the goals are still being captured.
     fn placement_evidence(
         &self,
         _shard: &DfsMetadataShardConfig,
@@ -617,7 +616,6 @@ pub(in crate::authority) fn conversion_source(
         source_cut_digest: source_cut_digest(source, captured.projection_fingerprint())?,
         pending_mapping_digest: digest(&(
             "dfs-shard-conversion-pending-mapping-v1",
-            captured.recovery_preparations(),
             &captured.proven_v7_terminals,
         ))?,
     })
@@ -659,9 +657,6 @@ fn step<E: ShardConversionEnv>(
         return parked("the shard has no serving record");
     };
     let record = keys.record()?;
-    if record.is_none() && env.local_copy_current(&keys.shard)? {
-        return Ok(Step::Done(ConversionProgress::Ready));
-    }
     if let Some(active) = record.as_ref().filter(|record| record.is_active()) {
         return finish_active(env, &shard_files, &keys, active, &local);
     }
@@ -1042,7 +1037,7 @@ fn accepted_contributions(accepted: &AcceptedContributions) -> Vec<ShardCountCon
 
 /// Per-shard activation check: the built image holds exactly the shard's
 /// settled rows with the counts its own rows and the sealed contributions
-/// give. It replaces re-running a filesystem-wide census around activation.
+/// give.
 fn validate_built_image(
     files: &AttemptFiles,
     accepted: &AcceptedContributions,
@@ -1059,7 +1054,6 @@ fn validate_built_image(
     crate::namespace_counts::contributions::validate_shard_image_counts(
         &accepted.catalog,
         &sinomo_dfs::DfsMetadataShardId::new(&shard.shard_id),
-        std::slice::from_ref(&shard.file_system_id),
         &image.tables,
         &accepted_contributions(accepted),
         COUNT_LIMITS,
@@ -1387,18 +1381,6 @@ impl<C: ContributionSource> ShardConversionEnv for OwnerConversionEnv<'_, C> {
         current_authority(&commit.result.authority)?;
         Ok(Submitted::Rejected)
     }
-    fn local_copy_current(&self, shard: &DfsMetadataShardConfig) -> Result<bool> {
-        let root = self.owner.metadata_root.join(&shard.shard_id);
-        Ok(sinomo_dfs::inspect_metadata_storage_generation(&root).is_ok_and(|header| {
-            header.identity.shard_id.0 == shard.shard_id
-                && (matches!(header.state, sinomo_dfs::DfsMetadataGenerationState::Active { .. })
-                    || matches!(
-                        header.identity.origin,
-                        sinomo_dfs::DfsMetadataGenerationOrigin::NativeGenesis
-                            | sinomo_dfs::DfsMetadataGenerationOrigin::NativeGenesisInGeneration { .. }
-                    ))
-        }))
-    }
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         let physical = sinomo_dfs::DfsMetadataShardId::new(&shard.shard_id);
         let Some(placement) = self.placement_evidence(shard)? else {
@@ -1559,20 +1541,21 @@ pub(super) fn install_activated_image(
 /// Which conversion a `Metadata{shard}` unit runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MetadataUnitDispatch {
+    /// The shard was born in the current format and needs no conversion.
+    Current,
     /// The per-shard driver.
     PerShard,
-    /// The complete-filesystem conversion, kept compiled until it is removed.
-    CompleteFileSystem,
 }
 
 /// The conversion a shard's unit runs, from its storage record.
 ///
-/// - A native-genesis record holds no old storage; its unit keeps the
-///   complete-filesystem path, which leaves a native-genesis copy to the core.
-/// - Every other shard runs the per-shard driver: a copy without a record,
-///   legacy or not, a shard whose rows live only in the legacy combined
-///   `root` copy (`crate::metadata::combined_root`), and every shard whose
-///   conversion already wrote a record.
+/// - A native-genesis record names a shard born in the current format: it
+///   holds no old storage, and its unit is Ready without a Converting record.
+/// - Every other shard runs the per-shard driver: a shard without a record
+///   holds old storage that migration owns, legacy or current format, as
+///   does a shard whose rows live only in the legacy combined `root` copy
+///   (`crate::metadata::combined_root`); a shard whose conversion already
+///   wrote a record continues it.
 ///   The per-shard stage reconciles a legacy member's acknowledgement floors,
 ///   including those only a local checkpoint capture anchors.
 pub(super) fn metadata_unit_dispatch(record: Option<&DfsMetadataShardStorage>) -> MetadataUnitDispatch {
@@ -1583,7 +1566,7 @@ pub(super) fn metadata_unit_dispatch(record: Option<&DfsMetadataShardStorage>) -
                     activation: sinomo_dfs::DfsMetadataShardActivation::NativeGenesis,
                 },
             ..
-        }) => MetadataUnitDispatch::CompleteFileSystem,
+        }) => MetadataUnitDispatch::Current,
         _ => MetadataUnitDispatch::PerShard,
     }
 }
@@ -1608,7 +1591,7 @@ impl MigrationOwner {
             .map(|entry| entry.decode::<DfsMetadataShardStorage>().map_err(error))
             .transpose()?;
         match metadata_unit_dispatch(record.as_ref()) {
-            MetadataUnitDispatch::CompleteFileSystem => self.queue_filesystem_for_shard(shard),
+            MetadataUnitDispatch::Current => Ok(State::Ready),
             MetadataUnitDispatch::PerShard => self.advance_shard_unit(unit, shard, &file_system_id),
         }
     }

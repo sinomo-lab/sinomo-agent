@@ -1117,7 +1117,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(owner) = owner else {
             return Ok(());
         };
-        if !self.metadata_shard_storage_is_converting(&owner)? {
+        if !self.shard_storage_record_is_closed(&owner)? {
             return Ok(());
         }
         self.note_namespace_job_parked(job, frame, std::slice::from_ref(&owner));
@@ -1141,10 +1141,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// shard whose copy refuses because its storage is closed cannot answer
     /// that resolution: the search goes on past it, and a target found
     /// nowhere else is unknown, not dangling, so the alias waits on those
-    /// shards. A failed resolution while any shard converts waits on the
-    /// converting shards. A dangling alias names no target and moves no
-    /// contribution. A shard without a record whose copy opens is admitted by
-    /// the filesystem-level rule and is not closed by this check.
+    /// shards. A failed resolution while any shard is closed waits on the
+    /// closed shards. A dangling alias names no target and moves no
+    /// contribution.
     fn hardlink_target_storage_wait<'a>(
         &mut self,
         moved: impl IntoIterator<Item = &'a DfsObjectMetadata>,
@@ -1185,7 +1184,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 Err(error) => {
                     for shard in &catalog {
-                        if !closed.contains(shard) && self.metadata_shard_storage_is_converting(shard)? {
+                        if !closed.contains(shard) && self.shard_storage_record_is_closed(shard)? {
                             closed.push(shard.clone());
                         }
                     }
@@ -1202,7 +1201,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
             .map_err(DfsError::from)?;
             if let Some(owner) = owner
-                && (closed.contains(&owner) || self.metadata_shard_storage_is_converting(&owner)?)
+                && (closed.contains(&owner) || self.shard_storage_record_is_closed(&owner)?)
             {
                 return Ok(Some((alias.path.clone(), vec![owner])));
             }
@@ -1210,9 +1209,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(None)
     }
 
-    /// Whether `shard`'s storage record, in the retained configuration
-    /// projection, names a conversion in progress.
-    pub(super) fn metadata_shard_storage_is_converting(
+    /// Whether `shard`'s storage is closed, by its storage record in the
+    /// retained configuration projection: the record names a conversion in
+    /// progress, or there is no record, so migration has yet to convert the
+    /// shard's storage.
+    pub(super) fn shard_storage_record_is_closed(
         &mut self,
         shard: &crate::DfsMetadataShardConfig,
     ) -> Result<bool> {
@@ -1222,7 +1223,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let record = crate::DfsControlPlaneStore::new(kv.as_mut())
             .get_metadata_shard_storage(&shard.file_system_id, &shard.shard_id)
             .map_err(DfsError::from)?;
-        Ok(record.is_some_and(|record| !record.is_active()))
+        Ok(record.is_none_or(|record| !record.is_active()))
     }
 
     fn run_cross_shard_adopt_for_job(

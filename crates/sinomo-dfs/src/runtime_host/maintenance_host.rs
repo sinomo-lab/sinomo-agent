@@ -108,23 +108,6 @@ pub(crate) fn release_idle_namespace_reconciliation_work(
     drop(retired);
 }
 
-/// Wake ordinary namespace maintenance after current durable job publication.
-/// A wake grants no effect permission and retains no fabricated task or vote.
-pub fn wake_namespace_reconciliation(
-    data_dir: &SinomoDataDir,
-    owner: &Arc<DfsDataOwnerLock>,
-) -> Result<(), DfsRuntimeError> {
-    let paths = DfsRuntimePaths::new(data_dir);
-    let current = require_daemon_dfs_data_owner_lock(&paths)?;
-    if !Arc::ptr_eq(&current, owner) {
-        return Err(DfsRuntimeError::Parse {
-            detail: "namespace wake lost its actual owner".into(),
-        });
-    }
-    request_daemon_dfs_maintenance_reconciliation(&paths)?;
-    Ok(())
-}
-
 pub(super) struct NamespaceReconciliationRun {
     pub(super) complete: bool,
     pub(super) blocks_ordinary_maintenance: bool,

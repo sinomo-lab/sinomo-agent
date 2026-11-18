@@ -1,6 +1,5 @@
-//! Checked terminal DATA transitions. Genuine genesis supplies the original
-//! immutable shape; altered activation bodies below are never published and do
-//! not qualify native generation admission or post-conversion shard birth.
+//! Checked terminal DATA transitions of a genuine genesis record. The altered
+//! bodies below are never published.
 use super::*;
 
 fn original(
@@ -21,24 +20,6 @@ fn original(
     assert_eq!(record.status, crate::DfsPreparedOperationStatus::Committed);
     record.validate().unwrap();
     (runtime, service, record)
-}
-fn with_activation(
-    original: &crate::DfsPreparedOperationRecord,
-) -> crate::DfsPreparedOperationRecord {
-    let mut record = original.clone();
-    let mut payload = record.payload.as_ref().clone();
-    for effect in &mut payload.metadata_effects {
-        if let crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } = effect {
-            file_system.metadata_storage = Some(crate::DfsMetadataStorageState::Active {
-                generation: "exact-original-generation".into(),
-                target_format: 12,
-                catalog_generation: file_system.catalog_generation,
-                activation_digest: format!("blake3:{}", "a".repeat(64)),
-            });
-        }
-    }
-    rebind_data(&mut record, payload);
-    record
 }
 fn rebind_data(
     record: &mut crate::DfsPreparedOperationRecord,
@@ -61,10 +42,9 @@ fn tables(record: &crate::DfsPreparedOperationRecord) -> DfsMetadataTables {
 }
 
 #[test]
-fn genesis_activation_eviction_none_preserves_original_terminal_encoding() {
+fn genesis_eviction_preserves_original_terminal_encoding() {
     let (runtime, service, record) = original("genesis-eviction-none");
     let terminal = crate::DfsPreparedOperationEviction::from_terminal_record(&record).unwrap();
-    assert!(terminal.genesis_storage_activation.is_none());
     #[derive(serde::Serialize)]
     struct OriginalTerminal<'a> {
         digest: &'a crate::DfsPreparedOperationDigest,
@@ -96,21 +76,15 @@ fn genesis_activation_eviction_none_preserves_original_terminal_encoding() {
 }
 
 #[test]
-fn genesis_activation_eviction_uses_original_body_and_preserves_exact_replay() {
-    let (runtime, service, original) = original("genesis-eviction-replay-data");
-    let record = with_activation(&original);
+fn genesis_eviction_uses_original_body_and_preserves_exact_replay() {
+    let (runtime, service, record) = original("genesis-eviction-replay-data");
     let expected = crate::DfsPreparedOperationEviction::from_terminal_record(&record).unwrap();
-    assert!(expected.genesis_storage_activation.is_some());
     let mut table = tables(&record);
-    // A newer mutable filesystem row cannot restamp the original witness.
+    // A newer mutable filesystem row cannot restamp the original terminal.
     for effect in &record.metadata_effects {
         if let crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } = effect {
             let mut newer = file_system.clone();
-            if let Some(crate::DfsMetadataStorageState::Active { generation, .. }) =
-                &mut newer.metadata_storage
-            {
-                *generation = "later-mutable-generation".into();
-            }
+            newer.display_name.push_str("-later");
             table
                 .file_systems
                 .insert(newer.file_system_id.clone(), newer);
@@ -150,20 +124,13 @@ fn genesis_activation_eviction_uses_original_body_and_preserves_exact_replay() {
 }
 
 #[test]
-fn genesis_activation_eviction_refuses_body_mismatch_and_retained_witness_downgrade() {
-    let (runtime, service, original) = original("genesis-eviction-mismatch-data");
-    let record = with_activation(&original);
+fn genesis_eviction_refuses_body_mismatch_and_a_retained_terminal_change() {
+    let (runtime, service, record) = original("genesis-eviction-mismatch-data");
     let expected = crate::DfsPreparedOperationEviction::from_terminal_record(&record).unwrap();
-    for replacement in [
-        None,
-        Some(crate::DfsMetadataStorageActivation {
-            generation: "another-generation".into(),
-            ..expected.genesis_storage_activation.clone().unwrap()
-        }),
-    ] {
+    {
         let mut table = tables(&record);
         let mut inconsistent = expected.clone();
-        inconsistent.genesis_storage_activation = replacement;
+        inconsistent.committed_entry.as_mut().unwrap().sequence += 1;
         table
             .prepared_operation_evictions
             .insert(record.operation_id.clone(), inconsistent.clone());
@@ -208,9 +175,6 @@ fn genesis_activation_eviction_refuses_body_mismatch_and_retained_witness_downgr
     payload.metadata_effects.push(fs);
     rebind_data(&mut duplicate, payload);
     assert!(crate::DfsPreparedOperationEviction::from_terminal_record(&duplicate).is_err());
-    let mut non_genesis = expected;
-    non_genesis.digest.owner_epoch = 2;
-    assert!(non_genesis.validate().is_err());
     drop(service);
     runtime.close().unwrap();
 }

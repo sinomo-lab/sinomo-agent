@@ -32,7 +32,7 @@ use super::shard_conversion::{
 use super::*;
 use crate::authority::contribution_source::ContributionSource;
 use crate::authority::contribution_sources::NativeContributionSource;
-use crate::authority::placement_work::native_tests::canonical_migration_runtime;
+use crate::authority::native_fixtures::canonical_migration_runtime;
 use crate::authority::staged_service::conversion_install::ConversionSourceCut;
 use sinomo_core::node::NodeId;
 use sinomo_dfs::test_support::DfsTestRuntime;
@@ -46,8 +46,11 @@ use std::time::{Duration, Instant};
 mod alias_history;
 mod closed_fences;
 mod closed_pair;
+mod member_restart;
 mod moves;
 mod passive;
+mod record_less;
+mod status;
 mod takeover;
 
 const HELD: &str = "ordinary opens held while shards convert";
@@ -74,9 +77,13 @@ fn start(name: &str, count: usize, assignments: &[(&str, usize, &[usize])]) -> C
             Arc::new(
                 sinomo_dfs::component_factory_with_storage_preparation(Arc::new(
                     move |context, scope, lifecycle| {
-                        let binding = storage_preparation_provider(context, scope, lifecycle)?;
+                        let binding = storage_preparation_provider(context, scope, lifecycle.clone())?;
                         let provider = binding.provider;
                         let held = Arc::clone(&factory_held);
+                        *crate::authority::shared_owner(context, lifecycle)?
+                            .held_conversions
+                            .lock()
+                            .unwrap() = Some(Arc::clone(&held));
                         Ok(sinomo_dfs::DfsStoragePreparationProviderBinding {
                             readiness: binding.readiness,
                             provider: Arc::new(move |root, unit, budget| {
@@ -129,7 +136,9 @@ fn write_namespace(cluster: &Cluster) {
     client.posix_mkdir("/users/sub").unwrap();
 }
 
-/// Restart every node with ordinary opens of `shards` held.
+/// Restart every node with ordinary opens of `shards` held, and with each
+/// node's own conversion units of `shards` waiting, so that the test alone
+/// steps their conversion until it releases them.
 fn hold(cluster: &mut Cluster, shards: &[&str]) {
     for node in cluster.nodes.clone().iter().rev() {
         cluster.native.stop_node(node).unwrap();
@@ -481,11 +490,11 @@ fn native_shards_convert_one_at_a_time_while_converted_shards_serve() {
     cluster.native.close().unwrap();
 }
 
-/// The converting primary's environment, with a serving change that moves
-/// the shard's epoch just before its activation is submitted.
-struct EpochMovesBeforeActivation<'a, C: ContributionSource> {
+/// The converting primary's environment, with a hook that runs once just
+/// before its activation is submitted.
+struct BeforeActivation<'a, C: ContributionSource> {
     inner: OwnerConversionEnv<'a, C>,
-    move_epoch: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    before_activation: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
     activations: RefCell<Vec<(KvTxnRequest, Submitted)>>,
 }
 
@@ -498,7 +507,7 @@ fn activates(request: &KvTxnRequest) -> bool {
     })
 }
 
-impl<C: ContributionSource> ShardConversionEnv for EpochMovesBeforeActivation<'_, C> {
+impl<C: ContributionSource> ShardConversionEnv for BeforeActivation<'_, C> {
     type Source = C;
     fn local_node(&self) -> Result<NodeId> {
         self.inner.local_node()
@@ -516,15 +525,12 @@ impl<C: ContributionSource> ShardConversionEnv for EpochMovesBeforeActivation<'_
         if !activates(request) {
             return self.inner.submit(request);
         }
-        if let Some(move_epoch) = self.move_epoch.borrow_mut().take() {
-            move_epoch();
+        if let Some(before_activation) = self.before_activation.borrow_mut().take() {
+            before_activation();
         }
         let outcome = self.inner.submit(request)?;
         self.activations.borrow_mut().push((request.clone(), outcome));
         Ok(outcome)
-    }
-    fn local_copy_current(&self, shard: &DfsMetadataShardConfig) -> Result<bool> {
-        self.inner.local_copy_current(shard)
     }
     fn capture(&self, shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         self.inner.capture(shard)
@@ -631,9 +637,9 @@ fn native_takeover_during_a_conversion_supersedes_its_attempt_on_every_node() {
     // over just before its activation commits.
     let stale = RefCell::new(None::<DfsMetadataShardConversion>);
     let unit = metadata_unit(&owners[0], "users");
-    let env = EpochMovesBeforeActivation {
+    let env = BeforeActivation {
         inner: OwnerConversionEnv::new(&owners[0], &unit, NativeContributionSource::new(Arc::clone(&owners[0].authority))),
-        move_epoch: RefCell::new(Some(Box::new(|| {
+        before_activation: RefCell::new(Some(Box::new(|| {
             let attempt = storage(&owners[0], &fs, "users").unwrap().converting_attempt().unwrap().clone();
             assert!(attempt.sealed().is_some());
             for owner in &owners[1..] {
@@ -704,23 +710,11 @@ fn settle_until_stopped<E: ShardConversionEnv>(env: &E, fs: &DfsFileSystemId, sh
     }
 }
 
-/// A hardlink alias whose target exists in no shard stops only its own
-/// shard's conversion, with a typed reason naming the alias and its target.
-/// The filesystem's other shards convert and serve, every member records the
-/// old copy it keeps as a retained original, and the stopped shard stays
-/// closed.
-#[test]
-fn native_dangling_alias_stops_only_its_own_shard() {
-    let mut cluster = start(
-        "shard-conversion-dangling",
-        3,
-        &[("root", 0, &[1, 2]), ("services", 1, &[0, 2]), ("users", 2, &[0, 1])],
-    );
-    write_namespace(&cluster);
-    // The services primary adopts an alias whose canonical target no shard
-    // has, as only a lost or damaged canonical row leaves one: the adopt step
-    // of a cross-shard hardlink, sent by the primary of its source path, does
-    // not read the target.
+/// Have the services primary adopt an alias whose canonical target no shard
+/// has, as only a lost or damaged canonical row leaves one: the adopt step of
+/// a cross-shard hardlink, sent by the primary of its source path, does not
+/// read the target. Returns the missing target.
+fn adopt_dangling_alias(cluster: &Cluster) -> sinomo_dfs::DfsObjectId {
     let target = sinomo_dfs::DfsObjectId::from_legacy_named("native-dangling-target").unwrap();
     let now = sinomo_dfs::test_support::now_unix_nanos();
     let dangling = sinomo_dfs::DfsObjectMetadata {
@@ -764,6 +758,23 @@ fn native_dangling_alias_stops_only_its_own_shard() {
             .unwrap();
         assert_eq!(reply.result, sinomo_dfs::DfsNamespaceResult::Applied);
     }
+    target
+}
+
+/// A hardlink alias whose target exists in no shard stops only its own
+/// shard's conversion, with a typed reason naming the alias and its target.
+/// The filesystem's other shards convert and serve, every member records the
+/// old copy it keeps as a retained original, and the stopped shard stays
+/// closed.
+#[test]
+fn native_dangling_alias_stops_only_its_own_shard() {
+    let mut cluster = start(
+        "shard-conversion-dangling",
+        3,
+        &[("root", 0, &[1, 2]), ("services", 1, &[0, 2]), ("users", 2, &[0, 1])],
+    );
+    write_namespace(&cluster);
+    let target = adopt_dangling_alias(&cluster);
     hold(&mut cluster, &["root", "services", "users"]);
     let owners = owners(&cluster);
     let fs = cluster.fs.clone();
@@ -786,7 +797,7 @@ fn native_dangling_alias_stops_only_its_own_shard() {
         // The primary's unit records its retained original when its step
         // reports the shard ready; the members' units record theirs on their
         // own owners.
-        owners[primary].record_completed_metadata_archives(&owners[primary].metadata_root.join(shard)).unwrap();
+        owners[primary].record_shard_conversion_original(&owners[primary].metadata_root.join(shard)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         for (owner, node) in owners.iter().zip(&cluster.nodes).filter(|(_, node)| members.contains(*node)) {
             while !owner.shard_conversion_original_recorded(&owner.metadata_root.join(shard)).unwrap() {

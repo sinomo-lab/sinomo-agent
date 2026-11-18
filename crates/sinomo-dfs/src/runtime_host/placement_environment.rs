@@ -82,21 +82,6 @@ pub(crate) fn notify_daemon_dfs_storage_environment_dirty(data_dir: &SinomoDataD
     signal.notify.notify_one();
 }
 
-/// Retained observation only. In particular, do not call the environment
-/// helper which would create a monitor/cache or sample missing host state.
-#[cfg(feature = "storage-conversion")]
-pub(super) fn retained_storage_import_placement_snapshot(
-    data_dir: &SinomoDataDir,
-) -> Option<Arc<sinomo_dfs::DfsPlacementSnapshot>> {
-    DAEMON_DFS_PLACEMENT_ENVIRONMENTS
-        .get()?
-        .lock()
-        .ok()?
-        .get(&data_dir.root())?
-        .cache
-        .snapshot()
-}
-
 fn placement_environments() -> &'static Mutex<BTreeMap<PathBuf, DaemonDfsPlacementEnvironment>> {
     DAEMON_DFS_PLACEMENT_ENVIRONMENTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }

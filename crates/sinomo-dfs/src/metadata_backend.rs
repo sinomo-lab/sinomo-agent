@@ -605,7 +605,7 @@ impl LocalSobjMetadataBackend {
             backend.recover_unmaterialized_local_journal_entries()?;
             if !native_genesis_staging && generation.identity.is_native_genesis() {
                 let actual = crate::storage_generation::native_genesis_activation_digest(&generation.identity, &backend.tables)?;
-                if generation.state != (crate::storage_generation::GenerationState::Active { activation_digest: actual, standalone_seal: None }) {
+                if generation.state != (crate::storage_generation::GenerationState::Active { activation_digest: actual }) {
                     return Err(MetadataBackendError::Serde("native storage generation receipt differs from committed genesis".into()));
                 }
             }
@@ -1130,10 +1130,10 @@ impl LocalSobjMetadataBackend {
         let stored = (stored_acknowledged_floor.is_some(), stored_authority_floor.is_some());
         let acknowledged_floor =
             permit.binding_ack_floor(stored_acknowledged_floor, |floor| floor.authority_epoch)?
-                .filter(|floor| !permit.snapshot_replaces_imported_prefix(&floor.durable_prefix_proof, snapshot.descriptor()));
+                .filter(|floor| !permit.snapshot_replaces_converted_prefix(&floor.durable_prefix_proof, snapshot.descriptor()));
         let authority_floor =
             permit.binding_ack_floor(stored_authority_floor, |floor| floor.authority_epoch)?
-                .filter(|floor| !permit.snapshot_replaces_imported_prefix(&floor.durable_prefix_proof, snapshot.descriptor()));
+                .filter(|floor| !permit.snapshot_replaces_converted_prefix(&floor.durable_prefix_proof, snapshot.descriptor()));
         // A nonbinding floor belongs to an earlier epoch or the exact source
         // clock superseded by this committed native storage cut.
         let superseded_floor = (stored.0 && acknowledged_floor.is_none())

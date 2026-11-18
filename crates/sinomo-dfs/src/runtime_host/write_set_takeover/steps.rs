@@ -91,9 +91,8 @@ pub(in crate::runtime_host) fn confirm_metadata_takeover_record(
         });
     }
     // The swap is built from this cut only after the promise. A cut that
-    // cannot build it, such as one whose filesystem configuration reserves
-    // the catalog for a pending storage transition, promises nothing; the
-    // attempt is planned again when the publication or the verdicts move.
+    // cannot build it promises nothing; the attempt is planned again when the
+    // publication or the verdicts move.
     if let Err(error) = crate::check_metadata_takeover_swap(&cut, local) {
         return Err(TakeOutcome::NotTaken {
             follow: false,

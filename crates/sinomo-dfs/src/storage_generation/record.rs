@@ -274,33 +274,20 @@ pub fn metadata_shard_storage_activation_digest(
     ))
 }
 
-/// The native-genesis identity of a shard born current. `activation` names a
-/// filesystem-level generation the birth binds to; it exists only while the
-/// filesystem-level storage state does.
+/// The native-genesis identity of a shard born current.
 pub(crate) fn native_genesis_generation_identity(
     shard: &DfsMetadataShardConfig,
-    activation: Option<&crate::DfsMetadataStorageActivation>,
 ) -> DfsMetadataGenerationIdentity {
     DfsMetadataGenerationIdentity {
         file_system_id: shard.file_system_id.clone(),
         shard_id: crate::DfsMetadataShardId::new(shard.shard_id.clone()),
-        generation: activation
-            .map(|activation| activation.generation.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "native-genesis:{}:{}:{}",
-                    shard.file_system_id,
-                    shard.shard_id,
-                    crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
-                )
-            }),
-        origin: activation
-            .map(
-                |activation| DfsMetadataGenerationOrigin::NativeGenesisInGeneration {
-                    activation: activation.clone(),
-                },
-            )
-            .unwrap_or(DfsMetadataGenerationOrigin::NativeGenesis),
+        generation: format!(
+            "native-genesis:{}:{}:{}",
+            shard.file_system_id,
+            shard.shard_id,
+            crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION
+        ),
+        origin: DfsMetadataGenerationOrigin::NativeGenesis,
     }
 }
 
@@ -522,7 +509,7 @@ impl DfsMetadataShardStorage {
                 DfsMetadataShardStorageState::Active {
                     activation: DfsMetadataShardActivation::NativeGenesis,
                 },
-                DfsMetadataGenerationState::Active { standalone_seal: None, .. },
+                DfsMetadataGenerationState::Active { .. },
             ) => true,
             (
                 DfsMetadataShardStorageState::Active {
@@ -533,7 +520,6 @@ impl DfsMetadataShardStorage {
                 },
                 DfsMetadataGenerationState::Active {
                     activation_digest: actual,
-                    standalone_seal: None,
                 },
             ) => actual == activation_digest,
             _ => false,
@@ -868,6 +854,9 @@ mod transactions {
     /// configured members, the membership-handoff acknowledgement rule with
     /// the retiring and desired configurations equal; the remaining members
     /// repair by snapshot once the shard is active.
+    ///
+    /// On a switched shard the primary's own install still needs every
+    /// write-set member, a departed one included, until the keeper replaces it.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum DfsMetadataShardConversionInstallRule {
         WriteSet { required: BTreeSet<NodeId> },
@@ -1338,7 +1327,7 @@ mod tests {
     fn storage_record_validation_binds_its_attempt_generation_and_digest() {
         let shard = shard(4, "primary-a");
         let genesis = DfsMetadataShardStorage::native_genesis(
-            &shard, native_genesis_generation_identity(&shard, None),
+            &shard, native_genesis_generation_identity(&shard),
         );
         genesis.validate_against(&shard).unwrap();
         // A converted generation cannot claim native-genesis activation.
@@ -1391,7 +1380,7 @@ mod tests {
         let header = DfsMetadataGenerationHeader {
             format_version: crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             identity: converting.generation.clone(),
-            state: DfsMetadataGenerationState::Active { activation_digest: digest.clone(), standalone_seal: None },
+            state: DfsMetadataGenerationState::Active { activation_digest: digest.clone() },
         };
         assert!(!converting.admits_header(&header), "a converting shard stays closed");
         let mut active = converting.clone();
@@ -1404,10 +1393,10 @@ mod tests {
         assert!(!active.admits_header(&staged));
         let mut other_digest = header.clone();
         other_digest.state = DfsMetadataGenerationState::Active {
-            activation_digest: format!("blake3:{}", "f".repeat(64)), standalone_seal: None,
+            activation_digest: format!("blake3:{}", "f".repeat(64)),
         };
         assert!(!active.admits_header(&other_digest));
-        let genesis_identity = native_genesis_generation_identity(&shard, None);
+        let genesis_identity = native_genesis_generation_identity(&shard);
         let genesis = DfsMetadataShardStorage::native_genesis(&shard, genesis_identity.clone());
         assert!(!genesis.admits_header(&header), "another generation is not admitted");
         let genesis_header = DfsMetadataGenerationHeader {

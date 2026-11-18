@@ -173,8 +173,6 @@ struct Env {
     activated: RefCell<Vec<DfsMetadataShardStorage>>,
     watched_keys: RefCell<BTreeSet<String>>,
     watched_nodes: RefCell<BTreeSet<NodeId>>,
-    /// The local copy is already current format.
-    current: std::cell::Cell<bool>,
     /// The shard's share of the original placement goals.
     placement: RefCell<Vec<crate::metadata::RetainedPlacementReservation>>,
     captures: std::cell::Cell<usize>,
@@ -240,9 +238,6 @@ impl ShardConversionEnv for Env {
         };
         cluster.ledger.insert(id, (digest, Some(outcome)));
         Ok(outcome)
-    }
-    fn local_copy_current(&self, _shard: &DfsMetadataShardConfig) -> Result<bool> {
-        Ok(self.current.get())
     }
     fn capture(&self, _shard: &DfsMetadataShardConfig) -> Result<CaptureProgress> {
         self.captures.set(self.captures.get() + 1);
@@ -412,7 +407,6 @@ fn env(name: &str, local: &str, cluster: &Rc<RefCell<Cluster>>) -> Env {
         activated: RefCell::new(Vec::new()),
         watched_keys: RefCell::new(BTreeSet::new()),
         watched_nodes: RefCell::new(BTreeSet::new()),
-        current: std::cell::Cell::new(false),
         placement: RefCell::new(Vec::new()),
         captures: std::cell::Cell::new(0),
         runtime: tokio::runtime::Builder::new_current_thread().build().unwrap(),
@@ -833,22 +827,9 @@ fn an_interrupted_image_exchange_finishes_on_repeat() {
     assert_eq!(std::fs::read(retained.join("old-copy")).unwrap(), b"retained source");
 }
 
-/// A native shard born before storage records existed has no record and a
-/// current local copy: the driver leaves it alone, writing no Converting.
-#[test]
-fn a_record_less_shard_with_a_current_copy_is_not_converted() {
-    let cluster = cluster("record-less-current", &["primary-p"], None);
-    let env = env("shard-conversion-record-less-current", "primary-p", &cluster);
-    env.current.set(true);
-    assert_eq!(settle(&env).unwrap(), ConversionProgress::Ready);
-    assert!(cluster.borrow().storage("users").is_none(), "no Converting is written");
-    assert!(env.submitted.borrow().is_empty());
-    assert_eq!(env.captures.get(), 0, "the current copy is never captured as a source");
-}
-
 /// A copy without a storage record, legacy or not, converts per shard, as
-/// does a shard whose conversion wrote a record. Only a native-genesis
-/// record keeps the complete-filesystem path, which holds no old storage.
+/// does a shard whose conversion wrote a record. A native-genesis record
+/// holds no old storage and needs no conversion.
 #[test]
 fn a_legacy_copy_without_a_record_converts_per_shard() {
     use super::shard_conversion::{MetadataUnitDispatch, metadata_unit_dispatch};
@@ -863,7 +844,7 @@ fn a_legacy_copy_without_a_record_converts_per_shard() {
             origin: sinomo_dfs::DfsMetadataGenerationOrigin::NativeGenesis,
         },
     );
-    assert_eq!(metadata_unit_dispatch(Some(&born)), MetadataUnitDispatch::CompleteFileSystem);
+    assert_eq!(metadata_unit_dispatch(Some(&born)), MetadataUnitDispatch::Current);
     let source = sinomo_dfs::DfsMetadataConversionSource {
         source_identity: "legacy-source".into(),
         source_format: Some(3),
@@ -1061,7 +1042,7 @@ fn the_attempt_binds_the_shards_share_of_the_placement_goals() {
     let cluster = cluster("placement", &["primary-p"], None);
     let mut env = env("shard-conversion-placement", "primary-p", &cluster);
     let catalog = env.catalog(&fs_id()).unwrap();
-    let goal = crate::authority::placement_work::native_tests::pending_v0_goal_for_test("per-shard-goal", &catalog);
+    let goal = crate::authority::native_fixtures::pending_v0_goal_for_test("per-shard-goal", &catalog);
     let evidence = crate::authority::placement_work::shard_placement_share(
         std::slice::from_ref(&goal),
         &fs_id(),

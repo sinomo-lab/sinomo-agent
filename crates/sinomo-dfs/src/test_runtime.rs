@@ -4356,7 +4356,7 @@ impl DfsTestRuntime {
 
     /// Borrow the ordinary Core effect opener for the actual owning shard.
     /// Its native owner, configuration projection and publication provider are
-    /// the same ones used by maintenance and storage-import effects.
+    /// the same ones maintenance effects use.
     pub fn metadata_primary_service(
         &self,
         path: &str,

@@ -1,5 +1,5 @@
-//! Non-executable original placement evidence. Only complete native activation
-//! and the existing retirement protocol can retire the referenced old work.
+//! Non-executable original placement evidence: a shard's share of the old
+//! placement reconciliation goals, bound into its captured copy.
 use super::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -34,10 +34,6 @@ impl RetainedPlacementReservation {
         }
         crate::authority::placement_job_source::OriginalPlacementJob::verify_capsule(&self.capsule)
     }
-
-    pub(crate) fn capsule(&self) -> &Value {
-        &self.capsule
-    }
 }
 
 pub(crate) fn validate_placement_reservations(
@@ -59,17 +55,4 @@ pub(crate) fn validate_placement_reservations(
         previous = Some(reference);
     }
     Ok(())
-}
-
-impl MetadataSourceCut {
-    /// Historical cuts can contain their original capsule in the old mapping.
-    /// New cohort cuts keep that mapping empty and bind the separate evidence.
-    pub(crate) fn data_reservation_capsules(&self) -> impl Iterator<Item = &Value> {
-        self.retained_placement_reservations
-            .iter()
-            .map(RetainedPlacementReservation::capsule)
-            .chain(self.pending_operations.iter().filter(|row| {
-                row["disposition"].as_str() == Some("data-after-original-reservation-retirement")
-            }))
-    }
 }

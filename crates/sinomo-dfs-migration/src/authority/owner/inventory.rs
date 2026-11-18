@@ -15,11 +15,9 @@ pub(super) struct UnitKey {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) enum UnitRole {
-    FileSystem { file_system_id: sinomo_dfs::DfsFileSystemId, source_catalog_generation: u64, target_format: u32 },
     Metadata { shard: sinomo_dfs::DfsMetadataShardId },
     MetadataGeneration { identity: sinomo_dfs::DfsMetadataGenerationIdentity },
     MetadataRouting,
-    PlacementGoals,
     ContentRoot,
     ContentVersion { object_id: String, version: String },
     ContentObject { object_id: String },
@@ -48,7 +46,7 @@ impl UnitKey {
                 validate_component(&identity.shard_id.0)?;
                 PathBuf::from("dfs/metadata").join(&identity.shard_id.0)
             }
-            UnitRole::MetadataRouting | UnitRole::PlacementGoals | UnitRole::FileSystem { .. } => PathBuf::from("dfs/metadata"),
+            UnitRole::MetadataRouting => PathBuf::from("dfs/metadata"),
             UnitRole::LocalState => PathBuf::from("dfs"),
             UnitRole::RetainedArtifact => {
                 if !["dfs/metadata/.metadata-conversion", "dfs/metadata/.metadata-retained", "dfs/.content-retained", "dfs/.content-conversion-v2", "dfs/content/.content-conversion-v2", "daemon/dfs-migration/receivers"]
@@ -82,7 +80,7 @@ impl UnitKey {
             UnitRole::ContentBlob { hash } => DfsStoragePreparationScope::ContentBlob { hash: hash.clone() },
             UnitRole::ContentInventory => DfsStoragePreparationScope::ContentInventory,
             UnitRole::LocalState => DfsStoragePreparationScope::LocalState,
-            UnitRole::RetainedArtifact | UnitRole::PlacementGoals | UnitRole::FileSystem { .. } => return None,
+            UnitRole::RetainedArtifact => return None,
         })
     }
     pub fn from_scope(data_root: &Path, root: &Path, scope: &DfsStoragePreparationScope) -> Result<Self> {

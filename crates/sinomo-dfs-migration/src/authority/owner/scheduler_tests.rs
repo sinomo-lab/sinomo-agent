@@ -216,11 +216,7 @@ fn hard_failure_is_not_retried_by_background_dependencies_but_restart_revalidate
     let mut scheduler = Scheduler::new();
     let key = UnitKey {
         relative_root: "dfs/metadata".into(),
-        role: UnitRole::FileSystem {
-            file_system_id: sinomo_dfs::sifs_file_system_id(),
-            source_catalog_generation: 0,
-            target_format: 12,
-        },
+        role: UnitRole::MetadataRouting,
     };
     scheduler.enqueue(key.clone(), false).unwrap();
     let (id, mut reference) = scheduler.next().unwrap();

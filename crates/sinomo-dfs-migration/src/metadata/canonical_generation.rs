@@ -1,11 +1,10 @@
 //! Migration-owned source projection and clean current-generation assembly.
-//! Original bodies stay in the verified source/event archive. Exact eligible
-//! V7 reservations may also cross the cut for guarded native recovery. This
-//! module produces DATA only; the owner separately qualifies native activation.
-mod prepared_recovery;
+//! Original bodies stay in the verified source/event archive; no original
+//! preparation crosses the cut. This module produces DATA only; the owner
+//! separately qualifies native activation.
 use super::*;
 use sinomo_dfs::{
-    DfsMetadataCandidateIdentity, DfsMetadataCandidateState, DfsMetadataCandidateWriter,
+    DfsMetadataCandidateState, DfsMetadataCandidateWriter,
     DfsMetadataGenerationIdentity, DfsMetadataGenerationSeal, DfsMetadataTableSnapshotTables,
     DfsObjectMetadata, DfsPreparedOperationEviction,
 };
@@ -30,23 +29,6 @@ pub(crate) struct CapturedMetadataSource {
     pub planned_target_root: PathBuf,
     pub event_ledger_cut: sinomo_core::storage::migration::stream::StreamCursor,
 }
-impl CapturedMetadataSource {
-    pub fn matches_source_cut(&self, cut: &MetadataSourceCut) -> bool {
-        self.retained_placement_reservations == cut.retained_placement_reservations
-            && self.actual_source_root == cut.source_root
-            && self.source_identity == cut.source_identity
-            && self.source_format == cut.source_format_version
-            && self.source_snapshot_fingerprint == cut.source_snapshot_fingerprint
-            && self.exact_prefix == cut.source_exact_prefix
-            && self.source_journal_sequence == cut.source_journal_sequence
-            && self.source_state_fingerprint == cut.source_state_fingerprint
-            && self.file_system_ids == cut.file_system_ids
-            && self.physical_shard == cut.scope_shard
-            && self.projection_assignments == cut.projection_assignments
-            && self.original_handoff == cut.original_handoff
-    }
-}
-
 /// An opaque original-wire outcome in the immutable verified source ledger.
 /// Its digest is not normalized or promoted to the current operation protocol.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,13 +61,11 @@ pub(crate) struct CapturedMetadataUnit {
     pub proven_v7_terminals: Vec<DfsPreparedOperationEviction>,
     pub unresolved: Vec<OriginalWorkRef>,
     capture_fingerprint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    recovery: Option<prepared_recovery::PreparedRecovery>,
 }
 
 impl CapturedMetadataUnit {
     pub fn projection_fingerprint(&self) -> &str {
-        self.recovery.as_ref().map_or(&self.capture_fingerprint, |recovery| &recovery.binding)
+        &self.capture_fingerprint
     }
     pub fn validate(&self) -> Result<()> {
         validate_placement_reservations(&self.source.retained_placement_reservations,
@@ -102,7 +82,6 @@ impl CapturedMetadataUnit {
                 "captured source projection differs from its verified ledger binding",
             ));
         }
-        if let Some(recovery) = &self.recovery { recovery.validate(self)?; }
         Ok(())
     }
     pub fn verify_retained_source(&self) -> Result<()> {
@@ -151,9 +130,8 @@ impl CapturedMetadataUnit {
     /// Pending requests the settled rows complete, are dropped from its
     /// unresolved work: the settled rows state each of them, and the count
     /// admission checks those rows. Every other captured fact is kept, and
-    /// the projection and any V7 recovery evidence are rebound to the
-    /// settled rows, so the result is admitted only as this settled
-    /// projection.
+    /// the projection is rebound to the settled rows, so the result is
+    /// admitted only as this settled projection.
     pub(crate) fn with_settled_rows(&self, rows: DfsMetadataTableSnapshotTables) -> Result<Self> {
         self.validate()?;
         let recorded_job = |id: &str| {
@@ -180,20 +158,62 @@ impl CapturedMetadataUnit {
             })
             .cloned()
             .collect();
-        let mut settled = Self::bind_projection(
+        let settled = Self::bind_projection(
             self.source.clone(),
             rows,
             self.original_outcomes.clone(),
             self.proven_v7_terminals.clone(),
             unresolved,
         )?;
-        if let Some(recovery) = &self.recovery {
-            let mut recovery = recovery.clone();
-            recovery.binding = recovery.expected_binding(&settled)?;
-            settled.recovery = Some(recovery);
-        }
         settled.validate()?;
         Ok(settled)
+    }
+    /// Whether original work without a proven outcome remains, a V7 prepare
+    /// whose outcome the copy does not record included.
+    pub(crate) fn has_unresolved_work(&self) -> bool {
+        !self.unresolved.is_empty()
+    }
+    /// [`Self::has_unresolved_work`] without the captured rows' own
+    /// non-Completed namespace jobs, Pending requests and staging intents:
+    /// those are recorded rows a reader can report as they stand. What
+    /// remains has no known effect on the rows yet.
+    pub(crate) fn has_unresolved_work_beside_recorded_rows(&self) -> bool {
+        let rows = &self.projected_rows;
+        self.unresolved.iter().any(|work| {
+            let recorded = match work.family.as_str() {
+                "namespace_jobs" => rows.namespace_jobs.iter().any(|job| {
+                    job.job_id == work.original_id
+                        && job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed
+                }),
+                "namespace_requests" => rows.namespace_requests.iter().any(|request| {
+                    request.request_id == work.original_id
+                        && request.status == sinomo_dfs::DfsNamespaceRequestStatus::Pending
+                }),
+                "intents" => rows.intents.iter().any(|intent| {
+                    intent.intent_id == work.original_id
+                        && matches!(
+                            intent.status,
+                            sinomo_dfs::DfsWriteIntentStatus::Staging
+                                | sinomo_dfs::DfsWriteIntentStatus::ReceiptsPending
+                        )
+                }),
+                _ => false,
+            };
+            !recorded
+        })
+    }
+    /// [`Self::has_unresolved_work`] without the captured rows' own
+    /// non-Completed namespace jobs: a converting shard settles each of
+    /// those from its rows, keeps it for another shard's job, or stops.
+    pub(crate) fn has_unresolved_work_beside_recorded_jobs(&self) -> bool {
+        let rows = &self.projected_rows;
+        self.unresolved.iter().any(|work| {
+            !(work.family == "namespace_jobs"
+                && rows.namespace_jobs.iter().any(|job| {
+                    job.job_id == work.original_id
+                        && job.status != sinomo_dfs::DfsNamespaceJobStatus::Completed
+                }))
+        })
     }
     fn bind_projection(
         source: CapturedMetadataSource,
@@ -216,13 +236,11 @@ impl CapturedMetadataUnit {
             proven_v7_terminals,
             unresolved,
             capture_fingerprint,
-            recovery: None,
         })
     }
 }
 
 pub(crate) struct CanonicalMetadataGeneration {
-    pub identity: DfsMetadataCandidateIdentity,
     pub seal: DfsMetadataGenerationSeal,
 }
 
@@ -290,8 +308,9 @@ pub(crate) fn build_canonical_generation(
     }
     let mut rows = captured.projected_rows.clone();
     rows.objects = counted_objects.to_vec();
-    rows.prepared_operations_v7 = captured.recovery_preparations().to_vec();
-    captured.validate_recovery_counts(counted_objects)?;
+    // No original preparation is carried: a Prepared one is unresolved work,
+    // refused above, and a terminal one is carried as its eviction.
+    rows.prepared_operations_v7 = Vec::new();
     rows.prepared_operation_evictions = captured.proven_v7_terminals.clone();
     for terminal in &rows.prepared_operation_evictions {
         terminal.validate()?;
@@ -299,7 +318,7 @@ pub(crate) fn build_canonical_generation(
     let rows = DfsMetadataCandidateState::new(rows)?.snapshot();
     let projection = fingerprint(&(generation, &rows, &captured.original_outcomes))?;
     // Source-to-representation checkpoint: no old journal frames or fabricated
-    // commits. Inherited reservations keep their exact original V7 identity.
+    // commits.
     let prefix = source_proof::conversion_base(
         captured.source.source_journal_sequence,
         &captured.source.source_identity,
@@ -326,7 +345,7 @@ pub(crate) fn build_canonical_generation(
     };
     let seal = writer.seal_storage_generation(&identity)?;
     captured.validate()?;
-    Ok(CanonicalMetadataGeneration { identity, seal })
+    Ok(CanonicalMetadataGeneration { seal })
 }
 
 pub(super) fn capture_projected_source(
@@ -408,10 +427,9 @@ pub(super) fn capture_projected_source(
         }
         unit = retained;
     } else {
-        write_count_cohort_checkpoint(&checkpoint, &unit)?;
+        write_immutable_checkpoint(&checkpoint, &unit)?;
     }
     unit.verify_retained_source_at(&session.source_root)?;
-    unit.bind_replayed_recovery(&operations, &session.staged_root)?;
     Ok(unit)
 }
 
@@ -463,35 +481,8 @@ fn deserialize_projected_rows<'de, D: serde::Deserializer<'de>>(
     Ok(rows)
 }
 
-struct BoundedWire(Vec<u8>, usize);
-impl std::io::Write for BoundedWire {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.1.saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other(
-                "captured source DATA exceeds transport byte budget",
-            ));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Bounded migration-owned wire DATA. It carries no native/source capability;
-/// each actual retiring owner compares it with its own captured source before
-/// publication. Current module payload codecs retain their canonical JSON bytes.
-pub(crate) fn encode_captured_unit(
-    unit: &CapturedMetadataUnit,
-    max_bytes: usize,
-) -> Result<Vec<u8>> {
-    unit.validate()?;
-    let mut wire = BoundedWire(Vec::new(), max_bytes);
-    serde_json::to_writer(&mut wire, unit).map_err(error)?;
-    Ok(wire.0)
-}
-
+/// Decode a retained capture within its byte and record bounds. The capture
+/// is migration-owned DATA and carries no native or source capability.
 pub(crate) fn decode_captured_unit(
     bytes: &[u8],
     max_bytes: usize,
@@ -530,7 +521,6 @@ pub(crate) fn decode_captured_unit(
         unit.original_outcomes.len(),
         unit.proven_v7_terminals.len(),
         unit.unresolved.len(),
-        unit.recovery_preparations().len(),
     ];
     let count = lengths
         .into_iter()
@@ -764,7 +754,6 @@ fn collect_original_outcomes(
                     digest: original_digest,
                     status,
                     committed_entry: committed,
-                    genesis_storage_activation: None,
                 }
             };
             terminal.validate()?;
@@ -884,7 +873,7 @@ mod tests {
         }
     }
     #[test]
-    fn bounded_capture_wire_preserves_typed_module_payload_and_rejects_tampering() {
+    fn bounded_capture_wire_preserves_typed_module_payload() {
         let root = sinomo_testdir::TestDir::new("captured-unit-wire-data");
         let mut fs = sinomo_dfs::DfsFileSystem::sifs(
             sinomo_core::node::NodeId::from_legacy_named("capture-wire-data").unwrap(),
@@ -901,7 +890,7 @@ mod tests {
         let unit =
             CapturedMetadataUnit::from_test_projection(source(root.path()), rows, Vec::new())
                 .unwrap();
-        let bytes = encode_captured_unit(&unit, 64 * 1024).unwrap();
+        let bytes = serde_json::to_vec(&unit).unwrap();
         let decoded = decode_captured_unit(&bytes, 64 * 1024, 16).unwrap();
         assert_eq!(decoded.projected_rows, unit.projected_rows);
         assert_eq!(
@@ -910,12 +899,6 @@ mod tests {
         );
         assert!(decode_captured_unit(&bytes, bytes.len() - 1, 16).is_err());
         assert!(decode_captured_unit(&bytes, 64 * 1024, 0).is_err());
-        assert!(encode_captured_unit(&unit, bytes.len() - 1).is_err());
-        let mut changed = decoded;
-        changed.projected_rows.file_systems[0]
-            .display_name
-            .push_str(" changed");
-        assert!(encode_captured_unit(&changed, 64 * 1024).is_err());
     }
     #[test]
     fn old_terminal_digest_stays_opaque_and_is_never_relabelled_as_v7() {

@@ -162,10 +162,10 @@ CAS head; it cannot rewind the namespace to the data-write generation.
 ### Content Without a Recorded Plan
 
 Current DFS never infers a durability plan from surviving locations or older
-records. `sinomo-dfs-migration` converts retained legacy durability evidence;
-its import grants follow actual source membership and fresh durable copies. A
-historical or already retained version without a complete plan is rejected
-until storage conversion supplies one.
+records. `sinomo-dfs-migration` converts retained legacy durability evidence:
+it restores only the grant that a version's committed write plan and original
+receipts in the same source record. A historical or already retained version
+without a complete plan is rejected until storage conversion supplies one.
 
 A current visible file head without a recorded plan can still be captured.
 Explicit capture and rule capture establish a fresh grant under the current

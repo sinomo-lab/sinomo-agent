@@ -28277,7 +28277,6 @@ mod tests {
             processed_content_bytes: 0,
             accepted_config: sinomo_runtime::dfs::DfsFileSystemConfig {
                 catalog_generation: 0,
-                metadata_storage: None,
                 file_system_id: sinomo_runtime::dfs::DfsFileSystemId::from_legacy_named("sifs")
                     .expect("filesystem"),
                 display_name: "SIFS".to_string(),
@@ -29486,7 +29485,6 @@ mod tests {
         policy.min_distinct_zones = 2;
         let config = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),

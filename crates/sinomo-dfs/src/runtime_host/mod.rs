@@ -417,15 +417,6 @@ impl DfsDataOwnerLock {
                 detail: "DFS owner runtime root has no physical data-directory parent".into(),
             })?
             .to_path_buf();
-        // The data root's owner removes the node-local repair state repair no
-        // longer has before anything else of this process reads the root.
-        crate::legacy_repair_state::remove_legacy_repair_state(&SinomoDataDir::new(
-            &physical_data_root,
-        ))
-        .map_err(|source| DfsRuntimeError::Io {
-            path: physical_data_root.display().to_string(),
-            detail: source.to_string(),
-        })?;
         Ok(Self {
             file,
             physical_data_root,
@@ -3839,8 +3830,6 @@ pub use materialization_test::{DfsTestMaterializationCapture, DfsTestMaterializa
 pub(crate) mod deferred_work_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use deferred_work_test::{DfsTestDeferredResponseCapture, DfsTestDeferredResponsePause};
-#[cfg(feature = "storage-conversion")]
-mod storage_import;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use data_plane::daemon_dfs_node_transport;
 #[cfg(test)]
@@ -3850,8 +3839,6 @@ pub(crate) use data_plane::{
     daemon_dfs_node_transport_on_runtime, daemon_dfs_peer_transports_on_runtime,
     with_daemon_dfs_control_plane_on_runtime,
 };
-#[cfg(feature = "storage-conversion")]
-pub use storage_import::DfsStorageImportContentReceiver;
 
 #[cfg(test)]
 mod test_support;
@@ -3967,49 +3954,7 @@ pub fn retain_component_data_owner(
     require_daemon_dfs_data_owner_lock(&paths)
 }
 
-/// Borrow the existing native host control client for storage-import process
-/// custody. No metadata service/backend or configuration readiness is opened.
-#[cfg(feature = "storage-conversion")]
-pub fn owned_storage_import_control_plane_client(
-    context: &sinomo_module::ComponentContext,
-    owner: &Arc<DfsDataOwnerLock>,
-) -> Result<Box<dyn crate::DfsControlPlaneKvClient>, DfsRuntimeError> {
-    if !matches!(
-        context.host_role(),
-        ComponentHostRole::Main | ComponentHostRole::Embedded
-    ) {
-        return Err(DfsRuntimeError::Parse {
-            detail: "storage import has no native effect host".into(),
-        });
-    }
-    let host =
-        registered_dfs_runtime_host(context.data_dir())?.ok_or_else(|| DfsRuntimeError::Parse {
-            detail: "storage import normal host is not registered yet".into(),
-        })?;
-    if host.shutting_down.is_cancelled() {
-        return Err(DfsRuntimeError::Parse {
-            detail: "storage import native host is stopping".into(),
-        });
-    }
-    let actual = retain_component_data_owner(context)?;
-    if !Arc::ptr_eq(&actual, owner) {
-        return Err(DfsRuntimeError::Parse {
-            detail: "storage import lost its exact current data owner".into(),
-        });
-    }
-    let runtime = context.runtime().ok_or_else(|| DfsRuntimeError::Parse {
-        detail: "storage import normal host runtime is absent".into(),
-    })?;
-    daemon_dfs_control_plane_client_on_runtime(
-        &ClusterPaths::new(context.data_dir()),
-        Some(runtime),
-    )
-    .ok_or_else(|| DfsRuntimeError::Parse {
-        detail: "storage import has no native cluster client".into(),
-    })
-}
-
-pub use maintenance_host::{queue_namespace_reconciliation_work, wake_namespace_reconciliation};
+pub use maintenance_host::queue_namespace_reconciliation_work;
 pub(crate) use maintenance_host::release_idle_namespace_reconciliation_work;
 
 #[cfg(test)]

@@ -523,161 +523,8 @@ impl OriginalPlacementJob {
         }
         Ok(true)
     }
-    pub(super) fn related_keys(&self) -> Vec<String> {
-        if self.source_schema == OriginalPlacementSchema::V0 {
-            return Vec::new();
-        }
-        let base = format!("/dfs/filesystems/{}", self.raw_file_system_id);
-        vec![
-            format!("{base}/placement-reconciliation-queue-v1"),
-            format!(
-                "{base}/placement-reconciliation-activity-v1/{}",
-                self.job_id.trim_matches('/').replace('/', "_")
-            ),
-            format!("{base}/placement-reconciliation-activity-index-v1"),
-        ]
-    }
-    pub(super) fn exact_retirement_compares(
-        captured: &[MetadataCapturedKvEntry],
-    ) -> Vec<KvCompare> {
-        let mut compares = captured_compares(captured);
-        for row in captured {
-            if let Some(entry) = &row.entry {
-                compares.push(KvCompare::CreateRevisionEquals {
-                    key: row.key.clone(),
-                    revision: entry.create_revision,
-                });
-                compares.push(KvCompare::VersionEquals {
-                    key: row.key.clone(),
-                    version: entry.version,
-                });
-            }
-        }
-        compares
-    }
-    /// Remove only this exact archived source identity from shared scheduling
-    /// DATA. The caller compares and archives all supplied entries natively.
-    pub(super) fn related_retirement_ops(
-        &self,
-        captured: &[MetadataCapturedKvEntry],
-    ) -> Result<Vec<KvOp>> {
-        let keys = self.related_keys();
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut ops = Vec::new();
-        for (index, key) in keys.iter().enumerate() {
-            let entry = captured
-                .iter()
-                .find(|row| &row.key == key)
-                .ok_or_else(|| error("placement retirement omits exact related key"))?;
-            let Some(entry) = &entry.entry else { continue };
-            let mut value =
-                crate::metadata::source_document::decode_original_document(&entry.value)?;
-            if !value.is_object() || value["schema_version"].as_u64() != Some(1) {
-                return Err(error("unknown original placement queue/activity schema"));
-            }
-            let changed = match index {
-                0 => {
-                    let ids = value["job_ids"]
-                        .as_array_mut()
-                        .ok_or_else(|| error("original placement queue lacks job_ids"))?;
-                    for id in ids.iter() {
-                        if id.as_str().is_none() {
-                            return Err(error("original placement queue identity is malformed"));
-                        }
-                    }
-                    let before = ids.len();
-                    ids.retain(|id| id.as_str() != Some(self.job_id.as_str()));
-                    before != ids.len()
-                }
-                1 => {
-                    let activity = &value["activity"];
-                    if text(activity, "job_id")? != self.job_id
-                        || text(activity, "file_system_id")? != self.raw_file_system_id
-                        || text(activity, "path")? != self.path
-                        || activity["scope"] != self.original_value["scope"]
-                    {
-                        return Err(error("original placement activity changes job identity"));
-                    }
-                    ops.push(KvOp::Delete { key: key.clone() });
-                    false
-                }
-                2 => {
-                    let recent = value["recent"].as_array_mut().ok_or_else(|| {
-                        error("original placement activity index lacks recent cursors")
-                    })?;
-                    for cursor in recent.iter() {
-                        let id = text(cursor, "job_id")?;
-                        let created = integer(cursor, "created_at_unix_nanos")?;
-                        if id == self.job_id && created != self.source_created_at_unix_nanos {
-                            return Err(error(
-                                "original placement activity cursor changes immutable creation identity",
-                            ));
-                        }
-                    }
-                    let before = recent.len();
-                    recent.retain(|cursor| cursor["job_id"].as_str() != Some(self.job_id.as_str()));
-                    before != recent.len()
-                }
-                _ => unreachable!(),
-            };
-            if changed {
-                ops.push(KvOp::Put {
-                    key: key.clone(),
-                    value: sinomo_core::kv::encode_kv_value(&value).map_err(error)?,
-                    lease_id: entry.lease_id,
-                });
-            }
-        }
-        Ok(ops)
-    }
     pub(super) fn source_digest(&self) -> Result<String> {
         digest(&(self.source_schema.source_domain(), &self.entry))
-    }
-    pub(super) fn validate_current_goal(
-        &self,
-        job: &sinomo_dfs::DfsPlacementReconciliationJob,
-    ) -> Result<()> {
-        if self.terminal
-            || job.schema_version != 1
-            || job.job_id != self.current_job_id()?
-            || job.file_system_id != self.file_system_id
-            || job.path != self.path
-            || job.scope != self.scope
-            || job.unavailable_node_ids
-                != original_node_ids(&self.original_value, "unavailable_node_ids")?
-            || job.candidate_snapshot.is_empty()
-            || job.accepted_config.file_system_id != self.file_system_id
-            || job.adaptive != self.is_adaptive()
-        {
-            return Err(error(
-                "current placement job changes its immutable original DATA goal",
-            ));
-        }
-        if self.is_adaptive() {
-            if job.adaptive_budget.as_ref() != Some(&self.current_adaptive_budget()?)
-                || job.placement_snapshot.is_none()
-                || job.processed_content_bytes
-                    < integer(&self.original_value, "processed_content_bytes")?
-            {
-                return Err(error(
-                    "current adaptive goal loosens original budget/spent accounting",
-                ));
-            }
-        } else if job.adaptive_budget.is_some() {
-            return Err(error("manual source changes execution class"));
-        }
-        Ok(())
-    }
-    pub(super) fn current_job_id(&self) -> Result<String> {
-        Ok(format!("placement-import-v7-{}", self.source_digest()?))
-    }
-    pub(super) fn current_job_key(&self) -> Result<String> {
-        Ok(sinomo_dfs::placement_reconciliation_key(
-            &self.file_system_id,
-            &self.current_job_id()?,
-        ))
     }
     pub(super) fn capsule_for_scope(&self, assignment: &DfsMetadataShardConfig) -> Result<Value> {
         if self.terminal
@@ -756,64 +603,6 @@ impl OriginalPlacementJob {
             original_shard_id: shard,
             capsule_digest: actual,
         })
-    }
-    pub(super) fn is_adaptive(&self) -> bool {
-        self.source_schema == OriginalPlacementSchema::V1Adaptive
-            && self.original_value["adaptive"].as_bool() == Some(true)
-    }
-    fn current_adaptive_budget(&self) -> Result<sinomo_dfs::DfsAdaptivePlacementBudget> {
-        if !self.is_adaptive() {
-            return Err(error("manual source has no adaptive execution budget"));
-        }
-        let budget = &self.original_value["adaptive_budget"];
-        Ok(sinomo_dfs::DfsAdaptivePlacementBudget {
-            max_objects_per_tick: usize::try_from(integer(budget, "max_objects_per_tick")?)
-                .map_err(error)?,
-            max_bytes_per_tick: integer(budget, "max_bytes_per_tick")?,
-            max_millis_per_tick: integer(budget, "max_millis_per_tick")?,
-        })
-    }
-    pub(super) fn build_current_job(
-        &self,
-        config: &DfsFileSystemConfig,
-        candidates: Vec<sinomo_dfs::DfsNodeAdvertisement>,
-        current_snapshot: Option<sinomo_dfs::DfsPlacementSnapshot>,
-        current_time: u64,
-    ) -> Result<sinomo_dfs::DfsPlacementReconciliationJob> {
-        if self.terminal || config.file_system_id != self.file_system_id {
-            return Err(error(
-                "terminal/foreign original goal cannot create current work",
-            ));
-        }
-        if self.is_adaptive() {
-            let snapshot = current_snapshot.ok_or_else(|| {
-                error("adaptive source reissue awaits an actual current host snapshot")
-            })?;
-            return sinomo_dfs::build_adaptive_placement_reconciliation_job(
-                self.current_job_id()?,
-                config,
-                self.path.clone(),
-                self.scope,
-                original_node_ids(&self.original_value, "unavailable_node_ids")?,
-                candidates,
-                snapshot,
-                self.current_adaptive_budget()?,
-                integer(&self.original_value, "processed_content_bytes")?,
-                current_time,
-            )
-            .map_err(error);
-        }
-        sinomo_dfs::build_placement_reconciliation_job(
-            self.current_job_id()?,
-            config,
-            self.path.clone(),
-            self.scope,
-            original_node_ids(&self.original_value, "unavailable_node_ids")?,
-            candidates,
-            None,
-            current_time,
-        )
-        .map_err(error)
     }
 }
 
@@ -922,10 +711,6 @@ mod original_source_tests {
             serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
         assert_eq!(restored.entry, row);
         assert_eq!(restored.original_value, job.original_value);
-        assert_eq!(
-            restored.current_job_id().unwrap(),
-            job.current_job_id().unwrap()
-        );
     }
     #[test]
     fn required_original_counters_and_exact_key_reject_malformed_source() {
@@ -986,20 +771,13 @@ mod original_source_tests {
         }
     }
     #[test]
-    fn terminal_original_outcomes_are_data_and_new_keys_are_stable() {
+    fn terminal_original_outcomes_are_data() {
         for state in ["completed", "failed"] {
             let row = entry(serde_ext::to_bytes(&wire(state), 1, LengthMode::U32).unwrap());
             let source = OriginalPlacementJob::decode(&row).unwrap();
             assert!(source.terminal);
             assert_eq!(source.original_value["state"], state);
             assert_eq!(source.entry, row);
-            assert_eq!(
-                source.current_job_key().unwrap(),
-                sinomo_dfs::placement_reconciliation_key(
-                    &source.file_system_id,
-                    &source.current_job_id().unwrap()
-                )
-            );
         }
     }
     #[test]
@@ -1168,10 +946,6 @@ mod original_source_tests {
             serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap();
         assert_eq!(restored.entry, row);
         assert_eq!(restored.original_value, source.original_value);
-        assert_eq!(
-            restored.current_job_id().unwrap(),
-            source.current_job_id().unwrap()
-        );
     }
     #[test]
     fn actual_docker_v1_snapshot_keeps_recorded_resource_pressure_and_rejects_unknown_fields() {
@@ -1299,79 +1073,6 @@ mod original_source_tests {
         assert!(OriginalPlacementJob::decode(&wrong).is_err());
     }
     #[test]
-    fn v1_shared_cleanup_preserves_unrelated_order_flags_and_exact_native_compares() {
-        let source = OriginalPlacementJob::decode(&first_v1()).unwrap();
-        let keys = source.related_keys();
-        let documents = [
-            serde_json::json!({"schema_version":1,"job_ids":["current-before",source.job_id,"current-after"]}),
-            serde_json::json!({"schema_version":1,"activity":{"job_id":source.job_id,"file_system_id":source.raw_file_system_id,"path":source.path,"scope":"subtree"}}),
-            serde_json::json!({"schema_version":1,"recent":[{"job_id":"current-before","created_at_unix_nanos":2},
-                {"job_id":source.job_id,"created_at_unix_nanos":17},{"job_id":"current-after","created_at_unix_nanos":3}],"partial":true,"history_truncated":true}),
-        ];
-        let captured = keys
-            .iter()
-            .zip(documents)
-            .map(|(key, value)| {
-                let mut row = entry(serde_ext::to_bytes(&value, 1, LengthMode::U32).unwrap());
-                row.key = key.clone();
-                MetadataCapturedKvEntry {
-                    key: key.clone(),
-                    entry: Some(row),
-                }
-            })
-            .collect::<Vec<_>>();
-        let saved = captured.clone();
-        let ops = source.related_retirement_ops(&captured).unwrap();
-        assert_eq!(
-            serde_json::to_value(&captured).unwrap(),
-            serde_json::to_value(&saved).unwrap()
-        );
-        assert_eq!(ops.len(), 3);
-        match &ops[0] {
-            KvOp::Put { value, .. } => {
-                let queue =
-                    crate::metadata::source_document::decode_original_document(value).unwrap();
-                assert_eq!(
-                    queue["job_ids"],
-                    serde_json::json!(["current-before", "current-after"])
-                );
-            }
-            _ => panic!("shared queue must retain unrelated current IDs"),
-        }
-        assert!(matches!(&ops[1],KvOp::Delete {key} if key == &keys[1]));
-        match &ops[2] {
-            KvOp::Put { value, .. } => {
-                let index =
-                    crate::metadata::source_document::decode_original_document(value).unwrap();
-                assert_eq!(index["partial"], true);
-                assert_eq!(index["history_truncated"], true);
-                assert_eq!(index["recent"][0]["job_id"], "current-before");
-                assert_eq!(index["recent"][1]["job_id"], "current-after");
-            }
-            _ => panic!("shared activity index must retain unrelated cursors"),
-        }
-        let compares = OriginalPlacementJob::exact_retirement_compares(&captured);
-        for row in &captured {
-            let original = row.entry.as_ref().unwrap();
-            assert!(compares.iter().any(|compare| matches!(compare,KvCompare::ValueEquals {key,value} if key == &row.key && value == &original.value)));
-            assert!(compares.iter().any(|compare| matches!(compare,KvCompare::ModifyRevisionEquals {key,revision} if key == &row.key && revision == &original.modify_revision)));
-        }
-        for row in &captured {
-            let original = row.entry.as_ref().unwrap();
-            assert!(compares.iter().any(|compare| matches!(compare,KvCompare::CreateRevisionEquals {key,revision} if key == &row.key && revision == &original.create_revision)));
-            assert!(compares.iter().any(|compare| matches!(compare,KvCompare::VersionEquals {key,version} if key == &row.key && version == &original.version)));
-            assert!(compares.iter().any(|compare| matches!(compare,KvCompare::LeaseEquals {key,lease_id} if key == &row.key && lease_id == &original.lease_id)));
-        }
-        let mut changed = captured.clone();
-        let activity = documents_for_foreign_activity(&source);
-        changed[1].entry.as_mut().unwrap().value =
-            serde_ext::to_bytes(&activity, 1, LengthMode::U32).unwrap();
-        assert!(source.related_retirement_ops(&changed).is_err());
-    }
-    fn documents_for_foreign_activity(source: &OriginalPlacementJob) -> Value {
-        serde_json::json!({"schema_version":1,"activity":{"job_id":"replaced-source-id","file_system_id":source.raw_file_system_id,"path":source.path,"scope":"subtree"}})
-    }
-    #[test]
     fn valid_current_v1_stays_on_normal_path_and_partial_later_pair_is_rejected() {
         let node =
             sinomo_core::node::NodeId::from_legacy_named("current-placement-fixture").unwrap();
@@ -1398,59 +1099,5 @@ mod original_source_tests {
             crate::metadata::source_document::decode_original_document(&row.value).unwrap();
         malformed["candidate_snapshot"] = serde_json::json!([]);
         assert!(OriginalPlacementJob::requires_conversion(&changed_v1(&row, &malformed)).is_err());
-    }
-    #[test]
-    fn adaptive_current_factory_keeps_exact_tick_caps_and_prior_spent_bytes() {
-        // Pure source/current DTO construction DATA, not a native host sample
-        // or permission witness. Production uses only the retained host getter.
-        let row = first_v1();
-        let mut raw =
-            crate::metadata::source_document::decode_original_document(&row.value).unwrap();
-        raw["adaptive"] = serde_json::json!(true);
-        raw["processed_content_bytes"] = serde_json::json!(4096);
-        raw["adaptive_budget"] = serde_json::json!({"max_objects_per_tick":31,"max_bytes_per_tick":8000,"max_millis_per_tick":777});
-        raw["placement_snapshot"] = serde_json::json!({"schema_version":1,"generation":23,
-            "primary_node_id":raw["candidate_snapshot"][0]["node_id"],
-            "observed_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-01T00:05:00Z"});
-        let source = OriginalPlacementJob::decode(&changed_v1(&row, &raw)).unwrap();
-        let node = normalized_source_id(raw["candidate_snapshot"][0]["node_id"].as_str().unwrap())
-            .unwrap();
-        let config = DfsFileSystemConfig::from(&sinomo_dfs::DfsFileSystem::sifs(node.clone()));
-        let candidates = vec![sinomo_dfs::DfsNodeAdvertisement::content(node.clone())];
-        assert!(
-            source
-                .build_current_job(&config, candidates.clone(), None, 19)
-                .is_err()
-        );
-        let now = time::OffsetDateTime::now_utc();
-        let current = sinomo_dfs::DfsPlacementSnapshot {
-            schema_version: 1,
-            generation: 24,
-            primary_node_id: node,
-            observed_at: now,
-            expires_at: now + time::Duration::minutes(5),
-            nodes: Vec::new(),
-            paths: Vec::new(),
-        };
-        let new = source
-            .build_current_job(&config, candidates, Some(current.clone()), 19)
-            .unwrap();
-        assert!(new.adaptive);
-        let budget = new.adaptive_budget.unwrap();
-        assert_eq!(budget.max_objects_per_tick, 31);
-        assert_eq!(budget.max_bytes_per_tick, 8000);
-        assert_eq!(budget.max_millis_per_tick, 777);
-        assert_eq!(new.processed_content_bytes, 4096);
-        assert_eq!(new.placement_snapshot, Some(current));
-        assert_eq!(
-            new.state,
-            sinomo_dfs::DfsPlacementReconciliationState::Pending
-        );
-        assert!(new.cursor.is_none());
-        assert_eq!(source.original_value, raw);
-        assert_eq!(
-            source.original_value["placement_snapshot"]["generation"],
-            23
-        );
     }
 }

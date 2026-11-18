@@ -1169,13 +1169,6 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn prepare_payload_for_publication(
-        &mut self,
-        payload: crate::DfsPreparedOperationPayload,
-    ) -> Result<DfsPreparedOperationDigest> {
-        self.prepare_payload_for_publication_with_file_system(payload, None)
-    }
-
     pub(crate) fn prepare_payload_for_publication_with_file_system(
         &mut self,
         mut payload: crate::DfsPreparedOperationPayload,
@@ -1644,15 +1637,12 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                     message: "publication requires the host's coherent shard configuration".into(),
                 })?;
             if digest.owner_epoch == 1 && digest.operation_id == crate::default_cluster::genesis::genesis_operation_id(&context.shard) {
-                context.namespace_catalog.as_ref().ok_or_else(|| crate::DfsError::Metadata {
-                    message: "native genesis requires its actual complete configuration catalog".into(),
-                })?.validate_native_genesis_preparation(&record)?;
+                crate::default_cluster::genesis::original_genesis_file_system(&record, &context.shard)?;
                 let generation = crate::storage_generation::read_generation(scope.root())?;
-                let original = crate::default_cluster::genesis::original_genesis_file_system(&record, &context.shard)?;
-                if generation.identity.file_system_id != digest.file_system_id
-                    || generation.identity.shard_id != digest.shard_id
-                    || !generation.identity.matches_native_file_system_storage(original.metadata_storage.as_ref()) {
-                    return Err(crate::DfsError::Metadata { message: "native genesis header differs from its original storage binding".into() });
+                if generation.identity
+                    != crate::storage_generation::native_genesis_generation_identity(&context.shard)
+                {
+                    return Err(crate::DfsError::Metadata { message: "native genesis header differs from its shard's native birth".into() });
                 }
             }
             let requirement = self.metadata_commit_requirement(&context, &payload)?;

@@ -78,8 +78,8 @@ pub(super) fn extend_as(
     })
 }
 /// A conversion base represents this exact retained source and current
-/// projection. It is not an empty genesis; activation must certify its image
-/// using the ordinary StorageImport handoff and native assigned voters.
+/// projection. It is not an empty genesis; the shard's activation certifies
+/// its image.
 pub(super) fn conversion_base(
     sequence: u64,
     source_cut: &str,

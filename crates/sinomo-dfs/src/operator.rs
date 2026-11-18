@@ -32,6 +32,10 @@ pub use sinomo_api::dfs::operator::DfsOperatorStatusOmission;
 
 pub use sinomo_api::dfs::operator::DfsOperatorStatus;
 
+pub use sinomo_api::dfs::operator::{
+    DfsMetadataShardStorageMigration, DfsMetadataShardStorageMigrationState,
+};
+
 pub use sinomo_api::dfs::operator::DfsOperatorFileSystemView;
 
 pub use sinomo_api::dfs::operator::DfsOperatorObjectView;

@@ -342,12 +342,6 @@ enum ImportedJobRouting<'a> {
         assignments: &'a [DfsMetadataShardConfig],
         target: &'a DfsMetadataShardConfig,
     },
-    // Entered after explicit standalone source-owner validation. Empty native
-    // assignments cannot choose this mode or supply an owner identity.
-    Standalone {
-        scope: &'a DfsMetadataShardId,
-        owner: &'a sinomo_core::node::NodeId,
-    },
 }
 impl ImportedJobRouting<'_> {
     fn coordinator(&self, fs: &DfsFileSystemId, path: &str) -> Result<ScopeTuple> {
@@ -359,10 +353,6 @@ impl ImportedJobRouting<'_> {
                     .map(ScopeTuple::of)
                     .ok_or_else(|| invalid("current adoption source coordinator missing"))
             }
-            Self::Standalone { scope, .. } => Ok(ScopeTuple {
-                file_system_id: fs.clone(),
-                shard_id: (*scope).clone(),
-            }),
         }
     }
     fn destination(&self, fs: &DfsFileSystemId, path: &str) -> Result<sinomo_core::node::NodeId> {
@@ -373,7 +363,6 @@ impl ImportedJobRouting<'_> {
                     .map(|config| config.primary_node_id)
                     .ok_or_else(|| invalid("current adoption destination scope missing"))
             }
-            Self::Standalone { owner, .. } => Ok((*owner).clone()),
         }
     }
     fn retains(
@@ -399,7 +388,6 @@ impl ImportedJobRouting<'_> {
                     && (target.shard_id == original.0
                         || coordinator.is_some_and(|scope| scope == &ScopeTuple::of(target))))
             }
-            Self::Standalone { .. } => Ok(true),
         }
     }
 }
@@ -545,23 +533,6 @@ pub(super) fn resolve_adoption_work(
         &ImportedJobRouting::Native {
             assignments,
             target,
-        },
-    )
-}
-pub(super) fn resolve_standalone_adoption_work(
-    tables: &mut DfsMetadataTableSnapshotTables,
-    pending: &mut [Value],
-    work: Vec<RequiredNativeWork>,
-    scope: &DfsMetadataShardId,
-    actual_owner: &sinomo_core::node::NodeId,
-) -> Result<(Vec<Value>, Vec<RequiredNativeWork>)> {
-    resolve_adoption_work_with_routing(
-        tables,
-        pending,
-        work,
-        &ImportedJobRouting::Standalone {
-            scope,
-            owner: actual_owner,
         },
     )
 }

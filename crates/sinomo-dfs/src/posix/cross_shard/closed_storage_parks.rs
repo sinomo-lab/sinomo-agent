@@ -113,8 +113,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .is_some_and(|coordinator| coordinator.shard_id == shard.shard_id)
     }
 
-    /// The shard `frame`'s step addresses, when its storage record names a
-    /// conversion: the step must not run until that shard activates.
+    /// The shard `frame`'s step addresses, when that shard's storage is
+    /// closed: the step must not run until that shard activates.
     pub(super) fn closed_namespace_step_shard(
         &mut self,
         job: &DfsNamespaceJobRecord,
@@ -124,7 +124,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         Ok(self
-            .metadata_shard_storage_is_converting(&shard)?
+            .shard_storage_record_is_closed(&shard)?
             .then_some((shard, path)))
     }
 

@@ -473,22 +473,12 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         if original_config.file_system_id != file_system.file_system_id {
             return Err(DfsError::Metadata { message: "native genesis filesystem configuration is misbound".into() });
         }
-        if let Some(storage) = &original_config.metadata_storage {
-            storage.validate_at_catalog_generation(original_config.catalog_generation)
-                .map_err(|message| DfsError::Metadata { message })?;
-            if !matches!(storage, crate::DfsMetadataStorageState::Active { target_format, .. }
-                if *target_format == u32::from(crate::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION)) {
-                return Err(DfsError::Metadata { message: "native shard birth requires a settled current filesystem storage generation".into() });
-            }
-        }
-        let activation = original_config.metadata_storage.as_ref().and_then(|storage| storage.active_descriptor());
         let original_file_system: DfsFileSystem = original_config.into();
         let selected_layout = self.publication_owners.selected_original_data_layout()?;
         for shard in &missing {
             crate::storage_generation::stage_native_genesis_storage_generation(
                 &crate::local_dfs_metadata_shard_path(&self.data_dir, &DfsMetadataShardId::new(&shard.shard_id)),
                 shard,
-                activation.as_ref(),
                 selected_layout.as_deref(),
             )?;
         }

@@ -1481,7 +1481,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             self.metadata.add_file_system(DfsFileSystem {
                 catalog_generation: 0,
-                metadata_storage: None,
                 retention_policies: Default::default(),
                 module_metadata: Default::default(),
                 file_system_id: object.file_system_id.clone(),

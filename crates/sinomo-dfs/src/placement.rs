@@ -316,7 +316,6 @@ pub(crate) fn dfs_file_system_semantically_eq(left: &DfsFileSystem, right: &DfsF
             && left.display_name == right.display_name
             && left.owner_node_id == right.owner_node_id
             && left.catalog_generation == right.catalog_generation
-            && left.metadata_storage == right.metadata_storage
             && left.retention_policies == right.retention_policies
             && left.module_metadata == right.module_metadata
             && canonical_subtree_policies(&left.subtree_policies)
@@ -4490,7 +4489,6 @@ pub(crate) fn scoped_placement_config_for_job(
 ) -> DfsFileSystemConfig {
     DfsFileSystemConfig {
         catalog_generation: config.catalog_generation,
-        metadata_storage: config.metadata_storage.clone(),
         retention_policies: Default::default(),
         module_metadata: Default::default(),
         file_system_id: config.file_system_id.clone(),
@@ -5589,7 +5587,6 @@ mod tests {
     fn placement_config(owner_node_id: NodeId) -> DfsFileSystemConfig {
         DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5808,7 +5805,6 @@ mod tests {
             DfsSubtreePolicy::new("/services", DfsObjectPolicy::ReplicatedEventual, 1, 2);
         let first = DfsFileSystem {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5857,7 +5853,6 @@ mod tests {
             DfsSubtreePolicy::new("/users/team", DfsObjectPolicy::ReplicatedConfirmed, 2, 2);
         let first = DfsFileSystem {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5914,7 +5909,6 @@ mod tests {
         };
         let first = DfsFileSystem {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5946,7 +5940,6 @@ mod tests {
         let owner = node("owner");
         let canonical = DfsFileSystem {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: sifs_file_system_id(),
@@ -5997,7 +5990,6 @@ mod tests {
     fn self_rule_overrides_same_path_subtree_without_affecting_children() {
         let mut config = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("fs"),
@@ -6120,7 +6112,6 @@ mod tests {
         let fs = DfsFileSystemId::from_legacy_named("sifs").expect("fs");
         let config = DfsFileSystemConfig {
             catalog_generation: 0,
-            metadata_storage: None,
             retention_policies: Default::default(),
             module_metadata: Default::default(),
             file_system_id: fs,

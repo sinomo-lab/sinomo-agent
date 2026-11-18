@@ -133,7 +133,9 @@ pub(crate) fn take_parked_on_activated_shard_storage(
     activated: &BTreeSet<DfsMetadataShardStorageKey>,
 ) -> bool {
     // A job waiting on an activated shard runs its step again in the
-    // maintenance pass this wakes, and records what it still waits on.
+    // maintenance pass this wakes, and records what it still waits on. A step
+    // refused because the shard's primary does not yet serve its activated
+    // copy resumes at the next maintenance pass.
     let mut parks = JOB_PARKS.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(node_parks) = parks.get_mut(node) {
         node_parks.retain(|(file_system_id, _), park| {
