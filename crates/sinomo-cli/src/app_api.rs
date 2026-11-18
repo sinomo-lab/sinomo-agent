@@ -8520,11 +8520,7 @@ fn unexpected_dfs_operator_response(
     format!("daemon returned DFS {actual} response to {expected} request")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SifsPlacementUpdateOutcome {
-    pub preview: SifsPlacementPreview,
-    pub reconciliation: SifsPlacementReconciliationJob,
-}
+pub type SifsPlacementUpdateOutcome = sinomo_runtime::api::DaemonDfsBrowserPlacementUpdateResponse;
 
 /// Metadata shard placement for the selected SIFS path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9132,12 +9128,7 @@ impl SifsBrowser {
     ) -> Result<SifsPlacementUpdateOutcome, String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => {
-                let (preview, reconciliation) =
-                    backend.update_placement(path, policy, scope, expected_preview_token)?;
-                Ok(SifsPlacementUpdateOutcome {
-                    preview,
-                    reconciliation,
-                })
+                backend.update_placement(path, policy, scope, expected_preview_token)
             }
             SifsBrowserBackend::Remote(remote) => {
                 remote.update_placement(path, policy, scope, expected_preview_token)
@@ -9838,7 +9829,7 @@ impl RemoteSifsBrowser {
         Ok(sifs_metadata_primary_transfer_from_rpc(response))
     }
 
-    fn preview_placement(
+    pub(crate) fn preview_placement(
         &self,
         path: &str,
         policy: Option<SifsPlacementPolicy>,
@@ -9856,7 +9847,7 @@ impl RemoteSifsBrowser {
         Ok(response.preview)
     }
 
-    fn update_placement(
+    pub(crate) fn update_placement(
         &self,
         path: &str,
         policy: Option<SifsPlacementPolicy>,
@@ -9870,12 +9861,15 @@ impl RemoteSifsBrowser {
                 policy,
                 scope,
                 expected_preview_token,
+                timeout_millis: Some(
+                    self.rpc_timeout()
+                        .map_err(|error| error.to_string())?
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                ),
             },
         )?;
-        Ok(SifsPlacementUpdateOutcome {
-            preview: response.preview,
-            reconciliation: response.reconciliation,
-        })
+        Ok(response)
     }
 
     fn placement_progress(&self, job_id: &str) -> Result<SifsPlacementReconciliationJob, String> {

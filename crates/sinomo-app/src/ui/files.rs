@@ -3700,6 +3700,7 @@ impl FilesState {
                 self.placement_applying = false;
                 match result {
                     Ok(outcome) => {
+                        let visibility_pending = !outcome.visibility.is_published();
                         let accepted_resolved = outcome.preview.resolved.clone();
                         if let Some(draft) = self.placement_draft.as_mut() {
                             draft.rebase_accepted_scope(
@@ -3726,7 +3727,8 @@ impl FilesState {
                         self.placement_preview = Some(outcome.preview);
                         self.placement_preview_revision = Some(self.placement_edit_revision);
                         self.placement_reconciliation = Some(outcome.reconciliation);
-                        self.placement_error = None;
+                        self.placement_error = visibility_pending.then(||
+                            "Policy accepted; this node has not confirmed the new policy yet. Do not apply it again.".to_string());
                         self.placement_error_from_reconciliation = false;
                         self.pending_select_path = Some(path);
                         if terminal {
@@ -29371,6 +29373,8 @@ mod tests {
                 result: Ok(SifsPlacementUpdateOutcome {
                     preview,
                     reconciliation,
+                    committed_revision: 1,
+                    visibility: sinomo_runtime::api::DfsPlacementConfigurationVisibility::Published,
                 }),
             })
         );
@@ -29396,6 +29400,49 @@ mod tests {
         assert!(
             !state.placement_apply_allowed(),
             "an unchanged accepted rule must not enqueue a duplicate reconciliation job"
+        );
+
+        // A known commit whose local visibility is pending is still accepted:
+        // retain its job and editing baseline, but do not display normal success
+        // or enable a duplicate Apply. Reconciliation progress cannot clear this
+        // distinct visibility warning.
+        let accepted_job = state.placement_reconciliation.clone().unwrap();
+        state.pending_placement_request_id = Some(74);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementUpdate {
+                request_id: 74,
+                path: "/folder".into(),
+                result: Ok(SifsPlacementUpdateOutcome {
+                    preview: state.placement_preview.clone().unwrap(),
+                    reconciliation: accepted_job.clone(),
+                    committed_revision: 2,
+                    visibility: sinomo_runtime::api::DfsPlacementConfigurationVisibility::Pending {
+                        detail: "publication deadline elapsed".into(),
+                    },
+                }),
+            })
+        );
+        assert!(
+            state
+                .placement_error
+                .as_deref()
+                .unwrap()
+                .contains("Policy accepted")
+        );
+        assert!(!state.placement_apply_allowed());
+        state.pending_placement_request_id = Some(75);
+        assert!(
+            state.apply_worker_result(FilesWorkerResult::PlacementProgress {
+                request_id: 75,
+                result: Ok(accepted_job),
+            })
+        );
+        assert!(
+            state
+                .placement_error
+                .as_deref()
+                .unwrap()
+                .contains("Policy accepted")
         );
 
         state.close_action_prompt();

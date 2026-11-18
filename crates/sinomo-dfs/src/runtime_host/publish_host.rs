@@ -544,7 +544,7 @@ pub(super) async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
         let initialize_owner = Arc::clone(&data_owner_lock);
         #[cfg(test)]
         let caller_task = tokio::task::try_id();
-        let initialized = crate::runtime_publish::run_owned_metadata_publish_blocking(&task_owner, move || {
+        let initialized = crate::runtime_publish::run_owned_dfs_blocking(&task_owner, move || {
             let _admission = admission;
             let _data_owner_lock = initialize_owner;
             #[cfg(test)]
@@ -665,6 +665,7 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                 runtime.clone(),
                 Arc::clone(&data_owner_lock),
                 deadline,
+                None,
             ),
         )
         .await;
@@ -889,6 +890,11 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
 ) -> Result<DaemonDfsMessagePeerSnapshot, String> {
+    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let owner_snapshot =
+        read_daemon_dfs_replica_owner_snapshot_before(&cluster_paths, &runtime, deadline)
+            .await
+            .map_err(|error| error.to_string())?;
     ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
         mutation_scheduler,
         data_dir,
@@ -896,7 +902,8 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
         lane,
         runtime,
         data_owner_lock,
-        tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        deadline,
+        owner_snapshot,
     )
     .await
     .map(|(peer, _)| peer)
@@ -910,6 +917,7 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
     deadline: tokio::time::Instant,
+    owner_snapshot: Option<DaemonDfsMessagePeerSnapshot>,
 ) -> Result<
     (
         DaemonDfsMessagePeerSnapshot,
@@ -917,11 +925,13 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
     ),
     String,
 > {
-    let peer_snapshot =
-        read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, &runtime, deadline)
+    let peer_snapshot = match owner_snapshot {
+        Some(snapshot) => snapshot,
+        None => read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, &runtime, deadline)
             .await
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "DFS metadata publish lacks a cluster peer snapshot".to_string())?;
+            .ok_or_else(|| "DFS metadata publish lacks a cluster peer snapshot".to_string())?,
+    };
     let task_owner = registered_dfs_runtime_host(&data_dir)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
@@ -974,7 +984,7 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
         };
         #[cfg(test)]
         let caller_task = tokio::task::try_id();
-        let initialized = crate::runtime_publish::run_owned_metadata_publish_blocking(&task_owner, move || {
+        let initialized = crate::runtime_publish::run_owned_dfs_blocking(&task_owner, move || {
             let _admission = admission;
             let _data_owner_lock = initialize_owner;
             #[cfg(test)]

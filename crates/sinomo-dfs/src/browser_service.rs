@@ -161,6 +161,19 @@ pub trait DfsBrowserServiceHost: Send + Sync + 'static {
     fn operation_guard(&self) -> Result<Option<Arc<dyn Send + Sync>>, ServiceError> {
         Ok(None)
     }
+    /// Observe the existing shared publication after an already committed Apply.
+    /// This runs without browser FIFO or writer custody and performs no mutation.
+    fn placement_configuration_published<'a>(
+        &'a self,
+        _revision: sinomo_core::kv::KvRevision,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServiceError>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(dfs_browser_service_error(
+                "placement configuration publication owner is unavailable",
+            ))
+        })
+    }
     /// Retain native execution ownership before borrowing the mutation service.
     /// Empty paths denote an opaque operation that may touch multiple shards.
     fn publication_execution_provider(
@@ -649,6 +662,48 @@ pub fn dfs_browser_backend_open_count(data_dir: &SinomoDataDir) -> usize {
 const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const DAEMON_DFS_BROWSER_STAT_CACHE_MAX_ENTRIES: usize = 256;
+const DAEMON_DFS_BROWSER_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn finish_placement_configuration_visibility(
+    backend: &DfsBrowserBackend,
+    mut response: crate::DaemonDfsBrowserPlacementUpdateResponse,
+    deadline: tokio::time::Instant,
+) -> crate::DaemonDfsBrowserPlacementUpdateResponse {
+    use crate::DfsPlacementConfigurationVisibility as Visibility;
+    let visibility = if tokio::time::Instant::now() >= deadline {
+        Visibility::Pending {
+            detail: "original Apply deadline elapsed before configuration visibility was confirmed"
+                .into(),
+        }
+    } else {
+        match tokio::time::timeout_at(
+            deadline,
+            backend
+                .host
+                .placement_configuration_published(sinomo_core::kv::KvRevision(
+                    response.committed_revision,
+                )),
+        )
+        .await
+        {
+            Ok(Ok(())) => Visibility::Published,
+            Ok(Err(error)) => Visibility::Pending {
+                detail: error.to_string(),
+            },
+            Err(_) => Visibility::Pending {
+                detail:
+                    "original Apply deadline elapsed before configuration visibility was confirmed"
+                        .into(),
+            },
+        }
+    };
+    // Other reads could have populated this cache while the effect-once task
+    // had released its FIFO and waited for the publication. Invalidate here,
+    // immediately before reporting the observed completion state.
+    backend.invalidate_stat_cache();
+    response.visibility = visibility;
+    response
+}
 
 /// A pending configuration result is returned only before the mutation closure
 /// runs. The caller retains the original payload without replaying an effect.
@@ -1989,23 +2044,18 @@ impl DfsBrowserBackend {
         )
         .map_err(dfs_browser_service_error)?;
 
-        require_accepted_daemon_dfs_browser_placement_update(
+        let committed = require_accepted_daemon_dfs_browser_placement_update(
             store.compare_and_put_placement_update(&expected, &desired, &reconciliation),
             &desired.file_system_id,
         )?;
-        self.invalidate_stat_cache();
-        let reconciliation = store
-            .placement_reconciliation(&desired.file_system_id, &reconciliation.job_id)
-            .map_err(dfs_browser_service_error)?
-            .ok_or_else(|| {
-                ServiceError::Service(
-                    "accepted SIFS placement job is missing from the control plane".to_string(),
-                )
-            })?;
         self.host.notify_maintenance();
         Ok(crate::DaemonDfsBrowserPlacementUpdateResponse {
             preview,
-            reconciliation,
+            reconciliation: committed.reconciliation,
+            committed_revision: committed.revision.0,
+            visibility: crate::DfsPlacementConfigurationVisibility::Pending {
+                detail: "configuration publication has not yet been observed".into(),
+            },
         })
     }
 
@@ -2280,7 +2330,7 @@ impl Service for HostedDfsBrowserService {
                     })
                     .require_capability("daemon.dfs.browser")
                     .with_concurrency_limit(4)
-                    .with_timeout(Duration::from_secs(60));
+                    .with_timeout(DAEMON_DFS_BROWSER_ROUTE_TIMEOUT);
                 if path_access {
                     descriptor = descriptor.require_capability(crate::SIFS_PATH_ACCESS_CAPABILITY);
                 }
@@ -2992,30 +3042,47 @@ impl Service for HostedDfsBrowserService {
                 }
 
                 DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE => {
+                    let received_at = tokio::time::Instant::now();
                     let payload: crate::DaemonDfsBrowserPlacementUpdateV2Request =
                         ctx.decode_request_body(&request).await?;
+                    let budget = payload
+                        .timeout_millis
+                        .map(Duration::from_millis)
+                        .unwrap_or(DAEMON_DFS_BROWSER_ROUTE_TIMEOUT)
+                        .min(DAEMON_DFS_BROWSER_ROUTE_TIMEOUT);
+                    let deadline = received_at + budget;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_browser_task(
                         Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser placement update v2",
                         move || {
+                            if tokio::time::Instant::now() >= deadline {
+                                return Err(dfs_browser_service_error(
+                                    "Apply deadline elapsed before the placement mutation",
+                                ));
+                            }
                             let backend = DfsBrowserBackend::for_data_dir(
                                 data_dir,
                                 &runtime,
                                 Arc::clone(&backend_host),
                             )?;
                             let result = backend.placement_update_v2(payload, &runtime)?;
-                            Ok((result, backend.event_origin_node_id()?))
+                            Ok((result, backend))
                         },
                     )
                     .await?;
+                    // The transaction closure has finished exactly once and
+                    // released FIFO/service/writer custody before this wait.
+                    let response =
+                        finish_placement_configuration_visibility(&result.1, result.0, deadline)
+                            .await;
                     effect_host.publish_placement_change(
-                        result.1.clone(),
+                        result.1.node_id.clone(),
                         "update-policy",
                         vec![changed_path],
                     );
-                    ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, result.0)?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, response)?;
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -3803,15 +3870,15 @@ pub fn require_satisfiable_daemon_dfs_browser_placement(
 }
 
 fn require_accepted_daemon_dfs_browser_placement_update(
-    result: Result<bool, KvError>,
+    result: Result<Option<crate::DfsPlacementUpdateCommit>, KvError>,
     file_system_id: &crate::DfsFileSystemId,
-) -> Result<(), ServiceError> {
+) -> Result<crate::DfsPlacementUpdateCommit, ServiceError> {
     let reason = match result {
-        Ok(true) => return Ok(()),
+        Ok(Some(committed)) => return Ok(committed),
         // Configuration, reconciliation queue, activity index and permit
         // compares share one transaction. A failed compare publishes nothing;
         // it does not necessarily mean the policy itself changed.
-        Ok(false) => "the placement control-plane snapshot changed",
+        Ok(None) => "the placement control-plane snapshot changed",
         Err(KvError::Busy { path })
             if path.starts_with(&format!(
                 "{}; active placement metadata mutation permit ",
@@ -3978,11 +4045,8 @@ mod tests {
     #[test]
     fn placement_apply_diagnostics_distinguish_rejection_from_unknown_outcomes() {
         let file_system_id = crate::sifs_file_system_id();
-        assert!(
-            require_accepted_daemon_dfs_browser_placement_update(Ok(true), &file_system_id).is_ok()
-        );
         let rejected =
-            require_accepted_daemon_dfs_browser_placement_update(Ok(false), &file_system_id)
+            require_accepted_daemon_dfs_browser_placement_update(Ok(None), &file_system_id)
                 .expect_err("failed compare")
                 .to_string();
         assert!(rejected.starts_with(crate::DFS_PLACEMENT_APPLY_REJECTED_PREFIX));
@@ -5116,6 +5180,10 @@ mod write_options_tests;
 #[cfg(test)]
 #[path = "browser_service/configuration_consumer_tests.rs"]
 mod configuration_consumer_tests;
+
+#[cfg(test)]
+#[path = "browser_service/placement_visibility_tests.rs"]
+mod placement_visibility_tests;
 
 #[cfg(test)]
 #[path = "browser_service/remote_parent_tests.rs"]

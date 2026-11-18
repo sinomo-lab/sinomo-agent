@@ -1965,6 +1965,14 @@ struct PlacementUpdateInputs {
     permit: Option<KvEntry>,
 }
 
+/// The exact job and revision accepted by one successful placement transaction.
+/// This proves the commit, not that a caller's configuration view has caught up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsPlacementUpdateCommit {
+    pub revision: KvRevision,
+    pub reconciliation: DfsPlacementReconciliationJob,
+}
+
 impl<'a> PlacementUpdatePublication<'a> {
     fn new(
         expected: &'a DfsFileSystemConfig,
@@ -2931,7 +2939,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         expected: &DfsFileSystemConfig,
         desired: &DfsFileSystemConfig,
         job: &DfsPlacementReconciliationJob,
-    ) -> Result<bool, KvError> {
+    ) -> Result<Option<DfsPlacementUpdateCommit>, KvError> {
         let publication = PlacementUpdatePublication::new(expected, desired, job)?;
         for attempt in 0..PLACEMENT_RECONCILIATION_QUEUE_CAS_RETRIES {
             // Only a definite rejection owns a new consistency read. Keep the
@@ -2942,7 +2950,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 self.kv.get_authoritative_consistent(&publication.keys)?
             };
             let Some(inputs) = publication.inputs(entries)? else {
-                return Ok(false);
+                return Ok(None);
             };
             let job_entries = match publication.queued_job_keys(&inputs)? {
                 Some(keys) => {
@@ -2963,11 +2971,15 @@ impl<'a> DfsControlPlaneStore<'a> {
                 }
             };
             let txn = publication.transaction(inputs, job_entries, permit_compare)?;
-            if self.kv.txn(txn)?.succeeded {
-                return Ok(true);
+            let response = self.kv.txn(txn)?;
+            if response.succeeded {
+                return Ok(Some(DfsPlacementUpdateCommit {
+                    revision: response.revision,
+                    reconciliation: publication.job,
+                }));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Load the compact, primary-owned debounce record for adaptive placement.
@@ -4729,7 +4741,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         expected: &DfsFileSystemConfig,
         desired: &DfsFileSystemConfig,
         job: &DfsPlacementReconciliationJob,
-    ) -> Result<bool, KvError> {
+    ) -> Result<Option<DfsPlacementUpdateCommit>, KvError> {
         let publication = PlacementUpdatePublication::new(expected, desired, job)?;
         for attempt in 0..PLACEMENT_RECONCILIATION_QUEUE_CAS_RETRIES {
             let entries = if attempt == 0 {
@@ -4742,7 +4754,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     .await?
             };
             let Some(inputs) = publication.inputs(entries)? else {
-                return Ok(false);
+                return Ok(None);
             };
             let job_entries = match publication.queued_job_keys(&inputs)? {
                 Some(keys) => {
@@ -4764,11 +4776,15 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 }
             };
             let txn = publication.transaction(inputs, job_entries, permit_compare)?;
-            if self.kv.txn_async(txn).await?.succeeded {
-                return Ok(true);
+            let response = self.kv.txn_async(txn).await?;
+            if response.succeeded {
+                return Ok(Some(DfsPlacementUpdateCommit {
+                    revision: response.revision,
+                    reconciliation: publication.job,
+                }));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// sinomo:kv-consistency: Async exact-key recheck of a suspected live placement holder, preserving the same CAS and recovery bounds.
@@ -7531,6 +7547,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&config, &config, &job)
                     .unwrap()
+                    .is_some()
             );
             store
                 .placement_reconciliation(&config.file_system_id, &job.job_id)
@@ -7650,6 +7667,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&old_config, &old_config, &old)
                 .unwrap()
+                .is_some()
         );
         let mut newest = old.clone();
         newest.job_id = "newer-current".into();
@@ -7664,6 +7682,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&old_config, &current_config, &newest)
                 .unwrap()
+                .is_some()
         );
         let (_, queue) = store
             .placement_reconciliation_queue_snapshot(
@@ -7730,6 +7749,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&config, &config, &job)
                     .unwrap()
+                    .is_some()
             );
         }
         let explicit = store
@@ -7840,6 +7860,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&config, &config, &job)
                     .unwrap()
+                    .is_some()
             );
         }
         assert_eq!(
@@ -8195,6 +8216,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&expected, &desired, &job)
                 .expect("commit placement")
+                .is_some()
         );
         assert_eq!(
             store
@@ -8262,6 +8284,7 @@ mod tests {
             !store
                 .compare_and_put_placement_update(&expected, &desired, &job)
                 .expect("reject stale update")
+                .is_some()
         );
 
         let mut completed = durable_job.clone();
@@ -8445,6 +8468,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&base, &desired, &new_job)
                 .expect("first post-upgrade Apply")
+                .is_some()
         );
         let page = store
             .placement_reconciliation_activity(&file_system_id, &[], None, None, 10)
@@ -8883,6 +8907,7 @@ mod tests {
             DfsControlPlaneStore::new(&mut authoritative)
                 .compare_and_put_placement_update(&base, &base, &background)
                 .expect("enqueue unrelated background work")
+                .is_some()
         );
         let mut client = StaleObservedAuthoritativeTxnKv {
             observed,
@@ -8895,6 +8920,7 @@ mod tests {
             DfsControlPlaneStore::new(&mut client)
                 .compare_and_put_placement_update(&base, &desired, &proposal)
                 .expect("retry rejected queue compare with the same proposal identity")
+                .is_some()
         );
         let store = DfsControlPlaneStore::new(&mut client.authoritative);
         assert_eq!(
@@ -8949,6 +8975,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&base, &first_config, &first_job)
                 .expect("first Apply")
+                .is_some()
         );
         let durable_first = store
             .placement_reconciliation(&base.file_system_id, &first_job.job_id)
@@ -9004,6 +9031,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&first_config, &second_config, &second_job,)
                 .expect("second Apply after release")
+                .is_some()
         );
         assert!(
             store
@@ -9054,6 +9082,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&base, &first_config, &first_job)
                     .expect("first Apply")
+                    .is_some()
             );
             store
                 .placement_reconciliation(&base.file_system_id, &first_job.job_id)
@@ -9072,6 +9101,7 @@ mod tests {
                 store
                     .compare_and_put_placement_update(&first_config, &second_config, &second_job,)
                     .expect("replacement Apply")
+                    .is_some()
             );
         }
 
@@ -9135,6 +9165,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&base, &first_config, &first_job)
                 .expect("first Apply")
+                .is_some()
         );
         let durable_first = store
             .placement_reconciliation(&base.file_system_id, &first_job.job_id)
@@ -9173,6 +9204,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&first_config, &second_config, &second_job)
                 .expect("Apply after exact release")
+                .is_some()
         );
         let durable_second = store
             .placement_reconciliation(&base.file_system_id, &second_job.job_id)
@@ -9242,6 +9274,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&base, &accepted, &job)
                 .expect("Apply")
+                .is_some()
         );
         let durable_job = store
             .placement_reconciliation(&base.file_system_id, &job.job_id)
@@ -9323,6 +9356,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&base, &accepted, &job)
                 .expect("Apply")
+                .is_some()
         );
         let durable_job = store
             .placement_reconciliation(&base.file_system_id, &job.job_id)
@@ -9448,6 +9482,7 @@ mod tests {
             store
                 .compare_and_put_placement_update(&base, &accepted, &job)
                 .expect("Apply")
+                .is_some()
         );
         let durable_job = store
             .placement_reconciliation(&base.file_system_id, &job.job_id)

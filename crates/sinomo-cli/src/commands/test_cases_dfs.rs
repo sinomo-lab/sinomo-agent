@@ -2168,6 +2168,9 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             preview.preview_token.clone(),
         )
         .map_err(|error| placement_test_error("apply subtree placement", error))?;
+    subtree_update
+        .require_published()
+        .map_err(SinomoTestError::failed)?;
     ctx.record("subtree_job_id", &subtree_update.reconciliation.job_id);
     // Reopen the Files-facing daemon client before observing the job. The job
     // must be recoverable by id from cluster KV, not retained in client memory.
@@ -2232,6 +2235,9 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             confirmed_preview.preview_token.clone(),
         )
         .map_err(|error| placement_test_error("apply self placement", error))?;
+    confirmed_update
+        .require_published()
+        .map_err(SinomoTestError::failed)?;
     let (confirmed_job, confirmed_states) = wait_for_placement_job(
         &progress_browser,
         &confirmed_update.reconciliation.job_id,
@@ -2284,6 +2290,9 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             removal_preview.preview_token.clone(),
         )
         .map_err(|error| placement_test_error("remove self placement", error))?;
+    removal_update
+        .require_published()
+        .map_err(SinomoTestError::failed)?;
     let (removal_job, removal_states) = wait_for_placement_job(
         &progress_browser,
         &removal_update.reconciliation.job_id,
@@ -2317,6 +2326,9 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             subtree_removal_preview.preview_token,
         )
         .map_err(|error| placement_test_error("remove subtree placement", error))?;
+    subtree_removal
+        .require_published()
+        .map_err(SinomoTestError::failed)?;
     let (_, cleanup_states) = wait_for_placement_job(
         &progress_browser,
         &subtree_removal.reconciliation.job_id,
@@ -4160,15 +4172,23 @@ fn run_write_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             // below proves its effective value before any timed write. Waiting
             // on unrelated background repair scheduling would not strengthen
             // that proof. Cleanup removes the rule and the entire fixture.
-            return Ok((update.reconciliation, attempt));
+            return Ok((update, attempt));
         }
         unreachable!("final placement attempt returns its result")
     };
     if prepared_base.is_none() {
-        let (job, preview_attempts) =
+        let (update, preview_attempts) =
             apply_policy(Some(policy.clone())).map_err(SinomoTestError::failed)?;
-        ctx.record("placement_setup_job", &job);
+        ctx.record("placement_setup_job", &update.reconciliation);
+        ctx.record(
+            "placement_setup_committed_revision",
+            update.committed_revision,
+        );
+        ctx.record("placement_setup_visibility", &update.visibility);
         ctx.record("placement_setup_preview_attempts", preview_attempts);
+        update
+            .require_published()
+            .map_err(SinomoTestError::failed)?;
     }
     let resolved = browser
         .stat(&base)
@@ -4291,8 +4311,10 @@ fn run_write_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("operation_latency_us", summaries);
     if !retain_fixture {
         let cleanup_started = Instant::now();
-        let cleanup =
-            apply_policy(None).and_then(|_| remove_scoped_sifs_test_tree(&browser, &base));
+        let cleanup = apply_policy(None).and_then(|(update, _)| {
+            update.require_published()?;
+            remove_scoped_sifs_test_tree(&browser, &base)
+        });
         ctx.record("cleanup_elapsed_ms", cleanup_started.elapsed().as_millis());
         ctx.record("cleanup_passed", cleanup.is_ok());
         if let Err(error) = cleanup {

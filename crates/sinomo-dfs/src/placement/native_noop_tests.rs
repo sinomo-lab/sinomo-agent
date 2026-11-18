@@ -193,6 +193,7 @@ impl NativePlacementFixture {
                 DfsControlPlaneStore::new(kv.as_mut())
                     .compare_and_put_placement_update(&desired, &desired, &job)
                     .unwrap()
+                    .is_some()
             }));
         }
         service.refresh_control_plane_latest().unwrap();
@@ -281,6 +282,7 @@ fn native_placement_fixture_queues_behind_the_actual_admission_and_permit_owner(
                 &case.job,
             )
             .unwrap()
+            .is_some()
     }));
     let object = case.objects[0].clone();
     let mut owner = case.runtime.metadata_primary_service(&object.path).unwrap();
@@ -378,6 +380,7 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&original_config, &accepted, &job)
             .unwrap()
+            .is_some()
     }));
     case.service.refresh_control_plane_latest().unwrap();
     let object = case.objects[0].clone();
@@ -424,6 +427,7 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&accepted, &current, &newer_job)
             .unwrap()
+            .is_some()
     }));
     let before = case.node_store().journal_last_sequence().unwrap();
     owner
@@ -569,6 +573,7 @@ fn native_local_placement_preserves_actual_content_owner_and_bytes() {
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &job)
             .unwrap()
+            .is_some()
     }));
     let (resolved, replication, placement) =
         reconciliation_placement_for_object(&config, &job, &object).unwrap();
@@ -1017,6 +1022,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&two_copies, &one_copy, &job)
             .unwrap()
+            .is_some()
     }));
     case.service.refresh_control_plane_latest().unwrap();
     reconcile_fixture_placement(&mut case.service, &case.primary, &one_copy, &job, &object)
@@ -1401,6 +1407,7 @@ fn native_local_owner_rejects_substitution_missing_owner_and_policy_conversion()
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &job)
             .unwrap()
+            .is_some()
     }));
     let before = primary
         .metadata_backend()
@@ -1495,6 +1502,7 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
         DfsControlPlaneStore::new(kv.as_mut())
             .compare_and_put_placement_update(&config, &config, &job)
             .unwrap()
+            .is_some()
     }));
     let read_job = || {
         case.control.with_client(|kv| {

@@ -23,6 +23,7 @@ fn inspect(
     crate::local_state::with_current_owned_dfs_shard_inspection(
         runtime.data_dir(node),
         shard,
+        None,
         |backend| {
             let Some(record) = backend.prepared_operation_record(operation)? else {
                 return Ok(None);

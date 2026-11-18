@@ -6,7 +6,9 @@ use std::sync::mpsc;
 static CONTENTION_CONTROL: Mutex<()> = Mutex::new(());
 
 fn required_genesis_lookup_waits_for_cache_ownership(contention: u8) {
-    let _control = CONTENTION_CONTROL.lock().unwrap();
+    // This gate carries no state. A failed assertion must not poison the
+    // other independently checked contention controls.
+    let _control = CONTENTION_CONTROL.lock().unwrap_or_else(|e| e.into_inner());
     let name = match contention {
         0 => "native-genesis-physical-registry-contention",
         1 => "native-genesis-root-slot-contention",
@@ -125,10 +127,22 @@ fn required_genesis_lookup_waits_for_cache_ownership(contention: u8) {
     });
     let status_data = data.clone();
     let status_peer = peer.clone();
+    // Cache lookup has its own busy controls above. For physical-fence and
+    // checkout contention, pin the same already-published owner during setup
+    // and read its actual maintained status while that contention is held.
+    // This isolates the intended boundary from unrelated fixture registration
+    // and tests a real snapshot read, not only a successful cache lookup.
+    let status_resident = (contention >= 2).then(|| resident.clone());
     let observer = std::thread::spawn(move || {
-        let result = daemon_dfs_bounded_status_resident(&status_data, &status_peer)
-            .map(|_| ())
-            .map_err(|error| error.to_string());
+        let result = match status_resident {
+            Some(resident) => resident
+                .bounded_status_snapshot()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => daemon_dfs_bounded_status_resident(&status_data, &status_peer)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        };
         status_tx.send(result).unwrap();
     });
     // Hold the actual lock, observe both paths, then release it before any

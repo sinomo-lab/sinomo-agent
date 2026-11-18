@@ -14,14 +14,15 @@ fn immutable_fetch_inspection_never_creates_or_recertifies_an_owner() {
     let shard_id = crate::DfsMetadataShardId::new("root");
     let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir)
         .join(crate::metadata_keys::key_segment(&shard_id.0));
-    let inspect = || {
+    let inspect = |resident: Option<&crate::ResidentLocalMetadataShardLease>| {
         crate::local_state::with_current_owned_dfs_shard_inspection(
             &data_dir,
             &shard_id,
+            resident,
             |backend| Ok(backend.metadata_prefix_proof(&shard_id)?),
         )
     };
-    assert!(inspect().unwrap().is_none());
+    assert!(inspect(None).unwrap().is_none());
     assert!(
         !metadata_root.exists(),
         "read admission must not create a metadata root"
@@ -45,24 +46,49 @@ fn immutable_fetch_inspection_never_creates_or_recertifies_an_owner() {
     let admission = crate::test_runtime::executor()
         .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
         .unwrap();
-    assert!(inspect().unwrap().flatten().is_some());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let peer = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+        .unwrap()
+        .unwrap();
+    let handle = daemon_dfs_cached_resident_metadata_shard_handle(
+        &data_dir,
+        &peer,
+        &crate::sifs_file_system_id(),
+        &shard_id,
+        &cluster_paths,
+        crate::test_runtime::executor().handle(),
+    )
+    .unwrap();
+    let resident = handle
+        .try_checkout_open()
+        .unwrap()
+        .expect("actual resident owner");
+    for view in [None, Some(&resident)] {
+        assert!(inspect(view).unwrap().flatten().is_some());
+    }
     let guard = crate::metadata_lock::metadata_write_lock(
         metadata_root.clone(),
         crate::metadata_cursor::journal_write_lock_path(&metadata_root),
     )
     .unwrap();
-    assert!(
-        inspect().unwrap().is_none(),
-        "busy writer must remain fenced"
-    );
-    assert!(
-        inspect().unwrap().is_none(),
-        "failed inspection must not release another owner's path guard"
-    );
+    for view in [None, Some(&resident)] {
+        assert!(
+            inspect(view).unwrap().is_none(),
+            "busy writer must remain fenced"
+        );
+        assert!(
+            inspect(view).unwrap().is_none(),
+            "failed inspection must not release another owner's path guard"
+        );
+    }
     drop(guard);
-    assert!(inspect().unwrap().flatten().is_some());
+    for view in [None, Some(&resident)] {
+        assert!(inspect(view).unwrap().flatten().is_some());
+    }
     crate::metadata_journal::admission::mark_uncertain(&metadata_root).unwrap();
-    assert!(inspect().unwrap().is_none());
+    for view in [None, Some(&resident)] {
+        assert!(inspect(view).unwrap().is_none());
+    }
     assert!(
         crate::metadata_journal::admission::current_owned_materialized_prefix(
             &metadata_root,
@@ -72,6 +98,7 @@ fn immutable_fetch_inspection_never_creates_or_recertifies_an_owner() {
         .is_none(),
         "observational reads must not clear uncertainty"
     );
+    drop(resident);
     drop(admission);
     native.close().unwrap();
 }
@@ -163,6 +190,30 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
             },
         )
     };
+    // Fetch authorization must reuse the already-open physical shard. Evict
+    // the separate inspection cache before each call so it cannot mask a cold
+    // metadata reopen on the ordinary resident path.
+    crate::metadata_backend::reset_metadata_backend_open_calls();
+    for _ in 0..3 {
+        crate::local_state::evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        assert!(
+            prepare_daemon_dfs_verified_blob_fetch(
+                &data_dir,
+                &cluster_paths,
+                &peer,
+                &command_for(fetch.clone()),
+                &preflight,
+                runtime.handle(),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+    assert_eq!(
+        crate::metadata_backend::metadata_backend_open_calls(),
+        0,
+        "a warm fetch must not decode a second metadata backend"
+    );
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
     let admission = runtime
         .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
@@ -431,7 +482,8 @@ fn committed_placement_policy_retains_resident_lanes_and_updates_configuration()
                     &job,
                 )
             })
-            .unwrap(),
+            .unwrap()
+            .is_some(),
         "normal placement Apply commits its actual checked policy transition"
     );
     lookup(2);

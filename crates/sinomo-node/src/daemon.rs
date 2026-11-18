@@ -35,10 +35,9 @@ pub const DFS_METADATA_STORAGE_GENERATION_V1_CAPABILITY: &str =
 /// write-set protocol only when every configured member advertises this in
 /// its own member record.
 ///
-/// [`main_daemon_capabilities`] does not advertise it. A node advertises it
-/// only once it implements the whole member-side contract of a write-set
-/// shard, including commit by write set and follower alignment after a
-/// takeover.
+/// Main implements guarded write-set commit, durable member fencing and
+/// follower alignment after takeover. Switching still requires every
+/// configured member to advertise the capability.
 pub const DFS_METADATA_WRITE_SET_V1_CAPABILITY: &str = "dfs.metadata.write-set.v1";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
@@ -62,6 +61,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
             .expect("valid maintained namespace-count capability"),
         CapabilityName::new(DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY)
             .expect("valid prepared-operation protocol capability"),
+        CapabilityName::new(DFS_METADATA_WRITE_SET_V1_CAPABILITY)
+            .expect("valid write-set protocol capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {
         capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));

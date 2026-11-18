@@ -1318,6 +1318,9 @@ impl SifsFileManagerBackend {
         policy: Option<DfsPlacementPolicy>,
         scope: DfsPlacementScope,
     ) -> Result<DfsPlacementPreview, String> {
+        if let Some(client) = self.resident_client(None, false)? {
+            return client.preview_placement(path, policy, scope);
+        }
         let path = normalize_sifs_path(path)?;
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         if !cluster_paths.state.exists() {
@@ -1375,7 +1378,10 @@ impl SifsFileManagerBackend {
         policy: Option<DfsPlacementPolicy>,
         scope: DfsPlacementScope,
         expected_preview_token: DfsPlacementPreviewToken,
-    ) -> Result<(DfsPlacementPreview, DfsPlacementReconciliationJob), String> {
+    ) -> Result<crate::app_api::SifsPlacementUpdateOutcome, String> {
+        if let Some(client) = self.resident_client(None, true)? {
+            return client.update_placement(path, policy, scope, expected_preview_token);
+        }
         let path = normalize_sifs_path(path)?;
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         if !cluster_paths.state.exists() {
@@ -1452,26 +1458,25 @@ impl SifsFileManagerBackend {
             now,
         )
         .map_err(|error| format!("cannot build SIFS placement reconciliation: {error}"))?;
-        if !store
+        let committed = store
             .compare_and_put_placement_update(&expected, &desired, &job)
             .map_err(|error| format!("cannot save SIFS placement policy: {error}"))?
-        {
-            return Err(
-                "SIFS placement policy changed concurrently; refresh the preview and retry"
-                    .to_string(),
-            );
-        }
-        let job = store
-            .placement_reconciliation(&desired.file_system_id, &job.job_id)
-            .map_err(|error| format!("cannot read accepted SIFS placement job: {error}"))?
             .ok_or_else(|| {
-                "accepted SIFS placement job is missing from the control plane".to_string()
+                "SIFS placement policy changed concurrently; refresh the preview and retry"
+                    .to_string()
             })?;
         // Reconciliation belongs to the main daemon, whose exclusive
         // data-owner lock makes prior-session permit recovery safe. A short-
         // lived CLI process must never become an indistinguishable placement
         // authority holder while that daemon remains active.
-        Ok((preview, job))
+        Ok(crate::app_api::SifsPlacementUpdateOutcome {
+            preview,
+            reconciliation: committed.reconciliation,
+            committed_revision: committed.revision.0,
+            visibility: sinomo_runtime::api::DfsPlacementConfigurationVisibility::Pending {
+                detail: "no resident configuration publication owner was available to confirm visibility".into(),
+            },
+        })
     }
 
     pub(crate) fn placement_progress(

@@ -4291,10 +4291,10 @@ impl DfsTestRuntime {
                     .compare_and_put_placement_update(&expected, &desired, &job)
             })
             .map_err(|error| error.to_string())?;
-        if !committed {
+        let Some(committed) = committed else {
             return Err("normal placement Apply rejected a changed current configuration".into());
-        }
-        Ok(job)
+        };
+        Ok(committed.reconciliation)
     }
 
     pub fn data_dir(&self, node: &NodeId) -> &SinomoDataDir {
@@ -6516,7 +6516,7 @@ impl DfsTestRuntime {
         Err("member record kept changing while setting the role".into())
     }
 
-    /// The test-support switch for the dormant write-set capability: commit
+    /// The test-support switch for a member's write-set capability: commit
     /// `node`'s actual cluster member record with the capability advertised,
     /// and its derived capability policy record with it, as the cluster
     /// member store does when a node's binary advertises a capability.
@@ -6528,6 +6528,23 @@ impl DfsTestRuntime {
     /// behind the commit, so no authoritative read compares the two at an
     /// equal revision before both carry it.
     pub fn advertise_metadata_write_set_capability(&self, node: &NodeId) -> Result<(), String> {
+        self.set_metadata_write_set_capability(node, true)
+    }
+
+    /// Model an older member through its real advertisement and policy. This
+    /// removes eligibility only; it cannot authorize a write or a switch.
+    pub(crate) fn withhold_metadata_write_set_capability(
+        &self,
+        node: &NodeId,
+    ) -> Result<(), String> {
+        self.set_metadata_write_set_capability(node, false)
+    }
+
+    fn set_metadata_write_set_capability(
+        &self,
+        node: &NodeId,
+        enabled: bool,
+    ) -> Result<(), String> {
         let member_key = sinomo_core::node::cluster_member_key(node);
         let policy_key = sinomo_core::node::cluster_capability_policy_key(node);
         let error = |error: sinomo_core::kv::KvError| error.to_string();
@@ -6546,10 +6563,16 @@ impl DfsTestRuntime {
             let mut member = member_entry
                 .decode::<sinomo_core::ClusterMemberRecord>()
                 .map_err(error)?;
-            if !member.capabilities.contains(&capability) {
+            if !enabled {
+                member.capabilities.retain(|value| value != &capability);
+                member
+                    .allowed_capabilities
+                    .retain(|value| value != &capability);
+            }
+            if enabled && !member.capabilities.contains(&capability) {
                 member.capabilities.push(capability.clone());
             }
-            if !member.allowed_capabilities.contains(&capability) {
+            if enabled && !member.allowed_capabilities.contains(&capability) {
                 member.allowed_capabilities.push(capability.clone());
             }
             let policy = sinomo_core::node::ClusterCapabilityPolicyRecord::from(&member);
@@ -6581,25 +6604,25 @@ impl DfsTestRuntime {
                 })
                 .map_err(error)?;
             if response.succeeded {
-                return self.advertise_in_local_state(node, &capability);
+                return self.set_capability_in_local_state(node, &capability, enabled);
             }
         }
         Err("member record kept changing while advertising the capability".into())
     }
 
-    /// Add `capability` to `node`'s own member record in its local cluster
-    /// state, until a re-read shows it there.
-    fn advertise_in_local_state(
+    /// Match the node-owned advertisement to its committed capability change.
+    fn set_capability_in_local_state(
         &self,
         node: &NodeId,
         capability: &sinomo_core::CapabilityName,
+        enabled: bool,
     ) -> Result<(), String> {
         let paths = ClusterPaths::new(self.data_dir(node));
         let advertised = |state: &sinomo_core::ClusterBootstrapState| {
             state.members.iter().any(|member| {
                 member.node_id == *node
-                    && member.capabilities.contains(capability)
-                    && member.allowed_capabilities.contains(capability)
+                    && member.capabilities.contains(capability) == enabled
+                    && member.allowed_capabilities.contains(capability) == enabled
             })
         };
         for _ in 0..8 {
@@ -6613,10 +6636,16 @@ impl DfsTestRuntime {
                 .iter_mut()
                 .find(|member| member.node_id == *node)
                 .ok_or("native fixture node has no local member record")?;
-            if !member.capabilities.contains(capability) {
+            if !enabled {
+                member.capabilities.retain(|value| value != capability);
+                member
+                    .allowed_capabilities
+                    .retain(|value| value != capability);
+            }
+            if enabled && !member.capabilities.contains(capability) {
                 member.capabilities.push(capability.clone());
             }
-            if !member.allowed_capabilities.contains(capability) {
+            if enabled && !member.allowed_capabilities.contains(capability) {
                 member.allowed_capabilities.push(capability.clone());
             }
             sinomo_core::cluster::write_cluster_state(&paths, &state)
@@ -6706,6 +6735,7 @@ struct NativeConfigurationFault {
     lose_delta_key: Option<String>,
     remaining_delta_loss: AtomicUsize,
     dropped_delta: Mutex<Option<sinomo_core::kv::ClusterKvCommittedDelta>>,
+    dropped_changed: std::sync::Condvar,
     pause_rebuild: AtomicBool,
     pause_used: AtomicBool,
     entered: Mutex<bool>,
@@ -6772,6 +6802,33 @@ impl DfsTestNativeConfigurationFault {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+    /// Observe the exact committed delta this fault withheld, without polling
+    /// or treating elapsed time as proof that the mutation reached its owner.
+    pub fn wait_dropped_delta(
+        &self,
+        budget: Duration,
+    ) -> Result<sinomo_core::kv::ClusterKvCommittedDelta, String> {
+        let deadline = std::time::Instant::now() + budget;
+        let mut dropped = self
+            .fault
+            .dropped_delta
+            .lock()
+            .map_err(|_| "delta observation poisoned")?;
+        loop {
+            if let Some(delta) = dropped.as_ref() {
+                return Ok(delta.clone());
+            }
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or("native configuration delta was not withheld")?;
+            dropped = self
+                .fault
+                .dropped_changed
+                .wait_timeout(dropped, left)
+                .map_err(|_| "delta observation poisoned")?
+                .0;
+        }
+    }
     pub fn release(&self) {
         self.fault.release.close();
     }
@@ -6821,6 +6878,7 @@ pub(crate) fn withhold_native_configuration_delta(
         .dropped_delta
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(delta.clone());
+    fault.dropped_changed.notify_all();
     true
 }
 
@@ -6981,6 +7039,7 @@ impl DfsTestRuntime {
             remaining_delta_loss: AtomicUsize::new(usize::from(lose_delta_key.is_some())),
             lose_delta_key,
             dropped_delta: Mutex::new(None),
+            dropped_changed: std::sync::Condvar::new(),
             pause_used: AtomicBool::new(false),
             entered: Mutex::new(false),
             reached: std::sync::Condvar::new(),

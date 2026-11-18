@@ -469,7 +469,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_deref_mut()
                 .expect("metadata backend remains installed during hydration")
                 .end_consistent_read_snapshot();
-            if !setup? || !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
+            if !setup? {
+                return Ok(false);
+            }
+            let recovery = self.recover_durable_namespace_prepares_pass(should_cancel)?;
+            if !recovery.completed {
+                // A live unknown prepare must be reported to the owner, not
+                // mistaken for callback cancellation (or a completed rebuild).
+                // Keep its hidden effects out of the hydration projection.
+                if let Some(unknown) = recovery.first_unknown {
+                    return Err(unknown);
+                }
                 return Ok(false);
             }
             self.metadata_backend
