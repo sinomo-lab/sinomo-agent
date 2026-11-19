@@ -105,6 +105,168 @@ impl Drop for ShardFenceGuard {
     }
 }
 
+/// The rows a cross-shard move's source holds across its adopt step: the
+/// moved object's family and namespace entry, or the job row the adopt binds.
+#[derive(Clone, Debug)]
+struct FencedSourceRows {
+    scope: DfsPublicationOwnerScope,
+    object_id: Option<crate::DfsObjectId>,
+    path: Option<String>,
+    job_id: Option<String>,
+}
+static FAMILY_FENCES: OnceLock<Mutex<std::collections::BTreeMap<u64, FencedSourceRows>>> =
+    OnceLock::new();
+static NEXT_FAMILY_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fence on one moved family's rows, or on one job row, of a source shard.
+/// It is installed while the shard's writer is held and lasts while the move
+/// waits on another node; the shard's writer is not held meanwhile. Every
+/// other publication on the shard goes ahead, and one that would change a
+/// fenced row is refused as busy (see [`fenced_source_rows_refusal`]).
+#[derive(Debug)]
+pub(crate) struct DfsSourceFamilyFence {
+    id: u64,
+}
+impl DfsSourceFamilyFence {
+    fn install(rows: FencedSourceRows) -> Self {
+        let id = NEXT_FAMILY_FENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FAMILY_FENCES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, rows);
+        Self { id }
+    }
+    /// Fence the moved object's family and its namespace entry at `path`.
+    pub(crate) fn object_family(
+        scope: &DfsPublicationOwnerScope,
+        object_id: &crate::DfsObjectId,
+        path: &str,
+    ) -> Self {
+        Self::install(FencedSourceRows {
+            scope: scope.clone(),
+            object_id: Some(object_id.clone()),
+            path: Some(crate::namespace::metadata_path(path)),
+            job_id: None,
+        })
+    }
+    /// Fence the job row `job_id`.
+    pub(crate) fn job_row(scope: &DfsPublicationOwnerScope, job_id: &str) -> Self {
+        Self::install(FencedSourceRows {
+            scope: scope.clone(),
+            object_id: None,
+            path: None,
+            job_id: Some(job_id.to_string()),
+        })
+    }
+}
+impl Drop for DfsSourceFamilyFence {
+    fn drop(&mut self) {
+        if let Some(fences) = FAMILY_FENCES.get() {
+            fences
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.id);
+        }
+    }
+}
+
+/// Whether `object_id`'s family is fenced on `scope`.
+#[cfg(test)]
+pub(crate) fn source_rows_fenced(
+    scope: &DfsPublicationOwnerScope,
+    object_id: &crate::DfsObjectId,
+) -> bool {
+    FAMILY_FENCES.get().is_some_and(|fences| {
+        fences
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .any(|rows| &rows.scope == scope && rows.object_id.as_ref() == Some(object_id))
+    })
+}
+
+/// The refusal of a publication on `scope` that would change a fenced row:
+/// the moved family's object, versions, receipts, intents, pins or locks, its
+/// namespace entry, or a fenced job row. The caller holds the shard's writer,
+/// so no fence appears or ends between this check and the publication.
+pub(crate) fn fenced_source_rows_refusal(
+    scope: &DfsPublicationOwnerScope,
+    payload: &crate::DfsPreparedOperationPayload,
+) -> Option<MetadataBackendError> {
+    let fences = FAMILY_FENCES.get()?;
+    let fences = fences.lock().unwrap_or_else(|error| error.into_inner());
+    let fenced = fences
+        .values()
+        .filter(|rows| &rows.scope == scope)
+        .collect::<Vec<_>>();
+    if fenced.is_empty() {
+        return None;
+    }
+    let (mut object_ids, paths) =
+        crate::metadata_tables::prepared_payload_reservation_keys(payload);
+    object_ids.extend(
+        payload
+            .content_receipts
+            .iter()
+            .map(|receipt| receipt.receipt.object_id.clone()),
+    );
+    object_ids.extend(
+        payload
+            .transaction
+            .versions
+            .iter()
+            .map(|version| version.object_id.clone()),
+    );
+    object_ids.extend(
+        payload
+            .transaction
+            .advisory_lock_states
+            .iter()
+            .map(|state| state.object_id.clone()),
+    );
+    object_ids.extend(
+        payload
+            .prepared_intent
+            .iter()
+            .chain(payload.terminal_intent.iter())
+            .map(|intent| intent.object_id.clone()),
+    );
+    let paths = paths
+        .iter()
+        .map(|path| crate::namespace::metadata_path(path))
+        .collect::<BTreeSet<_>>();
+    let job_ids = payload
+        .metadata_effects
+        .iter()
+        .filter_map(|effect| match effect {
+            crate::DfsPreparedMetadataEffect::PutNamespaceJob { job } => Some(job.job_id.as_str()),
+            crate::DfsPreparedMetadataEffect::PutNamespaceJobReceipt { receipt } => {
+                Some(receipt.job_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    fenced.into_iter().find_map(|rows| {
+        let object = rows
+            .object_id
+            .as_ref()
+            .is_some_and(|object_id| object_ids.contains(object_id));
+        let path = rows.path.as_ref().filter(|path| paths.contains(*path));
+        let job = rows
+            .job_id
+            .as_deref()
+            .is_some_and(|job_id| job_ids.contains(job_id));
+        (object || path.is_some() || job).then(|| MetadataBackendError::SourceFamilyFenced {
+            path: rows
+                .path
+                .clone()
+                .or_else(|| rows.job_id.clone())
+                .unwrap_or_default(),
+        })
+    })
+}
+
 /// The physical writer is held from final validation through durable effect.
 #[derive(Debug)]
 pub struct DfsPublicationWriterSession {
@@ -180,7 +342,7 @@ impl DfsPublicationExecutionProvider {
                     "bootstrap publication admission was transferred".into(),
                 )
             })?;
-            if !admission.is_global() && !admission.is_exact() {
+            if !admission.is_mutation() {
                 return Err(MetadataBackendError::Serde(
                     "bootstrap publication requires actual mutation admission".into(),
                 ));
@@ -580,8 +742,17 @@ impl DfsPublicationExecutionOwners {
         let Some(admission) = admission.as_ref() else {
             return false;
         };
-        self._data_owner.owns_backend_root(owner.root())
-            && (admission.is_exact() || admission.is_global())
+        if !self._data_owner.owns_backend_root(owner.root()) {
+            return false;
+        }
+        // Several lanes admit exactly their own shards, whatever the
+        // request's candidate scope names.
+        if let Some(keys) = admission.exact_shards() {
+            return keys.iter().any(|key| {
+                key.file_system_id == *admitted_file_system_id && key.shard_id == *admitted_shard_id
+            });
+        }
+        (admission.is_exact() || admission.is_global())
             && match &self.scope {
                 DfsMessageExecutionScope::ExactShard {
                     file_system_id,
@@ -1675,12 +1846,11 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             .map(|source| source.target_writer_custody(&scope))
             .transpose()?
             .flatten();
-        let fence = if let Some(custody) = &custody {
+        if let Some(custody) = &custody {
             custody.validate_scope(&scope)?;
-            custody.fence()
-        } else {
-            Arc::new(shard_fence_guard(&scope))
-        };
+        }
+        // A source custody holds row fences, not this shard's fence.
+        let fence = Arc::new(shard_fence_guard(&scope));
         let provider = self.publication_provider.current();
         let clustered = authorization
             .as_ref()

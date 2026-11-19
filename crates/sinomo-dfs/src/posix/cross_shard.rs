@@ -814,6 +814,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }));
                 }
             }
+        } else if let Some(owners) = self.directory_child_owners_outside_lease(source_path)? {
+            self.namespace_job_directory_page_from_owners(
+                &recorded_job,
+                source_path,
+                &owners,
+                cursor,
+                POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE,
+            )?
         } else {
             self.child_objects_for_sifs_dir_page(
                 source_path,
@@ -895,6 +903,171 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.schedule_cross_shard_move(job, moved, &old_path)?;
         }
         Ok(())
+    }
+
+    /// Look up `path` for a request on this service. A service on a
+    /// several-shard lease reads a path in a shard it does not hold from that
+    /// shard's primary, as a node outside the shard's replica set does.
+    pub(super) fn lookup_metadata_path_held_or_at_primary(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        if *file_system_id == sifs_file_system_id()
+            && let Some(shard) = self.routed_namespace_shard_for_path(path)?
+            && self.metadata_lease_omits_shard(&shard.shard_id)
+        {
+            return Ok(self.route_namespace_lookup_path_to_metadata_primary(
+                file_system_id.clone(),
+                shard.primary_node_id.clone(),
+                path.to_owned(),
+                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+            )?);
+        }
+        self.lookup_metadata_path(file_system_id, path)
+    }
+
+    /// The shards that own a child of `directory` when this service's
+    /// several-shard lease does not hold every one of them; `None` when the
+    /// service reads the whole directory from its own metadata.
+    fn directory_child_owners_outside_lease(
+        &mut self,
+        directory: &str,
+    ) -> Result<Option<Vec<crate::DfsMetadataShardConfig>>> {
+        if self
+            .metadata_backend
+            .as_ref()
+            .and_then(|backend| backend.resident_selected_shard_ids())
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let configs = self.metadata_shard_authorities(&sifs_file_system_id())?;
+        let owners = super::routing::directory_child_authority_shards(directory, &configs)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(owners
+            .iter()
+            .any(|shard| self.metadata_lease_omits_shard(&shard.shard_id))
+            .then_some(owners))
+    }
+
+    /// One page of a moving directory's children read from each shard that
+    /// owns a child of it, in shard order, from that shard's primary: a shard
+    /// this node is primary of answers here, any other one remotely. Each
+    /// query carries the job and its shard's part of the job's recorded
+    /// cursor, which the answering primary checks. A page ends where a shard
+    /// has more children, so every cursor it records is one that shard gave.
+    fn namespace_job_directory_page_from_owners(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+        directory: &str,
+        owners: &[crate::DfsMetadataShardConfig],
+        cursor: Option<&DfsDirectoryPageCursor>,
+        limit: usize,
+    ) -> Result<crate::DfsDirectoryPage> {
+        let fs = sifs_file_system_id();
+        let configs = self.metadata_shard_authorities(&fs)?;
+        let shards = owners
+            .iter()
+            .map(|shard| (DfsMetadataShardId::new(shard.shard_id.clone()), shard))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let resume = cursor.and_then(|cursor| cursor.shard_id.as_ref());
+        if cursor.is_some() && resume.is_none_or(|shard| !shards.contains_key(shard)) {
+            // The job keeps its frame rather than ending a move partway.
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: "moving directory's recorded cursor names no shard owning a child".into(),
+            }));
+        }
+        let changed = || {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: "directory owner page changes its exact scope or cursor order".into(),
+            })
+        };
+        let mut objects = Vec::new();
+        let mut last = None;
+        let mut next_cursor = None;
+        for (shard_id, shard) in shards {
+            if resume.is_some_and(|resume| &shard_id < resume) {
+                continue;
+            }
+            let remaining = limit.saturating_sub(objects.len());
+            if remaining == 0 {
+                next_cursor = last.clone();
+                break;
+            }
+            let after = cursor
+                .filter(|cursor| cursor.shard_id.as_ref() == Some(&shard_id))
+                .map(crate::metadata_keys::local_directory_page_cursor);
+            let crate::DfsMetadataQueryResult::DirectoryPage {
+                entries,
+                after: more,
+            } = self.query_metadata_authority_impl(
+                shard,
+                crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                    job: Box::new(job.clone()),
+                    path: directory.to_string(),
+                    after: after.clone(),
+                    limit: remaining,
+                },
+            )?
+            else {
+                return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                    message: "source directory authority returned another query kind".into(),
+                }));
+            };
+            if entries.len() > remaining
+                || more
+                    .as_ref()
+                    .is_some_and(|more| entries.last().is_none_or(|(_, last)| last != more))
+            {
+                return Err(changed());
+            }
+            let mut previous = after;
+            for (object, local) in entries {
+                let child = normalize_posix_path(&object.path)?;
+                if object.file_system_id != fs
+                    || local.object_id != object.object_id
+                    || local.path != object.path
+                    || local.shard_id.is_some()
+                    || crate::posix_path::parent_posix_path(&child).as_deref() != Some(directory)
+                    || previous.as_ref().is_some_and(|old| {
+                        super::metadata::compare_directory_page_cursors(old, &local)
+                            != std::cmp::Ordering::Less
+                    })
+                {
+                    return Err(changed());
+                }
+                previous = Some(local.clone());
+                last = Some(crate::metadata_keys::directory_page_cursor_with_shard(
+                    local, &shard_id,
+                ));
+                // A row the catalog gives another shard is that shard's to
+                // report; only its owner's row is this page's child.
+                let owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &fs,
+                    &configs,
+                    &object.path,
+                )
+                .map_err(DfsError::from)?;
+                if object.kind != DfsObjectKind::Tombstone
+                    && owner.is_some_and(|owner| owner.shard_id == shard_id.0)
+                {
+                    objects.push(object);
+                }
+            }
+            if let Some(more) = more {
+                next_cursor = Some(crate::metadata_keys::directory_page_cursor_with_shard(
+                    more, &shard_id,
+                ));
+                break;
+            }
+        }
+        Ok(crate::DfsDirectoryPage {
+            objects,
+            next_cursor,
+        })
     }
 
     fn namespace_job_source_object(
@@ -2028,7 +2201,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: existing_path,
             });
         }
-        let target = self.resolve_hardlink_target(&existing)?;
+        let target = self.resolve_hardlink_target_held_or_at_primary(&existing)?;
         match target.kind {
             DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory {
@@ -3413,17 +3586,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // it is visible.
         let target_path = normalize_posix_path(&moved_object.path)?;
         let refreshed = self
-            .lookup_metadata_path(&moved_object.file_system_id, &target_path)?
+            .lookup_metadata_path_held_or_at_primary(&moved_object.file_system_id, &target_path)?
             .filter(|record| {
                 record.object_id == moved_object.object_id
                     && record.kind != DfsObjectKind::Tombstone
             })
             .unwrap_or_else(|| moved_object.clone());
         let moved_object = &refreshed;
-        let needs_tombstone = !matches!(
-            self.lookup_metadata_path_raw(&moved_object.file_system_id, &old_path)?,
-            Some(existing) if existing.kind == DfsObjectKind::Tombstone
-        );
+        // A source this service's lease does not hold is remote; its owner
+        // corroborates the retirement below and no local tombstone is written.
+        let needs_tombstone = !matches!(sources.as_slice(),
+                [source] if self.metadata_lease_omits_shard(&source.shard_id))
+            && !matches!(
+                self.lookup_metadata_path_raw(&moved_object.file_system_id, &old_path)?,
+                Some(existing) if existing.kind == DfsObjectKind::Tombstone
+            );
         let _namespace_plan = self.namespace_execution.begin_independent_planning();
         // Adoption can already hide the source from logical path lookups while
         // its physical shard row still awaits eviction. Cleanup compares that
@@ -3667,6 +3844,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(&object.path)?;
+        // A destination another cross-shard move holds is a collision: the
+        // adopting move is refused with a typed conflict and rejects cleanly
+        // before any effect, rather than waiting on the other move.
+        if self
+            .cross_shard_namespace_locks
+            .blocks(&object.file_system_id, &path)
+        {
+            return Err(DfsPosixError::Conflict {
+                path: path.clone(),
+                reason: "the destination is held by another cross-shard move".into(),
+            });
+        }
         self.admit_directory_move_adoption(&object.file_system_id, &path)?;
         let mut destination_reservation = None;
         let directory_root_plan = if object.kind == DfsObjectKind::Directory {

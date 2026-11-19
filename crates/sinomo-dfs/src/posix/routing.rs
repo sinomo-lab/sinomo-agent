@@ -34,7 +34,7 @@ enum RoutedNamespaceNetworkRecovery {
 /// Possible owners of an immediate directory child under one exact catalog.
 /// A prefix boundary can own that child; deeper disjoint prefixes cannot.
 /// Hash assignments may select any child and retain the root fallback.
-pub(super) fn directory_child_authority_shards<'a>(
+pub(crate) fn directory_child_authority_shards<'a>(
     path: &str,
     configs: &'a [DfsMetadataShardConfig],
 ) -> Result<Vec<&'a DfsMetadataShardConfig>> {
@@ -348,7 +348,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         shard: &DfsMetadataShardConfig,
     ) -> bool {
-        shard.primary_node_id == self.node_id || shard.replica_node_ids.contains(&self.node_id)
+        (shard.primary_node_id == self.node_id || shard.replica_node_ids.contains(&self.node_id))
+            && !self.metadata_lease_omits_shard(&shard.shard_id)
     }
 
     /// Whether this service answers reads of `path` from its own metadata:

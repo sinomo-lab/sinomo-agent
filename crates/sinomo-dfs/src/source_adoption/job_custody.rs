@@ -316,9 +316,13 @@ impl DfsSourceAdoptionActor {
             || session.target != offer.target_config
             || session.destination != offer.destination
         {
-            return Err(error("genesis read changed the original namespace job/request custody"));
+            return Err(error(
+                "genesis read changed the original namespace job/request custody",
+            ));
         }
-        Ok(Some(session.capture.writer_custody()))
+        // The custody holds row fences, not the shard's writer: the read
+        // takes its own inspection fence.
+        Ok(None)
     }
 
     pub(super) fn inspect_original_job(

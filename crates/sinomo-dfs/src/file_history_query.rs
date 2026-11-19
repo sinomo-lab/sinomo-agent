@@ -812,25 +812,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "source query is outside its recorded namespace job frame",
                     ));
                 }
-                Some((job.as_ref(), source_path.as_str()))
+                Some((job.as_ref(), source_path.as_str(), false))
             }
             DfsMetadataSelection::DirectoryPageForNamespaceJob {
                 job, path, after, ..
             } => {
-                if !job.pending_frames.iter().any(|frame| {
-                    matches!(frame,
-                    DfsNamespaceJobFrame::CrossShardDirScan { source_path, cursor, .. }
-                    if source_path == path && cursor == after)
-                }) {
+                // The job's recorded scan cursor binds the query. A cursor
+                // without a shard is the directory owner's own page: only the
+                // owner answers it, after exactly that cursor. A shard-tagged
+                // cursor, or none, spans every shard that owns a child of the
+                // directory, in shard order: the queried shard's part is the
+                // cursor without its shard when it names this shard, the
+                // shard's start when it names an earlier shard or there is no
+                // cursor, and nothing when it names a later shard, whose page
+                // this shard already finished. `after` must equal that part;
+                // any other query is refused.
+                let queried = &query.shard_id;
+                let part = job.pending_frames.iter().find_map(|frame| {
+                    let DfsNamespaceJobFrame::CrossShardDirScan {
+                        source_path,
+                        cursor,
+                        ..
+                    } = frame
+                    else {
+                        return None;
+                    };
+                    if source_path != path {
+                        return None;
+                    }
+                    let owner_page = cursor.as_ref().is_some_and(|c| c.shard_id.is_none());
+                    let accepted = match cursor.as_ref().and_then(|c| c.shard_id.as_ref()) {
+                        None => cursor == after,
+                        Some(shard) if shard == queried => {
+                            after.as_ref()
+                                == cursor
+                                    .as_ref()
+                                    .map(crate::metadata_keys::local_directory_page_cursor)
+                                    .as_ref()
+                        }
+                        Some(shard) => shard < queried && after.is_none(),
+                    };
+                    accepted.then_some(owner_page)
+                });
+                let Some(owner_page) = part else {
                     return Err(error(
                         "source directory query differs from its recorded job cursor",
                     ));
-                }
-                Some((job.as_ref(), path.as_str()))
+                };
+                Some((job.as_ref(), path.as_str(), owner_page))
             }
             _ => None,
         };
-        let coordinated_scope = if let Some((job, source_path)) = coordinated_job {
+        let coordinated_scope = if let Some((job, source_path, owner_page)) = coordinated_job {
             let context = self.namespace_execution.context().ok_or_else(|| {
                 error("namespace job source read has no current authority context")
             })?;
@@ -857,12 +890,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "source read has no valid original Running rename job",
                 ));
             }
-            let source = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &query.file_system_id,
-                &context.shards,
-                source_path,
-            )?
-            .ok_or_else(|| error("namespace job source path has no current authority"))?;
+            // A directory page is read from each shard that owns a child of
+            // the directory, an owner's own page and any other job read from
+            // the source path's owner.
+            let source = if !owner_page
+                && matches!(
+                    query.selection,
+                    DfsMetadataSelection::DirectoryPageForNamespaceJob { .. }
+                ) {
+                crate::posix::directory_child_authority_shards(source_path, &context.shards)
+                    .map_err(|failure| error(failure.to_string()))?
+                    .into_iter()
+                    .find(|shard| shard.shard_id == query.shard_id.0)
+                    .cloned()
+                    .ok_or_else(|| {
+                        error("source directory has no child owned by the current queried shard")
+                    })?
+            } else {
+                crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &query.file_system_id,
+                    &context.shards,
+                    source_path,
+                )?
+                .ok_or_else(|| error("namespace job source path has no current authority"))?
+            };
             if source.shard_id != query.shard_id.0
                 || source.epoch != query.epoch
                 || source.primary_node_id != self.node_id
@@ -1359,6 +1410,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 metadata_journal_has_more: false,
             });
         }
+        // A request on several shard lanes reads another node's shard with
+        // its lanes released; the re-run takes the answer the yield brought.
+        let lanes_released_read = (expected.primary_node_id != self.node_id
+            && self.routed_read_waits_with_lanes_released(&expected.primary_node_id))
+        .then(|| {
+            self.routed_read_key(
+                &expected.primary_node_id,
+                &query.file_system_id,
+                &command.operation,
+            )
+        })
+        .transpose()?;
         let requested = std::time::Instant::now() + Duration::from_secs(30);
         let previous_deadline = self.transport.set_operation_deadline(Some(requested));
         let deadline = previous_deadline.map_or(requested, |old| old.min(requested));
@@ -1376,28 +1439,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             },
         );
         let result = (|| {
-            if expected.primary_node_id == self.node_id {
-                let message = self.next_dfs_routed_message(
+            let response = if let Some(key) = lanes_released_read {
+                match self.answered_remote_reads.get(&key).cloned() {
+                    Some(Ok(answer)) if answer.target == expected.primary_node_id => {
+                        answer.response
+                    }
+                    Some(Ok(_)) => {
+                        return Err(error("metadata query answer came from another primary"));
+                    }
+                    Some(Err(failed)) => return Err(failed),
+                    None => {
+                        let pending = self
+                            .pending_routed_namespace_ops
+                            .remove(&request_id)
+                            .ok_or_else(|| error("metadata query lost its response fence"))?;
+                        return Err(self.yield_routed_read(
+                            key,
+                            command.clone(),
+                            pending,
+                            deadline,
+                        ));
+                    }
+                }
+            } else {
+                if expected.primary_node_id == self.node_id {
+                    let message = self.next_dfs_routed_message(
+                        &expected.primary_node_id,
+                        DfsNetworkMessage::NamespaceRequest(command.clone()),
+                    );
+                    self.transport
+                        .send_local_metadata_query_to_main(message)
+                        .map_err(DfsError::from_network)?;
+                } else if !self.send_dfs_message_if_routable(
                     &expected.primary_node_id,
                     DfsNetworkMessage::NamespaceRequest(command.clone()),
-                );
-                self.transport
-                    .send_local_metadata_query_to_main(message)
-                    .map_err(DfsError::from_network)?;
-            } else if !self.send_dfs_message_if_routable(
-                &expected.primary_node_id,
-                DfsNetworkMessage::NamespaceRequest(command.clone()),
-            )? {
-                return Err(error("metadata query primary is not routable"));
-            }
-            let response = wait_for_metadata_query_response(
-                &mut self.transport,
-                self.cancellation.as_ref(),
-                &self.node_id,
-                &expected.primary_node_id,
-                &request_id,
-                deadline,
-            )?;
+                )? {
+                    return Err(error("metadata query primary is not routable"));
+                }
+                wait_for_metadata_query_response(
+                    &mut self.transport,
+                    self.cancellation.as_ref(),
+                    &self.node_id,
+                    &expected.primary_node_id,
+                    &request_id,
+                    deadline,
+                )?
+            };
             match &response.result {
                 DfsNamespaceResult::Applied => self.validate_routed_namespace_response_authority(
                     &expected.primary_node_id,

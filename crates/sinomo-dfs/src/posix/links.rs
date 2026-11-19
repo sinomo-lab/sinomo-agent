@@ -276,7 +276,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: existing_path,
             });
         }
-        let target = self.resolve_hardlink_target(&existing)?;
+        let target = self.resolve_hardlink_target_held_or_at_primary(&existing)?;
         match target.kind {
             DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory {

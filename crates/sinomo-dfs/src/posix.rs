@@ -34,6 +34,8 @@ mod routing;
 mod stat;
 pub(crate) mod sync;
 
+pub(crate) use routing::directory_child_authority_shards;
+
 #[cfg(test)]
 pub(crate) use metadata::{
     posix_directory_link_count_calls, posix_metadata_raw_lookup_count,

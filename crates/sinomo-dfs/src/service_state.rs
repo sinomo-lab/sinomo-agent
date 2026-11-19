@@ -695,6 +695,15 @@ impl AsMut<dyn DfsMetadataBackend> for DfsMetadataBackendOwner {
 }
 
 impl DfsMetadataBackendOwner {
+    /// The shards a several-shard resident lease holds. A service on such a
+    /// lease treats every other shard as a node without its copy does.
+    pub(crate) fn resident_selected_shard_ids(&self) -> Option<&BTreeSet<DfsMetadataShardId>> {
+        match self {
+            Self::ResidentSharded(lease) => lease.selected_shard_ids(),
+            Self::Owned(_) | Self::ResidentShard(_) => None,
+        }
+    }
+
     pub(crate) fn resident_exact_shard_id(&self) -> Option<&DfsMetadataShardId> {
         match self {
             Self::ResidentShard(lease) => Some(lease.shard_id()),
@@ -748,6 +757,16 @@ pub struct NetworkedDfsService<T> {
     /// SAME durable request retained across the existing host's remote-phase yield.
     pub(crate) pending_namespace_request_recovery: Option<Box<crate::DfsNamespaceRequestRecord>>,
     pub(crate) completed_remote_namespace_phases: BTreeMap<String, PendingRoutedNamespaceResult>,
+    /// Answers to the reads a request on several shard lanes sent to other
+    /// nodes' primaries with its lanes released, keyed by the request and
+    /// the read; its re-run takes each in place of sending that read.
+    pub(crate) answered_remote_reads: BTreeMap<
+        String,
+        std::result::Result<crate::source_adoption::CompletedRemoteTargetNamespacePhase, DfsError>,
+    >,
+    /// Requests whose runs so far only yielded reads: their re-run is still
+    /// the request's first execution.
+    pub(crate) read_yield_fresh_requests: BTreeSet<(NodeId, String)>,
     /// The deadline a file sync's repair wait yielded with, for its re-run.
     pub(crate) file_sync_wait_deadline:
         Option<(crate::DfsObjectId, crate::DfsVersion, std::time::Instant)>,

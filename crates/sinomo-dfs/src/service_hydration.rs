@@ -274,6 +274,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 true,
             );
         }
+        let selected = self
+            .metadata_backend
+            .as_ref()
+            .and_then(|backend| backend.resident_selected_shard_ids())
+            .cloned();
         if let Some(exact_shard_id) = exact_shard_id {
             // A snapshot install can remove a previously running job. Replace
             // this shard's complete job-owned projection so that obsolete
@@ -284,6 +289,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .into_iter()
                     .map(|(_, job_id, file_system_id, paths)| (job_id, file_system_id, paths)),
             );
+        } else if let Some(selected) = selected {
+            // A several-shard lease read only its own shards' jobs: replace
+            // each of those shards' guards and leave every other shard's.
+            for shard_id in &selected {
+                if closed.contains(shard_id) {
+                    continue;
+                }
+                self.cross_shard_namespace_locks.replace_shard_jobs(
+                    shard_id,
+                    locks
+                        .iter()
+                        .filter(|(lock_shard, ..)| lock_shard.as_ref() == Some(shard_id))
+                        .map(|(_, job_id, file_system_id, paths)| {
+                            (job_id.clone(), file_system_id.clone(), paths.clone())
+                        }),
+                );
+            }
         } else {
             self.cross_shard_namespace_locks
                 .replace_jobs_keeping_shards(locks, &closed);
@@ -305,12 +327,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             shards
                 .into_iter()
                 .filter(|shard| {
-                    shard.primary_node_id == self.node_id
-                        || shard.replica_node_ids.contains(&self.node_id)
+                    (shard.primary_node_id == self.node_id
+                        || shard.replica_node_ids.contains(&self.node_id))
+                        && !self.metadata_lease_omits_shard(&shard.shard_id)
                 })
                 .map(|shard| DfsMetadataShardId::new(shard.shard_id))
                 .collect(),
         )
+    }
+
+    /// Whether this service's resident lease leaves `shard_id` out: a
+    /// several-shard lease holds only the shards this node is primary of in
+    /// one filesystem, and its service reads any other shard from that
+    /// shard's primary, as a node outside the shard's replica set does.
+    pub(crate) fn metadata_lease_omits_shard(&self, shard_id: &str) -> bool {
+        self.metadata_backend
+            .as_ref()
+            .and_then(|backend| backend.resident_selected_shard_ids())
+            .is_some_and(|selected| !selected.contains(&DfsMetadataShardId::new(shard_id)))
     }
 
     /// Whether `path` lies in a SIFS shard outside `replicated`. An unknown

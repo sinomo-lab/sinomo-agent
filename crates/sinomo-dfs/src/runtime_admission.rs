@@ -342,6 +342,99 @@ impl DfsMutationScheduler {
         })
     }
 
+    /// Admit work on several shard lanes at once: every lane in `keys`, taken
+    /// in canonical (filesystem, shard id) order, plus the global read side.
+    ///
+    /// A lane is waited for only while this admission holds none: a busy lane
+    /// releases every lane already taken, the wait takes that lane alone, and
+    /// the others are then tried in canonical order without waiting. A holder
+    /// of several lanes therefore never waits for a lane already held, and a
+    /// waiting global writer never waits behind a lane held here while this
+    /// admission queues for the read side. Lanes beyond the shard-gate bound
+    /// fall back to the global writer, as single lanes do.
+    pub async fn admit_shards(
+        self: &Arc<Self>,
+        keys: &[DfsMutationLaneKey],
+    ) -> Result<DfsMutationAdmission, DfsError> {
+        let mut keys = keys.to_vec();
+        keys.sort();
+        keys.dedup();
+        let mut gates = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let Some(gate) = self.shard_gate(key)? else {
+                return Ok(self.admit_global().await);
+            };
+            gates.push(gate);
+        }
+        let closed = || DfsError::Network {
+            message: "DFS mutation scheduler closed a shard gate".to_string(),
+        };
+        // Take every lane without waiting, in canonical order, given the one
+        // lane `waited` already holds. On a busy lane, report its index.
+        let take_all = |waited: Option<(usize, tokio::sync::OwnedSemaphorePermit)>| {
+            let mut held = Vec::with_capacity(gates.len());
+            let mut waited = waited;
+            for (index, gate) in gates.iter().enumerate() {
+                if let Some((waited_index, _)) = waited.as_ref()
+                    && *waited_index == index
+                {
+                    held.push(waited.take().expect("waited lane").1);
+                    continue;
+                }
+                match Arc::clone(gate).try_acquire_owned() {
+                    Ok(permit) => held.push(permit),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(Err(index)),
+                    Err(tokio::sync::TryAcquireError::Closed) => return Err(closed()),
+                }
+            }
+            Ok(Ok(held))
+        };
+        let mut waited = None;
+        loop {
+            let busy = match take_all(waited.take())? {
+                Ok(shards) => match Arc::clone(&self.global).try_read_owned() {
+                    Ok(global) => {
+                        return Ok(DfsMutationAdmission::ExactShards {
+                            _scheduler: Arc::clone(self),
+                            _global: global,
+                            _shards: shards,
+                            keys,
+                        });
+                    }
+                    Err(_) => {
+                        // A global writer is queued. Release every lane before
+                        // joining the read queue, as a single lane does.
+                        drop(shards);
+                        let global = Arc::clone(&self.global).read_owned().await;
+                        match take_all(None)? {
+                            Ok(shards) => {
+                                return Ok(DfsMutationAdmission::ExactShards {
+                                    _scheduler: Arc::clone(self),
+                                    _global: global,
+                                    _shards: shards,
+                                    keys,
+                                });
+                            }
+                            Err(busy) => {
+                                // Never wait for a lane while retaining the
+                                // global read side.
+                                drop(global);
+                                busy
+                            }
+                        }
+                    }
+                },
+                Err(busy) => busy,
+            };
+            // Wait for the busy lane holding nothing else.
+            let permit = Arc::clone(&gates[busy])
+                .acquire_owned()
+                .await
+                .map_err(|_| closed())?;
+            waited = Some((busy, permit));
+        }
+    }
+
     /// Admit this node's answer to a peer's in-flight operation on `scope`'s
     /// exact shard lane. It queues behind local work on the same shard, as any
     /// exact admission does, and never runs while a global writer holds the
@@ -535,6 +628,13 @@ pub(crate) enum DfsMutationAdmission {
         _answers: DfsAnswerWriterHold,
         _global: tokio::sync::OwnedRwLockWriteGuard<()>,
     },
+    /// Several shard lanes taken at once by [`DfsMutationScheduler::admit_shards`].
+    ExactShards {
+        _scheduler: Arc<DfsMutationScheduler>,
+        _global: tokio::sync::OwnedRwLockReadGuard<()>,
+        _shards: Vec<tokio::sync::OwnedSemaphorePermit>,
+        keys: Vec<DfsMutationLaneKey>,
+    },
 }
 
 impl DfsMutationAdmission {
@@ -546,11 +646,26 @@ impl DfsMutationAdmission {
         matches!(self, Self::ExactShard { .. })
     }
 
+    /// Whether this admission may own mutation: one lane, several lanes or
+    /// the global writer.
+    pub fn is_mutation(&self) -> bool {
+        !matches!(self, Self::ReadOnly { .. })
+    }
+
+    /// The lanes of a several-lane admission, in canonical order.
+    pub fn exact_shards(&self) -> Option<&[DfsMutationLaneKey]> {
+        match self {
+            Self::ExactShards { keys, .. } => Some(keys),
+            _ => None,
+        }
+    }
+
     pub(crate) fn scheduler(&self) -> Arc<DfsMutationScheduler> {
         match self {
             Self::ReadOnly { _scheduler }
             | Self::ExactShard { _scheduler, .. }
-            | Self::Global { _scheduler, .. } => Arc::clone(_scheduler),
+            | Self::Global { _scheduler, .. }
+            | Self::ExactShards { _scheduler, .. } => Arc::clone(_scheduler),
         }
     }
 }
@@ -755,6 +870,137 @@ mod tests {
                 .expect("test filesystem id"),
             shard_id: DfsMetadataShardId::new(shard),
         }
+    }
+
+    fn lane(file_system: &str, shard: &str) -> DfsMutationLaneKey {
+        DfsMutationLaneKey::from_scope(&scope(file_system, shard)).expect("exact test lane")
+    }
+
+    /// A several-lane request takes its lanes in canonical order whatever
+    /// order it names them in, and runs beside work on other lanes and an
+    /// answer on a lane it does not hold.
+    #[tokio::test]
+    async fn several_lanes_admit_beside_other_lanes_and_answers() {
+        let scheduler = Arc::new(DfsMutationScheduler::new());
+        let lanes = [lane("lanes-fs", "users"), lane("lanes-fs", "root")];
+        let held = scheduler.admit_shards(&lanes).await.unwrap();
+        assert_eq!(
+            held.exact_shards().unwrap(),
+            [lane("lanes-fs", "root"), lane("lanes-fs", "users")]
+        );
+        assert!(held.is_mutation() && !held.is_global() && !held.is_exact());
+        let services = scope("lanes-fs", "services");
+        let replica_only = scope("lanes-fs", "replica-only");
+        let beside = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                scheduler.admit(&services),
+                scheduler.admit_answer(&replica_only),
+            )
+        })
+        .await
+        .expect("another lane and an answer on it do not wait");
+        drop((beside.0.unwrap(), beside.1.unwrap()));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                scheduler.admit(&scope("lanes-fs", "users"))
+            )
+            .await
+            .is_err(),
+            "a held lane serializes its own exact work"
+        );
+        drop(held);
+    }
+
+    /// A several-lane request that meets a busy lane holds none of its lanes
+    /// while it waits: a single-lane holder of that lane can take another of
+    /// the request's lanes meanwhile, so the two never wait on each other.
+    #[tokio::test]
+    async fn several_lanes_wait_holding_none() {
+        let scheduler = Arc::new(DfsMutationScheduler::new());
+        let root = lane("wait-fs", "root");
+        let users = lane("wait-fs", "users");
+        let users_holder = scheduler.admit(&scope("wait-fs", "users")).await.unwrap();
+        let several = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            let lanes = vec![root.clone(), users.clone()];
+            async move { scheduler.admit_shards(&lanes).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The waiting request released root, so the users holder can also
+        // take root without waiting on it.
+        let root_by_holder = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.admit(&scope("wait-fs", "root")),
+        )
+        .await
+        .expect("a waiting several-lane request holds none of its lanes")
+        .unwrap();
+        drop(root_by_holder);
+        drop(users_holder);
+        let several = tokio::time::timeout(Duration::from_secs(2), several)
+            .await
+            .expect("the several-lane request is admitted once its lanes free")
+            .unwrap()
+            .unwrap();
+        assert_eq!(several.exact_shards().unwrap(), [root, users]);
+    }
+
+    /// A queued global writer is not held up by a several-lane request that
+    /// waits for the read side: the request releases its lanes first, as a
+    /// single lane does, and a holding writer still excludes it.
+    #[tokio::test]
+    async fn several_lanes_release_their_lanes_behind_a_queued_writer() {
+        let scheduler = Arc::new(DfsMutationScheduler::new());
+        let reader = scheduler
+            .admit(&scope("writer-fs", "services"))
+            .await
+            .unwrap();
+        let writer = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            async move {
+                scheduler
+                    .admit(&DfsMessageExecutionScope::GlobalExclusive)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let lanes = [lane("writer-fs", "root"), lane("writer-fs", "users")];
+        let several = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            let lanes = lanes.to_vec();
+            async move { scheduler.admit_shards(&lanes).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // While it queues for the read side it holds neither lane: an answer
+        // on one of them is admitted past the waiting writer.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.admit_answer(&scope("writer-fs", "root")),
+        )
+        .await
+        .expect("a lane of a queued several-lane request stays free")
+        .unwrap();
+        drop(answer);
+        drop(reader);
+        let held = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("the writer is admitted")
+            .unwrap()
+            .unwrap();
+        assert!(held.is_global());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !several.is_finished(),
+            "a holding writer excludes several lanes"
+        );
+        drop(held);
+        let several = tokio::time::timeout(Duration::from_secs(2), several)
+            .await
+            .expect("the several-lane request follows the writer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(several.exact_shards().unwrap(), lanes);
     }
 
     /// Two nodes each hold one shard's lane while a keeper there waits on

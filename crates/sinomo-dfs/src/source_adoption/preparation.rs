@@ -1629,9 +1629,11 @@ mod genuine_source_first_tests {
                     from: from.into(), to: to.into(),
                 },
             };
+            // The job custody validates the resumed request; it holds row
+            // fences, not a shard writer to lend.
             assert!(actor.ingress_job_writer_custody(
                 &prepared.offer, &command, &held.plan.job_config,
-            ).unwrap().is_some());
+            ).unwrap().is_none());
             command.request_id.push_str("-unrelated");
             assert!(actor.ingress_job_writer_custody(
                 &prepared.offer, &command, &held.plan.job_config,
@@ -1980,19 +1982,46 @@ mod genuine_source_first_tests {
                 .to_string()
                 .contains("valid original Running rename job")
         );
-        let mut wrong_source_shard = captured_job.clone();
-        wrong_source_shard
+        // A directory page is read from every shard that owns a child of the
+        // directory. The nested shard's root is a child of the job root, so
+        // the nested shard answers that page; a directory none of whose
+        // children it owns is refused.
+        let mut child_owner = captured_job.clone();
+        child_owner
             .pending_frames
             .push(crate::DfsNamespaceJobFrame::CrossShardDirScan {
                 source_path: captured_job.root_path.clone(),
                 target_path: "/users/source-first".into(),
                 cursor: None,
             });
+        let answered = coordinator_reader.query_metadata_authority_impl(
+            &nested,
+            crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                job: Box::new(child_owner.clone()),
+                path: captured_job.root_path.clone(),
+                after: None,
+                limit: 64,
+            },
+        );
+        assert!(matches!(
+            &answered,
+            Ok(crate::DfsMetadataQueryResult::DirectoryPage { entries, .. })
+                if entries.iter().any(|(object, _)| object.path == source_path)
+        ));
+        let elsewhere = format!("{}/elsewhere", captured_job.root_path);
+        let mut wrong_source_shard = captured_job.clone();
+        wrong_source_shard
+            .pending_frames
+            .push(crate::DfsNamespaceJobFrame::CrossShardDirScan {
+                source_path: elsewhere.clone(),
+                target_path: "/users/source-first/elsewhere".into(),
+                cursor: None,
+            });
         let denied = coordinator_reader.query_metadata_authority_impl(
             &nested,
             crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
                 job: Box::new(wrong_source_shard),
-                path: captured_job.root_path.clone(),
+                path: elsewhere,
                 after: None,
                 limit: 64,
             },
@@ -2003,6 +2032,57 @@ mod genuine_source_first_tests {
                 .to_string()
                 .contains("current queried shard")
         );
+        // Each shard's part of the recorded cursor: a shard before a tagged
+        // cursor's shard has finished its page and is refused; the cursor's
+        // own shard is queried after the cursor without its shard; a cursor
+        // without a shard is the directory owner's page alone.
+        let root_shard = crate::DfsMetadataShardId::new("root");
+        assert!(crate::DfsMetadataShardId::new(nested.shard_id.clone()) < root_shard);
+        let Ok(crate::DfsMetadataQueryResult::DirectoryPage { entries, .. }) = answered else {
+            unreachable!("matched above");
+        };
+        let (_, nested_cursor) = entries.last().unwrap().clone();
+        let nested_shard = crate::DfsMetadataShardId::new(nested.shard_id.clone());
+        let tagged = |shard| {
+            crate::metadata_keys::directory_page_cursor_with_shard(nested_cursor.clone(), shard)
+        };
+        for (recorded, after, refusal) in [
+            (tagged(&root_shard), None, Some("recorded job cursor")),
+            (tagged(&nested_shard), None, Some("recorded job cursor")),
+            (tagged(&nested_shard), Some(nested_cursor.clone()), None),
+            (
+                nested_cursor.clone(),
+                Some(nested_cursor.clone()),
+                Some("current queried shard"),
+            ),
+        ] {
+            let mut resumed = captured_job.clone();
+            resumed
+                .pending_frames
+                .push(crate::DfsNamespaceJobFrame::CrossShardDirScan {
+                    source_path: captured_job.root_path.clone(),
+                    target_path: "/users/source-first".into(),
+                    cursor: Some(recorded),
+                });
+            let result = coordinator_reader.query_metadata_authority_impl(
+                &nested,
+                crate::DfsMetadataSelection::DirectoryPageForNamespaceJob {
+                    job: Box::new(resumed),
+                    path: captured_job.root_path.clone(),
+                    after,
+                    limit: 64,
+                },
+            );
+            match refusal {
+                None => assert!(result.is_ok(), "{result:?}"),
+                Some(refusal) => assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.to_string().contains(refusal)),
+                    "{result:?}"
+                ),
+            }
+        }
         // A separate restrictive guard can never be borrowed as this job's
         // authority. This negative-only fault is removed by its exact key.
         registry.upsert_job(

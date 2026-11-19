@@ -679,6 +679,11 @@ pub(crate) fn dfs_metadata_snapshot_rejection_for(
 pub(crate) enum DfsResidentMetadataScope {
     ExactShard(ResidentLocalMetadataShardHandle),
     Global(ResidentLocalShardedMetadataBackend),
+    /// The shards a several-lane admission holds, behind the full router.
+    Shards(
+        ResidentLocalShardedMetadataBackend,
+        std::collections::BTreeSet<DfsMetadataShardId>,
+    ),
 }
 
 impl DfsResidentMetadataScope {
@@ -690,6 +695,8 @@ impl DfsResidentMetadataScope {
             Self::Global(backend) => {
                 service.attach_resident_sharded_metadata_backend(backend.checkout_global()?)
             }
+            Self::Shards(backend, shard_ids) => service
+                .attach_resident_sharded_metadata_backend(backend.checkout_shards(shard_ids)?),
         }
     }
 
@@ -715,6 +722,15 @@ impl DfsResidentMetadataScope {
             Self::Global(backend) => backend
                 .scope_shard(file_system_id, shard_id)
                 .map_err(Into::into),
+            Self::Shards(backend, shard_ids) if shard_ids.contains(shard_id) => backend
+                .scope_shard(file_system_id, shard_id)
+                .map_err(Into::into),
+            Self::Shards(..) => Err(crate::DfsError::Metadata {
+                message: format!(
+                    "several-shard resident scope does not hold requested shard {file_system_id}/{}",
+                    shard_id.0
+                ),
+            }),
         }
     }
 }
@@ -760,6 +776,13 @@ pub(crate) struct DfsRuntimeMessageCacheEntry {
     /// unfinished, so namespace requests on the lane read published state only.
     pub exact_write_services: std::collections::BTreeMap<
         crate::DfsMutationLaneKey,
+        Arc<DfsRuntimeMessageServiceLaneHandle>,
+    >,
+    /// Services for namespace requests that may touch several shards, keyed
+    /// by the lanes they hold: every shard of one filesystem this node is
+    /// primary of. Each is leased exactly those shards.
+    pub multi_shard_services: std::collections::BTreeMap<
+        Vec<crate::DfsMutationLaneKey>,
         Arc<DfsRuntimeMessageServiceLaneHandle>,
     >,
     pub content_read_service: Option<Arc<DfsRuntimeMessageServiceLaneHandle>>,
@@ -1438,6 +1461,15 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 "normal Main decoded repair reply execution failed"),
         }
     }
+    let served_namespace_request_id =
+        resume_command
+            .as_ref()
+            .and_then(|command| match &command.routed_message.message {
+                DfsNetworkMessage::NamespaceRequest(namespace) => {
+                    Some(namespace.request_id.clone())
+                }
+                _ => None,
+            });
     let remote_namespace_phase = service_lane
         .service
         .remote_namespace_phase
@@ -1448,6 +1480,13 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 phase,
             )
         });
+    if remote_namespace_phase.is_none()
+        && let Some(request_id) = served_namespace_request_id.as_deref()
+    {
+        service_lane
+            .service
+            .forget_answered_remote_reads(request_id);
+    }
     let replica_materialization_shard = process_report
         .committed_work
         .metadata_materialization
@@ -1567,7 +1606,12 @@ impl DfsRuntimeMessageServiceLane {
         scope: &DfsResidentMetadataScope,
     ) -> Result<(), crate::DfsError> {
         scope.attach(&mut self.service)?;
-        if self.needs_global_hydration && matches!(scope, DfsResidentMetadataScope::Global(_)) {
+        if self.needs_global_hydration
+            && matches!(
+                scope,
+                DfsResidentMetadataScope::Global(_) | DfsResidentMetadataScope::Shards(..)
+            )
+        {
             if let Err(error) = self.service.hydrate_file_systems_from_metadata_backend() {
                 self.service.release_resident_metadata_backend()?;
                 return Err(error);

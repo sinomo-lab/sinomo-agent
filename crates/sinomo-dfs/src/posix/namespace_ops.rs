@@ -856,8 +856,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(mut destination) = self.lookup_sifs_path(&to)?
             && destination.kind != DfsObjectKind::Tombstone
         {
-            let source_target = self.resolve_hardlink_target(&source)?;
-            let destination_target = self.resolve_hardlink_target(&destination)?;
+            let source_target = self.resolve_hardlink_target_held_or_at_primary(&source)?;
+            let destination_target =
+                self.resolve_hardlink_target_held_or_at_primary(&destination)?;
             if source_target.object_id == destination_target.object_id {
                 return self.posix_stat(&to);
             }
@@ -935,7 +936,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let source_hardlink_target = if source.kind == DfsObjectKind::Hardlink {
-            Some(self.resolve_hardlink_target(&source)?)
+            Some(self.resolve_hardlink_target_held_or_at_primary(&source)?)
         } else {
             None
         };

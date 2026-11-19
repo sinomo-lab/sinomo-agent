@@ -2602,7 +2602,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     current_primary_node_id: None,
                                 }
                             }
-                            durable_execute => {
+                            mut durable_execute => {
+                                // A request whose earlier runs only yielded
+                                // reads runs again as the fresh request it was:
+                                // its pending row records no execution yet.
+                                if let Some(DurableNamespaceRequestAdmission::Execute {
+                                    record,
+                                    replaying_pending,
+                                    ..
+                                }) = durable_execute.as_mut()
+                                    && *replaying_pending
+                                    && self.read_yield_fresh_requests.contains(&(
+                                        record.requester_node_id.clone(),
+                                        record.request_id.clone(),
+                                    ))
+                                {
+                                    *replaying_pending = false;
+                                }
                                 let replaying_pending_request = durable_execute.as_ref().and_then(
                                     |admission| match admission {
                                         DurableNamespaceRequestAdmission::Execute {
@@ -2829,15 +2845,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         &outcome,
                                         Err(posix_model::DfsPosixError::Dfs(DfsError::Busy { .. }))
                                     );
-                                let retryable_error = !fresh_busy_rejection
-                                    && outcome.as_ref().err().is_some_and(|error| {
-                                        namespace_execution_must_remain_pending(
-                                            error,
-                                            durable_prepare_recorded,
-                                            durable_job_recorded,
-                                        )
-                                    });
+                                // A run that yielded a read and recorded no
+                                // prepare or job took no effect: the host runs
+                                // the request again with the read's answer, so
+                                // this run records neither a pending request nor
+                                // an outcome.
+                                let read_yield_without_effects = !durable_prepare_recorded
+                                    && !durable_job_recorded
+                                    && matches!(
+                                        self.remote_namespace_phase.as_deref(),
+                                        Some(crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(_))
+                                    );
+                                if let Some(DurableNamespaceRequestAdmission::Execute {
+                                    record,
+                                    replaying_pending,
+                                    ..
+                                }) = durable_execute.as_ref()
+                                {
+                                    let key = (
+                                        record.requester_node_id.clone(),
+                                        record.request_id.clone(),
+                                    );
+                                    if read_yield_without_effects && !*replaying_pending {
+                                        self.read_yield_fresh_requests.insert(key);
+                                    } else {
+                                        self.read_yield_fresh_requests.remove(&key);
+                                    }
+                                }
+                                let retryable_error = read_yield_without_effects
+                                    || (!fresh_busy_rejection
+                                        && outcome.as_ref().err().is_some_and(|error| {
+                                            namespace_execution_must_remain_pending(
+                                                error,
+                                                durable_prepare_recorded,
+                                                durable_job_recorded,
+                                            )
+                                        }));
                                 if retryable_error
+                                    && !read_yield_without_effects
                                     && !durable_prepare_recorded
                                     && let Some(DurableNamespaceRequestAdmission::Execute {
                                         shard_id,
@@ -3612,8 +3657,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requested_shards: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        // Only shards this node replicates are fed by response batches. A
+        // service on a several-shard lease replicates only the shards it holds.
         let shards = match requested_shards {
-            // Only shards this node replicates are fed by response batches.
             Some(requested) => requested
                 .iter()
                 .filter(|shard| {
@@ -3628,7 +3674,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .chain(self.replication.routed_replica_projections.keys())
                 .cloned()
                 .collect(),
-        };
+        }
+        .into_iter()
+        .filter(|shard_id| !self.metadata_lease_omits_shard(&shard_id.0))
+        .collect::<BTreeSet<_>>();
         for shard_id in &shards {
             self.refresh_routed_replica_projection(shard_id)?;
         }
@@ -4165,6 +4214,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        if matches!(
+            operation,
+            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
+        ) && self.routed_read_waits_with_lanes_released(&primary_node_id)
+        {
+            let key = self.routed_read_key(&primary_node_id, &file_system_id, &operation)?;
+            if let Some(result) = self.take_answered_remote_read(&key, &primary_node_id)? {
+                return Ok(result);
+            }
+            let (command, pending) = self.prepare_routed_namespace_request(
+                &request_id,
+                file_system_id,
+                &primary_node_id,
+                operation,
+                replay_journal_batches,
+                apply_synced_path_object,
+            )?;
+            return Err(self.yield_routed_read(key, command, pending, deadline));
+        }
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
             file_system_id,
@@ -4199,6 +4267,124 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.pending_routed_namespace_ops
             .insert(request_id.clone(), pending);
         self.settle_routed_namespace_op(&request_id, remaining)
+    }
+
+    /// Whether a read this service routes to `primary` waits with its lanes
+    /// released. A served request on a several-shard lease holds the lanes of
+    /// every shard this node is primary of in its filesystem, and the shard
+    /// it reads may have a lane on its primary that a request there holds
+    /// while it waits on this node. The read therefore yields to the host,
+    /// which sends it once this request's lanes and admission have ended and
+    /// re-runs the request with the answer.
+    pub(crate) fn routed_read_waits_with_lanes_released(&self, primary: &NodeId) -> bool {
+        primary != &self.node_id
+            && self.transport.serves_routed_request()
+            && self.publication_execution.current().is_some()
+            && self
+                .metadata_backend
+                .as_ref()
+                .is_some_and(|backend| backend.resident_selected_shard_ids().is_some())
+    }
+
+    /// Forget the answers a request's yielded reads brought back once a run
+    /// of that request ends without yielding again.
+    pub(crate) fn forget_answered_remote_reads(&mut self, request_id: &str) {
+        let marker = format!("/{request_id}|");
+        self.answered_remote_reads
+            .retain(|key, _| !key.starts_with('|') && !key.contains(&marker));
+    }
+
+    /// One routed read's identity within the request it serves: the same
+    /// read on the request's re-run has the same key.
+    pub(crate) fn routed_read_key(
+        &self,
+        primary: &NodeId,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<String, DfsError> {
+        let request = self
+            .namespace_execution
+            .request()
+            .map(|request| format!("{}/{}", request.requester_node_id, request.request_id))
+            .unwrap_or_default();
+        let operation = serde_json::to_string(operation).map_err(|error| DfsError::Metadata {
+            message: format!("routed read has no stable identity: {error}"),
+        })?;
+        Ok(format!("{request}|{primary}|{file_system_id}|{operation}"))
+    }
+
+    /// Settle the answer a yielded read brought back as its response would
+    /// have settled; `None` while that read has no answer.
+    fn take_answered_remote_read(
+        &mut self,
+        key: &str,
+        primary: &NodeId,
+    ) -> Result<Option<PendingRoutedNamespaceResult>, DfsError> {
+        // The answer stays for the request's later re-runs, which repeat
+        // this read before reaching a read that has yet to be answered.
+        let Some(answer) = self.answered_remote_reads.get(key).cloned() else {
+            return Ok(None);
+        };
+        let answer = answer?;
+        if &answer.target != primary {
+            return Err(DfsError::Distributed {
+                message: "routed read answer came from another primary".into(),
+            });
+        }
+        let request = answer.command.request_id.clone();
+        self.pending_routed_namespace_ops
+            .insert(request.clone(), answer.pending);
+        let handled = self.handle_namespace_response(answer.target, answer.response);
+        let pending = self.pending_routed_namespace_ops.remove(&request);
+        handled?;
+        pending
+            .and_then(|pending| pending.result)
+            .map(Some)
+            .ok_or_else(|| DfsError::Distributed {
+                message: "routed read answer did not settle its request".into(),
+            })
+    }
+
+    /// Yield one routed read to the host: it is sent to its primary once this
+    /// request's lanes and admission have ended. The returned error ends this
+    /// run; the host discards its outcome and re-runs the request.
+    pub(crate) fn yield_routed_read(
+        &mut self,
+        key: String,
+        command: DfsNamespaceCommand,
+        pending: PendingRoutedNamespaceOp,
+        deadline: Instant,
+    ) -> DfsError {
+        let waits = || DfsError::Network {
+            message: "routed read waits for its primary with the request's lanes released".into(),
+        };
+        // One yield per run: a second read waits for the re-run.
+        if self.remote_namespace_phase.is_some() {
+            return waits();
+        }
+        let Some(owners) = self.publication_execution.current() else {
+            return DfsError::Metadata {
+                message: "routed read has no runtime custody to yield to".into(),
+            };
+        };
+        let actor = match crate::source_adoption::actor_for_root(owners.data_root()) {
+            Ok(actor) => actor,
+            Err(error) => return DfsError::from(error),
+        };
+        self.remote_namespace_phase = Some(Box::new(
+            crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(
+                crate::source_adoption::RemoteReadNamespacePhase {
+                    key,
+                    read: crate::source_adoption::RemoteTargetNamespacePhase {
+                        actor,
+                        command,
+                        pending,
+                        deadline,
+                    },
+                },
+            ),
+        ));
+        waits()
     }
 
     /// Build the request and its response fence from the same authority cut.

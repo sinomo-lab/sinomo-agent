@@ -2002,6 +2002,33 @@ impl ResidentLocalShardedMetadataBackend {
     /// its refusal; node-wide scans see the router as a node without a copy
     /// of that shard ([`slots`]).
     pub fn checkout_global(&self) -> Result<ResidentLocalShardedMetadataBackendLease> {
+        self.checkout_router(None)
+    }
+
+    /// Check out only `shard_ids`, in canonical order, behind a router that
+    /// still routes every path. The lease holds no other shard: a request on
+    /// it that reaches another shard meets that shard as absent, and the
+    /// shards' own lanes keep serving answers and exact work beside it.
+    /// Dropping it returns those shards and their router entries only.
+    pub fn checkout_shards(
+        &self,
+        shard_ids: &BTreeSet<DfsMetadataShardId>,
+    ) -> Result<ResidentLocalShardedMetadataBackendLease> {
+        for shard_id in shard_ids {
+            if !self.inner.shards.contains_key(shard_id) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "unknown resident DFS metadata shard: {}",
+                    shard_id.0
+                )));
+            }
+        }
+        self.checkout_router(Some(shard_ids))
+    }
+
+    fn checkout_router(
+        &self,
+        selected: Option<&BTreeSet<DfsMetadataShardId>>,
+    ) -> Result<ResidentLocalShardedMetadataBackendLease> {
         /// A closed slot reserved to this checkout until the lease owns it.
         struct ClosedReservation(Option<Arc<ResidentLocalMetadataShardSlot>>);
         impl Drop for ClosedReservation {
@@ -2014,6 +2041,9 @@ impl ResidentLocalShardedMetadataBackend {
         let mut leases = Vec::with_capacity(self.inner.shards.len());
         let mut closed = Vec::new();
         for (shard_id, slot) in &self.inner.shards {
+            if selected.is_some_and(|selected| !selected.contains(shard_id)) {
+                continue;
+            }
             tracing::trace!(
                 target: "sinomo.dfs.perf",
                 data_root = %slot.root.display(),
@@ -2110,6 +2140,7 @@ impl ResidentLocalShardedMetadataBackend {
         }
         Ok(ResidentLocalShardedMetadataBackendLease {
             resident: self.clone(),
+            selected: selected.cloned(),
             backend: Some(LocalShardedMetadataBackend {
                 root: router.root,
                 local_node_id: router.local_node_id,
@@ -2139,6 +2170,8 @@ impl ResidentLocalShardedMetadataBackend {
 /// changed by handoff or routing-fallback reconciliation.
 pub struct ResidentLocalShardedMetadataBackendLease {
     resident: ResidentLocalShardedMetadataBackend,
+    /// The shards of a several-shard lease; `None` for a global one.
+    selected: Option<BTreeSet<DfsMetadataShardId>>,
     backend: Option<LocalShardedMetadataBackend>,
 }
 
@@ -2148,6 +2181,14 @@ impl std::fmt::Debug for ResidentLocalShardedMetadataBackendLease {
             .debug_struct("ResidentLocalShardedMetadataBackendLease")
             .field("shard_count", &self.resident.inner.shards.len())
             .finish_non_exhaustive()
+    }
+}
+
+impl ResidentLocalShardedMetadataBackendLease {
+    /// The shards a several-shard lease holds; `None` for a global lease,
+    /// which holds every copy the node keeps.
+    pub(crate) fn selected_shard_ids(&self) -> Option<&BTreeSet<DfsMetadataShardId>> {
+        self.selected.as_ref()
     }
 }
 
@@ -2212,6 +2253,18 @@ impl Drop for ResidentLocalShardedMetadataBackendLease {
                 .get(&shard_id.0)
                 .unwrap_or(&resident_slot.config);
             resident_slot.restore_with_status_config(backend, Some(status_config));
+        }
+        if let Some(selected) = self.selected.as_ref() {
+            // Other shards' lanes may have rebound their own router entries
+            // meanwhile; return only this lease's.
+            for shard_id in selected {
+                if let Some(config) = shard_configs.get(&shard_id.0) {
+                    router
+                        .shard_configs
+                        .insert(shard_id.0.clone(), config.clone());
+                }
+            }
+            return;
         }
         *router = ResidentLocalShardedMetadataRouterState {
             root,
@@ -2841,18 +2894,35 @@ impl LocalShardedMetadataBackend {
         remove_object_shard_index(&self.root, object_id)
     }
 
+    /// The refusal of a read or write addressed to a shard this router holds
+    /// no slot for. A configured shard without a slot is one a several-shard
+    /// lease leaves out; it answers as a shard without a local copy does, with
+    /// its filesystem unknown here, so a namespace walk stops at that shard
+    /// boundary and an addressed read fails closed.
+    fn shard_missing_error(&self, shard_id: &DfsMetadataShardId) -> MetadataBackendError {
+        match self.shard_configs.get(&shard_id.0) {
+            Some(config) if !self.shards.holds(shard_id) => {
+                MetadataBackendError::UnknownFileSystem {
+                    file_system_id: config.file_system_id.clone(),
+                }
+            }
+            _ => MetadataBackendError::Serde(format!(
+                "unknown local DFS metadata shard: {}",
+                shard_id.0
+            )),
+        }
+    }
+
     pub(crate) fn shard_backend(
         &self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<&LocalSobjMetadataBackend> {
+        if !self.shards.holds(shard_id) {
+            return Err(self.shard_missing_error(shard_id));
+        }
         self.shards
             .get(shard_id)
-            .ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "unknown local DFS metadata shard: {}",
-                    shard_id.0
-                ))
-            })?
+            .expect("held shard slot checked above")
             .backend()
     }
 
@@ -2860,14 +2930,12 @@ impl LocalShardedMetadataBackend {
         &mut self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<&mut LocalSobjMetadataBackend> {
+        if !self.shards.holds(shard_id) {
+            return Err(self.shard_missing_error(shard_id));
+        }
         self.shards
             .get_mut(shard_id)
-            .ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "unknown local DFS metadata shard: {}",
-                    shard_id.0
-                ))
-            })?
+            .expect("held shard slot checked above")
             .backend_mut()
     }
 
@@ -3285,11 +3353,14 @@ impl LocalShardedMetadataBackend {
         // destination therefore hides the historical source record even when
         // the replica-local object index is stale or absent. If a newly
         // activated target has not received the object yet, preserve the old
-        // source fallback until migration installs the routed copy.
-        if self
-            .shard_backend(&selected_shard_id)?
-            .get_object_by_path(&object.file_system_id, &object.path)?
-            .is_some_and(|selected| !is_source_eviction_tombstone(&selected))
+        // source fallback until migration installs the routed copy. A router
+        // without the selected shard's copy cannot see that record; as for an
+        // uncorroborated index, the placement among its held copies decides.
+        if self.shards.holds(&selected_shard_id)
+            && self
+                .shard_backend(&selected_shard_id)?
+                .get_object_by_path(&object.file_system_id, &object.path)?
+                .is_some_and(|selected| !is_source_eviction_tombstone(&selected))
         {
             return Ok(false);
         }
@@ -7445,9 +7516,9 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut statuses = Vec::new();
         for shard in self.shard_configs.values() {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-            // As in a scan: a closed copy reports no status, as on a node
-            // without that copy.
-            if self.shards.probe_closed(&shard_id)? {
+            // As in a scan: a closed copy, or one a several-shard lease does
+            // not hold, reports no status, as on a node without that copy.
+            if !self.shards.holds(&shard_id) || self.shards.probe_closed(&shard_id)? {
                 continue;
             }
             let backend = self.shard_backend(&shard_id)?;

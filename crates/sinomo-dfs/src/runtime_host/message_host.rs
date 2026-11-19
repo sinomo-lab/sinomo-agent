@@ -466,6 +466,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
                 primary_service: None,
                 exact_shard_services: BTreeMap::new(),
                 exact_write_services: BTreeMap::new(),
+                multi_shard_services: BTreeMap::new(),
                 content_read_service: None,
             });
         }
@@ -932,6 +933,187 @@ pub(crate) async fn admit_daemon_dfs_peer_answer(
     preempt_maintenance: bool,
 ) -> Result<DaemonDfsMutationAdmission, DaemonError> {
     admit_daemon_dfs_message_as(scheduler, execution_scope, preempt_maintenance, true).await
+}
+
+/// Admit a namespace request that may touch several shards on the lanes of
+/// `keys`, with the same foreground preemption of maintenance as one lane.
+pub(crate) async fn admit_daemon_dfs_message_shards(
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+    keys: &[DaemonDfsMutationLaneKey],
+    preempt_maintenance: bool,
+) -> Result<DaemonDfsMutationAdmission, DaemonError> {
+    if !preempt_maintenance {
+        return scheduler.admit_shards(keys).await.map_err(Into::into);
+    }
+    scheduler.request_foreground_admission();
+    let mut admission = std::pin::pin!(scheduler.admit_shards(keys));
+    std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(admission.as_mut(), cx);
+        if result.is_pending() {
+            scheduler.request_foreground_admission();
+        }
+        result
+    })
+    .await
+    .map_err(Into::into)
+}
+
+/// Keep a several-lane admission only once every one of its shards is
+/// resident in the current generation. Otherwise the global writer
+/// initializes or rolls that generation only, and the lanes are taken again;
+/// lanes still not current afterwards leave the request under the global
+/// writer, whose service validates its stamps.
+#[allow(clippy::too_many_arguments)]
+async fn daemon_dfs_admit_current_multi_shard_lanes(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    runtime: &tokio::runtime::Handle,
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+    keys: &[DaemonDfsMutationLaneKey],
+    preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+    preempt_maintenance: bool,
+    data_owner_lock: &Arc<DaemonDataOwnerLock>,
+    admission: DaemonDfsMutationAdmission,
+) -> Result<DaemonDfsMutationAdmission, DaemonError> {
+    // Each check and the roll keep the admission inside their worker, so a
+    // cancelled RPC cannot release it while the cache is read or rolled.
+    let run = |work: Box<dyn FnOnce() -> Result<bool, sinomo_dfs::DfsError> + Send>,
+               admission: DaemonDfsMutationAdmission| {
+        let owner = Arc::clone(data_owner_lock);
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let _owner = owner;
+                (work(), admission)
+            })
+            .await
+            .map_err(|source| DaemonError::Network {
+                address: "DFS message".to_string(),
+                detail: format!("DFS several-lane cache task failed: {source}"),
+            })
+        }
+    };
+    let current = |wait: bool| {
+        let data_dir = data_dir.clone();
+        let cluster_paths = cluster_paths.clone();
+        let peer_snapshot = peer_snapshot.clone();
+        let runtime = runtime.clone();
+        let keys = keys.to_vec();
+        Box::new(move || {
+            for key in &keys {
+                if daemon_dfs_message_cache_exact_admission_handle_with(
+                    &data_dir,
+                    &cluster_paths,
+                    &peer_snapshot,
+                    key,
+                    &runtime,
+                    wait,
+                )?
+                .is_none()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }) as Box<dyn FnOnce() -> Result<bool, sinomo_dfs::DfsError> + Send>
+    };
+    let (is_current, admission) = run(current(false), admission).await?;
+    if is_current.unwrap_or(false) {
+        return Ok(admission);
+    }
+    drop(admission);
+    let admission = admit_daemon_dfs_message(
+        scheduler,
+        &DfsMessageExecutionScope::GlobalExclusive,
+        preempt_maintenance,
+    )
+    .await?;
+    let Some(preflight) = preflight.cloned() else {
+        return Ok(admission);
+    };
+    let roll = {
+        let data_dir = data_dir.clone();
+        let cluster_paths = cluster_paths.clone();
+        let peer_snapshot = peer_snapshot.clone();
+        let runtime = runtime.clone();
+        let kind = DaemonDfsMessageLaneKind::MutationShards(keys.to_vec());
+        Box::new(move || {
+            roll_daemon_dfs_resident_generation_for_exact_mutation(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                &runtime,
+                kind,
+                &preflight,
+            )
+        }) as Box<dyn FnOnce() -> Result<bool, sinomo_dfs::DfsError> + Send>
+    };
+    let (rolled, admission) = run(roll, admission).await?;
+    if !rolled? {
+        return Ok(admission);
+    }
+    drop(admission);
+    let admission = admit_daemon_dfs_message_shards(scheduler, keys, preempt_maintenance).await?;
+    let (is_current, admission) = run(current(true), admission).await?;
+    if is_current.unwrap_or(false) || admission.is_global() {
+        return Ok(admission);
+    }
+    // The generation moved again between the roll and these lanes.
+    drop(admission);
+    admit_daemon_dfs_message(
+        scheduler,
+        &DfsMessageExecutionScope::GlobalExclusive,
+        preempt_maintenance,
+    )
+    .await
+}
+
+/// The lanes a namespace request without exactly one shard stamp takes:
+/// every shard of its filesystem this node is primary of, in canonical
+/// order. Its footprint is not known before planning (a hardlink's canonical
+/// inode or a job's frames may lie on another shard), but it can publish only
+/// on shards this node is primary of, and it never takes a shard this node
+/// only replicates. `None` keeps the global writer: a read, an exact request,
+/// or a node primary of none of the filesystem's shards.
+pub(crate) fn daemon_dfs_message_multi_shard_lanes(
+    command: &DfsMessageCommand,
+    execution_scope: &DfsMessageExecutionScope,
+    preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+    local_node_id: &NodeId,
+) -> Result<Option<Vec<DaemonDfsMutationLaneKey>>, sinomo_dfs::DfsError> {
+    let sinomo_dfs::DfsNetworkMessage::NamespaceRequest(namespace) =
+        &command.routed_message.message
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        execution_scope,
+        DfsMessageExecutionScope::GlobalExclusive | DfsMessageExecutionScope::NamespacePaths { .. }
+    ) || dfs_message_is_read_only_request(command)
+    {
+        return Ok(None);
+    }
+    let Some(preflight) = preflight else {
+        return Ok(None);
+    };
+    let Some(topology) = preflight
+        .authority
+        .retained_complete_prefix_for_generation(preflight.generation)
+    else {
+        return Ok(None);
+    };
+    let mut keys =
+        daemon_dfs_metadata_shards_from_authority_projection(&topology, &namespace.file_system_id)?
+            .into_iter()
+            .filter(|shard| shard.primary_node_id == *local_node_id)
+            .map(|shard| DaemonDfsMutationLaneKey {
+                file_system_id: shard.file_system_id,
+                shard_id: DfsMetadataShardId::new(shard.shard_id),
+            })
+            .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    Ok((!keys.is_empty()).then_some(keys))
 }
 
 async fn admit_daemon_dfs_message_as(
@@ -1890,6 +2072,8 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
             DaemonDfsResidentMetadataScope::Global(backend) => {
                 service.with_resident_sharded_metadata_backend_lazy(backend.checkout_global()?)?
             }
+            DaemonDfsResidentMetadataScope::Shards(backend, shard_ids) => service
+                .with_resident_sharded_metadata_backend_lazy(backend.checkout_shards(shard_ids)?)?,
         },
         None => {
             // Mutation lanes retain the filesystem catalog and durable namespace
@@ -2419,6 +2603,8 @@ pub(crate) enum DaemonDfsMessageLaneKind {
     MutationExact(DaemonDfsMutationLaneKey),
     /// The shard lane's routed-write service, admitted on the same lane.
     MutationExactWrite(DaemonDfsMutationLaneKey),
+    /// A several-lane admission's service, leased exactly those shards.
+    MutationShards(Vec<DaemonDfsMutationLaneKey>),
     ContentRead,
 }
 
@@ -2544,6 +2730,7 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
             primary_service: None,
             exact_shard_services: BTreeMap::new(),
             exact_write_services: BTreeMap::new(),
+            multi_shard_services: BTreeMap::new(),
             content_read_service: None,
         });
     } else if generation_changed && allow_generation_rollover {
@@ -3261,10 +3448,11 @@ fn roll_daemon_dfs_resident_generation_for_exact_mutation(
     kind: DaemonDfsMessageLaneKind,
     preflight: &DaemonDfsMetadataAuthorityPreflight,
 ) -> Result<bool, sinomo_dfs::DfsError> {
-    let (DaemonDfsMessageLaneKind::MutationExact(key)
-    | DaemonDfsMessageLaneKind::MutationExactWrite(key)) = kind.clone()
-    else {
-        return Ok(false);
+    let keys = match kind.clone() {
+        DaemonDfsMessageLaneKind::MutationExact(key)
+        | DaemonDfsMessageLaneKind::MutationExactWrite(key) => vec![key],
+        DaemonDfsMessageLaneKind::MutationShards(keys) => keys,
+        _ => return Ok(false),
     };
     match select_daemon_dfs_message_lane(
         data_dir,
@@ -3282,14 +3470,20 @@ fn roll_daemon_dfs_resident_generation_for_exact_mutation(
         | DaemonDfsMessageLaneSelection::OwnedByWriteLane(..) => {}
         DaemonDfsMessageLaneSelection::AuthorityPreflightStale(_) => return Ok(false),
     }
-    Ok(daemon_dfs_message_cache_exact_admission_handle_waiting(
-        data_dir,
-        cluster_paths,
-        peer_snapshot,
-        &key,
-        runtime,
-    )?
-    .is_some())
+    for key in &keys {
+        if daemon_dfs_message_cache_exact_admission_handle_waiting(
+            data_dir,
+            cluster_paths,
+            peer_snapshot,
+            key,
+            runtime,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn try_select_daemon_dfs_message_lane(
@@ -3347,6 +3541,7 @@ fn try_select_daemon_dfs_message_lane(
         &kind,
         DaemonDfsMessageLaneKind::MutationExact(_)
             | DaemonDfsMessageLaneKind::MutationExactWrite(_)
+            | DaemonDfsMessageLaneKind::MutationShards(_)
             | DaemonDfsMessageLaneKind::MutationGlobal
     ) && !entry.resident_metadata_initialized
     {
@@ -3494,8 +3689,50 @@ fn try_select_daemon_dfs_message_lane(
                 lane
             }
         }
+        DaemonDfsMessageLaneKind::MutationShards(keys)
+            if entry.resident_metadata_backend.is_some() =>
+        {
+            if let Some(lane) = entry.multi_shard_services.get(&keys) {
+                Arc::clone(lane)
+            } else {
+                let resident = entry
+                    .resident_metadata_backend
+                    .clone()
+                    .expect("several-shard resident lane checked above");
+                let shard_ids = keys
+                    .iter()
+                    .map(|key| key.shard_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let lane = open_daemon_dfs_message_service_lane_with_content(
+                    data_dir,
+                    cluster_paths,
+                    &entry.signature.local_node_id,
+                    entry.peer_node_ids.clone(),
+                    runtime,
+                    entry.content_store.clone(),
+                    Some(
+                        entry
+                            .metadata_authority_generation
+                            .load_complete_prefix_for_generation(
+                                entry.signature.metadata_authority_generation,
+                            )
+                            .ok_or_else(|| {
+                                daemon_dfs_stale_authority(
+                                    &entry.metadata_authority_generation,
+                                    entry.signature.metadata_authority_generation,
+                                )
+                            })?,
+                    ),
+                    Some(DaemonDfsResidentMetadataScope::Shards(resident, shard_ids)),
+                    entry.cross_shard_namespace_locks.clone(),
+                )?;
+                entry.multi_shard_services.insert(keys, Arc::clone(&lane));
+                lane
+            }
+        }
         DaemonDfsMessageLaneKind::MutationExact(_)
         | DaemonDfsMessageLaneKind::MutationExactWrite(_)
+        | DaemonDfsMessageLaneKind::MutationShards(_)
         | DaemonDfsMessageLaneKind::MutationGlobal => {
             try_daemon_dfs_global_message_lane(data_dir, cluster_paths, runtime, entry)?
         }
@@ -3804,6 +4041,11 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     let cache_select_started = Instant::now();
     let lane_kind = if use_content_read_lane {
         DaemonDfsMessageLaneKind::ContentRead
+    } else if let Some(keys) = mutation_admission
+        .as_ref()
+        .and_then(|admission| admission.exact_shards())
+    {
+        DaemonDfsMessageLaneKind::MutationShards(keys.to_vec())
     } else if allow_exact_service_lane
         && let Some(key) = DaemonDfsMutationLaneKey::from_scope(execution_scope)
     {
@@ -3912,7 +4154,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         Some(owner)
             if mutation_admission
                 .as_ref()
-                .is_some_and(|admission| admission.is_exact() || admission.is_global()) =>
+                .is_some_and(|admission| admission.is_mutation()) =>
         {
             Some(
                 crate::publication_guard::DfsPublicationExecutionScope::enter(
@@ -4012,7 +4254,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         Ok(Some(shard)) => match daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir)) {
             Ok(Some(data_owner_lock)) => match mutation_admission
                 .take()
-                .filter(|admission| admission.is_exact() || admission.is_global())
+                .filter(|admission| admission.is_mutation())
             {
                 Some(admission) => {
                     schedule_daemon_dfs_replica_materialization_on_runtime(
@@ -5104,8 +5346,27 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let scheduler_started = admission_trace.start();
         let preempt_maintenance =
             daemon_dfs_message_preempts_maintenance(&command.routed_message.message);
+        let multi_shard_lanes = if uses_content_read_lane
+            || exact_service_lane_candidate
+            || stage_admission.is_some()
+        {
+            None
+        } else {
+            daemon_dfs_message_multi_shard_lanes(
+                &command,
+                &execution_scope,
+                process_metadata_authority_preflight.as_ref(),
+                &peer_snapshot.local_node_id,
+            )?
+        };
         let admitted = if let Some(admission) = stage_admission {
             Ok(admission)
+        } else if let Some(keys) = multi_shard_lanes.as_ref() {
+            tracing::Instrument::instrument(
+                admit_daemon_dfs_message_shards(&scheduler, keys, preempt_maintenance),
+                admission_trace.span("initial-scheduler"),
+            )
+            .await
         } else {
             tracing::Instrument::instrument(
                 admit_daemon_dfs_message(&scheduler, &admission_scope, preempt_maintenance),
@@ -5124,6 +5385,23 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             admitted.as_ref().ok(),
         );
         let mut admission = admitted?;
+        if let Some(keys) = multi_shard_lanes.as_ref()
+            && admission.exact_shards().is_some()
+        {
+            admission = daemon_dfs_admit_current_multi_shard_lanes(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                runtime,
+                &scheduler,
+                keys,
+                process_metadata_authority_preflight.as_ref(),
+                preempt_maintenance,
+                &data_owner_lock,
+                admission,
+            )
+            .await?;
+        }
         let cache_started = (exact_service_lane_candidate && admission.is_exact())
             .then(|| admission_trace.start())
             .flatten();
