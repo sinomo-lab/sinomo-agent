@@ -826,6 +826,14 @@ impl DfsSourceAdoptionActor {
         let _retirement = service
             .acquire_prepared_execution(&retirement_scope)
             .map_err(error)?;
+        // This service opened the shard on its own. A handoff the assignment
+        // already completed leaves its instance frozen until it is rebound, as
+        // every other mutation entry does before it takes the writer.
+        service
+            .rebind_completed_local_metadata_shard_membership_handoff_if_frozen(
+                &offer.source_config,
+            )
+            .map_err(error)?;
         let family = service
             .metadata_backend_mut()
             .ok_or_else(|| error("source completion has no native backend"))?
