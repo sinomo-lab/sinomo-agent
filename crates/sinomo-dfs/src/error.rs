@@ -263,6 +263,7 @@ impl DfsError {
     pub(crate) fn metadata_rejection_code(&self) -> crate::DfsMetadataRejectionCode {
         match self {
             Self::MetadataRejection { code, .. } => *code,
+            Self::StoragePreparationPending { .. } => crate::DfsMetadataRejectionCode::StoragePreparationPending,
             _ => crate::DfsMetadataRejectionCode::Other,
         }
     }

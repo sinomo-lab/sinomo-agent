@@ -36,6 +36,10 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     #[cfg(test)]
     PlacementRecoveryOwnerAcquired,
     #[cfg(test)]
+    PlacementPermitQuorum {
+        releasing: bool,
+    },
+    #[cfg(test)]
     LocalPlacementAuthorityAcquired {
         job_id: &'a str,
         path: &'a str,
@@ -1086,10 +1090,16 @@ pub(crate) fn daemon_dfs_message_multi_shard_lanes(
     else {
         return Ok(None);
     };
+    // An owner write keeps its write state on one shard's write service; one
+    // without exactly one stamp is an unstamped write for the global writer.
     if !matches!(
         execution_scope,
         DfsMessageExecutionScope::GlobalExclusive | DfsMessageExecutionScope::NamespacePaths { .. }
     ) || dfs_message_is_read_only_request(command)
+        || matches!(
+            namespace.operation,
+            sinomo_dfs::DfsNamespaceOperation::WriteFile { .. }
+        )
     {
         return Ok(None);
     }
@@ -3428,6 +3438,10 @@ pub(crate) fn daemon_dfs_exact_lane_kind(
         sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(_)
             | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(_)
             | sinomo_dfs::DfsNetworkMessage::RetainedWriteRequest(_)
+            | sinomo_dfs::DfsNetworkMessage::NamespaceRequest(sinomo_dfs::DfsNamespaceCommand {
+                operation: sinomo_dfs::DfsNamespaceOperation::WriteFile { .. },
+                ..
+            })
     ) || crate::runtime_message::dfs_runtime_message_is_transfer_response(command)
     {
         DaemonDfsMessageLaneKind::MutationExactWrite(key)
@@ -3968,6 +3982,7 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         None,
         None,
         None,
+        None,
         false,
         false,
     )
@@ -3991,6 +4006,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
     stage_shard: Option<ResidentLocalMetadataShardHandle>,
     prepared_write: Option<crate::DfsPreparedOperationDigest>,
+    placement: Option<crate::placement::AdmittedPlacement>,
     retain_write: bool,
     readmit_owned_replies: bool,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
@@ -4209,6 +4225,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
         publication_provider,
         completed_phase,
+        placement,
         stage_shard,
         prepared_write,
         write_attempt.as_ref().map(|(command, _)| command),
@@ -5018,8 +5035,8 @@ async fn prepare_daemon_dfs_genesis_ingress(
 
 pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     paths: &DaemonPaths,
-    command: DfsMessageCommand,
-    attachment: Option<DfsInboundAttachment>,
+    mut command: DfsMessageCommand,
+    mut attachment: Option<DfsInboundAttachment>,
     traceparent: Option<String>,
     encoded_value_bytes: Option<u64>,
     runtime: &tokio::runtime::Handle,
@@ -5138,6 +5155,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             }
         }
     }
+    let inline_stage_permit =
+        crate::runtime_message::receive_inline_stage(&mut command, &mut attachment).await?;
     let content = if attachment.is_some() {
         let content_data_dir = data_dir.clone();
         let content_cluster_paths = cluster_paths.clone();
@@ -5279,6 +5298,16 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 ),
             );
         }
+        let mut placement = placement_admission::acquire(
+            &data_dir,
+            &cluster_paths,
+            &peer_snapshot,
+            &command,
+            metadata_authority_preflight.as_ref(),
+            &data_owner_lock,
+            runtime,
+        )
+        .await?;
         let process_data_dir = data_dir.clone();
         let process_cluster_paths = cluster_paths.clone();
         let process_peer_snapshot = peer_snapshot.clone();
@@ -5636,6 +5665,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let process_execution_scope = execution_scope.clone();
         let spawn_started = Instant::now();
         let blocking_queue_started = spawn_started;
+        let process_stage_permit = inline_stage_permit.clone();
         let process_data_owner_lock = Arc::clone(&data_owner_lock);
         #[cfg(test)]
         let admission_observation_hook = daemon_dfs_pre_dispatch_test_hook(&data_dir);
@@ -5656,6 +5686,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             // JoinHandle while blocking work continues. Retain the OS-backed data
             // lock inside the blocking closure so no replacement daemon can prove
             // this placement-authority session dead prematurely.
+            let _stage_permit = process_stage_permit;
             let _data_owner_lock = process_data_owner_lock;
             let mut mutation_admission = Some(admission);
             let blocking_started = Instant::now();
@@ -5679,6 +5710,9 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     process_completed_phase.map(|completed| *completed),
                     process_stage_shard,
                     process_prepared_write,
+                    placement
+                        .as_mut()
+                        .and_then(placement_admission::PlacementDispatch::take_cut),
                     true,
                     process_reply_readmission,
                 )
@@ -5707,6 +5741,10 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 }
             }
             drop(mutation_admission);
+            let release = placement
+                .map(placement_admission::PlacementDispatch::release)
+                .transpose();
+            let result = result.and_then(|outcome| release.map(|_| outcome));
             (result, blocking_queue, blocking_started.elapsed())
         })
         .await
@@ -6101,6 +6139,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         None,
         None,
         None,
+        None,
         false,
         background_response,
     )?;
@@ -6136,6 +6175,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
             Duration::ZERO,
             &mut mutation_admission,
             runtime,
+            None,
             None,
             None,
             None,
@@ -6177,3 +6217,5 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
 
 #[cfg(test)]
 mod genesis_cache_lookup_tests;
+
+mod placement_admission;

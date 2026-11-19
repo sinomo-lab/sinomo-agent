@@ -145,7 +145,7 @@ pub(crate) struct CanonicalCurrentWriteCompletion {
 }
 
 impl CanonicalCurrentWriteCompletion {
-    fn from_current_publication(
+    pub(crate) fn from_current_publication(
         publication: Option<&DfsWritePublication>,
         object: &DfsObjectMetadata,
         version: &DfsVersion,
@@ -169,6 +169,13 @@ impl CanonicalCurrentWriteCompletion {
                 extents: Vec::new(),
             },
         })
+    }
+
+    pub(crate) fn publish(&self, content: &crate::LocalContentStore) -> Result<ContentManifest, crate::ContentStoreError> {
+        if let Some(live) = content.try_complete_canonical_current_inline_manifest(self)? {
+            return Ok(live);
+        }
+        content.put_blob_only_manifest(&self.manifest.object_id,&self.manifest.version,&self.manifest.content_hash,self.manifest.size_bytes)
     }
 
     pub(crate) fn manifest(&self) -> &ContentManifest {
@@ -884,50 +891,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
         validate_write_operation_id(&command.request_id)?;
-        let (
-            exclusive_create_is_still_visible,
-            exclusive_create_pending_generation_is_visible,
-            exclusive_create_payload_mismatch_path,
-        ) = if let Some(expected_event_id) = routed_exclusive_create_event_id(command) {
-            let object = command
-                .object_metadata
-                .as_ref()
-                .expect("exclusive-create replay identity requires object metadata");
-            let path_key = crate::posix_path::normalized_posix_path_key(&object.path)
-                .unwrap_or_else(|| object.path.clone());
-            // A committed exclusive create is replayable only while the exact
-            // target generation remains visible at the path carried by the
-            // request. While its durable intent is still collecting receipts,
-            // the transient namespace object intentionally retains its base
-            // version; its derived event id still proves that it belongs to
-            // this exact request and may safely replay the Pending outcome.
-            // Resolve that path through its authoritative shard instead of
-            // looking up a brand-new object id with no shard index. The latter
-            // falls back across every shard and makes cold creates pay for
-            // unrelated journal refreshes before their normal path check.
-            let visible = self.authoritative_metadata_object_for_path(
-                &command.request.file_system_id,
-                &path_key,
-            )?;
-            let same_object = visible.as_ref().is_some_and(|visible| {
-                visible.object_id == command.request.object_id
-                    && visible.kind != DfsObjectKind::Tombstone
-            });
-            let same_request = same_object
-                && visible.as_ref().is_some_and(|visible| {
-                    visible.last_modified_by_event_id.as_ref() == Some(&expected_event_id)
-                });
-            let same_generation = same_object
-                && visible
-                    .as_ref()
-                    .is_some_and(|visible| visible.version == command.request.target_version);
-            let exact = same_generation && same_request;
-            let mismatch_path = (same_generation && !exact)
-                .then(|| visible.expect("same generation has a visible object").path);
-            (Some(exact), Some(same_request), mismatch_path)
-        } else {
-            (None, None, None)
-        };
         let expected_content_hash = routed_write_command_content_hash(command);
         let Some(expected_content_size_bytes) = routed_write_command_content_size_bytes(command)
         else {
@@ -954,22 +917,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             if let DfsWriteIntentState::PreconditionFailed { failure } = &intent.state {
-                return Err(DfsError::WritePreconditionFailed { failure: failure.clone() });
-            }
-            if let Some(path) = exclusive_create_payload_mismatch_path.clone() {
-                return Err(DfsError::AlreadyExists { path });
-            }
-            if exclusive_create_is_still_visible == Some(false)
-                && (matches!(intent.state, DfsWriteIntentState::Committed)
-                    || exclusive_create_pending_generation_is_visible != Some(true))
-            {
-                return Err(DfsError::WriteReconciliationRequired {
-                    operation_id: command.request_id.clone(),
-                    object_id: command.request.object_id.clone(),
-                    reason: "the exclusive-create result is no longer the visible path generation"
-                        .to_string(),
+                return Err(DfsError::WritePreconditionFailed {
+                    failure: failure.clone(),
                 });
             }
+            let committed = matches!(intent.state, DfsWriteIntentState::Committed)
+                || self.recover_unpublished_exclusive_create(
+                    &intent,
+                    command,
+                    &expected_content_hash,
+                    expected_content_size_bytes,
+                )?;
+            self.validate_exclusive_replay_visibility(command, committed)?;
             return self.replayed_routed_write_outcome_for_intent(
                 &intent,
                 &expected_content_hash,
@@ -983,7 +942,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None
         };
         if stable_record.is_none() {
-            stable_record = self.recover_retained_routed_write_opening(
+            stable_record = self.recover_retained_routed_write(
                 requester_node_id,
                 command,
                 &stable_intent_id,
@@ -1015,25 +974,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             if let DfsWriteIntentStatus::PreconditionFailed { failure } = &record.status {
-                return Err(DfsError::WritePreconditionFailed { failure: failure.clone() });
-            }
-            if let Some(path) = exclusive_create_payload_mismatch_path {
-                return Err(DfsError::AlreadyExists { path });
-            }
-            if exclusive_create_is_still_visible == Some(false)
-                && (matches!(record.status, DfsWriteIntentStatus::Committed)
-                    || exclusive_create_pending_generation_is_visible != Some(true))
-            {
-                return Err(DfsError::WriteReconciliationRequired {
-                    operation_id: command.request_id.clone(),
-                    object_id: command.request.object_id.clone(),
-                    reason: "the exclusive-create result is no longer the visible path generation"
-                        .to_string(),
+                return Err(DfsError::WritePreconditionFailed {
+                    failure: failure.clone(),
                 });
             }
+            let committed = matches!(record.status, DfsWriteIntentStatus::Committed)
+                || (command.exclusive_create
+                    && self.recover_unpublished_exclusive_create(
+                        &crate::intent::distributed_intent_from_record(&record),
+                        command,
+                        &expected_content_hash,
+                        expected_content_size_bytes,
+                    )?);
+            self.validate_exclusive_replay_visibility(command, committed)?;
             self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
             self.restore_backend_receipt_pages_for_intent(&record)?;
-            if matches!(record.status, DfsWriteIntentStatus::Committed) {
+            if committed {
                 self.restore_recorded_content_receipts(&record)?;
             }
             let Some(intent) = self.coordinator.intent(&record.intent_id).cloned() else {
@@ -1065,10 +1021,112 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(None)
     }
 
-    /// After restart an initial prepare can be durable while neither the
-    /// applied-intent row nor the resident coordinator exists. Its absence
-    /// from those projections must not admit a newly timestamped opening.
-    fn recover_retained_routed_write_opening(
+    /// A cold owner can recover the pending intent from the sealed prepare
+    /// before it has a resident coordinator or a visible path. Both forms
+    /// must finish the same original record before checking path visibility.
+    fn recover_unpublished_exclusive_create(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        command: &DfsDistributedWriteCommand,
+        hash: &str,
+        size: u64,
+    ) -> Result<bool, DfsError> {
+        if !command.exclusive_create || self.transport.delegates_local_namespace_authority() {
+            return Ok(false);
+        }
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        let Some(record) = backend
+            .prepared_operation_record(&format!("write:{}", intent.intent_id))?
+            .filter(|r| r.status == DfsPreparedOperationStatus::Prepared)
+        else {
+            return Ok(false);
+        };
+        Self::validate_prepared_routed_final(&record, intent, command, hash, size)?;
+        self.recover_one_prepared_operation(record)
+    }
+
+    fn validate_exclusive_replay_visibility(
+        &mut self,
+        command: &DfsDistributedWriteCommand,
+        committed: bool,
+    ) -> Result<(), DfsError> {
+        let Some(expected_event) = routed_exclusive_create_event_id(command) else {
+            return Ok(());
+        };
+        let object = command
+            .object_metadata
+            .as_ref()
+            .expect("create event requires metadata");
+        let path = crate::posix_path::normalized_posix_path_key(&object.path)
+            .unwrap_or_else(|| object.path.clone());
+        let visible =
+            self.authoritative_metadata_object_for_path(&command.request.file_system_id, &path)?;
+        if let Some(current) = visible
+            && current.object_id == command.request.object_id
+            && current.kind != DfsObjectKind::Tombstone
+        {
+            let same_event = current.last_modified_by_event_id.as_ref() == Some(&expected_event);
+            let same_version = current.version == command.request.target_version;
+            if same_event && (same_version || !committed) {
+                return Ok(());
+            }
+            if same_version && !same_event {
+                return Err(DfsError::AlreadyExists { path: current.path });
+            }
+        }
+        Err(DfsError::WriteReconciliationRequired {
+            operation_id: command.request_id.clone(),
+            object_id: command.request.object_id.clone(),
+            reason: "the exclusive-create result is no longer the visible path generation".into(),
+        })
+    }
+
+    fn validate_prepared_routed_final(
+        record: &DfsPreparedOperationRecord,
+        intent: &DistributedWriteIntent,
+        command: &DfsDistributedWriteCommand,
+        hash: &str,
+        size: u64,
+    ) -> Result<(), DfsError> {
+        record.validate()?;
+        let target = record
+            .payload
+            .transaction
+            .objects
+            .iter()
+            .find(|o| o.object_id == intent.object_id);
+        let create_event = routed_exclusive_create_event_id(command);
+        if record.digest.operation_id != format!("write:{}", intent.intent_id)
+            || intent.operation_id.as_deref() != Some(&command.request_id)
+            || intent.policy != command.policy
+            || intent.touch_parent_on_create != command.touch_parent_on_create
+            || intent.desired_replica_nodes.iter().collect::<BTreeSet<_>>()
+                != command
+                    .desired_replica_nodes
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+            || command
+                .expected_base_version
+                .as_ref()
+                .is_some_and(|v| intent.base_version.as_ref() != Some(v))
+            || command.exclusive_create
+                && (create_event.is_none()
+                    || target.and_then(|o| o.last_modified_by_event_id.as_ref())
+                        != create_event.as_ref())
+        {
+            return Err(DfsError::WriteOperationIdConflict {
+                operation_id: command.request_id.clone(),
+                object_id: intent.object_id.clone(),
+            });
+        }
+        Self::validate_recorded_write_retry(&record.payload, intent, hash, size)
+    }
+
+    /// A restart may retain the original prepare before any applied intent
+    /// row exists. Only that immutable opening or final write may be recovered.
+    fn recover_retained_routed_write(
         &mut self,
         requester_node_id: &NodeId,
         command: &DfsDistributedWriteCommand,
@@ -1131,19 +1189,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             let intent = crate::intent::distributed_intent_from_record(original);
-            validate_retained_write_opening(&prepared, original, &intent, content_hash)?;
-            if self.pending_write_size_hint(
-                &object.object_id,
-                &original.target_version,
-                content_hash,
-            )? != Some(content_size_bytes)
-            {
-                return Err(DfsError::WriteReconciliationRequired {
-                    operation_id: command.request_id.clone(),
-                    object_id: object.object_id.clone(),
-                    reason: "retained opening has no exact transfer size/source for this retry"
-                        .into(),
-                });
+            if prepared.payload.prepared_intent.is_some() {
+                Self::validate_prepared_routed_final(
+                    &prepared,
+                    &intent,
+                    command,
+                    content_hash,
+                    content_size_bytes,
+                )?;
+            } else {
+                validate_retained_write_opening(&prepared, original, &intent, content_hash)?;
+                if self.pending_write_size_hint(
+                    &object.object_id,
+                    &original.target_version,
+                    content_hash,
+                )? != Some(content_size_bytes)
+                {
+                    return Err(DfsError::WriteReconciliationRequired {
+                        operation_id: command.request_id.clone(),
+                        object_id: object.object_id.clone(),
+                        reason: "retained opening has no exact transfer size/source for this retry"
+                            .into(),
+                    });
+                }
             }
             if opening.replace(prepared).is_some() {
                 return Err(DfsError::WriteReconciliationRequired {
@@ -1222,7 +1290,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }))
     }
 
-    fn replayed_routed_write_outcome_for_intent(
+    pub(crate) fn replayed_routed_write_outcome_for_intent(
         &mut self,
         intent: &DistributedWriteIntent,
         content_hash: &str,
@@ -1576,6 +1644,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut preingested_blob: Option<ContentStoreQuarantinedBlob>,
         replay_only: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let dispatch = if command.wait_for_commit {
+            DfsWriteDispatch::AwaitCommit
+        } else {
+            DfsWriteDispatch::AwaitResponse
+        };
         let request_id = command.request_id.clone();
         let object_id = command.request.object_id.clone();
         let file_system_id = command.request.file_system_id.clone();
@@ -1832,6 +1905,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     } else {
                                         DfsWriteRepair::Background
                                     },
+                                    dispatch,
                                     ..DfsDistributedWriteOptions::default()
                                 },
                             )
@@ -1852,6 +1926,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     } else {
                                         DfsWriteRepair::Background
                                     },
+                                    dispatch,
                                     ..DfsDistributedWriteOptions::default()
                                 },
                             )
@@ -1873,6 +1948,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     } else {
                                         DfsWriteRepair::Background
                                     },
+                                    dispatch,
                                     ..DfsDistributedWriteOptions::default()
                                 },
                             )
@@ -1904,6 +1980,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 } else {
                                     DfsWriteRepair::Background
                                 },
+                                dispatch,
                                 ..DfsDistributedWriteOptions::default()
                             },
                         )
@@ -1923,7 +2000,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 } else {
                                     DfsWriteRepair::Background
                                 },
-                                dispatch: DfsWriteDispatch::AwaitResponse,
+                                dispatch,
                                 replay_response_journal: true,
                                 operation_id: Some(request_id.clone()),
                             },
@@ -3250,12 +3327,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| object.object_id)
             .unwrap_or_else(|| publication_object_id.clone());
         let published = (|| {
-            if let Some(completion) = completion.as_ref()
-                && let Some(manifest) = self
-                    .content
-                    .try_complete_canonical_current_inline_manifest(completion)?
-            {
-                return Ok(manifest);
+            if let Some(completion) = completion.as_ref() {
+                return completion.publish(&self.content);
             }
             self.content.put_blob_only_manifest(
                 object_id.as_str(),

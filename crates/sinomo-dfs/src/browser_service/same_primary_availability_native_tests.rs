@@ -85,15 +85,20 @@ mod filesystem_projection;
 
 #[test]
 fn native_fresh_w2_n3_create_survives_a_same_primary_follower_partition() {
-    same_primary_follower_partition("native-same-primary-follower-baseline", true);
+    same_primary_follower_partition("native-same-primary-follower-baseline", true, false);
 }
 
 #[test]
 fn native_write_set_continuation_expires_with_the_original_caller() {
-    same_primary_follower_partition("native-write-set-continuation-cancel", false);
+    same_primary_follower_partition("native-write-set-continuation-cancel", false, false);
 }
 
-fn same_primary_follower_partition(name: &str, settle_verdict: bool) {
+#[test]
+fn native_owner_path_write_continues_its_original_w2_prepare_after_partition() {
+    same_primary_follower_partition("native-owner-path-write-follower-partition", true, true);
+}
+
+fn same_primary_follower_partition(name: &str, settle_verdict: bool, path_command:bool) {
     let (native, nodes) = DfsTestRuntime::start_cluster(name, 3).unwrap();
     let assignment = native
         .metadata_shards()
@@ -348,8 +353,14 @@ fn same_primary_follower_partition(name: &str, settle_verdict: bool) {
                     let actual_options =
                         (options.policy.clone(), options.replica_candidates.clone());
                     let previous = service.set_transport_operation_deadline(Some(deadline));
-                    let outcome = service
-                        .posix_create_file_with_operation_id(PATH, BYTES, options, &operation);
+                    let outcome = if path_command {
+                        service.route_namespace_operation_with_request_id_and_result(operation.clone(),primary.clone(),crate::DfsNamespaceOperation::WriteFile {
+                            path:PATH.into(),bytes:crate::DfsOwnerWriteContent::Inline(bytes::Bytes::from_static(BYTES)),expected:None,
+                        }).and_then(|result| match result {
+                            Some(crate::DfsPosixCoordinationResult::FileWritten(_)) => service.posix_stat_distributed(PATH),
+                            other => Err(crate::DfsPosixError::Dfs(crate::DfsError::Metadata {message:format!("missing committed owner receipt: {other:?}")})),
+                        })
+                    } else { service.posix_create_file_with_operation_id(PATH, BYTES, options, &operation) };
                     service.set_transport_operation_deadline(previous);
                     Ok((actual_options, outcome))
                 },

@@ -647,8 +647,19 @@ fn next_inner(root: &Path, cursor: &mut SourceCursor) -> Result<Option<SourceRec
                     }
                     Err(error) => return Err(error),
                 };
+                let record_len = 4 + bytes.len() as u64;
+                let bytes = if source.kind == Kind::JournalSegment {
+                    let original = sinomo_dfs::original_metadata_journal_document(&bytes)?;
+                    if original.len() == bytes.len() {
+                        bytes
+                    } else {
+                        original.to_vec()
+                    }
+                } else {
+                    bytes
+                };
                 let value = decode(&bytes)?;
-                cursor.offset += 4 + bytes.len() as u64;
+                cursor.offset += record_len;
                 match &source.kind {
                     Kind::TableLog => SourceRecord::TableBatch {
                         batch: value,

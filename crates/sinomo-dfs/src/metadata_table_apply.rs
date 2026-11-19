@@ -615,6 +615,18 @@ pub(crate) fn compact_metadata_table_log_if_needed(
     if len <= max_log_bytes && !has_rotated_checkpoint {
         return Ok(());
     }
+    checkpoint_materialized_tables(root, state)
+}
+
+/// Install one complete exact materialization cut before retiring any WAL
+/// segment. Authored write batching and legacy log compaction use the same
+/// storage-generation, handoff and snapshot ordering.
+pub(crate) fn checkpoint_materialized_tables(
+    root: &Path,
+    state: TableMaterializationState<'_>,
+) -> Result<()> {
+    validate_checkpoint_layout(root, state.selected_original_data_layout.as_deref())?;
+    let path = metadata_table_path(root);
     // Observable history transitions are authoritative journal mutations.
     // Snapshot-only body folding would leave an incremental replica with old
     // recovery records capable of resurrecting metadata after promotion.
@@ -1767,7 +1779,10 @@ fn require_same_checkpoint_layout(
     Ok(())
 }
 
-fn validate_checkpoint_layout(root: &Path, selected: Option<&crate::DfsSelectedOriginalDataLayout>) -> Result<()> {
+pub(crate) fn validate_checkpoint_layout(
+    root: &Path,
+    selected: Option<&crate::DfsSelectedOriginalDataLayout>,
+) -> Result<()> {
     if let Some(layout) = selected {
         crate::metadata_api::validate_handoff_layout_root(layout, root)
     } else {
@@ -2781,6 +2796,14 @@ mod tests {
                 "/services",
             )
             .unwrap();
+        let original_root =
+            crate::default_dfs_metadata_shards_root(native.data_dir(&config.primary_node_id))
+                .join(&config.shard_id);
+        let subscriber = crate::LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(&config.shard_id),
+            &original_root,
+        )
+        .unwrap();
         service
             .posix_mkdir_all("/services/checkpoint-source")
             .unwrap();
@@ -2791,9 +2814,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let original_root =
-            crate::default_dfs_metadata_shards_root(native.data_dir(&config.primary_node_id))
-                .join(&config.shard_id);
+        drop(subscriber);
         drop(service);
         native.stop_node(&config.primary_node_id).unwrap();
         let copy = sinomo_testdir::TestDir::new("native-checkpoint-certificate-copy");

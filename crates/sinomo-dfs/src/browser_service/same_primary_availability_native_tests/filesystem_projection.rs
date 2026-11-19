@@ -286,6 +286,88 @@ impl Fixture {
 }
 
 #[test]
+fn ordinary_w2_create_and_overwrite_each_publish_one_recoverable_write() {
+    let fixture = Fixture::new("native-one-publication-w2");
+    for bytes in [b"first".as_slice(), b"replacement".as_slice()] {
+        let before = fixture.cut().materialized_through_sequence;
+        fixture
+            .backend
+            .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+                path: PATH.into(),
+                bytes: bytes.to_vec(),
+            })
+            .expect("owner commits the requested bytes");
+        let cut = fixture.cut();
+        let object = cut.tables.objects.iter().find(|o| o.path == PATH).unwrap();
+        let records: Vec<_> = cut.tables.prepared_operations_v7.iter()
+            .filter(|p| p.digest.prepare_sequence > before)
+            .filter(|p| p.terminal_intent.as_ref().is_some_and(|i| i.object_id == object.object_id)
+                || p.metadata_effects.iter().any(|e| matches!(e, DfsPreparedMetadataEffect::PutIntent {intent} if intent.object_id == object.object_id)))
+            .collect();
+        assert_eq!(records.len(), 1, "one native write transaction");
+        let record = records[0];
+        assert_eq!(record.status, crate::DfsPreparedOperationStatus::Committed);
+        assert!(record.completed_request_completion.is_some());
+        assert_eq!(record.content_receipts.len(), 2);
+        assert_eq!(
+            record.terminal_intent.as_ref().unwrap().target_version,
+            object.version
+        );
+        assert_eq!(object.content_hash, Some(crate::content_hash(bytes)));
+    }
+    fixture.native.close().unwrap();
+}
+
+#[test]
+fn cold_table_reader_joins_a_private_write_cut_and_observes_subsequent_publication() {
+    let fixture = Fixture::new("native-private-projection-reader-handoff");
+    let write = |bytes: &[u8]| {
+        fixture
+            .backend
+            .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+                path: PATH.into(),
+                bytes: bytes.to_vec(),
+            })
+            .unwrap()
+    };
+    let shard = DfsMetadataShardId::new(&fixture.assignment.shard_id);
+    let primary = &fixture.assignment.primary_node_id;
+    let root = crate::local_dfs_metadata_shard_path(fixture.native.data_dir(primary), &shard);
+    write(b"wal-only first version");
+    let mut reader = LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &root).unwrap();
+    reader.begin_stat_read_snapshot().unwrap();
+    let get = |reader: &LocalSobjMetadataBackend| {
+        reader
+            .get_object_by_path(&sifs_file_system_id(), PATH)
+            .unwrap()
+            .unwrap()
+    };
+    let first = get(&reader);
+    assert_eq!(
+        first.content_hash,
+        Some(crate::content_hash(b"wal-only first version"))
+    );
+    write(b"published with a pinned reader");
+    assert_eq!(get(&reader).version, first.version);
+    reader.end_stat_read_snapshot();
+    reader.begin_stat_read_snapshot().unwrap();
+    assert_eq!(
+        get(&reader).content_hash,
+        Some(crate::content_hash(b"published with a pinned reader"))
+    );
+    reader.end_stat_read_snapshot();
+    drop(reader);
+    write(b"last version before reopen");
+    let reopened = LocalSobjMetadataBackend::new(shard, root).unwrap();
+    assert_eq!(
+        get(&reopened).content_hash,
+        Some(crate::content_hash(b"last version before reopen"))
+    );
+    drop(reopened);
+    fixture.native.close().unwrap();
+}
+
+#[test]
 fn healthy_current_create_preserves_the_actual_w2_n3_native_definition() {
     let fixture = Fixture::new("native-filesystem-definition-current");
     let before = fixture.cut();

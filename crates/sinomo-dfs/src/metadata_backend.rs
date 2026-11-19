@@ -30,9 +30,8 @@ use crate::metadata_io::create_dir_all;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch,
     journal_entries_since_limited_with_next_sequence, metadata_prefix_proof_after_exact_frame,
-    persist_replayed_journal_frames, read_next_journal_sequence_lenient,
-    read_segmented_journal_frame_at_sequence, read_segmented_journal_frames_at_sequences,
-    write_local_journal_frame_with_bytes,
+    read_next_journal_sequence_lenient, read_segmented_journal_frame_at_sequence,
+    read_segmented_journal_frames_at_sequences, write_local_journal_frame_with_bytes,
 };
 use crate::metadata_keys::{
     directory_page_cursor_with_dentry, normalize_path, path_record_for_object,
@@ -318,6 +317,8 @@ pub struct LocalSobjMetadataBackend {
     root: PathBuf,
     selected_original_data_layout: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
     replica_progress: crate::DfsMetadataReplicaObserver,
+    table_reader: Option<projection::TableReader>,
+    buffered_projection: projection::BufferedProjection,
     next_sequence: u64,
     tables: DfsMetadataTables,
     table_log_offset: u64,
@@ -520,6 +521,13 @@ impl LocalSobjMetadataBackend {
         let mut backend = Self {
             shard_id,
             replica_progress: crate::metadata_replica_observer::subscribe(&root),
+            // Staged genesis has a separate activation/cold-recovery owner.
+            table_reader: if native_genesis_staging {
+                None
+            } else {
+                projection::TableReader::register(&root, try_writer)?
+            },
+            buffered_projection: Default::default(),
             root,
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
@@ -580,12 +588,21 @@ impl LocalSobjMetadataBackend {
                 &backend.root,
                 &backend.shard_id,
             )?;
-            let state = load_metadata_tables(&backend.root)?;
+            let mut state = load_metadata_tables(&backend.root)?;
             if state.generation.is_none() && !native_genesis_staging {
                 return Err(MetadataBackendError::Serde("active metadata unit has no current generation checkpoint".into()));
             }
             if state.generation.as_ref().is_some_and(|identity| identity != &generation.identity) {
                 return Err(MetadataBackendError::Serde("snapshot and root storage generation identities differ".into()));
+            }
+            if state.materialized_through_sequence.unwrap_or(0)
+                < backend.next_sequence.saturating_sub(1)
+            {
+                backend.buffered_projection = projection::hydrate_private_projection(
+                    &backend.root,
+                    &backend.shard_id,
+                    &mut state,
+                )?;
             }
             let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
             backend.tables = state.tables;
@@ -674,11 +691,9 @@ impl LocalSobjMetadataBackend {
         Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
         #[cfg(test)]
         METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
-        let storage_generation_before = metadata_table_storage_generation(&root)?;
-        let state = read_metadata_table_state_lenient(&root)?;
-        let storage_generation_after = metadata_table_storage_generation(&root)?;
-        let table_storage_generation = (storage_generation_before == storage_generation_after)
-            .then_some(storage_generation_after);
+        let table_reader = projection::TableReader::subscribe(&root)?;
+        let (state, buffered_projection, table_storage_generation) =
+            projection::read_inspection_state(&root, &shard_id)?;
         require_version_pin_table_invariants(&state.tables)?;
         let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         let next_sequence = read_next_journal_sequence_lenient(&root)?
@@ -690,6 +705,8 @@ impl LocalSobjMetadataBackend {
         Ok(Self {
             shard_id,
             replica_progress: crate::metadata_replica_observer::subscribe(&root),
+            table_reader,
+            buffered_projection,
             root,
             next_sequence,
             tables: state.tables,
@@ -726,6 +743,7 @@ impl LocalSobjMetadataBackend {
     /// bounded migration keeps these handles across yielded continuations so
     /// a 256-record page does not rehydrate every shard catalog.
     pub(crate) fn refresh_for_inspection(&mut self) -> Result<()> {
+        self.validate_projection_subscription()?;
         let storage_generation_before = metadata_table_storage_generation(&self.root)?;
         metadata_read_snapshot::ensure_table_log_cursor_generation(
             &self.root,
@@ -733,6 +751,27 @@ impl LocalSobjMetadataBackend {
             &storage_generation_before,
             self.table_log_offset,
         )?;
+        if (self.buffered_projection.bytes != 0
+            && self.table_storage_generation.as_ref() != Some(&storage_generation_before))
+            || (cfg!(unix) && self.table_reader.is_none() && self.root.is_dir())
+        {
+            if self.table_reader.is_none() {
+                self.table_reader = projection::TableReader::subscribe(&self.root)?;
+            }
+            let (state, buffered, generation) =
+                projection::read_inspection_state(&self.root, &self.shard_id)?;
+            self.tables = state.tables;
+            self.table_log_offset = state.table_log_offset;
+            self.materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
+            self.prefix_proof = state.prefix_proof;
+            self.table_snapshot_fingerprint = state.snapshot_fingerprint;
+            self.table_storage_generation = generation;
+            self.buffered_projection = buffered;
+            self.next_sequence = read_next_journal_sequence_lenient(&self.root)?
+                .max(self.materialized_through_sequence.saturating_add(1));
+            self.release_obsolete_read_snapshot_cache();
+            return require_version_pin_table_invariants(&self.tables);
+        }
         metadata_read_snapshot::refresh_metadata_tables_lenient(
             &self.root,
             &mut self.tables,
@@ -800,8 +839,10 @@ impl LocalSobjMetadataBackend {
         if selected_original_data_layout.is_some() {
             Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
         }
-        let state = match read_metadata_table_state_lenient(&root) {
-            Ok(state) => state,
+        let table_reader = projection::TableReader::subscribe(&root)?;
+        let (state, buffered_projection) = match projection::read_inspection_state(&root, &shard_id)
+        {
+            Ok((state, buffered, _)) => (state, buffered),
             Err(error) => {
                 tracing::warn!(
                     target: "sinomo.dfs",
@@ -810,7 +851,10 @@ impl LocalSobjMetadataBackend {
                     error = %error,
                     "opening non-primary metadata replica from its last self-contained snapshot; authenticated snapshot repair is required"
                 );
-                read_metadata_table_snapshot_for_replica_repair(&root)?
+                (
+                    read_metadata_table_snapshot_for_replica_repair(&root)?,
+                    Default::default(),
+                )
             }
         };
         require_version_pin_table_invariants(&state.tables)?;
@@ -818,6 +862,8 @@ impl LocalSobjMetadataBackend {
         let mut backend = Self {
             shard_id,
             replica_progress: crate::metadata_replica_observer::subscribe(&root),
+            table_reader,
+            buffered_projection,
             root,
             // Ignore the unreadable journal suffix until the primary either
             // sends a clean continuation or replaces it with a snapshot.
@@ -1048,6 +1094,8 @@ impl LocalSobjMetadataBackend {
         let mut backend = Self {
             shard_id,
             replica_progress: crate::metadata_replica_observer::subscribe(&root),
+            table_reader: projection::TableReader::subscribe(&root)?,
+            buffered_projection: Default::default(),
             root,
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
@@ -1249,6 +1297,7 @@ impl LocalSobjMetadataBackend {
         }
         let staged_snapshot = snapshot.stage_candidate_copy(&self.root)?;
         crate::metadata_journal::admission::invalidate(&self.root)?;
+        self.buffered_projection = Default::default();
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         #[cfg(test)]
         snapshot_install_fault(&self.root, "after-archive")?;
@@ -1573,6 +1622,7 @@ impl LocalSobjMetadataBackend {
             Some(self.materialized_through_sequence),
             self.prefix_proof.as_ref(),
         )?;
+        self.buffered_projection = Default::default();
         self.table_log_offset = 0;
 
         self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
@@ -1728,26 +1778,6 @@ impl LocalSobjMetadataBackend {
             )));
         }
         Ok(proof)
-    }
-
-    fn write_journal_unlocked(
-        &mut self,
-        mutation: DfsMetadataMutation,
-    ) -> Result<DfsMetadataJournalEntry> {
-        self.write_journal_unlocked_with_record_bytes(mutation)
-            .map(|(entry, _)| entry)
-    }
-
-    fn write_journal_unlocked_with_record_bytes(
-        &mut self,
-        mutation: DfsMetadataMutation,
-    ) -> Result<(DfsMetadataJournalEntry, u64)> {
-        let frame = crate::metadata_journal::DfsMetadataJournalFrame::local(
-            &self.shard_id,
-            self.next_sequence,
-            mutation,
-        )?;
-        self.write_journal_frame_unlocked(&frame, &mut None)
     }
 
     fn write_journal_frame_unlocked(
@@ -2069,7 +2099,10 @@ impl LocalSobjMetadataBackend {
     fn reload_durable_metadata_table_state(&mut self) -> Result<()> {
         #[cfg(test)]
         METADATA_DURABLE_TABLE_RELOADS.set(METADATA_DURABLE_TABLE_RELOADS.get().saturating_add(1));
-        let state = read_metadata_table_state_lenient(&self.root)?;
+        let mut state = read_metadata_table_state_lenient(&self.root)?;
+        self.buffered_projection =
+            projection::hydrate_private_projection(&self.root, &self.shard_id, &mut state)?;
+        self.release_obsolete_read_snapshot_cache();
         self.tables = state.tables;
         self.tables.clear_repair_index_changes();
         self.table_log_offset = state.table_log_offset;
@@ -2107,6 +2140,7 @@ impl LocalSobjMetadataBackend {
         fields(stage = "dfs.metadata.refresh")
     )]
     fn refresh_after_metadata_write_lock(&mut self) -> Result<()> {
+        self.validate_projection_subscription()?;
         #[cfg(test)]
         METADATA_BEGIN_WRITE_CALLS.set(METADATA_BEGIN_WRITE_CALLS.get().saturating_add(1));
         // `next_sequence` advances only after the local journal record is
@@ -2357,6 +2391,7 @@ impl LocalSobjMetadataBackend {
         sequence: u64,
         ops: Vec<DfsMetadataTableOp>,
     ) -> Result<()> {
+        self.publish_buffered_projection()?;
         let root = self.root.clone();
         metadata_table_apply::append_and_apply_table_ops(
             &root,
@@ -2376,6 +2411,7 @@ impl LocalSobjMetadataBackend {
         ops: Vec<DfsMetadataTableOp>,
         rollback: DfsMetadataTableRollback,
     ) -> Result<()> {
+        self.publish_buffered_projection()?;
         let root = self.root.clone();
         metadata_table_apply::append_preapplied_table_ops(
             &root,
@@ -2441,6 +2477,11 @@ impl LocalSobjMetadataBackend {
             return self.reload_durable_metadata_table_state();
         }
         let current_storage_generation = metadata_table_storage_generation(&self.root)?;
+        if self.buffered_projection.bytes != 0
+            && self.table_storage_generation.as_ref() != Some(&current_storage_generation)
+        {
+            return self.reload_durable_metadata_table_state();
+        }
         metadata_read_snapshot::ensure_table_log_cursor_generation(
             &self.root,
             &self.table_storage_generation,
@@ -2559,6 +2600,7 @@ impl LocalSobjMetadataBackend {
     }
 
     pub(crate) fn current_tables_snapshot(&self) -> Result<DfsMetadataTablesSnapshot<'_>> {
+        self.validate_projection_subscription()?;
         #[cfg(test)]
         METADATA_CURRENT_TABLES_SNAPSHOT_CALLS.set(
             METADATA_CURRENT_TABLES_SNAPSHOT_CALLS
@@ -3395,6 +3437,7 @@ fn snapshot_install_fault(root: &Path, point: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests;
 
+mod projection;
 mod replay;
 
 mod alignment;

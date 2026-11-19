@@ -26,6 +26,16 @@ pub struct DfsMetadataReplicaObservation {
 struct ObservationState {
     latest: Option<DfsMetadataReplicaObservation>,
     outbound_cursors: BTreeMap<NodeId, u64>,
+    replacement_generation: u64,
+    unprepared: BTreeMap<NodeId, PreparationWait>,
+}
+
+#[derive(Debug)]
+struct PreparationWait {
+    file_system_id: DfsFileSystemId,
+    epoch: u64,
+    cursor: u64,
+    retry_at: std::time::Instant,
 }
 
 type ObservationCell = Mutex<ObservationState>;
@@ -85,6 +95,8 @@ impl DfsMetadataReplicaObserver {
         let mut state = self.cell.lock().unwrap_or_else(|error| error.into_inner());
         if replaced {
             state.outbound_cursors.clear();
+            state.unprepared.clear();
+            state.replacement_generation += 1;
         }
         let latest = &mut state.latest;
         if !replaced
@@ -118,8 +130,27 @@ impl DfsMetadataReplicaObserver {
     pub(crate) fn observe_outbound(&self, cursors: &[(NodeId, u64)]) {
         let mut state = self.cell.lock().unwrap_or_else(|error| error.into_inner());
         for (node, sequence) in cursors {
+            if state
+                .unprepared
+                .get(node)
+                .is_some_and(|wait| *sequence > wait.cursor)
+            {
+                state.unprepared.remove(node);
+            }
             let cursor = state.outbound_cursors.entry(node.clone()).or_default();
             *cursor = (*cursor).max(*sequence);
+        }
+    }
+
+    pub(crate) fn preparation_watch(self) -> ReplicaPreparationWatch {
+        let generation = self
+            .cell
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replacement_generation;
+        ReplicaPreparationWatch {
+            observer: self,
+            generation,
         }
     }
 
@@ -144,4 +175,93 @@ pub(crate) fn outbound_cursor(root: &Path, node: &NodeId) -> Option<u64> {
         .and_then(Weak::upgrade)?;
     let state = cell.lock().unwrap_or_else(|error| error.into_inner());
     state.outbound_cursors.get(node).copied()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicaPreparationWatch {
+    observer: DfsMetadataReplicaObserver,
+    generation: u64,
+}
+
+impl ReplicaPreparationWatch {
+    /// A scheduling hint scoped to this physical root. A confirmed advance,
+    /// new assignment epoch, snapshot replacement or the retry deadline reopens it.
+    pub(crate) fn preparation_pending(
+        &self,
+        node: &NodeId,
+        fs: &DfsFileSystemId,
+        epoch: u64,
+        cursor: u64,
+    ) -> bool {
+        let state = self
+            .observer
+            .cell
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.replacement_generation == self.generation
+            && state.unprepared.get(node).is_some_and(|wait| {
+                wait.file_system_id == *fs
+                    && wait.epoch == epoch
+                    && wait.cursor == cursor
+                    && wait.retry_at > std::time::Instant::now()
+            })
+    }
+
+    pub(crate) fn wait_for_preparation(
+        &self,
+        node: &NodeId,
+        fs: &DfsFileSystemId,
+        epoch: u64,
+        cursor: u64,
+        retry_at: std::time::Instant,
+    ) {
+        let mut state = self
+            .observer
+            .cell
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = std::time::Instant::now();
+        state.unprepared.retain(|_, wait| wait.retry_at > now);
+        if state.replacement_generation == self.generation
+            && state
+                .outbound_cursors
+                .get(node)
+                .is_none_or(|confirmed| *confirmed <= cursor)
+        {
+            state.unprepared.insert(
+                node.clone(),
+                PreparationWait {
+                    file_system_id: fs.clone(),
+                    epoch,
+                    cursor,
+                    retry_at,
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn preparation_hint_expires_without_new_input_and_cannot_park_after_progress() {
+        let root = sinomo_testdir::TestDir::new("dfs-replica-preparation-wait");
+        let observer = subscribe(root.path());
+        let watch = observer.clone().preparation_watch();
+        let target = NodeId::from_legacy_named("dfs-unprepared-target").unwrap();
+        let fs = crate::sifs_file_system_id();
+        let now = Instant::now();
+        watch.wait_for_preparation(&target, &fs, 3, 4, now);
+        assert!(!watch.preparation_pending(&target, &fs, 3, 4));
+        let future = now + Duration::from_secs(30);
+        watch.wait_for_preparation(&target, &fs, 3, 4, future);
+        assert!(watch.preparation_pending(&target, &fs, 3, 4));
+        assert!(!watch.preparation_pending(&target, &fs, 4, 4));
+        observer.observe_outbound(&[(target.clone(), 5)]);
+        watch.wait_for_preparation(&target, &fs, 3, 4, future);
+        assert!(!watch.preparation_pending(&target, &fs, 3, 4));
+    }
 }

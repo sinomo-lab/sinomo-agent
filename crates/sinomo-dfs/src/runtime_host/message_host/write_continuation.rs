@@ -11,6 +11,10 @@ pub(super) fn candidate(
         &command.routed_message.message,
         crate::DfsNetworkMessage::DistributedWriteRequest(_)
             | crate::DfsNetworkMessage::ExclusiveCreateRequest(_)
+            | crate::DfsNetworkMessage::NamespaceRequest(crate::DfsNamespaceCommand {
+                operation: crate::DfsNamespaceOperation::WriteFile { .. },
+                ..
+            })
     ) {
         return None;
     }
@@ -22,17 +26,27 @@ fn candidate_from_snapshot(
     snapshot: &crate::DfsConfigurationSnapshot,
     command: &DfsMessageCommand,
 ) -> Option<crate::DfsMetadataShardWriteSet> {
-    let write = match &command.routed_message.message {
-        crate::DfsNetworkMessage::DistributedWriteRequest(write) if !write.exclusive_create => {
-            write
+    let shard = match &command.routed_message.message {
+        crate::DfsNetworkMessage::DistributedWriteRequest(w)
+            if !w.exclusive_create && w.patch.is_none() && w.publication.is_current() =>
+        {
+            w.authority_shard.as_ref()?
         }
-        crate::DfsNetworkMessage::ExclusiveCreateRequest(write) if write.exclusive_create => write,
+        crate::DfsNetworkMessage::ExclusiveCreateRequest(w)
+            if w.exclusive_create && w.patch.is_none() && w.publication.is_current() =>
+        {
+            w.authority_shard.as_ref()?
+        }
+        crate::DfsNetworkMessage::NamespaceRequest(ns)
+            if matches!(ns.operation, crate::DfsNamespaceOperation::WriteFile { .. }) =>
+        {
+            let [shard] = ns.authority_shards.as_slice() else {
+                return None;
+            };
+            shard
+        }
         _ => return None,
     };
-    if write.patch.is_some() || !write.publication.is_current() {
-        return None;
-    }
-    let shard = write.authority_shard.as_ref()?;
     let entries =
         snapshot.entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)?;
     let context = crate::metadata_replica_context_from_authority_entries(

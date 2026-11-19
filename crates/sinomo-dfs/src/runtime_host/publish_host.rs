@@ -13,6 +13,7 @@ fn own_dfs_publish_task(data_dir: &SinomoDataDir, task: Option<tokio::task::Join
 pub(super) fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOptions {
     DfsMetadataJournalReplicationOptions {
         background_publication: true,
+        max_batches_per_target: 1,
         ..sinomo_dfs::dfs_resident_metadata_replication_options()
     }
 }

@@ -1468,6 +1468,17 @@ impl DfsBrowserBackend {
                 return Ok(DfsBrowserWriteAttempt::ConfigurationPending(request));
             }
         };
+        if configuration.is_some()
+            && service
+                .try_route_browser_write(&path, &request.bytes, None)
+                .map_err(dfs_browser_service_error)?
+                .is_some()
+        {
+            self.flush_after_mutation(&mut service)?;
+            return Ok(DfsBrowserWriteAttempt::Complete(
+                crate::DaemonDfsBrowserWriteFileResponse,
+            ));
+        }
         // Parent preparation, policy selection and the write resolve the same
         // path. One lookup scope lets them share each authority observation;
         // any routed mutation among them discards the earlier observations.
@@ -1556,6 +1567,33 @@ impl DfsBrowserBackend {
             }
         };
         let mut service = self.lock_mutation_for_paths(&[path.as_str()])?;
+        match service.try_route_browser_write(
+            &path,
+            &request.bytes,
+            Some(crate::DfsNamespaceObjectPrecondition {
+                object_id: object_id.clone(),
+                version: version.clone(),
+            }),
+        ) {
+            Ok(Some(receipt)) => {
+                let maintenance_warning = self
+                    .flush_after_mutation(&mut service)
+                    .err()
+                    .map(|e| e.to_string());
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: Outcome::Committed {
+                        receipt,
+                        maintenance_warning,
+                    },
+                });
+            }
+            Err(error) => {
+                return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
+                    outcome: daemon_dfs_browser_conditional_write_error(error),
+                });
+            }
+            Ok(None) => {}
+        }
         let replica_candidates = self.content_replica_candidates()?;
         let options = match sifs_browser_write_options(&mut service, &path, &replica_candidates) {
             Ok(options) => options,
@@ -3565,7 +3603,7 @@ pub(crate) fn prepare_sifs_browser_write_parent<T: DfsMessageTransport>(
         error = tracing::field::Empty
     )
 )]
-fn sifs_browser_write_options_with_configuration<T: DfsMessageTransport>(
+pub(crate) fn sifs_browser_write_options_with_configuration<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     path: &str,
     replica_candidates: &[sinomo_core::node::NodeId],
@@ -3911,7 +3949,9 @@ pub fn require_matching_daemon_dfs_browser_placement_preview_token(
     ))
 }
 
-fn daemon_dfs_browser_write_receipt(stat: &crate::DfsStat) -> crate::DaemonDfsBrowserWriteReceipt {
+pub(crate) fn daemon_dfs_browser_write_receipt(
+    stat: &crate::DfsStat,
+) -> crate::DaemonDfsBrowserWriteReceipt {
     crate::DaemonDfsBrowserWriteReceipt {
         object_id: stat.object_id.to_string(),
         version: stat.version.to_string(),

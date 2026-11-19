@@ -114,14 +114,14 @@ fn native_verified_checkpoint_wakes_exact_selection_once_without_configuration_c
         .unwrap(),
         head
     );
-    put_local_dfs_metadata_replication_cursor(&data_dir, &target, &shard_id, head).unwrap();
+    put_local_dfs_metadata_replication_cursor(&data_dir, &target, &shard_id, head, None).unwrap();
     let work = reactor
         .pending_work()
         .expect("actual durable checkpoint satisfies the exact registered dependency");
     assert!(work.reconcile_defaults);
     assert_eq!(work.inputs, inputs);
     reactor.complete_default_reconciliation(&work);
-    put_local_dfs_metadata_replication_cursor(&data_dir, &target, &shard_id, head).unwrap();
+    put_local_dfs_metadata_replication_cursor(&data_dir, &target, &shard_id, head, None).unwrap();
     assert!(
         reactor.pending_work().is_none(),
         "no dependency remains to wake steady state"
@@ -151,6 +151,7 @@ fn native_cancelled_checkpoint_waiter_preserves_completed_cursor_notification() 
             target.clone(),
             shard_id.clone(),
             head,
+            None,
             None,
         ));
         tokio::time::timeout(Duration::from_secs(5), paused)

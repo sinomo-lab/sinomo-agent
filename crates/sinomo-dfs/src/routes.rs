@@ -331,6 +331,17 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
                 .unwrap_or(DfsMessageExecutionScope::ReadOnly)
         }
         DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(command.operation, DfsNamespaceOperation::WriteFile { .. }) =>
+        {
+            // An owner write publishes only on its stamped shard: a hardlink,
+            // a symlink or a parent on another shard gets a path-resolution
+            // reply before any effect. It runs on that shard's write lane, as
+            // a routed write does; without exactly one stamp it is an
+            // unstamped write.
+            namespace_authority_shard_execution_scope(command)
+                .unwrap_or(DfsMessageExecutionScope::GlobalExclusive)
+        }
+        DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
                 DfsNamespaceOperation::Unlink { .. }
@@ -1210,6 +1221,7 @@ mod tests {
             authority_shard: None,
             touch_parent_on_create: true,
             foreground_replica_repair: true,
+            wait_for_commit: false,
             exclusive_create: false,
         };
 

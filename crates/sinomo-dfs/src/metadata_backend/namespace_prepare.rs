@@ -42,7 +42,10 @@ pub(super) fn validate_namespace_request_completion_shape(
         ));
     }
     if completion.result != DfsNamespaceResult::Applied
-        || completion.posix_coordination_result.is_some()
+        || !matches!(
+            completion.posix_coordination_result,
+            None | Some(crate::DfsPosixCoordinationResult::FileWritten(_))
+        )
         || completion.completed_at < completion.created_at
     {
         return Err(MetadataBackendError::Serde(format!(
@@ -361,7 +364,14 @@ pub(super) fn validate_prepared_operation_shape(
         if completion.file_system_id != prepare.file_system_id
             || completion.authority_shard_id != prepare.shard_id
             || completion.transaction_id != prepare.transaction.transaction_id
-            || !attached_identity_matches(&completion.operation_id)
+            || if matches!(
+                completion.posix_coordination_result,
+                Some(crate::DfsPosixCoordinationResult::FileWritten(_))
+            ) {
+                !crate::posix::owner_write::proves_completion(prepare, completion)
+            } else {
+                !attached_identity_matches(&completion.operation_id)
+            }
         {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} has an invalid compact completed request attachment",

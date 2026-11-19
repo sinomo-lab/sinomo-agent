@@ -16,6 +16,7 @@ impl LocalSobjMetadataBackend {
         fields(stage = "dfs.metadata.read_snapshot", phase = "stat-view")
     )]
     pub(crate) fn pin_stat_read_snapshot(&mut self) -> Result<()> {
+        self.validate_projection_subscription()?;
         let snapshot = metadata_read_snapshot::pin_current_tables_snapshot(
             &self.root,
             &self.tables,

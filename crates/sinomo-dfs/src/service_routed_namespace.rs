@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use sinomo_core::node::NodeId;
 
 use crate::protocol::{
-    DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES, DfsNamespaceLookupRangeRequest,
+    DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES, DfsNamespaceLookupRangeRequest,
 };
 use crate::*;
 use crate::{posix_model, posix_path};
@@ -249,7 +249,8 @@ fn metadata_path_is_direct_child_of_posix_dir(directory_path: &str, metadata_pat
 fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOperation) -> bool {
     !matches!(
         operation,
-        DfsNamespaceOperation::MetadataQuery { .. }
+        DfsNamespaceOperation::WriteFile { .. }
+            | DfsNamespaceOperation::MetadataQuery { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
@@ -339,7 +340,8 @@ fn namespace_operation_can_fuse_durable_request_admission(
 ) -> bool {
     matches!(
         operation,
-        DfsNamespaceOperation::MkdirAll { .. }
+        DfsNamespaceOperation::WriteFile { .. }
+            | DfsNamespaceOperation::MkdirAll { .. }
             | DfsNamespaceOperation::CommitLocalEventualBatch { .. }
     )
 }
@@ -474,6 +476,25 @@ impl serde::Serialize for NamespaceOperationIdentity<'_> {
 }
 
 pub fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
+    if let DfsNamespaceOperation::WriteFile {
+        path,
+        bytes,
+        expected,
+    } = &command.operation
+    {
+        let (hash, size) = bytes.identity();
+        return crate::posix::owner_write::command_digest(
+            &command.file_system_id,
+            &command.requesting_node_id,
+            path,
+            expected.as_ref(),
+            &hash,
+            size,
+        )
+        .map_err(|e| DfsError::Serialization {
+            message: e.to_string(),
+        });
+    }
     let encoded = serde_json::to_vec(&(
         &command.file_system_id,
         &command.requesting_node_id,
@@ -678,7 +699,10 @@ fn classify_stable_namespace_operation(
     }
 }
 
-fn namespace_request_operation_id(requester_node_id: &NodeId, request_id: &str) -> String {
+pub(crate) fn namespace_request_operation_id(
+    requester_node_id: &NodeId,
+    request_id: &str,
+) -> String {
     let identity = format!("{requester_node_id}\0{request_id}");
     format!(
         "req-{}",
@@ -823,7 +847,8 @@ fn namespace_transaction_proves_operation_completed(
                 candidate.object_id == alias.object_id && candidate.path == alias.path
             })
         }
-        DfsNamespaceOperation::BeginContentCopy { .. }
+        DfsNamespaceOperation::WriteFile { .. }
+        | DfsNamespaceOperation::BeginContentCopy { .. }
         | DfsNamespaceOperation::MetadataQuery { .. }
         | DfsNamespaceOperation::PollNamespaceChanges { .. }
         | DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
@@ -1551,6 +1576,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 command,
                 true,
                 false,
+                None,
+                None,
             );
             if self.remote_namespace_phase.is_some() {
                 // Actual owned work is a yield, never a rejection diagnostic.
@@ -1580,10 +1607,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
 
             let detail = match attempt {
-                Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                    result: DfsNamespaceResult::Rejected { reason, .. },
-                    ..
-                }) => reason,
+                Ok((
+                    NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                        result: DfsNamespaceResult::Rejected { reason, .. },
+                        ..
+                    },
+                    _,
+                )) => reason,
                 Ok(_) => "namespace request remained pending after recovery execution".to_string(),
                 Err(error) => error.to_string(),
             };
@@ -1611,6 +1641,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: &mut DfsNamespaceCommand,
         shard_id: DfsMetadataShardId,
         recovering: bool,
+        continuation: Option<&DfsPreparedOperationDigest>,
     ) -> Result<DurableNamespaceRequestAdmission, DfsError> {
         let admission = self
             .metadata_backend
@@ -1649,6 +1680,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 posix_coordination_result: receipt.posix_coordination_result,
             });
         }
+        // A live write-set continuation has already matched the exact native
+        // digest and command. Let its final prepare reach the guarded commit
+        // below instead of rediscovering it as an unrelated interrupted write.
+        let continuing_final = prepared.as_ref().is_some_and(|record| {
+            Some(&record.digest) == continuation
+                && record.completed_request_completion.is_some()
+                && namespace_prepare_matches_routed_command(
+                    &record.payload,
+                    requester_node_id,
+                    command,
+                    &shard_id,
+                    &digest,
+                )
+        });
         if let Some(mut existing) = existing {
             if existing.file_system_id != command.file_system_id
                 || existing.command_digest != digest
@@ -1665,7 +1710,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             if existing.status == DfsNamespaceRequestStatus::Pending {
-                let owns_prepare = prepared.is_some();
+                let owns_prepare = prepared.is_some() && !continuing_final;
                 if owns_prepare {
                     if !recovering {
                         let request_key = BTreeSet::from([(
@@ -1734,7 +1779,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             };
         }
-        if let Some(prepare) = prepared {
+        if let Some(prepare) = prepared.filter(|_| !continuing_final) {
             if !namespace_prepare_matches_routed_command(
                 &prepare.payload,
                 requester_node_id,
@@ -1762,6 +1807,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     command,
                     shard_id,
                     true,
+                    None,
                 );
             }
             return Ok(DurableNamespaceRequestAdmission::Reject {
@@ -2164,7 +2210,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsNamespaceCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        self.handle_namespace_request_internal(requester_node_id, command, false, true)
+        self.handle_namespace_request_internal(requester_node_id, command, false, true, None, None)
+            .map(|(event, _)| event)
+    }
+
+    pub(crate) fn handle_staged_browser_write(
+        &mut self,
+        requester: NodeId,
+        command: DfsNamespaceCommand,
+        blob: crate::ContentStoreQuarantinedBlob,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.handle_namespace_request_internal(requester, command, false, true, None, Some(blob))
+            .map(|(event, _)| event)
+    }
+
+    pub(crate) fn resume_browser_write_command(
+        &mut self,
+        requester: NodeId,
+        command: DfsNamespaceCommand,
+        digest: &DfsPreparedOperationDigest,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        if self
+            .browser_write_prepare(&requester, &command, &digest.operation_id)?
+            .as_ref()
+            .map(|record| &record.digest)
+            != Some(digest)
+        {
+            return Err(DfsError::Metadata {
+                message: "path write lost its exact original prepare".into(),
+            });
+        }
+        self.handle_namespace_request_internal(requester, command, false, true, Some(digest), None)
+            .map(|(event, _)| event)
     }
 
     fn handle_namespace_request_internal(
@@ -2173,7 +2250,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut command: DfsNamespaceCommand,
         recovering: bool,
         send_response: bool,
-    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        continuation: Option<&DfsPreparedOperationDigest>,
+        mut write_blob: Option<crate::ContentStoreQuarantinedBlob>,
+    ) -> Result<(NetworkedDfsServiceEvent, Option<DfsPosixCoordinationResult>), DfsError> {
+        if matches!(command.operation, DfsNamespaceOperation::WriteFile { .. })
+            && requester_node_id != command.requesting_node_id
+        {
+            return Err(DfsError::Metadata {
+                message: "path write requester differs from its authenticated source".into(),
+            });
+        }
         let _namespace_plan = self.namespace_execution.begin_independent_planning();
         if let DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } = &command.operation
             && (requester_node_id != source_offer.job_offer.coordinator_node_id
@@ -2192,6 +2278,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => None,
         };
+        let placement = self.namespace_execution.placement.take().filter(|cut| {
+            requester_node_id == command.requesting_node_id && cut.command == command
+        });
         let request_id = command.request_id.clone();
         let trace_started = Instant::now();
         let trace_operation = dfs_namespace_operation_trace_label(&command.operation);
@@ -2436,6 +2525,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     &mut command,
                                     shard_id,
                                     recovering,
+                                    continuation,
                                 ) {
                                     // The request row's own commit can be left
                                     // unknown. That is the requester's answer:
@@ -2541,6 +2631,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         &mut command,
                                         scope.shard_id,
                                         recovering,
+                                        None,
                                     )?
                                 }
                             });
@@ -2665,6 +2756,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         // inherit an outer local planning snapshot.
                                         self.namespace_execution.replace_context(None)
                                     };
+                                let resumed_write = if foreign_shard.is_none() {
+                                    continuation.map(|digest| {
+                                        self.resume_browser_write_at_owner(
+                                            &requester_node_id,
+                                            &command,
+                                            digest,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
                                 let outcome = match (&foreign_shard, &mut command.operation) {
                                     (
                                         None,
@@ -2782,6 +2884,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         )
                                         .map(|()| None)
                                     }
+                                    (
+                                        None,
+                                        DfsNamespaceOperation::WriteFile {
+                                            path,
+                                            bytes,
+                                            expected,
+                                        },
+                                    ) => resumed_write
+                                        .unwrap_or_else(|| {
+                                            self.write_browser_file_at_owner(
+                                                &requester_node_id,
+                                                &request_id,
+                                                path,
+                                                bytes,
+                                                write_blob.take(),
+                                                expected.as_ref(),
+                                            )
+                                        })
+                                        .map(Some),
                                     (None, DfsNamespaceOperation::MetadataQuery { query }) => self
                                         .serve_metadata_query_for_requester(
                                             query,
@@ -2790,6 +2911,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         .map(DfsPosixCoordinationResult::MetadataQuery)
                                         .map(Some)
                                         .map_err(posix_model::DfsPosixError::from),
+                                    (
+                                        None,
+                                        operation @ DfsNamespaceOperation::ReconcilePlacement {
+                                            ..
+                                        },
+                                    ) if placement.is_some() => self
+                                        .ensure_namespace_operation_not_reserved_by_directory_move(
+                                            operation,
+                                        )
+                                        .and_then(|()| {
+                                            self.execute_namespace_operation_local_with_placement(
+                                                operation, placement,
+                                            )
+                                        })
+                                        .map(|()| None),
                                     (None, operation) => {
                                         self.execute_posix_coordination_operation_local(operation)
                                     }
@@ -2881,8 +3017,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                                 durable_job_recorded,
                                             )
                                         }));
+                                // Native write openings already retain the exact bytes, owner,
+                                // and original condition. Writing another Pending row here can
+                                // overlap that prepare and obscure its typed unknown outcome.
+                                let has_write_opening = match (&command.operation, &outcome) {
+                                    (
+                                        DfsNamespaceOperation::WriteFile { .. },
+                                        Err(posix_model::DfsPosixError::Dfs(
+                                            DfsError::MetadataCommitOutcomeUnknown {
+                                                operation_id,
+                                                ..
+                                            },
+                                        )),
+                                    ) => self
+                                        .browser_write_prepare(
+                                            &requester_node_id,
+                                            &command,
+                                            operation_id.as_str(),
+                                        )?
+                                        .is_some(),
+                                    _ => false,
+                                };
                                 if retryable_error
                                     && !read_yield_without_effects
+                                    && !has_write_opening
                                     && !durable_prepare_recorded
                                     && let Some(DurableNamespaceRequestAdmission::Execute {
                                         shard_id,
@@ -2918,6 +3076,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     ..
                                 }) = durable_execute
                                     && !retryable_error
+                                    && !matches!(posix_coordination_result, Some(DfsPosixCoordinationResult::FileWriteNeedsPathResolution))
                                 {
                                     let completion_started = Instant::now();
                                     // A successful request-owned prepare
@@ -2968,9 +3127,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &request.identity.version,
             )?;
         }
+        if let (DfsNamespaceOperation::WriteFile {path,..}, DfsNamespaceResult::Applied, Some(DfsPosixCoordinationResult::FileWritten(receipt))) =
+            (&command.operation,&result,&posix_coordination_result) {
+            self.finish_owner_write_content(&command.file_system_id,path,receipt)?;
+        }
         let mutates_metadata = !durable_replay
             && !matches!(
                 &command.operation,
+                DfsNamespaceOperation::WriteFile { .. } |
                 // Managed placement records each actual metadata write via
                 // committed work; polling its progress is not an authored edge.
                 DfsNamespaceOperation::ReconcilePlacement { .. }
@@ -3052,7 +3216,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 inline_range: Some(range),
                 ..
             } = &command.operation
-            && range.max_bytes <= DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES
+            && range.max_bytes <= DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES
             && let Some(object) = synced_path_object.as_ref()
             && let NetworkedDfsRangeReadOutcome::Found {
                 data,
@@ -3080,12 +3244,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_journal_has_more,
             posix_coordination_result,
         };
-        if !recovering && send_response {
+        let local_result = if !recovering && send_response {
             self.send_dfs_message_if_routable(
                 &requester_node_id,
                 DfsNetworkMessage::NamespaceResponse(response),
             )?;
-        }
+            None
+        } else {
+            response.posix_coordination_result
+        };
         let trace_send_ms = send_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
             "namespace-request node={} requester={} request={} operation={} involved_paths={} affected_shards={} result={} affected_ms={} admission_ms={} execute_ms={} completion_ms={} journal_batches={} journal_ms={} synced_path_objects={} sync_ms={} response_send_ms={} total_ms={}",
@@ -3110,12 +3277,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_send_ms,
             trace_started.elapsed().as_millis()
         ));
-        Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
-            request_id,
-            requester_node_id,
-            result,
-            mutates_metadata,
-        })
+        Ok((
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                request_id,
+                requester_node_id,
+                result,
+                mutates_metadata,
+            },
+            local_result,
+        ))
     }
 
     /// Execute a local-primary mutation through the same durable request
@@ -3162,6 +3332,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         operation: DfsNamespaceOperation,
     ) -> posix_model::Result<DfsNamespaceResult> {
+        self.execute_local_primary_namespace_reply(file_system_id, operation_id, operation)
+            .map(|(result, _)| result)
+    }
+
+    pub(crate) fn execute_local_primary_namespace_reply(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        operation: DfsNamespaceOperation,
+    ) -> posix_model::Result<(DfsNamespaceResult, Option<DfsPosixCoordinationResult>)> {
         validate_namespace_operation_id(&operation_id).map_err(DfsPosixError::from)?;
         if self.control_plane.is_none() {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
@@ -3181,12 +3361,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     false,
                 )
                 .map_err(DfsPosixError::from)?;
-            return Ok(result.result);
+            return Ok((result.result, result.posix_coordination_result));
         }
         let authority_shards =
             self.namespace_operation_effect_authority_shards(&file_system_id, &operation)?;
         let requester = self.node_id.clone();
-        let event = self.handle_namespace_request_internal(
+        let (event, coordination) = self.handle_namespace_request_internal(
             requester.clone(),
             DfsNamespaceCommand {
                 request_id: operation_id,
@@ -3199,9 +3379,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             },
             false,
             false,
+            None,
+            None,
         )?;
         match event {
-            NetworkedDfsServiceEvent::RemoteNamespaceServed { result, .. } => Ok(result),
+            NetworkedDfsServiceEvent::RemoteNamespaceServed { result, .. } => {
+                Ok((result, coordination))
+            }
             other => Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: format!(
                     "local-primary durable namespace execution returned unexpected event {other:?}"
@@ -3938,7 +4122,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id,
             primary_node_id,
             path,
-            (max_bytes <= DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES)
+            (max_bytes <= DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES)
                 .then_some(DfsNamespaceLookupRangeRequest { offset, max_bytes }),
             timeout,
         )

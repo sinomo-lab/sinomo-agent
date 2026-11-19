@@ -28,6 +28,7 @@ pub(crate) mod locks;
 mod metadata;
 pub(crate) use metadata::updated_namespace_link_count;
 mod namespace_ops;
+pub(crate) mod owner_write;
 mod query;
 mod read;
 mod routing;
@@ -3448,6 +3449,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         operation_id.as_deref(),
                         None,
                         Default::default(),
+                        None,
+                        None,
                     )?;
                     if report_stat {
                         service.posix_write_commit_stat(commit).map(Some)
@@ -3563,6 +3566,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             operation_id,
             opened_parent,
             publication,
+            None,
+            None,
         )?;
         self.posix_write_commit_stat(commit)
     }
@@ -3606,7 +3611,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: Option<&str>,
         opened_parent: Option<&DfsObjectMetadata>,
         publication: crate::DfsWritePublication,
+        requester: Option<&NodeId>,
+        staged: Option<crate::ContentStoreQuarantinedBlob>,
     ) -> Result<PosixWriteCommit> {
+        let write_requester = requester.unwrap_or(&self.node_id).clone();
         let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = if resolve_links {
@@ -3654,7 +3662,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let trace_started = Instant::now();
         let trace_path = path.clone();
-        let trace_bytes = bytes.len();
+        let content_size_bytes = staged
+            .as_ref()
+            .map_or(bytes.len() as u64, |blob| blob.size_bytes);
+        let trace_bytes = content_size_bytes;
         let mut transient_create = false;
         let current_object = if plans_from_authority {
             self.lookup_sifs_path_direct_distributed_synced(&path)?
@@ -3704,7 +3715,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
                 let mut object =
-                    recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
+                    recreated_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = match opened_parent {
                     Some(parent) => inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid),
@@ -3712,7 +3723,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id {
-                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                    object.object_id =
+                        stable_create_object_id(&write_requester, &path, operation_id);
                 }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
@@ -3724,7 +3736,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None => {
                 let mut object =
-                    new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
+                    new_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = match opened_parent {
                     Some(parent) => inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid),
@@ -3732,7 +3744,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id {
-                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                    object.object_id =
+                        stable_create_object_id(&write_requester, &path, operation_id);
                 }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
@@ -3749,7 +3762,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let target_version = operation_id
             .map(|operation_id| {
-                stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+                stable_write_target_version(&write_requester, &object.object_id, operation_id)
             })
             .unwrap_or_else(|| next_version(&object.version));
         if let Some((expected_object_id, expected_version)) = expected_existing {
@@ -3818,7 +3831,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && !remote_metadata_primary;
         let streamed_remote_primary_write = remote_metadata_primary;
         let content_started = Instant::now();
-        let manifest = if streamed_remote_primary_write {
+        let manifest = if let Some(blob) = staged {
+            if streamed_remote_primary_write {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(DfsError::Metadata {
+                    message: "received path write no longer belongs to this primary".into(),
+                }
+                .into());
+            }
+            match self.content.bind_quarantined_blob(
+                object.object_id.as_str(),
+                target_version.as_str(),
+                blob,
+            ) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    if transient_create {
+                        self.remove_transient_object_metadata(&object.object_id);
+                    }
+                    return Err(DfsPosixError::Dfs(error.into()));
+                }
+            }
+        } else if streamed_remote_primary_write {
             None
         } else {
             match self.content.put_object_version_blob_only(
@@ -3846,13 +3882,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         let content_elapsed = content_started.elapsed();
-        let content_size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let distributed_started = Instant::now();
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
             target_version: target_version.clone(),
-            requesting_node_id: self.node_id.clone(),
+            requesting_node_id: write_requester,
         };
         let outcome = if streamed_remote_primary_write {
             self.write_distributed_bytes_with_base(
@@ -3903,6 +3938,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                     dispatch: if detach_request {
                         DfsWriteDispatch::Detached
+                    } else if options.wait_for_commit {
+                        DfsWriteDispatch::AwaitCommit
                     } else {
                         DfsWriteDispatch::AwaitResponse
                     },

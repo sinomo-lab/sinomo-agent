@@ -795,7 +795,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(false);
         };
         if intent.state != DfsWriteIntentState::AwaitingReceipts
-            || !intent.publication.is_default_current()
+            || !intent.publication.is_current()
             || !self.writes.pending_writes.contains_key(intent_id)
         {
             return Ok(false);
@@ -1107,12 +1107,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .backend_receipt_for_replica(&intent.object_id, &intent.target_version, replica)?
                 .is_none()
             {
-                // These holders were planned against this same table state.
-                let generation = self.backend_receipt_slot_generation(
-                    &intent.object_id,
-                    &intent.target_version,
-                    replica,
-                )?;
+                // A delayed opening must use each stage's original generation.
+                // The native PutReceipt validation rejects a withdrawn slot.
+                let generation = match self
+                    .writes
+                    .pending_writes
+                    .get(&intent.intent_id)
+                    .and_then(|p| p.planned_receipt_generations.get(replica))
+                    .copied()
+                {
+                    Some(planned) => planned,
+                    None => self.backend_receipt_slot_generation(
+                        &intent.object_id,
+                        &intent.target_version,
+                        replica,
+                    )?,
+                };
                 effects.push(DfsPreparedMetadataEffect::PutReceipt {
                     receipt: DfsReplicaReceiptRecord {
                         receipt: DfsWriteReceipt {
@@ -1914,6 +1924,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         crate::write_precondition::bind_guard(condition, &mut expected_object_versions,
                             &mut expected_path_occupants).map_err(|message| DfsError::Metadata { message })?;
                     }
+                    let completion = crate::posix::owner_write::completion(
+                        self.namespace_execution.request(),
+                        &intent_record,
+                        &committed_object,
+                        &transaction,
+                    );
                     self.publish_prepared_operation_with_file_system(
                         DfsPreparedOperationPayload::for_namespace_transaction(
                             DfsPreparedOperationScope {
@@ -1930,7 +1946,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             Some(intent_record.clone()),
                             durable_nodes.iter().cloned().collect(),
                             None,
-                            None,
+                            completion,
                         )?,
                         configured_file_system.as_ref(),
                     )?
@@ -2032,6 +2048,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// Before exposing a pending synchronous W=2 write, retain its original
+    /// opening only if no final transaction already owns those receipts.
+    pub(crate) fn retain_unfinished_stage_opening(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        hash: &str,
+        size: u64,
+    ) -> Result<(), DfsError> {
+        if !self
+            .coordinator
+            .intent(&intent.intent_id)
+            .is_some_and(|i| i.state == DfsWriteIntentState::AwaitingReceipts)
+        {
+            return Ok(());
+        }
+        self.refresh_committed_write_projection(&intent.intent_id)?;
+        if !self
+            .coordinator
+            .intent(&intent.intent_id)
+            .is_some_and(|i| i.state == DfsWriteIntentState::AwaitingReceipts)
+        {
+            return Ok(());
+        }
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && let Some(final_record) =
+                backend.prepared_operation_record(&format!("write:{}", intent.intent_id))?
+        {
+            Self::validate_recorded_write_retry(&final_record.payload, intent, hash, size)?;
+            return Ok(());
+        }
+        let receipts: Vec<_> = self
+            .coordinator
+            .receipts_for_intent(&intent.intent_id)
+            .into_iter()
+            .filter(|receipt| receipt.state == DfsReplicaReceiptState::Durable)
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect();
+        self.put_metadata_intent_and_receipts(intent, hash, &receipts)
+    }
+
     fn recorded_write_operation_for_retry(
         &self,
         intent: &DistributedWriteIntent,
@@ -2058,7 +2114,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(digest))
     }
 
-    fn validate_recorded_write_retry(
+    pub(crate) fn validate_recorded_write_retry(
         payload: &DfsPreparedOperationPayload,
         intent: &DistributedWriteIntent,
         content_hash: &str,

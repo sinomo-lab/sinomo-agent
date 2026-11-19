@@ -1181,6 +1181,7 @@ fn routed_inline_blob_records_requester_receipt_without_restaging() {
                 authority_shard: Some(config),
                 touch_parent_on_create: false,
                 foreground_replica_repair: true,
+                wait_for_commit: false,
                 exclusive_create: false,
             }),
         ),

@@ -835,6 +835,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: DfsNamespaceOperation,
     ) -> Result<Option<DfsPosixCoordinationResult>> {
         let file_system_id = sifs_file_system_id();
+        let replay = !matches!(operation, DfsNamespaceOperation::WriteFile { .. });
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
             let routed = match self
@@ -844,8 +845,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     primary.clone(),
                     operation.clone(),
                     DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-                    true,
-                    true,
+                    replay,
+                    replay,
                 ) {
                 Ok(result) => result,
                 // A stable request id makes a retry after a possibly applied
@@ -947,6 +948,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: Option<&str>,
         operation: &DfsNamespaceOperation,
     ) -> Result<Option<DfsPosixCoordinationResult>> {
+        if let (Some(id), DfsNamespaceOperation::WriteFile { .. }) = (operation_id, operation) {
+            return self.local_browser_write_reply(id.to_owned(), operation.clone());
+        }
         if let Some(operation_id) =
             operation_id.filter(|_| namespace_operation_uses_stable_admission(operation))
         {
@@ -1112,6 +1116,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn execute_namespace_operation_local(
         &mut self,
         operation: &DfsNamespaceOperation,
+    ) -> Result<()> {
+        self.execute_namespace_operation_local_with_placement(operation, None)
+    }
+
+    pub(crate) fn execute_namespace_operation_local_with_placement(
+        &mut self,
+        operation: &DfsNamespaceOperation,
+        placement: Option<crate::placement::AdmittedPlacement>,
     ) -> Result<()> {
         let _source_scope = match operation {
             DfsNamespaceOperation::AdoptObjectAtPath { source_offer, .. } => {
@@ -1347,8 +1359,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object_policy,
                 replication_policy,
                 desired_replica_node_ids,
-            } => self
-                .reconcile_object_placement_local(
+            } => match placement {
+                Some(cut) => match cut.job? {
+                    Some((job, config)) => self.apply_admitted_placement(
+                        &job,
+                        &config,
+                        path,
+                        object_id,
+                        expected_version,
+                        object_policy.clone(),
+                        replication_policy.clone(),
+                        desired_replica_node_ids,
+                    ),
+                    None => Ok(()),
+                },
+                None => self.reconcile_object_placement_local(
                     job_id,
                     path,
                     object_id,
@@ -1356,9 +1381,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object_policy.clone(),
                     replication_policy.clone(),
                     desired_replica_node_ids,
-                )
-                .map_err(DfsPosixError::from),
-            DfsNamespaceOperation::BeginContentCopy { .. }
+                ),
+            }
+            .map_err(DfsPosixError::from),
+            DfsNamespaceOperation::WriteFile { .. }
+            | DfsNamespaceOperation::BeginContentCopy { .. }
             | DfsNamespaceOperation::AbortPendingWrite { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. }
             | DfsNamespaceOperation::AdvisoryLock { .. }

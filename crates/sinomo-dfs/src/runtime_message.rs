@@ -1288,6 +1288,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    placement: Option<crate::placement::AdmittedPlacement>,
     stage_shard: Option<ResidentLocalMetadataShardHandle>,
     prepared: Option<crate::DfsPreparedOperationDigest>,
     retained_write_command: Option<&DfsMessageCommand>,
@@ -1375,19 +1376,12 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
         crate::DfsNetworkMessage::NamespaceRequest(_)
     )
     .then(|| command.clone());
-    let write_command =
-        retained_write_command.and_then(|command| match &command.routed_message.message {
-            DfsNetworkMessage::DistributedWriteRequest(write)
-            | DfsNetworkMessage::ExclusiveCreateRequest(write) => {
-                Some((&command.routed_message.source_node_id, write))
-            }
-            _ => None,
-        });
     let process_started = std::time::Instant::now();
     let committed_work_tracker = crate::DfsCommittedWorkTracker::new();
     service_lane
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
+    service_lane.service.namespace_execution.placement = placement;
     let mut process_report = match verified_fetch {
         Some(verified) => service_lane
             .service
@@ -1400,8 +1394,10 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 prepared.as_ref(),
             ),
     };
-    let prepared_write = write_command.and_then(|(requester, write)| {
-        let (operation_id, cause) = match &process_report.outcome {
+    service_lane.service.namespace_execution.placement = Default::default();
+    let prepared_write = retained_write_command.and_then(|original| {
+        let requester = &original.routed_message.source_node_id;
+        let (id, cause) = match &process_report.outcome {
             Err(crate::DfsError::MetadataCommitOutcomeUnknown {
                 operation_id,
                 cause,
@@ -1412,27 +1408,50 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 .response
                 .outbound_messages
                 .iter()
-                .find_map(|message| {
-                    let DfsNetworkMessage::DistributedWriteResponse(response) = &message.message
-                    else {
-                        return None;
-                    };
-                    if message.target_node_id != *requester
-                        || response.request_id != write.request_id
-                        || response.object_id != write.request.object_id
-                    {
-                        return None;
-                    }
-                    match &response.result {
-                        crate::DfsDistributedWriteResult::CommitOutcomeUnknown {
-                            operation_id,
-                            cause,
-                            current_primary_node_id: None,
-                            ..
-                        } => Some((operation_id, cause)),
+                .filter(|m| &m.target_node_id == requester)
+                .find_map(
+                    |reply| match (&original.routed_message.message, &reply.message) {
+                        (
+                            DfsNetworkMessage::DistributedWriteRequest(w)
+                            | DfsNetworkMessage::ExclusiveCreateRequest(w),
+                            DfsNetworkMessage::DistributedWriteResponse(r),
+                        ) if r.request_id == w.request_id && r.object_id == w.request.object_id => {
+                            match &r.result {
+                                crate::DfsDistributedWriteResult::CommitOutcomeUnknown {
+                                    operation_id,
+                                    cause,
+                                    current_primary_node_id: None,
+                                    ..
+                                } => Some((operation_id, cause)),
+                                _ => None,
+                            }
+                        }
+                        (
+                            DfsNetworkMessage::NamespaceRequest(n),
+                            DfsNetworkMessage::NamespaceResponse(r),
+                        ) if r.request_id == n.request_id
+                            && matches!(
+                                n.operation,
+                                crate::DfsNamespaceOperation::WriteFile { .. }
+                            ) =>
+                        {
+                            match &r.result {
+                                crate::DfsNamespaceResult::Rejected {
+                                    posix_error:
+                                        Some(crate::DfsNamespacePosixError::CommitOutcomeUnknown {
+                                            operation_id,
+                                            cause,
+                                            current_primary_node_id: None,
+                                            ..
+                                        }),
+                                    ..
+                                } => Some((operation_id, cause)),
+                                _ => None,
+                            }
+                        }
                         _ => None,
-                    }
-                })?,
+                    },
+                )?,
             _ => return None,
         };
         if !matches!(
@@ -1443,11 +1462,21 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
         ) {
             return None;
         }
-        service_lane
-            .service
-            .prepared_routed_write_continuation(requester, write, operation_id)
-            .ok()
-            .flatten()
+        match &original.routed_message.message {
+            DfsNetworkMessage::DistributedWriteRequest(w)
+            | DfsNetworkMessage::ExclusiveCreateRequest(w) => service_lane
+                .service
+                .prepared_routed_write_continuation(requester, w, id)
+                .ok()
+                .flatten(),
+            DfsNetworkMessage::NamespaceRequest(ns) => service_lane
+                .service
+                .browser_write_prepare(requester, ns, id)
+                .ok()
+                .flatten()
+                .map(|r| r.digest),
+            _ => None,
+        }
     });
     if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {
         match &process_report.outcome {
@@ -1649,6 +1678,62 @@ pub(crate) fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static 
     }
 }
 
+/// Small current-stage bodies remain private until normal source, intent,
+/// generation and hash validation binds them. Charge their bytes through the
+/// processing worker, including cancellation and pre-execution retries.
+pub(crate) async fn receive_inline_stage(
+    command: &mut DfsMessageCommand,
+    attachment: &mut Option<DfsInboundAttachment>,
+) -> Result<Option<std::sync::Arc<tokio::sync::SemaphorePermit<'static>>>, crate::DfsError> {
+    static STAGE_BYTES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4 * 1024 * 1024);
+    let DfsNetworkMessage::StageBlob(stage) = &mut command.routed_message.message else {
+        return Ok(None);
+    };
+    let Some(body) = attachment.as_ref() else {
+        return Ok(None);
+    };
+    if body.descriptor.total_size_bytes > crate::content_store::INLINE_BLOB_SMALL_LIMIT_BYTES {
+        return Ok(None);
+    }
+    if !stage.bytes.is_empty()
+        || body
+            .descriptor
+            .content_hash
+            .as_ref()
+            .is_some_and(|hash| hash != &stage.content_hash)
+    {
+        return Err(crate::DfsError::Distributed {
+            message: "invalid small stage attachment descriptor".into(),
+        });
+    }
+    let size = body.descriptor.total_size_bytes as usize;
+    let permit = STAGE_BYTES
+        .acquire_many(size.max(1) as u32)
+        .await
+        .expect("static stage byte budget is never closed");
+    let bytes = attachment
+        .take()
+        .expect("checked stage attachment")
+        .body
+        .collect_to_vec(size)
+        .await
+        .map_err(crate::DfsError::from_network)?;
+    if bytes.len() != size {
+        return Err(crate::DfsError::Distributed {
+            message: "small stage attachment length mismatch".into(),
+        });
+    }
+    let actual = crate::content_hash(&bytes);
+    if actual != stage.content_hash {
+        return Err(crate::DfsError::ContentHashMismatch {
+            expected: stage.content_hash.clone(),
+            actual,
+        });
+    }
+    stage.bytes = bytes;
+    Ok(Some(std::sync::Arc::new(permit)))
+}
+
 /// Stream an inbound RPC attachment into the DFS quarantine store and bind the
 /// resulting content identity to the request. Network/body plumbing remains a
 /// host concern; validation, hashing, quarantine, and command mutation are DFS
@@ -1721,6 +1806,13 @@ pub(crate) async fn ingest_dfs_message_attachment_with_owner<G: Send + 'static>(
         DfsNetworkMessage::StageBlob(stage)
         | DfsNetworkMessage::StageRetainedBlob(stage)
         | DfsNetworkMessage::RepairRetainedBlob(stage) => (Some(stage.content_hash.clone()), true),
+        DfsNetworkMessage::NamespaceRequest(ns)
+            if matches!(&ns.operation,
+            crate::DfsNamespaceOperation::WriteFile { bytes:crate::protocol::DfsOwnerWriteContent::Attachment {content_hash,size_bytes},.. }
+            if attachment.descriptor.content_hash.as_ref()==Some(content_hash) && attachment.descriptor.total_size_bytes==*size_bytes) =>
+        {
+            (attachment.descriptor.content_hash.clone(), true)
+        }
         DfsNetworkMessage::DistributedWriteRequest(_)
         | DfsNetworkMessage::ExclusiveCreateRequest(_)
         | DfsNetworkMessage::RetainedWriteRequest(_) => {

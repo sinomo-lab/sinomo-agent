@@ -398,11 +398,10 @@ fn hosted_browser_routes_file_work_without_a_private_native_metadata_image() {
     runtime.close().unwrap();
 }
 
-/// A browser write beneath an existing parent asks its authorities with
-/// batched reads and one write. It routes no recursive creation, no
-/// per-component lookups and no read of a stat its response does not carry.
+/// Existing-parent writes send exactly one path command. Both W receipts and
+/// the file bytes must be visible after the caller returns.
 #[test]
-fn browser_write_beneath_existing_parent_routes_batched_reads_and_one_write() {
+fn browser_write_beneath_existing_parent_routes_one_owner_command() {
     use crate::{DfsNamespaceOperation, DfsNetworkMessage};
 
     const ROOT: &str = "/services/browser-write-round-trips";
@@ -479,47 +478,12 @@ fn browser_write_beneath_existing_parent_routes_batched_reads_and_one_write() {
         ("create", SECOND, b"second original".as_slice()),
     ] {
         let (operations, writes) = served(&|| write(path, bytes));
-        assert_eq!(
-            writes, 1,
-            "{label}: one routed write, served {operations:?}"
-        );
-        let lookups = operations
-            .iter()
-            .filter(|operation| {
-                matches!(
-                    operation,
-                    DfsNamespaceOperation::LookupPath { .. }
-                        | DfsNamespaceOperation::LookupPaths { .. }
-                )
-            })
-            .count();
-        // Planning an overwrite reads the current head once, from the shard
-        // its resolved path names rather than from every shard in turn.
-        let heads = operations
-            .iter()
-            .filter(|operation| {
-                matches!(
-                    operation,
-                    DfsNamespaceOperation::MetadataQuery { query }
-                        if query.shard_id.0 == "services"
-                            && matches!(
-                                query.selection,
-                                crate::DfsMetadataSelection::CurrentObject { .. }
-                            )
-                )
-            })
-            .count();
-        assert!(heads <= 1, "{label}: one current-head read: {operations:?}");
-        assert_eq!(
-            lookups + heads,
-            operations.len(),
-            "{label}: a write beneath an existing parent routes reads only: {operations:?}"
-        );
-        // One batch for the components in the path's shard, and one exact
-        // lookup for the lone component its parent shard owns.
+        assert_eq!(writes, 0, "{label}: unexpected second write dispatch");
         assert!(
-            lookups <= 2,
-            "{label}: components resolve in batches per shard: {operations:?}"
+            matches!(operations.as_slice(),
+            [DfsNamespaceOperation::WriteFile { path: sent, bytes: crate::protocol::DfsOwnerWriteContent::Inline(body), expected: None }]
+            if sent == path && body.as_ref() == bytes),
+            "{label}: served {operations:?}"
         );
         let mut stored = backend.lock_service().unwrap();
         assert_eq!(stored.posix_read_file_distributed(path).unwrap(), bytes);
@@ -1793,4 +1757,90 @@ fn assert_only_shard_assignment_point_reads(probe: &crate::test_runtime::DfsTest
             .all(|key| crate::dfs_metadata_shard_config_key_is_exact(key)),
         "browser write options read non-assignment keys: {keys:?}"
     );
+}
+
+#[test]
+fn remote_owner_write_replays_initial_receipt_after_overwrite_and_refuses_changed_condition() {
+    let (runtime, nodes) = native_browser_runtime("native-owner-write-replay", 3);
+    let directory = "/services/owner-write-replay";
+    let path = format!("{directory}/file");
+    let shard = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let primary = shard.primary_node_id;
+    let peer = nodes.iter().find(|peer| **peer != primary).unwrap();
+    let mut caller = runtime.client(peer).unwrap();
+    caller.posix_mkdir_all(directory).unwrap();
+    let command = |bytes: &[u8], expected| crate::DfsNamespaceOperation::WriteFile {
+        path: path.clone(),
+        bytes: crate::protocol::DfsOwnerWriteContent::Inline(bytes::Bytes::copy_from_slice(bytes)),
+        expected,
+    };
+    let mut dispatch = |request_id: &str, operation| {
+        caller
+            .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                request_id.into(),
+                crate::sifs_file_system_id(),
+                primary.clone(),
+                operation,
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                false,
+                false,
+            )
+            .unwrap()
+    };
+    let create = command(b"first", None);
+    let first = dispatch("path-create", create.clone());
+    let Some(crate::DfsPosixCoordinationResult::FileWritten(first_receipt)) =
+        first.posix_coordination_result
+    else {
+        panic!("missing create receipt: {first:?}")
+    };
+    let expected = crate::DfsNamespaceObjectPrecondition {
+        object_id: crate::DfsObjectId::new(first_receipt.object_id.clone()).unwrap(),
+        version: crate::DfsVersion::new(first_receipt.version.clone()).unwrap(),
+    };
+    let replace = command(b"second", Some(expected.clone()));
+    let second = dispatch("path-replace", replace.clone());
+    assert!(matches!(second.result, crate::DfsNamespaceResult::Applied));
+    assert_ne!(
+        second.posix_coordination_result,
+        Some(crate::DfsPosixCoordinationResult::FileWritten(
+            first_receipt.clone()
+        ))
+    );
+    assert_eq!(
+        dispatch("path-create", create).posix_coordination_result,
+        Some(crate::DfsPosixCoordinationResult::FileWritten(
+            first_receipt
+        ))
+    );
+    assert_eq!(
+        dispatch("path-replace", replace).posix_coordination_result,
+        second.posix_coordination_result
+    );
+    assert!(matches!(
+        dispatch("path-replace", command(b"other", Some(expected.clone()))).result,
+        crate::DfsNamespaceResult::Rejected { .. }
+    ));
+    assert!(matches!(
+        dispatch("stale-base", command(b"third", Some(expected))).result,
+        crate::DfsNamespaceResult::Rejected { .. }
+    ));
+    let payload = vec![0x83; 192 * 1024];
+    let large = command(&payload, None);
+    let first = dispatch("streamed-path-write", large.clone());
+    assert!(
+        matches!(&first.posix_coordination_result,Some(crate::DfsPosixCoordinationResult::FileWritten(r)) if r.size_bytes == Some(payload.len() as u64))
+    );
+    assert_eq!(
+        dispatch("streamed-path-write", large).posix_coordination_result,
+        first.posix_coordination_result
+    );
+    assert_eq!(caller.posix_read_file_distributed(&path).unwrap(), payload);
+    drop(caller);
+    runtime.close().unwrap();
 }

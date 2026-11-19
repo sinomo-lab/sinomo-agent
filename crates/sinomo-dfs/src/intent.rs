@@ -282,6 +282,7 @@ mod stable_operation_tests {
             authority_shard: None,
             touch_parent_on_create: false,
             foreground_replica_repair: true,
+            wait_for_commit: false,
             exclusive_create: false,
         }
     }

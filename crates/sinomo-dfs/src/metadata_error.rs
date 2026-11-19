@@ -126,6 +126,7 @@ impl MetadataBackendError {
     pub(crate) fn rejection_code(&self) -> crate::DfsMetadataRejectionCode {
         match self {
             Self::Rejected { code, .. } => *code,
+            Self::StoragePreparationPending { .. } => crate::DfsMetadataRejectionCode::StoragePreparationPending,
             Self::SourceEpochFenced { .. } => crate::DfsMetadataRejectionCode::SourceEpochFenced,
             _ => crate::DfsMetadataRejectionCode::Other,
         }

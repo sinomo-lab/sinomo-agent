@@ -274,6 +274,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
             authority_shard: None,
             touch_parent_on_create: true,
             foreground_replica_repair: true,
+            wait_for_commit: false,
             exclusive_create: false,
         },
         "bytes",
@@ -1032,6 +1033,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
         authority_shard: Some(shard),
         touch_parent_on_create: false,
         foreground_replica_repair: true,
+        wait_for_commit: false,
         exclusive_create: false,
     };
     let routed_message = build_dfs_routed_message(

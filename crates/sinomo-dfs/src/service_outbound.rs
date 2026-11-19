@@ -290,7 +290,7 @@ where
         let transfer = replica_transfer_identity(&message);
         let background_repair = matches!(&message, DfsNetworkMessage::RepairReplica(command) if command.background_repair);
         let routed = self.next_dfs_routed_message(target_node_id, message);
-        let call = crate::message_transport::native_snapshot_routed_call(routed)?;
+        let call = crate::message_transport::routed_call_with_content(routed)?;
         if let Some((intent, request_id, stage)) = &transfer {
             self.begin_replica_transfer_attempt(
                 intent,
@@ -603,7 +603,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let target_node_id = routed_message.target_node_id.clone();
         match self.transport.send_routed_call(
             &target_node_id,
-            crate::message_transport::native_snapshot_routed_call(routed_message)?,
+            crate::message_transport::routed_call_with_content(routed_message)?,
         ) {
             Ok(()) => Ok(true),
             Err(NetworkError::UnknownNode { .. }) => Ok(false),
@@ -816,7 +816,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let transfer = replica_transfer_identity(&message);
         let background_repair = matches!(&message, DfsNetworkMessage::RepairReplica(command) if command.background_repair);
         let routed = self.next_dfs_routed_message(target_node_id, message);
-        let call = crate::message_transport::native_snapshot_routed_call(routed)?;
+        let call = crate::message_transport::routed_call_with_content(routed)?;
         if let Some((intent, request_id, stage)) = &transfer {
             self.begin_replica_transfer_attempt(
                 intent,

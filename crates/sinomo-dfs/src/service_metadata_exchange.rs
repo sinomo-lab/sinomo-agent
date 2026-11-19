@@ -1499,7 +1499,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let apply_result = {
-            let permit = &validated_source.permit;
+            let mut permit = validated_source.permit.clone();
+            permit.acknowledge_replication = command.durable_replication.is_some();
+            permit.write_set_generation = validated_source
+                .replica_context
+                .write_set
+                .as_ref()
+                .map(|w| w.generation);
+            let permit = &permit;
             let backend = self
                 .metadata_backend
                 .as_mut()
@@ -1581,8 +1588,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             let durable_prefix_proof = apply_report.durable_prefix_proof().cloned().ok_or_else(|| DfsError::Metadata {
                                 message: "authority acknowledgement has no exact durable prefix".into(),
                             })?;
-                            backend
-                                .put_metadata_authority_ack_floor(
+                            apply_report.persist_authority_ack(backend.as_mut(),
                                     &crate::DfsMetadataAuthorityAckFloor {
                                         shard_id: shard_id.clone(),
                                         journal_sequence: next_after_sequence,

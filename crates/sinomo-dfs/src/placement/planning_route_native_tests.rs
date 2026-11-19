@@ -805,3 +805,38 @@ fn native_routed_placement_reaches_intent_publication_entry_during_real_configur
     drop((faults, capture, publisher, original_ready, authority));
     fixture.close();
 }
+
+#[test]
+fn foreground_shard_lookup_progresses_during_both_placement_quorum_waits() {
+    let fixture = RoutingFixture::new("native-placement-quorum-outside-admission");
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let acquire = Arc::new(StepGate::default());
+    let release = Arc::new(StepGate::default());
+    let caller = fixture.caller.clone();
+    let path = fixture.stat.path.clone();
+    let before = acquire.clone();
+    let after = release.clone();
+    fixture.phases.set_extra_hook(Arc::new(move |point, command, _| {
+        let DaemonDfsPreDispatchTestPoint::PlacementPermitQuorum { releasing } = point else {return Ok(())};
+        if command.is_some_and(|cmd| cmd.routed_message.source_node_id == caller
+            && matches!(&cmd.routed_message.message, DfsNetworkMessage::NamespaceRequest(ns)
+                if matches!(&ns.operation, DfsNamespaceOperation::ReconcilePlacement {path:p,..} if p == &path))) {
+            return (if releasing {&after} else {&before}).enter(serde_json::Value::Bool(releasing),deadline);
+        }
+        Ok(())
+    }));
+    let mut reader = fixture.native.client(&fixture.caller).unwrap();
+    reader.set_transport_operation_deadline(Some(deadline));
+    let worker = fixture.spawn_reconcile(deadline);
+    for gate in [&acquire, &release] {
+        gate.wait(deadline).unwrap();
+        // The registered client's authoritative lookup must cross the actual
+        // namespace lane on the same primary while repair remains paused.
+        let got = reader.posix_stat_distributed(&fixture.stat.path);
+        gate.release();
+        assert_eq!(got.unwrap().object_id, fixture.stat.object_id);
+    }
+    worker.join().unwrap().unwrap();
+    drop(reader);
+    fixture.close();
+}
