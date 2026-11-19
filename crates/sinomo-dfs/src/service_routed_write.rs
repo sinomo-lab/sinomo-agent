@@ -2384,9 +2384,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(error) => return Err(error),
         };
         let target = if current.kind == DfsObjectKind::Hardlink {
+            let exact_lane = self
+                .metadata_backend
+                .as_ref()
+                .and_then(|backend| backend.resident_exact_shard_id())
+                .is_some();
             self.resolve_hardlink_target(&current)
-                .map_err(|error| DfsError::Metadata {
-                    message: error.to_string(),
+                .map_err(|error| match error {
+                    // An exact lane reads only its own shard, so a canonical
+                    // inode it cannot find lies in another one: the same
+                    // shard-crossing rebase the authority check refuses
+                    // below, which the caller re-resolves and re-stamps.
+                    crate::DfsPosixError::NotFound { .. } if exact_lane => DfsError::Busy {
+                        path: current.path.clone(),
+                    },
+                    error => DfsError::Metadata {
+                        message: error.to_string(),
+                    },
                 })?
         } else {
             current.clone()

@@ -4155,6 +4155,34 @@ impl DfsTestRuntime {
         )
     }
 
+    /// Whether a global writer holds `node`'s mounted Main scheduler, so no
+    /// answer to a peer is admitted there until it releases. Observation only.
+    #[cfg(test)]
+    pub(crate) fn main_global_writer_holds(&self, node: &NodeId) -> Result<bool, String> {
+        let context = self.component_context(node)?;
+        let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(context.data_dir())
+            .map_err(|error| error.to_string())?;
+        Ok(scheduler.global_writer_holds())
+    }
+
+    /// Whether admitted work holds `shard_id`'s lane on `node`'s mounted Main
+    /// scheduler, through its shard permit or a global writer.
+    #[cfg(test)]
+    pub(crate) fn main_lane_held(
+        &self,
+        node: &NodeId,
+        file_system_id: &crate::DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<bool, String> {
+        let context = self.component_context(node)?;
+        let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(context.data_dir())
+            .map_err(|error| error.to_string())?;
+        Ok(scheduler.lane_held(&crate::DfsMutationLaneKey::new(
+            file_system_id.clone(),
+            crate::DfsMetadataShardId::new(shard_id),
+        )))
+    }
+
     fn hold_main_admission(
         &self,
         node: &NodeId,

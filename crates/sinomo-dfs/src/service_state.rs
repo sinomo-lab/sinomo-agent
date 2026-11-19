@@ -764,6 +764,10 @@ pub struct NetworkedDfsService<T> {
     /// preemption or shell destruction cannot repeatedly rewind a settled prefix.
     pub(crate) write_intent_maintenance_scan:
         Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
+    /// Write intents another service of this node still serves: a shard
+    /// lane's write service owns an unfinished routed write. This service's
+    /// intent recovery leaves them to that service.
+    pub(crate) foreign_live_write_intents: BTreeSet<String>,
     pub(crate) maintenance_progress: Arc<crate::maintenance::DfsMaintenanceProgressState>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,

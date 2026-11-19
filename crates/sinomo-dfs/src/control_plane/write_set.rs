@@ -42,6 +42,8 @@ pub(crate) use takeover::{
 #[cfg(test)]
 mod commit_native_tests;
 #[cfg(test)]
+mod crossing_native_tests;
+#[cfg(test)]
 mod keeping_native_tests;
 #[cfg(test)]
 mod native_tests;
