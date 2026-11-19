@@ -376,12 +376,19 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
         candidates,
         "native-accepted-two-candidates".into(),
     );
-    assert!(case.control.with_client(|kv| {
-        DfsControlPlaneStore::new(kv.as_mut())
-            .compare_and_put_placement_update(&original_config, &accepted, &job)
-            .unwrap()
-            .is_some()
-    }));
+    // Submit each policy change between Main turns on the object's actual
+    // primary. Its autonomous reconciler may be finishing a placement effect
+    // under the filesystem permit when the test is ready to publish.
+    let apply = |expected, desired, job| {
+        let _admission = case.runtime.hold_main_mutation_admission(&case.primary).unwrap();
+        assert!(case.control.with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .compare_and_put_placement_update(expected, desired, job)
+                .unwrap()
+                .is_some()
+        }));
+    };
+    apply(&original_config, &accepted, &job);
     case.service.refresh_control_plane_latest().unwrap();
     let object = case.objects[0].clone();
     let (resolved, replication, placement) =
@@ -423,12 +430,7 @@ fn native_placement_keeps_accepted_candidates_and_fences_later_policy() {
         candidates,
         "native-newer-placement-policy".into(),
     );
-    assert!(case.control.with_client(|kv| {
-        DfsControlPlaneStore::new(kv.as_mut())
-            .compare_and_put_placement_update(&accepted, &current, &newer_job)
-            .unwrap()
-            .is_some()
-    }));
+    apply(&accepted, &current, &newer_job);
     let before = case.node_store().journal_last_sequence().unwrap();
     owner
         .reconcile_object_placement_local(

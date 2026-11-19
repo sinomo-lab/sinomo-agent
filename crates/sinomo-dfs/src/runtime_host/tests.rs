@@ -12712,16 +12712,20 @@ fn daemon_dfs_message_cache_rebuilds_only_for_metadata_authority_changes() {
         );
     };
     let lookup = |id: &str, frame, path: &str| {
-        let response = handle_daemon_dfs_message_on_runtime(
+        // The global lookup and concurrent maintenance share Main admission.
+        // A direct synchronous dispatch can hold the cache while waiting for
+        // a shard the maintenance owner needs that same cache to return.
+        let response = runtime.block_on(handle_daemon_dfs_message_async(
             &paths,
             test_dfs_message_command(
                 id,
                 test_dfs_lookup_routed_message(&local, &local, frame, path),
             ),
+            None,
+            None,
             &runtime,
-        )
-        .expect("actual mounted Main lookup");
-        assert_eq!(response.request_id, id);
+        )).expect("actual mounted Main lookup");
+        assert_eq!(response.response.request_id, id);
     };
     // The global service can be checked out by maintenance between commands.
     // This progress owner belongs to the resident cache entry for its whole
@@ -14211,7 +14215,7 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
     let (child_registered_tx, child_registered_rx) = tokio::sync::oneshot::channel();
     let child_host = Arc::clone(&host);
     let child_runtime = runtime.clone();
-    host.own_task(runtime.spawn_blocking(move || {
+    let parent = runtime.spawn_blocking(move || {
         parent_started_tx.send(()).unwrap();
         create_child_rx.recv().unwrap();
         let child = child_runtime.spawn_blocking(move || {
@@ -14224,9 +14228,12 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
         child_started_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
+        let id = child.id();
         child_host.own_task(child);
-        let _ = child_registered_tx.send(());
-    }));
+        let _ = child_registered_tx.send(id);
+    });
+    let parent_id = parent.id();
+    host.own_task(parent);
     parent_started_rx
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
@@ -14243,7 +14250,7 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
         .await
         .unwrap();
         create_child_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), child_registered_rx)
+        let child_id = tokio::time::timeout(Duration::from_secs(1), child_registered_rx)
             .await
             .unwrap()
             .unwrap();
@@ -14253,11 +14260,18 @@ fn stopped_runtime_joins_a_started_blocking_child_registered_during_drain() {
         joining.await.unwrap().unwrap();
         assert!(owner_weak.upgrade().is_some(),
             "the actual mounted component still retains the same storage owner after this task drain");
-        assert!(host.tasks.lock().unwrap().is_empty());
-
+        assert!(host.tasks.lock().unwrap().iter().all(|task|
+            task.id() != parent_id && task.id() != child_id
+        ), "the parent and its late registered child must both be drained");
     });
+    // Other live component producers may still register tasks. Inspect the
+    // whole registry after the normal component shutdown has stopped them.
+    let stopped_host = Arc::downgrade(&host);
     drop(host);
     native.stop_node(&local).unwrap();
+    if let Some(stopped) = stopped_host.upgrade() {
+        assert!(stopped.tasks.lock().unwrap().is_empty());
+    }
     assert!(
         owner_weak.upgrade().is_none(),
         "actual component scope drain and started blocking-child join release the original owner"

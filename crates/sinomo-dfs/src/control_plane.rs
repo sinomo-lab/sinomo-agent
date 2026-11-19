@@ -1096,6 +1096,8 @@ pub struct DfsMetadataShardMembershipHandoff {
     /// Highest partial-shard publication or sync prefix committed through the
     /// cluster Raft log when this handoff began.
     pub required_prepared_sequence: u64,
+    /// Exact history the retiring head must cover. A retained activation
+    /// watermark can belong to a smaller ring in the same epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_head_watermark: Option<DfsMetadataShardHeadWatermark>,
     /// Exact retiring-primary state captured only after that primary has
@@ -3424,10 +3426,10 @@ impl<'a> DfsControlPlaneStore<'a> {
             if shard_entry.decode::<DfsMetadataShardConfig>()? != *retiring {
                 return Ok(None);
             }
-            let proof_compare = previous_handoff_proof_compare(
-                retiring,
-                self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?,
-            )?;
+            let previous_proof = self.kv.get(&metadata_shard_membership_handoff_proof_key(
+                &retiring.file_system_id, &retiring.shard_id,
+            ))?;
+            let proof_compare = previous_handoff_proof_compare(retiring, previous_proof.as_ref())?;
             if let Some(entry) = self.kv.get(&handoff_key)? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
@@ -3457,15 +3459,12 @@ impl<'a> DfsControlPlaneStore<'a> {
                 None => 0,
             };
             let watermark_entry = self.kv.get(&watermark_key)?;
-            let required_head_watermark = watermark_entry
-                .as_ref()
-                .map(|entry| {
-                    normalize_metadata_shard_head_watermark(
-                        retiring,
-                        &entry.decode::<DfsMetadataShardHeadWatermark>()?,
-                    )
-                })
-                .transpose()?;
+            let required_head_watermark = handoff_head_requirement(
+                retiring,
+                watermark_entry.as_ref(),
+                write_set_entry.as_ref(),
+                previous_proof.as_ref(),
+            )?;
             let required_prepared_sequence = required_head_watermark
                 .as_ref()
                 .map(|watermark| watermark.journal_sequence)
@@ -3616,16 +3615,14 @@ impl<'a> DfsControlPlaneStore<'a> {
             &retiring.file_system_id,
             &retiring.shard_id,
         ))?;
-        if metadata_handoff_write_set_ops(
+        let Ok((write_set_compare, _)) = metadata_handoff_write_set_ops(
             retiring,
             &handoff.desired_shard,
             write_set_entry.as_ref(),
             None,
-        )
-        .is_err()
-        {
+        ) else {
             return Ok(None);
-        }
+        };
 
         let floor_entry = self.kv.get(&floor_key)?;
         let current_floor = floor_entry
@@ -3638,10 +3635,15 @@ impl<'a> DfsControlPlaneStore<'a> {
             current_floor.as_ref(),
         )?;
         let watermark_entry = self.kv.get(&watermark_key)?;
-        if !metadata_shard_membership_handoff_watermark_is_exact(
-            &handoff,
+        let previous_proof = self.kv.get(&metadata_shard_membership_handoff_proof_key(
+            &retiring.file_system_id, &retiring.shard_id,
+        ))?;
+        if handoff_head_requirement(
+            retiring,
             watermark_entry.as_ref(),
-        )? {
+            write_set_entry.as_ref(),
+            previous_proof.as_ref(),
+        )? != handoff.required_head_watermark {
             return Ok(None);
         }
         let floor_compare = match floor_entry {
@@ -3674,6 +3676,8 @@ impl<'a> DfsControlPlaneStore<'a> {
                     },
                     floor_compare,
                     watermark_compare,
+                    write_set_compare,
+                    previous_handoff_proof_compare(retiring, previous_proof.as_ref())?,
                 ],
                 success: vec![KvOp::put_serde(handoff_key, &acknowledged, None)?],
                 failure: Vec::new(),
@@ -3734,7 +3738,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             current_floor.as_ref(),
         )?;
         let activated_watermark =
-            metadata_shard_membership_handoff_activated_watermark(&handoff, &proof)?;
+            metadata_shard_membership_handoff_activated_watermark(&proof)?;
         let (write_set_compare, write_set_put) = metadata_handoff_write_set_ops(
             retiring,
             desired,
@@ -3742,10 +3746,13 @@ impl<'a> DfsControlPlaneStore<'a> {
             Some(&proof),
         )?;
         let watermark_entry = self.kv.get(&watermark_key)?;
-        if !metadata_shard_membership_handoff_watermark_is_exact(
-            &handoff,
+        let previous_proof = self.kv.get(&proof_key)?;
+        if handoff_head_requirement(
+            retiring,
             watermark_entry.as_ref(),
-        )? {
+            write_set_entry.as_ref(),
+            previous_proof.as_ref(),
+        )? != handoff.required_head_watermark {
             return Ok(false);
         }
         let floor_compare = match floor_entry {
@@ -3791,10 +3798,7 @@ impl<'a> DfsControlPlaneStore<'a> {
                 .collect();
         // A membership handoff changes serving authority, not path
         // assignment, so it does not advance the catalog generation.
-        compares.push(previous_handoff_proof_compare(
-            retiring,
-            self.kv.get(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id))?,
-        )?);
+        compares.push(previous_handoff_proof_compare(retiring, previous_proof.as_ref())?);
         Ok(self
             .kv
             .txn(KvTxn {
@@ -4824,10 +4828,10 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             if shard_entry.decode::<DfsMetadataShardConfig>()? != *retiring {
                 return Ok(None);
             }
-            let proof_compare = previous_handoff_proof_compare(
-                retiring,
-                self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?,
-            )?;
+            let previous_proof = self.kv.get_async(&metadata_shard_membership_handoff_proof_key(
+                &retiring.file_system_id, &retiring.shard_id,
+            )).await?;
+            let proof_compare = previous_handoff_proof_compare(retiring, previous_proof.as_ref())?;
             if let Some(entry) = self.kv.get_async(&handoff_key).await? {
                 let handoff = entry.decode::<DfsMetadataShardMembershipHandoff>()?;
                 return Ok((handoff.retiring_shard == *retiring
@@ -4860,15 +4864,12 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 None => 0,
             };
             let watermark_entry = self.kv.get_async(&watermark_key).await?;
-            let required_head_watermark = watermark_entry
-                .as_ref()
-                .map(|entry| {
-                    normalize_metadata_shard_head_watermark(
-                        retiring,
-                        &entry.decode::<DfsMetadataShardHeadWatermark>()?,
-                    )
-                })
-                .transpose()?;
+            let required_head_watermark = handoff_head_requirement(
+                retiring,
+                watermark_entry.as_ref(),
+                write_set_entry.as_ref(),
+                previous_proof.as_ref(),
+            )?;
             let required_prepared_sequence = required_head_watermark
                 .as_ref()
                 .map(|watermark| watermark.journal_sequence)
@@ -4969,16 +4970,14 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 &retiring.shard_id,
             ))
             .await?;
-        if metadata_handoff_write_set_ops(
+        let Ok((write_set_compare, _)) = metadata_handoff_write_set_ops(
             retiring,
             &handoff.desired_shard,
             write_set_entry.as_ref(),
             None,
-        )
-        .is_err()
-        {
+        ) else {
             return Ok(None);
-        }
+        };
 
         let floor_entry = self.kv.get_async(&floor_key).await?;
         let current_floor = floor_entry
@@ -4991,10 +4990,15 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             current_floor.as_ref(),
         )?;
         let watermark_entry = self.kv.get_async(&watermark_key).await?;
-        if !metadata_shard_membership_handoff_watermark_is_exact(
-            &handoff,
+        let previous_proof = self.kv.get_async(&metadata_shard_membership_handoff_proof_key(
+            &retiring.file_system_id, &retiring.shard_id,
+        )).await?;
+        if handoff_head_requirement(
+            retiring,
             watermark_entry.as_ref(),
-        )? {
+            write_set_entry.as_ref(),
+            previous_proof.as_ref(),
+        )? != handoff.required_head_watermark {
             return Ok(None);
         }
         let floor_compare = match floor_entry {
@@ -5027,6 +5031,8 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     },
                     floor_compare,
                     watermark_compare,
+                    write_set_compare,
+                    previous_handoff_proof_compare(retiring, previous_proof.as_ref())?,
                 ],
                 success: vec![KvOp::put_serde(handoff_key, &acknowledged, None)?],
                 failure: Vec::new(),
@@ -5088,7 +5094,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             current_floor.as_ref(),
         )?;
         let activated_watermark =
-            metadata_shard_membership_handoff_activated_watermark(&handoff, &proof)?;
+            metadata_shard_membership_handoff_activated_watermark(&proof)?;
         let (write_set_compare, write_set_put) = metadata_handoff_write_set_ops(
             retiring,
             desired,
@@ -5096,10 +5102,13 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             Some(&proof),
         )?;
         let watermark_entry = self.kv.get_async(&watermark_key).await?;
-        if !metadata_shard_membership_handoff_watermark_is_exact(
-            &handoff,
+        let previous_proof = self.kv.get_async(&proof_key).await?;
+        if handoff_head_requirement(
+            retiring,
             watermark_entry.as_ref(),
-        )? {
+            write_set_entry.as_ref(),
+            previous_proof.as_ref(),
+        )? != handoff.required_head_watermark {
             return Ok(false);
         }
         let floor_compare = match floor_entry {
@@ -5144,10 +5153,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 .collect();
         // A membership handoff changes serving authority, not path
         // assignment, so it does not advance the catalog generation.
-        compares.push(previous_handoff_proof_compare(
-            retiring,
-            self.kv.get_async(&metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id)).await?,
-        )?);
+        compares.push(previous_handoff_proof_compare(retiring, previous_proof.as_ref())?);
         Ok(self
             .kv
             .txn_async(KvTxn {
@@ -5556,7 +5562,7 @@ fn validate_metadata_shard_cas_identity(
 /// handoff that completes in between fails the transaction.
 fn previous_handoff_proof_compare(
     retiring: &DfsMetadataShardConfig,
-    previous: Option<KvEntry>,
+    previous: Option<&KvEntry>,
 ) -> Result<KvCompare, KvError> {
     let key =
         metadata_shard_membership_handoff_proof_key(&retiring.file_system_id, &retiring.shard_id);
@@ -5571,7 +5577,7 @@ fn previous_handoff_proof_compare(
     previous.decode::<DfsMetadataShardMembershipHandoffProof>()?;
     Ok(KvCompare::ValueEquals {
         key,
-        value: previous.value,
+        value: previous.value.clone(),
     })
 }
 
@@ -5951,32 +5957,76 @@ pub(crate) fn metadata_shard_membership_handoff_acknowledgements_are_safe(
             >= desired_quorum
 }
 
-fn metadata_shard_membership_handoff_watermark_is_exact(
-    handoff: &DfsMetadataShardMembershipHandoff,
-    current_entry: Option<&KvEntry>,
-) -> Result<bool, KvError> {
-    match (&handoff.required_head_watermark, current_entry) {
-        (None, None) => Ok(true),
-        (Some(required), Some(entry)) => Ok(normalize_metadata_shard_head_watermark(
-            &handoff.retiring_shard,
-            &entry.decode::<DfsMetadataShardHeadWatermark>()?,
-        )? == *required),
-        _ => Ok(false),
+/// The retained head is a lower bound for the retiring primary's freeze.
+fn handoff_head_requirement(
+    retiring: &DfsMetadataShardConfig,
+    entry: Option<&KvEntry>,
+    write_set: Option<&KvEntry>,
+    previous_proof: Option<&KvEntry>,
+) -> Result<Option<DfsMetadataShardHeadWatermark>, KvError> {
+    let Some(entry) = entry else { return Ok(None) };
+    let head = entry.decode::<DfsMetadataShardHeadWatermark>()?;
+    let invalid = match normalize_metadata_shard_head_watermark(retiring, &head) {
+        Ok(head) => return Ok(Some(head)),
+        Err(error) => error,
+    };
+    // Older recruit transactions could leave the last activation watermark in
+    // place when growing the ring within the same epoch. Recognize exactly
+    // what that activation wrote, using the proof compared by this transaction.
+    let Some(previous) = previous_proof else {
+        return Err(invalid);
+    };
+    let previous = previous.decode::<DfsMetadataShardMembershipHandoffProof>()?;
+    let old = &previous.desired_shard;
+    validate_metadata_shard_cas_identity(Some(&previous.retiring_shard), old)?;
+    validate_metadata_shard_cas_reconfiguration(&previous.retiring_shard, old)?;
+    let expanded = DfsMetadataShardConfig {
+        replica_node_ids: retiring.replica_node_ids.clone(),
+        ..old.clone()
+    };
+    let same_epoch_growth = expanded == *retiring
+        && old.replica_node_ids.len() < retiring.replica_node_ids.len()
+        && old
+            .replica_node_ids
+            .iter()
+            .all(|node| retiring.replica_node_ids.contains(node));
+    let state =
+        metadata_shard_write_set_state(retiring, write_set.map(|entry| entry.value.as_slice()));
+    if !same_epoch_growth || state.switched().is_none() {
+        return Err(invalid);
     }
+    let acknowledgements = previous.acknowledged_node_ids.iter().cloned().collect();
+    if previous.handoff_id.is_empty()
+        || !metadata_shard_membership_handoff_acknowledgements_are_safe(
+            &previous.retiring_shard,
+            old,
+            &acknowledgements,
+        )
+        || crate::DfsMetadataPrefixProof::from_digest(
+            head.journal_sequence,
+            head.state_fingerprint.clone(),
+        )
+        .is_none()
+        || metadata_shard_membership_handoff_activated_watermark(&previous)? != head
+    {
+        return Err(invalid);
+    }
+    // These ACKs constrain the freeze. Only fresh ACKs of the current head
+    // contribute to the quorum that replaces the watermark at activation.
+    Ok(Some(head))
 }
 
 fn metadata_shard_membership_handoff_activated_watermark(
-    handoff: &DfsMetadataShardMembershipHandoff,
     proof: &DfsMetadataShardMembershipHandoffProof,
 ) -> Result<DfsMetadataShardHeadWatermark, KvError> {
-    let desired_node_ids = metadata_shard_configured_node_ids(&handoff.desired_shard);
+    let desired_node_ids = metadata_shard_configured_node_ids(&proof.desired_shard);
     normalize_metadata_shard_head_watermark(
-        &handoff.desired_shard,
+        &proof.desired_shard,
         &DfsMetadataShardHeadWatermark {
-            file_system_id: handoff.desired_shard.file_system_id.clone(),
-            shard_id: handoff.desired_shard.shard_id.clone(),
-            primary_node_id: handoff.desired_shard.primary_node_id.clone(),
-            epoch: handoff.desired_shard.epoch,
+            file_system_id: proof.desired_shard.file_system_id.clone(),
+            shard_id: proof.desired_shard.shard_id.clone(),
+            primary_node_id: proof.desired_shard.primary_node_id.clone(),
+            epoch: proof.desired_shard.epoch,
             journal_sequence: proof.journal_sequence,
             state_fingerprint: proof.state_fingerprint.clone(),
             acknowledged_node_ids: proof
