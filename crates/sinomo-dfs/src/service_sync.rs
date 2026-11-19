@@ -379,6 +379,7 @@ pub(crate) fn completed_metadata_handoff_evidence(
         freeze.journal_sequence,
         &freeze.state_fingerprint,
         &freeze.rebind_prefix_proof,
+        None,
     )?
     else {
         return Ok(None);
@@ -972,6 +973,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend
                     .native_held_snapshot_for_scope(&requested_retiring.file_system_id, &shard_id)
             });
+            // The old ring's watermark is only a history constraint. Check
+            // the native frames before installing a local freeze; the new
+            // ring must still acknowledge the head captured by that freeze.
+            let verified_head = if let Some(required) =
+                observed_handoff.required_head_watermark.as_ref().filter(|head| {
+                    head.acknowledged_node_ids.len()
+                        < dfs_metadata_replica_quorum_size(requested_retiring.replica_node_ids.len())
+                })
+            {
+                backend.refresh_metadata_shard_durable_view_if_changed(&shard_id)?;
+                Some(verify_handoff_watermark_ancestry(
+                    backend, &shard_id, required, deadline,
+                )?)
+            } else {
+                None
+            };
             let Some(write_freeze) = backend.freeze_metadata_shard_for_membership_handoff(
                 &shard_id,
                 &observed_handoff.handoff_id,
@@ -980,6 +997,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             else {
                 return Ok(false);
             };
+            if verified_head.is_some_and(|head| {
+                head.journal_sequence != write_freeze.journal_sequence
+                    || head.digest != write_freeze.state_fingerprint
+            }) {
+                return Ok(false);
+            }
             timing.mark("handoff-write-freeze-returned");
             #[cfg(any(test, feature = "test-support"))]
             if let Some(trace) = native_boundary.as_mut() {
@@ -3529,12 +3552,42 @@ pub fn inspect_metadata_prefix_descendant(
     Ok(proof)
 }
 
+fn verify_handoff_watermark_ancestry(
+    backend: &dyn DfsMetadataBackend,
+    shard_id: &DfsMetadataShardId,
+    required: &crate::DfsMetadataShardHeadWatermark,
+    deadline: Instant,
+) -> Result<DfsMetadataPrefixProof, DfsError> {
+    let anchor = DfsMetadataPrefixProof::from_digest(
+        required.journal_sequence,
+        required.state_fingerprint.clone(),
+    )
+    .ok_or_else(|| DfsError::Metadata {
+        message: "retained handoff watermark has no native prefix digest".into(),
+    })?;
+    metadata_shard_prefix_matches_or_extends_marker(
+        backend,
+        shard_id,
+        anchor.journal_sequence,
+        &anchor.digest,
+        &anchor,
+        Some(deadline),
+    )?
+    .ok_or_else(|| DfsError::Metadata {
+        message: format!(
+            "metadata shard {} cannot prove descent from the retained watermark",
+            shard_id.0
+        ),
+    })
+}
+
 fn metadata_shard_prefix_matches_or_extends_marker(
     backend: &dyn DfsMetadataBackend,
     shard_id: &DfsMetadataShardId,
     marker_sequence: u64,
     marker_fingerprint: &str,
     rebind_prefix_proof: &DfsMetadataPrefixProof,
+    deadline: Option<Instant>,
 ) -> Result<Option<DfsMetadataPrefixProof>, DfsError> {
     metadata_shard_prefix_matches_or_extends_marker_with_reader(
         backend,
@@ -3543,6 +3596,11 @@ fn metadata_shard_prefix_matches_or_extends_marker(
         marker_fingerprint,
         rebind_prefix_proof,
         |after| {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return Err(DfsError::Metadata {
+                    message: "retained watermark ancestry check reached the handoff deadline".into(),
+                });
+            }
             Ok(backend.journal_batch_for_shard_since_limited(
                 shard_id,
                 after,
@@ -3765,6 +3823,53 @@ fn record_metadata_sync_prefix_probe_events(
 mod tests {
     use super::*;
     use crate::*;
+
+    #[test]
+    fn retained_watermark_must_be_an_ancestor_of_the_native_head() {
+        let (runtime, mut caller, shard) = crate::test_support::current_native_metadata_service(
+            "native-recert-watermark-ancestry",
+            1,
+            "/",
+        )
+        .unwrap();
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let head = || {
+            runtime
+                .metadata_primary_service("/")
+                .unwrap()
+                .metadata_backend()
+                .unwrap()
+                .metadata_prefix_proof(&shard_id)
+                .unwrap()
+                .unwrap()
+        };
+        let prior = head();
+        caller.posix_mkdir("/recert-watermark-history").unwrap();
+        let current = head();
+        assert!(current.journal_sequence > prior.journal_sequence);
+        let owner = runtime.metadata_primary_service("/").unwrap();
+        let backend = owner.metadata_backend().unwrap();
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let mut watermark = DfsMetadataShardHeadWatermark {
+            file_system_id: shard.file_system_id,
+            shard_id: shard.shard_id,
+            primary_node_id: shard.primary_node_id.clone(),
+            epoch: shard.epoch,
+            journal_sequence: prior.journal_sequence,
+            state_fingerprint: prior.digest,
+            acknowledged_node_ids: vec![shard.primary_node_id],
+        };
+        assert_eq!(
+            verify_handoff_watermark_ancestry(backend, &shard_id, &watermark, deadline).unwrap(),
+            current
+        );
+        // A real later digest attached to the older sequence names a different history.
+        watermark.state_fingerprint = current.digest;
+        assert!(verify_handoff_watermark_ancestry(backend, &shard_id, &watermark, deadline).is_err());
+        drop(owner);
+        drop(caller);
+        runtime.close().unwrap();
+    }
 
     #[test]
     fn native_completed_handoff_is_not_reclaimed_after_effect_admission_changes() {

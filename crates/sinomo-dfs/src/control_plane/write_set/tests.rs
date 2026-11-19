@@ -652,6 +652,157 @@ fn a_swap_during_a_pending_handoff_deletes_it_and_the_completion_loses() {
     );
 }
 
+#[tokio::test]
+async fn expanded_ring_recertifies_its_fenced_head_before_replacing_the_watermark() {
+    for async_begin in [false, true] {
+        let mut fixture = Fixture::new();
+        let original = fixture.cut().shard;
+        let previous = DfsMetadataShardMembershipHandoffProof {
+            cause: DfsMetadataShardHandoffCause::Membership,
+            handoff_id: "previous-growth".into(),
+            retiring_shard: shard(&fixture.nodes[0], &[&fixture.nodes[1]], original.epoch - 1),
+            desired_shard: original.clone(),
+            journal_sequence: 2,
+            state_fingerprint: proof(2, 'a').digest,
+            acknowledged_node_ids: fixture.nodes[..2].to_vec(),
+        };
+        let old = metadata_shard_membership_handoff_activated_watermark(&previous).unwrap();
+        let key = metadata_shard_head_watermark_key(&fs(), "root");
+        put(
+            &mut fixture.kv,
+            metadata_shard_membership_handoff_proof_key(&fs(), "root"),
+            &previous,
+        );
+        fixture.switch_all();
+        let member = fixture.nodes[3].clone();
+        let recruit = build_metadata_write_set_recruit(
+            &fixture.cut(),
+            &member,
+            &bounds(1, 4),
+            DfsMetadataShardRecruit::BelowN,
+        )
+        .unwrap();
+        assert!(fixture.apply(&recruit));
+        let add = build_metadata_write_set_add(&fixture.cut(), &member).unwrap();
+        assert!(fixture.apply(&add));
+        let active = fixture.cut().shard;
+        let desired = metadata_shard_primary_handoff_target(&active, &fixture.nodes[1]).unwrap();
+        assert!(normalize_metadata_shard_head_watermark(&active, &old).is_err());
+
+        // Reproduce the persisted shape from before recruitment retired the
+        // preceding activation watermark. A different prefix has no producer.
+        let foreign = DfsMetadataShardHeadWatermark {
+            state_fingerprint: proof(2, 'b').digest,
+            ..old.clone()
+        };
+        put(&mut fixture.kv, key.clone(), &foreign);
+        let mut store = DfsControlPlaneStore::new(&mut fixture.kv);
+        assert!(
+            store
+                .begin_metadata_shard_membership_handoff(&active, &desired)
+                .is_err()
+        );
+        assert!(
+            store
+                .get_metadata_shard_membership_handoff(&fs(), "root")
+                .unwrap()
+                .is_none()
+        );
+        put(&mut fixture.kv, key.clone(), &old);
+        let old_entry = DfsControlPlaneKvClient::get(&fixture.kv, &key).unwrap();
+        let pending = if async_begin {
+            DfsControlPlaneAsyncStore::new(&mut fixture.kv)
+                .begin_metadata_shard_membership_handoff(&active, &desired)
+                .await
+        } else {
+            DfsControlPlaneStore::new(&mut fixture.kv)
+                .begin_metadata_shard_membership_handoff(&active, &desired)
+        }
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending.required_head_watermark.as_ref(), Some(&old));
+        assert_eq!(pending.required_prepared_sequence, old.journal_sequence);
+        assert_eq!(
+            DfsControlPlaneKvClient::get(&fixture.kv, &key).unwrap(),
+            old_entry
+        );
+
+        let mut fence = DfsMetadataShardMembershipHandoffFence {
+            handoff_id: pending.handoff_id.clone(),
+            primary_node_id: active.primary_node_id.clone(),
+            journal_sequence: old.journal_sequence,
+            state_fingerprint: foreign.state_fingerprint,
+        };
+        assert!(
+            DfsControlPlaneStore::new(&mut fixture.kv)
+                .acknowledge_metadata_shard_membership_handoff_fence(&pending, &fence)
+                .is_err()
+        );
+        fence.journal_sequence = 4;
+        fence.state_fingerprint = proof(4, 'c').digest;
+        let fenced = if async_begin {
+            DfsControlPlaneStore::new(&mut fixture.kv)
+                .acknowledge_metadata_shard_membership_handoff_fence(&pending, &fence)
+        } else {
+            DfsControlPlaneAsyncStore::new(&mut fixture.kv)
+                .acknowledge_metadata_shard_membership_handoff_fence(&pending, &fence)
+                .await
+        }
+        .unwrap()
+        .unwrap();
+
+        let mut certificate = DfsMetadataShardMembershipHandoffProof {
+            cause: DfsMetadataShardHandoffCause::Membership,
+            handoff_id: fenced.handoff_id,
+            retiring_shard: active.clone(),
+            desired_shard: desired.clone(),
+            journal_sequence: fence.journal_sequence,
+            state_fingerprint: fence.state_fingerprint,
+            acknowledged_node_ids: old.acknowledged_node_ids.clone(),
+        };
+        let mut store = DfsControlPlaneStore::new(&mut fixture.kv);
+        assert!(
+            store
+                .complete_metadata_shard_membership_handoff(&active, &desired, &certificate)
+                .is_err()
+        );
+        assert_eq!(
+            store.get_metadata_shard(&fs(), "root").unwrap(),
+            Some(active.clone())
+        );
+        assert_eq!(
+            DfsControlPlaneKvClient::get(&fixture.kv, &key).unwrap(),
+            old_entry
+        );
+
+        certificate
+            .acknowledged_node_ids
+            .push(fixture.nodes[2].clone());
+        let completed =
+            if async_begin {
+                DfsControlPlaneAsyncStore::new(&mut fixture.kv)
+                    .complete_metadata_shard_membership_handoff(&active, &desired, &certificate)
+                    .await
+            } else {
+                DfsControlPlaneStore::new(&mut fixture.kv)
+                    .complete_metadata_shard_membership_handoff(&active, &desired, &certificate)
+            }
+            .unwrap();
+        assert!(completed);
+        let store = DfsControlPlaneStore::new(&mut fixture.kv);
+        assert_eq!(
+            store.get_metadata_shard(&fs(), "root").unwrap(),
+            Some(desired)
+        );
+        assert_eq!(
+            store
+                .get_metadata_shard_head_watermark(&fs(), "root")
+                .unwrap(),
+            Some(metadata_shard_membership_handoff_activated_watermark(&certificate).unwrap())
+        );
+    }
+}
+
 #[test]
 fn a_recruited_replica_can_be_promoted_by_handoff_or_takeover() {
     let mut fixture = Fixture::new();
