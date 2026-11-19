@@ -1641,6 +1641,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: &mut DfsNamespaceCommand,
         shard_id: DfsMetadataShardId,
         recovering: bool,
+        continuation: Option<&DfsPreparedOperationDigest>,
     ) -> Result<DurableNamespaceRequestAdmission, DfsError> {
         let admission = self
             .metadata_backend
@@ -1679,6 +1680,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 posix_coordination_result: receipt.posix_coordination_result,
             });
         }
+        // A live write-set continuation has already matched the exact native
+        // digest and command. Let its final prepare reach the guarded commit
+        // below instead of rediscovering it as an unrelated interrupted write.
+        let continuing_final = prepared.as_ref().is_some_and(|record| {
+            Some(&record.digest) == continuation
+                && record.completed_request_completion.is_some()
+                && namespace_prepare_matches_routed_command(
+                    &record.payload,
+                    requester_node_id,
+                    command,
+                    &shard_id,
+                    &digest,
+                )
+        });
         if let Some(mut existing) = existing {
             if existing.file_system_id != command.file_system_id
                 || existing.command_digest != digest
@@ -1695,7 +1710,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             if existing.status == DfsNamespaceRequestStatus::Pending {
-                let owns_prepare = prepared.is_some();
+                let owns_prepare = prepared.is_some() && !continuing_final;
                 if owns_prepare {
                     if !recovering {
                         let request_key = BTreeSet::from([(
@@ -1764,7 +1779,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             };
         }
-        if let Some(prepare) = prepared {
+        if let Some(prepare) = prepared.filter(|_| !continuing_final) {
             if !namespace_prepare_matches_routed_command(
                 &prepare.payload,
                 requester_node_id,
@@ -1792,6 +1807,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     command,
                     shard_id,
                     true,
+                    None,
                 );
             }
             return Ok(DurableNamespaceRequestAdmission::Reject {
@@ -2509,6 +2525,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     &mut command,
                                     shard_id,
                                     recovering,
+                                    continuation,
                                 ) {
                                     // The request row's own commit can be left
                                     // unknown. That is the requester's answer:
@@ -2614,6 +2631,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         &mut command,
                                         scope.shard_id,
                                         recovering,
+                                        None,
                                     )?
                                 }
                             });

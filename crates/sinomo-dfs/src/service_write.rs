@@ -610,15 +610,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 None,
             )?;
         }
-        self.coordinator.validate_new_intent_for_publication(
-            &request.file_system_id,
-            &request.object_id,
-            expected_base_version,
-            &request.target_version,
-            desired_replica_nodes,
-            policy,
-            publication,
-        )?;
+        let validate = |coordinator: &DistributedEventualCoordinator| {
+            coordinator.validate_new_intent_for_publication(
+                &request.file_system_id,
+                &request.object_id,
+                expected_base_version,
+                &request.target_version,
+                desired_replica_nodes,
+                policy,
+                publication,
+            )
+        };
+        match validate(&self.coordinator) {
+            Err(DfsDistributedError::PendingIntentConflict {
+                pending_intent_id, ..
+            }) => {
+                // Another resident lane can finish the exact intent after this
+                // coordinator observed its prepare. Only its durable terminal
+                // can remove the conflict; an actually pending write stays fenced.
+                self.refresh_committed_write_projection(&pending_intent_id)?;
+                validate(&self.coordinator)?;
+            }
+            result => result?,
+        }
         Ok(())
     }
 
@@ -970,6 +984,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     touch_parent_on_create,
                     creation: options.creation,
                     repair: options.repair,
+                    dispatch: options.dispatch,
                     ..DfsDistributedWriteOptions::default()
                 },
             ),
@@ -1649,6 +1664,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 authority_shard: None,
                 touch_parent_on_create,
                 foreground_replica_repair,
+                wait_for_commit: false,
                 exclusive_create: false,
             };
             let requester_node_id = request.requesting_node_id.clone();
@@ -1834,6 +1850,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 creation: options.creation,
                 repair: options.repair,
                 operation_id: Some(operation_id),
+                dispatch: options.dispatch,
                 ..DfsDistributedWriteOptions::default()
             },
         )
@@ -1873,6 +1890,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 creation: options.creation,
                 repair: options.repair,
                 operation_id: Some(operation_id),
+                dispatch: options.dispatch,
                 ..DfsDistributedWriteOptions::default()
             },
         )
@@ -1912,6 +1930,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 creation: options.creation,
                 repair: options.repair,
                 operation_id: Some(operation_id),
+                dispatch: options.dispatch,
                 ..DfsDistributedWriteOptions::default()
             },
         )
@@ -2078,6 +2097,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 authority_shard: None,
                 touch_parent_on_create,
                 foreground_replica_repair,
+                wait_for_commit: false,
                 exclusive_create,
             };
             if exclusive_create {
@@ -2177,14 +2197,69 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let record_receipt_elapsed = record_receipt_started.elapsed();
-        let commit_started = Instant::now();
         let receipt_node_ids = initial_receipt_node_ids;
-        if publication.is_default_current() && !foreground_replica_repair
+        let synchronous_pair = options.dispatch == DfsWriteDispatch::AwaitCommit
+            && updated_intent.operation_id.as_ref().is_some_and(|id| {
+                updated_intent.target_version
+                    == crate::intent::stable_write_target_version(
+                        &request.requesting_node_id,
+                        &request.object_id,
+                        id,
+                    )
+            })
+            && publication.is_current()
+            && !foreground_replica_repair
+            && updated_intent.policy.min_commit_replicas == 2
+            && self.can_commit_ready_intent_batched(&updated_intent)?;
+
+        let stage_started = Instant::now();
+        let staged = if synchronous_pair {
+            for node in &receipt_node_ids {
+                let generation = self.backend_receipt_slot_generation(
+                    &intent.object_id,
+                    &intent.target_version,
+                    node,
+                )?;
+                self.writes
+                    .pending_writes
+                    .get_mut(&intent.intent_id)
+                    .expect("new write")
+                    .planned_receipt_generations
+                    .insert(node.clone(), generation);
+            }
+            self.writes
+                .pending_writes
+                .get_mut(&intent.intent_id)
+                .expect("new write")
+                .collecting_initial_receipts = true;
+            self.stage_missing_desired_replicas_for_intent(&intent.intent_id, object.clone())
+        } else {
+            Ok(())
+        };
+        let early_stage_elapsed = stage_started.elapsed();
+        let commit_started = Instant::now();
+        if synchronous_pair {
+            // Acknowledgement of a transfer alone never counts. Consume the
+            // ordinary authenticated response with its exact request and slot
+            // generation, just as the outer synchronous settle loop does.
+            let result = staged.and_then(|()| {
+                self.process_incoming_without_deferred_parent_touches()
+                    .map(drop)
+            });
+            if let Some(pending) = self.writes.pending_writes.get_mut(&intent.intent_id) {
+                pending.collecting_initial_receipts = false;
+            }
+            if !result
+                .as_ref()
+                .is_err_and(DfsError::is_commit_outcome_unknown)
+            {
+                self.retain_unfinished_stage_opening(&intent, &content_hash, content_size_bytes)?;
+            }
+            result?;
+            self.record_durable_write_intent_work(&updated_intent, &receipt_node_ids);
+        } else if publication.is_default_current()
+            && !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
-            // Snapshot planning can replace the caller's initially durable
-            // node with a healthier replica. In that case the manifest path
-            // starts with zero receipts and must stage before visibility; the
-            // one-batch fast path is valid only after W is already satisfied.
             && self
                 .coordinator
                 .is_commit_ready(&updated_intent.intent_id)?
@@ -2217,7 +2292,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get(&updated_intent.intent_id)
             .cloned()
         {
-            if !is_committed {
+            if !is_committed && !synchronous_pair {
                 if self.open_pending_write_blob_stream(&pending).is_ok() {
                     self.stage_missing_desired_replicas_for_intent(
                         &updated_intent.intent_id,
@@ -2242,7 +2317,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
             }
         }
-        let stage_elapsed = stage_started.elapsed();
+        let stage_elapsed = early_stage_elapsed + stage_started.elapsed();
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         dfs_perf_trace(format_args!(
@@ -2465,6 +2540,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 authority_shard: None,
                 touch_parent_on_create,
                 foreground_replica_repair,
+                wait_for_commit: false,
                 exclusive_create,
             };
             if exclusive_create {
@@ -2904,6 +2980,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(DfsOutboundAttachment::from_shared_bytes_with_transport_integrity(bytes.clone()))
         };
         let command = DfsDistributedWriteCommand {
+            wait_for_commit: options.dispatch == DfsWriteDispatch::AwaitCommit
+                && options.publication.is_current()
+                && !foreground_replica_repair
+                && policy.min_commit_replicas == 2,
             publication: options.publication.clone(),
             patch: None,
             request_id: request_id.clone(),
@@ -3057,6 +3137,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             authority_shard: Some(shard.clone()),
             touch_parent_on_create: false,
             foreground_replica_repair,
+            wait_for_commit: false,
             exclusive_create: false,
         };
         let message = command.clone().into_network_message();
@@ -3155,6 +3236,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let primary_node_id = shard.primary_node_id.clone();
         let command = DfsDistributedWriteCommand {
+            wait_for_commit: options.dispatch == DfsWriteDispatch::AwaitCommit
+                && options.publication.is_current()
+                && !foreground_replica_repair
+                && policy.min_commit_replicas == 2,
             publication: options.publication.clone(),
             patch: None,
             request_id: request_id.clone(),
@@ -3349,6 +3434,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             (Some(captured_hash.clone()), Some(captured_size))
         };
         let command = DfsDistributedWriteCommand {
+            wait_for_commit: options.dispatch == DfsWriteDispatch::AwaitCommit
+                && options.publication.is_current()
+                && !foreground_replica_repair
+                && policy.min_commit_replicas == 2,
             publication: options.publication.clone(),
             patch: None,
             request_id: request_id.clone(),

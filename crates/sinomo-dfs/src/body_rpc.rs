@@ -319,6 +319,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn small_stages_validate_private_bytes_and_leave_large_attachments_streaming() {
+        for (declared, payload, expected, inline) in [
+            (4096, vec![7; 4096], vec![7; 4096], true),
+            (4096, vec![9; 4096], vec![7; 4096], true),
+            (4096, vec![7; 4095], vec![7; 4095], true),
+            (16385, vec![7; 16385], vec![7; 16385], false),
+        ] {
+            let mut command = stage_blob_command(expected.clone());
+            let DfsNetworkMessage::StageBlob(stage) = &mut command.routed_message.message else {
+                unreachable!()
+            };
+            stage.bytes.clear();
+            let (sender, body) = ObjectRpcIncomingBody::test_channel(Some(payload.len() as u64), 1);
+            sender.send(payload.clone()).await.unwrap();
+            drop(sender);
+            let mut attachment = Some(crate::DfsInboundAttachment {
+                descriptor: DfsRpcAttachmentDescriptor {
+                    total_size_bytes: declared,
+                    content_hash: Some(content_hash(&expected)),
+                },
+                body,
+            });
+            let result =
+                crate::runtime_message::receive_inline_stage(&mut command, &mut attachment).await;
+            if payload != expected || payload.len() as u64 != declared {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().is_some(), inline);
+                assert_eq!(attachment.is_none(), inline);
+                if inline {
+                    assert!(
+                        matches!(command.routed_message.message, DfsNetworkMessage::StageBlob(s) if s.bytes == expected)
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn explicit_stage_blob_attachment_round_trips() {
         let bytes = (0..4097)

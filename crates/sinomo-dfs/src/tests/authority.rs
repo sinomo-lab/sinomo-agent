@@ -4714,12 +4714,12 @@ fn compound_receipt_location_retry_preserves_original_publication() {
 }
 
 #[test]
-fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_replay() {
+fn routed_w2_create_with_an_unknown_final_prepare_completes_the_original_on_replay() {
     let name = "native-routed-create-opening-cleanup";
     let path = "/native-routed-create-opening-cleanup";
     let operation = "native-routed-create-opening-cleanup-original";
-    let bytes = b"original native create input before its opening is published";
-    let (runtime, initial_client, shard) =
+    let bytes = b"original native create input before final publication";
+    let (mut runtime, initial_client, shard) =
         crate::test_support::current_native_metadata_service(name, 3, "/").unwrap();
     drop(initial_client);
     let primary = shard.primary_node_id.clone();
@@ -4738,7 +4738,7 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
     // committed work promptly: each setup pass publishes, then confirms its
     // replicas with journal batches after the pass returns. Drive that work to
     // completion first, so the first-call faults below meet the original
-    // write's opening quorum rather than earlier work. A round runs ordinary
+    // write's metadata confirmation rather than earlier work. A round runs ordinary
     // passes until one reports no further work, then lets the publication they
     // scheduled land; the setup is finished once a whole round sends no journal
     // batch to the faulted peer.
@@ -4826,35 +4826,32 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
             &root,
         )
         .unwrap()
-        .export_table_snapshot().unwrap()
+        .export_table_snapshot()
+        .unwrap()
     };
     let before = inspect();
-    let openings = before
+    // The synchronous protocol has already obtained W. Its single final
+    // prepare owns both receipts and the original request across this fault.
+    let preparations = before
         .tables
         .prepared_operations_v7
         .iter()
         .filter_map(|prepared| {
-            prepared
-                .payload
-                .metadata_effects
-                .iter()
-                .find_map(|effect| match effect {
-                    DfsPreparedMetadataEffect::PutIntent { intent }
-                        if intent.operation_id.as_deref() == Some(operation)
-                            && crate::intent::write_intent_status_is_active(&intent.status) =>
-                    {
-                        Some((prepared.clone(), intent.clone()))
-                    }
-                    _ => None,
-                })
+            let original = prepared.prepared_intent.as_ref()?;
+            (original.operation_id.as_deref() == Some(operation))
+                .then(|| (prepared.clone(), original.clone()))
         })
         .collect::<Vec<_>>();
-    let replay = if openings.len() == 1 {
+    drop(client);
+    runtime.stop_node(&primary).unwrap();
+    runtime.reopen_node(primary.clone()).unwrap();
+    let mut client = runtime.client(&primary).unwrap();
+    let replay = if preparations.len() == 1 {
         Some(client.posix_write_file_with_operation_id(path, bytes, options.clone(), operation))
     } else {
         None
     };
-    let changed = if openings.len() == 1 {
+    let changed = if preparations.len() == 1 {
         Some(client.posix_write_file_with_operation_id(
             path,
             b"different bytes cannot replace the original operation",
@@ -4909,15 +4906,26 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
                 DfsError::MetadataCommitOutcomeUnknown { .. }
             ))
         ),
-        "the opening quorum's negative boundary leaves the outcome unknown: {first:?}"
+        "the final prepare quorum's negative boundary leaves the outcome unknown: {first:?}"
     );
     assert_eq!(
-        openings.len(),
+        preparations.len(),
         1,
-        "one real opening must retain the original input"
+        "one final prepare must retain the original input"
     );
-    let (opening, original) = &openings[0];
-    opening.validate().unwrap();
+    let (prepared, original) = &preparations[0];
+    prepared.validate().unwrap();
+    assert_eq!(prepared.status, DfsPreparedOperationStatus::Prepared);
+    assert_eq!(prepared.content_receipts.len(), 2);
+    assert!(
+        after
+            .tables
+            .prepared_operations_v7
+            .iter()
+            .any(|row| row.digest == prepared.digest
+                && row.payload == prepared.payload
+                && row.status == DfsPreparedOperationStatus::Committed)
+    );
     assert_eq!(original.policy.min_commit_replicas, 2);
     assert_eq!(original.policy.desired_replicas, 2);
     assert_eq!(
@@ -4936,9 +4944,8 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
         "replay must not allocate another original intent"
     );
     let terminal = records[0];
-    // The opening's commit outcome was unknown, so nothing aborted it: the
-    // replay with the same operation id continued the original body.
-    assert_ne!(terminal.status, DfsWriteIntentStatus::Aborted);
+    // The exact retry completed the previously uncertain preparation.
+    assert_eq!(terminal.status, DfsWriteIntentStatus::Committed);
     assert_eq!(terminal.intent_id, original.intent_id);
     assert_eq!(terminal.created_at, original.created_at);
     let aborts_original = |prepared: &crate::DfsPreparedOperationRecord| {
@@ -4959,19 +4966,77 @@ fn routed_create_with_an_unknown_opening_outcome_completes_the_original_on_repla
                 .prepared_operations_v7
                 .iter()
                 .any(aborts_original),
-        "an unknown outcome never prepares an abort of the original opening"
+        "an unknown outcome never prepares an abort of the original write"
     );
-    // The replay continues the original body: it commits, or is still
-    // pending its content receipts. It is never a definite failure.
+    // Both original receipts were already sealed before the injected failure.
     let replay = replay.unwrap();
     assert!(
-        matches!(&replay, Ok(_) | Err(DfsPosixError::PendingWrite { .. })),
+        replay.is_ok(),
         "the same operation continues its original body: {replay:?}"
     );
     assert!(
         changed.unwrap().is_err(),
         "the original identity rejects changed bytes"
     );
+}
+
+#[test]
+fn synchronous_pair_uses_two_remote_holders_in_one_publication() {
+    let (runtime, mut service, shard) = crate::test_support::current_native_metadata_service(
+        "native-two-remote-stage-receipts",
+        3,
+        "/",
+    )
+    .unwrap();
+    let remotes = shard.replica_node_ids.clone();
+    assert_eq!(remotes.len(), 2);
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = remotes.clone();
+    policy.forbidden_node_ids = vec![shard.primary_node_id.clone()];
+    let operation = "native-two-remote-stage-write";
+    let stat = service
+        .posix_write_file_with_operation_id(
+            "/two-remote-content-holders",
+            b"both remote copies",
+            DfsWriteOptions {
+                policy,
+                replica_candidates: remotes.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+            operation,
+        )
+        .unwrap();
+    let reader = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(&shard.shard_id),
+        crate::local_dfs_metadata_shard_path(
+            runtime.data_dir(&shard.primary_node_id),
+            &DfsMetadataShardId::new(&shard.shard_id),
+        ),
+    )
+    .unwrap();
+    let records: Vec<_> = reader.export_table_snapshot().unwrap().tables.prepared_operations_v7
+        .into_iter().filter(|record| {
+            record.terminal_intent.as_ref().is_some_and(|i| i.operation_id.as_deref() == Some(operation))
+                || record.metadata_effects.iter().any(|effect| matches!(effect,
+                    DfsPreparedMetadataEffect::PutIntent { intent } if intent.operation_id.as_deref() == Some(operation)))
+        }).collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, DfsPreparedOperationStatus::Committed);
+    assert_eq!(
+        records[0]
+            .content_receipts
+            .iter()
+            .map(|r| r.replica_node_id.clone())
+            .collect::<BTreeSet<_>>(),
+        remotes.into_iter().collect()
+    );
+    assert_eq!(
+        records[0].terminal_intent.as_ref().unwrap().target_version,
+        stat.version
+    );
+    drop(service);
+    runtime.close().unwrap();
 }
 
 fn check_retained_intent_opening(
@@ -5021,9 +5086,15 @@ fn check_retained_intent_opening(
     let operation = "retained-opening-original-operation";
     let bytes = b"exact native bytes before intent publication";
     runtime.stop_node(&stopped).unwrap();
+    // A caller accepting Pending still authors this opening. Recover the real
+    // retained representation with the same synchronous retry used after upgrade.
+    let opening_options = DfsWriteOptions {
+        wait_for_commit: false,
+        ..options.clone()
+    };
     assert!(
         owner
-            .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
+            .posix_write_file_with_operation_id(path, bytes, opening_options, operation)
             .is_err()
     );
     let prepared = owner

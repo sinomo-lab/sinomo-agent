@@ -1634,6 +1634,62 @@ pub(crate) fn dfs_network_message_kind(message: &DfsNetworkMessage) -> &'static 
     }
 }
 
+/// Small current-stage bodies remain private until normal source, intent,
+/// generation and hash validation binds them. Charge their bytes through the
+/// processing worker, including cancellation and pre-execution retries.
+pub(crate) async fn receive_inline_stage(
+    command: &mut DfsMessageCommand,
+    attachment: &mut Option<DfsInboundAttachment>,
+) -> Result<Option<std::sync::Arc<tokio::sync::SemaphorePermit<'static>>>, crate::DfsError> {
+    static STAGE_BYTES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4 * 1024 * 1024);
+    let DfsNetworkMessage::StageBlob(stage) = &mut command.routed_message.message else {
+        return Ok(None);
+    };
+    let Some(body) = attachment.as_ref() else {
+        return Ok(None);
+    };
+    if body.descriptor.total_size_bytes > crate::content_store::INLINE_BLOB_SMALL_LIMIT_BYTES {
+        return Ok(None);
+    }
+    if !stage.bytes.is_empty()
+        || body
+            .descriptor
+            .content_hash
+            .as_ref()
+            .is_some_and(|hash| hash != &stage.content_hash)
+    {
+        return Err(crate::DfsError::Distributed {
+            message: "invalid small stage attachment descriptor".into(),
+        });
+    }
+    let size = body.descriptor.total_size_bytes as usize;
+    let permit = STAGE_BYTES
+        .acquire_many(size.max(1) as u32)
+        .await
+        .expect("static stage byte budget is never closed");
+    let bytes = attachment
+        .take()
+        .expect("checked stage attachment")
+        .body
+        .collect_to_vec(size)
+        .await
+        .map_err(crate::DfsError::from_network)?;
+    if bytes.len() != size {
+        return Err(crate::DfsError::Distributed {
+            message: "small stage attachment length mismatch".into(),
+        });
+    }
+    let actual = crate::content_hash(&bytes);
+    if actual != stage.content_hash {
+        return Err(crate::DfsError::ContentHashMismatch {
+            expected: stage.content_hash.clone(),
+            actual,
+        });
+    }
+    stage.bytes = bytes;
+    Ok(Some(std::sync::Arc::new(permit)))
+}
+
 /// Stream an inbound RPC attachment into the DFS quarantine store and bind the
 /// resulting content identity to the request. Network/body plumbing remains a
 /// host concern; validation, hashing, quarantine, and command mutation are DFS

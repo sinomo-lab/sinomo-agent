@@ -4191,6 +4191,7 @@ fn test_dfs_write_routed_message(
         touch_parent_on_create: false,
         exclusive_create: false,
         foreground_replica_repair: false,
+        wait_for_commit: false,
     });
     DfsRoutedMessage {
         source_node_id: source_node_id.clone(),

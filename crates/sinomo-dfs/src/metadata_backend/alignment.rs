@@ -250,6 +250,9 @@ impl LocalSobjMetadataBackend {
             }
         };
         crate::metadata_journal::admission::invalidate(&self.root)?;
+        // The discarded writer's uncheckpointed table operations describe
+        // its old suffix. Replay below owns the new epoch's exact prefix.
+        self.buffered_projection = Default::default();
         crate::metadata_table_store::remove_metadata_table_checkpoint_log(&self.root)?;
         crate::metadata_table_store::truncate_metadata_table_log(&self.root)?;
         crate::metadata_journal::truncate_segmented_journal_after(

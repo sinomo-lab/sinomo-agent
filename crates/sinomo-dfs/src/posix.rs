@@ -3936,6 +3936,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                     dispatch: if detach_request {
                         DfsWriteDispatch::Detached
+                    } else if options.wait_for_commit {
+                        DfsWriteDispatch::AwaitCommit
                     } else {
                         DfsWriteDispatch::AwaitResponse
                     },

@@ -2562,12 +2562,19 @@ fn prepared_v7_initial_epoch_requires_the_real_host_provider() {
 #[test]
 fn native_table_replay_validates_each_unchanged_owned_prepared_body_once() {
     let (mut runtime, mut service, config) = native_case("native-replay-owned-body-validation", 1);
-    let expected = directory(&mut service, "/services/owned-body-validation");
     let source = runtime
         .data_dir(&config.primary_node_id)
         .dfs_dir()
         .join("metadata")
         .join(&config.shard_id);
+    // Exercise the shared, file-backed projection the replay test consumes.
+    let reader = LocalSobjMetadataBackend::open_for_inspection(
+        DfsMetadataShardId::new(&config.shard_id),
+        &source,
+    )
+    .unwrap();
+    let expected = directory(&mut service, "/services/owned-body-validation");
+    drop(reader);
     drop(service);
     runtime.stop_node(&config.primary_node_id).unwrap();
     let copy = sinomo_testdir::TestDir::new("native-replay-owned-body-copy");
