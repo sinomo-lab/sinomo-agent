@@ -764,6 +764,7 @@ async fn native_remote_noop_pages_resume_at_exact_backend_cursor_without_mutatio
             3,
             None,
             Instant::now(),
+            None,
         )
         .await
         .unwrap();
@@ -785,6 +786,7 @@ async fn native_remote_noop_pages_resume_at_exact_backend_cursor_without_mutatio
             3,
             None,
             Instant::now(),
+            None,
         )
         .await
         .unwrap();
@@ -1608,7 +1610,7 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
 }
 
 #[test]
-fn native_served_placement_yields_actual_global_owner_to_foreground_query() {
+fn native_served_placement_keeps_the_root_available_while_its_remote_page_is_pending() {
     use crate::test_runtime::{FaultAction, FaultRule};
     let mut case = NativePlacementFixture::new("native-placement-foreground-preemption", true, 1);
     let root_node = case.service.node_id().clone();
@@ -1651,14 +1653,14 @@ fn native_served_placement_yields_actual_global_owner_to_foreground_query() {
             let outcome = native.maintenance_tick(&worker_node, Duration::from_secs(5));
             (native, outcome)
         });
-        handle.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), async {
+        let page_call = handle.block_on(async {
+            let page_call = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if observe().iter().any(|call| call.call_id > first_call && call.target == case.primary && call.route == crate::DFS_DATA_NAMESPACE_ROUTE && call.phase == RpcPhase::BeforeDispatch) { break; }
+                    if let Some(call) = observe().iter().find(|call| call.call_id > first_call && call.target == case.primary && call.route == crate::DFS_DATA_NAMESPACE_ROUTE && call.phase == RpcPhase::BeforeDispatch) { break call.call_id; }
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             }).await.expect("ordinary served maintenance reached its actual remote no-op lookup");
-            assert!(scheduler.global_is_exclusively_held());
+            assert!(!scheduler.global_is_exclusively_held(), "placement retained caller-wide admission");
             scheduler.request_foreground_admission();
             let foreground = tokio::time::timeout(Duration::from_millis(500), scheduler.admit(&crate::DfsMessageExecutionScope::ExactShard { file_system_id: root_shard.file_system_id.clone(), shard_id: crate::DfsMetadataShardId::new(&root_shard.shard_id) })).await.expect("foreground query must acquire the normal owner before stalled RPC release").unwrap();
             let backend = &mut store;
@@ -1667,14 +1669,21 @@ fn native_served_placement_yields_actual_global_owner_to_foreground_query() {
             let result = backend.query_file_history_on_shard(&query).unwrap();
             backend.end_consistent_read_snapshot();
             assert!(matches!(result, crate::DfsMetadataQueryResult::RetainedRevisions { entries, .. } if entries.is_empty()));
-            assert!(observe().iter().any(|call| call.call_id > first_call && call.route == crate::DFS_DATA_NAMESPACE_ROUTE && call.phase == RpcPhase::EndedWithoutResponse), "foreground receives owner only after the actual pending lookup is cancelled");
+            assert!(!observe().iter().any(|call| call.call_id == page_call && matches!(call.phase, RpcPhase::EndedWithoutResponse | RpcPhase::Completed)), "foreground query must finish while the original page is outstanding");
             let after = case.control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut()).placement_reconciliation(&case.job.file_system_id, &case.job.job_id).unwrap().unwrap());
-            assert_eq!(after.cursor, original_job.cursor, "a cancelled remote page cannot checkpoint its unconfirmed row");
+            assert_eq!(after.cursor, original_job.cursor, "the outstanding page cannot checkpoint its unconfirmed row");
             drop(foreground);
+            page_call
         });
         gate.add_permits(1);
         let (native, outcome) = worker.join().unwrap();
         outcome.unwrap();
+        assert!(
+            observe()
+                .iter()
+                .any(|call| call.call_id == page_call && call.phase == RpcPhase::Completed),
+            "releasing the remote peer completes the original page RPC"
+        );
         native
     });
     case.runtime = native;

@@ -215,6 +215,49 @@ fn a_pass_whose_index_read_fails_keeps_its_events_and_stays_pending() {
     assert!(events.reachability_changed);
 }
 
+#[test]
+fn scoped_pass_retains_another_shards_new_event_before_reading_any_index() {
+    let executor = DfsRepairExecutor::default();
+    let mut scheduler = DfsRepairScheduler::default();
+    let primaries = BTreeMap::from([("services".to_owned(), 1), ("users".to_owned(), 2)]);
+    let exclusions = DfsMaintenanceExecutionExclusions::default();
+    executor
+        .pass_events(
+            &mut scheduler,
+            &FailingIndex,
+            1,
+            primaries.clone(),
+            &exclusions,
+            8,
+        )
+        .unwrap();
+    let object = DfsObjectId::from_legacy_named("changed-while-admitting").unwrap();
+    lock(&executor.events)
+        .changed
+        .insert("services".into(), BTreeSet::from([object.clone()]));
+    let admitted = scheduler.work_shards(&primaries, &lock(&executor.events), 2);
+    assert_eq!(admitted, BTreeSet::from(["services".to_owned()]));
+    lock(&executor.events)
+        .changed
+        .insert("users".into(), BTreeSet::from([object]));
+    assert!(
+        executor
+            .pass_events_on_shards(
+                &mut scheduler,
+                &FailingIndex,
+                2,
+                primaries,
+                &exclusions,
+                8,
+                Some(&admitted)
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(lock(&executor.events).changed.len(), 2);
+    assert!(executor.pending.load(Ordering::SeqCst));
+}
+
 /// One shard's index holding a single need, for executor-level passes.
 struct OneNeedIndex(DfsRepairNeedKey, DfsRepairNeed);
 

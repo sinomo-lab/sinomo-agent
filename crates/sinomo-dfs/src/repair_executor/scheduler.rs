@@ -262,6 +262,59 @@ impl DfsRepairScheduler {
         &self.primaries
     }
 
+    /// Indexes this pass may consult. A demand for a previously untracked
+    /// object has no shard hint and needs the current primary set.
+    pub(super) fn work_shards(
+        &self,
+        primaries: &BTreeMap<String, u64>,
+        events: &super::DfsRepairExecutorEvents,
+        now: u64,
+    ) -> BTreeSet<String> {
+        if events
+            .demanded
+            .iter()
+            .any(|object| !self.by_object.contains_key(object))
+        {
+            return primaries.keys().cloned().collect();
+        }
+        let mut shards: BTreeSet<_> = primaries
+            .iter()
+            .filter(|(id, epoch)| {
+                self.primaries.get(*id) != Some(*epoch) || !self.need_counts.contains_key(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .chain(self.traversals.keys().cloned())
+            .chain(events.changed.keys().cloned())
+            .chain(events.replaced.iter().cloned())
+            .collect();
+        let mut add = |key: &DfsRepairNeedKey| {
+            if let Some(need) = self.needs.get(key) {
+                shards.insert(need.shard.clone());
+            }
+        };
+        for (_, key) in &self.ready {
+            add(key);
+        }
+        for (_, key) in self.due.iter().take_while(|(due, _)| *due <= now) {
+            add(key);
+        }
+        for keys in self.parked.values() {
+            for key in keys {
+                add(key);
+            }
+        }
+        if events.authority_changed {
+            for key in &self.awaiting_authority {
+                add(key);
+            }
+        }
+        for (key, ..) in &events.outcomes {
+            add(key);
+        }
+        shards.retain(|shard| primaries.contains_key(shard));
+        shards
+    }
+
     fn capacity(&self) -> usize {
         DFS_REPAIR_EXECUTOR_MAX_IN_FLIGHT.saturating_sub(self.in_flight)
     }
@@ -404,7 +457,7 @@ impl DfsRepairScheduler {
         }
         self.traversals.retain(|shard, _| !changed.contains(shard));
         self.need_counts
-            .retain(|shard, _| primaries.contains_key(shard));
+            .retain(|shard, _| primaries.contains_key(shard) && !changed.contains(shard));
         for shard in primaries.keys() {
             if changed.contains(shard) {
                 self.traversals.insert(shard.clone(), None);
@@ -568,6 +621,15 @@ impl DfsRepairScheduler {
         for (key, request_id, outcome, error) in input.outcomes {
             self.apply_outcome(&key, request_id.as_deref(), outcome, error, now);
         }
+        let recount: BTreeSet<_> = self
+            .primaries
+            .keys()
+            .filter(|shard| !self.need_counts.contains_key(*shard))
+            .chain(input.changed.keys())
+            .chain(input.replaced.iter())
+            .filter(|shard| self.primaries.contains_key(*shard))
+            .cloned()
+            .collect();
         for shard in input.replaced {
             if self.primaries.contains_key(&shard) {
                 self.traversals.insert(shard, None);
@@ -661,7 +723,7 @@ impl DfsRepairScheduler {
                 self.traversals.insert(shard.clone(), last);
             }
         }
-        for shard in self.primaries.keys().cloned().collect::<Vec<_>>() {
+        for shard in recount {
             let count = source.need_count(&shard)?;
             self.need_counts.insert(shard, count);
         }

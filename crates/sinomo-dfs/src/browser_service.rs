@@ -961,6 +961,40 @@ impl DfsBrowserBackend {
         skip_all,
         fields(stage = "dfs.browser.lock")
     )]
+    /// Hosted path writes dispatch even the local shard through Main. Only the
+    /// owner mutates metadata. Give the caller its own response inbox so it can
+    /// wait for that owner without borrowing the resident browser service.
+    fn owner_write_client(
+        &self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Option<crate::MountedSifsService>, ServiceError> {
+        if self.host.data_plane_host().is_none() {
+            return Ok(None);
+        }
+        let service = self.lock_service()?;
+        if !service.transport.delegates_local_namespace_authority() {
+            return Ok(None);
+        }
+        let transport = service.transport.fork_browser_request();
+        let content = service.content.clone();
+        let cancellation = service.cancellation.clone();
+        let frame_ids = Arc::clone(&service.next_frame_id);
+        let message_ids = Arc::clone(&service.next_message_id);
+        drop(service);
+        let control = self
+            .host
+            .control_plane_client(&ClusterPaths::new(&self.data_dir), runtime)
+            .ok_or_else(|| {
+                dfs_browser_service_error("hosted write lost its control-plane client")
+            })?;
+        let mut caller =
+            crate::MountedSifsService::new(transport, content).with_boxed_control_plane(control);
+        caller.next_frame_id = frame_ids;
+        caller.next_message_id = message_ids;
+        caller.set_cancellation(cancellation);
+        Ok(Some(caller))
+    }
+
     pub fn lock_service(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, crate::MountedSifsService>, ServiceError> {
@@ -1429,6 +1463,14 @@ impl DfsBrowserBackend {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn try_write_file(
+        &self,
+        request: crate::DaemonDfsBrowserWriteFileRequest,
+    ) -> Result<DfsBrowserWriteAttempt, ServiceError> {
+        self.try_write_file_with_client(request, None)
+    }
+
     #[tracing::instrument(
         target = "sinomo.perf",
         level = "trace",
@@ -1436,9 +1478,10 @@ impl DfsBrowserBackend {
         skip_all,
         fields(stage = "dfs.browser.write.attempt")
     )]
-    fn try_write_file(
+    fn try_write_file_with_client(
         &self,
         request: crate::DaemonDfsBrowserWriteFileRequest,
+        mut client: Option<crate::MountedSifsService>,
     ) -> Result<DfsBrowserWriteAttempt, ServiceError> {
         let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
         let mut phase_started = trace_started;
@@ -1451,7 +1494,15 @@ impl DfsBrowserBackend {
             })
         };
         let path = normalize_sifs_browser_path(&request.path)?;
-        let mut service = self.lock_mutation()?;
+        let routed = client.is_some();
+        let mut resident;
+        let service = match client.as_mut() {
+            Some(caller) => caller,
+            None => {
+                resident = self.lock_mutation()?;
+                &mut *resident
+            }
+        };
         let lock_us = phase_elapsed();
         // One coherent, already-published view supplies provider eligibility
         // and the complete zone identity. Reject an unknown floor before any
@@ -1475,7 +1526,7 @@ impl DfsBrowserBackend {
                 .map_err(dfs_browser_service_error)?
                 .is_some()
         {
-            self.flush_after_mutation(&mut service)?;
+            self.flush_after_mutation(service)?;
             return Ok(DfsBrowserWriteAttempt::Complete(
                 crate::DaemonDfsBrowserWriteFileResponse,
             ));
@@ -1483,6 +1534,15 @@ impl DfsBrowserBackend {
         // Parent preparation, policy selection and the write resolve the same
         // path. One lookup scope lets them share each authority observation;
         // any routed mutation among them discards the earlier observations.
+        // Main explicitly requested path resolution, or this is a standalone
+        // write. Parent creation and link traversal use the resident owner.
+        let mut fallback;
+        let service = if routed {
+            fallback = self.lock_mutation()?;
+            &mut *fallback
+        } else {
+            service
+        };
         let (mkdir_us, candidates_us, options_us, write_us) = service
             .with_metadata_lookup_cache_mut(|service| -> Result<_, ServiceError> {
                 prepare_sifs_browser_write_parent(service, &path)
@@ -1509,7 +1569,7 @@ impl DfsBrowserBackend {
                     .map_err(dfs_browser_service_error)?;
                 Ok((mkdir_us, candidates_us, options_us, phase_elapsed()))
             })?;
-        self.flush_after_mutation(&mut service)?;
+        self.flush_after_mutation(service)?;
         let flush_us = phase_elapsed();
         if let Some(started) = trace_started {
             crate::dfs_perf_trace(format_args!(
@@ -1534,6 +1594,7 @@ impl DfsBrowserBackend {
     fn replace_file_if_version(
         &self,
         request: crate::DaemonDfsBrowserReplaceFileIfVersionRequest,
+        mut client: Option<crate::MountedSifsService>,
     ) -> Result<crate::DaemonDfsBrowserReplaceFileIfVersionResponse, ServiceError> {
         use crate::DaemonDfsBrowserReplaceFileIfVersionOutcome as Outcome;
 
@@ -1567,7 +1628,15 @@ impl DfsBrowserBackend {
                 });
             }
         };
-        let mut service = self.lock_mutation_for_paths(&[path.as_str()])?;
+        let routed = client.is_some();
+        let mut resident;
+        let service = match client.as_mut() {
+            Some(caller) => caller,
+            None => {
+                resident = self.lock_mutation_for_paths(&[path.as_str()])?;
+                &mut *resident
+            }
+        };
         match service.try_route_browser_write(
             &path,
             &request.bytes,
@@ -1578,7 +1647,7 @@ impl DfsBrowserBackend {
         ) {
             Ok(Some(receipt)) => {
                 let maintenance_warning = self
-                    .flush_after_mutation(&mut service)
+                    .flush_after_mutation(service)
                     .err()
                     .map(|e| e.to_string());
                 return Ok(crate::DaemonDfsBrowserReplaceFileIfVersionResponse {
@@ -1595,6 +1664,13 @@ impl DfsBrowserBackend {
             }
             Ok(None) => {}
         }
+        let mut fallback;
+        let mut service = if routed {
+            fallback = self.lock_mutation_for_paths(&[path.as_str()])?;
+            &mut *fallback
+        } else {
+            service
+        };
         let replica_candidates = self.content_replica_candidates()?;
         let options = match sifs_browser_write_options(&mut service, &path, &replica_candidates) {
             Ok(options) => options,
@@ -2673,7 +2749,8 @@ impl Service for HostedDfsBrowserService {
                         let backend_runtime = runtime.clone();
                         let attempt_host = Arc::clone(&backend_host);
                         let traceparent = request_traceparent.clone();
-                        let attempt = run_blocking_browser_task(
+                        let queue = backend_host.data_plane_host().is_none();
+                        let attempt = run_browser_task_with_admission(
                             Arc::clone(&data_dir),
                             route.clone(),
                             "DFS browser write file",
@@ -2684,7 +2761,7 @@ impl Service for HostedDfsBrowserService {
                                         &backend_runtime,
                                         attempt_host,
                                     )?;
-                                    match backend.try_write_file(payload)? {
+                                    match backend.try_write_file_with_client(payload, backend.owner_write_client(&backend_runtime)?)? {
                                         DfsBrowserWriteAttempt::Complete(response) => Ok((
                                             DfsBrowserWriteAttempt::Complete(response),
                                             Some(backend.event_origin_node_id()?),
@@ -2700,6 +2777,7 @@ impl Service for HostedDfsBrowserService {
                                     }
                                 })
                             },
+                            queue,
                         )
                         .await?;
                         match attempt {
@@ -2746,7 +2824,8 @@ impl Service for HostedDfsBrowserService {
                     let publish_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
                     let traceparent = request_traceparent.clone();
-                    let result = run_blocking_browser_task(
+                    let queue = backend_host.data_plane_host().is_none();
+                    let result = run_browser_task_with_admission(
                         Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser conditional replace file",
@@ -2757,10 +2836,14 @@ impl Service for HostedDfsBrowserService {
                                     &backend_runtime,
                                     Arc::clone(&backend_host),
                                 )?;
-                                let result = backend.replace_file_if_version(payload)?;
+                                let result = backend.replace_file_if_version(
+                                    payload,
+                                    backend.owner_write_client(&backend_runtime)?,
+                                )?;
                                 Ok((result, backend.event_origin_node_id()?))
                             })
                         },
+                        queue,
                     )
                     .await?;
                     if result.0.outcome.is_committed() {
@@ -4871,6 +4954,88 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "health still observes the real negative preparation boundary"
         );
+    }
+
+    #[test]
+    fn hosted_write_releases_both_browser_locks_while_the_owner_executes() {
+        struct Sink;
+        impl sinomo_core::service::ResponseSink for Sink {
+            fn send(
+                self: Box<Self>,
+                _: sinomo_core::network::ObjectRpcOutgoingResponse,
+            ) -> Result<(), ServiceError> {
+                Ok(())
+            }
+        }
+        let (native, nodes) = crate::test_runtime::DfsTestRuntime::start_cluster(
+            "browser-write-independent-owner",
+            1,
+        )
+        .unwrap();
+        let node = nodes[0].clone();
+        let data = Arc::new(native.data_dir(&node).clone());
+        let runtime = native.runtime_handle();
+        let backend =
+            DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &runtime).unwrap();
+        let slot = browser_backend_slot(&data).unwrap();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, hold) = std::sync::mpsc::channel();
+        let hold = Mutex::new(hold);
+        let guard = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            &data,
+            Arc::new(move |point, command, _| {
+                if matches!(point, crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. })
+                    && command.is_some_and(|c| matches!(&c.routed_message.message,
+                        crate::DfsNetworkMessage::NamespaceRequest(n)
+                            if matches!(&n.operation, crate::DfsNamespaceOperation::WriteFile { path, .. }
+                                if path == "/held-owner.bin")))
+                {
+                    entered.send(()).unwrap();
+                    hold.lock().unwrap().recv_timeout(Duration::from_secs(15)).unwrap();
+                }
+                Ok(())
+            }),
+        );
+        let locks = std::thread::scope(|threads| {
+            let write = threads.spawn(|| {
+                runtime.block_on(async {
+                    let browser = HostedDfsBrowserService::new(
+                        Some(runtime.clone()),
+                        dfs_browser_component_host(&data)?,
+                    );
+                    let ctx = ServiceContext::new(
+                        Arc::clone(&data),
+                        None,
+                        ServiceSigner::Local,
+                        sinomo_core::network::ObjectRpcIncomingBody::empty(),
+                        Box::new(Sink),
+                    );
+                    let request = ObjectRpcRequest::encode_body(
+                        DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+                        DAEMON_RPC_CATEGORY,
+                        &crate::DaemonDfsBrowserWriteFileRequest {
+                            path: "/held-owner.bin".into(),
+                            bytes: b"committed".to_vec(),
+                        },
+                    )
+                    .unwrap();
+                    browser.handle(ctx, request).await
+                })
+            });
+            let observed = waiting.recv_timeout(Duration::from_secs(15));
+            let locks = (
+                slot.execution.try_lock().is_ok(),
+                backend.service.try_lock().is_ok(),
+            );
+            let _ = release.send(());
+            write.join().unwrap().unwrap();
+            observed.unwrap();
+            locks
+        });
+        drop(guard);
+        drop(backend);
+        native.close().unwrap();
+        assert_eq!(locks, (true, true));
     }
 
     #[test]

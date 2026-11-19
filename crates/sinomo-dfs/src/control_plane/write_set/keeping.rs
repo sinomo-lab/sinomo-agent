@@ -242,8 +242,9 @@ pub(crate) fn plan_metadata_write_set_keeping(
         }
     }
 
-    // A pending commit whose content W the record does not yet accept.
-    if plan.txn.is_none() && view.demanded_w > write_set.accepted_w() {
+    // Raising the accepted W does not remove a participant. Order this demand
+    // before membership maintenance so the next plan uses the new bound.
+    if view.demanded_w > write_set.accepted_w() {
         plan.txn = Some(DfsWriteSetKeepingTxn::RaiseN {
             w: view.demanded_w,
         });
@@ -627,6 +628,21 @@ mod tests {
         let mut case = Case::new(&["m"], &["m"], 2, 2);
         case.members.get_mut(&node("m")).unwrap().mobile = true;
         assert_eq!(case.plan(), DfsWriteSetKeepingPlan::default());
+    }
+
+    #[test]
+    fn higher_content_w_precedes_shrink_at_the_same_generation() {
+        let mut case =
+            Case::new(&["b", "c"], &["b", "c"], 1, 2).reach("c", DfsWriteSetMemberReach::NoPath);
+        assert!(matches!(
+            case.plan().txn,
+            Some(DfsWriteSetKeepingTxn::Shrink { .. })
+        ));
+        case.demanded_w = 2;
+        assert_eq!(
+            case.plan().txn,
+            Some(DfsWriteSetKeepingTxn::RaiseN { w: 2 })
+        );
     }
 
     #[test]

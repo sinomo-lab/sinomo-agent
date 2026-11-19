@@ -3317,6 +3317,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             if let Some(shard) = shard.as_ref()
                 && shard.primary_node_id == self.node_id
+                && !self.transport.delegates_local_namespace_authority()
             {
                 return Ok(
                     if self.current_read_object_metadata(&object.object_id)? == *object {
@@ -3326,7 +3327,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                 );
             }
-        } else if self.is_local_metadata_primary_for_object(object)? {
+        } else if !self.transport.delegates_local_namespace_authority()
+            && self.is_local_metadata_primary_for_object(object)?
+        {
             return Ok(
                 if self
                     .certified_local_metadata_owner_shard_for_object(object)?
@@ -3340,7 +3343,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         Ok(shard
-            .filter(|shard| shard.primary_node_id != self.node_id)
+            .filter(|shard| {
+                shard.primary_node_id != self.node_id
+                    || self.transport.delegates_local_namespace_authority()
+            })
             .map(PlacementNoopCheck::LookupRemote)
             .unwrap_or(PlacementNoopCheck::RequiresReconciliation))
     }
@@ -4593,6 +4599,16 @@ fn subtree_object_page_result(
     }
 }
 
+/// The coordinator's existing resident tables used for bounded local planning.
+/// The page's network reads and effects never borrow these shards.
+pub(crate) struct DfsPlacementPageRead {
+    pub(crate) resident: crate::ResidentLocalShardedMetadataBackend,
+    pub(crate) scheduler: std::sync::Arc<crate::DfsMutationScheduler>,
+    pub(crate) authority: std::sync::Arc<crate::DfsMetadataAuthorityRuntime>,
+    pub(crate) generation: u64,
+    pub(crate) storage_generation: u64,
+}
+
 /// Pages a placement job's scope shard by shard in shard-id order. The caller
 /// fetches each requested page from that shard's authority.
 struct PlacementShardPager {
@@ -4909,7 +4925,9 @@ where
         let mut pager = PlacementShardPager::new(shards, job, max_objects)?;
         while let Some((shard, path, after, limit)) = pager.next_request() {
             let selection = crate::DfsMetadataSelection::SubtreeObjectPageV1 { path, after, limit };
-            let result = if shard.primary_node_id == self.node_id {
+            let result = if shard.primary_node_id == self.node_id
+                && !self.transport.delegates_local_namespace_authority()
+            {
                 self.query_own_shard_metadata(&shard, selection)?
             } else {
                 let query = crate::DfsMetadataShardQuery {
@@ -5038,7 +5056,7 @@ where
         &mut self,
         max_objects: usize,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
-        self.run_placement_reconciliation_bounded_async_with_eligibility(max_objects, None)
+        self.run_placement_reconciliation_bounded_async_with_eligibility(max_objects, None, None)
             .await
     }
 
@@ -5047,6 +5065,22 @@ where
         max_objects: usize,
         pending_repair_count: usize,
         admitted_metadata_shards: &[crate::DfsMetadataShardConfig],
+    ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
+        self.run_placement_page_with_pending_repairs(
+            max_objects,
+            pending_repair_count,
+            admitted_metadata_shards,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_placement_page_with_pending_repairs(
+        &mut self,
+        max_objects: usize,
+        pending_repair_count: usize,
+        admitted_metadata_shards: &[crate::DfsMetadataShardConfig],
+        planning: Option<&DfsPlacementPageRead>,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
         let Some(root) =
             crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
@@ -5066,6 +5100,7 @@ where
         self.run_placement_reconciliation_bounded_async_with_eligibility(
             max_objects,
             Some(pending_repair_count),
+            planning,
         )
         .await
     }
@@ -5074,6 +5109,7 @@ where
         &mut self,
         max_objects: usize,
         pending_repair_count: Option<usize>,
+        planning: Option<&DfsPlacementPageRead>,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
         let (current_config, coordinator_node_id) = {
@@ -5219,6 +5255,7 @@ where
                 max_objects.max(1),
                 page_authority.as_ref(),
                 started,
+                planning,
             )
             .await;
         // Finish this remote page's poll before any progress publication I/O.
@@ -5309,6 +5346,7 @@ where
         max_objects: usize,
         authority: Option<&PlacementPageAuthority>,
         started: Instant,
+        planning: Option<&DfsPlacementPageRead>,
     ) -> Result<(), DfsError> {
         let budget = placement_page_budget(job, max_objects);
         let mut processed_objects = 0usize;
@@ -5324,9 +5362,46 @@ where
         let (page, page_sources) = self
             .placement_object_page_async(job, budget.max_objects_per_tick)
             .await?;
-        let objects = self.prepare_placement_reconciliation_page(
-            config, page, job, &budget, started, authority,
-        )?;
+        let plan = |service: &mut Self| {
+            service.prepare_placement_reconciliation_page(
+                config, page, job, &budget, started, authority,
+            )
+        };
+        let objects = if let Some(planning) = planning.filter(|_| !page_sources.is_empty()) {
+            let shards = page_sources
+                .values()
+                .map(|s| crate::DfsMetadataShardId::new(s.shard_id.clone()))
+                .collect::<BTreeSet<_>>();
+            let keys = shards
+                .iter()
+                .map(|shard_id| crate::runtime_admission::DfsMutationLaneKey {
+                    file_system_id: job.file_system_id.clone(),
+                    shard_id: shard_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            let _read = planning.scheduler.admit_shards(&keys).await?;
+            if planning
+                .authority
+                .retained_complete_prefix_for_generation(planning.generation)
+                .is_none()
+                || planning.authority.storage_generation() != planning.storage_generation
+            {
+                return Err(DfsError::Metadata {
+                    message: "placement planning lost its admitted shard configuration".into(),
+                });
+            }
+            // Only this routing shell borrows the page's tables. Read the
+            // recorded version W/N and original placement intent at the same
+            // boundary as before. Return the lease before any subsequent RPC.
+            let lease = planning.resident.checkout_shards(&shards)?;
+            self.metadata_backend =
+                Some(crate::service_state::DfsMetadataBackendOwner::ResidentSharded(lease));
+            let result = plan(self);
+            self.release_resident_metadata_backend()?;
+            result?
+        } else {
+            plan(self)?
+        };
         let mut remote_proofs = self
             .read_remote_placement_noop_proofs(
                 config,
@@ -5444,7 +5519,8 @@ where
         };
         let shard = self.select_metadata_shard_for_object(object)?;
         if let Some(shard) = shard
-            && shard.primary_node_id != self.node_id
+            && (shard.primary_node_id != self.node_id
+                || self.transport.delegates_local_namespace_authority())
         {
             // As on the synchronous path, a later maintenance invocation gets
             // a fresh monotonic request token. This invocation's redirects keep

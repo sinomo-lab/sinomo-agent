@@ -2111,6 +2111,33 @@ impl LocalContentStore {
         self.write_object_version_blob_only(object_id, version, bytes)
     }
 
+    /// A routed write already names an immutable version at its content holder.
+    /// Bind it with its reservation and bytes in one frame, as for a content
+    /// replica. Only the guarded metadata transaction can make it current.
+    #[tracing::instrument(
+        target = "sinomo.perf",
+        level = "trace",
+        name = "dfs.content.blob",
+        skip_all,
+        fields(stage = "dfs.content.blob")
+    )]
+    pub(crate) fn put_owner_write_content(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<ContentManifest> {
+        if bytes.len() as u64 <= INLINE_BLOB_SMALL_LIMIT_BYTES {
+            self.prepare_version_if_missing(object_id, version)?;
+            if let Some(manifest) =
+                self.try_write_inline_binding_with_phase(object_id, version, bytes, true)?
+            {
+                return Ok(manifest);
+            }
+        }
+        self.write_object_version_blob_only(object_id, version, bytes)
+    }
+
     pub fn put_blob_only_manifest(
         &self,
         object_id: &str,
