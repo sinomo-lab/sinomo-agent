@@ -218,6 +218,25 @@ impl DfsMutationScheduler {
         self.global.try_read().is_err()
     }
 
+    /// Whether a global writer holds the node, which closes it to answers.
+    #[cfg(test)]
+    pub fn global_writer_holds(&self) -> bool {
+        self.answers.lock().writer_holds
+    }
+
+    /// Whether admitted work holds `key`'s lane: its shard permit, or the
+    /// node through a global writer.
+    #[cfg(test)]
+    pub fn lane_held(&self, key: &DfsMutationLaneKey) -> bool {
+        self.global_writer_holds()
+            || self
+                .shard_gates
+                .lock()
+                .expect("DFS mutation scheduler shard-gate map")
+                .get(key)
+                .is_some_and(|gate| gate.available_permits() == 0)
+    }
+
     pub fn try_admit_global(self: &Arc<Self>) -> Option<DfsMutationAdmission> {
         let global = Arc::clone(&self.global).try_write_owned().ok()?;
         let answers = self.answers.try_hold()?;

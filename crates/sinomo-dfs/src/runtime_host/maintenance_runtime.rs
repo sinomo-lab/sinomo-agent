@@ -681,6 +681,7 @@ impl DaemonDfsMaintenanceServiceReturn<'_> {
         // temporary dispatch mode; the outer worker still owns the same actual
         // checkpointed calls and starts after admission release.
         retained.lane.service.set_background_replica_dispatch(false);
+        retained.lane.service.foreign_live_write_intents.clear();
         // A foreground generation belongs to this maintenance turn. Never
         // leave its already-triggered cancellation source on the reused lane.
         retained.lane.service.set_cancellation(self.previous_cancellation.take());
@@ -762,6 +763,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     let execution_exclusions =
         daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state)
             .with_repair_authority_epoch(repair_authority_epoch);
+    // The shard lanes' unfinished-write phase below reuses these inputs.
+    let write_phase_exclusions = execution_exclusions.clone();
+    let write_phase_owners = publication_owners.clone();
+    let write_phase_tracker = committed_work_tracker.clone();
+    let write_phase_budget =
+        daemon_dfs_routine_maintenance_tick_options(node_resources).repair_max_jobs;
     // Transfer the mutation lane only after validating the admitted native
     // identity. Topology comes from the retained proof-bearing generation
     // below; maintenance must never refresh or materialize the complete KV
@@ -812,6 +819,9 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     let peer_node_ids = retained.peer_node_ids.clone();
     let detached_send_runtime = Arc::clone(&retained.detached_send_runtime);
     let mut maintenance_service = &mut retained.lane.service;
+    // Unfinished routed writes stay with the shard lanes that serve them;
+    // their own phase below advances them, not this service's recovery.
+    maintenance_service.foreign_live_write_intents = daemon_dfs_live_write_lane_intents(&data_dir)?;
     *turn_progress = Some((
         Arc::clone(&maintenance_service.maintenance_progress),
         maintenance_service.maintenance_progress.epoch()?,
@@ -1228,6 +1238,30 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             request, phase,
         ));
     }
+    // A routed write stays on the shard lane that served it until it finishes.
+    // Run that lane's unfinished-write phase as the repair phase ran it on the
+    // global service: due stage retries, the replies they bring back, and the
+    // terminal reply its requester is still owed. It runs whatever this
+    // turn's own phases reported: a recovery pass that settled a lane's write
+    // durably still owes that write's reply. The global service's backend
+    // lease has been returned above, so each lane checks out its own shard
+    // while this turn still holds the global admission.
+    if maintenance_kind != DaemonDfsMaintenanceKind::RepairExecutor
+        && let Some(owners) = write_phase_owners.as_ref()
+    {
+        run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
+            &data_dir,
+            owners,
+            &metadata_authority_generation,
+            runtime,
+            &write_phase_exclusions,
+            write_phase_budget,
+            &write_phase_tracker,
+            _foreground_preemption,
+            _deferred_work,
+        )
+        .await?;
+    }
     // A completed old turn is not completion of a newer authority generation.
     // Its durable effects and queue checkpoints remain, but the next turn must
     // acquire the current proof before acknowledging reconciliation readiness.
@@ -1277,6 +1311,136 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     Ok(DaemonDfsMaintenancePreExecution::Finished(Some(
         reached_limit,
     )))
+}
+
+// Dropping the cancellable maintenance future mid-phase must return the
+// lane's live write custody to its cache slot, as the global service's own
+// return owner does.
+struct DaemonDfsMaintenanceWriteServiceReturn<'a> {
+    data_dir: &'a SinomoDataDir,
+    taken: Option<DaemonDfsMaintenanceWriteService>,
+    previous_cancellation: Option<crate::DfsCancellationFlag>,
+}
+
+impl DaemonDfsMaintenanceWriteServiceReturn<'_> {
+    fn restore(&mut self) -> Result<bool, sinomo_dfs::DfsError> {
+        let Some(mut taken) = self.taken.take() else {
+            return Ok(false);
+        };
+        taken
+            .lane
+            .service
+            .set_cancellation(self.previous_cancellation.take());
+        if taken.lane.resident_metadata_scope.is_some() {
+            taken.lane.service.release_resident_metadata_backend()?;
+        }
+        restore_daemon_dfs_write_service_after_maintenance(self.data_dir, taken)
+    }
+}
+
+impl Drop for DaemonDfsMaintenanceWriteServiceReturn<'_> {
+    fn drop(&mut self) {
+        if self.taken.is_none() {
+            return;
+        }
+        if let Err(error) = self.restore() {
+            tracing::warn!(
+                data_root = %self.data_dir.root().display(),
+                "routed-write service handback failed after interrupted maintenance: {error}"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_daemon_dfs_unfinished_write_phase_on_shard_lanes(
+    data_dir: &SinomoDataDir,
+    owners: &Arc<crate::publication_guard::DfsPublicationExecutionOwners>,
+    metadata_authority_generation: &Arc<DaemonDfsMetadataAuthorityGeneration>,
+    runtime: &tokio::runtime::Handle,
+    execution_exclusions: &crate::DfsMaintenanceExecutionExclusions,
+    repair_max_jobs: usize,
+    committed_work_tracker: &DfsCommittedWorkTracker,
+    foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
+    deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
+) -> Result<(), DaemonError> {
+    for taken in take_daemon_dfs_unfinished_write_services(data_dir)? {
+        let mut write_return = DaemonDfsMaintenanceWriteServiceReturn {
+            data_dir,
+            previous_cancellation: taken.lane.service.cancellation.clone(),
+            taken: Some(taken),
+        };
+        let taken = write_return.taken.as_mut().expect("taken write service");
+        let key = taken.key.clone();
+        let detached_send_runtime = Arc::clone(&taken.detached_send_runtime);
+        let lane = &mut taken.lane;
+        let phase = async {
+            if let Some(scope) = lane.resident_metadata_scope.clone() {
+                lane.attach_metadata_scope(&scope)?;
+            }
+            let provider = crate::DfsPublicationExecutionProvider::from_execution_owners(
+                owners,
+                Arc::clone(metadata_authority_generation),
+                runtime.clone(),
+            )?;
+            let _publication_scope = lane
+                .service
+                .publication_execution
+                .install(Arc::clone(owners));
+            let _provider_scope = lane.service.publication_provider.install(provider);
+            lane.service
+                .set_committed_work_tracker(committed_work_tracker.clone());
+            lane.service
+                .add_cancellation(foreground_preemption.cancellation_flag());
+            // An outcome settled elsewhere is replied first; retries follow.
+            let mut events = Vec::new();
+            lane.service
+                .flush_completed_pending_remote_write_responses(&mut events)?;
+            lane.service
+                .retry_pending_stages_async(repair_max_jobs, execution_exclusions)
+                .await?;
+            lane.service
+                .process_incoming_async_until_quiescent()
+                .await?;
+            lane.service
+                .flush_completed_pending_remote_write_responses(&mut events)?;
+            Ok::<_, sinomo_dfs::DfsError>(())
+        }
+        .await;
+        if lane.service.message_deferred_work_pending()? {
+            let worker = lane.service.detach_message_deferred_work();
+            match deferred_work.as_mut() {
+                Some((_, existing)) => existing.retain_prepared_calls_from(&worker),
+                None => {
+                    *deferred_work = Some((detached_send_runtime, worker));
+                }
+            }
+        }
+        match write_return.restore() {
+            Ok(true) => {}
+            Ok(false) => tracing::info!(
+                data_root = %data_dir.root().display(), fs = %key.file_system_id,
+                shard = %key.shard_id.0,
+                "dropped a routed-write service whose owner or storage changed during maintenance"
+            ),
+            Err(error) => tracing::warn!(
+                data_root = %data_dir.root().display(), fs = %key.file_system_id,
+                shard = %key.shard_id.0,
+                "routed-write service handback failed after maintenance: {error}"
+            ),
+        }
+        if let Err(error) = phase {
+            if error.is_cancellation() && foreground_preemption.is_requested() {
+                return Ok(());
+            }
+            tracing::warn!(
+                data_root = %data_dir.root().display(), fs = %key.file_system_id,
+                shard = %key.shard_id.0,
+                "routed-write lane unfinished-write phase failed: {error}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether this pass itself proved that it stopped with bounded, immediately

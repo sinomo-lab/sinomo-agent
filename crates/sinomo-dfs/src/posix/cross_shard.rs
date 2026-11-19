@@ -976,10 +976,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Surfaces `Busy` (retriable) so coordinators reject up front and parked
     /// sagas wait for the write to drain.
     fn ensure_no_open_write_state_for_object(
-        &self,
+        &mut self,
         object: &DfsObjectMetadata,
         path: &str,
     ) -> Result<()> {
+        // Another service of this node can be the one serving a write: a
+        // shard lane's write service owns its routed writes. A copy held here
+        // takes its durable outcome first, so a write already committed or
+        // failed there does not fence the move. A copy that cannot take it
+        // stays as it is and keeps fencing.
+        let held = self
+            .writes
+            .pending_writes
+            .iter()
+            .filter(|(_, pending)| pending.object_id == object.object_id)
+            .map(|(intent_id, _)| intent_id.clone())
+            .chain(
+                self.coordinator
+                    .open_intent_ids_for_object(&object.object_id)
+                    .cloned(),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        for intent_id in held {
+            if let Err(error) = self.refresh_committed_write_projection(&intent_id) {
+                tracing::debug!(target: "sinomo.dfs", %intent_id, %error,
+                    "held write copy kept its resident state before a move fence");
+            }
+        }
         let busy = || {
             Err(DfsPosixError::Dfs(DfsError::Busy {
                 path: path.to_string(),

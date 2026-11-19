@@ -122,6 +122,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut eligible = Vec::with_capacity(page.intents.len());
         if let Some(shard_id) = page.scanned_shard_id.as_ref() {
             for intent in page.intents {
+                // A shard lane's write service still serves this write: its
+                // own maintenance phase advances it there.
+                if self.foreign_live_write_intents.contains(&intent.intent_id) {
+                    continue;
+                }
                 if backend.write_intent_maintenance_candidate_is_listable(shard_id, &intent)? {
                     eligible.push(intent);
                 }

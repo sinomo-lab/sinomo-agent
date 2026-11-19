@@ -78,6 +78,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             source_adoption: Default::default(),
             pending_namespace_request_recovery_cursor: None,
             write_intent_maintenance_scan: std::sync::Arc::new(Default::default()),
+            foreign_live_write_intents: Default::default(),
             maintenance_progress: std::sync::Arc::new(Default::default()),
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: Default::default(),
@@ -634,6 +635,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || self.committed_work_tracker.is_some();
 
         metadata_lookup_scope_quiescent
+            && !self.coordinator.has_open_intents()
             && self.writes.is_quiescent()
             && self.reads.is_quiescent()
             && self.replication.is_quiescent()
@@ -642,6 +644,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && self.pending_namespace_request_recovery.is_none()
             && self.routed_namespace_settle_depth == 0
             && committed_work_has_durable_owner
+    }
+
+    /// Whether a routed write this service served is unfinished: it still
+    /// awaits receipts or its commit, or still owes its requester a reply.
+    pub(crate) fn has_unfinished_routed_writes(&self) -> bool {
+        self.coordinator.has_open_intents()
+            || !self.writes.pending_writes.is_empty()
+            || !self.writes.pending_remote_write_responses.is_empty()
+    }
+
+    /// The write intents of [`Self::has_unfinished_routed_writes`].
+    pub(crate) fn unfinished_routed_write_intent_ids(&self) -> std::collections::BTreeSet<String> {
+        self.coordinator
+            .open_intent_ids()
+            .chain(self.writes.pending_writes.keys())
+            .chain(self.writes.pending_remote_write_responses.keys())
+            .cloned()
+            .collect()
     }
 
     /// Release a quiescent exact-shard lane's rebuildable metadata mirror.

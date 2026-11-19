@@ -754,6 +754,14 @@ pub(crate) struct DfsRuntimeMessageCacheEntry {
         crate::DfsMutationLaneKey,
         Arc<DfsRuntimeMessageServiceLaneHandle>,
     >,
+    /// Each shard lane's routed-write service. It is admitted on the same
+    /// shard lane as the shard's namespace service, but keeps a routed write's
+    /// coordinator, pending-write and receipt state while the write is
+    /// unfinished, so namespace requests on the lane read published state only.
+    pub exact_write_services: std::collections::BTreeMap<
+        crate::DfsMutationLaneKey,
+        Arc<DfsRuntimeMessageServiceLaneHandle>,
+    >,
     pub content_read_service: Option<Arc<DfsRuntimeMessageServiceLaneHandle>>,
 }
 
@@ -937,16 +945,21 @@ pub(crate) fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCom
 // Repair replies have no wire shard. Only the host that still owns the exact
 // original local call may supply their scoped admission; unpaired ingress keeps
 // its existing global scope and current intent/policy validation.
+//
+// A stamped routed write owns its coordinator, pending-write and receipt state
+// in its shard's lane. Replies to its own transfers return to that lane's
+// service through `existing_transfer_response_service_lane`.
 pub(crate) fn dfs_runtime_message_supports_exact_service_lane(command: &DfsMessageCommand) -> bool {
-    matches!(
-        &command.routed_message.message,
+    match &command.routed_message.message {
         DfsNetworkMessage::MetadataJournalBatch(_)
-            | DfsNetworkMessage::MetadataSnapshotInstall(_)
-            | DfsNetworkMessage::RepairReplicaResponse(_)
-    ) || matches!(
-        &command.routed_message.message,
-        DfsNetworkMessage::NamespaceRequest(namespace) if namespace.authority_shards.len() == 1
-    )
+        | DfsNetworkMessage::MetadataSnapshotInstall(_)
+        | DfsNetworkMessage::RepairReplicaResponse(_) => true,
+        DfsNetworkMessage::NamespaceRequest(namespace) => namespace.authority_shards.len() == 1,
+        DfsNetworkMessage::DistributedWriteRequest(write)
+        | DfsNetworkMessage::ExclusiveCreateRequest(write)
+        | DfsNetworkMessage::RetainedWriteRequest(write) => write.authority_shard.is_some(),
+        _ => false,
+    }
 }
 
 pub(crate) fn dfs_runtime_message_cache() -> &'static DfsRuntimeMessageCache {
@@ -1095,6 +1108,120 @@ pub(crate) fn existing_fetch_response_service_lane(
         owner = Some(Arc::clone(handle));
     }
     Ok(owner)
+}
+
+/// Whether a reply may belong to a write served on an exact lane, so the host
+/// looks for that lane's service before executing it on the global one.
+pub(crate) fn dfs_runtime_message_is_transfer_response(command: &DfsMessageCommand) -> bool {
+    matches!(
+        &command.routed_message.message,
+        DfsNetworkMessage::FetchBlobResponse(_)
+            | DfsNetworkMessage::StageBlobResponse(_)
+            | DfsNetworkMessage::RepairReplicaResponse(_)
+            | DfsNetworkMessage::CommitVersionResponse(_)
+    )
+}
+
+/// Global scheduler admission still owns this reply. A routed write served on
+/// an exact lane keeps its coordinator and pending-write state in that lane's
+/// service; a reply to one of its transfers that returns on its own (the
+/// return of a detached send) executes there. A stage reply matches the exact
+/// stage request still in flight, a fetch reply the live fetch owner, and a
+/// repair or commit reply the one lane still serving its write. A reply no
+/// live lane owns keeps the global service and its durable validation.
+pub(crate) fn existing_transfer_response_service_lane(
+    candidates: &[(
+        crate::DfsMetadataShardConfig,
+        Arc<DfsRuntimeMessageServiceLaneHandle>,
+    )],
+    command: &DfsMessageCommand,
+) -> Result<Option<Arc<DfsRuntimeMessageServiceLaneHandle>>, crate::DfsError> {
+    fn lock(
+        handle: &DfsRuntimeMessageServiceLaneHandle,
+    ) -> Result<std::sync::MutexGuard<'_, DfsRuntimeMessageServiceLane>, crate::DfsError> {
+        handle.lock().map_err(|_| crate::DfsError::Network {
+            message: "DFS runtime message lane lock poisoned".into(),
+        })
+    }
+    let source = &command.routed_message.source_node_id;
+    match &command.routed_message.message {
+        DfsNetworkMessage::FetchBlobResponse(_) => {
+            existing_fetch_response_service_lane(candidates, command)
+        }
+        DfsNetworkMessage::StageBlobResponse(response) => {
+            if source != &response.replica_node_id {
+                return Ok(None);
+            }
+            let mut owner = None;
+            for (config, handle) in candidates {
+                let lane = lock(handle)?;
+                let stage_in_flight = lane
+                    .service
+                    .writes
+                    .pending_writes
+                    .get(&response.intent_id)
+                    .is_some_and(|pending| {
+                        pending.object_id == response.object_id
+                            && pending.version == response.version
+                            && pending.stage_inflight_request_ids.get(source)
+                                == Some(&response.request_id)
+                    });
+                if !stage_in_flight || config.file_system_id != response.file_system_id {
+                    continue;
+                }
+                if owner.is_some() {
+                    return Err(crate::DfsError::Metadata {
+                        message: "multiple native service lanes own the same stage response".into(),
+                    });
+                }
+                owner = Some(Arc::clone(handle));
+            }
+            Ok(owner)
+        }
+        DfsNetworkMessage::RepairReplicaResponse(crate::DfsRepairReplicaResponse {
+            intent_id,
+            file_system_id,
+            object_id,
+            version,
+            replica_node_id,
+            ..
+        })
+        | DfsNetworkMessage::CommitVersionResponse(crate::DfsCommitVersionResponse {
+            intent_id,
+            file_system_id,
+            object_id,
+            version,
+            replica_node_id,
+            ..
+        }) => {
+            if source != replica_node_id {
+                return Ok(None);
+            }
+            let mut owners = Vec::new();
+            for (config, handle) in candidates {
+                let lane = lock(handle)?;
+                let writes = &lane.service.writes;
+                let serving = writes
+                    .pending_remote_write_responses
+                    .get(intent_id)
+                    .is_some_and(|pending| pending.object_id == *object_id)
+                    || writes.pending_writes.get(intent_id).is_some_and(|pending| {
+                        pending.object_id == *object_id && pending.version == *version
+                    });
+                if serving && config.file_system_id == *file_system_id {
+                    owners.push(Arc::clone(handle));
+                }
+            }
+            // Receipt publication is durable and lane-independent; only the
+            // served write's terminal reply needs its lane. An ambiguous
+            // owner keeps the global service.
+            Ok(match <[_; 1]>::try_from(owners) {
+                Ok([owner]) => Some(owner),
+                Err(_) => None,
+            })
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug)]
