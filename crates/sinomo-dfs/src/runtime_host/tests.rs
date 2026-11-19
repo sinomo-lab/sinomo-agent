@@ -4459,12 +4459,14 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
         explicit_recovery.metadata_replication,
         DfsMetadataJournalReplicationOptions {
             background_publication: false,
+            max_batches_per_target: DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
             ..daemon_dfs_metadata_replication_options()
         }
     );
     assert_eq!(
         daemon_dfs_metadata_replication_options().max_batches_per_target,
-        DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET
+        1,
+        "background catch-up releases the shard between acknowledged pages"
     );
     assert_eq!(
         explicit_recovery.repair_max_jobs,

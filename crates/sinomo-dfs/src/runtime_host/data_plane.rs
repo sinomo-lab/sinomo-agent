@@ -1406,7 +1406,22 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     false,
                 );
             }
-            let operation = operation.map_err(daemon_dfs_data_plane_error)?;
+            // Opening the authorized physical copy already requested preparation.
+            // Preserve its typed answer across RPC without claiming an applied prefix.
+            let operation = match operation {
+                Err(error @ DaemonError::StoragePreparationPending { .. }) => {
+                    return Ok(daemon_dfs_metadata_journal_rejection_for(
+                        rejection_request_id,
+                        rejection_shard_id,
+                        rejection_next_after_sequence,
+                        crate::DfsMetadataRejection::new(
+                            crate::DfsMetadataRejectionCode::StoragePreparationPending,
+                            error.to_string(),
+                        ),
+                    ));
+                }
+                other => other.map_err(daemon_dfs_data_plane_error)?,
+            };
             let (response, namespace_paths) = match operation {
                 DaemonDfsResidentReplicaOperation::Completed { result } => result,
                 DaemonDfsResidentReplicaOperation::Rejected { reason } => {

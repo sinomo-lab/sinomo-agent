@@ -2,6 +2,7 @@
 
 pub(crate) mod ack;
 pub(crate) mod admission;
+pub(crate) mod publication;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -917,7 +918,7 @@ fn cache_journal_segment_durable_append(
             Arc::make_mut(&mut index.entries).extend(offsets.iter().copied());
             index.sequences_monotonic &= offsets
                 .windows(2)
-                .all(|pair| pair[0].sequence <= pair[1].sequence);
+                .all(|pair| pair[0].sequence < pair[1].sequence);
             index.identity = after.identity.clone();
             index.observed_file_len = after.file_len;
             index.modified = after.modified;
@@ -935,7 +936,7 @@ fn cache_journal_segment_durable_append(
                 entries: Arc::new(offsets.clone()),
                 sequences_monotonic: offsets
                     .windows(2)
-                    .all(|pair| pair[0].sequence <= pair[1].sequence),
+                    .all(|pair| pair[0].sequence < pair[1].sequence),
             }
         } else {
             return;
@@ -2162,7 +2163,7 @@ fn open_indexed_journal_segment(path: &Path) -> Result<IndexedJournalSegment> {
             if index
                 .entries
                 .last()
-                .is_some_and(|previous| previous.sequence > entry.sequence)
+                .is_some_and(|previous| previous.sequence >= entry.sequence)
             {
                 index.sequences_monotonic = false;
             }
@@ -3003,6 +3004,46 @@ mod tests {
             error
                 .to_string()
                 .contains("conflicting duplicate sequence 1")
+        );
+    }
+
+    #[test]
+    fn catchup_page_pins_only_one_bounded_range_and_refuses_a_replaced_source() {
+        let _guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("dfs-pinned-catchup-page");
+        let shard = test_journal_entry(1).shard_id;
+        for sequence in 1..=5 {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence)).unwrap();
+        }
+        let pin = |entries, bytes| {
+            publication::PinnedPublicationPage::capture(root.path(), &shard, 1, 5, entries, bytes)
+                .unwrap()
+                .unwrap()
+        };
+        let page = pin(2, usize::MAX);
+        assert_eq!(page.materialize().unwrap().next_after_sequence, 3);
+        assert_eq!(
+            pin(8, 1).materialize().unwrap().next_after_sequence,
+            2,
+            "one oversized entry must progress"
+        );
+        append_segmented_journal_entry(root.path(), &test_journal_entry(6)).unwrap();
+        let batch = page.materialize().unwrap();
+        assert_eq!(
+            batch.decoded().unwrap().entries,
+            vec![test_journal_entry(2), test_journal_entry(3)]
+        );
+        let path = root.join("journal/segments/00000000000000000001.slog");
+        let predecessor = path.with_extension("original");
+        std::fs::rename(&path, &predecessor).unwrap();
+        std::fs::copy(predecessor, &path).unwrap();
+        assert!(
+            !page.is_current().unwrap(),
+            "a delayed ACK cannot checkpoint a replacement"
+        );
+        assert!(
+            page.materialize().is_err(),
+            "cached frames cannot escape their source generation"
         );
     }
 

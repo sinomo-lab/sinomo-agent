@@ -6,6 +6,7 @@
 //! SIFS metadata records. Durable metadata storage itself remains owned by
 //! `metadata_backend`.
 
+use crate::metadata_journal::publication::PinnedPublicationPage;
 use crate::{DfsMetadataRejection, DfsMetadataRejectionCode, MetadataBackendError};
 
 use serde::{Deserialize, Serialize};
@@ -432,6 +433,7 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
             }
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut **backend,
+                Some(&expected_shard_root),
                 local_node_id,
                 shard,
                 &metadata_suppressions,
@@ -1009,6 +1011,11 @@ pub enum DfsMetadataJournalReplicationOutcome {
         shard_id: DfsMetadataShardId,
         after_sequence: u64,
     },
+    StoragePreparationPending {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
     TopologyMismatchSuppressed {
         target_node_id: NodeId,
         shard_id: DfsMetadataShardId,
@@ -1145,6 +1152,7 @@ pub fn dfs_metadata_replication_notice_lines(
             }
             DfsMetadataJournalReplicationOutcome::NoChanges { .. }
             | DfsMetadataJournalReplicationOutcome::MissingRoute { .. }
+            | DfsMetadataJournalReplicationOutcome::StoragePreparationPending { .. }
             | DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed { .. }
             | DfsMetadataJournalReplicationOutcome::MissingShard { .. }
             | DfsMetadataJournalReplicationOutcome::NotPrimary { .. }
@@ -1414,6 +1422,7 @@ fn dfs_metadata_publish_retry_class(
         matches!(
             outcome,
             DfsMetadataJournalReplicationOutcome::MissingRoute { .. }
+                | DfsMetadataJournalReplicationOutcome::StoragePreparationPending { .. }
         )
     }) {
         return DfsMetadataPublishRetryClass::MissingRoute;
@@ -2991,6 +3000,8 @@ pub(crate) struct DfsPreparedMetadataJournalTargetPublish {
     /// Durable source head represented by this immutable preparation.
     pub(crate) prepared_source_head: u64,
     pub(crate) commands: Vec<DfsMetadataJournalBatchCommand>,
+    pinned_page: Option<Arc<PinnedPublicationPage>>,
+    preparation_watch: Option<crate::metadata_replica_observer::ReplicaPreparationWatch>,
     pub(crate) backlog_after_sequence: Option<u64>,
     pub(crate) caught_up_probe: bool,
     cursor_durability_inconsistency: Option<DfsMetadataCursorDurabilityInconsistency>,
@@ -3108,6 +3119,9 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         resident_cursor_status_observer: None,
     }))
 }
+
+#[cfg(test)]
+mod parked_catchup_tests;
 
 #[cfg(test)]
 mod metadata_publish_membership_tests {
@@ -4077,6 +4091,7 @@ async fn prepare_cluster_dfs_metadata_journal_publish_async(
 
 fn prepare_dfs_metadata_journal_publish_for_primary_shard(
     backend: &mut dyn DfsMetadataBackend,
+    local_root: Option<&std::path::Path>,
     local_node_id: &NodeId,
     shard: DfsMetadataShardConfig,
     metadata_suppressions: &[DfsMetadataReplicationSuppressionRecord],
@@ -4098,6 +4113,14 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
     let mut outcomes = Vec::new();
     let mut targets = Vec::new();
     let mut payloads_by_after_sequence = BTreeMap::new();
+    let preparation_watch = if options.background_publication {
+        backend
+            .subscribe_metadata_replica_progress(&shard_id)?
+            .map(|observer| observer.preparation_watch())
+    } else {
+        None
+    };
+
     for target_node_id in shard
         .replica_node_ids
         .into_iter()
@@ -4124,8 +4147,29 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
             continue;
         }
         let after_sequence = replication_cursor(backend, &target_node_id, &shard_id)?;
+        if preparation_watch.as_ref().is_some_and(|watch| {
+            watch.preparation_pending(
+                &target_node_id,
+                &shard.file_system_id,
+                shard.epoch,
+                after_sequence,
+            )
+        }) {
+            tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id, target = %target_node_id,
+                shard = %shard_id.0, epoch = shard.epoch, after_sequence,
+                disposition = "storage-preparation-pending", "metadata-publish-target-decision");
+            outcomes.push(
+                DfsMetadataJournalReplicationOutcome::StoragePreparationPending {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                },
+            );
+            continue;
+        }
         let prepared = prepare_dfs_metadata_journal_target_publish(
             backend,
+            local_root,
             local_node_id,
             target_node_id.clone(),
             shard.file_system_id.clone(),
@@ -4160,12 +4204,13 @@ fn prepare_dfs_metadata_journal_publish_for_primary_shard(
                     outcome = ?outcome, "metadata-publish-target-decision");
                 outcomes.push(outcome);
             }
-            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
+            DfsPreparedMetadataJournalTargetPublishResult::Publish { mut target } => {
+                target.preparation_watch = preparation_watch.clone();
                 tracing::trace!(target: "sinomo.dfs.perf", node = %local_node_id,
                     target = %target.target_node_id, shard = %shard_id.0, epoch = shard.epoch,
                     after_sequence = target.after_sequence,
                     source_head = target.prepared_source_head, caught_up_probe = target.caught_up_probe,
-                    commands = target.commands.len(), required_work,
+                    commands = target.commands.len() + usize::from(target.pinned_page.is_some()), required_work,
                     execution_hint_excluded = execution_exclusions.contains(&target.target_node_id),
                     disposition = "dispatch",
                     "metadata-publish-target-decision");
@@ -4252,6 +4297,7 @@ pub(crate) fn prepare_dfs_metadata_journal_publish_with_host_and_execution_exclu
         let (shard_outcomes, shard_targets) =
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut *backend,
+                None,
                 local_node_id,
                 shard,
                 metadata_suppressions,
@@ -4312,7 +4358,7 @@ fn prepare_dfs_metadata_journal_publish_with_local_backends_and_execution_exclus
         let root = local_dfs_metadata_shard_path(data_dir, &shard_id);
         // A primary copy closed for storage has no journal to send until it
         // opens; the node's other shards still publish.
-        let mut backend = match LocalSobjMetadataBackend::new(shard_id.clone(), root) {
+        let mut backend = match LocalSobjMetadataBackend::new(shard_id.clone(), root.clone()) {
             Ok(backend) => backend,
             Err(error) if crate::metadata_sharded_backend::metadata_shard_storage_is_closed(&error) => continue,
             Err(error) => return Err(error.into()),
@@ -4321,6 +4367,7 @@ fn prepare_dfs_metadata_journal_publish_with_local_backends_and_execution_exclus
         let (shard_outcomes, shard_targets) =
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut backend,
+                Some(&root),
                 local_node_id,
                 shard,
                 metadata_suppressions,
@@ -4348,6 +4395,10 @@ enum DfsPreparedMetadataJournalTargetPublishResult {
 
 #[derive(Clone, Debug)]
 enum DfsPreparedMetadataJournalPayload {
+    Pinned {
+        page: Arc<PinnedPublicationPage>,
+        head: u64,
+    },
     NoChanges,
     CaughtUp {
         state_fingerprint: String,
@@ -4392,6 +4443,7 @@ pub(crate) fn prepare_dfs_metadata_journal_frame_batch(
 
 fn prepare_dfs_metadata_journal_target_publish(
     backend: &mut dyn DfsMetadataBackend,
+    local_root: Option<&std::path::Path>,
     local_node_id: &NodeId,
     target_node_id: NodeId,
     file_system_id: DfsFileSystemId,
@@ -4401,6 +4453,19 @@ fn prepare_dfs_metadata_journal_target_publish(
     options: DfsMetadataJournalReplicationOptions,
     payloads_by_after_sequence: &mut BTreeMap<u64, DfsPreparedMetadataJournalPayload>,
 ) -> Result<DfsPreparedMetadataJournalTargetPublishResult, DfsError> {
+    if options.background_publication
+        && options.max_batches_per_target == 0
+        && after_sequence < backend.journal_last_sequence()?
+    {
+        return Ok(DfsPreparedMetadataJournalTargetPublishResult::NoChanges {
+            outcome: DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id,
+                shard_id,
+                after_sequence,
+                max_batches: 0,
+            },
+        });
+    }
     let payload = match payloads_by_after_sequence.get(&after_sequence) {
         Some(payload) => payload.clone(),
         None => {
@@ -4408,6 +4473,27 @@ fn prepare_dfs_metadata_journal_target_publish(
             let mut batches = Vec::new();
             let mut backlog_after_sequence = None;
             let payload = loop {
+                if options.background_publication
+                    && let Some(root) = local_root
+                {
+                    let head = backend.journal_last_sequence()?;
+                    if head == after_sequence && !options.probe_caught_up_replicas {
+                        break DfsPreparedMetadataJournalPayload::NoChanges;
+                    }
+                    if let Some(page) = PinnedPublicationPage::capture(
+                        root,
+                        &shard_id,
+                        after_sequence,
+                        head,
+                        options.batch_entry_limit,
+                        options.batch_byte_limit,
+                    )? {
+                        break DfsPreparedMetadataJournalPayload::Pinned {
+                            page: Arc::new(page),
+                            head,
+                        };
+                    }
+                }
                 let Some(batch) = backend.journal_batch_for_shard_since_limited(
                     &shard_id,
                     next_after_sequence,
@@ -4454,6 +4540,16 @@ fn prepare_dfs_metadata_journal_target_publish(
 
                 next_after_sequence = batch.next_after_sequence;
                 batches.push(prepare_dfs_metadata_journal_frame_batch(backend, &batch)?);
+                // An irregular or compacted journal keeps its checked reader.
+                // An asynchronous turn still prepares just its first page.
+                if options.background_publication {
+                    let head = backend.journal_last_sequence()?;
+                    break DfsPreparedMetadataJournalPayload::Batches {
+                        batches,
+                        backlog_after_sequence: (next_after_sequence < head)
+                            .then_some(next_after_sequence),
+                    };
+                }
                 if batches.len() >= options.max_batches_per_target {
                     if backend
                         .journal_batch_for_shard_since_limited(
@@ -4478,6 +4574,24 @@ fn prepare_dfs_metadata_journal_target_publish(
     };
 
     match payload {
+        DfsPreparedMetadataJournalPayload::Pinned { page, head } => {
+            Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
+                target: DfsPreparedMetadataJournalTargetPublish {
+                    target_node_id,
+                    file_system_id,
+                    shard_id,
+                    shard_epoch,
+                    after_sequence,
+                    prepared_source_head: head,
+                    commands: Vec::new(),
+                    pinned_page: Some(page),
+                    preparation_watch: None,
+                    backlog_after_sequence: None,
+                    caught_up_probe: false,
+                    cursor_durability_inconsistency: None,
+                },
+            })
+        }
         DfsPreparedMetadataJournalPayload::NoChanges => {
             Ok(DfsPreparedMetadataJournalTargetPublishResult::NoChanges {
                 outcome: DfsMetadataJournalReplicationOutcome::NoChanges {
@@ -4508,6 +4622,8 @@ fn prepare_dfs_metadata_journal_target_publish(
                     commands: vec![command],
                     backlog_after_sequence: None,
                     caught_up_probe: true,
+                    preparation_watch: None,
+                    pinned_page: None,
                     cursor_durability_inconsistency: None,
                 },
             })
@@ -4536,6 +4652,8 @@ fn prepare_dfs_metadata_journal_target_publish(
                     commands: vec![command],
                     backlog_after_sequence: None,
                     caught_up_probe: true,
+                    preparation_watch: None,
+                    pinned_page: None,
                     cursor_durability_inconsistency: Some(
                         DfsMetadataCursorDurabilityInconsistency {
                             cursor_after_sequence: after_sequence,
@@ -4589,6 +4707,8 @@ fn prepare_dfs_metadata_journal_target_publish(
                     commands,
                     backlog_after_sequence,
                     caught_up_probe: false,
+                    preparation_watch: None,
+                    pinned_page: None,
                     cursor_durability_inconsistency: None,
                 },
             })
@@ -5216,6 +5336,8 @@ mod explicitly_unreachable_target_tests {
             commands: Vec::new(),
             backlog_after_sequence: None,
             caught_up_probe: false,
+            preparation_watch: None,
+            pinned_page: None,
             cursor_durability_inconsistency: None,
         };
         let mut plan = DfsPreparedClusterMetadataJournalPublish {
@@ -5459,8 +5581,10 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         shard_epoch,
         mut after_sequence,
         prepared_source_head,
-        commands,
-        backlog_after_sequence,
+        mut commands,
+        preparation_watch,
+        pinned_page,
+        mut backlog_after_sequence,
         caught_up_probe,
         cursor_durability_inconsistency,
     } = target;
@@ -5489,6 +5613,31 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         return Ok(());
     }
 
+    if let Some(page) = &pinned_page {
+        let batch = page.materialize();
+        match batch {
+            Ok(batch) => {
+                backlog_after_sequence = (batch.next_after_sequence < prepared_source_head)
+                    .then_some(batch.next_after_sequence);
+                commands.push(dfs_metadata_durable_journal_batch_command(
+                    local_node_id,
+                    &target_node_id,
+                    &file_system_id,
+                    shard_epoch,
+                    batch,
+                    true,
+                ));
+            }
+            Err(error) => {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                    target_node_id,
+                    shard_id,
+                    reason: error.to_string(),
+                });
+                return Ok(());
+            }
+        }
+    }
     let target_started_at = Instant::now();
     let mut completed_plan = true;
     let had_commands = !commands.is_empty();
@@ -5607,6 +5756,7 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                     &target_node_id,
                     &shard_id,
                     next_after_sequence,
+                    pinned_page.as_deref(),
                 )?;
                 after_sequence = next_after_sequence;
                 if let Some(inconsistency) = cursor_durability_inconsistency {
@@ -5632,6 +5782,29 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                         next_after_sequence,
                     });
                 }
+            }
+            DfsMetadataJournalBatchResult::Rejected {
+                code: DfsMetadataRejectionCode::StoragePreparationPending,
+                ..
+            } if options.background_publication => {
+                if let Some(watch) = &preparation_watch {
+                    watch.wait_for_preparation(
+                        &target_node_id,
+                        &file_system_id,
+                        shard_epoch,
+                        after_sequence,
+                        Instant::now() + DFS_METADATA_MISSING_ROUTE_RETRY_MAX_DELAY,
+                    );
+                }
+                outcomes.push(
+                    DfsMetadataJournalReplicationOutcome::StoragePreparationPending {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        after_sequence,
+                    },
+                );
+                completed_plan = false;
+                break;
             }
             DfsMetadataJournalBatchResult::Rejected { reason, code } => {
                 // Another foreground commit can advance the receiver beyond
@@ -5825,6 +5998,7 @@ fn execute_prepared_dfs_metadata_snapshot_repair(
                 target_node_id,
                 shard_id,
                 command.next_after_sequence,
+                None,
             )?;
             if let Some(inconsistency) = cursor_durability_inconsistency {
                 outcomes.push(
@@ -5903,6 +6077,8 @@ mod concurrent_target_publish_tests {
             }],
             backlog_after_sequence: None,
             caught_up_probe: false,
+            preparation_watch: None,
+            pinned_page: None,
             cursor_durability_inconsistency: None,
         }
     }
@@ -6290,8 +6466,10 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         shard_epoch,
         mut after_sequence,
         prepared_source_head,
-        commands,
-        backlog_after_sequence,
+        mut commands,
+        preparation_watch,
+        pinned_page,
+        mut backlog_after_sequence,
         caught_up_probe,
         cursor_durability_inconsistency,
     } = target;
@@ -6320,6 +6498,38 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         return Ok(());
     }
 
+    if let Some(page) = &pinned_page {
+        let batch = {
+            let page = Arc::clone(page);
+            tokio::task::spawn_blocking(move || page.materialize())
+                .await
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?
+        };
+        match batch {
+            Ok(batch) => {
+                backlog_after_sequence = (batch.next_after_sequence < prepared_source_head)
+                    .then_some(batch.next_after_sequence);
+                commands.push(dfs_metadata_durable_journal_batch_command(
+                    local_node_id,
+                    &target_node_id,
+                    &file_system_id,
+                    shard_epoch,
+                    batch,
+                    true,
+                ));
+            }
+            Err(error) => {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                    target_node_id,
+                    shard_id,
+                    reason: error.to_string(),
+                });
+                return Ok(());
+            }
+        }
+    }
     let target_started_at = Instant::now();
     let mut completed_plan = true;
     let had_commands = !commands.is_empty();
@@ -6439,6 +6649,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     target_node_id.clone(),
                     shard_id.clone(),
                     next_after_sequence,
+                    pinned_page.clone(),
                     resident_cursor_status_observer.cloned(),
                 )
                 .await?;
@@ -6466,6 +6677,29 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                         next_after_sequence,
                     });
                 }
+            }
+            DfsMetadataJournalBatchResult::Rejected {
+                code: DfsMetadataRejectionCode::StoragePreparationPending,
+                ..
+            } if options.background_publication => {
+                if let Some(watch) = &preparation_watch {
+                    watch.wait_for_preparation(
+                        &target_node_id,
+                        &file_system_id,
+                        shard_epoch,
+                        after_sequence,
+                        Instant::now() + DFS_METADATA_MISSING_ROUTE_RETRY_MAX_DELAY,
+                    );
+                }
+                outcomes.push(
+                    DfsMetadataJournalReplicationOutcome::StoragePreparationPending {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        after_sequence,
+                    },
+                );
+                completed_plan = false;
+                break;
             }
             DfsMetadataJournalBatchResult::Rejected { reason, code } => {
                 // Another foreground commit can advance the receiver beyond
@@ -6630,6 +6864,7 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
                 target_node_id.clone(),
                 shard_id.clone(),
                 command.next_after_sequence,
+                None,
                 resident_cursor_status_observer.cloned(),
             )
             .await?;
@@ -6785,6 +7020,7 @@ fn put_local_dfs_metadata_replication_cursor(
     target_node_id: &NodeId,
     shard_id: &DfsMetadataShardId,
     next_after_sequence: u64,
+    page: Option<&PinnedPublicationPage>,
 ) -> Result<(), DfsError> {
     // Cursor acknowledgement is independent of materialized metadata tables.
     // Keep the same shard write lock and monotonic atomic hint update
@@ -6794,6 +7030,13 @@ fn put_local_dfs_metadata_replication_cursor(
         root.clone(),
         metadata_cursor::journal_write_lock_path(&root),
     )?;
+    if let Some(page) = page
+        && !page.is_current()?
+    {
+        return Err(DfsError::Metadata {
+            message: "journal replaced before catch-up ACK checkpoint".into(),
+        });
+    }
     let checkpoint = metadata_cursor::put_metadata_replication_cursor_and_observe(
         &root,
         target_node_id,
@@ -6869,6 +7112,7 @@ async fn put_local_dfs_metadata_replication_cursor_async(
     target_node_id: NodeId,
     shard_id: DfsMetadataShardId,
     next_after_sequence: u64,
+    page: Option<Arc<PinnedPublicationPage>>,
     resident_cursor_status_observer: Option<ResidentMetadataReplicationCursorStatusObserver>,
 ) -> Result<(), DfsError> {
     let observed_target_node_id = target_node_id.clone();
@@ -6879,6 +7123,7 @@ async fn put_local_dfs_metadata_replication_cursor_async(
             &target_node_id,
             &shard_id,
             next_after_sequence,
+            page.as_deref(),
         )
     })
     .await
@@ -9791,6 +10036,7 @@ mod cursor_update_tests {
         let head = backend.journal_last_sequence().unwrap();
         let outcome = match prepare_dfs_metadata_journal_target_publish(
             backend,
+            None,
             &shard.primary_node_id,
             shard.replica_node_ids[0].clone(),
             shard.file_system_id.clone(),
@@ -10588,6 +10834,7 @@ mod cursor_update_tests {
                 shard_id.clone(),
                 42,
                 None,
+                None,
             ))
             .expect("cursor commit");
         runtime
@@ -10596,6 +10843,7 @@ mod cursor_update_tests {
                 target_node_id.clone(),
                 shard_id.clone(),
                 12,
+                None,
                 None,
             ))
             .expect("monotonic cursor commit");

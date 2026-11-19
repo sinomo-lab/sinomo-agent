@@ -80,6 +80,8 @@ impl From<crate::DfsError> for DfsMetadataRejection {
 pub enum DfsMetadataRejectionCode {
     ReplicaDiverged,
     ReplicaUnreadable,
+    /// The authorized receiver handed this physical copy to its preparation owner.
+    StoragePreparationPending,
     PrefixMismatch,
     PrimaryMismatch,
     /// A write-set catch-up probe named a record generation this member's
