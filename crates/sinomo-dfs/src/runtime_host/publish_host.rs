@@ -951,17 +951,30 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
                 .map_err(|error| {
                     format!("DFS metadata publish authority preflight failed: {error}")
                 })?;
-        if daemon_dfs_message_cache_exact_admission_is_current(
-            &data_dir,
-            &cluster_paths,
-            &peer_snapshot,
-            &lane,
-            &runtime,
-            #[cfg(test)]
-            None,
-        )
-        .map_err(|error| error.to_string())?
-        {
+        // A cache another request holds for a moment is not a stale
+        // generation: wait for it on a blocking worker, so only a generation
+        // that really moved takes the refresh below, which yields to
+        // foreground work and leaves this publish for a later retry.
+        let current = {
+            let data_dir = data_dir.clone();
+            let cluster_paths = cluster_paths.clone();
+            let peer_snapshot = peer_snapshot.clone();
+            let lane = lane.clone();
+            let runtime = runtime.clone();
+            crate::runtime_publish::run_owned_dfs_blocking(&task_owner, move || {
+                daemon_dfs_message_cache_exact_admission_is_current_waiting(
+                    &data_dir,
+                    &cluster_paths,
+                    &peer_snapshot,
+                    &lane,
+                    &runtime,
+                )
+            })
+            .await
+            .map_err(|error| format!("DFS metadata publish currency check failed: {error}"))?
+            .map_err(|error| error.to_string())?
+        };
+        if current {
             return Ok((peer_snapshot, metadata_authority_preflight));
         }
 

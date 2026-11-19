@@ -2288,6 +2288,35 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_is_current(
     .is_some())
 }
 
+/// [`daemon_dfs_message_cache_exact_admission_is_current`] for a background
+/// owner on a blocking worker. It waits for a busy cache: another request
+/// holding the cache for its own lookup is not evidence that the generation
+/// is stale.
+pub(crate) fn daemon_dfs_message_cache_exact_admission_is_current_waiting(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    key: &DaemonDfsMutationLaneKey,
+    runtime: &tokio::runtime::Handle,
+) -> Result<bool, sinomo_dfs::DfsError> {
+    #[cfg(test)]
+    if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
+        hook(
+            DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess,
+            None,
+            None,
+        )?;
+    }
+    Ok(daemon_dfs_message_cache_exact_admission_handle_waiting(
+        data_dir,
+        cluster_paths,
+        peer_snapshot,
+        key,
+        runtime,
+    )?
+    .is_some())
+}
+
 /// Admit a stamped namespace lookup to an exact lane only when both its full
 /// authority stamp and every routed path match the retained committed
 /// topology, and the exact shard backend is already resident.

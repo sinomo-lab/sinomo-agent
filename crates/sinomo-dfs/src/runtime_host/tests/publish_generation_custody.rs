@@ -262,6 +262,76 @@ fn native_publish_idle_generation_child_belongs_to_actual_host_drain() {
     generation_child_is_owned("idle");
 }
 
+/// A lane publish whose resident generation is current meets a cache another
+/// request holds for a moment. It waits for that cache and finds the lane
+/// current; it does not read the busy cache as a stale generation and take
+/// the refresh that yields to foreground work and leaves the publish for a
+/// later retry.
+#[test]
+fn native_lane_publish_waits_for_a_busy_cache_instead_of_refreshing() {
+    let name = "native-publish-busy-cache";
+    let (native, _) = crate::test_runtime::DfsTestRuntime::start_cluster(name, 2).unwrap();
+    let shard = native.root_shard().unwrap();
+    let node = shard.primary_node_id.clone();
+    let data = native.data_dir(&node).clone();
+    let paths = DfsRuntimePaths::new(&data);
+    let cluster_paths = ClusterPaths::new(&data);
+    let runtime = native.runtime_handle();
+    let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
+    let owner = require_daemon_dfs_data_owner_lock(&paths).unwrap();
+    let lane = DaemonDfsMutationLaneKey {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+    };
+    let publish = || {
+        super::super::publish_host::ensure_daemon_dfs_metadata_publish_resident_generation(
+            Arc::clone(&scheduler),
+            data.clone(),
+            cluster_paths.clone(),
+            lane.clone(),
+            runtime.clone(),
+            Arc::clone(&owner),
+        )
+    };
+    // The resident generation serves the lane before the cache is held.
+    runtime.block_on(publish()).unwrap();
+    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_refreshes = Arc::clone(&refreshes);
+    let hook = install_daemon_dfs_pre_dispatch_test_hook(
+        &data,
+        Arc::new(move |point, _, _| {
+            if matches!(
+                point,
+                DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { .. }
+            ) {
+                hook_refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+    );
+    let slot = daemon_dfs_message_service_cache()
+        .root(&data.root())
+        .unwrap();
+    let held = slot.lock().unwrap();
+    assert!(held.is_some(), "the resident cache entry exists");
+    let waiting = runtime.spawn(publish());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !waiting.is_finished(),
+        "the publish waits for the busy cache"
+    );
+    drop(held);
+    runtime.block_on(waiting).unwrap().unwrap();
+    assert_eq!(
+        refreshes.load(Ordering::SeqCst),
+        0,
+        "a busy cache is not read as a stale generation"
+    );
+    drop(hook);
+    drop(owner);
+    native.close().unwrap();
+}
+
 #[test]
 fn cancelled_placement_recovery_drains_the_actual_data_owner_before_reopen() {
     let root = temp_root("placement-recovery-worker-drain");
