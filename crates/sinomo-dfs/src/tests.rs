@@ -170,6 +170,7 @@ fn test_routed_write_command(
         authority_shard: None,
         touch_parent_on_create: true,
         foreground_replica_repair: true,
+        wait_for_commit: false,
         exclusive_create: false,
     }
 }

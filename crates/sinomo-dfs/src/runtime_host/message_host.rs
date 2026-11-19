@@ -4470,8 +4470,8 @@ async fn prepare_daemon_dfs_genesis_ingress(
 
 pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     paths: &DaemonPaths,
-    command: DfsMessageCommand,
-    attachment: Option<DfsInboundAttachment>,
+    mut command: DfsMessageCommand,
+    mut attachment: Option<DfsInboundAttachment>,
     traceparent: Option<String>,
     encoded_value_bytes: Option<u64>,
     runtime: &tokio::runtime::Handle,
@@ -4590,6 +4590,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             }
         }
     }
+    let inline_stage_permit =
+        crate::runtime_message::receive_inline_stage(&mut command, &mut attachment).await?;
     let content = if attachment.is_some() {
         let content_data_dir = data_dir.clone();
         let content_cluster_paths = cluster_paths.clone();
@@ -4939,6 +4941,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         let process_execution_scope = execution_scope.clone();
         let spawn_started = Instant::now();
         let blocking_queue_started = spawn_started;
+        let process_stage_permit = inline_stage_permit.clone();
         let process_data_owner_lock = Arc::clone(&data_owner_lock);
         #[cfg(test)]
         let admission_observation_hook = daemon_dfs_pre_dispatch_test_hook(&data_dir);
@@ -4959,6 +4962,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             // JoinHandle while blocking work continues. Retain the OS-backed data
             // lock inside the blocking closure so no replacement daemon can prove
             // this placement-authority session dead prematurely.
+            let _stage_permit = process_stage_permit;
             let _data_owner_lock = process_data_owner_lock;
             let mut mutation_admission = Some(admission);
             let blocking_started = Instant::now();

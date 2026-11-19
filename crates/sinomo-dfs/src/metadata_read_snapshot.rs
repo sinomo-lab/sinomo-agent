@@ -94,6 +94,7 @@ fn replay_incremental_table_suffix(
     path: &Path,
     offset: u64,
     tables: &mut DfsMetadataTables,
+    prefix: Option<&DfsMetadataPrefixProof>,
 ) -> Result<crate::metadata_tables::MetadataTableReplay> {
     #[cfg(test)]
     METADATA_INCREMENTAL_REPLAY_OPEN_HOOK.with(|hook| {
@@ -102,7 +103,7 @@ fn replay_incremental_table_suffix(
             action();
         }
     });
-    replay_metadata_table_batches_from(root, path, offset, tables)
+    replay_metadata_table_batches_from(root, path, offset, tables, prefix)
 }
 
 /// Byte offsets are valid only within their captured append-only file. A
@@ -275,7 +276,13 @@ where
     if len == *table_log_offset {
         return Ok(());
     }
-    let replay = replay_incremental_table_suffix(root, &path, *table_log_offset, tables)?;
+    let replay = replay_incremental_table_suffix(
+        root,
+        &path,
+        *table_log_offset,
+        tables,
+        prefix_proof.as_ref(),
+    )?;
     *table_log_offset = replay.offset;
 
     if let Some(sequence) = replay.materialized_through_sequence {
@@ -499,7 +506,7 @@ fn current_tables_snapshot_once<'a>(
                 }
                 let mut tables = live_tables.clone();
                 let replay =
-                    replay_incremental_table_suffix(root, &path, table_log_offset, &mut tables)?;
+                    replay_incremental_table_suffix(root, &path, table_log_offset, &mut tables, prefix_proof.as_ref())?;
                 let state = DfsMetadataTableState {
                     tables,
                     generation: Some(crate::storage_generation::read_generation(root)?.identity),
@@ -511,7 +518,7 @@ fn current_tables_snapshot_once<'a>(
                     ),
                     snapshot_format_version: None,
                     snapshot_fingerprint: current_snapshot_fingerprint,
-                    prefix_proof: replay.prefix_proof,
+                    prefix_proof: replay.prefix_proof.or_else(|| prefix_proof.clone()),
                 };
                 return Ok(snapshot_from_state(read_snapshot_cache, state, None));
             }
@@ -568,7 +575,7 @@ fn cached_or_advanced_read_snapshot<'a>(
         // previous view, while the common sequential path reuses allocations.
         let tables = Arc::make_mut(&mut cache.tables);
         let replay =
-            match replay_incremental_table_suffix(root, path, cache.table_log_offset, tables) {
+            match replay_incremental_table_suffix(root, path, cache.table_log_offset, tables, cache.prefix_proof.as_ref()) {
                 Ok(replay) => replay,
                 Err(error) => {
                     // Replay can mutate tables before encountering a bad later
@@ -1095,6 +1102,9 @@ mod tests {
         ).unwrap();
         let node = nodes[0].clone();
         let shard_id = DfsMetadataShardId::new("root");
+        let root = crate::local_dfs_metadata_shard_path(native.data_dir(&node), &shard_id);
+        let subscriber =
+            crate::LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), &root).unwrap();
         {
             let mut client = native.client(&node).unwrap();
             client.posix_write_file(
@@ -1103,7 +1113,7 @@ mod tests {
             ).unwrap();
         }
         let second = native.file_system();
-        let root = crate::local_dfs_metadata_shard_path(native.data_dir(&node), &shard_id);
+        drop(subscriber);
         native.stop_node(&node).unwrap();
         let mut writer = crate::LocalSobjMetadataBackend::new(shard_id.clone(), &root).unwrap();
         let mut inspector = crate::LocalSobjMetadataBackend::open_for_inspection(

@@ -336,6 +336,10 @@ pub struct DfsDistributedWriteCommand {
     pub authority_shard: Option<DfsMetadataShardConfig>,
     pub touch_parent_on_create: bool,
     pub foreground_replica_repair: bool,
+    /// Scheduling only. The requester intends to wait for the committed
+    /// outcome. Older callers continue to receive a durable pending opening.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_for_commit: bool,
     /// Reject the write at the metadata authority if the path already names a
     /// current object. Used by POSIX O_EXCL/mknod and symlink creation.
     pub exclusive_create: bool,

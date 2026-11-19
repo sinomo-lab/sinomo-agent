@@ -346,11 +346,18 @@ impl LocalSobjMetadataBackend {
         let native_before = native_observation
             .as_ref()
             .map(|_| self.native_prepared_kernel_held_snapshot_v1(Some(digest.owner_epoch)));
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::PrepareOperationV7 {
-            file_system_id: digest.file_system_id.clone(),
-            operation_id: digest.operation_id.clone(),
-            record: Box::new(record.clone()),
-        })?;
+        let projection = self.begin_authored_projection()?;
+        let mut frame = crate::metadata_journal::DfsMetadataJournalFrame::local(
+            &self.shard_id,
+            self.next_sequence,
+            DfsMetadataMutation::PrepareOperationV7 {
+                file_system_id: digest.file_system_id.clone(),
+                operation_id: digest.operation_id.clone(),
+                record: Box::new(record.clone()),
+            },
+        )?;
+        frame.private_projection = projection.is_some();
+        let (entry, written) = self.write_journal_frame_unlocked(&frame, &mut None)?;
         if entry.sequence != digest.prepare_sequence {
             return Err(MetadataBackendError::Serde(
                 "prepared operation journal slot changed under its writer".into(),
@@ -366,12 +373,17 @@ impl LocalSobjMetadataBackend {
                 self.native_observed_exact_frame.take(),
             );
         }
-        self.append_and_apply_table_ops(
-            entry.sequence,
-            vec![DfsMetadataTableOp::PutPreparedOperationV7 {
-                record: Box::new(record),
-            }],
-        )?;
+        let op = DfsMetadataTableOp::PutPreparedOperationV7 {
+            record: Box::new(record),
+        };
+        if projection.is_some() {
+            self.tables.apply_checked(op.clone())?;
+            self.finish_private_projection(entry.sequence, written, op)?;
+        } else {
+            self.append_and_apply_table_ops(entry.sequence, vec![op])?;
+        }
+        drop(projection);
+        self.validate_projection_subscription()?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         #[cfg(any(test, feature = "test-support"))]
         if let (Some(observation), Some(before)) = (&mut native_observation, native_before) {
@@ -627,7 +639,8 @@ impl LocalSobjMetadataBackend {
         let native_before = native_observation
             .as_ref()
             .map(|_| self.native_prepared_kernel_held_snapshot_v1(Some(digest.owner_epoch)));
-        let frame = crate::metadata_journal::DfsMetadataJournalFrame::local(
+        let projection = self.begin_authored_projection()?;
+        let mut frame = crate::metadata_journal::DfsMetadataJournalFrame::local(
             &self.shard_id,
             self.next_sequence,
             DfsMetadataMutation::CommitPreparedOperationV7 {
@@ -636,6 +649,7 @@ impl LocalSobjMetadataBackend {
                 digest: digest.clone(),
             },
         )?;
+        frame.private_projection = projection.is_some();
         let commit_op = DfsMetadataTableOp::CommitPreparedOperationV7 {
             digest: digest.clone(),
             committed_entry: Box::new(
@@ -654,7 +668,7 @@ impl LocalSobjMetadataBackend {
             return Err(error);
         }
         let mut rollback = Some(rollback);
-        let (entry, _) = self.write_journal_frame_unlocked(&frame, &mut rollback)?;
+        let (entry, written) = self.write_journal_frame_unlocked(&frame, &mut rollback)?;
         #[cfg(test)]
         if crate::native_boundary_diagnostics::selected_operation(&self.root, &digest.operation_id)
         {
@@ -680,11 +694,17 @@ impl LocalSobjMetadataBackend {
                 self.native_observed_exact_frame.take(),
             );
         }
-        self.append_preapplied_table_ops(
-            entry.sequence,
-            vec![commit_op],
-            rollback.expect("owned preapplied commit"),
-        )?;
+        if projection.is_some() {
+            self.finish_private_projection(entry.sequence, written, commit_op)?;
+        } else {
+            self.append_preapplied_table_ops(
+                entry.sequence,
+                vec![commit_op],
+                rollback.expect("owned preapplied commit"),
+            )?;
+        }
+        drop(projection);
+        self.validate_projection_subscription()?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         if commit_owner
             .source_witness()

@@ -973,7 +973,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &response.intent_id,
                                 &response.replica_node_id,
                             )?;
-                        let admitted = if commit_publishes_receipt {
+                        let collecting = service
+                            .writes
+                            .pending_writes
+                            .get(&response.intent_id)
+                            .is_some_and(|pending| pending.collecting_initial_receipts);
+                        let admitted = if commit_publishes_receipt || collecting {
                             service
                                 .metadata_receipt_object_at_generation(
                                     &response.file_system_id,
@@ -1052,6 +1057,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 .as_ref()
                                 .is_err_and(DfsError::is_commit_outcome_unknown);
                             if commit_publishes_receipt
+                                && !collecting
                                 && !outcome_unknown
                                 && service
                                     .backend_receipt_for_replica(

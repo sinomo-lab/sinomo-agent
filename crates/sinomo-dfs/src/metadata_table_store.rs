@@ -363,6 +363,7 @@ fn read_metadata_table_state_once(
             &checkpoint_path,
             0,
             state.materialized_through_sequence,
+            state.prefix_proof.as_ref(),
             &mut state.tables,
         )?;
         state.materialized_through_sequence = max_optional_sequence(
@@ -389,6 +390,7 @@ fn read_metadata_table_state_once(
             &table_path,
             0,
             state.materialized_through_sequence,
+            state.prefix_proof.as_ref(),
             &mut state.tables,
         )?;
         state.table_log_offset = replay.offset;
@@ -455,6 +457,7 @@ pub(crate) fn read_metadata_table_checkpoint_state(root: &Path) -> Result<DfsMet
         &checkpoint_path,
         0,
         state.materialized_through_sequence,
+        state.prefix_proof.as_ref(),
         &mut state.tables,
     )?;
     state.materialized_through_sequence = max_optional_sequence(
@@ -563,8 +566,16 @@ pub(crate) fn replay_metadata_table_batches_from(
     path: &Path,
     offset: u64,
     tables: &mut DfsMetadataTables,
+    prefix: Option<&DfsMetadataPrefixProof>,
 ) -> Result<MetadataTableReplay> {
-    replay_metadata_table_batches_after_checkpoint_from(root, path, offset, None, tables)
+    replay_metadata_table_batches_after_checkpoint_from(
+        root,
+        path,
+        offset,
+        prefix.map(|p| p.journal_sequence),
+        prefix,
+        tables,
+    )
 }
 
 /// Read only the active table generation's compact replay-pressure metadata.
@@ -587,6 +598,7 @@ pub(crate) fn current_metadata_table_log_replay(root: &Path) -> Result<MetadataT
         root,
         &path,
         Some(u64::MAX),
+        None,
         &mut DfsMetadataTables::default(),
     )
 }
@@ -596,6 +608,7 @@ fn replay_metadata_table_batches_after_checkpoint_from(
     path: &Path,
     offset: u64,
     checkpoint_sequence: Option<u64>,
+    checkpoint_proof: Option<&DfsMetadataPrefixProof>,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
     let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
@@ -622,7 +635,14 @@ fn replay_metadata_table_batches_after_checkpoint_from(
             path: path.to_owned(),
             source,
         })?;
-    replay_metadata_table_batches(&mut file, root, path, checkpoint_sequence, tables)
+    replay_metadata_table_batches(
+        &mut file,
+        root,
+        path,
+        checkpoint_sequence,
+        checkpoint_proof,
+        tables,
+    )
 }
 
 fn decode_current_metadata_table_batch(bytes: &[u8], path: &Path) -> Result<DfsMetadataTableBatch> {
@@ -712,6 +732,7 @@ fn replay_metadata_table_batches(
     root: &Path,
     path: &Path,
     checkpoint_sequence: Option<u64>,
+    checkpoint_proof: Option<&DfsMetadataPrefixProof>,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
     crate::metadata_records::with_prepared_payload_validation(|| {
@@ -748,8 +769,17 @@ fn replay_metadata_table_batches(
                     "table batch prefix/sequence is inconsistent".into(),
                 ));
             }
+            if checkpoint_proof
+                .is_some_and(|prior| prior.journal_sequence == batch.sequence && prior != proof)
+            {
+                return Err(MetadataBackendError::replica_diverged(
+                    "shared table interval disagrees with the already materialized prefix".into(),
+                ));
+            }
             through = Some(batch.sequence);
-            prefix = Some(proof.clone());
+            if checkpoint_proof.is_none_or(|prior| batch.sequence >= prior.journal_sequence) {
+                prefix = Some(proof.clone());
+            }
             if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
                 for op in batch.ops {
                     tables.apply_checked(op)?;

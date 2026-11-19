@@ -15,6 +15,9 @@ pub(crate) struct PendingNetworkedWrite {
     /// asynchronous stage responses so crossing W cannot silently turn a
     /// background write into synchronous N-W repair.
     pub(crate) foreground_replica_repair: bool,
+    /// The synchronous owner is collecting validated receipts for its first
+    /// publication. A pending result must first transfer them to a durable opening.
+    pub(crate) collecting_initial_receipts: bool,
     pub(crate) patch: Option<PendingNetworkedWritePatch>,
     pub(crate) stage_retries: BTreeMap<NodeId, RepairRetryState>,
     /// The receipt-slot generation each replica's latest stage send planned
@@ -51,6 +54,7 @@ impl PendingNetworkedWrite {
             content_hash,
             size_bytes,
             foreground_replica_repair: true,
+            collecting_initial_receipts: false,
             patch,
             stage_retries: BTreeMap::new(),
             planned_receipt_generations: BTreeMap::new(),

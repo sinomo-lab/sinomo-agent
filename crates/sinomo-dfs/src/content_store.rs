@@ -75,7 +75,7 @@ const CONTENT_RESERVATION_RECONCILIATION_CURSOR_FILE: &str =
 const MANIFEST_ABSENCE_OBSERVATION_FORMAT_VERSION: u32 = 1;
 const MANIFEST_ABSENCE_OBSERVATION_DIR: &str = "manifest-absence-observations";
 const VERSION_GC_DELETE_BATCH_SIZE: usize = 1024;
-const INLINE_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
+pub(crate) const INLINE_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 
 fn intrinsic_empty_content_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();

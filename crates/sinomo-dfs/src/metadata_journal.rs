@@ -27,6 +27,7 @@ use crate::metadata_records::{
 };
 
 pub(crate) const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
+const PRIVATE_PROJECTION_TAG: &[u8; 8] = b"DFSVIEW1";
 const JOURNAL_SEGMENT_INDEX_CACHE_LIMIT: usize = 256;
 // Point lookups may name multi-megabyte namespace records. Keep their decoded
 // form under a deliberately small process-wide LRU so repeated table replay
@@ -42,6 +43,7 @@ const JOURNAL_SEGMENT_DECODED_CACHE_BYTE_LIMIT: u64 = 32 * 1024 * 1024;
 /// without serializing the entry again.
 #[derive(Debug)]
 pub(crate) struct DfsMetadataJournalFrame<'a> {
+    pub(crate) private_projection: bool,
     entry: Cow<'a, DfsMetadataJournalEntry>,
     ack: Option<ack::JournalWitness>,
     exact_bytes: Arc<[u8]>,
@@ -51,6 +53,7 @@ impl<'a> DfsMetadataJournalFrame<'a> {
     pub(crate) fn encode(entry: &'a DfsMetadataJournalEntry) -> Result<Self> {
         let exact_bytes = encode_metadata_journal_entry(entry)?;
         Ok(Self {
+            private_projection: false,
             ack: None,
             entry: Cow::Borrowed(entry),
             exact_bytes,
@@ -132,19 +135,27 @@ impl DfsMetadataJournalFrame<'static> {
         };
         let exact_bytes = encode_metadata_journal_entry(&entry)?;
         Ok(Self {
+            private_projection: false,
             ack: None,
             entry: Cow::Owned(entry),
             exact_bytes,
         })
     }
     fn decode_exact(bytes: Vec<u8>) -> Result<Self> {
-        let (ack, inner) = ack::split(&bytes)?;
+        let projected = bytes.strip_prefix(PRIVATE_PROJECTION_TAG);
+        let (ack, inner) = ack::split(projected.unwrap_or(&bytes))?;
+        let private_projection = projected.is_some();
+        if private_projection && ack.is_some() {
+            return Err(MetadataBackendError::Serde(
+                "authored projection cannot carry a replica ACK".into(),
+            ));
+        }
         let entry = sinomo_object_serde::from_bytes(inner)
             .map_err(|e| MetadataBackendError::Serde(e.to_string()))?;
         if let Some(ack) = &ack {
             ack.validate(&entry)?;
         }
-        let exact_bytes = if ack.is_some() {
+        let exact_bytes = if ack.is_some() || private_projection {
             Arc::from(inner)
         } else {
             Arc::from(bytes)
@@ -153,6 +164,7 @@ impl DfsMetadataJournalFrame<'static> {
             entry: Cow::Owned(entry),
             exact_bytes,
             ack,
+            private_projection,
         })
     }
 }
@@ -161,7 +173,13 @@ impl DfsMetadataJournalFrame<'static> {
 /// Legacy documents pass through for decoding by the migration owner.
 #[cfg(feature = "storage-conversion")]
 pub fn original_metadata_journal_document(bytes: &[u8]) -> Result<&[u8]> {
-    let (witness, inner) = ack::split(bytes)?;
+    let projected = bytes.strip_prefix(PRIVATE_PROJECTION_TAG);
+    let (witness, inner) = ack::split(projected.unwrap_or(bytes))?;
+    if projected.is_some() && witness.is_some() {
+        return Err(MetadataBackendError::Serde(
+            "authored projection cannot carry a replica ACK".into(),
+        ));
+    }
     if let Some(witness) = witness {
         let entry = sinomo_object_serde::from_bytes(inner)
             .map_err(|e| MetadataBackendError::Serde(e.to_string()))?;
@@ -1468,7 +1486,20 @@ pub(crate) fn append_segmented_journal_frame_with_record_bytes(
     root: &Path,
     frame: &DfsMetadataJournalFrame<'_>,
 ) -> Result<u64> {
-    append_segmented_journal_exact_frame_with_record_bytes(root, frame.entry(), frame.exact_bytes())
+    if frame.private_projection {
+        // The local read-view marker is outside the exact replicated/hash input.
+        let mut record =
+            Vec::with_capacity(PRIVATE_PROJECTION_TAG.len() + frame.exact_bytes().len());
+        record.extend_from_slice(PRIVATE_PROJECTION_TAG);
+        record.extend_from_slice(frame.exact_bytes());
+        append_segmented_journal_exact_frame_with_record_bytes(root, frame.entry(), &record)
+    } else {
+        append_segmented_journal_exact_frame_with_record_bytes(
+            root,
+            frame.entry(),
+            frame.exact_bytes(),
+        )
+    }
 }
 
 #[tracing::instrument(
@@ -2547,6 +2578,74 @@ pub(crate) fn read_segmented_journal_frames_at_sequences(
     Ok(frames)
 }
 
+/// Join the contiguous authored read-view suffix at cold attach. A live
+/// reader subscription fences private appends; ordinary replica frames stop
+/// this projection. Do not populate the shared writer index from an unfenced
+/// inspection or reopen a segment for each row.
+pub(crate) fn visit_private_projection(
+    root: &Path,
+    after: u64,
+    mut visit: impl FnMut(DfsMetadataJournalFrame<'static>) -> Result<()>,
+) -> Result<()> {
+    let mut next = after
+        .checked_add(1)
+        .ok_or_else(|| MetadataBackendError::Serde("journal sequence exhausted".into()))?;
+    loop {
+        let segment = journal_segment_id(next);
+        let path = root
+            .join("journal/segments")
+            .join(format!("{segment:020}.slog"));
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(MetadataBackendError::Io { path, source }),
+        };
+        let snapshot = JournalSegmentFileSnapshot::from_file(&file).map_err(|source| {
+            MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        if let Some(index) = cached_journal_segment_index(&path)
+            && index.matches_file_snapshot(&snapshot)
+            && index.sequences_monotonic
+        {
+            let at = index.entries.partition_point(|e| e.sequence < next);
+            let Some(start) = index.entries.get(at) else {
+                return Ok(());
+            };
+            file.seek(SeekFrom::Start(start.record_start))
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+        while let Some(frame) = read_next_segmented_journal_frame(&mut file, &path)? {
+            if frame.entry().sequence < next {
+                continue;
+            }
+            if !frame.private_projection {
+                return Ok(());
+            }
+            if frame.entry().sequence != next {
+                return Err(MetadataBackendError::replica_diverged(
+                    "authored read projection has a journal gap".into(),
+                ));
+            }
+            visit(frame)?;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| MetadataBackendError::Serde("journal sequence exhausted".into()))?;
+            if journal_segment_id(next) != segment {
+                break;
+            }
+        }
+        if journal_segment_id(next) == segment {
+            return Ok(());
+        }
+    }
+}
+
 /// Read one segmented entry while preserving the exact immutable SOBJ bytes
 /// that were inside its durable length-prefixed record.
 pub(crate) fn read_segmented_journal_frame_at_sequence(
@@ -3005,6 +3104,25 @@ mod tests {
                 .to_string()
                 .contains("conflicting duplicate sequence 1")
         );
+    }
+
+    #[test]
+    fn private_table_projection_preserves_exact_wire_and_recovery_bytes() {
+        let entry = test_journal_entry(7);
+        let encoded = DfsMetadataJournalFrame::encode(&entry).unwrap();
+        let mut stored = PRIVATE_PROJECTION_TAG.to_vec();
+        stored.extend_from_slice(encoded.exact_bytes());
+        let frame = DfsMetadataJournalFrame::decode_exact(stored.clone()).unwrap();
+        assert!(frame.private_projection);
+        assert_eq!(frame.entry(), &entry);
+        assert_eq!(frame.exact_bytes(), encoded.exact_bytes());
+        #[cfg(feature = "storage-conversion")]
+        assert_eq!(
+            original_metadata_journal_document(&stored).unwrap(),
+            encoded.exact_bytes()
+        );
+        let nested = [PRIVATE_PROJECTION_TAG.as_slice(), stored.as_slice()].concat();
+        assert!(DfsMetadataJournalFrame::decode_exact(nested).is_err());
     }
 
     #[test]
