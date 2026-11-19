@@ -11,6 +11,8 @@ pub(crate) struct RuntimeDfsBrowserServiceHost {
     data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
     metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
     data_plane: Arc<dyn crate::DfsDataPlaneHost>,
+    // All request callers observe the browser's monotonic configuration floor.
+    control_plane: std::sync::OnceLock<DaemonDfsControlPlaneKvClient>,
 }
 
 impl RuntimeDfsBrowserServiceHost {
@@ -31,6 +33,7 @@ impl RuntimeDfsBrowserServiceHost {
             data_owner,
             metadata_authority,
             data_plane,
+            control_plane: Default::default(),
         }
     }
 }
@@ -174,7 +177,16 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
         cluster_paths: &ClusterPaths,
         runtime: &tokio::runtime::Handle,
     ) -> Option<Box<dyn crate::DfsControlPlaneKvClient>> {
-        daemon_dfs_control_plane_client_on_runtime(cluster_paths, Some(runtime))
+        if self.metadata_authority.is_none() {
+            return daemon_dfs_control_plane_client_on_runtime(cluster_paths, Some(runtime));
+        }
+        let client = self.control_plane.get_or_init(|| {
+            let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(cluster_paths, runtime);
+            client.retained_metadata_authority = self.metadata_authority.clone();
+            client.write_configuration_projection_required = true;
+            client
+        });
+        Some(Box::new(client.clone()))
     }
 
     fn peer_transports(

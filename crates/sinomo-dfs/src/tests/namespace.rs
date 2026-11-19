@@ -2674,8 +2674,12 @@ fn lazy_service_rebuild_preserves_shared_namespace_guard_registry() {
         node,
     );
     let registry = service.cross_shard_namespace_lock_registry();
-    service.next_frame_id = 41;
-    service.next_message_id = 42;
+    service
+        .next_frame_id
+        .store(41, std::sync::atomic::Ordering::Relaxed);
+    service
+        .next_message_id
+        .store(42, std::sync::atomic::Ordering::Relaxed);
     service.next_request_id = 43;
     service.repair_retry_tick = 44;
     let replica = NodeId::from_legacy_named("node_lazy_shared_replica").expect("replica");
@@ -2697,8 +2701,18 @@ fn lazy_service_rebuild_preserves_shared_namespace_guard_registry() {
             .shares_state_with(&registry),
         "disaster-recovery collapse must retain the generation's shared registry"
     );
-    assert_eq!(rebuilt.next_frame_id, 41);
-    assert_eq!(rebuilt.next_message_id, 42);
+    assert_eq!(
+        rebuilt
+            .next_frame_id
+            .load(std::sync::atomic::Ordering::Relaxed),
+        41
+    );
+    assert_eq!(
+        rebuilt
+            .next_message_id
+            .load(std::sync::atomic::Ordering::Relaxed),
+        42
+    );
     assert_eq!(rebuilt.next_request_id, 43);
     assert_eq!(rebuilt.repair_retry_tick, 44);
     assert_eq!(

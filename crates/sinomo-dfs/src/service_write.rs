@@ -651,7 +651,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         durable_nodes.extend(receipt_node_ids.iter().cloned());
         self.record_message_committed_work(DfsMessageCommittedWork {
             publish_metadata: true,
-            repair_maintenance: durable_nodes.len() < intent.policy.desired_replicas,
+            // A committed version's repair-index change already wakes the
+            // executor with its shard and object. Only an unfinished intent
+            // needs the general stage-retry turn.
+            repair_maintenance: durable_nodes.len() < intent.policy.desired_replicas
+                && !self
+                    .coordinator
+                    .intent(&intent.intent_id)
+                    .is_some_and(|current| current.state == DfsWriteIntentState::Committed),
             namespace_maintenance: false,
             metadata_replica_progress: false,
             metadata_materialization: false,

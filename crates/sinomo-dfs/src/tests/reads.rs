@@ -3497,10 +3497,13 @@ fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune()
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
     sifs_posix_cluster_pump_until(&mut cluster, "primary async repair", |cluster| {
-        drive_repair_executor(&cluster._runtime, &mut cluster.primary);
-        // The primary node's store and content store hold the repaired copy.
-        node_store_content_hash(&cluster._runtime, &cluster.primary_node, path)
-            .is_some_and(|hash| hash == expected_hash)
+        // The mounted executor owns the repair. Wait for its published
+        // location as well as the bytes before testing journal replication.
+        node_store_object(&cluster._runtime, &cluster.primary_node, path).is_some_and(|row| {
+            row.content_hash.as_deref() == Some(expected_hash.as_str())
+                && row.current_locations.contains(&cluster.primary_node)
+                && row.current_locations.contains(&cluster.writer_node)
+        })
             && cluster
                 .primary
                 .content()

@@ -403,10 +403,16 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<Option<ContentManifest>> {
-        self.try_write_inline_binding_with_phase(object_id, version, bytes)
+        self.try_write_inline_binding_with_phase(object_id, version, bytes, false)
     }
 
-    fn try_write_inline_binding_with_phase(&self, object_id: &str, version: &str, bytes: &[u8]) -> Result<Option<ContentManifest>> {
+    pub(in crate::content_store) fn try_write_inline_binding_with_phase(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+        preserve_extents: bool,
+    ) -> Result<Option<ContentManifest>> {
         if bytes.len() as u64 > INLINE_BLOB_SMALL_LIMIT_BYTES {
             return Ok(None);
         }
@@ -434,6 +440,9 @@ impl LocalContentStore {
                         existing_hash: existing.content_hash,
                         new_hash: manifest.content_hash.clone(),
                     });
+                }
+                if preserve_extents && !existing.extents.is_empty() {
+                    return Ok(None);
                 }
                 Some(existing)
             }

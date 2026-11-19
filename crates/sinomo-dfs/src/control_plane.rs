@@ -10105,12 +10105,23 @@ mod tests {
         assert_eq!(requested.desired_shard, desired);
         drop(gate);
         let configurations = runtime.metadata_shards().unwrap();
-        source
-            .reconcile_pending_metadata_shard_membership_handoffs(
-                &configurations,
-                std::time::Duration::from_secs(5),
-            )
-            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reconciliation = source.reconcile_pending_metadata_shard_membership_handoffs(
+            &configurations,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        );
+        if let Err(error) = reconciliation {
+            // The mounted reconciler may already have activated this exact
+            // transfer. The original retiring lane then correctly loses authority.
+            assert!(
+                matches!(error, crate::DfsError::StaleOwnerEpoch {
+                ref file_system_id, ref local_node_id, ref primary_node_id, epoch
+            } if file_system_id == &desired.file_system_id
+                && local_node_id == &current.primary_node_id
+                && primary_node_id == &desired.primary_node_id && epoch == desired.epoch),
+                "unexpected reconciliation error: {error}"
+            );
+        }
         let store = DfsControlPlaneStore::new(source.control_plane.as_mut().unwrap().as_mut());
         let active = store
             .get_metadata_shard(&current.file_system_id, &current.shard_id)
@@ -10147,6 +10158,18 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(original, proof);
+        assert_eq!(pending.handoff_id, requested.handoff_id);
+        assert_eq!(
+            runtime
+                .observe_completed_native_handoff(
+                    &runtime.shared_control_plane().unwrap(),
+                    &pending,
+                    deadline,
+                )
+                .unwrap(),
+            Some(desired.clone()),
+            "the original transfer must have its durable activation marker"
+        );
         let mut missing_promoted = original;
         missing_promoted
             .acknowledged_node_ids

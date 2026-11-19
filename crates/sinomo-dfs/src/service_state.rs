@@ -844,8 +844,9 @@ pub struct NetworkedDfsService<T> {
     pub(crate) committed_work_tracker: Option<DfsCommittedWorkTracker>,
     pub(crate) transport: T,
     pub(crate) repair_retry_tick: u64,
-    pub(crate) next_frame_id: u64,
-    pub(crate) next_message_id: u64,
+    /// Request-local transports retain one sequence with their originating service.
+    pub(crate) next_frame_id: Arc<AtomicU64>,
+    pub(crate) next_message_id: Arc<AtomicU64>,
     pub(crate) next_request_id: u64,
     pub(crate) cancellation: Option<DfsCancellationFlag>,
     pub(crate) writes: DfsWriteState,

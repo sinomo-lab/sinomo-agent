@@ -2216,11 +2216,18 @@ impl DfsNodeTransport {
     /// copied into the fork, otherwise an opened-file read could consume a
     /// response owned by the mutable mounted service (or vice versa).
     pub(crate) fn fork_read_only_request(&self) -> Self {
+        let mut fork = self.fork_browser_request();
+        fork.operation_deadline = None;
+        fork
+    }
+
+    /// Independent caller inbox with the same Main route and original budget.
+    pub(crate) fn fork_browser_request(&self) -> Self {
         let mut fork = self.clone();
         fork.served_message = None;
         fork.incoming_messages.clear();
         fork.detached_send_state = DfsNodeDetachedSendState::default();
-        fork.operation_deadline = None;
+        fork.send_cancellation = self.send_cancellation.clone();
         fork
     }
 

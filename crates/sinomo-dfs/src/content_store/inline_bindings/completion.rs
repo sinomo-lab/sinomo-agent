@@ -118,8 +118,13 @@ mod tests {
     fn canonical_completion_reuses_exact_binding_and_clears_observations() {
         let (_root, _owner, store) = active_store("dfs-inline-completion-exact");
         let manifest = store
-            .put_object_version("object", "v1", b"completed content")
+            .put_owner_write_content("object", "v1", b"completed content")
             .unwrap();
+        assert_eq!(
+            sequence(&store),
+            1,
+            "one frame binds the owner version, reservation and bytes"
+        );
         let original = store.content_reservation_roots().unwrap().reservations;
         let absence = store.manifest_absence_observation_path(&identity(&manifest));
         let orphan = store

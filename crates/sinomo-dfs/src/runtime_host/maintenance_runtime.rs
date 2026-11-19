@@ -254,6 +254,244 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     result
 }
 
+/// The coordinator owns the KV job, while each read and mutation is admitted
+/// by its shard owner. A remote primary can therefore call back into any shard
+/// on this node while the page is outstanding.
+async fn run_placement_page_without_admission(
+    data: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    preflight: &DaemonDfsMetadataAuthorityPreflight,
+    local: &NodeId,
+    budget: usize,
+) -> Result<bool, DaemonError> {
+    let Some(snapshot) = preflight
+        .authority
+        .retained_complete_prefix_for_generation(preflight.generation)
+    else {
+        // Projection publication will wake maintenance again.
+        return Ok(true);
+    };
+    let fs = crate::sifs_file_system_id();
+    let shards = crate::metadata_shards_from_authority_projection(&snapshot, &fs)?;
+    let root =
+        crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &fs, &shards, "/",
+        )?;
+    if !root.is_some_and(|shard| &shard.primary_node_id == local) {
+        return Ok(false);
+    }
+    let cache = daemon_dfs_message_service_cache().root(&data.root())?;
+    let resident = cache
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?
+        .as_ref()
+        .filter(|entry| {
+            Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority)
+                && entry.signature.metadata_authority_generation == preflight.generation
+        })
+        .and_then(|entry| {
+            entry
+                .resident_metadata_backend
+                .clone()
+                .map(|resident| (resident, entry.signature.metadata_storage_generation))
+        });
+    let Some((resident, storage_generation)) = resident else {
+        return Ok(true);
+    };
+    let planning = crate::placement::DfsPlacementPageRead {
+        resident,
+        scheduler: daemon_dfs_mutation_scheduler(data)?,
+        authority: Arc::clone(&preflight.authority),
+        generation: preflight.generation,
+        storage_generation,
+    };
+    let mut caller = open_dfs_runtime_service(data, Some(runtime))?;
+    let pending = crate::repair_executor::repair_executor_work(&data.root()).need_count;
+    let page = caller
+        .run_placement_page_with_pending_repairs(budget, pending, &shards, Some(&planning))
+        .await?;
+    Ok(page
+        .as_ref()
+        .is_some_and(crate::maintenance::placement_page_can_continue))
+}
+
+/// A warm executor consumes the indexed work of this node's primary shards.
+/// Cold cache initialization and explicit node recovery keep their normal owner.
+async fn run_scoped_repair_turn(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+    runtime: &tokio::runtime::Handle,
+    preflight: &DaemonDfsMetadataAuthorityPreflight,
+    authority_epoch: u64,
+    resources: sinomo_device::NodeResourceSnapshot,
+) -> Result<Option<DaemonDfsMaintenanceTickOutcome>, DaemonError> {
+    let limit = daemon_dfs_routine_maintenance_tick_options(resources)
+        .repair_max_jobs
+        .min(crate::service_repair::DFS_REPAIR_EXAMINED_RECORDS_PER_PAGE);
+    if limit == 0 {
+        return Ok(Some(DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: false,
+        }));
+    }
+    let Some(projection) = preflight
+        .authority
+        .retained_complete_prefix_for_generation(preflight.generation)
+    else {
+        return Ok(None);
+    };
+    let shards = crate::metadata_shards_from_authority_projection(
+        &projection,
+        &crate::sifs_file_system_id(),
+    )?;
+    let primaries = crate::repair_executor::local_primary_shards(&shards, &state.local_node_id);
+    #[cfg(test)]
+    crate::maintenance::phase_runs::record(
+        &data_dir.root(),
+        crate::maintenance::phase_runs::EXECUTOR_TURN,
+    );
+    let work = crate::repair_executor::repair_turn_shards(&data_dir.root(), &primaries);
+    if work.is_empty() {
+        return Ok(
+            if crate::repair_executor::repair_executor_work(&data_dir.root()).due {
+                None // The final primary was lost. Retire the old scheduler state.
+            } else {
+                Some(DaemonDfsMaintenanceTickOutcome::Completed {
+                    reached_limit: false,
+                })
+            },
+        );
+    }
+    let keys = work
+        .iter()
+        .map(|id| DaemonDfsMutationLaneKey {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: crate::DfsMetadataShardId::new(id.clone()),
+        })
+        .collect::<Vec<_>>();
+    let Some(peer) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
+        return Ok(None);
+    };
+    if peer.cluster_id != state.cluster_id || peer.local_node_id != state.local_node_id {
+        return Ok(None);
+    }
+    let exclusions = daemon_dfs_maintenance_execution_exclusions(cluster_paths, state)
+        .with_repair_authority_epoch(authority_epoch);
+    let scheduler = daemon_dfs_mutation_scheduler(data_dir)?;
+    let foreground = scheduler.begin_maintenance_interest();
+    let Some(admission) = crate::acquire_dfs_maintenance_admission_until_foreground_waits(
+        &foreground,
+        scheduler.admit_shards(&keys),
+    )
+    .await?
+    else {
+        return Ok(Some(DaemonDfsMaintenanceTickOutcome::Deferred));
+    };
+    if admission.is_global() {
+        return Ok(None);
+    }
+    for key in &keys {
+        if daemon_dfs_message_cache_exact_admission_handle(
+            data_dir,
+            cluster_paths,
+            &peer,
+            key,
+            runtime,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+    }
+    #[cfg(test)]
+    if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(data_dir) {
+        hook(
+            DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight,
+            None,
+            Some(preflight),
+        )?;
+    }
+    let (handle, _) = daemon_dfs_message_lane(
+        data_dir,
+        cluster_paths,
+        &peer,
+        runtime,
+        DaemonDfsMessageLaneKind::MutationShards(keys),
+        false,
+        Some(preflight),
+    )?;
+    let mut admission = Some(admission);
+    let scope = DfsMessageExecutionScope::NamespacePaths {
+        file_system_id: crate::sifs_file_system_id(),
+        paths: Vec::new(),
+    };
+    let publication = crate::publication_guard::DfsPublicationExecutionScope::enter(
+        data_dir.root(),
+        scope.clone(),
+        &mut admission,
+        require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))?,
+    )?;
+    let tracker = DfsCommittedWorkTracker::new();
+    let mut lane = handle.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    let Some(metadata @ DaemonDfsResidentMetadataScope::Shards(..)) =
+        lane.resident_metadata_scope.clone()
+    else {
+        return Ok(None);
+    };
+    let provider = crate::DfsPublicationExecutionProvider::from_execution_owners(
+        &publication.owners(),
+        Arc::clone(&preflight.authority),
+        runtime.clone(),
+    )?;
+    lane.attach_metadata_scope(&metadata)?;
+    let service = &mut lane.service;
+    let provider = service.publication_provider.install(provider);
+    let owners = service.publication_execution.install(publication.owners());
+    let previous = service.committed_work_tracker.replace(tracker.clone());
+    service.set_background_replica_dispatch(true);
+    let result = service.run_repair_executor_pass_on_shards(
+        &data_dir.root(),
+        &shards,
+        &exclusions,
+        limit,
+        Some(&work),
+    );
+    let worker = service
+        .message_deferred_work_pending()
+        .map(|pending| pending.then(|| service.detach_message_deferred_work()));
+
+    service.set_background_replica_dispatch(false);
+    service.committed_work_tracker = previous;
+    drop(owners);
+    drop(provider);
+    let release = service.release_resident_metadata_backend();
+    drop(lane);
+    let finish = publication.finish();
+    drop(admission);
+    emit_daemon_dfs_committed_edges(
+        data_dir,
+        cluster_paths,
+        &scope,
+        runtime,
+        None,
+        tracker.take(),
+        &[],
+    );
+    if let Some(worker) = worker? {
+        schedule_daemon_dfs_message_deferred_work(
+            runtime,
+            cluster_paths,
+            Arc::clone(handle.detached_send_runtime()),
+            worker,
+        );
+    }
+    release?;
+    finish?;
+    Ok(Some(DaemonDfsMaintenanceTickOutcome::Completed {
+        reached_limit: result?.has_more,
+    }))
+}
+
 async fn run_daemon_dfs_maintenance_tick_kind_inner(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
@@ -306,6 +544,20 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         )
         .await?
     };
+    if executor_only
+        && let Some(outcome) = run_scoped_repair_turn(
+            &data_dir,
+            &cluster_paths,
+            &preflight_cluster_state,
+            runtime,
+            &initial_metadata_authority_preflight,
+            repair_authority_epoch,
+            node_resources,
+        )
+        .await?
+    {
+        return Ok(outcome);
+    }
     // Publication can advance the shared configuration's authority fence even
     // when every filesystem and physical store is unchanged. Complete it before
     // capturing the admitted generation. Retain the initial owner through this
@@ -463,6 +715,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
         }
         let mut deferred_work = None;
         let mut turn_progress = None;
+        let mut placement_budget = 0;
         let committed_work_tracker = DfsCommittedWorkTracker::new();
         let maintenance_result = run_daemon_dfs_maintenance_until_foreground_waits(
             &foreground_preemption,
@@ -479,6 +732,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                     committed_work_tracker.clone(),
                     &mut deferred_work,
                     &mut turn_progress,
+                    &mut placement_budget,
                     &mut completed_remote_phase,
                     publication_scope
                         .as_ref()
@@ -636,6 +890,27 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
                 }
             }
         };
+        let outcome = if placement_budget > 0
+            && run_placement_page_without_admission(
+                &data_dir,
+                runtime,
+                &metadata_authority_preflight,
+                &preflight_cluster_state.local_node_id,
+                placement_budget,
+            )
+            .await?
+        {
+            match outcome {
+                DaemonDfsMaintenanceTickOutcome::Completed { .. } => {
+                    DaemonDfsMaintenanceTickOutcome::Completed {
+                        reached_limit: true,
+                    }
+                }
+                other => other,
+            }
+        } else {
+            outcome
+        };
         if !executor_only && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
             // Lifecycle work can delete or compact content without producing a
             // served-message event. One coalesced dirty edge after a completed pass
@@ -739,6 +1014,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     committed_work_tracker: DfsCommittedWorkTracker,
     _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
     turn_progress: &mut Option<(Arc<crate::maintenance::DfsMaintenanceProgressState>, u64)>,
+    placement_budget: &mut usize,
     completed_remote_phase: &mut Option<(
         Box<crate::DfsNamespaceRequestRecord>,
         Box<crate::source_adoption::CompletedRemoteNamespacePhase>,
@@ -1044,7 +1320,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         // Both kinds now execute the same bounded phases. Recovery has already
         // durably transferred discovered work before this future can yield to
         // foreground RPCs (including replies from its own promotion outbox).
-        let result = sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
+        let result = crate::maintenance::run_reactive_maintenance_phases(
             &mut maintenance_service,
             data_dir.clone(),
             cluster_paths.clone(),
@@ -1055,6 +1331,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             execution_exclusions,
             committed_work_tracker,
             options,
+            Some(placement_budget),
         )
         .await;
         match result {

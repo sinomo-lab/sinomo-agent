@@ -1587,6 +1587,11 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                     crate::DfsError::Cancelled { .. } => {
                         crate::DfsCommitOutcomeUnknownCause::Cancelled
                     }
+                    crate::DfsError::WriteConfigurationPending => {
+                        crate::DfsCommitOutcomeUnknownCause::ConfigurationPending {
+                            detail: error.to_string(),
+                        }
+                    }
                     other => crate::DfsCommitOutcomeUnknownCause::Interrupted {
                         detail: other.to_string(),
                     },
