@@ -16,6 +16,11 @@ fn native_catchup_parks_one_receiver_and_resumes_one_acknowledged_page_at_a_time
     let healthy = &shard.replica_node_ids[1];
     let data = runtime.data_dir(primary).clone();
     let id = DfsMetadataShardId::new(&shard.shard_id);
+    // This fixture drives the actual publisher itself. Own its source lane so
+    // a concurrent Main turn cannot hold its writer or advance the same ACK.
+    let source_admission = runtime.hold_main_exact_admission(
+        primary, &shard.file_system_id, &shard.shard_id,
+    ).unwrap();
     let slot = crate::runtime_host::daemon_dfs_message_service_cache()
         .root(&data.root())
         .unwrap();
@@ -160,5 +165,6 @@ fn native_catchup_parks_one_receiver_and_resumes_one_acknowledged_page_at_a_time
     drop(transport);
     drop(handle);
     drop(resident);
+    drop(source_admission);
     runtime.close().unwrap();
 }

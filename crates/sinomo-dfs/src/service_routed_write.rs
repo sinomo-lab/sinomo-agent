@@ -1444,8 +1444,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || command.touch_parent_on_create
             || command.requester_blob_pre_staged
             || patch.patch_size_bytes == 0
-            || patch.offset > patch.base_size_bytes
-            || patch.offset.checked_add(patch.patch_size_bytes).is_none()
+            || !patch.valid_ranges()
         {
             return Err(conflict());
         }
@@ -1531,7 +1530,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             content_hash: patch.base_content_hash.clone(),
             size_bytes: patch.base_size_bytes,
         };
-        let replay = self.content.replay_object_version_patch_manifest(
+        let replay = if !patch.ranges.is_empty() {
+            self.content.range_patch_manifest(
+                command.request.object_id.as_str(),
+                base.as_str(),
+                command.request.target_version.as_str(),
+                &patch,
+                &[],
+                None,
+                true,
+            )?
+        } else {
+            self.content.replay_object_version_patch_manifest(
             command.request.object_id.as_str(),
             base.as_str(),
             command.request.target_version.as_str(),
@@ -1539,7 +1549,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &patch.patch_hash,
             patch.patch_size_bytes,
             &base_identity,
-        )?;
+        )?
+        };
         let Some(manifest) = replay else {
             if record.is_some() {
                 return Err(DfsError::WriteReconciliationRequired {
@@ -1598,6 +1609,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             content_hash: patch.base_content_hash.clone(),
             size_bytes: patch.base_size_bytes,
         };
+        if !patch.ranges.is_empty() {
+            return self
+                .content
+                .range_patch_manifest(
+                    command.request.object_id.as_str(),
+                    base.as_str(),
+                    command.request.target_version.as_str(),
+                    patch,
+                    &command.bytes,
+                    preingested_blob.take(),
+                    false,
+                )?
+                .ok_or_else(|| DfsError::ContentStore {
+                    message: "admitted ranges have no resulting manifest".into(),
+                });
+        }
         Ok(if let Some(blob) = preingested_blob.take() {
             self.content
                 .bind_quarantined_patch(

@@ -222,6 +222,7 @@ impl From<crate::ContentStoreError> for DfsRuntimeError {
 
 #[derive(Debug)]
 pub struct DfsDataOwnerLock {
+    pub(crate) metadata_sync_flights: Arc<crate::service_sync_flights::DfsMetadataSyncFlights>,
     file: File,
     physical_data_root: PathBuf,
     selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
@@ -419,6 +420,7 @@ impl DfsDataOwnerLock {
             .to_path_buf();
         Ok(Self {
             file,
+            metadata_sync_flights: Default::default(),
             physical_data_root,
             selected_original_data_layout: None,
         })

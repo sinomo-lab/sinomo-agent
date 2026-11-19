@@ -445,6 +445,15 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
         .posix_symlink("absent-target", link, options.clone())
         .expect("initial native dangling symlink");
     let original = writer.posix_lstat_distributed(link).unwrap();
+    // Receipt updates can advance this shard independently of either create.
+    // Pin each materialization check to its own native publication.
+    let commit_sequence = |backend: &dyn DfsMetadataBackend, intent_id: &str| {
+        let digest = backend.prepared_operation_digest(&format!("write:{intent_id}"))
+            .unwrap().expect("exact symlink prepare");
+        assert_eq!(digest.shard_id, shard_id);
+        backend.committed_prepared_operation(&digest).unwrap()
+            .expect("exact symlink commit").sequence
+    };
     let initial_sequence = {
         let owner = runtime.metadata_primary_service(link).unwrap();
         let backend = owner.metadata_backend().unwrap();
@@ -456,7 +465,13 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
             snapshot.materialized_through_sequence,
             snapshot.prefix_proof.journal_sequence
         );
-        snapshot.materialized_through_sequence
+        let intent = backend.intents_for_object(&original.object_id).unwrap().into_iter()
+            .find(|intent| intent.target_version == original.version
+                && intent.status == DfsWriteIntentStatus::Committed)
+            .expect("initial committed symlink intent");
+        let sequence = commit_sequence(backend, &intent.intent_id);
+        assert!(snapshot.materialized_through_sequence >= sequence);
+        sequence
     };
     crate::runtime_host::materialization_test::wait_for_existing_materialization(
         runtime.data_dir(&writer_node),
@@ -587,10 +602,13 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
             assert_eq!(recorded.status, DfsNamespaceRequestStatus::Completed);
             assert_eq!(recorded.result, Some(DfsNamespaceResult::Applied));
         }
-        backend
-            .export_table_snapshot()
-            .unwrap()
-            .materialized_through_sequence
+        // The caller waits for this recreate's decision. A subsequent content
+        // receipt can advance the primary journal independently.
+        let (request_id, object_id, version) = actual_dispatch.as_ref().expect("real native recreate dispatch");
+        let stat = recreated.as_ref().expect("committed recreate");
+        assert_eq!((&stat.object_id, &stat.version), (object_id, version));
+        let intent = crate::intent::stable_write_intent_id(&writer_node, object_id, request_id);
+        commit_sequence(backend, &intent)
     };
     let mut last_materialization = None;
     let materialized = crate::runtime_host::materialization_test::wait_for_existing_materialization(
@@ -614,9 +632,12 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
         actual_dispatch.is_some(),
         "real recreate must reach native Main"
     );
+    let replica = node_store_object(&runtime, &writer_node, link).expect("replica holds the recreated symlink");
+    assert_eq!((&replica.object_id, &replica.version), (&recreated.object_id, &recreated.version));
     let current = writer.posix_lstat_distributed(link).unwrap();
     assert_eq!(current.kind, DfsObjectKind::Symlink);
     assert_eq!(current.object_id, recreated.object_id);
+    assert_eq!(current.version, recreated.version);
     assert_ne!(current.object_id, original.object_id);
     assert_eq!(
         writer.posix_readlink_distributed(link).unwrap(),

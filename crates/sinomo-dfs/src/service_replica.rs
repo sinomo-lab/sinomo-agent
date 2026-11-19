@@ -386,11 +386,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         context: &DfsMetadataReplicaShardContext,
         payload: &crate::DfsPreparedOperationPayload,
     ) -> Result<DfsMetadataCommitRequirement, DfsError> {
+        self.metadata_participant_requirement(context, prepared_payload_commit_intent_w(payload))
+    }
+
+    pub(crate) fn metadata_participant_requirement(
+        &self,
+        context: &DfsMetadataReplicaShardContext,
+        intent_w: usize,
+    ) -> Result<DfsMetadataCommitRequirement, DfsError> {
         let Some(write_set) = context.write_set.clone() else {
             return Ok(DfsMetadataCommitRequirement::AllMembers);
         };
         let bounds = self.retained_metadata_shard_bounds(&context.shard)?;
-        let intent_w = prepared_payload_commit_intent_w(payload);
         let floor = crate::metadata_commit_write_set_floor(&bounds, intent_w);
         let shard_id = DfsMetadataShardId::new(context.shard.shard_id.clone());
         let pending_adds = self

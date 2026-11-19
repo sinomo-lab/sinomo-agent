@@ -147,6 +147,12 @@ impl std::fmt::Debug for DfsPublicationExecutionProvider {
     }
 }
 impl DfsPublicationExecutionProvider {
+    pub(crate) fn metadata_sync_flights(
+        &self,
+    ) -> &Arc<crate::service_sync_flights::DfsMetadataSyncFlights> {
+        &self.data_owner.metadata_sync_flights
+    }
+
     pub(crate) fn from_runtime(
         data_root: PathBuf,
         data_owner: Arc<DfsDataOwnerLock>,

@@ -588,7 +588,7 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
     } = prepared;
     let mut control_plane = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime);
     let published = if publish_required {
-        sinomo_dfs::publish_dfs_content_advertisement_async(
+        let changed = sinomo_dfs::publish_dfs_content_advertisement_if_needed_async(
             &mut control_plane,
             &local_node_id,
             desired.clone(),
@@ -597,7 +597,7 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
         with_placement_environment(&data_dir, &local_node_id, |environment| {
             environment.last_published_local_advertisement = Some(desired.clone());
         });
-        true
+        changed
     } else {
         false
     };

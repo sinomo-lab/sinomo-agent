@@ -1158,3 +1158,87 @@ fn native_default_setup_never_moves_a_shard_with_a_stale_record() {
     ));
     runtime.close().unwrap();
 }
+
+#[test]
+fn write_set_file_sync_fans_out_one_frozen_barrier() {
+    use super::commit_native_tests::{hold_replies, release};
+    let (runtime, config) = switched("native-one-write-set-barrier", None);
+    let mut service = primary(&runtime);
+    let path = "/services/one-barrier";
+    let opts = crate::DfsWriteOptions::replicated_eventual(
+        std::iter::once(config.primary_node_id.clone())
+            .chain(config.replica_node_ids.clone())
+            .collect(),
+    );
+    service.posix_write_file(path, b"frozen", opts).unwrap();
+    let frozen = service
+        .posix_capture_file_sync_target(path, crate::DfsPosixSyncKind::File)
+        .unwrap();
+    service
+        .posix_sync_file_local(&frozen, Duration::from_secs(5))
+        .unwrap();
+    let mut second = primary(&runtime);
+    let owner = service
+        .publication_provider
+        .current()
+        .expect("native publication owner");
+    let flights = owner.metadata_sync_flights();
+    let mut peers = config.replica_node_ids.clone();
+    peers.sort();
+    let mark = runtime
+        .rpc_observations()
+        .iter()
+        .map(|e| e.call_id)
+        .max()
+        .unwrap_or(0);
+    let gate = hold_replies(&runtime, &config, &peers[0]);
+    std::thread::scope(|scope| {
+        let task = scope.spawn(|| service.posix_sync_file_local(&frozen, Duration::from_secs(5)));
+        let until = Instant::now() + Duration::from_secs(3);
+        let reached = loop {
+            let seen: std::collections::BTreeSet<_> = runtime
+                .rpc_observations()
+                .into_iter()
+                .filter(|e| {
+                    e.call_id > mark
+                        && e.source == config.primary_node_id
+                        && e.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                        && e.dfs_request_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with("dfs_sync_probe_"))
+                })
+                .map(|e| e.target)
+                .collect();
+            if peers.iter().all(|node| seen.contains(node)) {
+                break true;
+            }
+            if Instant::now() >= until || task.is_finished() {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let joined = scope.spawn(|| second.posix_sync_file_local(&frozen, Duration::from_secs(5)));
+        while flights.live_waiters() == 0 && Instant::now() < until && !joined.is_finished() {
+            std::thread::yield_now();
+        }
+        let waiters = flights.live_waiters();
+        release(&gate);
+        let cert = task.join().unwrap().unwrap();
+        let also = joined.join().unwrap().unwrap();
+        assert_eq!(
+            waiters, 1,
+            "same prefix and membership join the outstanding proof"
+        );
+        assert_eq!(also.metadata_certificate, cert.metadata_certificate);
+        assert_eq!(cert.target, frozen);
+        assert_eq!(cert.metadata_certificate.acknowledged_node_ids.len(), 3);
+        assert!(
+            reached,
+            "both members must receive a probe while the first reply is held"
+        );
+    });
+    runtime.clear_faults();
+    drop(second);
+    drop(service);
+    runtime.close().unwrap();
+}

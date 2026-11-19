@@ -374,6 +374,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let completed = self
             .hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
                 false,
+                false,
                 &hydration_never_cancelled,
             )?;
         debug_assert!(completed, "non-cancellable DFS hydration was cancelled");
@@ -394,6 +395,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let completed = self
             .hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
                 true,
+                false,
                 &hydration_never_cancelled,
             )?;
         debug_assert!(
@@ -409,6 +411,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool, DfsError> {
         self.hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
             true,
+            true,
             should_cancel,
         )
     }
@@ -419,6 +422,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
         &mut self,
         reconstruct_commit_promotions: bool,
+        try_writer: bool,
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool, DfsError> {
         if self.metadata_backend.is_none() {
@@ -430,10 +434,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut observation =
             crate::background_observation::DfsBackgroundObservation::new("hydration", "rebuild");
         let result = (|| {
-            self.metadata_backend
-                .as_deref_mut()
-                .expect("metadata backend checked above")
-                .begin_consistent_read_snapshot()?;
+            let backend = self.metadata_backend.as_deref_mut().expect("metadata backend checked above");
+            if try_writer {
+                if !backend.try_begin_consistent_read_snapshot()? { return Ok(false); }
+            } else {
+                backend.begin_consistent_read_snapshot()?;
+            }
             // Preserve the original coherent catalog/reset setup, then end
             // that read scope before recovery can publish or observe a commit.
             let setup = (|| -> Result<bool, DfsError> {
@@ -487,10 +493,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 return Ok(false);
             }
-            self.metadata_backend
-                .as_deref_mut()
-                .expect("metadata backend checked above")
-                .begin_consistent_read_snapshot()?;
+            let backend = self.metadata_backend.as_deref_mut().expect("metadata backend checked above");
+            if try_writer {
+                if !backend.try_begin_consistent_read_snapshot()? { return Ok(false); }
+            } else {
+                backend.begin_consistent_read_snapshot()?;
+            }
             let result = self
                 .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
                     reconstruct_commit_promotions,

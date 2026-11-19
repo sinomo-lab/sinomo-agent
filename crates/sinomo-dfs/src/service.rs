@@ -2175,10 +2175,12 @@ mod tests {
         stored.updated_at -= time::Duration::hours(1);
         stored.expires_at = Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1));
         let key = crate::content_service_key(&node);
-        sinomo_core::cluster::append_cluster_raft_command(&paths, &node, sinomo_core::kv::KvCommand::Op(
-            sinomo_core::kv::KvOp::put_serde(key.clone(), &stored, None).unwrap(),
-        )).unwrap();
         let mut client = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, &runtime.runtime_handle());
+        // Seed through the live replica's writer, so its resident applied image
+        // and WAL both contain the deliberately expired advertisement.
+        runtime.runtime_handle().block_on(crate::publish_dfs_content_advertisement_async(
+            &mut client, &node, stored.clone(),
+        )).unwrap();
         let read = runtime.runtime_handle().block_on(crate::AsyncDfsControlPlaneKvClient::get_async(&client, &key)).unwrap().unwrap();
         assert_eq!(read.decode::<crate::DfsNodeAdvertisement>().unwrap(), stored);
         let wal = paths.kv_paths().raft_wal_paths(&node).wal;

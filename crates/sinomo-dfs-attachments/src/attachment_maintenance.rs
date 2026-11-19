@@ -24,6 +24,11 @@ struct State {
     frames: Vec<Frame>,
     known_catalogs: bool,
     next_due: Option<u64>,
+    // An unrelated namespace event can advance a feed or enqueue a source.
+    // It does not make a failed managed-directory page available. Startup
+    // already reconciles from the beginning, so this deadline is local.
+    #[serde(skip)]
+    scan_retry_at: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct Feed {
@@ -293,6 +298,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
         let hints = std::mem::take(&mut *cache.hints.lock().unwrap());
         let result = (|| {
             if reconcile {
+                state.scan_retry_at = None;
                 state.scan_root = 0;
                 state.frames.clear();
                 state.feeds.clear();
@@ -346,6 +352,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                 };
                 let batch = crate::poll_dfs_namespace_changes(backend, &feed.cursor, shard, "/")?;
                 if batch.rescan_required() {
+                    state.scan_retry_at = None;
                     state.scan_root = 0;
                     state.frames.clear();
                     feed.cursor = DfsNamespaceChangeCursor::from_shard_config(
@@ -418,7 +425,9 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
             // Reconciliation covers missed hints, compaction gaps and late orphan
             // uploads. It scans only managed directories, never the user namespace.
             for _ in 0..16 {
-                if state.tasks.len() >= MAX_TASKS {
+                if state.tasks.len() >= MAX_TASKS
+                    || state.scan_retry_at.is_some_and(|due| due > now)
+                {
                     break;
                 }
                 if state.frames.is_empty() {
@@ -436,6 +445,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                         after: None,
                     });
                 }
+                state.scan_retry_at = None;
                 let mut frame = state.frames.pop().unwrap();
                 let page = match self.posix_list_dir_beneath_no_links_distributed_page(
                     "/",
@@ -448,6 +458,7 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                     Err(e) => {
                         report.errors.push(e.to_string());
                         state.frames.push(frame);
+                        state.scan_retry_at = Some(now.saturating_add(RETRY_NANOS));
                         break;
                     }
                 };
@@ -503,16 +514,17 @@ impl<T: DfsMessageTransport> DfsAttachmentService<'_, T> {
                 }
             }
             report.pending_sources = state.tasks.len();
-            state.next_due =
-                if feed_more || state.scan_root < ROOTS.len() || !state.frames.is_empty() {
-                    Some(if report.errors.is_empty() {
-                        now
-                    } else {
-                        now.saturating_add(RETRY_NANOS)
-                    })
-                } else {
-                    state.tasks.iter().map(|task| task.due).min()
-                };
+            let scan_pending = state.scan_root < ROOTS.len() || !state.frames.is_empty();
+            let queue_has_room = state.tasks.len() < MAX_TASKS;
+            state.next_due = state
+                .tasks
+                .iter()
+                .map(|task| task.due)
+                .chain(
+                    (queue_has_room && scan_pending).then_some(state.scan_retry_at.unwrap_or(now)),
+                )
+                .chain((queue_has_room && feed_more).then_some(now))
+                .min();
             crate::checkpoint::write_sobj_atomic(checkpoint, &state)?;
             *cache.state.lock().unwrap() = state;
             Ok(report)

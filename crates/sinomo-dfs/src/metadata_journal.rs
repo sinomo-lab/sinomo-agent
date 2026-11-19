@@ -1076,7 +1076,11 @@ pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     }
 
     let next_sequence = max_sequence.saturating_add(1).max(1);
-    if head_next_sequence != Some(next_sequence) {
+    // A missing hint already denotes an empty journal. A repair probe of a
+    // virgin replica must not manufacture a physical migration source.
+    if head_next_sequence != Some(next_sequence)
+        && (next_sequence > 1 || head_path.exists())
+    {
         write_sobj_atomic(&head_path, &DfsMetadataJournalHead { next_sequence })?;
     }
     if let Some(tail_hint) = segmented_tail_hint

@@ -531,8 +531,17 @@ fn same_primary_follower_partition(name: &str, settle_verdict: bool, path_comman
     // frontend token/object. Endpoint-filtered errors alone prove no causality.
     let mut original_authority_carriers = Vec::new();
     let mut native_trace_quality = Vec::new();
-    for (node, trace) in &traces {
+    // Closing stops new observations. Terminal packets for already admitted
+    // native calls arrive when their owners return; keep the original bound.
+    for (_, trace) in &traces {
         trace.close();
+    }
+    while traces.iter().any(|(_, trace)| trace.has_in_flight_observations())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    for (node, trace) in &traces {
         let mut bytes = Vec::new();
         trace.export_raw(&mut bytes).unwrap();
         std::fs::write(

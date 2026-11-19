@@ -566,11 +566,10 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
         )
         .expect("owner large patch write");
 
-    let mut committed = false;
-    for _ in 0..16 {
-        runtime
-            .maintenance_tick(&owner, Duration::from_secs(5))
-            .expect("normal owner maintenance");
+    // The live Main publishes the asynchronous write. A fixed number of
+    // foreground polling turns does not establish a replica deadline.
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
         replica_dfs.process_incoming().expect("replica incoming");
         owner_dfs.process_incoming().expect("owner incoming");
         replica_dfs
@@ -583,11 +582,13 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
         if owner_object.content_hash.as_deref() == Some(expected_hash.as_str())
             && replica_object.content_hash.as_deref() == Some(expected_hash.as_str())
         {
-            committed = true;
             break;
         }
+        assert!(Instant::now() < deadline,
+            "expected {expected_hash}, owner {:?}, replica {:?}",
+            owner_object.content_hash, replica_object.content_hash);
+        std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(committed, "chunked replicated patch write did not commit");
 
     let committed_owner = node_store_object_with_receipts(&runtime, &owner, &object_id)
         .expect("committed owner metadata");

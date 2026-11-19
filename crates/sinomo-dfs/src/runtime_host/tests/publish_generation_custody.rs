@@ -136,6 +136,7 @@ fn generation_child_is_owned(kind: &'static str) {
                 peer,
                 preflight,
                 task_runtime,
+                deadline,
             )
             .await
         } else {

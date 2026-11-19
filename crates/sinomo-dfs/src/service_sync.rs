@@ -45,6 +45,7 @@ const DFS_METADATA_SYNC_ROUTED_FANOUT_CAP: usize = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MetadataQuorumSyncPurpose {
     OrdinaryDurability,
+    WriteSet(crate::service_replica::DfsMetadataCommitRequirement),
     /// Fixed source prefix, every assigned participant, no snapshot repair.
     /// Its result is live barrier DATA, not a serving or recovery capability.
     ExactPrefixFullAssignment,
@@ -1583,10 +1584,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return Ok(None);
         };
-        let Some(write_set) = context.write_set.clone() else {
+        let requirement = self.metadata_participant_requirement(&context, 0)?;
+        let crate::service_replica::DfsMetadataCommitRequirement::WriteSet {
+            write_set, floor, ..
+        } = &requirement
+        else {
             return Ok(None);
         };
-        if Some(context.shard.epoch) != target.authority_epoch
+        if target.expected_shard.as_ref() != Some(&context.shard)
+            || target.primary_node_id != self.node_id
+            || Some(context.shard.epoch) != target.authority_epoch
             || context.shard.primary_node_id != self.node_id
         {
             return Err(DfsError::StaleOwnerEpoch {
@@ -1596,80 +1603,72 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: context.shard.epoch,
             });
         }
-        let bounds = self.retained_metadata_shard_bounds(&context.shard)?;
-        if write_set.write_set.len() < bounds.w_floor {
+        if write_set.write_set.len() < *floor {
             return Ok(Some(DfsWriteSetSync::BelowFloor {
                 write_set: write_set.write_set.len(),
-                floor: bounds.w_floor,
+                floor: *floor,
             }));
         }
-        let pending = self
-            .metadata_backend
-            .as_deref()
-            .ok_or_else(|| DfsError::Metadata {
-                message: "write-set sync requires the shard's durable backend".into(),
-            })?
-            .write_set_member_state(&target.shard_id)?
-            .map(|state| {
-                state
-                    .pending_adds
-                    .into_iter()
-                    .filter(|add| {
-                        !crate::metadata_pending_write_set_add_superseded(
-                            &add.cut,
-                            &context.shard,
-                            Some(&write_set),
-                        )
-                    })
-                    .map(|add| add.node_id)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        let required = write_set
-            .write_set
-            .iter()
-            .chain(&pending)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        // One barrier per member, each naming only that member, within what
-        // remains of the caller's own sync timeout. A member that already
-        // holds the prefix answers at once, so a zero timeout still certifies
-        // a write set that is caught up.
-        let deadline = Instant::now().checked_add(timeout);
-        let local = self.node_id.clone();
-        for member in required.iter().filter(|member| **member != local) {
-            let remaining = deadline.map_or(timeout, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            });
-            let member_target = DfsMetadataQuorumSyncTarget {
-                replica_node_ids: vec![member.clone()],
-                expected_shard: Some(context.shard.clone()),
-                barrier_id: sinomo_core::Id::generate().to_string(),
-                checkpoint_snapshot: None,
-                ..target.clone()
-            };
-            match self.sync_metadata_shard_to_quorum_intersecting(
-                &member_target,
-                std::slice::from_ref(member),
-                remaining,
-            ) {
-                Ok(_) => {}
-                Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => {
-                    return Err(DfsError::Distributed {
-                        message: format!(
-                            "write-set member {member} did not acknowledge metadata shard {} prefix {} within the sync timeout",
-                            target.shard_id.0, target.journal_sequence
-                        ),
+        let required = requirement.required_node_ids(&context.shard);
+        let frozen = DfsMetadataQuorumSyncTarget {
+            replica_node_ids: required
+                .iter()
+                .filter(|member| **member != self.node_id)
+                .cloned()
+                .collect(),
+            expected_shard: Some(context.shard),
+            ..target.clone()
+        };
+        let purpose = MetadataQuorumSyncPurpose::WriteSet(requirement.clone());
+        self.revalidate_metadata_quorum_sync_authority(&frozen, &purpose)?;
+        let admission = self.publication_provider.current().map(|provider| {
+            provider
+                .metadata_sync_flights()
+                .enter(&frozen, &requirement)
+        });
+        let mut certificate = match admission {
+            Some(crate::service_sync_flights::Admission::Join(receiver)) => {
+                let deadline = self
+                    .transport
+                    .operation_deadline()
+                    .map_or(timeout, |limit| {
+                        timeout.min(limit.saturating_duration_since(Instant::now()))
                     });
+                let certificate = receiver.wait(deadline, self.cancellation.as_ref())?;
+                self.revalidate_metadata_quorum_sync_authority(&frozen, &purpose)?;
+                certificate
+            }
+            leader => {
+                let result = self.sync_metadata_shard_to_quorum_with_required_intersection(
+                    &frozen, &required, purpose, timeout,
+                );
+                if let Some(crate::service_sync_flights::Admission::Lead(leader)) = leader {
+                    leader.finish(&result);
                 }
-                Err(error) => return Err(error),
+                result?
+            }
+        };
+        // A peer can request a newer, covering checkpoint. Certify the
+        // caller's frozen prefix only if it is still in that actual history.
+        if certificate.target.journal_sequence != frozen.journal_sequence {
+            let retained = self
+                .metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "write-set sync lost its source".into(),
+                })?
+                .historical_metadata_prefix_proof(&frozen.shard_id, frozen.journal_sequence)?;
+            if certificate.target.journal_sequence < frozen.journal_sequence
+                || retained
+                    .is_none_or(|p| !p.is_well_formed() || p.digest != frozen.state_fingerprint)
+            {
+                return Err(DfsError::Metadata {
+                    message: "the durable barrier no longer covers the frozen file prefix".into(),
+                });
             }
         }
-        Ok(Some(DfsWriteSetSync::Certified(DfsMetadataQuorumSyncCertificate {
-            target: target.clone(),
-            quorum_size: required.len(),
-            acknowledged_node_ids: required.into_iter().collect(),
-        })))
+        certificate.quorum_size = required.len();
+        Ok(Some(DfsWriteSetSync::Certified(certificate)))
     }
 
     /// Replicate a frozen metadata prefix to quorum while also requiring at
@@ -1859,7 +1858,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // before the requested historical prefix is delivered.
             let mut rejected_nodes = BTreeSet::new();
             let mut source_history_gap_node_ids = BTreeSet::new();
-            if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability | MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            if matches!(
+                purpose,
+                MetadataQuorumSyncPurpose::OrdinaryDurability
+                    | MetadataQuorumSyncPurpose::WriteSet(_)
+                    | MetadataQuorumSyncPurpose::ExactPrefixFullAssignment
+            ) {
                 rejected_nodes.extend(self.send_metadata_sync_catchup_batches(
                     &target,
                     probe_barrier_id,
@@ -2727,7 +2731,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             journal_sequence: target.journal_sequence,
             state_fingerprint: target.state_fingerprint.clone(),
             primary_handoff_id: None,
-            write_set_generation: None,
+            write_set_generation: match purpose {
+                MetadataQuorumSyncPurpose::WriteSet(
+                    crate::service_replica::DfsMetadataCommitRequirement::WriteSet {
+                        write_set,
+                        ..
+                    },
+                ) => Some(write_set.generation),
+                _ => None,
+            },
             epoch_start_alignment: None,
         };
         let probe = crate::DfsMetadataJournalFrameBatch {
@@ -3227,7 +3239,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<(), DfsError> {
-        if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability | MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+        if matches!(
+            purpose,
+            MetadataQuorumSyncPurpose::OrdinaryDurability
+                | MetadataQuorumSyncPurpose::WriteSet(_)
+                | MetadataQuorumSyncPurpose::ExactPrefixFullAssignment
+        ) {
             let backend = self
                 .metadata_backend
                 .as_deref()
@@ -3271,7 +3288,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // A write-set shard certifies exactly the members a target names:
             // keeping W and POSIX sync need the write set, not a majority of
             // every configured member.
-            let named_members = target.replica_node_ids == configured
+            let fixed_write_set = if let MetadataQuorumSyncPurpose::WriteSet(captured) = purpose {
+                if &self.metadata_participant_requirement(&context, 0)? != captured {
+                    return Err(DfsError::Metadata {
+                        message: "metadata write-set membership changed during the sync barrier"
+                            .into(),
+                    });
+                }
+                true
+            } else {
+                false
+            };
+            let named_members = fixed_write_set
+                || target.replica_node_ids == configured
                 || (context.write_set.is_some()
                     && !target.replica_node_ids.is_empty()
                     && target

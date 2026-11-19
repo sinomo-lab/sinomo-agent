@@ -898,8 +898,13 @@ impl LocalSobjMetadataBackend {
         if backend.selected_original_data_layout.is_some() {
             Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
         }
-        backend.ensure_local_materialization_cursor()?;
-        backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
+        // A repair-only open does not admit this copy. Writing a cursor for
+        // an absent shard would leave apparent migration input on the next
+        // probe and prevent the authenticated snapshot from installing.
+        if materialized_through_sequence != 0 {
+            backend.ensure_local_materialization_cursor()?;
+            backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
+        }
         backend.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
         if backend.selected_original_data_layout.is_some() {
             Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
@@ -2053,7 +2058,6 @@ impl LocalSobjMetadataBackend {
         skip_all,
         fields(stage = "dfs.metadata.read_snapshot")
     )]
-    #[cfg(test)]
     pub(crate) fn try_begin_resident_read_snapshot(&mut self) -> Result<bool> {
         if self.consistent_read_snapshot_depth == 0
             && self.try_materialize_resident_journal()?.is_none()

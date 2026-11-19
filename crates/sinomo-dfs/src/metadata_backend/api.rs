@@ -385,6 +385,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(())
     }
 
+    fn try_begin_consistent_read_snapshot(&mut self) -> Result<bool> {
+        self.try_begin_resident_read_snapshot()
+    }
+
     fn end_consistent_read_snapshot(&mut self) {
         self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_sub(1);
     }

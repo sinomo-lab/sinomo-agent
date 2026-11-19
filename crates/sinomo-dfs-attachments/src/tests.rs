@@ -991,7 +991,7 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
     let source = source(&stat);
     let inline_slots = DFS_ATTACHMENT_INLINE_BUDGET_BYTES / DFS_ATTACHMENT_INLINE_BYTES;
     let mut last = None;
-    let mut checkpointed = 0;
+    let mut sealed_windows = 0;
     for i in 0..inline_slots + 3 {
         last = Some(stored(
             dfs.file_attachment(
@@ -1007,7 +1007,8 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
             .unwrap(),
         ));
         // Preserve each completed catalog mutation before the next bounded capture window.
-        checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+        assert!(runtime.checkpoint_rpc_observation_window().unwrap() > 0, "catalog mutation {i} produced no RPC evidence");
+        sealed_windows += 1;
     }
     let entries = dfs
         .posix_list_dir_distributed(&dfs_attachment_catalog_directory(&source))
@@ -1023,11 +1024,8 @@ fn small_attachment_spill_keeps_catalog_payload_bounded() {
     assert!(
         matches!(dfs.file_attachment(DfsAttachmentRequest::Read { source, key: last.metadata.key, revision: last.revision, offset: 0, max_bytes: DFS_ATTACHMENT_MAX_RANGE_BYTES }, None).unwrap(), DfsAttachmentResponse::Data { bytes, eof: true } if bytes == vec![(inline_slots+2) as u8; DFS_ATTACHMENT_INLINE_BYTES])
     );
-    checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
-    assert!(
-        checkpointed > 4096,
-        "the full spill workload spans capture windows"
-    );
+    assert!(runtime.checkpoint_rpc_observation_window().unwrap() > 0, "the final lookup and read produced no RPC evidence");
+    assert_eq!(sealed_windows, inline_slots + 3);
     assert_eq!(runtime.observation_dropped_count(), 0);
     drop(dfs);
     runtime.close().unwrap();
@@ -1230,5 +1228,83 @@ fn last_generic_source_reference_release_wakes_catalog_cleanup_from_durable_feed
         Err(DfsPosixError::NotFound { .. })
     ));
     drop(dfs);
+    runtime.close().unwrap();
+}
+
+#[test]
+fn ordinary_write_wakes_do_not_retry_a_disconnected_catalog_scan() {
+    use sinomo_dfs::test_support::{DfsTestPartition, current_native_metadata_service};
+    let (runtime, initial, root) =
+        current_native_metadata_service("attachment-scan-disconnect", 3, "/").unwrap();
+    drop(initial);
+    let node = &root.replica_node_ids[0];
+    let mut browser = runtime.client(node).unwrap();
+    let data = runtime.data_dir(node);
+    let checkpoint = crate::attachment_maintenance::checkpoint_path(data);
+    let shards = runtime.metadata_shards().unwrap();
+    let now = crate::dfs_now_unix_nanos();
+    runtime.partition_node(
+        &root.primary_node_id,
+        DfsTestPartition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    let first = browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, now)
+        .unwrap();
+    assert!(
+        !first.errors.is_empty(),
+        "the managed root must be unreachable"
+    );
+    let retry = crate::attachment_maintenance::deadline(data)
+        .unwrap()
+        .unwrap();
+    assert!(retry > now);
+    let calls = || {
+        runtime
+            .rpc_observations()
+            .into_iter()
+            .filter(|call| {
+                &call.source == node
+                    && call.target == root.primary_node_id
+                    && call.route == sinomo_dfs::DFS_DATA_NAMESPACE_ROUTE
+            })
+            .count()
+    };
+    let before = calls();
+    assert!(before > 0);
+    crate::attachment_maintenance::notify(data);
+    crate::attachment_maintenance::begin_pass(data);
+    let wake = browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, now)
+        .unwrap();
+    assert!(wake.errors.is_empty());
+    assert_eq!(
+        calls(),
+        before,
+        "a write must not retry the blocked directory RPC"
+    );
+    assert_eq!(
+        crate::attachment_maintenance::deadline(data).unwrap(),
+        Some(retry)
+    );
+
+    runtime.partition_node(
+        &root.primary_node_id,
+        DfsTestPartition {
+            kv: false,
+            dfs: false,
+        },
+    );
+    let resumed = browser
+        .maintain_file_attachments_bounded_at(&checkpoint, &shards, 8, retry)
+        .unwrap();
+    assert!(resumed.errors.is_empty(), "{:?}", resumed.errors);
+    assert!(
+        calls() > before,
+        "the original cursor must resume on reconnect"
+    );
+    drop(browser);
     runtime.close().unwrap();
 }

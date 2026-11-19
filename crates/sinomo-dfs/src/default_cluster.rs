@@ -9,7 +9,7 @@ pub(crate) mod genesis;
 #[cfg(test)]
 mod genesis_followup_tests;
 
-use serde::Serialize;
+use crate::placement::advertisement_needs_publication;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
@@ -384,23 +384,6 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         }
     }
 
-    async fn put_serde_if_changed<T>(&mut self, key: String, value: &T) -> Result<(), DfsError>
-    where
-        T: Serialize,
-    {
-        let encoded = sinomo_core::kv::encode_kv_value(value)?;
-        if self
-            .control_plane
-            .get_async(&key)
-            .await?
-            .is_some_and(|entry| entry.value == encoded)
-        {
-            return Ok(());
-        }
-        self.control_plane.put_async(key, encoded).await?;
-        Ok(())
-    }
-
     async fn compare_and_put_metadata_shard(
         &mut self,
         desired: &DfsMetadataShardConfig,
@@ -732,7 +715,11 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         key: String,
         advertisement: DfsNodeAdvertisement,
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
-        Box::pin(async move { self.put_serde_if_changed(key, &advertisement).await })
+        Box::pin(async move {
+            crate::placement::publish_node_advertisement_if_changed(
+                self.control_plane.as_mut(), key, &advertisement,
+            ).await.map(|_| ())
+        })
     }
 
     fn prepare_native_genesis_async<'a>(
@@ -1217,7 +1204,35 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
             }
         }
         if let Some(error) = parked_handoff {
-            // A pending request is not completion or materialization authority.
+            // A retiring shard cannot authorize its proposed layout. An
+            // independently assigned local singleton may still have its
+            // original genesis to finish while that handoff is parked.
+            if options.materialize_local_metadata && metadata_shards.iter().any(|shard|
+                shard.primary_node_id == state.local_node_id && shard.epoch == 1 && shard.replica_node_ids.is_empty()
+            ) {
+                let mut active = Vec::with_capacity(metadata_shards.len());
+                let mut unfinished = false;
+                for shard in &metadata_shards {
+                    let Some(current) = host.current_metadata_shard_async(
+                        shard.file_system_id.clone(), shard.shard_id.clone(),
+                    ).await? else { return Err(error); };
+                    if current.primary_node_id == state.local_node_id && current.epoch == 1
+                        && current.replica_node_ids.is_empty()
+                        && !host.native_genesis_committed_async(current.clone()).await?
+                    {
+                        unfinished = true;
+                    }
+                    active.push(current);
+                }
+                if unfinished {
+                    // The normal owner rechecks handoff evidence and skips
+                    // pending shards. Pass only the committed assignments.
+                    host.materialize_default_sifs_metadata_on_shards_async(
+                        file_system.clone(), active, stable_dfs_service_node_ids(state),
+                        state.local_node_id.clone(),
+                    ).await?;
+                }
+            }
             return Err(error);
         }
         if local_has_primary_metadata_shards && options.materialize_local_metadata {
@@ -1763,34 +1778,20 @@ async fn publish_local_dfs_service_advertisement_with_async_host(
     let [current_metadata, current_content] = host
         .current_node_advertisements_async([metadata_key.clone(), content_key.clone()])
         .await?;
-    let metadata = stable_dfs_advertisement(current_metadata, metadata);
-    let content = stable_dfs_advertisement(current_content, content);
     tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "local-advertisements-read-completed", local_node = %state.local_node_id);
-    tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "metadata-advertisement-put-started", local_node = %state.local_node_id, key = %metadata_key);
-    host.put_node_advertisement_async(metadata_key.clone(), metadata)
-        .await?;
-    tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "metadata-advertisement-put-completed", local_node = %state.local_node_id, key = %metadata_key);
-    tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "content-advertisement-put-started", local_node = %state.local_node_id, key = %content_key);
-    host.put_node_advertisement_async(content_key.clone(), content)
-        .await?;
-    tracing::trace!(target: "sinomo.dfs.reconciliation", phase = "content-advertisement-put-completed", local_node = %state.local_node_id, key = %content_key);
+    // A semantic match completes this observation. Sending its old bytes to a
+    // later byte-wise put could overwrite a sample installed between the reads.
+    for (key, current, desired) in [
+        (metadata_key, current_metadata, metadata),
+        (content_key, current_content, content),
+    ] {
+        if advertisement_needs_publication(current.as_ref(), &desired) {
+            host.put_node_advertisement_async(key, desired).await?;
+        }
+    }
     Ok(())
 }
 
-fn stable_dfs_advertisement(
-    current: Option<DfsNodeAdvertisement>,
-    desired: DfsNodeAdvertisement,
-) -> DfsNodeAdvertisement {
-    let Some(current) = current else {
-        return desired;
-    };
-    if current.accepts_metadata == desired.accepts_metadata
-        && crate::placement_environment::advertisement_semantics_equal(&current, &desired)
-    {
-        return current;
-    }
-    desired
-}
 
 #[cfg(test)]
 mod advertisement_publication_tests {
@@ -1818,9 +1819,8 @@ mod advertisement_publication_tests {
         sampled.expires_at = sampled
             .expires_at
             .map(|expiry| expiry + time::Duration::seconds(1));
-        assert_eq!(
-            stable_dfs_advertisement(Some(current.clone()), sampled),
-            current,
+        assert!(
+            !advertisement_needs_publication(Some(&current), &sampled),
             "an unrelated topology wake cannot flush measurement fields coalesced by the storage owner"
         );
     }
@@ -1843,16 +1843,12 @@ mod advertisement_publication_tests {
         for mutate in mutations {
             let mut desired = current.clone();
             mutate(&mut desired);
-            assert_eq!(
-                stable_dfs_advertisement(Some(current.clone()), desired.clone()),
-                desired
-            );
+            assert!(advertisement_needs_publication(Some(&current), &desired));
         }
         let mut expired = current.clone();
         expired.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
-        assert_eq!(
-            stable_dfs_advertisement(Some(expired.clone()), current),
-            expired,
+        assert!(
+            !advertisement_needs_publication(Some(&expired), &current),
             "time-only reconciliation must retain the honest expired canonical payload"
         );
     }

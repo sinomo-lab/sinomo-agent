@@ -407,14 +407,16 @@ pub(super) fn native_genesis_committed(
 }
 
 impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
-    fn open_owned_bootstrap_metadata(
+    fn staged_singleton_genesis(
         &self,
-        shards: Vec<DfsMetadataShardConfig>,
-    ) -> Result<crate::LocalShardedMetadataBackend, DfsError> {
-        let root = default_dfs_metadata_shards_root(&self.data_dir);
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<BTreeSet<DfsMetadataShardId>, DfsError> {
         let mut staged = BTreeSet::new();
-        for shard in &shards {
-            if shard.primary_node_id != self.local_node_id || shard.epoch != 1 || !shard.replica_node_ids.is_empty() {
+        for shard in shards {
+            if shard.primary_node_id != self.local_node_id
+                || shard.epoch != 1
+                || !shard.replica_node_ids.is_empty()
+            {
                 continue;
             }
             let id = DfsMetadataShardId::new(&shard.shard_id);
@@ -424,13 +426,29 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 if generation.identity.file_system_id == shard.file_system_id
                     && generation.identity.shard_id == id
                     && generation.identity.is_native_genesis()
-                    && matches!(generation.state, crate::storage_generation::GenerationState::Staged { .. }) {
+                    && matches!(
+                        generation.state,
+                        crate::storage_generation::GenerationState::Staged { .. }
+                    )
+                {
                     staged.insert(id);
                 }
             }
         }
+        Ok(staged)
+    }
+
+    fn open_owned_bootstrap_metadata(
+        &self,
+        shards: Vec<DfsMetadataShardConfig>,
+        staged: &BTreeSet<DfsMetadataShardId>,
+    ) -> Result<crate::LocalShardedMetadataBackend, DfsError> {
+        let root = default_dfs_metadata_shards_root(&self.data_dir);
         Ok(crate::LocalShardedMetadataBackend::open_for_native_genesis(
-            root, shards, &self.local_node_id, &staged,
+            root,
+            shards,
+            &self.local_node_id,
+            staged,
             self.publication_owners.selected_original_data_layout()?,
         )?)
     }
@@ -482,7 +500,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                 selected_layout.as_deref(),
             )?;
         }
-        let mut backend = self.open_owned_bootstrap_metadata(shards.to_vec())?;
+        let mut backend = self.open_owned_bootstrap_metadata(shards.to_vec(), &self.staged_singleton_genesis(shards)?)?;
         for shard in missing {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
             let physical = backend.shard_backend_mut(&shard_id)?;
@@ -606,17 +624,22 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         );
         let content = self.publication_owners.open_native_content()?;
         let service = crate::NetworkedDfsService::new(transport, content);
+        // After an interrupted initial publication, the assignment can already
+        // exist while its storage generation is staged. Only the genesis
+        // opener can recover that original operation; a serving checkout must
+        // wait for activation.
+        let staged = self.staged_singleton_genesis(&shards)?;
         let mut service = if let Some(backend) = self.genesis_backend.take() {
             service.with_metadata_backend_lazy(backend)?
         } else if let Some(resident) = self.resident_metadata_backend.as_ref().filter(|resident| {
-            resident
+            staged.is_empty() && resident
                 .matches_topology(&default_dfs_metadata_shards_root(&self.data_dir), &shards)
                 .unwrap_or(false)
         }) {
             service.with_resident_sharded_metadata_backend_lazy(resident.checkout_global()?)?
         } else {
             service.with_metadata_backend_lazy(
-                self.open_owned_bootstrap_metadata(shards.clone())?,
+                self.open_owned_bootstrap_metadata(shards.clone(), &staged)?,
             )?
         };
         service = service.with_boxed_control_plane(

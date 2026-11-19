@@ -124,14 +124,12 @@ fn mkdir_all_over_tombstone_uses_new_directory_attributes_and_policy() {
 #[test]
 fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
     let node = NodeId::from_legacy_named("node_mkdir_tombstone_managed_policy").expect("node id");
-    let (_runtime, dfs) = native_sifs_service(
+    let (_runtime, mut caller) = native_sifs_service(
         "mkdir_over_tombstone_applies_current_managed_directory_policy",
         node.clone(),
     );
     let path = "/services/deleted-file";
-    drop(dfs);
-    let mut dfs = _runtime.metadata_primary_service(path).unwrap();
-    let deleted = dfs
+    let deleted = caller
         .posix_write_file_with_create_attrs(
             path,
             b"deleted",
@@ -139,6 +137,7 @@ fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
             DfsPosixCreateAttrs::new(0o600, 2001, 2002),
         )
         .expect("create file");
+    let mut dfs = _runtime.metadata_primary_service(path).unwrap();
     let mut deleted_metadata = dfs
         .metadata_backend()
         .unwrap()
@@ -148,12 +147,16 @@ fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
     deleted_metadata.policy = DfsObjectPolicy::LocalOwned;
     dfs.add_object_metadata(deleted_metadata)
         .expect("install distinct deleted policy");
-    dfs.posix_unlink(path).expect("tombstone file");
+    // The setup owner changed the recorded policy. Namespace mutations must
+    // pass through Main admission, including when requester and primary coincide.
+    drop(dfs);
+    let tombstone = caller.posix_unlink(path).expect("tombstone file");
+    assert_eq!(tombstone.object_id, deleted.object_id);
+    assert_eq!(tombstone.policy, DfsObjectPolicy::LocalOwned);
 
     // A metadata filesystem row cannot replace the canonical managed rule.
     // Apply the new rule through the actual native configuration producer.
-    let owner = dfs.node_id().clone();
-    drop(dfs);
+    let owner = caller.node_id().clone();
     let accepted = _runtime
         .apply_placement_policy(
             &owner,
@@ -199,7 +202,8 @@ fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
     assert_eq!(current.policy.min_commit_replicas, 2);
     assert_eq!(current.policy.desired_replicas, 2);
 
-    let recreated = dfs.posix_mkdir(path).expect("recreate managed directory");
+    drop(dfs);
+    let recreated = caller.posix_mkdir(path).expect("recreate managed directory");
     assert_eq!(recreated.kind, DfsObjectKind::Directory);
     assert_eq!(
         (recreated.mode, recreated.uid, recreated.gid),
@@ -210,7 +214,7 @@ fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
         DfsObjectPolicy::ReplicatedConfirmed,
         "mkdir must resolve the current managed policy instead of retaining the dead object policy"
     );
-    drop(dfs);
+    drop(caller);
     _runtime.close().unwrap();
 }
 

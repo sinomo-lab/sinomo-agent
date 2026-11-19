@@ -1929,11 +1929,13 @@ mod current_layout_data_tests {
         fs::create_dir_all(cursor_path.parent().unwrap()).unwrap();
         fs::write(&cursor_path, &cursor).unwrap();
         assert!(!source::has_migration_source_data(&empty).unwrap());
+        assert!(original_unit_absent(&empty, &DfsMetadataShardId::new("users")).unwrap());
         assert!(discover_metadata_source(&empty, &empty).unwrap().is_none());
         assert_eq!(fs::read(&cursor_path).unwrap(), cursor);
         let foreign = copied.join("bookkeeping/foreign");
         copy_data(&empty, &foreign);
         assert!(source::has_migration_source_data(&foreign).unwrap());
+        assert!(!original_unit_absent(&foreign, &DfsMetadataShardId::new("foreign")).unwrap());
         assert_eq!(
             discover_metadata_source(&foreign, &foreign).unwrap(),
             Some(foreign)
@@ -1943,6 +1945,7 @@ mod current_layout_data_tests {
         let actual: Value = sinomo_core::object::serde_ext::from_bytes(&advanced).unwrap();
         assert!(actual["last_sequence"].as_u64().unwrap() > 0);
         fs::write(&cursor_path, &advanced).unwrap();
+        assert!(!original_unit_absent(&empty, &DfsMetadataShardId::new("users")).unwrap());
         assert!(source::has_migration_source_data(&empty).unwrap());
         fs::write(&cursor_path, &cursor).unwrap();
         let ack = "coordination/metadata-prefix-ack-floors/users.sobj";
@@ -2692,8 +2695,7 @@ pub(crate) fn original_unit_absent(root: &Path, shard: &DfsMetadataShardId) -> R
         }
     }
     if present(&root.join("metadata-generation.sobj"))?
-        || present(&unversioned_conversion_stage_base_path(root, shard)?)?
-        || original_source_present(root)? {
+        || present(&unversioned_conversion_stage_base_path(root, shard)?)? {
         return Ok(false);
     }
     // Older combined roots can own an absent split scope. Do not classify that
@@ -2710,9 +2712,10 @@ pub(crate) fn original_unit_absent(root: &Path, shard: &DfsMetadataShardId) -> R
         && original_source_present(&retained)? {
         return Ok(false);
     }
-    let mut directories = vec![root.to_owned()];
+    let mut has_bookkeeping = false;
+    let mut directories = vec![(root.to_owned(), 0usize)];
     let mut remaining = 64usize;
-    while let Some(directory) = directories.pop() {
+    while let Some((directory, depth)) = directories.pop() {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2728,12 +2731,24 @@ pub(crate) fn original_unit_absent(root: &Path, shard: &DfsMetadataShardId) -> R
                 if directory == root && !matches!(entry.file_name().to_str(), Some("records" | "journal")) {
                     return Ok(false);
                 }
-                directories.push(path);
+                if depth >= 5 { return Ok(false); }
+                directories.push((path, depth + 1));
+            } else if kind.is_file() && (path == root.join("records/local-materialization/cursor.sobj")
+                || path == root.join("journal/head.sobj")) {
+                has_bookkeeping = true;
             } else if path != root.join("journal/write.lock") || !kind.is_file()
                 || entry.metadata().map_err(error)?.len() != 0 {
                 return Ok(false);
             }
         }
+    }
+    if has_bookkeeping {
+        // Older repair openers wrote empty hints before receiving an image.
+        // Use the migration decoder's fenced source classification: a foreign,
+        // advanced or malformed cursor must stay with its original owner.
+        return Ok(root.file_name().and_then(|name| name.to_str()) == Some(shard.0.as_str())
+            && matches!(source::has_migration_source_data(root), Ok(false))
+            && !present(&root.join("metadata-generation.sobj"))?);
     }
     Ok(true)
 }
@@ -2750,6 +2765,30 @@ mod original_unit_absence_tests {
         fs::create_dir_all(root.join("journal/segments")).unwrap();
         fs::write(root.join("journal/write.lock"), b"").unwrap();
         assert!(original_unit_absent(&root, &shard).unwrap());
+        let cursor = root.join("records/local-materialization/cursor.sobj");
+        fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        for (name, sequence, absent) in [("users", 0, true), ("other", 0, false), ("users", 1, false)] {
+            let bytes = sinomo_core::object::serde_ext::to_bytes(
+                &serde_json::json!({"shard_id": name, "last_sequence": sequence}),
+                1, sinomo_core::object::LengthMode::U32,
+            ).unwrap();
+            fs::write(&cursor, &bytes).unwrap();
+            assert_eq!(original_unit_absent(&root, &shard).unwrap(), absent);
+            assert_eq!(fs::read(&cursor).unwrap(), bytes);
+        }
+        fs::write(&cursor, b"unreadable").unwrap();
+        assert!(!original_unit_absent(&root, &shard).unwrap());
+        fs::remove_file(&cursor).unwrap();
+        let head = root.join("journal/head.sobj");
+        for (next_sequence, absent) in [(1, true), (2, false)] {
+            let bytes = sinomo_core::object::serde_ext::to_bytes(
+                &serde_json::json!({"next_sequence": next_sequence}), 1, sinomo_core::object::LengthMode::U32,
+            ).unwrap();
+            fs::write(&head, &bytes).unwrap();
+            assert_eq!(original_unit_absent(&root, &shard).unwrap(), absent);
+            assert_eq!(fs::read(&head).unwrap(), bytes);
+        }
+        fs::remove_file(&head).unwrap();
         fs::write(root.join("journal/write.lock"), b"unknown retained bytes").unwrap();
         assert!(!original_unit_absent(&root, &shard).unwrap());
         fs::write(root.join("journal/write.lock"), b"").unwrap();

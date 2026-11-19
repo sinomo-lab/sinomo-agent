@@ -2264,6 +2264,9 @@ fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
     runtime
         .apply_placement_policy(&primary_node, path, DfsPlacementScope::SelfOnly, placement)
         .unwrap();
+    // Apply committed on the primary. The remote reader must first observe
+    // that revision through its own published configuration.
+    runtime.wait_published_configuration_current(&writer_node).unwrap();
     let mut writer = runtime.client(&writer_node).unwrap();
     let (_, _, policy) = writer
         .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 1)

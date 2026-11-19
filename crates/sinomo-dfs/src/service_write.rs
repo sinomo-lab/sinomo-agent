@@ -1223,6 +1223,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     request,
                     expected_base_version,
                     offset,
+                    None,
+                    Vec::new(),
                     source,
                     desired_replica_nodes,
                     policy,
@@ -1957,7 +1959,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             manifest.content_hash,
             manifest.size_bytes,
             None,
-            Some(PendingNetworkedWritePatch {
+            (patch.ranges.len() <= 1).then(|| PendingNetworkedWritePatch {
                 base_version,
                 offset: patch.offset,
                 patch_hash: patch.patch_hash.clone(),
@@ -1969,6 +1971,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             receipt_nodes,
             DfsDistributedWriteOptions {
                 operation_id: Some(operation_id),
+                dispatch: if patch.ranges.is_empty() {
+                    DfsWriteDispatch::AwaitResponse
+                } else {
+                    DfsWriteDispatch::AwaitCommit
+                },
                 repair: if foreground_replica_repair {
                     DfsWriteRepair::Foreground
                 } else {
@@ -3051,12 +3058,126 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(outcome)
     }
 
+    pub(crate) fn publish_packed_range_write(
+        &mut self,
+        request: DfsWriteRequest,
+        object: DfsObjectMetadata,
+        operation_id: &str,
+        ranges: Vec<(u64, u64)>,
+        packed_len: u64,
+        reader: &mut dyn Read,
+        desired: Vec<NodeId>,
+        options: crate::DfsWriteOptions,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let offset = ranges[0].0;
+        let shard = self.select_metadata_shard_for_object(&object)?;
+        // FUSE already bounds the dirty input. Stream genuinely large sparse
+        // extensions but avoid a quarantine file just to pack resident bytes.
+        let mut packed = Vec::new();
+        let source = if packed_len <= 64 * 1024 * 1024 {
+            reader
+                .read_to_end(&mut packed)
+                .map_err(|e| DfsError::ContentStore {
+                    message: e.to_string(),
+                })?;
+            DfsPatchSource::Bytes(&packed)
+        } else {
+            DfsPatchSource::Reader(reader)
+        };
+        if let Some(shard) = shard
+            && (shard.primary_node_id != self.node_id
+                || self.transport.delegates_local_namespace_authority())
+        {
+            return self.route_distributed_patch(
+                request,
+                object.version.clone(),
+                offset,
+                Some(operation_id.into()),
+                ranges,
+                source,
+                desired,
+                options.policy,
+                options.foreground_replica_repair,
+                object,
+                shard,
+            );
+        }
+        let current = self.current_object_for_write(&object.object_id)?;
+        let (bytes, blob, hash) = match source {
+            DfsPatchSource::Bytes(bytes) => (bytes, None, crate::content_hash(bytes)),
+            DfsPatchSource::Reader(reader) => {
+                let blob = self.content.capture_quarantined_patch_reader(reader)?;
+                let hash = blob.content_hash.clone();
+                (&[][..], Some(blob), hash)
+            }
+        };
+        let base = object.version.clone();
+        let patch = crate::DfsDistributedWritePatch {
+            offset,
+            ranges,
+            patch_hash: hash,
+            patch_size_bytes: packed_len,
+            base_content_hash: object.content_hash.clone().ok_or_else(|| {
+                DfsError::ContentStore {
+                    message: "range write has no base content hash".into(),
+                }
+            })?,
+            base_size_bytes: object.content_size_bytes.unwrap_or(0),
+        };
+        let replay = self.content.range_patch_manifest(
+            object.object_id.as_str(),
+            base.as_str(),
+            request.target_version.as_str(),
+            &patch,
+            &[],
+            None,
+            true,
+        )?;
+        let manifest = if let Some(manifest) = replay {
+            manifest
+        } else {
+            self.validate_distributed_write_admission(
+                &request,
+                Some(&base),
+                &current,
+                &desired,
+                &options.policy,
+                &Default::default(),
+            )?;
+            self.content
+                .range_patch_manifest(
+                    object.object_id.as_str(),
+                    base.as_str(),
+                    request.target_version.as_str(),
+                    &patch,
+                    bytes,
+                    blob,
+                    false,
+                )?
+                .ok_or_else(|| DfsError::ContentStore {
+                    message: "range write produced no manifest".into(),
+                })?
+        };
+        self.write_stable_ingested_distributed_patch_manifest(
+            request,
+            base,
+            &patch,
+            manifest,
+            desired,
+            options.policy,
+            operation_id.into(),
+            options.foreground_replica_repair,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn route_distributed_patch(
         &mut self,
         request: DfsWriteRequest,
         base_version: DfsVersion,
         offset: u64,
+        operation_id: Option<String>,
+        ranges: Vec<(u64, u64)>,
         source: DfsPatchSource<'_>,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
@@ -3064,7 +3185,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: DfsObjectMetadata,
         shard: DfsMetadataShardConfig,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let request_id = self.next_request_id();
+        let request_id = operation_id.unwrap_or_else(|| self.next_request_id());
         let (hash, size, attachment, attachment_bytes, patch_attachment) = match source {
             DfsPatchSource::Bytes(bytes) => {
                 let bytes = bytes::Bytes::copy_from_slice(bytes);
@@ -3114,12 +3235,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.local_metadata_journal_after_sequence_for_shard(&shard)?
         };
+        let wait_for_commit = !ranges.is_empty();
         let command = DfsDistributedWriteCommand {
             publication: Default::default(),
             patch: Some(crate::DfsDistributedWritePatch {
                 base_content_hash: base_hash,
                 base_size_bytes: base_size,
                 offset,
+                ranges,
                 patch_hash: hash.clone(),
                 patch_size_bytes: size,
             }),
@@ -3137,7 +3260,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             authority_shard: Some(shard.clone()),
             touch_parent_on_create: false,
             foreground_replica_repair,
-            wait_for_commit: false,
+            wait_for_commit,
             exclusive_create: false,
         };
         let message = command.clone().into_network_message();
@@ -3930,6 +4053,8 @@ mod routed_patch_native_tests {
                 request,
                 before.version.clone(),
                 offset,
+                None,
+                Vec::new(),
                 DfsPatchSource::Bytes(patch),
                 vec![node.clone()],
                 DfsReplicationPolicy::new(1, 1).unwrap(),
@@ -4042,6 +4167,8 @@ mod routed_patch_native_tests {
                 },
                 before.version,
                 0,
+                None,
+                Vec::new(),
                 DfsPatchSource::Bytes(b"forbidden obsolete patch"),
                 vec![node.clone()],
                 DfsReplicationPolicy::new(1, 1).unwrap(),

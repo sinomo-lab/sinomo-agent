@@ -190,6 +190,13 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
             },
         )
     };
+    // Keep other Main turns from checking out the shard during the warm-open
+    // measurement. Below, the same admission takes the metadata checkout and
+    // exercises the distinct busy-owner fetch path.
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
     // Fetch authorization must reuse the already-open physical shard. Evict
     // the separate inspection cache before each call so it cannot mask a cold
     // metadata reopen on the ordinary resident path.
@@ -214,10 +221,6 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
         0,
         "a warm fetch must not decode a second metadata backend"
     );
-    let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
-    let admission = runtime
-        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
-        .unwrap();
     let cluster = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
     let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,

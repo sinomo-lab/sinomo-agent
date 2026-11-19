@@ -356,6 +356,10 @@ impl NativeShardTraceCapture {
             .original_commit_subscription
             .include_original_current_term_commits(false);
     }
+    #[cfg(test)]
+    pub(crate) fn has_in_flight_observations(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|error| error.into_inner()).in_flight != 0
+    }
     /// Scalar frontier from this existing capture. Boundary packets receive
     /// their ordinal before the call, then flush after its owner returns.
     #[cfg(test)]

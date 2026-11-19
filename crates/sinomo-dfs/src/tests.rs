@@ -1045,32 +1045,24 @@ fn sifs_cluster_publish_metadata_until(
     what: &str,
     mut done: impl FnMut(&mut SifsPosixCluster) -> bool,
 ) {
-    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-    loop {
+    let mut scheduled = false;
+    sifs_posix_cluster_pump_until(cluster, what, |cluster| {
         if done(cluster) {
-            return;
+            return true;
         }
-        let outcomes = cluster
-            ._runtime
-            .maintenance_tick(
-                &cluster.primary_node,
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
-            )
-            .expect("ordinary Main metadata publication");
-        assert!(outcomes.outcome.is_ok(), "{:?}", outcomes.outcome);
-        assert_eq!(outcomes.omitted_kv_event_count, 0);
-        sifs_posix_cluster_pump_round(cluster);
-        if Instant::now() >= deadline {
-            panic!(
-                "SIFS cluster metadata publication did not converge: {what}; \
-                 last outcomes: {outcomes:?}; journal rejections: {:?}",
-                cluster.rejections
-            );
+        if !scheduled {
+            // Dispatch the publisher whose observable effect the caller awaits.
+            // An all-purpose maintenance tick can spend this window on repairs
+            // for unrelated objects.
+            let data_dir = cluster._runtime.data_dir(&cluster.primary_node);
+            crate::runtime_host::schedule_daemon_dfs_metadata_publish_on_runtime(
+                &crate::runtime_host::DfsRuntimePaths::new(data_dir),
+                &cluster._runtime.runtime_handle(), None,
+            ).expect("schedule the normal Main metadata publisher");
+            scheduled = true;
         }
-        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
-    }
+        false
+    });
 }
 
 /// Reads a file through a node's caller, pumping the cluster until the read

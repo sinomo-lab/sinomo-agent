@@ -470,10 +470,28 @@ fn recruit_and_remove_keep_n_and_the_floor_and_record_substitutes() {
     let shrink = build_metadata_write_set_shrink(&cut, &fixture.nodes[2], &bounds(2, 3)).unwrap();
     assert!(fixture.apply(&shrink));
     let cut = fixture.cut();
+    // A watermark published after the recruitment was planned must fence it.
+    let stale_recruit = build_metadata_write_set_recruit(
+        &cut, &fixture.nodes[3], &bounds(2, 3), DfsMetadataShardRecruit::BelowN,
+    ).unwrap();
+    let previous_head = DfsMetadataShardHeadWatermark {
+        file_system_id: cut.shard.file_system_id.clone(),
+        shard_id: cut.shard.shard_id.clone(),
+        primary_node_id: cut.shard.primary_node_id.clone(),
+        epoch: cut.shard.epoch,
+        journal_sequence: 7,
+        state_fingerprint: "original-three-member-head".into(),
+        acknowledged_node_ids: fixture.nodes[..2].to_vec(),
+    };
+    assert!(DfsControlPlaneStore::new(&mut fixture.kv)
+        .publish_metadata_shard_head_watermark(&cut.shard, &previous_head).unwrap());
+    assert!(!fixture.apply(&stale_recruit));
+    let cut = fixture.cut();
     let recruit = build_metadata_write_set_recruit(&cut, &fixture.nodes[3], &bounds(2, 3), DfsMetadataShardRecruit::BelowN).unwrap();
     assert!(fixture.apply(&recruit));
     let cut = fixture.cut();
     assert!(cut.shard.replica_node_ids.contains(&fixture.nodes[3]));
+    assert!(cut.watermark_value.is_none());
     assert_eq!(cut.shard.epoch, 3, "recruitment never advances the epoch");
     let write_set = cut.write_set_state().switched().cloned().unwrap();
     assert_eq!(write_set.substitutes.len(), 1);
@@ -632,6 +650,45 @@ fn a_swap_during_a_pending_handoff_deletes_it_and_the_completion_loses() {
             .unwrap()
             .succeeded
     );
+}
+
+#[test]
+fn a_recruited_replica_can_be_promoted_by_handoff_or_takeover() {
+    let mut fixture = Fixture::new();
+    fixture.switch_all();
+    let member = fixture.nodes[3].clone();
+    let cut = fixture.cut();
+    let recruit = build_metadata_write_set_recruit(
+        &cut, &member, &bounds(1, 4), DfsMetadataShardRecruit::BelowN,
+    ).unwrap();
+    assert!(fixture.apply(&recruit));
+    let add = build_metadata_write_set_add(&fixture.cut(), &member).unwrap();
+    assert!(fixture.apply(&add));
+    let cut = fixture.cut();
+    let state = cut.write_set_state();
+    let current = state.switched().unwrap();
+    assert!(current.substitutes.iter().any(|sub| sub.node_id == member));
+    let desired = metadata_shard_primary_handoff_target(&cut.shard, &member).unwrap();
+    let prefix = proof(7, 'a');
+    let handoff = DfsMetadataShardMembershipHandoffProof {
+        cause: DfsMetadataShardHandoffCause::Membership,
+        handoff_id: "recruited-primary".into(),
+        retiring_shard: cut.shard.clone(),
+        desired_shard: desired.clone(),
+        journal_sequence: prefix.journal_sequence,
+        state_fingerprint: prefix.digest.clone(),
+        acknowledged_node_ids: current.write_set.clone(),
+    };
+    for promoted in [
+        metadata_write_set_after_handoff(current, &desired, &handoff).unwrap(),
+        metadata_write_set_after_takeover(
+            current, &cut.shard.primary_node_id, &desired, &prefix, &KvRequestId::generate(),
+        ).unwrap(),
+    ] {
+        promoted.validate_against(&desired).unwrap();
+        assert!(promoted.contains(&member));
+        assert!(!promoted.substitutes.iter().any(|sub| sub.node_id == member));
+    }
 }
 
 #[test]

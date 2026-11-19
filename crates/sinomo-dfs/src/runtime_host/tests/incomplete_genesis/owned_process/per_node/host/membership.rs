@@ -44,11 +44,12 @@ pub(super) async fn request(
     let mut store = crate::DfsControlPlaneAsyncStore::new(&mut client);
     // Genuine configuration reads/transaction, not namespace metadata in KV.
     // The enclosing native driver owns the unchanged absolute five-second cap.
-    let current = store
-        .get_metadata_shard(&crate::sifs_file_system_id(), "root")
-        .await
-        .map_err(|e| invalid(e.to_string()))?;
-    let value = if let Some(current) = current {
+    let cut = store.read_metadata_shard_record_cut(
+        &crate::sifs_file_system_id(), "root", &peers.iter().cloned().collect::<Vec<_>>(),
+    ).await.map_err(|e| invalid(e.to_string()))?;
+    let value = if let Some(cut) = cut {
+        let switched = cut.write_set_state().switched().is_some();
+        let current = cut.shard;
         if current.primary_node_id != *source {
             json!({"state":"NotPrimary","mutation_attempted":false,"current":current})
         } else {
@@ -60,16 +61,45 @@ pub(super) async fn request(
                     "fixture refuses to remove a recorded foreign member",
                 ));
             }
+            // The three real peers must remain desired after a write-set switch.
+            // Install a fixture-only rule through the ordinary guarded placement Apply.
+            let scope = crate::DfsPlacementScope::SelfOnly;
+            let rule = crate::normalize_placement_rule("/process-prefix-fixture", scope,
+                crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, peers.len())
+                    .map_err(|e| invalid(e.to_string()))?,
+            ).map_err(|e| invalid(e.to_string()))?;
+            let configured = tokio::task::block_in_place(|| -> Result<bool, NetworkError> {
+                let mut setup_client = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, runtime);
+                let mut store = crate::DfsControlPlaneStore::new(&mut setup_client);
+                let Some(expected) = store.get_file_system_config(&crate::sifs_file_system_id())
+                    .map_err(|e| invalid(e.to_string()))? else { return Ok(false); };
+                if expected.subtree_policies.contains(&rule) { return Ok(true); }
+                let candidates = store.content_services().map_err(|e| invalid(e.to_string()))?;
+                if !peers.iter().all(|id| candidates.iter().any(|candidate| &candidate.node_id == id)) {
+                    return Ok(false);
+                }
+                let mut desired = expected.clone();
+                crate::upsert_placement_rule(&mut desired.subtree_policies, rule.clone());
+                let job = crate::control_plane::build_placement_reconciliation_job(
+                    sinomo_core::Id::generate().to_string(), &desired, rule.path_prefix, scope,
+                    BTreeSet::new(), candidates, None, crate::metadata_records::dfs_now_unix_nanos(),
+                ).map_err(|e| invalid(e.to_string()))?;
+                Ok(store.compare_and_put_placement_update(&expected, &desired, &job)
+                    .map_err(|e| invalid(e.to_string()))?.is_some())
+            })?;
             let pending = store
                 .get_metadata_shard_membership_handoff(&current.file_system_id, &current.shard_id)
                 .await
                 .map_err(|e| invalid(e.to_string()))?;
-            if pending.is_some() || (current.epoch == 1 && current.replica_node_ids.is_empty()) {
+            if !configured || pending.is_some() || (current.epoch == 1 && current.replica_node_ids.is_empty()) {
                 // The normal initial genesis/expansion and any in-flight handoff
                 // keep their sole owner and original identity. Never force them.
                 json!({"state":"Waiting","mutation_attempted":false,"current":current,"pending":pending})
             } else if &members == peers {
                 json!({"state":"AlreadyConfigured","mutation_attempted":false,"current":current})
+            } else if switched {
+                // Only the write-set keeper admits new replicas on this protocol.
+                json!({"state":"Waiting","mutation_attempted":false,"current":current})
             } else {
                 let mut desired = current.clone();
                 desired.replica_node_ids =
@@ -84,11 +114,13 @@ pub(super) async fn request(
                 // This only requests a guarded handoff. The native reconciler
                 // must supply all actual freeze/prefix/participant/custody proof.
                 // Any error/timeout is uncertain: the parent must not resubmit.
-                match store
-                    .begin_metadata_shard_membership_handoff(&current, &desired)
-                    .await
-                    .map_err(|e| invalid(e.to_string()))?
-                {
+                let pending = match store.begin_metadata_shard_membership_handoff(&current, &desired).await {
+                    Ok(pending) => pending,
+                    // The switch won the compare before this legacy request.
+                    Err(error) if error.to_string().contains("replica changes use recruit and remove") => None,
+                    Err(error) => return Err(invalid(error.to_string())),
+                };
+                match pending {
                     Some(pending) => json!({"state":"Requested","mutation_attempted":true,
                         "current":current,"desired":desired,"pending":pending}),
                     // No transaction applied. The next observation must start

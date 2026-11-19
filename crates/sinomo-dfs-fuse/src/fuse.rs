@@ -38,11 +38,11 @@ const MIN_FUSE_READ_WORKERS: usize = 4;
 const MAX_FUSE_READ_WORKERS: usize = 16;
 const FUSE_READ_QUEUE_DEPTH_PER_WORKER: usize = 4;
 const FUSE_FATAL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
-// Bound acknowledged-but-not-yet-published data per descriptor. Ordinary
+// Bound acknowledged-but-not-yet-published data per inode. Ordinary
 // Linux FUSE writes arrive as much smaller kernel chunks, so this keeps a
 // sequential transfer to one canonical DFS publication without allowing an
-// idle descriptor to retain unbounded mount memory.
-const MAX_DIRTY_WRITE_BYTES_PER_HANDLE: usize = 64 * 1024 * 1024;
+// idle inode to retain unbounded mount memory.
+const MAX_DIRTY_WRITE_BYTES_PER_INODE: usize = 64 * 1024 * 1024;
 static NEXT_MOUNT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 type SifsService = dfs::MountedSifsService;
 type FuseReadJob = Box<dyn FnOnce() + Send + 'static>;
@@ -1944,58 +1944,69 @@ impl SifsFuseFileSystem {
     }
 
     fn commit_handle(&self, fh: u64) -> std::result::Result<(), libc::c_int> {
-        self.ensure_handle_lock_not_lost(fh)?;
-        let has_dirty = {
-            let state = self.lock_state()?;
-            let handle = state.handles.get(&fh).ok_or(libc::EBADF)?;
-            !handle.dirty.is_empty()
-        };
-        if !has_dirty {
-            return Ok(());
-        }
-        self.ensure_handle_lock_budget(fh, None, LOCKED_IO_MIN_LEASE)?;
-        let Some(publication) = self.lock_state()?.take_dirty_publication(fh)? else {
-            return Ok(());
-        };
-        match self.publish_dirty_publication(&publication) {
-            Ok(stat) => self.refresh_opened_object_stats(&publication.object_id, &stat),
-            Err(errno) => {
-                // A timeout may be ambiguous, but replaying the same ranges
-                // through the stable object id is content-idempotent. Keep the
-                // acknowledged bytes available for a later flush/fsync retry.
-                self.lock_state()?
-                    .restore_dirty_publication(fh, publication)?;
-                Err(errno)
-            }
-        }
+        let gate = self.inode_publication_gate(fh)?;
+        let _guard = gate.lock().map_err(|_| libc::EIO)?;
+        self.commit_inode_ranges(fh).map(drop)
     }
 
-    fn publish_dirty_publication(
+    fn inode_publication_gate(&self, fh: u64) -> std::result::Result<Arc<Mutex<()>>, libc::c_int> {
+        Ok(self
+            .lock_state()?
+            .handles
+            .get(&fh)
+            .ok_or(libc::EBADF)?
+            .publication_gate
+            .clone())
+    }
+
+    // Caller holds the inode gate. Reads can still see the frozen bytes while
+    // the immutable batch is in flight. An ambiguous reply retains its ID.
+    fn commit_inode_ranges(
         &self,
-        publication: &FuseDirtyPublication,
-    ) -> std::result::Result<dfs::DfsStat, libc::c_int> {
-        debug_assert!(!publication.dirty.is_empty());
-        let options = self.write_options();
-        self.run_mounted_mutation(
-            FuseMountedMutationOperation::BufferedWritePublication,
-            |dfs| {
-                let mut latest = None;
-                for (&offset, bytes) in &publication.dirty.ranges {
-                    latest = Some(
-                        dfs.posix_write_file_at_for_object(
-                            &publication.object_id,
-                            offset,
-                            bytes,
-                            options.clone(),
-                        )
-                        .map_err(FuseMountedMutationError::from)?,
-                    );
-                }
-                latest.ok_or_else(|| {
-                    FuseMountedMutationError::ambiguous(libc::EIO, "fuse-empty-dirty-publication")
-                })
-            },
-        )
+        fh: u64,
+    ) -> std::result::Result<Option<dfs::DfsStat>, libc::c_int> {
+        self.ensure_handle_lock_not_lost(fh)?;
+        let mut last = None;
+        loop {
+            let Some(publication) = self.lock_state()?.take_dirty_publication(fh)? else {
+                return Ok(last);
+            };
+            for writer in &publication.writers {
+                self.ensure_handle_lock_not_lost(*writer)?;
+                self.ensure_handle_lock_budget(*writer, None, LOCKED_IO_MIN_LEASE)?;
+            }
+            let options = self.write_options();
+            let stat = self.run_mounted_mutation(
+                FuseMountedMutationOperation::BufferedWritePublication,
+                |dfs| {
+                    dfs.posix_publish_dirty_ranges(
+                        &publication.base,
+                        &publication.dirty.ranges,
+                        &publication.operation_id,
+                        options,
+                    )
+                    .map_err(FuseMountedMutationError::from)
+                },
+            )?;
+            let mut state = self.lock_state()?;
+            state.refresh_object_handle_stats(&publication.base.object_id, &stat)?;
+            let dirty = state
+                .dirty_inodes
+                .get_mut(&publication.base.object_id)
+                .ok_or(libc::ESTALE)?;
+            dirty.frozen = None;
+            if dirty
+                .base
+                .as_ref()
+                .is_some_and(|base| base.version == publication.base.version)
+            {
+                dirty.base = Some(stat.clone());
+            }
+            if dirty.active.is_empty() {
+                state.dirty_inodes.remove(&publication.base.object_id);
+            }
+            last = Some(stat);
+        }
     }
 
     fn commit_dirty_handles_for_path(
@@ -2042,13 +2053,26 @@ impl SifsFuseFileSystem {
     }
 
     fn sync_handle(&self, fh: u64, datasync: bool) -> std::result::Result<(), libc::c_int> {
-        self.commit_dirty_handles_for_handle_object(fh)?;
         let kind = if datasync {
             dfs::DfsPosixSyncKind::FileData
         } else {
             dfs::DfsPosixSyncKind::File
         };
-        let target = self.current_file_sync_target_for_handle(fh, kind)?;
+        let target = {
+            let gate = self.inode_publication_gate(fh)?;
+            let _guard = gate.lock().map_err(|_| libc::EIO)?;
+            match self.commit_inode_ranges(fh)? {
+                Some(stat) => dfs::DfsPosixFileSyncTarget {
+                    kind,
+                    object_id: stat.object_id,
+                    file_system_id: stat.file_system_id,
+                    path: stat.path,
+                    version: stat.version,
+                    content_hash: stat.content_hash.ok_or(libc::EIO)?,
+                },
+                None => self.current_file_sync_target_for_handle(fh, kind)?,
+            }
+        };
         self.ensure_handle_lock_budget(fh, None, LOCKED_IO_MIN_LEASE)?;
         self.run_mounted_mutation(FuseMountedMutationOperation::FileSync, |dfs| {
             dfs.posix_sync_file_target(&target)
@@ -2621,28 +2645,24 @@ impl SifsFuseFileSystem {
             return Ok(0);
         }
 
+        let gate = self.inode_publication_gate(fh)?;
+        let _guard = gate.lock().map_err(|_| libc::EIO)?;
         if sync_mode != HandleSyncMode::None {
-            // An O_SYNC/O_DSYNC publication must follow every earlier
-            // acknowledged write to this object, including another open
-            // descriptor's coalesced buffer.
-            self.commit_dirty_handles_for_object(&object_id, None)?;
+            self.commit_inode_ranges(fh)?;
             self.publish_immediate_handle_write(
                 fh, &object_id, start, data, sync_mode, lock_owner,
             )?;
             return Ok(written);
         }
-
-        // Preserve the serialized FUSE write order across descriptors. At
-        // most one descriptor per object remains dirty, while repeated chunks
-        // on that descriptor retain the fast coalescing path.
-        self.commit_dirty_handles_for_object(&object_id, Some(fh))?;
-
         loop {
             let outcome = self.lock_state()?.buffer_handle_write(fh, start, data)?;
             match outcome {
                 DirtyWriteInsert::Buffered => return Ok(written),
-                DirtyWriteInsert::NeedsPublication => self.commit_handle(fh)?,
+                DirtyWriteInsert::NeedsPublication => {
+                    self.commit_inode_ranges(fh)?;
+                }
                 DirtyWriteInsert::PublishDirectly => {
+                    self.commit_inode_ranges(fh)?;
                     self.publish_immediate_handle_write(
                         fh,
                         &object_id,
@@ -3812,31 +3832,23 @@ impl DirtyWriteBuffer {
             .collect()
     }
 
-    fn restore_older(&mut self, older: Self) {
-        debug_assert!(self.is_empty(), "FUSE dispatch serializes handle writes");
-        if self.is_empty() {
-            *self = older;
-            return;
-        }
 
-        // Be conservative if a future dispatcher permits concurrent writes:
-        // the resident buffer is newer and therefore overlays the restored
-        // publication on overlap.
-        let newer = std::mem::take(self);
-        *self = older;
-        for (offset, bytes) in newer.ranges {
-            let inserted = self
-                .try_write(offset, &bytes, usize::MAX)
-                .expect("resident dirty range was already size-checked");
-            debug_assert_eq!(inserted, DirtyWriteInsert::Buffered);
-        }
-    }
 }
 
 #[derive(Debug)]
 struct FuseDirtyPublication {
-    object_id: dfs::DfsObjectId,
+    base: dfs::DfsStat,
+    operation_id: String,
+    writers: BTreeSet<u64>,
     dirty: DirtyWriteBuffer,
+}
+
+#[derive(Debug, Default)]
+struct DirtyInode {
+    base: Option<dfs::DfsStat>,
+    active: DirtyWriteBuffer,
+    writers: BTreeSet<u64>,
+    frozen: Option<Arc<FuseDirtyPublication>>,
 }
 
 #[derive(Debug)]
@@ -3849,6 +3861,7 @@ struct FuseState {
     ino_by_object_id: BTreeMap<dfs::DfsObjectId, u64>,
     object_id_by_ino: BTreeMap<u64, dfs::DfsObjectId>,
     handles: BTreeMap<u64, OpenFileHandle>,
+    dirty_inodes: BTreeMap<dfs::DfsObjectId, DirtyInode>,
     held_locks: BTreeMap<(dfs::DfsObjectId, u64), FuseHeldLock>,
     pending_locks: BTreeMap<(dfs::DfsObjectId, u64), FusePendingLock>,
     lost_locks: BTreeMap<(dfs::DfsObjectId, u64), FuseLostLock>,
@@ -3871,6 +3884,7 @@ impl FuseState {
             ino_by_object_id: BTreeMap::new(),
             object_id_by_ino: BTreeMap::new(),
             handles: BTreeMap::new(),
+            dirty_inodes: BTreeMap::new(),
             held_locks: BTreeMap::new(),
             pending_locks: BTreeMap::new(),
             lost_locks: BTreeMap::new(),
@@ -3897,19 +3911,14 @@ impl FuseState {
     fn opened_read(&self, fh: u64, offset: u64, max_bytes: usize) -> Option<FuseOpenedRead> {
         let handle = self.handles.get(&fh)?;
         let object_id = &handle.object_id;
-        let logical_size = self
-            .handles
-            .values()
-            .filter(|candidate| &candidate.object_id == object_id)
-            .map(|candidate| candidate.logical_size)
-            .max()
-            .unwrap_or(handle.logical_size);
-        let dirty_overlays = self
-            .handles
-            .values()
-            .filter(|candidate| &candidate.object_id == object_id)
-            .flat_map(|candidate| candidate.dirty.overlays_for_read(offset, max_bytes))
-            .collect();
+        let logical_size = self.dirty_size(object_id).max(handle.logical_size);
+        let mut dirty_overlays = Vec::new();
+        if let Some(inode) = self.dirty_inodes.get(object_id) {
+            if let Some(frozen) = &inode.frozen {
+                dirty_overlays.extend(frozen.dirty.overlays_for_read(offset, max_bytes));
+            }
+            dirty_overlays.extend(inode.active.overlays_for_read(offset, max_bytes));
+        }
         Some(FuseOpenedRead {
             identity: FuseOpenedReadIdentity {
                 path: handle.path.clone(),
@@ -3922,16 +3931,22 @@ impl FuseState {
         })
     }
 
+    fn dirty_size(&self, object: &dfs::DfsObjectId) -> u64 {
+        self.dirty_inodes.get(object).map_or(0, |inode| {
+            let end = |ranges: &DirtyWriteBuffer| {
+                ranges
+                    .ranges
+                    .last_key_value()
+                    .map_or(0, |(at, bytes)| at + bytes.len() as u64)
+            };
+            end(&inode.active).max(inode.frozen.as_ref().map_or(0, |p| end(&p.dirty)))
+        })
+    }
+
     fn visible_handle_stat(&self, fh: u64) -> Option<dfs::DfsStat> {
         let handle = self.handles.get(&fh)?;
         let mut stat = handle.visible_stat();
-        stat.size_bytes = self
-            .handles
-            .values()
-            .filter(|candidate| candidate.object_id == handle.object_id)
-            .map(|candidate| candidate.logical_size)
-            .max()
-            .or(stat.size_bytes);
+        stat.size_bytes = Some(handle.logical_size.max(self.dirty_size(&handle.object_id)));
         Some(stat)
     }
 
@@ -4213,6 +4228,12 @@ impl FuseState {
         let fh = self.next_fh;
         self.next_fh = self.next_fh.saturating_add(1);
         let logical_size = stat.size_bytes.unwrap_or(0);
+        let publication_gate = self
+            .handles
+            .values()
+            .find(|h| h.object_id == stat.object_id)
+            .map(|h| h.publication_gate.clone())
+            .unwrap_or_default();
         self.handles.insert(
             fh,
             OpenFileHandle {
@@ -4220,7 +4241,7 @@ impl FuseState {
                 object_id: stat.object_id.clone(),
                 opened_stat: stat,
                 logical_size,
-                dirty: DirtyWriteBuffer::default(),
+                publication_gate,
                 writable: flags_has_write_access(flags),
                 sync_mode: HandleSyncMode::from_open_flags(flags),
             },
@@ -4276,11 +4297,31 @@ impl FuseState {
         let end = offset
             .checked_add(u64::try_from(bytes.len()).map_err(|_| libc::EFBIG)?)
             .ok_or(libc::EFBIG)?;
-        let outcome = handle
-            .dirty
-            .try_write(offset, bytes, MAX_DIRTY_WRITE_BYTES_PER_HANDLE)?;
+        let inode = self
+            .dirty_inodes
+            .entry(handle.object_id.clone())
+            .or_default();
+        if inode
+            .base
+            .as_ref()
+            .is_some_and(|base| base.version != handle.opened_stat.version)
+        {
+            return Ok(DirtyWriteInsert::NeedsPublication);
+        }
+        // Bound metadata as well as bytes for sparse single-byte writes.
+        if inode.active.ranges.len() >= 1024 && !inode.active.ranges.contains_key(&offset) {
+            return Ok(DirtyWriteInsert::NeedsPublication);
+        }
+        let outcome = inode
+            .active
+            .try_write(offset, bytes, MAX_DIRTY_WRITE_BYTES_PER_INODE)?;
         if outcome == DirtyWriteInsert::Buffered && !bytes.is_empty() {
+            inode.base.get_or_insert_with(|| handle.opened_stat.clone());
+            inode.writers.insert(fh);
             handle.logical_size = handle.logical_size.max(end);
+        }
+        if inode.active.is_empty() && inode.frozen.is_none() {
+            self.dirty_inodes.remove(&handle.object_id);
         }
         Ok(outcome)
     }
@@ -4288,28 +4329,30 @@ impl FuseState {
     fn take_dirty_publication(
         &mut self,
         fh: u64,
-    ) -> std::result::Result<Option<FuseDirtyPublication>, libc::c_int> {
-        let handle = self.handles.get_mut(&fh).ok_or(libc::EBADF)?;
-        if handle.dirty.is_empty() {
+    ) -> std::result::Result<Option<Arc<FuseDirtyPublication>>, libc::c_int> {
+        let handle = self.handles.get(&fh).ok_or(libc::EBADF)?;
+        let Some(inode) = self.dirty_inodes.get_mut(&handle.object_id) else {
             return Ok(None);
+        };
+        if inode.frozen.is_none() && !inode.active.is_empty() {
+            inode.frozen = Some(Arc::new(FuseDirtyPublication {
+                base: inode.base.take().ok_or(libc::ESTALE)?,
+                operation_id: format!("fuse_ranges_{}", dfs::DfsVersion::generate()),
+                writers: std::mem::take(&mut inode.writers),
+                dirty: std::mem::take(&mut inode.active),
+            }));
         }
-        Ok(Some(FuseDirtyPublication {
-            object_id: handle.object_id.clone(),
-            dirty: std::mem::take(&mut handle.dirty),
-        }))
+        Ok(inode.frozen.clone())
     }
 
-    fn restore_dirty_publication(
-        &mut self,
-        fh: u64,
-        publication: FuseDirtyPublication,
-    ) -> std::result::Result<(), libc::c_int> {
-        let handle = self.handles.get_mut(&fh).ok_or(libc::EBADF)?;
-        if handle.object_id != publication.object_id {
-            return Err(libc::ESTALE);
-        }
-        handle.dirty.restore_older(publication.dirty);
-        Ok(())
+    fn dirty_writer(&self, object: &dfs::DfsObjectId) -> Option<u64> {
+        let inode = self.dirty_inodes.get(object)?;
+        inode
+            .frozen
+            .as_ref()
+            .and_then(|p| p.writers.first())
+            .or_else(|| inode.writers.first())
+            .copied()
     }
 
     fn dirty_handles_for_path(&self, path: &str, include_descendants: bool) -> Vec<u64> {
@@ -4322,14 +4365,9 @@ impl FuseState {
             })
             .map(|handle| handle.object_id.clone())
             .collect::<BTreeSet<_>>();
-        self.handles
+        matching_objects
             .iter()
-            .filter_map(|(&fh, handle)| {
-                let matches = handle.path == path
-                    || (include_descendants && renamed_path(&handle.path, path, path).is_some())
-                    || matching_objects.contains(&handle.object_id);
-                (matches && !handle.dirty.is_empty()).then_some(fh)
-            })
+            .filter_map(|object| self.dirty_writer(object))
             .collect()
     }
 
@@ -4338,14 +4376,9 @@ impl FuseState {
         object_id: &dfs::DfsObjectId,
         except_fh: Option<u64>,
     ) -> Vec<u64> {
-        self.handles
-            .iter()
-            .filter_map(|(&fh, handle)| {
-                (Some(fh) != except_fh
-                    && &handle.object_id == object_id
-                    && !handle.dirty.is_empty())
-                .then_some(fh)
-            })
+        self.dirty_writer(object_id)
+            .filter(|fh| Some(*fh) != except_fh)
+            .into_iter()
             .collect()
     }
 }
@@ -4359,7 +4392,7 @@ struct OpenFileHandle {
     // peer for bytes under a size/version combination that was not committed.
     opened_stat: dfs::DfsStat,
     logical_size: u64,
-    dirty: DirtyWriteBuffer,
+    publication_gate: Arc<Mutex<()>>,
     writable: bool,
     sync_mode: HandleSyncMode,
 }
@@ -4374,11 +4407,7 @@ impl OpenFileHandle {
     fn refresh_stat(&mut self, stat: &dfs::DfsStat) {
         self.opened_stat = stat.clone();
         let committed_size = stat.size_bytes.unwrap_or(0);
-        self.logical_size = if self.dirty.is_empty() {
-            committed_size
-        } else {
-            self.logical_size.max(committed_size)
-        };
+        self.logical_size = committed_size;
     }
 }
 
@@ -6978,8 +7007,13 @@ mod errno_tests {
         }
 
         let handle = state.handles.get(&fh).expect("open handle");
-        assert_eq!(handle.dirty.len(), 1);
-        assert_eq!(handle.dirty.buffered_bytes(), 8 * 1024 * 1024);
+        assert_eq!(state.dirty_inodes[&handle.object_id].active.len(), 1);
+        assert_eq!(
+            state.dirty_inodes[&handle.object_id]
+                .active
+                .buffered_bytes(),
+            8 * 1024 * 1024
+        );
         assert_eq!(handle.logical_size, 8 * 1024 * 1024);
         let publication = state
             .take_dirty_publication(fh)
@@ -7117,6 +7151,31 @@ mod errno_tests {
     }
 
     #[test]
+    fn alternating_handles_freeze_one_ordered_inode_publication() {
+        let path = "/root/alternate";
+        let stat = test_stat("alternatingobject", "alternatingversion", path);
+        let mut state = FuseState::new("/root".into());
+        let a = state.allocate_handle(path.into(), stat.clone(), libc::O_RDWR);
+        let b = state.allocate_handle(path.into(), stat, libc::O_RDWR);
+        for (fh, at, bytes) in [(a, 1, &b"ab"[..]), (b, 9, &b"z"[..]), (b, 2, &b"c"[..])] {
+            assert_eq!(
+                state.buffer_handle_write(fh, at, bytes).unwrap(),
+                DirtyWriteInsert::Buffered
+            );
+        }
+        let batch = state.take_dirty_publication(a).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            &batch,
+            &state.take_dirty_publication(b).unwrap().unwrap()
+        ));
+        assert_eq!(batch.writers, BTreeSet::from([a, b]));
+        assert_eq!(
+            batch.dirty.ranges,
+            BTreeMap::from([(1, b"ac".to_vec()), (9, b"z".to_vec())])
+        );
+    }
+
+    #[test]
     fn sync_handles_never_accept_buffered_dirty_state() {
         let path = "/root/sync.bin";
         let opened = test_stat("fusesyncobject", "fusesyncversion", path);
@@ -7129,14 +7188,7 @@ mod errno_tests {
                     .expect("classify sync write"),
                 DirtyWriteInsert::PublishDirectly
             );
-            assert!(
-                state
-                    .handles
-                    .get(&fh)
-                    .expect("sync handle")
-                    .dirty
-                    .is_empty()
-            );
+            assert!(state.dirty_inodes.is_empty());
         }
     }
 
@@ -7154,12 +7206,16 @@ mod errno_tests {
             .take_dirty_publication(fh)
             .expect("take publication")
             .expect("dirty publication");
-        assert!(state.handles.get(&fh).expect("handle").dirty.is_empty());
-
-        state
-            .restore_dirty_publication(fh, publication)
-            .expect("restore failed publication");
-        let restored = &state.handles.get(&fh).expect("handle").dirty;
+        // The uncertain operation stays frozen, including its original ID,
+        // while newer accepted bytes remain separately visible.
+        state.buffer_handle_write(fh, 0, b"new").unwrap();
+        let retry = state.take_dirty_publication(fh).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&publication, &retry));
+        assert_eq!(
+            state.opened_read(fh, 0, 8).unwrap().finish(vec![]).unwrap(),
+            b"newry-me"
+        );
+        let restored = &retry.dirty;
         assert_eq!(restored.buffered_bytes(), 8);
         assert_eq!(
             restored.ranges.get(&0).expect("restored range"),

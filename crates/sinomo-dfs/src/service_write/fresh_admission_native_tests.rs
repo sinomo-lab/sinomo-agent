@@ -493,6 +493,10 @@ fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_hea
             "actual RPC observation window remains complete"
         );
         runtime.clear_faults();
+        // The denied content RPC earned a retry backoff. Model the end of that
+        // delay before starting the caller clock. Fsync must still obtain the
+        // actual third receipt and certify the same revision within its bound.
+        crate::repair_executor::elapse_repair_executor_backoffs_for_test(&runtime.data_dir(&b).root());
         let heal_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         let previous = writer.set_transport_operation_deadline(Some(heal_deadline));
         let healed = writer.posix_sync_file(path, crate::DfsPosixSyncKind::File);

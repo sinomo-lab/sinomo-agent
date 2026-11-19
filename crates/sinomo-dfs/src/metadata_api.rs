@@ -1066,6 +1066,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(())
     }
 
+    /// Maintenance holding global admission must yield it when a physical
+    /// writer is busy: that writer may need a local participant RPC to finish.
+    #[doc(hidden)]
+    fn try_begin_consistent_read_snapshot(&mut self) -> Result<bool> {
+        self.begin_consistent_read_snapshot().map(|()| true)
+    }
+
     /// End one bounded coherent-read scope opened above.
     fn end_consistent_read_snapshot(&mut self) {}
 

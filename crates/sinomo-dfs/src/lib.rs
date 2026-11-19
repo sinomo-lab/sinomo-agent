@@ -228,6 +228,7 @@ mod service_routed_write;
 mod service_stage_transfer;
 mod service_state;
 mod service_sync;
+mod service_sync_flights;
 mod service_trace;
 mod service_write;
 mod service_write_set_keeping;

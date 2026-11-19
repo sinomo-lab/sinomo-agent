@@ -31,6 +31,7 @@ mod namespace_ops;
 pub(crate) mod owner_write;
 mod query;
 mod read;
+mod range_write;
 mod routing;
 mod stat;
 pub(crate) mod sync;

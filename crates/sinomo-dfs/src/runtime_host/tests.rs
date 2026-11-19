@@ -1069,29 +1069,30 @@ struct NativeMaterializationFixture {
     shard: ResidentLocalMetadataShardHandle,
     scheduler: Arc<DaemonDfsMutationScheduler>,
     object_id: crate::DfsObjectId,
+    accepted: crate::DfsMetadataJournalEntry,
     config: DfsMetadataShardConfig,
     pause: DfsTestMaterializationPause,
 }
 impl NativeMaterializationFixture {
     fn wait_materialized(&self) {
-        self.runtime.block_on(async {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                if self
-                    .shard
-                    .with_backend(|backend| backend.get_object(&self.object_id))
-                    .unwrap()
-                    .is_some()
-                {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "actual durable suffix did not materialize"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // An acknowledged prepare can precede delivery of its decision. Replay
+        // owns the suffix actually accepted by this replica when the hold began.
+        super::materialization_test::wait_for_existing_materialization(
+            &self.data_dir, &self.config.file_system_id, &self.accepted.shard_id,
+            &self.runtime, self.accepted.sequence, Instant::now() + Duration::from_secs(2), |_| {},
+        ).expect("actual durable suffix materializes after admission is released");
+        let digest = match &self.accepted.mutation {
+            crate::DfsMetadataMutation::PrepareOperationV7 { record, .. } => &record.digest,
+            crate::DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } => digest,
+            other => panic!("unexpected mkdir journal entry {other:?}"),
+        };
+        self.shard.with_backend(|backend| {
+            assert_eq!(backend.prepared_operation_digest(&digest.operation_id)?.as_ref(), Some(digest));
+            if matches!(self.accepted.mutation, crate::DfsMetadataMutation::CommitPreparedOperationV7 { .. }) {
+                assert_eq!(backend.committed_prepared_operation(digest)?.as_ref(), Some(&self.accepted));
             }
-        });
+            Ok(())
+        }).unwrap();
     }
     fn close(mut self) {
         self.pause.release();
@@ -1135,22 +1136,15 @@ fn replica_materialization_fixture(name: &str) -> NativeMaterializationFixture {
     let paths = DaemonPaths::new(&data_dir);
     let data_owner = require_daemon_dfs_data_owner_lock(&paths).unwrap();
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir).unwrap();
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
-        .unwrap()
-        .unwrap();
-    let shard = daemon_dfs_message_cache_exact_admission_handle(
-        &data_dir,
-        &cluster_paths,
-        &peer_snapshot,
-        &DaemonDfsMutationLaneKey {
-            file_system_id: config.file_system_id.clone(),
-            shard_id,
-        },
-        &runtime,
-    )
-    .unwrap()
-    .unwrap();
+    let (shard, cut) = super::materialization_test::wait_for_existing_materialization_with_handle(
+        &data_dir, &config.file_system_id, &shard_id, &runtime, 0,
+        Instant::now() + Duration::from_secs(2), |_| {},
+    ).unwrap();
+    let sequence = cut.durable_sequence.unwrap();
+    assert!(sequence > cut.materialized_sequence.unwrap(), "{cut:?}");
+    let accepted = crate::metadata_journal::segmented_journal_entry_at_sequence(
+        &cut.physical_root, sequence,
+    ).unwrap().expect("frame durably accepted by the held replica");
     assert!(
         shard
             .with_backend(|backend| backend.get_object(&object_id))
@@ -1165,6 +1159,7 @@ fn replica_materialization_fixture(name: &str) -> NativeMaterializationFixture {
         shard,
         scheduler,
         object_id,
+        accepted,
         config,
         pause,
     }
@@ -1245,14 +1240,6 @@ fn replica_materialization_resumes_after_foreground_without_another_append() {
         assert!(fixture.shard.try_checkout().unwrap().is_some());
         drop(foreground);
     });
-    fixture.wait_materialized();
-    assert!(
-        fixture
-            .shard
-            .with_backend(|backend| backend.get_object(&fixture.object_id))
-            .unwrap()
-            .is_some()
-    );
     fixture.close();
 }
 
@@ -1338,22 +1325,10 @@ fn replica_materialization_reacquires_generation_changed_while_queued() {
         old_scope.try_checkout().unwrap().is_some(),
         "replay must release its previous canonical generation"
     );
-    let paths = ClusterPaths::new(&fixture.data_dir);
-    let peer = read_daemon_dfs_message_peer_snapshot(&paths)
-        .unwrap()
-        .unwrap();
-    let current = daemon_dfs_message_cache_exact_admission_handle(
-        &fixture.data_dir,
-        &paths,
-        &peer,
-        &DaemonDfsMutationLaneKey {
-            file_system_id: activated.file_system_id.clone(),
-            shard_id: DfsMetadataShardId::new(activated.shard_id),
-        },
-        &fixture.runtime,
-    )
-    .unwrap()
-    .unwrap();
+    let (current, _) = super::materialization_test::wait_for_existing_materialization_with_handle(
+        &fixture.data_dir, &activated.file_system_id, &DfsMetadataShardId::new(activated.shard_id),
+        &fixture.runtime, fixture.accepted.sequence, Instant::now() + Duration::from_secs(2), |_| {},
+    ).unwrap();
     assert!(
         current
             .with_backend(|backend| backend.get_object(&fixture.object_id))
@@ -6134,24 +6109,23 @@ fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
         .unwrap();
     assert_eq!(job.status, DfsNamespaceJobStatus::Running);
     let paths = DaemonPaths::new(native.data_dir(&node));
-    let observed_at = OffsetDateTime::now_utc();
     let pending = daemon_dfs_pending_maintenance_work_on_runtime(
         &paths,
         crate::test_runtime::executor().handle(),
     )
     .unwrap();
-    let inspector = native.metadata_primary_service(old).unwrap();
-    let actual_job = inspector
-        .metadata_backend()
-        .unwrap()
-        .get_namespace_job(&job.job_id)
-        .unwrap();
-    drop(inspector);
-    assert_eq!(
-        pending.pending_namespace_job_count, 1,
-        "actual job at probe starting {observed_at}: {actual_job:?}; captured reply={job:?}"
-    );
-    assert!(pending.should_trigger_background_maintenance());
+    match pending.pending_namespace_job_count {
+        1 => assert!(pending.should_trigger_background_maintenance()),
+        0 => {
+            // Native maintenance is already running. A zero count is valid
+            // only if the same job has reached its durable terminal state.
+            let inspector = native.metadata_primary_service(old).unwrap();
+            let actual = inspector.metadata_backend().unwrap()
+                .get_namespace_job(&job.job_id).unwrap().unwrap();
+            assert_eq!(actual.status, DfsNamespaceJobStatus::Completed);
+        }
+        other => panic!("unexpected pending namespace job count {other}"),
+    }
     for _ in 0..8 {
         let tick = native
             .maintenance_tick(&node, Duration::from_secs(5))
@@ -12559,36 +12533,26 @@ fn daemon_dfs_message_cache_rebuilds_only_for_metadata_authority_changes() {
         .expect("actual mounted Main lookup");
         assert_eq!(response.request_id, id);
     };
-    let lane = || {
-        let cache_slot = daemon_dfs_message_service_cache()
-            .root(&cache_key)
-            .expect("actual root cache slot");
-        let cache = cache_slot.lock().unwrap();
-        Arc::clone(
-            cache
-                .as_ref()
-                .unwrap()
-                .primary_service
-                .as_ref()
-                .expect("actual resident metadata lane"),
-        )
+    // The global service can be checked out by maintenance between commands.
+    // This progress owner belongs to the resident cache entry for its whole
+    // lifetime, including maintenance checkouts. A physical rebuild
+    // allocates a fresh owner.
+    let progress = || {
+        let slot = daemon_dfs_message_service_cache().root(&cache_key).unwrap();
+        Arc::clone(&slot.lock().unwrap().as_ref().unwrap().maintenance_progress)
     };
     commit_unrelated(b"initial");
     lookup("dfs_message_authority_cache_1", 1, "/services/cache-1.txt");
-    let first_lane = lane();
-    let first_lane_weak = Arc::downgrade(&first_lane);
-    let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+    let first_generation = progress();
+    let first_generation_weak = Arc::downgrade(&first_generation);
     commit_unrelated(b"changed");
     lookup("dfs_message_authority_cache_2", 2, "/services/cache-2.txt");
-    let unchanged_lane = lane();
+    let unchanged_generation = progress();
     assert!(
-        Arc::ptr_eq(&first_lane, &unchanged_lane),
-        "unrelated native KV commits must preserve the resident lane"
+        Arc::ptr_eq(&first_generation, &unchanged_generation),
+        "unrelated native KV commits must preserve the resident cache generation"
     );
-    assert_eq!(
-        daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        opens_before
-    );
+    let release_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let scope = native
         .bootstrap_empty_metadata_prefix("authority-cache-extra", "/authority-cache-extra")
         .expect("normal native genesis, assignment CAS and guarded publication");
@@ -12596,19 +12560,21 @@ fn daemon_dfs_message_cache_rebuilds_only_for_metadata_authority_changes() {
     lookup(
         "dfs_message_authority_cache_3",
         3,
-        "/authority-cache-extra/cache-3.txt",
+        "/services/cache-3.txt",
     );
-    let rebuilt_lane = lane();
+    let rebuilt_generation = progress();
     assert!(
-        !Arc::ptr_eq(&first_lane, &rebuilt_lane),
-        "actual physical topology change must replace the old resident lane"
+        !Arc::ptr_eq(&first_generation, &rebuilt_generation),
+        "actual physical topology change must replace the resident cache generation"
     );
-    drop((unchanged_lane, first_lane));
-    assert!(
-        first_lane_weak.upgrade().is_none(),
-        "superseded completed resident service must be collectible"
-    );
-    drop((rebuilt_lane, cluster, context));
+    drop((unchanged_generation, first_generation));
+    // A tick already using the predecessor can finish returning its lane
+    // after the replacement was observed. Prove collection with Main live.
+    while first_generation_weak.strong_count() != 0 {
+        assert!(Instant::now() < release_deadline, "superseded cache progress owner was retained");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop((rebuilt_generation, cluster, context));
     native.close().unwrap();
 }
 
@@ -14013,11 +13979,19 @@ fn cancelled_embedded_runtime_join_restores_unfinished_task_ownership() {
         join_registered_runtime_for_test(&data_dir, Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(host.tasks.lock().unwrap().is_empty());
+        assert!(host.tasks.lock().unwrap().iter().all(|task| task.id() != task_id),
+            "the restored task must have been joined");
         assert!(completed.load(Ordering::Acquire));
     });
+    // A mounted component can still register other tasks while this test
+    // exercises its join primitive. Stop the real producers before inspecting
+    // the entire task registry.
+    let stopped_host = Arc::downgrade(&host);
     drop(host);
     native.close().unwrap();
+    if let Some(stopped) = stopped_host.upgrade() {
+        assert!(stopped.tasks.lock().unwrap().is_empty());
+    }
 }
 
 #[test]

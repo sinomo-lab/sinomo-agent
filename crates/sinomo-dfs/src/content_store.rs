@@ -12,6 +12,7 @@ pub use import_blob::{
 mod preparation;
 use preparation::ContentInventoryState;
 mod inline_bindings;
+mod range_patch;
 mod readers;
 
 pub use accounting::{
@@ -4237,8 +4238,7 @@ impl LocalContentStore {
         let hash_tree = self.patch_hash_tree_for_extents(
             &base_manifest,
             &target_manifest_for_hash,
-            offset,
-            patch_size,
+            &[(offset, patch_size)],
             trusted_content_hash,
         )?;
         let content_hash = match (hash_tree.as_ref(), trusted_content_hash) {
@@ -5288,8 +5288,7 @@ impl LocalContentStore {
         &self,
         base_manifest: &ContentManifest,
         target_manifest: &ContentManifest,
-        offset: u64,
-        patch_size: u64,
+        ranges: &[(u64, u64)],
         trusted_content_hash: Option<&str>,
     ) -> Result<Option<ContentHashTree>> {
         if target_manifest.size_bytes <= CONTENT_HASH_TREE_LEAF_BYTES {
@@ -5302,15 +5301,7 @@ impl LocalContentStore {
         };
         let leaf_count = content_hash_tree_leaf_count(target_manifest.size_bytes)?;
         let mut leaves = Vec::with_capacity(leaf_count);
-        let patch_end =
-            offset
-                .checked_add(patch_size)
-                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
-                    message: format!(
-                        "patch range overflows object size: object={}, offset={offset}, bytes={patch_size}",
-                        target_manifest.object_id
-                    ),
-                })?;
+        let mut changed = ranges.iter().peekable();
         for index in 0..leaf_count {
             let (logical_offset, size_bytes) =
                 content_hash_tree_leaf_range(target_manifest.size_bytes, index)?;
@@ -5322,7 +5313,13 @@ impl LocalContentStore {
                     ),
                 }
             })?;
-            let overlaps_patch = logical_offset < patch_end && leaf_end > offset;
+            while changed
+                .peek()
+                .is_some_and(|(offset, len)| offset.saturating_add(*len) <= logical_offset)
+            {
+                changed.next();
+            }
+            let overlaps_patch = changed.peek().is_some_and(|(offset, _)| *offset < leaf_end);
             let reusable = base_tree.as_ref().and_then(|tree| {
                 tree.leaves.get(index).filter(|leaf| {
                     !overlaps_patch

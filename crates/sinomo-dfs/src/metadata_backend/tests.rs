@@ -55,6 +55,21 @@ fn assert_resident_snapshot_pending_preserves_fence<G>(
 }
 
 #[test]
+fn opening_an_absent_replica_for_snapshot_repair_preserves_its_absence() {
+    let directory = sinomo_testdir::TestDir::new("absent-replica-repair-open");
+    let root = directory.path().join("users");
+    let shard = DfsMetadataShardId::new("users");
+    for _ in 0..2 {
+        let backend = LocalSobjMetadataBackend::open_for_replica_repair(shard.clone(), &root).unwrap();
+        assert!(backend.replica_repair_only);
+        assert_eq!(crate::metadata_journal::recover_next_journal_sequence(&root).unwrap(), 1);
+        assert!(!metadata_cursor::journal_head_path(&root).exists());
+        assert_eq!(backend.local_materialization_cursor().unwrap().last_sequence, 0);
+        assert!(!metadata_cursor::local_materialization_cursor_path(&root).exists());
+    }
+}
+
+#[test]
 fn resident_snapshot_yields_to_local_source_fence_and_recovers_exact_view() {
     use crate::DfsMetadataBackend;
     let root = sinomo_testdir::TestDir::new("resident-local-source-fence");

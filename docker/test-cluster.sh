@@ -2795,6 +2795,20 @@ request_fresh_dfs_topology() {
     "$rows" >"$roster" || return 1
   members="$(jq -c '[.[].node_id] | sort' "$roster")" || return 1
   layout="$ARTIFACTS/dfs-requested-topology.layout.last.json"
+  local placement="$ARTIFACTS/dfs-requested-topology.placement.json"
+  while :; do
+    command_timeout="$(deadline_command_timeout "$deadline" "$DFS_CONVERGENCE_WAIT")" || return 1
+    if compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.prepare-shard-layout \
+      --require-cluster --json >"$placement" 2>"${placement%.json}.stderr.log"; then
+      jq -e '.status == "passed"' "$placement" >/dev/null || return 1
+      break
+    fi
+    # Native singleton genesis can still own the shard at formation. Only its
+    # explicit pre-effect rejection permits re-entering the idempotent setup.
+    jq -e '.status == "failed" and (.summary | endswith("remains prepared; mutation deferred before content or request binding"))' \
+      "$placement" >/dev/null || return 1
+    sleep "$POLL_INTERVAL"
+  done
   while :; do
     command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
     if ! compose_exec_timeout "$command_timeout" node1 sinomo test run cluster.dfs.shard-layout \
@@ -2839,7 +2853,14 @@ request_fresh_dfs_topology() {
         | length == (unique | length) and all(.[]; . as $member | $wanted | index($member) != null)' \
         "$layout" >/dev/null || { log "fresh topology: current assignment contains an unexpected member"; return 1; }
       if ! jq -e --arg lane "$lane" --argjson wanted "$members" '.diagnostics.shards[] | select(.lane == $lane)
-        | ([.primary_node_id] + .replica_node_ids | sort) == $wanted' "$layout" >/dev/null; then
+        | ([.primary_node_id] + .replica_node_ids | sort) == $wanted
+          and (.write_set == null or (.write_set | sort) == $wanted)' "$layout" >/dev/null; then
+        if ! jq -e --arg lane "$lane" '.diagnostics.shards[] | select(.lane == $lane) | .write_set == null' "$layout" >/dev/null; then
+          # Switched shards recruit and join through the native write-set keeper.
+          phase=recruiting
+          sleep "$POLL_INTERVAL"
+          break
+        fi
         phase=membership
         command=(sinomo dfs metadata shard set-replicas "$shard" --filesystem "$fs" --expected-epoch "$epoch" --json)
         replicas="$(jq -c --arg primary "$current_primary" '[.[].node_id | select(. != $primary)] | sort' "$roster")" || return 1
@@ -2853,7 +2874,14 @@ request_fresh_dfs_topology() {
       transition=$((transition + 1))
       report="$ARTIFACTS/dfs-requested-topology-$transition-$lane-$phase.json"
       command_timeout="$(deadline_command_timeout "$deadline" "$READINESS_COMMAND_TIMEOUT")" || return 1
-      compose_exec_timeout "$command_timeout" node1 "${command[@]}" >"$report" 2>"${report%.json}.stderr.log" || return 1
+      if ! compose_exec_timeout "$command_timeout" node1 "${command[@]}" >"$report" 2>"${report%.json}.stderr.log"; then
+        # If the protocol switched after the read, this transition was explicitly
+        # refused. Re-read its authority before choosing the membership producer.
+        if [ "$phase" = membership ] && grep -Fq 'replica changes use recruit and remove' "${report%.json}.stderr.log"; then
+          break
+        fi
+        return 1
+      fi
       jq -e --arg fs "$fs" --arg shard "$shard" --arg primary "$current_primary" --arg phase "$phase" \
         --arg desired_primary "$desired_primary" --argjson epoch "$epoch" --argjson wanted "$members" '
         .pending_handoff as $h

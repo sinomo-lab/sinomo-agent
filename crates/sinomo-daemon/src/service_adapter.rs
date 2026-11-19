@@ -156,6 +156,9 @@ fn daemon_error(error: DaemonError) -> ServiceError {
         DaemonError::ClusterReadOnly { detail } => {
             ServiceError::Network(NetworkError::ClusterReadOnly { detail })
         }
+        DaemonError::NetworkDelivery { address, detail, delivery_state } => {
+            ServiceError::Network(NetworkError::delivery_failed(address, delivery_state, detail))
+        }
         DaemonError::AuthDenied => ServiceError::Network(NetworkError::AuthDenied),
         DaemonError::AuthExpired => ServiceError::Network(NetworkError::AuthExpired),
         DaemonError::ClusterOrphan => ServiceError::Network(NetworkError::ClusterOrphan),
@@ -3812,6 +3815,10 @@ mod tests {
 
     #[test]
     fn daemon_error_preserves_cluster_control_plane_identity() {
+        let delivery = sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent;
+        let unavailable = NetworkError::delivery_failed("open carrier", delivery, "dispatcher replaced");
+        assert!(matches!(daemon_error(unavailable.into()),
+            ServiceError::Network(error) if error.delivery_state() == Some(delivery)));
         assert!(matches!(
             daemon_error(DaemonError::ClusterReadOnly {
                 detail: "forwarded authoritative cluster KV read reached a non-leader voter"

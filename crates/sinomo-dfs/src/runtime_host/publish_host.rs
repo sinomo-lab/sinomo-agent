@@ -53,20 +53,28 @@ pub(super) fn daemon_dfs_metadata_publish_discovery_schedule_options()
 
 async fn admit_daemon_dfs_background_generation_refresh(
     scheduler: &Arc<DaemonDfsMutationScheduler>,
+    deadline: tokio::time::Instant,
 ) -> Result<DaemonDfsMutationAdmission, String> {
-    // A queued global writer also blocks later exact readers. Background cache
-    // refresh must use the same preemption edge as maintenance, or a publisher
-    // on another shard can wait for an acknowledgement trapped behind it.
-    // Yield only before admission: the existing publish owner retains its work
-    // and retries, while admitted initialization remains protected to completion.
-    let foreground = scheduler.begin_maintenance_interest();
-    crate::runtime_admission::acquire_dfs_maintenance_admission_until_foreground_waits(
-        &foreground,
-        scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
-    )
-    .await
-    .map_err(|error| format!("DFS metadata generation admission failed: {error}"))?
-    .ok_or_else(|| "DFS metadata generation refresh yielded to foreground protocol work".into())
+    let acquire = async {
+        loop {
+            let admitted = {
+                let foreground = scheduler.begin_maintenance_interest();
+                crate::runtime_admission::acquire_dfs_maintenance_admission_until_foreground_waits(
+                    &foreground,
+                    scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+                ).await.map_err(|error| format!("DFS metadata generation admission failed: {error}"))?
+            };
+            if let Some(admission) = admitted {
+                return Ok(admission);
+            }
+            // The foreground request gets the queued writer's place. Rejoin
+            // the fair admission queue with the same owner and deadline;
+            // preemption before checkout is not a failed replication attempt.
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout_at(deadline, acquire).await
+        .map_err(|_| "DFS metadata generation admission deadline elapsed".to_string())?
 }
 
 pub(super) fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
@@ -476,6 +484,7 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
             peer_snapshot,
             preflight,
             runtime.clone(),
+            deadline,
         )
         .await?;
     }
@@ -493,6 +502,7 @@ pub(super) async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
     peer_snapshot: DaemonDfsMessagePeerSnapshot,
     preflight: DaemonDfsMetadataAuthorityPreflight,
     runtime: tokio::runtime::Handle,
+    deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     let already_current = {
         let slot = daemon_dfs_message_service_cache()
@@ -536,7 +546,7 @@ pub(super) async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
         if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
             hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { owner: "idle", caller_task: tokio::task::try_id() }, None, Some(&preflight)).map_err(|error|error.to_string())?;
         }
-        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
+        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler, deadline).await?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
         let initialize_peer_snapshot = peer_snapshot.clone();
@@ -972,7 +982,7 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
         if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
             hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { owner: "lane", caller_task: tokio::task::try_id() }, None, Some(&metadata_authority_preflight)).map_err(|error|error.to_string())?;
         }
-        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
+        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler, deadline).await?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
         let initialize_peer_snapshot = peer_snapshot.clone();
@@ -1345,4 +1355,29 @@ pub(super) async fn run_daemon_dfs_smoke_async(
         return Err(DaemonError::ClusterOrphan);
     };
     Ok(report)
+}
+
+#[cfg(test)]
+mod generation_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preempted_source_refresh_rejoins_after_the_foreground_request() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+        let global = DfsMessageExecutionScope::GlobalExclusive;
+        let held = scheduler.admit(&global).await.unwrap();
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let mut refresh = Box::pin(admit_daemon_dfs_background_generation_refresh(&scheduler, deadline));
+        assert!(poll_fn(|cx| Poll::Ready(refresh.as_mut().poll(cx))).await.is_pending());
+        let mut foreground = Box::pin(admit_daemon_dfs_foreground_message(&scheduler, &global));
+        assert!(poll_fn(|cx| Poll::Ready(foreground.as_mut().poll(cx))).await.is_pending());
+        assert!(poll_fn(|cx| Poll::Ready(refresh.as_mut().poll(cx))).await.is_pending());
+        drop(held);
+        let first = tokio::time::timeout_at(deadline, foreground).await.unwrap().unwrap();
+        drop(first);
+        assert!(refresh.await.is_ok());
+    }
 }

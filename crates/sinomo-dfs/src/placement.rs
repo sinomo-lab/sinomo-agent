@@ -1558,18 +1558,48 @@ pub async fn publish_dfs_content_advertisement_if_needed_async(
         });
     }
     desired.accepts_metadata = false;
-    let key = crate::content_service_key(local_node_id);
-    if let Some(current) = control_plane
-        .get_async(&key)
-        .await?
-        .map(|entry| entry.decode::<DfsNodeAdvertisement>())
-        .transpose()?
-        && dfs_content_advertisement_is_current(&current, &desired)
-    {
+    publish_node_advertisement_if_changed(control_plane, crate::content_service_key(local_node_id), &desired).await
+}
+
+pub(crate) fn advertisement_needs_publication(
+    current: Option<&DfsNodeAdvertisement>,
+    desired: &DfsNodeAdvertisement,
+) -> bool {
+    current.is_none_or(|current| {
+        current.accepts_metadata != desired.accepts_metadata
+            || !crate::placement_environment::advertisement_semantics_equal(current, desired)
+    })
+}
+
+pub(crate) async fn publish_node_advertisement_if_changed(
+    control_plane: &mut dyn AsyncDfsControlPlaneKvClient,
+    key: String,
+    desired: &DfsNodeAdvertisement,
+) -> Result<bool, DfsError> {
+    use sinomo_core::kv::{KvCompare, KvOp, KvTxn};
+
+    let current = control_plane.get_async(&key).await?;
+    let record = current.as_ref().map(|entry| entry.decode::<DfsNodeAdvertisement>()).transpose()?;
+    if !advertisement_needs_publication(record.as_ref(), desired) {
         return Ok(false);
     }
-    publish_dfs_content_advertisement_async(control_plane, local_node_id, desired).await?;
-    Ok(true)
+    let compare = match current {
+        Some(entry) => KvCompare::ValueEquals { key: key.clone(), value: entry.value },
+        None => KvCompare::Missing { key: key.clone() },
+    };
+    let response = control_plane.txn_async(KvTxn {
+        compares: vec![compare],
+        success: vec![KvOp::put_serde(key.clone(), desired, None)?],
+        failure: Vec::new(),
+    }).await?;
+    if response.succeeded { return Ok(true); }
+
+    // Another owner published first. An equivalent sample satisfies this
+    // request. A different sample requires a fresh owner observation.
+    let winner = control_plane.get_async(&key).await?
+        .map(|entry| entry.decode::<DfsNodeAdvertisement>()).transpose()?;
+    if !advertisement_needs_publication(winner.as_ref(), desired) { return Ok(false); }
+    Err(DfsError::Distributed { message: format!("node advertisement {key} changed during publication") })
 }
 
 pub async fn publish_dfs_content_advertisement_async(

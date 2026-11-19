@@ -375,6 +375,26 @@ fn captured_write_reply(
 pub(crate) async fn pause_decoded_write_commit_publication(
     command: &crate::DfsMetadataJournalBatchCommand,
 ) -> Result<(), ServiceError> {
+    // The transport observer cannot inspect streamed metadata requests. Capture
+    // only the identity after the native decoder and signer checks.
+    if command.verify_prefix_only && command.prefix_probe.is_some() {
+        let _ = NATIVE_RPC_CALL_CONTEXT.try_with(|ctx| {
+            let mut event = ctx.observation.clone();
+            if event.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                && command.source_node_id.as_ref() == Some(&event.source)
+                && event
+                    .signer
+                    .as_ref()
+                    .and_then(ServiceSigner::cluster_identity)
+                    .is_some_and(|(node, _)| node == event.source.as_str())
+                && let Some(fabric) = ctx.fabric.upgrade()
+            {
+                event.phase = RpcPhase::Decoded;
+                event.dfs_request_id = Some(command.request_id.clone());
+                fabric.record(event);
+            }
+        });
+    }
     let selected = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
         let Some(fabric) = context.fabric.upgrade() else { return Ok(None); };
         let observation = &context.observation;

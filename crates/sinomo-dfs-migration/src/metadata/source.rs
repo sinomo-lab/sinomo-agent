@@ -271,7 +271,7 @@ pub(super) fn discover(root: &Path) -> Result<SourceInventory> {
     inventory.fingerprint = hash.finalize().to_hex().to_string();
     Ok(inventory)
 }
-/// Current open can create an empty cursor before its first native frame.
+/// An older open can leave a zero cursor or an empty head hint before its first frame.
 /// That bookkeeping is not an original metadata source. All real payload and
 /// acknowledgement evidence, unknown rows and nonzero cursors remain sources.
 pub(super) fn has_migration_source_data(root: &Path) -> Result<bool> {
@@ -286,6 +286,15 @@ pub(super) fn has_migration_source_data(root: &Path) -> Result<bool> {
     }
     let inventory = discover(root)?;
     for file in &inventory.files {
+        if file.relative == Path::new("journal/head.sobj") {
+            let bytes = bounded_document(&root.join(&file.relative), file.len)?;
+            let row = super::source_document::decode_original_document(&bytes)?;
+            if row.as_object().is_some_and(|fields| fields.len() == 1
+                && fields.get("next_sequence").and_then(Value::as_u64) == Some(1))
+            {
+                continue;
+            }
+        }
         if file.relative == Path::new("records/local-materialization/cursor.sobj") {
             let bytes = bounded_document(&root.join(&file.relative), file.len)?;
             let row = super::source_document::decode_original_document(&bytes)?;

@@ -319,6 +319,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_routed_status())
         .register(dfs_remote_shard_write())
         .register(dfs_shard_layout())
+        .register(dfs_prepare_shard_layout())
         .register(dfs_service_advertisements())
         .register(dfs_placement_management())
         .register(dfs_placement_activity())
@@ -393,6 +394,71 @@ sinomo_runtime::test::sinomo_test_case! {
             run_remote_shard_write(ctx)
         }
     }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_prepare_shard_layout(ctx) {
+        id: "cluster.dfs.prepare-shard-layout",
+        summary: "Request six metadata members for each Docker test shard using scoped placement rules",
+        tags: ["cluster-dfs", "docker-setup"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: { prepare_shard_layout(ctx) }
+    }
+}
+
+fn prepare_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let browser = open_local_daemon_sifs_browser(ctx)?;
+    let policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 6)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    // These empty directories are siblings of the workloads. Their rules set
+    // each shard's desired metadata membership without changing file policy.
+    for path in [
+        "/cluster-tests/metadata-layout",
+        "/services/cluster-tests/metadata-layout",
+        "/users/cluster-tests/metadata-layout",
+    ] {
+        browser
+            .create_dir_all(path)
+            .map_err(SinomoTestError::failed)?;
+        let installed = || -> Result<bool, String> {
+            Ok(browser.stat(path)?.placement.is_some_and(|placement| {
+                verify_write_latency_placement(&placement, path, &policy).is_ok()
+            }))
+        };
+        if !installed().map_err(SinomoTestError::failed)? {
+            for attempt in 1..=5 {
+                let preview = browser
+                    .preview_placement(path, Some(policy.clone()), DfsPlacementScope::Subtree)
+                    .map_err(SinomoTestError::failed)?;
+                match browser.update_placement(
+                    path,
+                    Some(policy.clone()),
+                    DfsPlacementScope::Subtree,
+                    preview.preview_token,
+                ) {
+                    Ok(update) => {
+                        update
+                            .require_published()
+                            .map_err(SinomoTestError::failed)?;
+                        break;
+                    }
+                    Err(error) if attempt < 5 && write_latency_preview_can_refresh(&error) => {
+                        continue;
+                    }
+                    Err(error) => return Err(SinomoTestError::failed(error)),
+                }
+            }
+            if !installed().map_err(SinomoTestError::failed)? {
+                return Err(SinomoTestError::failed(format!(
+                    "metadata layout policy is not visible at {path}"
+                )));
+            }
+        }
+        ctx.record(path, &policy);
+    }
+    Ok(SinomoTestOutcome::passed(
+        "requested six metadata members on each shard",
+    ))
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -1545,6 +1611,7 @@ struct DfsShardLayoutProbe {
     file_system_id: String,
     primary_node_id: String,
     replica_node_ids: Vec<String>,
+    write_set: Option<Vec<NodeId>>,
     epoch: u64,
     metadata_protocol_version: u8,
 }
@@ -1606,7 +1673,20 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
         }
+        let key = dfs::metadata_shard_write_set_key(&shard.file_system_id, &shard.shard_id);
+        let state = dfs::metadata_shard_write_set_state(
+            &shard, authority.snapshot().get(&key).map(|entry| entry.value.as_slice()),
+        );
+        let write_set = match state {
+            dfs::DfsMetadataShardWriteSetState::Unswitched => None,
+            dfs::DfsMetadataShardWriteSetState::Switched(record) => Some(record.write_set),
+            dfs::DfsMetadataShardWriteSetState::Stale { reason }
+            | dfs::DfsMetadataShardWriteSetState::Unreadable { reason } => {
+                return Err(SinomoTestError::failed(format!("shard {} write set: {reason}", shard.shard_id)));
+            }
+        };
         layouts.push(DfsShardLayoutProbe {
+            write_set,
             lane,
             base_prefix,
             shard_id: shard.shard_id.to_string(),

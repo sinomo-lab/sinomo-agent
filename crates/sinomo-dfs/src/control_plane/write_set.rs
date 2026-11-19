@@ -925,7 +925,7 @@ pub fn build_metadata_write_set_recruit(
     });
     let mut shard = cut.shard.clone();
     shard.replica_node_ids.push(node_id.clone());
-    change_request(cut, request_id, compares, next, Some(shard), Vec::new())
+    change_membership(cut, request_id, compares, next, shard)
 }
 
 /// Raise the shard's accepted content W to `w`, so its effective N is at
@@ -1022,9 +1022,20 @@ pub fn build_metadata_write_set_remove(
         .retain(|node| !node_ids.contains(node));
     // The W floor comes from the placement rules in the filesystem
     // configuration.
-    let mut compares = vec![handoff_missing(cut)?, cut.file_system_config_compare()];
-    // A head watermark that acknowledges a removed member could not be
-    // normalized against the reduced configuration again.
+    let compares = vec![handoff_missing(cut)?, cut.file_system_config_compare()];
+    change_membership(cut, request_id, compares, next, shard)
+}
+
+fn change_membership(
+    cut: &DfsMetadataShardRecordCut,
+    request_id: KvRequestId,
+    mut compares: Vec<KvCompare>,
+    next: DfsMetadataShardWriteSet,
+    shard: DfsMetadataShardConfig,
+) -> Result<DfsMetadataWriteSetChangeRequest, KvError> {
+    // Membership changes within this epoch. An old head watermark can name a
+    // removed member or have fewer ACKs than the expanded ring's quorum.
+    // Retire it only in the CAS that installs the new configuration.
     compares.push(exact_compare(
         cut.key(metadata_shard_head_watermark_key),
         cut.watermark_value.as_ref(),
@@ -1128,6 +1139,7 @@ pub(crate) fn metadata_write_set_after_takeover(
     )?;
     write_set.epoch = next.epoch;
     write_set.primary_node_id = next.primary_node_id.clone();
+    write_set.substitutes.retain(|member| member.node_id != next.primary_node_id);
     write_set.write_set.retain(|node| node != previous_primary);
     write_set.epoch_start = Some(epoch_start.clone());
     Ok(write_set)
@@ -1196,6 +1208,9 @@ pub(crate) fn metadata_write_set_after_handoff(
     )?;
     next.epoch = desired.epoch;
     next.primary_node_id = desired.primary_node_id.clone();
+    // Recruitment history ranks substitute replicas. Promotion ends that
+    // role even though this member remains in the write set.
+    next.substitutes.retain(|member| member.node_id != desired.primary_node_id);
     if !next.contains(&desired.primary_node_id) {
         next.write_set.push(desired.primary_node_id.clone());
         next.write_set.sort();

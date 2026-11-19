@@ -292,9 +292,36 @@ pub enum DfsWriteResult {
 pub struct DfsDistributedWritePatch {
     pub base_content_hash: String,
     pub base_size_bytes: u64,
+    /// Logical offsets and lengths of successive slices of the packed attachment.
+    /// An empty list is the original contiguous patch encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<(u64, u64)>,
     pub offset: u64,
     pub patch_hash: String,
     pub patch_size_bytes: u64,
+}
+
+impl DfsDistributedWritePatch {
+    pub(crate) fn valid_ranges(&self) -> bool {
+        if self.ranges.is_empty() {
+            return self.offset <= self.base_size_bytes
+                && self.offset.checked_add(self.patch_size_bytes).is_some();
+        }
+        let mut end = 0;
+        let mut total = 0u64;
+        for &(offset, size) in &self.ranges {
+            if size == 0 || offset < end || offset > end.max(self.base_size_bytes) {
+                return false;
+            }
+            let (Some(next), Some(length)) = (offset.checked_add(size), total.checked_add(size))
+            else {
+                return false;
+            };
+            end = next;
+            total = length;
+        }
+        self.ranges[0].0 == self.offset && total == self.patch_size_bytes
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

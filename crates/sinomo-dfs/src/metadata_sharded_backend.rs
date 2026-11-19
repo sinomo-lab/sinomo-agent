@@ -2245,8 +2245,11 @@ impl LocalMetadataShardSlot {
         self.open_mode != LocalMetadataShardOpenMode::ReplicaRepair
     }
 
-    fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(), self.native_catalog.as_ref(), false).map(Box::new)
+    fn open_backend(&self, try_writer: bool) -> Result<Box<LocalSobjMetadataBackend>> {
+        open_local_metadata_shard_backend(
+            &self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone(),
+            self.native_catalog.as_ref(), try_writer,
+        ).map(Box::new)
     }
 
     fn backend(&self) -> Result<&LocalSobjMetadataBackend> {
@@ -2258,7 +2261,7 @@ impl LocalMetadataShardSlot {
                 ))
             })?;
             if self.backend.get().is_none() {
-                let backend = self.open_backend()?;
+                let backend = self.open_backend(false)?;
                 self.backend
                     .set(backend)
                     .expect("metadata shard initialization lock admits one backend");
@@ -2272,8 +2275,12 @@ impl LocalMetadataShardSlot {
     }
 
     fn backend_mut(&mut self) -> Result<&mut LocalSobjMetadataBackend> {
+        self.backend_mut_with_writer(false)
+    }
+
+    fn backend_mut_with_writer(&mut self, try_writer: bool) -> Result<&mut LocalSobjMetadataBackend> {
         if self.backend.get().is_none() {
-            let backend = self.open_backend()?;
+            let backend = self.open_backend(try_writer)?;
             self.backend
                 .set(backend)
                 .expect("exclusive metadata shard slot initialization succeeds");
@@ -2711,7 +2718,7 @@ impl LocalShardedMetadataBackend {
                             // checkout's: the router still serves its other
                             // shards, and a read routed to it meets the refusal.
                             if let Some(backend) =
-                                slot.storage_closure.observe_open(slot.open_backend())?
+                                slot.storage_closure.observe_open(slot.open_backend(false))?
                             {
                                 slot.backend.set(backend).expect(
                                     "new metadata shard slot accepts eager backend initialization",
@@ -2971,18 +2978,27 @@ impl LocalShardedMetadataBackend {
     fn begin_consistent_read_snapshot_for_shards(
         &mut self,
         shard_ids: &[DfsMetadataShardId],
-    ) -> Result<()> {
+        try_writer: bool,
+    ) -> Result<bool> {
         #[cfg(test)]
         SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS
             .with(|observed| observed.borrow_mut().extend_from_slice(shard_ids));
         for (index, shard_id) in shard_ids.iter().enumerate() {
-            let begin = self
+            let slot = self
                 .shards
                 .get_mut(shard_id)
-                .expect("routed consistent-read shard remains installed")
-                .backend_mut()
-                .and_then(LocalSobjMetadataBackend::begin_consistent_read_snapshot);
-            if let Err(error) = begin {
+                .expect("routed consistent-read shard remains installed");
+            let begin = if try_writer {
+                // Lazy slots use the same nonblocking physical open as native
+                // ingress. A busy shard cannot strand the already pinned set.
+                slot.backend_mut_with_writer(true)
+                    .and_then(LocalSobjMetadataBackend::try_begin_consistent_read_snapshot)
+            } else {
+                slot.backend_mut()
+                    .and_then(LocalSobjMetadataBackend::begin_consistent_read_snapshot)
+                    .map(|()| true)
+            };
+            if !matches!(begin, Ok(true)) {
                 for pinned_shard_id in &shard_ids[..index] {
                     self.shards
                         .get_mut(pinned_shard_id)
@@ -2991,10 +3007,10 @@ impl LocalShardedMetadataBackend {
                         .expect("pinned consistent-read shard was opened")
                         .end_consistent_read_snapshot();
                 }
-                return Err(error);
+                return begin;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn end_consistent_read_snapshot_for_shards(&mut self, shard_ids: &[DfsMetadataShardId]) {
@@ -4849,7 +4865,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
         let shard_ids = self.shards.scanned_ids()?;
-        self.begin_consistent_read_snapshot_for_shards(&shard_ids)
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids, false).map(drop)
+    }
+
+    fn try_begin_consistent_read_snapshot(&mut self) -> Result<bool> {
+        let shard_ids = self.shards.scanned_ids()?;
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids, true)
     }
 
     fn begin_stat_read_snapshot(&mut self) -> Result<()> {
@@ -4911,7 +4932,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 "read snapshot names an unavailable shard".into(),
             ));
         }
-        self.begin_consistent_read_snapshot_for_shards(std::slice::from_ref(shard_id))
+        self.begin_consistent_read_snapshot_for_shards(std::slice::from_ref(shard_id), false).map(drop)
     }
 
     fn end_consistent_read_snapshot_on_shard(&mut self, shard_id: &DfsMetadataShardId) {
@@ -4933,7 +4954,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         path: &str,
     ) -> Result<()> {
         let shard_ids = self.consistent_read_shard_ids_for_path(file_system_id, path)?;
-        self.begin_consistent_read_snapshot_for_shards(&shard_ids)
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids, false).map(|_| ())
     }
 
     fn end_consistent_read_snapshot_for_path(

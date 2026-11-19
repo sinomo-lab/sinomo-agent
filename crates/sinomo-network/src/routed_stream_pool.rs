@@ -702,6 +702,16 @@ fn reusable_pooled_client(
     Some(client)
 }
 
+// Both checks precede the logical open carrying this caller's application
+// bytes. A replaced local dispatcher invalidates the carrier selection.
+fn dispatcher_changed_before_open() -> NetworkError {
+    NetworkError::delivery_failed(
+        "open pooled routed stream",
+        crate::NetworkDeliveryState::DefinitelyNotSent,
+        "local reverse dispatcher changed during carrier establishment",
+    )
+}
+
 fn current_pooled_client<G>(
     key: &PoolKey,
     current_generation: &G,
@@ -711,9 +721,7 @@ where
 {
     let validate = || {
         if registered_routed_stream_incoming_token(&key.local_node_id) != key.local_dispatcher {
-            return Err(NetworkError::Directory {
-                detail: "local reverse dispatcher changed during carrier establishment".into(),
-            });
+            return Err(dispatcher_changed_before_open());
         }
         let observed = current_generation();
         if observed != key.route_compatibility_generation {
@@ -1049,10 +1057,7 @@ where
                             if registered_routed_stream_incoming_token(&key.local_node_id)
                                 != key.local_dispatcher
                             {
-                                return Err(NetworkError::Directory {
-                        detail: "local reverse dispatcher changed during carrier establishment"
-                            .into(),
-                    });
+                                return Err(dispatcher_changed_before_open());
                             }
                             if carrier.local_node_id != key.local_node_id
                                 || carrier.peer_node_id != key.peer_node_id
@@ -2437,7 +2442,10 @@ mod tests {
             // publication whose key no longer belongs to this caller.
             admission.published.notify_waiters();
             let outcome = std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx))).await;
-            if matches!(invalid, "dispatcher" | "generation") {
+            if invalid == "dispatcher" {
+                assert!(matches!(outcome, Poll::Ready(Err(error))
+                    if error.delivery_state() == Some(crate::NetworkDeliveryState::DefinitelyNotSent)));
+            } else if invalid == "generation" {
                 assert!(
                     matches!(outcome, Poll::Ready(Err(NetworkError::Directory { .. }))),
                     "{invalid}"
@@ -3127,7 +3135,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(NetworkError::Directory { .. })));
+        assert!(matches!(result, Err(error) if error.delivery_state() == Some(crate::NetworkDeliveryState::DefinitelyNotSent)));
         assert_eq!(retire_pooled_routed_streams(&scope).await, 0);
     }
 
