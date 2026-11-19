@@ -309,7 +309,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent_id: actual_intent_id.clone(),
                     write_operation_id: command.request_id.clone(),
                 },
-                crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                crate::DFS_NO_CALLER_BUDGET,
                 false,
                 false,
             )?;

@@ -2154,12 +2154,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     pin_transfer_id,
                 )?;
                 let metadata_target = self.capture_metadata_quorum_sync_target(transfer_object)?;
-                self.sync_metadata_shard_to_quorum(
-                    &metadata_target,
-                    crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
-                )
-                .map(drop)
-                .map_err(DfsPosixError::from)
+                self.sync_metadata_shard_to_quorum(&metadata_target, None)
+                    .map(drop)
+                    .map_err(DfsPosixError::from)
             }
         }
     }

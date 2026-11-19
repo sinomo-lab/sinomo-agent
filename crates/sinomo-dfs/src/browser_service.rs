@@ -662,30 +662,31 @@ pub fn dfs_browser_backend_open_count(data_dir: &SinomoDataDir) -> usize {
 const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 const DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const DAEMON_DFS_BROWSER_STAT_CACHE_MAX_ENTRIES: usize = 256;
-const DAEMON_DFS_BROWSER_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn finish_placement_configuration_visibility(
     backend: &DfsBrowserBackend,
     mut response: crate::DaemonDfsBrowserPlacementUpdateResponse,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
 ) -> crate::DaemonDfsBrowserPlacementUpdateResponse {
     use crate::DfsPlacementConfigurationVisibility as Visibility;
-    let visibility = if tokio::time::Instant::now() >= deadline {
+    let visibility = if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
         Visibility::Pending {
             detail: "original Apply deadline elapsed before configuration visibility was confirmed"
                 .into(),
         }
     } else {
-        match tokio::time::timeout_at(
-            deadline,
+        let published =
             backend
                 .host
                 .placement_configuration_published(sinomo_core::kv::KvRevision(
                     response.committed_revision,
-                )),
-        )
-        .await
-        {
+                ));
+        // Without a caller deadline the wait ends on the publication itself.
+        let published = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, published).await,
+            None => Ok(published.await),
+        };
+        match published {
             Ok(Ok(())) => Visibility::Published,
             Ok(Err(error)) => Visibility::Pending {
                 detail: error.to_string(),
@@ -2367,8 +2368,9 @@ impl Service for HostedDfsBrowserService {
                         sinomo_module::ModuleRouteAuth::LocalCommand.as_scope()
                     })
                     .require_capability("daemon.dfs.browser")
-                    .with_concurrency_limit(4)
-                    .with_timeout(DAEMON_DFS_BROWSER_ROUTE_TIMEOUT);
+                    // No route timeout: a browser request is bounded in
+                    // time only by a budget its caller sends with it.
+                    .with_concurrency_limit(4);
                 if path_access {
                     descriptor = descriptor.require_capability(crate::SIFS_PATH_ACCESS_CAPABILITY);
                 }
@@ -3083,19 +3085,21 @@ impl Service for HostedDfsBrowserService {
                     let received_at = tokio::time::Instant::now();
                     let payload: crate::DaemonDfsBrowserPlacementUpdateV2Request =
                         ctx.decode_request_body(&request).await?;
-                    let budget = payload
+                    // The caller's remaining budget, captured once at ingress.
+                    // A caller that sent none has no deadline here.
+                    let deadline = payload
                         .timeout_millis
                         .map(Duration::from_millis)
-                        .unwrap_or(DAEMON_DFS_BROWSER_ROUTE_TIMEOUT)
-                        .min(DAEMON_DFS_BROWSER_ROUTE_TIMEOUT);
-                    let deadline = received_at + budget;
+                        .and_then(|budget| received_at.checked_add(budget));
                     let changed_path = payload.path.clone();
                     let result = run_blocking_browser_task(
                         Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser placement update v2",
                         move || {
-                            if tokio::time::Instant::now() >= deadline {
+                            if deadline
+                                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                            {
                                 return Err(dfs_browser_service_error(
                                     "Apply deadline elapsed before the placement mutation",
                                 ));

@@ -159,6 +159,22 @@ pub(crate) struct DfsMutationScheduler {
     maintenance_interest_count: AtomicUsize,
     foreground_generation: Arc<crate::service_state::DfsCancellationGeneration>,
     foreground_notify: tokio::sync::Notify,
+    /// Counts the admissions this scheduler's work has released. Work that
+    /// yielded to foreground work waits here for that work to finish.
+    admission_releases: tokio::sync::watch::Sender<u64>,
+}
+
+/// The scheduler an admission came from. Dropping it, as the last step of
+/// releasing that admission, announces the release.
+#[derive(Debug)]
+pub(crate) struct DfsAdmissionRelease(Arc<DfsMutationScheduler>);
+
+impl Drop for DfsAdmissionRelease {
+    fn drop(&mut self) {
+        self.0
+            .admission_releases
+            .send_modify(|releases| *releases = releases.wrapping_add(1));
+    }
 }
 
 impl Default for DfsMutationScheduler {
@@ -181,7 +197,15 @@ impl DfsMutationScheduler {
             maintenance_interest_count: AtomicUsize::new(0),
             foreground_generation: Arc::default(),
             foreground_notify: tokio::sync::Notify::new(),
+            admission_releases: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Follow the releases of this scheduler's admissions. Work that yielded
+    /// to foreground work subscribes before it yields; the next change is the
+    /// earliest moment that foreground work can have finished.
+    pub(crate) fn subscribe_admission_releases(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.admission_releases.subscribe()
     }
 
     pub fn begin_maintenance_interest(self: &Arc<Self>) -> DfsMaintenanceForegroundPreemption {
@@ -241,7 +265,7 @@ impl DfsMutationScheduler {
         let global = Arc::clone(&self.global).try_write_owned().ok()?;
         let answers = self.answers.try_hold()?;
         Some(DfsMutationAdmission::Global {
-            _scheduler: Arc::clone(self),
+            _scheduler: DfsAdmissionRelease(Arc::clone(self)),
             _answers: answers,
             _global: global,
         })
@@ -253,7 +277,7 @@ impl DfsMutationScheduler {
         // node; no new answer starts until it releases.
         let answers = self.answers.hold().await;
         DfsMutationAdmission::Global {
-            _scheduler: Arc::clone(self),
+            _scheduler: DfsAdmissionRelease(Arc::clone(self)),
             _answers: answers,
             _global: global,
         }
@@ -336,7 +360,7 @@ impl DfsMutationScheduler {
             }
         };
         Ok(DfsMutationAdmission::ExactShard {
-            _scheduler: Arc::clone(self),
+            _scheduler: DfsAdmissionRelease(Arc::clone(self)),
             _global: DfsExactGlobalAdmission::Read(global),
             _shard: shard,
         })
@@ -395,7 +419,7 @@ impl DfsMutationScheduler {
                 Ok(shards) => match Arc::clone(&self.global).try_read_owned() {
                     Ok(global) => {
                         return Ok(DfsMutationAdmission::ExactShards {
-                            _scheduler: Arc::clone(self),
+                            _scheduler: DfsAdmissionRelease(Arc::clone(self)),
                             _global: global,
                             _shards: shards,
                             keys,
@@ -409,7 +433,7 @@ impl DfsMutationScheduler {
                         match take_all(None)? {
                             Ok(shards) => {
                                 return Ok(DfsMutationAdmission::ExactShards {
-                                    _scheduler: Arc::clone(self),
+                                    _scheduler: DfsAdmissionRelease(Arc::clone(self)),
                                     _global: global,
                                     _shards: shards,
                                     keys,
@@ -466,7 +490,7 @@ impl DfsMutationScheduler {
         let answer = self.answers.enter().await;
         trace_dfs_admission_gate(self, scope, "peer-answer", gate_started);
         Ok(DfsMutationAdmission::ExactShard {
-            _scheduler: Arc::clone(self),
+            _scheduler: DfsAdmissionRelease(Arc::clone(self)),
             _global: DfsExactGlobalAdmission::Answer(answer),
             _shard: shard,
         })
@@ -615,22 +639,23 @@ fn trace_dfs_admission_gate(
 #[derive(Debug)]
 pub(crate) enum DfsMutationAdmission {
     ReadOnly {
+        // A read holds no lane, so its end releases nothing a writer waits for.
         _scheduler: Arc<DfsMutationScheduler>,
     },
     ExactShard {
-        _scheduler: Arc<DfsMutationScheduler>,
+        _scheduler: DfsAdmissionRelease,
         _global: DfsExactGlobalAdmission,
         _shard: tokio::sync::OwnedSemaphorePermit,
     },
     Global {
-        _scheduler: Arc<DfsMutationScheduler>,
+        _scheduler: DfsAdmissionRelease,
         // Released in reverse of acquisition: the answer gate, then the lock.
         _answers: DfsAnswerWriterHold,
         _global: tokio::sync::OwnedRwLockWriteGuard<()>,
     },
     /// Several shard lanes taken at once by [`DfsMutationScheduler::admit_shards`].
     ExactShards {
-        _scheduler: Arc<DfsMutationScheduler>,
+        _scheduler: DfsAdmissionRelease,
         _global: tokio::sync::OwnedRwLockReadGuard<()>,
         _shards: Vec<tokio::sync::OwnedSemaphorePermit>,
         keys: Vec<DfsMutationLaneKey>,
@@ -662,10 +687,10 @@ impl DfsMutationAdmission {
 
     pub(crate) fn scheduler(&self) -> Arc<DfsMutationScheduler> {
         match self {
-            Self::ReadOnly { _scheduler }
-            | Self::ExactShard { _scheduler, .. }
+            Self::ReadOnly { _scheduler } => Arc::clone(_scheduler),
+            Self::ExactShard { _scheduler, .. }
             | Self::Global { _scheduler, .. }
-            | Self::ExactShards { _scheduler, .. } => Arc::clone(_scheduler),
+            | Self::ExactShards { _scheduler, .. } => Arc::clone(&_scheduler.0),
         }
     }
 }

@@ -479,6 +479,53 @@ fn native_served_commit_ends_when_its_requesters_own_budget_does() {
     runtime.close().unwrap();
 }
 
+/// Longer than every default deadline DFS used to add to a request: 45 s for
+/// a POSIX commit, 50 s for a sync and 60 s for a routed namespace request.
+const SLOWER_THAN_EVERY_REMOVED_DEFAULT: Duration = Duration::from_secs(65);
+
+/// A requester without a budget and a member that is slow but reachable: the
+/// commit waits for the member for longer than any deadline DFS used to add,
+/// nothing times out, and it commits when the member answers.
+#[test]
+fn native_commit_without_a_budget_waits_for_a_slow_member() {
+    let (runtime, config, held_member, requester) = serving("native-budget-none");
+    let served = Served::observe(&runtime, &config, &requester);
+    let started = Instant::now();
+    let write = write_from(
+        &runtime,
+        &config,
+        &requester,
+        "/services/no-budget.txt",
+        "no-budget",
+        Requester::default(),
+    );
+    let gate = served.hold_member(&runtime, &config, &held_member);
+    assert!(
+        write
+            .recv_timeout(SLOWER_THAN_EVERY_REMOVED_DEFAULT)
+            .is_err(),
+        "nothing ends a commit that waits for a slow, reachable member"
+    );
+    assert!(lane_held(&runtime, &config), "the primary still serves it");
+    served.events_are(
+        &runtime,
+        &config,
+        &["execute"],
+        "the one attempt is still the only one",
+    );
+    runtime.clear_faults();
+    release(&gate);
+    let outcome = write
+        .recv_timeout(EVENT_BOUND)
+        .expect("the write ends when its member answers");
+    assert!(
+        outcome.is_ok(),
+        "the slow member's answer commits the write: {outcome:?}"
+    );
+    assert!(started.elapsed() >= SLOWER_THAN_EVERY_REMOVED_DEFAULT);
+    runtime.close().unwrap();
+}
+
 /// A response-retry-safe request whose stream breaks in the middle of its
 /// commit is replayed inside the requester's budget. The first attempt's
 /// handler is dropped with its stream, so its served wait ends and its

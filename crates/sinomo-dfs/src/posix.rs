@@ -224,8 +224,12 @@ fn touch_directory_for_batched_child(directory: &mut DfsObjectMetadata, advance_
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
 const POSIX_WAIT_FOR_COMMIT_STAGE_MAX_TARGETS_PER_PASS: usize = 1;
-const POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP: Duration = Duration::from_millis(10);
-const POSIX_WAIT_FOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(45);
+/// A waiting write re-drives its own unfinished stages on this timer, doubling
+/// to the network layer's liveness interval. The timer only re-sends: the wait
+/// itself ends on the write's outcome, the caller's deadline or cancellation.
+const POSIX_WAIT_FOR_COMMIT_STAGE_RESEND_FIRST: Duration = Duration::from_millis(250);
+const POSIX_WAIT_FOR_COMMIT_STAGE_RESEND_MAX: Duration =
+    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
 const POSIX_LIST_DIR_COLLECT_PAGE_SIZE: usize = 4096;
 const POSIX_LINK_COUNT_PAGE_SIZE: usize = 4096;
 const POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS: usize = 512;
@@ -242,11 +246,14 @@ const POSIX_BULK_PARENT_RETRY_ATTEMPTS: usize = 3;
 /// response replay has not yet surfaced the mutation locally.
 pub(crate) const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 /// Whole-file POSIX writes are blind overwrites, not user-supplied CAS writes.
-/// If another service instance is already committing, wait for that intent to
-/// settle, refresh from the backend, and retry against the new current version.
-/// The caller's transport deadline remains authoritative; callers without one
-/// use the same bounded wait as foreground commit settlement.
-const POSIX_WRITE_SERIALIZATION_RETRY_IDLE_SLEEP: Duration = Duration::from_millis(10);
+/// If another writer is already committing, the write is re-sent against the
+/// new current version once that intent has settled. Nothing announces a
+/// remote intent settling to this caller, so the re-send runs on a timer,
+/// doubling to the network layer's liveness interval. Only the caller's
+/// deadline or cancellation ends the retries.
+const POSIX_WRITE_SERIALIZATION_RESEND_FIRST: Duration = Duration::from_millis(10);
+const POSIX_WRITE_SERIALIZATION_RESEND_MAX: Duration =
+    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
 /// Budget for an authoritative path lookup or the best-effort freshness pull
 /// used after that lookup cannot answer. These requests share the serialized
 /// namespace lane with durable mutations, so the budget must tolerate bounded
@@ -382,26 +389,14 @@ enum PosixWriteCommit {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Run one POSIX commit. A commit adds no deadline of its own: the
+    /// operation deadline its caller installed, if any, is the only bound in
+    /// time, and it travels with every request the commit sends.
     fn with_posix_commit_operation_deadline<R>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
-        let requested_deadline = Instant::now() + POSIX_WAIT_FOR_COMMIT_TIMEOUT;
-        let observed_previous_deadline = self.transport.operation_deadline();
-        let replaced_previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
-        let effective_deadline = previous_deadline
-            .map(|deadline| deadline.min(requested_deadline))
-            .unwrap_or(requested_deadline);
-        if effective_deadline != requested_deadline {
-            self.transport
-                .set_operation_deadline(Some(effective_deadline));
-        }
-        let result = operation(self);
-        self.transport.set_operation_deadline(previous_deadline);
-        result
+        operation(self)
     }
 
     /// Retry the waiting write's own unfinished stages, bounded when the
@@ -436,15 +431,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(outcome);
         };
         let mut intent_id = intent_id.clone();
-        let started_at = Instant::now();
+        // Only the caller's deadline bounds the settle in time. Without one it
+        // ends on the write's outcome, a definite failure or cancellation.
         let caller_deadline = self.transport.operation_deadline();
-        let settle_deadline = caller_deadline
-            .map(|deadline| deadline.min(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT))
-            .unwrap_or(started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT);
+        let deadline_passed = || caller_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        // Cancellation wakes the wait below at once.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
+        let mut stage_resend = POSIX_WAIT_FOR_COMMIT_STAGE_RESEND_FIRST;
+        let mut next_stage_resend = Instant::now() + stage_resend;
         let mut outcome = outcome;
         let mut ready_drains = 0;
         loop {
-            if Instant::now() >= settle_deadline {
+            if deadline_passed() {
                 self.compact_pending_routed_write(&intent_id);
                 return Ok(outcome);
             }
@@ -482,14 +487,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(outcome);
             }
             // Before W the write is not committed and has no repair need: it
-            // retries only its own stages, as part of the write protocol,
-            // bounded by any caller deadline.
-            if foreground_replica_repair && Instant::now() < settle_deadline {
+            // re-sends only its own stages, as part of the write protocol, on
+            // the re-send timer.
+            if foreground_replica_repair
+                && !deadline_passed()
+                && Instant::now() >= next_stage_resend
+            {
                 self.retry_own_stages_reporting_failure(
                     &intent_id,
                     caller_deadline.is_some(),
                     &mut events,
                 );
+                stage_resend = stage_resend
+                    .saturating_mul(2)
+                    .min(POSIX_WAIT_FOR_COMMIT_STAGE_RESEND_MAX);
+                next_stage_resend = Instant::now() + stage_resend;
             }
             // Re-scheduled repairs alone are not progress: on a degraded cluster
             // every retry fails fast and reschedules, and treating that churn as
@@ -497,13 +509,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // write). Only incoming events skip the pacing wait — which wakes
             // early on arrival, so healthy-path settle latency is unchanged.
             if events.is_empty() || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
-                let now = Instant::now();
-                if now >= settle_deadline {
+                if deadline_passed() {
                     self.compact_pending_routed_write(&intent_id);
                     return Ok(outcome);
                 }
-                let wait = POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP
-                    .min(settle_deadline.saturating_duration_since(now));
+                // An arrival or cancellation wakes this wait. Its length is
+                // only when the next re-send is due, or the caller's deadline.
+                let now = Instant::now();
+                let mut wait = if foreground_replica_repair {
+                    next_stage_resend.saturating_duration_since(now)
+                } else {
+                    POSIX_WAIT_FOR_COMMIT_STAGE_RESEND_MAX
+                };
+                if let Some(deadline) = caller_deadline {
+                    wait = wait.min(deadline.saturating_duration_since(now));
+                }
                 if let Err(error) = self.transport.wait_for_incoming(wait) {
                     self.compact_pending_routed_write(&intent_id);
                     return Err(DfsError::from_network(error));
@@ -3414,20 +3434,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(operation_id) = operation_id.as_deref() {
             crate::service_routed_write::validate_write_operation_id(operation_id)?;
         }
-        let started_at = Instant::now();
-        let requested_deadline = started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT;
-        let observed_previous_deadline = self.transport.operation_deadline();
-        let replaced_previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
-        let write_deadline = previous_deadline
-            .map(|deadline| deadline.min(requested_deadline))
-            .unwrap_or(requested_deadline);
-        if write_deadline != requested_deadline {
-            self.transport.set_operation_deadline(Some(write_deadline));
-        }
-        let result = (|| {
+        // The caller's operation deadline, if it installed one, is the only
+        // bound in time on the write and on its serialization retries.
+        let write_deadline = self.transport.operation_deadline();
+        let mut resend = POSIX_WRITE_SERIALIZATION_RESEND_FIRST;
+        {
             loop {
                 // Resolution, parent validation, and terminal lookup overlap
                 // heavily for a single write. Reuse their exact observations
@@ -3470,21 +3481,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         // attempt; the retry must plan from fresh observations.
                         self.clear_metadata_lookup_cache();
                         let now = Instant::now();
-                        if now >= write_deadline {
+                        if write_deadline.is_some_and(|deadline| now >= deadline) {
                             return Err(error);
                         }
-                        std::thread::sleep(
-                            POSIX_WRITE_SERIALIZATION_RETRY_IDLE_SLEEP
-                                .min(write_deadline.saturating_duration_since(now)),
-                        );
+                        let wait = write_deadline.map_or(resend, |deadline| {
+                            resend.min(deadline.saturating_duration_since(now))
+                        });
+                        self.wait_for_resend(wait);
+                        resend = resend
+                            .saturating_mul(2)
+                            .min(POSIX_WRITE_SERIALIZATION_RESEND_MAX);
                         self.hydrate_from_metadata_backend()?;
                     }
                     Err(error) => return Err(error),
                 }
             }
-        })();
-        self.transport.set_operation_deadline(previous_deadline);
-        result
+        }
     }
 
     fn posix_write_file_bytes_checked_parent_once(

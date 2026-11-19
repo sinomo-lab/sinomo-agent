@@ -560,9 +560,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn wait_for_stable_write_reconciliation(
         &mut self,
         request_id: &str,
-        timeout: std::time::Duration,
+        deadline: Option<std::time::Instant>,
     ) -> Result<DfsStableWriteOperationReconciliation, DfsError> {
-        let started = std::time::Instant::now();
+        // The probe ends on the authority's answer, on the network's verdict
+        // for its send (an error from processing incoming work), on
+        // cancellation, or at the caller's deadline if it set one.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         loop {
             self.process_incoming()?;
             if let Some(result) = self
@@ -575,7 +585,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .remove(request_id);
                 return Ok(result);
             }
-            if started.elapsed() >= timeout {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 self.writes
                     .stable_write_reconciliation_targets
                     .remove(request_id);
@@ -586,9 +596,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             self.check_cancelled("stable write reconciliation")?;
-            let remaining = timeout.saturating_sub(started.elapsed());
+            let wait = deadline.map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            });
             self.transport
-                .wait_for_incoming(std::time::Duration::from_millis(10).min(remaining))
+                .wait_for_incoming(wait)
                 .map_err(DfsError::from_network)?;
         }
     }
@@ -684,7 +696,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        self.wait_for_stable_write_reconciliation(&request_id, std::time::Duration::from_secs(5))
+        self.wait_for_stable_write_reconciliation(&request_id, self.transport.operation_deadline())
     }
 
     /// Read-only stable-create reconciliation convenience. The object identity

@@ -1376,7 +1376,7 @@ mod atomic_namespace_tests {
     }
 
     #[test]
-    fn rmdir_installs_and_restores_the_commit_deadline() {
+    fn rmdir_runs_under_the_callers_deadline_and_adds_none() {
         let node =
             crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-rmdir-deadline", 1)
                 .remove(0);
@@ -1386,31 +1386,37 @@ mod atomic_namespace_tests {
         runtime.start_nodes().unwrap();
         let mut service = runtime.client(&node).unwrap();
         service.posix_mkdir("/services/rmdir-deadline").unwrap();
+        service.posix_mkdir("/services/rmdir-budget").unwrap();
+        // A caller without a budget: the commit installs no deadline.
         assert_eq!(service.transport.operation_deadline(), None);
-        let started = Instant::now();
-        let mut installed = None;
         service
             .with_posix_commit_operation_deadline(|service| {
-                installed = service.transport.operation_deadline();
-                // Invoke the actual ordinary namespace mutation. Its nested scope
-                // must preserve the current caller deadline and restore that scope.
+                assert_eq!(service.transport.operation_deadline(), None);
                 service.posix_rmdir("/services/rmdir-deadline")?;
-                assert_eq!(service.transport.operation_deadline(), installed);
+                assert_eq!(service.transport.operation_deadline(), None);
                 Ok(())
             })
             .unwrap();
-        let installed = installed.expect("normal caller deadline was installed");
-        assert!(installed > started + Duration::from_secs(40));
-        assert!(installed <= started + Duration::from_secs(46));
-        assert_eq!(
-            service.transport.operation_deadline(),
-            None,
-            "normal caller scope restored"
-        );
-        assert!(matches!(
-            service.posix_lstat_distributed("/services/rmdir-deadline"),
-            Err(DfsPosixError::NotFound { .. })
-        ));
+        assert_eq!(service.transport.operation_deadline(), None);
+        // A caller's own budget is the commit's deadline, unchanged.
+        let budget = Instant::now() + Duration::from_secs(120);
+        service.transport.set_operation_deadline(Some(budget));
+        service
+            .with_posix_commit_operation_deadline(|service| {
+                assert_eq!(service.transport.operation_deadline(), Some(budget));
+                service.posix_rmdir("/services/rmdir-budget")?;
+                assert_eq!(service.transport.operation_deadline(), Some(budget));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(service.transport.operation_deadline(), Some(budget));
+        service.transport.set_operation_deadline(None);
+        for removed in ["/services/rmdir-deadline", "/services/rmdir-budget"] {
+            assert!(matches!(
+                service.posix_lstat_distributed(removed),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
         drop(service);
         runtime.close().unwrap();
     }

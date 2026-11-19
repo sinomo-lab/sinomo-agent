@@ -1187,9 +1187,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn wait_for_stable_namespace_reconciliation(
         &mut self,
         request_id: &str,
-        timeout: std::time::Duration,
+        deadline: Option<std::time::Instant>,
     ) -> Result<DfsStableNamespaceOperationReconciliation, DfsError> {
-        let started = std::time::Instant::now();
+        // The probe ends on the authority's answer, on the network's verdict
+        // for its send (an error from processing incoming work), on
+        // cancellation, or at the caller's deadline if it set one.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         loop {
             self.process_incoming()?;
             if let Some(result) = self
@@ -1200,7 +1210,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .remove(request_id);
                 return Ok(result);
             }
-            if started.elapsed() >= timeout {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 self.stable_namespace_reconciliation_targets
                     .remove(request_id);
                 return Ok(
@@ -1212,9 +1222,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
             self.check_cancelled("stable namespace reconciliation")?;
-            let remaining = timeout.saturating_sub(started.elapsed());
+            let wait = deadline.map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            });
             self.transport
-                .wait_for_incoming(std::time::Duration::from_millis(10).min(remaining))
+                .wait_for_incoming(wait)
                 .map_err(DfsError::from_network)?;
         }
     }
@@ -1299,7 +1311,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let reconciliation = self.wait_for_stable_namespace_reconciliation(
             &request_id,
-            std::time::Duration::from_secs(5),
+            self.transport.operation_deadline(),
         )?;
         if let DfsStableNamespaceOperationReconciliation::Applied { receipt } = &reconciliation {
             let command = DfsNamespaceCommand {
@@ -3356,7 +3368,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     file_system_id,
                     self.node_id.clone(),
                     operation,
-                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                    DFS_NO_CALLER_BUDGET,
                     false,
                     false,
                 )
@@ -3895,7 +3907,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id,
             root_path,
             cursors,
-            DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+            DFS_NO_CALLER_BUDGET,
         )
     }
 
@@ -3904,8 +3916,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         root_path: &str,
         cursors: &[DfsNamespaceChangeCursor],
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Vec<DfsNamespaceChangeBatch>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         let root_path = posix_path::normalize_posix_path(root_path)
             .map_err(dfs_error_from_posix_namespace_sync)?;
         if self.control_plane.is_none() {
@@ -4078,8 +4091,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsNamespaceResult, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         Ok(self
             .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                 file_system_id,
@@ -4097,8 +4111,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         path: String,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         self.route_namespace_lookup_path_to_metadata_primary_with_inline_range(
             file_system_id,
             primary_node_id,
@@ -4116,8 +4131,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: String,
         offset: u64,
         max_bytes: usize,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         self.route_namespace_lookup_path_to_metadata_primary_with_inline_range(
             file_system_id,
             primary_node_id,
@@ -4134,8 +4150,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         path: String,
         inline_range: Option<DfsNamespaceLookupRangeRequest>,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         let mut primary = primary_node_id;
         let operation = DfsNamespaceOperation::LookupPath { path, inline_range };
         for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
@@ -4216,8 +4233,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         paths: Vec<String>,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -4292,7 +4310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id,
                 primary_node_id,
                 operation,
-                DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                DFS_NO_CALLER_BUDGET,
                 false,
                 false,
             )?
@@ -4333,10 +4351,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         let request_id = self.next_request_id();
         self.route_namespace_operation_to_metadata_primary_with_request_id_and_options(
             request_id,
@@ -4359,22 +4378,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         validate_namespace_operation_id(&request_id)?;
-        let requested_deadline = Instant::now() + timeout;
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let effective_deadline = previous_deadline
-            .filter(|existing| *existing < requested_deadline)
-            .unwrap_or(requested_deadline);
-        if effective_deadline != requested_deadline {
-            self.transport
-                .set_operation_deadline(Some(effective_deadline));
-        }
+        // `timeout` is a budget the caller owns for this request. Together
+        // with the operation deadline already installed, it is the only bound
+        // in time: without either, the request ends on its answer, a network
+        // verdict or cancellation.
+        let previous_deadline = self.transport.operation_deadline();
+        let effective_deadline = match (
+            timeout
+                .into()
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+            previous_deadline,
+        ) {
+            (Some(own), Some(existing)) => Some(own.min(existing)),
+            (deadline, None) | (None, deadline) => deadline,
+        };
+        self.transport.set_operation_deadline(effective_deadline);
         let result = self.route_namespace_operation_to_metadata_primary_with_deadline(
             request_id,
             file_system_id,
@@ -4394,7 +4417,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        deadline: Instant,
+        deadline: Option<Instant>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
@@ -4415,7 +4438,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replay_journal_batches,
                 apply_synced_path_object,
             )?;
-            return Err(self.yield_routed_read(key, command, pending, Some(deadline)));
+            return Err(self.yield_routed_read(key, command, pending, deadline));
         }
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
@@ -4436,10 +4459,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let Some(remaining) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-        else {
+        let remaining = deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+        });
+        let Some(remaining) = remaining.map_or(Some(None), |remaining| remaining.map(Some)) else {
             // The request was dispatched; it may have applied.
             return Err(DfsError::NetworkDelivery {
                 message: format!(
@@ -4666,7 +4691,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_routed_namespace_op(
         &mut self,
         request_id: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
         let result = self.settle_routed_namespace_op_inner(request_id, timeout);
@@ -4677,9 +4702,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_routed_namespace_op_inner(
         &mut self,
         request_id: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let started_at = Instant::now();
+        // Cancellation wakes the wait below at once.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         loop {
             if let Err(cancelled) = self.check_cancelled("routed namespace settle") {
                 self.pending_routed_namespace_ops.remove(request_id);
@@ -4704,7 +4738,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(pending.result.expect("settled result checked above"));
             }
             let elapsed = started_at.elapsed();
-            if elapsed >= timeout {
+            if timeout.is_some_and(|timeout| elapsed >= timeout) {
                 self.pending_routed_namespace_ops.remove(request_id);
                 // The request was dispatched; it may have applied, so a
                 // retry must reuse the same request id.
@@ -4716,7 +4750,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             if events.is_empty() {
-                let wait = DFS_ROUTED_NAMESPACE_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
+                // The answer's arrival or cancellation wakes this wait; its
+                // length is the caller's remaining budget, or the network's
+                // liveness interval when the caller set none.
+                let wait = timeout
+                    .map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |timeout| {
+                        timeout.saturating_sub(elapsed)
+                    });
                 self.transport
                     .wait_for_incoming(wait)
                     .map_err(DfsError::from_network)?;
@@ -4731,7 +4771,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 struct AsyncPlacementNamespaceSession<'a, T: DfsMessageTransport> {
     service: &'a mut NetworkedDfsService<T>,
     request_id: String,
-    deadline: Instant,
+    deadline: Option<Instant>,
     previous_deadline: Option<Instant>,
     previous_settle_depth: usize,
     pending_owned: bool,
@@ -4752,7 +4792,25 @@ impl<T: DfsMessageTransport> Drop for AsyncPlacementNamespaceSession<'_, T> {
     }
 }
 
+/// Drive `work` until it finishes or the caller's deadline, if it set one.
+async fn within_caller_deadline<F: std::future::Future>(
+    deadline: Option<Instant>,
+    work: F,
+) -> Result<F::Output, ()> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
+            .await
+            .map_err(drop),
+        None => Ok(work.await),
+    }
+}
+
 impl<T: DfsMessageTransport> AsyncPlacementNamespaceSession<'_, T> {
+    fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     fn timeout_error(&self, phase: &str) -> DfsError {
         DfsError::NetworkDelivery {
             delivery_state: if self.dispatch_started {
@@ -4783,7 +4841,7 @@ where
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
@@ -4810,17 +4868,20 @@ where
                 message: format!("placement namespace request {request_id} is already pending"),
             });
         }
-        let requested_deadline = Instant::now() + timeout;
         let previous_settle_depth = self.routed_namespace_settle_depth;
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let deadline = previous_deadline
-            .filter(|existing| *existing < requested_deadline)
-            .unwrap_or(requested_deadline);
-        if deadline != requested_deadline {
-            self.transport.set_operation_deadline(Some(deadline));
-        }
+        let previous_deadline = self.transport.operation_deadline();
+        // Only the caller's budget and the operation deadline already
+        // installed bound this request in time.
+        let deadline = match (
+            timeout
+                .into()
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+            previous_deadline,
+        ) {
+            (Some(own), Some(existing)) => Some(own.min(existing)),
+            (deadline, None) | (None, deadline) => deadline,
+        };
+        self.transport.set_operation_deadline(deadline);
         let mut session = AsyncPlacementNamespaceSession {
             service: self,
             request_id,
@@ -4838,12 +4899,12 @@ where
             replay_journal_batches,
             apply_synced_path_object,
         )?;
-        if Instant::now() >= session.deadline {
+        if session.deadline_passed() {
             return Err(session.timeout_error("before dispatch"));
         }
         session.dispatch_started = true;
-        let sent = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(session.deadline),
+        let sent = within_caller_deadline(
+            session.deadline,
             session.service.send_dfs_message_if_routable_async(
                 &primary_node_id,
                 DfsNetworkMessage::NamespaceRequest(command),
@@ -4861,7 +4922,7 @@ where
                 ),
             });
         }
-        if Instant::now() >= session.deadline {
+        if session.deadline_passed() {
             return Err(session.timeout_error("before response settle"));
         }
         session
@@ -4872,11 +4933,9 @@ where
         session.service.routed_namespace_settle_depth = previous_settle_depth.saturating_add(1);
         loop {
             session.service.check_cancelled("routed namespace settle")?;
-            let events = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(session.deadline),
-                session.service.process_incoming_async(),
-            )
-            .await;
+            let events =
+                within_caller_deadline(session.deadline, session.service.process_incoming_async())
+                    .await;
             let events = match events {
                 Ok(result) => result?,
                 Err(_) => return Err(session.timeout_error("response processing")),
@@ -4896,20 +4955,21 @@ where
                     .result
                     .expect("settled placement result checked above"));
             }
-            let Some(remaining) = session
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-            else {
+            if session.deadline_passed() {
                 return Err(session.timeout_error("metadata primary response"));
-            };
+            }
             if events.is_empty() {
-                let waiting = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(session.deadline),
-                    session
-                        .service
-                        .transport
-                        .wait_for_incoming_async(DFS_ROUTED_NAMESPACE_IDLE_WAIT.min(remaining)),
+                // The answer's arrival wakes this wait; its length is the
+                // caller's remaining budget, or the network's liveness
+                // interval when the caller set none.
+                let wait = session
+                    .deadline
+                    .map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                let waiting = within_caller_deadline(
+                    session.deadline,
+                    session.service.transport.wait_for_incoming_async(wait),
                 )
                 .await;
                 match waiting {

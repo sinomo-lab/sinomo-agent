@@ -1484,6 +1484,8 @@ pub(crate) fn current_dfs_send_cancellation() -> Option<crate::DfsCancellationFl
 struct DfsIncomingWaitInterrupt {
     interrupted: std::sync::Mutex<bool>,
     ready: std::sync::Condvar,
+    /// Wakes an asynchronous waiter on the same interrupt.
+    ready_async: tokio::sync::Notify,
 }
 
 impl DfsIncomingWaitInterrupt {
@@ -1499,12 +1501,37 @@ impl DfsIncomingWaitInterrupt {
         *interrupted = false;
     }
 
+    /// The asynchronous form of [`Self::wait`]: an interrupt ends it at once.
+    async fn wait_async(&self, timeout: Duration) {
+        let interrupted = self.ready_async.notified();
+        tokio::pin!(interrupted);
+        // Register before the check, so an interrupt between the two is seen.
+        interrupted.as_mut().enable();
+        let take = || {
+            std::mem::take(
+                &mut *self
+                    .interrupted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        if take() {
+            return;
+        }
+        tokio::select! {
+            () = interrupted => {}
+            () = tokio::time::sleep(timeout) => {}
+        }
+        take();
+    }
+
     fn interrupt(&self) {
         *self
             .interrupted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.ready.notify_all();
+        self.ready_async.notify_waiters();
     }
 }
 
@@ -4461,7 +4488,7 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
                     return Ok(true);
                 }
                 if !timeout.is_zero() {
-                    tokio::time::sleep(timeout).await;
+                    self.incoming_wait_interrupt.wait_async(timeout).await;
                 }
                 return Ok(DfsMessageTransport::pending_incoming_count(self)?
                     .is_some_and(|count| count > 0));
@@ -4473,7 +4500,7 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
                 return inbox.wait_async(timeout).await;
             }
             if !timeout.is_zero() {
-                tokio::time::sleep(timeout).await;
+                self.incoming_wait_interrupt.wait_async(timeout).await;
             }
             Ok(self.owned_incoming_count()? > 0)
         })

@@ -326,6 +326,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|cancellation| cancellation.register_waker(waker))
     }
 
+    /// Wait until a re-send is due, or until this service's cancellation
+    /// fires, whichever is first.
+    pub(crate) fn wait_for_resend(&self, wait: std::time::Duration) {
+        let due = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let cancelled = std::sync::Arc::clone(&due);
+        let waker: crate::service_state::DfsCancellationWaker = std::sync::Arc::new(move || {
+            *cancelled
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            cancelled.1.notify_all();
+        });
+        let _registration = self.register_cancellation_waker(&waker);
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(DfsCancellationFlag::is_cancelled)
+        {
+            return;
+        }
+        let woken = due
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            due.1
+                .wait_timeout_while(woken, wait, |woken| !*woken)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
     pub(crate) fn check_cancelled(&self, operation: &'static str) -> Result<(), DfsError> {
         if self
             .cancellation

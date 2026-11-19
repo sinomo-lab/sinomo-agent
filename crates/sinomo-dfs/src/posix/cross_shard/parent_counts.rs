@@ -19,7 +19,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &participant.expected.path,
             &participant.participant_id,
         )?;
-        self.sync_metadata_shard_to_quorum(&target, crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT)?;
+        self.sync_metadata_shard_to_quorum(&target, None)?;
         Ok(())
     }
 

@@ -1394,18 +1394,9 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         daemon_dfs_metadata_replication_options(),
         Some(hook),
     );
-    let result = f.runtime.block_on(async {
-        if expire_handoff {
-            tokio::time::timeout(
-                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT + Duration::from_secs(2),
-                prepare,
-            )
-            .await
-            .expect("the expired original budget must not grant the successor a new budget")
-        } else {
-            prepare.await
-        }
-    });
+    // Planning has no deadline of its own: a handoff slower than the
+    // network's liveness interval delays it and does not fail it.
+    let result = f.runtime.block_on(prepare);
     let attempts = seen.planning_attempts.lock().unwrap();
     let outcomes = seen.planning_outcomes.lock().unwrap();
     assert!(!attempts.is_empty() && attempts.len() <= 3);
@@ -1422,17 +1413,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
             .collect::<Vec<_>>(),
         *attempts
     );
-    if expire_handoff {
-        let error = result.expect_err("the original planning deadline expired during handoff");
-        assert!(error.contains("deadline elapsed"), "{error}");
-        assert_eq!(seen.selections.load(Ordering::SeqCst), 1);
-        assert_eq!(seen.injected_provider_edges.load(Ordering::SeqCst), 1);
-        assert_eq!(seen.refreshes.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            outcomes.last().unwrap().1,
-            DaemonDfsPublishPlanningAttemptOutcome::AuthorityStale
-        );
-    } else if changed_attempts == 1 {
+    if changed_attempts == 1 {
         let plan =
             result.expect("a provider-only rollover can rebind before preparing publication");
         assert!(
@@ -1470,9 +1451,7 @@ fn publisher_provider_delta_before_plan(changed_attempts: usize, expire_handoff:
         .count();
     assert_eq!(
         stale_count,
-        if expire_handoff {
-            attempts.len()
-        } else if changed_attempts == 1 {
+        if changed_attempts == 1 {
             attempts.len() - 1
         } else {
             3
@@ -1538,7 +1517,7 @@ fn publisher_provider_churn_exhausts_existing_preeffect_replan_bound() {
 }
 
 #[test]
-fn publisher_handoff_preserves_the_original_planning_deadline() {
+fn publisher_handoff_slower_than_the_liveness_interval_still_plans() {
     publisher_provider_delta_before_plan(1, true);
 }
 

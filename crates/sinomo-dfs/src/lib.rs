@@ -225,9 +225,7 @@ mod service_routed_journal;
 mod service_routed_namespace;
 pub use service_routed_namespace::namespace_command_digest;
 mod served_request;
-pub use served_request::{
-    DfsRequestBudgetEnded, DfsServedRequestDeparture, DfsServedRequestScope,
-};
+pub use served_request::{DfsRequestBudgetEnded, DfsServedRequestDeparture, DfsServedRequestScope};
 mod service_routed_write;
 mod service_stage_transfer;
 mod service_state;
@@ -878,10 +876,11 @@ pub use routes::{
 pub(crate) use routes::build_dfs_routed_message;
 pub(crate) use service_content::object_content_identity;
 pub(crate) use service_repair::DFS_PENDING_TRANSFER_STALE_AFTER;
+#[cfg(test)]
+pub(crate) use service_sync::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
 pub use service_sync::{
-    DEFAULT_DFS_POSIX_SYNC_TIMEOUT, DfsMetadataQuorumSyncCertificate,
-    DfsMetadataQuorumSyncProgress, DfsMetadataQuorumSyncTarget, dfs_metadata_replica_quorum_size,
-    inspect_metadata_prefix_descendant,
+    DfsMetadataQuorumSyncCertificate, DfsMetadataQuorumSyncProgress, DfsMetadataQuorumSyncTarget,
+    dfs_metadata_replica_quorum_size, inspect_metadata_prefix_descendant,
 };
 
 pub use sinomo_api::dfs::identity_types::DfsFileSystemId;
@@ -923,8 +922,7 @@ pub(crate) use service_state::{
     DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT, DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH,
     DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
     DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE, DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
-    DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_IDLE_WAIT,
-    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+    DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT, DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
     DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT, NetworkedDfsRangeReadStream,
@@ -934,7 +932,7 @@ pub(crate) use service_state::{
     StageBlobSendOutcome, retained_networked_dfs_service_events,
 };
 pub use service_state::{
-    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
+    DFS_NO_CALLER_BUDGET, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
     DfsCommittedWork, DfsCommittedWorkTracker, DfsConfirmedTimeoutAction,
     DfsConfirmedTimeoutOutcome, DfsMessageCommittedWork, DfsMessageProcessReport,
     DfsMessageProcessResult, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,

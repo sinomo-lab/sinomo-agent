@@ -6,7 +6,6 @@
 //! and response remain separately typed so a lock outcome can never be
 //! mistaken for a namespace mutation acknowledgement.
 
-use crate::posix::locks::DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -132,9 +131,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path,
                     object_id,
                     command,
-                    std::time::Duration::from_millis(*timeout_millis)
-                        .min(DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT)
-                        .max(std::time::Duration::from_millis(1)),
+                    // The caller's budget as it sent it; no default, no cap.
+                    timeout_millis.map(|millis| {
+                        std::time::Duration::from_millis(millis)
+                            .max(std::time::Duration::from_millis(1))
+                    }),
                 )
                 .map(DfsPosixCoordinationResult::AdvisoryLock)
                 .map(Some),

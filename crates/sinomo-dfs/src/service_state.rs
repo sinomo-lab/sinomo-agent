@@ -129,10 +129,11 @@ impl TransientMetadataObjectIndex {
     }
 }
 
-// Namespace RPCs are on the app-visible critical path and may include a
-// durable WAN metadata mutation plus bounded journal replay. The authority's
-// durable request ledger prevents blind re-execution after this deadline.
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// The budget of a request whose caller set none. DFS adds no deadline of its
+/// own: such a request ends on its answer, a definite failure, the network's
+/// verdict or cancellation. A caller that wants a bound passes its own budget,
+/// which travels with the request to the node serving it.
+pub const DFS_NO_CALLER_BUDGET: Option<Duration> = None;
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
@@ -160,7 +161,6 @@ pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT: usize = 2048
 pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT: usize =
     crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
 pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 

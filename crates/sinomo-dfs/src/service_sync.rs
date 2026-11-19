@@ -31,8 +31,10 @@ use crate::{
     service_state::PendingMetadataReplicationResponseKind, sifs_file_system_id,
 };
 
-/// Default time budget for a foreground POSIX durability barrier.
-pub const DEFAULT_DFS_POSIX_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
+/// The bound tests put on their own durability waits. No request path uses a
+/// default: a sync is bounded in time only by its caller's budget.
+#[cfg(test)]
+pub(crate) const DEFAULT_DFS_POSIX_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
 
 const DFS_POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
 /// Give every member of a healthy shard one normal round trip to answer before

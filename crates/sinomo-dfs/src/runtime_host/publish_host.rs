@@ -51,22 +51,76 @@ pub(super) fn daemon_dfs_metadata_publish_discovery_schedule_options()
     }
 }
 
+/// Why a background generation refresh did not get its admission.
+enum DaemonDfsGenerationRefreshRefusal {
+    /// Foreground work asked for admission first. `releases` follows the
+    /// scheduler's admission releases from before the yield.
+    Yielded {
+        releases: tokio::sync::watch::Receiver<u64>,
+    },
+    Failed(String),
+}
+
+impl DaemonDfsGenerationRefreshRefusal {
+    fn message(&self) -> String {
+        match self {
+            Self::Yielded { .. } => {
+                "DFS metadata generation refresh yielded to foreground protocol work".into()
+            }
+            Self::Failed(error) => error.clone(),
+        }
+    }
+}
+
 async fn admit_daemon_dfs_background_generation_refresh(
     scheduler: &Arc<DaemonDfsMutationScheduler>,
-) -> Result<DaemonDfsMutationAdmission, String> {
+) -> Result<DaemonDfsMutationAdmission, DaemonDfsGenerationRefreshRefusal> {
     // A queued global writer also blocks later exact readers. Background cache
     // refresh must use the same preemption edge as maintenance, or a publisher
     // on another shard can wait for an acknowledgement trapped behind it.
     // Yield only before admission: the existing publish owner retains its work
     // and retries, while admitted initialization remains protected to completion.
+    // Subscribe before the admission can be refused, so the release of the
+    // foreground work this refresh yields to is not missed.
+    let mut releases = scheduler.subscribe_admission_releases();
+    releases.mark_unchanged();
     let foreground = scheduler.begin_maintenance_interest();
     crate::runtime_admission::acquire_dfs_maintenance_admission_until_foreground_waits(
         &foreground,
         scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
     )
     .await
-    .map_err(|error| format!("DFS metadata generation admission failed: {error}"))?
-    .ok_or_else(|| "DFS metadata generation refresh yielded to foreground protocol work".into())
+    .map_err(|error| {
+        DaemonDfsGenerationRefreshRefusal::Failed(format!(
+            "DFS metadata generation admission failed: {error}"
+        ))
+    })?
+    .ok_or(DaemonDfsGenerationRefreshRefusal::Yielded { releases })
+}
+
+/// A lane publish whose refresh yielded to foreground work is requested again
+/// when that work releases its admission. The publish scheduler's own retry
+/// timer stays behind it as a fallback only.
+fn request_daemon_dfs_lane_publish_after_foreground_work(
+    task_owner: &Arc<DfsRuntimeHost>,
+    mut releases: tokio::sync::watch::Receiver<u64>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    runtime: tokio::runtime::Handle,
+    lane: DaemonDfsMutationLaneKey,
+) {
+    let wake_runtime = runtime.clone();
+    task_owner.own_task(runtime.spawn(async move {
+        if releases.changed().await.is_ok() {
+            schedule_daemon_dfs_metadata_publish_lane_on_runtime(
+                data_dir,
+                cluster_paths,
+                &wake_runtime,
+                None,
+                lane,
+            );
+        }
+    }));
 }
 
 pub(super) fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
@@ -439,10 +493,11 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
     let state = sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, cluster_paths)
         .await
         .map_err(|error| format!("DFS metadata lanes lack cluster state: {error}"))?;
-    // The same bounded projection budget covers native authority and routing.
-    // No-primary nodes still roll their resident metadata generation forward;
-    // their route read must join the actual native owner outside DFS admission.
-    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    // Lane discovery has no caller and no deadline: its native authority and
+    // routing reads wait for the projection's own event. No-primary nodes
+    // still roll their resident metadata generation forward; their route read
+    // must join the actual native owner outside DFS admission.
+    let deadline = None::<tokio::time::Instant>;
     let authority = daemon_dfs_metadata_authority_generation_for_identity(
         cluster_paths,
         &state.cluster_id,
@@ -536,7 +591,9 @@ pub(super) async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
         if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
             hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { owner: "idle", caller_task: tokio::task::try_id() }, None, Some(&preflight)).map_err(|error|error.to_string())?;
         }
-        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
+        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler)
+            .await
+            .map_err(|refusal| refusal.message())?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
         let initialize_peer_snapshot = peer_snapshot.clone();
@@ -629,9 +686,9 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
     replication_options: sinomo_dfs::DfsMetadataJournalReplicationOptions,
     #[cfg(test)] invocation_hook: Option<Arc<super::message_host::DaemonDfsPreDispatchTestHook>>,
 ) -> Result<Option<sinomo_dfs::DfsPreparedClusterMetadataJournalPublish>, String> {
-    // Native reads, exact-lane waits and every owner handoff share the
-    // caller's original projection budget; a replan cannot restart it.
-    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    // Planning has no deadline of its own. Its native reads and exact-lane
+    // waits end on their own events; a failed attempt is retried by the
+    // publish scheduler, whose timer only re-sends.
     let task_owner = registered_dfs_runtime_host(&data_dir)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
@@ -642,9 +699,6 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
         None::<std::sync::Weak<DaemonDfsMutationAdmission>>,
     ));
     for replan in 0..=2 {
-        if tokio::time::Instant::now() >= deadline {
-            return Err("DFS metadata publish planning projection deadline elapsed".to_string());
-        }
         #[cfg(test)]
         if let Some(hook) = invocation_hook.as_ref() {
             hook(
@@ -656,36 +710,30 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
             )
             .map_err(|error| error.to_string())?;
         }
-        let resident = tokio::time::timeout_at(
-            deadline,
-            ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
-                Arc::clone(&mutation_scheduler),
-                data_dir.clone(),
-                cluster_paths.clone(),
-                lane.clone(),
-                runtime.clone(),
-                Arc::clone(&data_owner_lock),
-                deadline,
-                None,
-            ),
+        let resident = ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
+            Arc::clone(&mutation_scheduler),
+            data_dir.clone(),
+            cluster_paths.clone(),
+            lane.clone(),
+            runtime.clone(),
+            Arc::clone(&data_owner_lock),
+            None,
+            None,
         )
         .await;
         #[cfg(test)]
         if let Some(hook) = invocation_hook.as_ref() {
             use super::message_host::DaemonDfsPublishPlanningAttemptOutcome as Outcome;
             let outcome = match &resident {
-                Err(_) => Some(Outcome::Deadline),
-                Ok(Err(_)) => Some(Outcome::Failed),
-                Ok(Ok(_)) => None,
+                Err(_) => Some(Outcome::Failed),
+                Ok(_) => None,
             };
             if let Some(outcome) = outcome {
                 hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { replan, outcome },
                     None, None).map_err(|error| error.to_string())?;
             }
         }
-        let (peer_snapshot, preflight) = resident.map_err(|_| {
-            "DFS metadata publish resident projection deadline elapsed".to_string()
-        })??;
+        let (peer_snapshot, preflight) = resident?;
         let planning_data_dir = data_dir.clone();
         let planning_cluster_paths = cluster_paths.clone();
         let planning_runtime = runtime.clone();
@@ -696,18 +744,7 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
         let planning_observed_admission = Arc::clone(&observed_admission);
         let file_system_id = lane.file_system_id.clone();
         let shard_id = lane.shard_id.clone();
-        if tokio::time::Instant::now() >= deadline {
-            #[cfg(test)]
-            if let Some(hook) = invocation_hook.as_ref() {
-                hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished {
-                    replan, outcome: super::message_host::DaemonDfsPublishPlanningAttemptOutcome::Deadline,
-                }, None, None).map_err(|error| error.to_string())?;
-            }
-            return Err("DFS metadata publish planning projection deadline elapsed".to_string());
-        }
-        let attempt = tokio::time::timeout_at(
-            deadline,
-            sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
+        let attempt = sinomo_dfs::run_metadata_publish_lane_planning_with_admission(
             Arc::clone(&mutation_scheduler),
             lane.clone(),
             task_owner.as_ref(),
@@ -716,9 +753,6 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                 {
                     *planning_observed_admission.lock().expect("actual planner admission observer") =
                         Some(Arc::downgrade(_admission));
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("DFS metadata publish planning projection deadline elapsed".to_string());
                 }
                 // A cancelled async caller cannot release these owners while
                 // the blocking planner is still capturing local durable work.
@@ -787,9 +821,6 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                     "DFS metadata publish resident backend does not match retained authority for filesystem {} shard {}",
                     file_system_id, shard_id.0,
                 ))?;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("DFS metadata publish planning projection deadline elapsed".to_string());
-                }
                 let Some(mut backend) = shard.try_checkout().map_err(|error| error.to_string())? else {
                     return Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::WaitForResidentShard(shard));
                 };
@@ -817,7 +848,6 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
                 ).map_err(|error| error.to_string())?;
                 Ok(sinomo_dfs::DfsMetadataPublishPlanningAttempt::Complete(Ok(plan)))
             },
-            ),
         )
         .await;
         #[cfg(test)]
@@ -840,20 +870,14 @@ pub(super) async fn prepare_daemon_dfs_metadata_publish_with_replanning(
         if let Some(hook) = invocation_hook.as_ref() {
             use super::message_host::DaemonDfsPublishPlanningAttemptOutcome as Outcome;
             let outcome = match &attempt {
-                Err(_) => Outcome::Deadline,
-                Ok(Err(_)) => Outcome::Failed,
-                Ok(Ok(Ok(_))) => Outcome::Complete,
-                Ok(Ok(Err(_))) => Outcome::AuthorityStale,
+                Err(_) => Outcome::Failed,
+                Ok(Ok(_)) => Outcome::Complete,
+                Ok(Err(_)) => Outcome::AuthorityStale,
             };
             hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishPlanningAttemptFinished { replan, outcome },
                 None, None).map_err(|error| error.to_string())?;
         }
-        let attempt = attempt.map_err(|_| {
-            "DFS metadata publish planning projection deadline elapsed".to_string()
-        })??;
-        if tokio::time::Instant::now() >= deadline {
-            return Err("DFS metadata publish planning projection deadline elapsed".to_string());
-        }
+        let attempt = attempt?;
         // The helper has dropped exact-shard admission and any checked-out
         // backend before returning this typed pre-effect outcome.
         match attempt {
@@ -891,7 +915,9 @@ pub(super) async fn ensure_daemon_dfs_metadata_publish_resident_generation(
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
 ) -> Result<DaemonDfsMessagePeerSnapshot, String> {
-    let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    // A background publish has no caller and no deadline: its authority reads
+    // wait for the projection's own event.
+    let deadline = None::<tokio::time::Instant>;
     let owner_snapshot =
         read_daemon_dfs_replica_owner_snapshot_before(&cluster_paths, &runtime, deadline)
             .await
@@ -917,7 +943,7 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
     lane: DaemonDfsMutationLaneKey,
     runtime: tokio::runtime::Handle,
     data_owner_lock: Arc<DaemonDataOwnerLock>,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     owner_snapshot: Option<DaemonDfsMessagePeerSnapshot>,
 ) -> Result<
     (
@@ -985,7 +1011,24 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
         if let Some(hook) = daemon_dfs_pre_dispatch_test_hook(&data_dir) {
             hook(super::message_host::DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { owner: "lane", caller_task: tokio::task::try_id() }, None, Some(&metadata_authority_preflight)).map_err(|error|error.to_string())?;
         }
-        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
+        let admission =
+            match admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    let message = refusal.message();
+                    if let DaemonDfsGenerationRefreshRefusal::Yielded { releases } = refusal {
+                        request_daemon_dfs_lane_publish_after_foreground_work(
+                            &task_owner,
+                            releases,
+                            data_dir.clone(),
+                            cluster_paths.clone(),
+                            runtime.clone(),
+                            lane.clone(),
+                        );
+                    }
+                    return Err(message);
+                }
+            };
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
         let initialize_peer_snapshot = peer_snapshot.clone();

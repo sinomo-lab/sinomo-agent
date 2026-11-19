@@ -17,8 +17,46 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 
-fn default_advisory_lock_timeout_millis() -> u64 {
-    45_000
+/// Reads an advisory-lock budget written either as an optional value or as a
+/// plain number, which is a caller with that budget.
+fn deserialize_advisory_lock_budget_millis<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Budget;
+    impl<'de> serde::de::Visitor<'de> for Budget {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an advisory-lock budget in milliseconds, or none")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            u64::deserialize(deserializer).map(Some)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, millis: u64) -> Result<Self::Value, E> {
+            Ok(Some(millis))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, millis: i64) -> Result<Self::Value, E> {
+            u64::try_from(millis)
+                .map(Some)
+                .map_err(|_| E::custom("an advisory-lock budget cannot be negative"))
+        }
+    }
+    deserializer.deserialize_any(Budget)
 }
 
 pub(crate) fn content_reference_outcome_family_fingerprint(
@@ -755,10 +793,16 @@ pub enum DfsNamespaceOperation {
         path: String,
         object_id: DfsObjectId,
         command: DfsAdvisoryLockCommand,
-        /// Server execution budget, kept below the caller's RPC deadline so
-        /// a canonical outcome can return before transport timeout.
-        #[serde(default = "default_advisory_lock_timeout_millis")]
-        timeout_millis: u64,
+        /// The caller's budget for executing the command on the authority,
+        /// kept below the caller's own deadline so a canonical outcome can
+        /// return before it. Absent: the caller set no budget, and the
+        /// authority adds none.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_advisory_lock_budget_millis"
+        )]
+        timeout_millis: Option<u64>,
     },
     /// File durability barrier for an immutable object/version/hash prefix.
     FileSync {
@@ -1998,6 +2042,81 @@ mod commit_outcome_unknown_wire_tests {
         })
         .unwrap();
         assert!(serde_json::from_slice::<PreChangeResult>(&encoded).is_err());
+    }
+}
+
+#[cfg(test)]
+mod advisory_lock_budget_wire_tests {
+    use super::DfsNamespaceOperation;
+
+    fn command() -> crate::DfsAdvisoryLockCommand {
+        crate::DfsAdvisoryLockCommand::Close {
+            request_id: crate::DfsAdvisoryLockRequestId::new("request"),
+            session_id: crate::DfsAdvisoryLockSessionId::new("session"),
+        }
+    }
+
+    fn lock(timeout_millis: Option<u64>) -> DfsNamespaceOperation {
+        DfsNamespaceOperation::AdvisoryLock {
+            path: "/locks/file".into(),
+            object_id: crate::DfsObjectId::from_legacy_named("lock-budget-object").unwrap(),
+            command: command(),
+            timeout_millis,
+        }
+    }
+
+    /// The lock request's budget is the caller's alone. A caller without one
+    /// writes no field, and an absent field reads back as no budget.
+    #[test]
+    fn a_lock_request_without_a_budget_writes_and_reads_none() {
+        let wire = serde_json::to_value(lock(None)).unwrap();
+        assert!(
+            wire["advisory-lock"].get("timeout_millis").is_none(),
+            "{wire}"
+        );
+        assert_eq!(
+            serde_json::from_value::<DfsNamespaceOperation>(wire).unwrap(),
+            lock(None)
+        );
+    }
+
+    /// A peer that writes the budget as a plain number is read as a caller
+    /// with that budget, through the codec requests travel in.
+    #[test]
+    fn a_lock_budget_written_as_a_number_reads_as_some() {
+        use serde::Serialize;
+        use sinomo_core::network::SinomoObjectCodec;
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum NumberedBudget {
+            AdvisoryLock {
+                path: String,
+                object_id: crate::DfsObjectId,
+                command: crate::DfsAdvisoryLockCommand,
+                timeout_millis: u64,
+            },
+        }
+        let codec = SinomoObjectCodec::network_frame();
+        let numbered = codec
+            .encode(&NumberedBudget::AdvisoryLock {
+                path: "/locks/file".into(),
+                object_id: crate::DfsObjectId::from_legacy_named("lock-budget-object").unwrap(),
+                command: command(),
+                timeout_millis: 45_000,
+            })
+            .unwrap();
+        assert_eq!(
+            codec.decode::<DfsNamespaceOperation>(&numbered).unwrap(),
+            lock(Some(45_000))
+        );
+        for budget in [None, Some(1), Some(45_000)] {
+            let encoded = codec.encode(&lock(budget)).unwrap();
+            assert_eq!(
+                codec.decode::<DfsNamespaceOperation>(&encoded).unwrap(),
+                lock(budget)
+            );
+        }
     }
 }
 
