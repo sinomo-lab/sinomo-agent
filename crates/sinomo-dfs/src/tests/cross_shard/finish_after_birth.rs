@@ -204,6 +204,70 @@ fn native_cross_shard_move_finishes_after_a_shard_birth_at_its_finish_frame() {
     cluster.close();
 }
 
+/// While a move runs in a directory, every kind of create in that directory
+/// is refused by the primary that serves it, whatever lookup its requester
+/// made: a routed write, an exclusive create, an owner path write and a
+/// create issued on the primary itself. Each is allowed once the move ends.
+#[test]
+fn native_creates_in_a_moving_entrys_parent_are_refused_at_their_primary() {
+    let mut cluster = foreign_parent_cluster("native-move-fences-creates");
+    source_tree(&mut cluster);
+    let coordinator = cluster.users_primary_node.clone();
+    let path = |name: &str| format!("{PARENT}/{name}");
+    let (refused, outcome) = hold_at_finish(&mut cluster, |cluster| {
+        let options = write_options(cluster);
+        let routed = cluster
+            .replica
+            .posix_write_file(&path("routed-create"), b"routed", options.clone())
+            .map(drop);
+        let exclusive = cluster
+            .replica
+            .posix_symlink("/services", &path("exclusive-create"), options.clone())
+            .map(drop);
+        let owner = cluster
+            .replica
+            .try_route_browser_write(&path("owner-create"), b"owner", None)
+            .map(drop);
+        let mut primary = cluster._runtime.client(&coordinator).unwrap();
+        let local = primary
+            .posix_write_file(&path("primary-create"), b"local", options)
+            .map(drop);
+        drop(primary);
+        [
+            ("routed write", routed),
+            ("exclusive create", exclusive),
+            ("owner write", owner),
+            ("create on the primary", local),
+        ]
+    });
+    for (kind, result) in &refused {
+        assert!(
+            matches!(result, Err(DfsPosixError::Dfs(DfsError::Busy { path })) if path == PARENT),
+            "a {kind} in the moving entry's parent is refused as busy: {result:?}"
+        );
+    }
+    outcome.expect("the move finishes");
+    let options = write_options(&cluster);
+    cluster
+        .replica
+        .posix_write_file(&path("routed-create"), b"routed", options.clone())
+        .expect("a routed create is allowed after the move");
+    cluster
+        .replica
+        .posix_symlink("/services", &path("exclusive-create"), options.clone())
+        .expect("an exclusive create is allowed after the move");
+    cluster
+        .replica
+        .try_route_browser_write(&path("owner-create"), b"owner", None)
+        .expect("an owner write is allowed after the move");
+    let mut primary = cluster._runtime.client(&coordinator).unwrap();
+    primary
+        .posix_write_file(&path("primary-create"), b"local", options)
+        .expect("a create on the primary is allowed after the move");
+    drop(primary);
+    cluster.close();
+}
+
 #[test]
 fn native_cross_shard_move_resumed_by_maintenance_at_its_finish_frame_converges() {
     let mut cluster = foreign_parent_cluster("native-move-finish-resumed-after-birth");

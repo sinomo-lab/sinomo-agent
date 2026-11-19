@@ -393,6 +393,29 @@ impl DfsCrossShardNamespaceLockRegistry {
         self.blocks_except_verified_job(file_system_id, path, None)
     }
 
+    /// The guard rule for a lookup of one path: `LookupPath`, `LookupPaths`
+    /// and the stat queries path resolution uses. A lookup at or under a
+    /// moving path is refused. A lookup of a directory that merely contains a
+    /// moving entry passes: the move publishes that directory's times and
+    /// counts as whole committed rows, so the reader sees the row before or
+    /// after such a publication and never the moving entry itself. Listings
+    /// and mutations keep the two-way rule of [`Self::blocks`], which also
+    /// refuses an ancestor of a moving path.
+    pub(crate) fn blocks_lookup(&self, file_system_id: &DfsFileSystemId, path: &str) -> bool {
+        self.blocks_lookup_except_verified_job(file_system_id, path, None)
+    }
+
+    /// [`Self::blocks_lookup`] with the read exemption of
+    /// [`Self::blocks_except_verified_job`].
+    pub(crate) fn blocks_lookup_except_verified_job(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        verified: Option<(&str, &DfsMetadataShardId, &str)>,
+    ) -> bool {
+        self.blocks_with(file_system_id, path, verified, false)
+    }
+
     /// The caller has authenticated the current coordinator and checked the
     /// recorded Running job and read footprint. This filters only that job's
     /// read reservation; every other guard and every mutation check remains.
@@ -401,6 +424,16 @@ impl DfsCrossShardNamespaceLockRegistry {
         file_system_id: &DfsFileSystemId,
         path: &str,
         verified: Option<(&str, &DfsMetadataShardId, &str)>,
+    ) -> bool {
+        self.blocks_with(file_system_id, path, verified, true)
+    }
+
+    fn blocks_with(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        verified: Option<(&str, &DfsMetadataShardId, &str)>,
+        ancestors: bool,
     ) -> bool {
         self.locks_by_job
             .lock()
@@ -417,10 +450,11 @@ impl DfsCrossShardNamespaceLockRegistry {
                     })
                     && lock.paths.iter().any(|locked_path| {
                         crate::posix_path::posix_path_is_at_or_under_prefix(path, locked_path)
-                            || crate::posix_path::posix_path_is_at_or_under_prefix(
-                                locked_path,
-                                path,
-                            )
+                            || (ancestors
+                                && crate::posix_path::posix_path_is_at_or_under_prefix(
+                                    locked_path,
+                                    path,
+                                ))
                     })
             })
     }
@@ -1542,5 +1576,48 @@ mod cancellation_wake_tests {
             !next.is_cancelled(),
             "a flag from the new generation stays live"
         );
+    }
+}
+
+#[cfg(test)]
+mod path_guard_rule_tests {
+    use super::*;
+
+    /// A lookup passes for an ancestor of a moving path and is refused at or
+    /// under it; listings and mutations are refused both ways. The rule is
+    /// the same for a moving file and a moving directory.
+    #[test]
+    fn lookup_of_an_ancestor_passes_and_everything_else_keeps_the_two_way_rule() {
+        let fs = crate::sifs_file_system_id();
+        let registry = DfsCrossShardNamespaceLockRegistry::default();
+        registry.upsert_job(
+            Some(DfsMetadataShardId::new("services")),
+            "moving-file".into(),
+            fs.clone(),
+            "/services/moving.txt".to_string(),
+        );
+        registry.upsert_job(
+            Some(DfsMetadataShardId::new("services")),
+            "moving-directory".into(),
+            fs.clone(),
+            "/services/tree/moving".to_string(),
+        );
+        for ancestor in ["/", "/services", "/services/tree"] {
+            assert!(!registry.blocks_lookup(&fs, ancestor), "{ancestor}");
+            assert!(registry.blocks(&fs, ancestor), "{ancestor}");
+        }
+        for moving in [
+            "/services/moving.txt",
+            "/services/tree/moving",
+            "/services/tree/moving/child",
+            "/services/tree/moving/child/deeper.txt",
+        ] {
+            assert!(registry.blocks_lookup(&fs, moving), "{moving}");
+            assert!(registry.blocks(&fs, moving), "{moving}");
+        }
+        for unrelated in ["/users", "/services/other.txt", "/services/tree/sibling"] {
+            assert!(!registry.blocks_lookup(&fs, unrelated), "{unrelated}");
+            assert!(!registry.blocks(&fs, unrelated), "{unrelated}");
+        }
     }
 }

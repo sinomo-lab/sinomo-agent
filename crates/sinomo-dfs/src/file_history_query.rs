@@ -694,26 +694,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else { None };
         // Contributions attribute every path with the catalog this primary
         // admitted the query under; the epoch/primary check above binds it.
-        let contribution_catalog =
-            if matches!(query.selection, DfsMetadataSelection::CountContributionsV1 { .. }) {
-                Some(
-                    self.namespace_execution
-                        .context()
-                        .filter(|context| context.file_system_id == query.file_system_id)
-                        .ok_or_else(|| {
-                            error("count contributions require the admitted authority catalog")
-                        })?
-                        .shards
-                        .clone(),
-                )
-            } else {
-                None
-            };
+        let contribution_catalog = if matches!(
+            query.selection,
+            DfsMetadataSelection::CountContributionsV1 { .. }
+        ) {
+            Some(
+                self.namespace_execution
+                    .context()
+                    .filter(|context| context.file_system_id == query.file_system_id)
+                    .ok_or_else(|| {
+                        error("count contributions require the admitted authority catalog")
+                    })?
+                    .shards
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        // Path-resolution stats follow the lookup rule: refused only at or
+        // under a moving path, not for a directory that contains one.
         if let DfsMetadataSelection::StatAtPathV2 { path } = &query.selection {
-            self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
+            self.ensure_lookup_path_not_in_cross_shard_flight(&query.file_system_id, path)?;
             if !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &query.file_system_id, inode_catalog.as_deref().expect("stat catalog"), path,
-            )?.is_some_and(|shard| shard.shard_id == query.shard_id.0 && shard.epoch == query.epoch) {
+                &query.file_system_id,
+                inode_catalog.as_deref().expect("stat catalog"),
+                path,
+            )?
+            .is_some_and(|shard| shard.shard_id == query.shard_id.0 && shard.epoch == query.epoch)
+            {
                 return Err(error("stat path does not belong to the queried authority"));
             }
         }
@@ -752,7 +760,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (complete_stat_scope, stat_catalog) =
             if let DfsMetadataSelection::StatAtPathV1 { request } = &query.selection {
-                self.ensure_path_not_in_cross_shard_flight(&query.file_system_id, &request.path)?;
+                self.ensure_lookup_path_not_in_cross_shard_flight(
+                    &query.file_system_id,
+                    &request.path,
+                )?;
                 let context = self
                     .namespace_execution
                     .context()
@@ -950,6 +961,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let diagnostic_root = self
             .native_publication_owner_for_observation()
             .map(|(root, _)| root);
+        // A path stat resolves its path component by component; each check
+        // follows the lookup rule. Every other read keeps the two-way rule.
+        let path_stat = matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. });
         let ensure_read = |file_system_id: &DfsFileSystemId, path: &str| {
             if query_cancellation
                 .as_ref()
@@ -968,11 +982,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let exemption = coordinated_scope
                 .as_ref()
                 .map(|(id, shard, root)| (*id, shard, *root));
-            if self.cross_shard_namespace_locks.blocks_except_verified_job(
-                file_system_id,
-                &path_key,
-                exemption,
-            ) {
+            let blocked = if path_stat {
+                self.cross_shard_namespace_locks
+                    .blocks_lookup_except_verified_job(file_system_id, &path_key, exemption)
+            } else {
+                self.cross_shard_namespace_locks.blocks_except_verified_job(
+                    file_system_id,
+                    &path_key,
+                    exemption,
+                )
+            };
+            if blocked {
                 #[cfg(test)]
                 if let Some(root) = &diagnostic_root {
                     crate::native_boundary_diagnostics::record(

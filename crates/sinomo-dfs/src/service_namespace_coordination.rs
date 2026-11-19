@@ -587,6 +587,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// The fence of a mutation that adds an entry: the two-way rule on the
+    /// entry's path and on its parent, whose times and counts the mutation
+    /// also publishes. The serving primary applies it at admission, before
+    /// any effect; a lookup that passes for the parent grants nothing. A
+    /// move's own steps do not create through this path: adoption, eviction
+    /// and parent counts are authenticated job commands.
+    pub(crate) fn ensure_new_entry_not_in_cross_shard_flight(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<(), DfsError> {
+        self.ensure_path_not_in_cross_shard_flight(file_system_id, path)?;
+        if let Some(parent) = posix_path::parent_posix_path(path) {
+            self.ensure_path_not_in_cross_shard_flight(file_system_id, &parent)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::ensure_path_not_in_cross_shard_flight`] for a lookup of one
+    /// path: only a path at or under a moving path is refused (see
+    /// [`DfsCrossShardNamespaceLockRegistry::blocks_lookup`]).
+    pub(crate) fn ensure_lookup_path_not_in_cross_shard_flight(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<(), DfsError> {
+        if self.cross_shard_namespace_locks.is_empty() {
+            return Ok(());
+        }
+        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
+            return Ok(());
+        };
+        let blocked = self
+            .cross_shard_namespace_locks
+            .blocks_lookup(file_system_id, &normalized);
+        if blocked {
+            #[cfg(test)]
+            if let Some((root, _)) = self.native_publication_owner_for_observation() {
+                crate::native_boundary_diagnostics::record(
+                    &root,
+                    "namespace-path-blocked",
+                    || {
+                        serde_json::json!({
+                            "node": self.node_id, "file_system_id": file_system_id, "path": path,
+                            "locks": format!("{:?}", self.cross_shard_namespace_locks),
+                        })
+                    },
+                    true,
+                );
+            }
+            return Err(DfsError::Busy {
+                path: path.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_object_not_in_cross_shard_flight(
         &self,
         object: &DfsObjectMetadata,

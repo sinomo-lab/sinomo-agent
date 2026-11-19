@@ -3619,6 +3619,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
+        // This write creates the entry: fence it and its parent here, not
+        // through whatever lookup the requester made.
+        self.ensure_new_entry_not_in_cross_shard_flight(&object.file_system_id, &object.path)?;
         if exclusive_create {
             let path_key = crate::posix_path::normalized_posix_path_key(&object.path)
                 .unwrap_or_else(|| object.path.clone());

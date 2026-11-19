@@ -1226,9 +1226,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Mutations must not interleave with an in-flight cross-shard move of
         // the same path; the coordinator releases the lock when the move
         // completes or aborts.
+        // A lookup is refused only at or under a moving path; a directory
+        // that merely contains a moving entry answers it.
+        let lookup = matches!(
+            operation,
+            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
+        );
         for path in operation.involved_paths() {
             if let Some(normalized) = normalized_posix_path_key(path) {
-                self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &normalized)?;
+                if lookup {
+                    self.ensure_lookup_path_not_in_cross_shard_flight(
+                        &sifs_file_system_id(),
+                        &normalized,
+                    )?;
+                } else {
+                    self.ensure_path_not_in_cross_shard_flight(
+                        &sifs_file_system_id(),
+                        &normalized,
+                    )?;
+                }
             }
         }
         match operation {

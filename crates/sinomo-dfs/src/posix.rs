@@ -3685,6 +3685,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.lookup_sifs_path(&path)?
         };
+        // A create this node serves from its own metadata is fenced here,
+        // with its parent; one planned from the authority is fenced by the
+        // primary that admits it.
+        if !plans_from_authority
+            && current_object
+                .as_ref()
+                .is_none_or(|object| object.kind == DfsObjectKind::Tombstone)
+        {
+            self.ensure_new_entry_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
+        }
         let mut object = match current_object {
             Some(object)
                 if exclusive_create

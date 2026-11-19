@@ -197,6 +197,14 @@ fn routed_rename(
     from: &'static str,
     to: &'static str,
 ) -> mpsc::Receiver<Result<(), String>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // One caller-owned id for every attempt: a retry of a rename whose job
+    // already ran reconciles with that job instead of starting another.
+    let operation_id = format!(
+        "dfs_test_crossing_rename_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let data_dir = runtime.data_dir(node).clone();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -206,7 +214,9 @@ fn routed_rename(
                 &data_dir,
                 Some(crate::test_runtime::executor().handle()),
             ) {
-                Ok(mut client) => client.posix_rename(from, to).map(drop),
+                Ok(mut client) => client
+                    .posix_rename_with_operation_id(from, to, &operation_id)
+                    .map(drop),
                 Err(error) => break Err(error.to_string()),
             };
             match attempt {
@@ -447,13 +457,14 @@ fn native_crossing_primaries_each_rename_into_the_other() {
 
     runtime.checkpoint_rpc_observation_window().unwrap();
     let gate = hold_routes(&runtime, &a, &b, &[crate::DFS_DATA_NAMESPACE_ROUTE]);
-    let into_users = routed_rename(
+    // One attempt each: a Busy answer to either caller fails the test.
+    let into_users = routed_rename_once(
         &runtime,
         &c,
         "/services/crossing-rename-a.txt",
         "/users/crossing-rename-a.txt",
     );
-    let into_services = routed_rename(
+    let into_services = routed_rename_once(
         &runtime,
         &c,
         "/users/crossing-rename-b.txt",
@@ -501,7 +512,10 @@ fn native_crossing_primaries_each_rename_into_the_other() {
     );
     for (rename, outcome) in ["into users", "into services"].into_iter().zip(&outcomes) {
         let (result, elapsed) = outcome.as_ref().unwrap();
-        assert!(result.is_ok(), "the rename {rename} commits: {result:?}");
+        assert!(
+            result.is_ok(),
+            "the rename {rename} commits on its first attempt, with no Busy answer: {result:?}"
+        );
         assert!(
             *elapsed < CROSSING_RENAME_BOUND,
             "the rename {rename} ends within {CROSSING_RENAME_BOUND:?}, not by its adopt \
