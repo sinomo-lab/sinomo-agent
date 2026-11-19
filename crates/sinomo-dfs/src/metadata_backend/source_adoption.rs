@@ -1,26 +1,70 @@
 use super::*;
 use crate::DfsNamespaceJobStatus;
-use crate::publication_guard::{DfsPublicationOwnerScope, ShardFenceGuard, shard_fence_guard};
-use std::sync::Arc;
+use crate::publication_guard::{
+    DfsPublicationOwnerScope, DfsSourceFamilyFence, ShardFenceGuard, shard_fence_guard,
+};
+use std::sync::{Arc, Mutex};
 
-/// Shares an already-acquired native writer/fence; it cannot authorize effect.
-/// Only capture under the real backend writer constructs this opaque custody.
+/// Native source or job custody; it cannot authorize effect. Only a capture
+/// under the real backend writer constructs it. The capture reads under the
+/// shard's writer and fence, fences the rows it captured, and then releases
+/// that writer: across the wait on another node the custody holds only those
+/// row fences, so every other publication on the shard goes ahead.
 #[derive(Clone, Debug)]
 pub(crate) struct DfsSourceAdoptionWriterCustody {
     scope: DfsPublicationOwnerScope,
     prefix: DfsMetadataPrefixProof,
-    writer: Arc<MetadataWriteLock>,
-    fence: Arc<ShardFenceGuard>,
+    held: Arc<Mutex<Option<(MetadataWriteLock, ShardFenceGuard)>>>,
+    fences: Arc<Mutex<Vec<DfsSourceFamilyFence>>>,
 }
 impl DfsSourceAdoptionWriterCustody {
     pub(crate) fn scope(&self) -> &DfsPublicationOwnerScope {
         &self.scope
     }
-    pub(crate) fn writer(&self) -> Arc<MetadataWriteLock> {
-        Arc::clone(&self.writer)
+    /// Fence `object_id`'s family and its namespace entry at `path`. Called
+    /// while the capture still holds the shard's writer.
+    fn fence_object_family(&self, object_id: &DfsObjectId, path: &str) -> Result<()> {
+        self.require_held()?;
+        self.fences
+            .lock()
+            .map_err(|_| MetadataBackendError::Serde("source fences poisoned".into()))?
+            .push(DfsSourceFamilyFence::object_family(
+                &self.scope,
+                object_id,
+                path,
+            ));
+        Ok(())
     }
-    pub(crate) fn fence(&self) -> Arc<ShardFenceGuard> {
-        Arc::clone(&self.fence)
+    /// Fence the job row `job_id`, while the capture still holds the writer.
+    fn fence_job_row(&self, job_id: &str) -> Result<()> {
+        self.require_held()?;
+        self.fences
+            .lock()
+            .map_err(|_| MetadataBackendError::Serde("source fences poisoned".into()))?
+            .push(DfsSourceFamilyFence::job_row(&self.scope, job_id));
+        Ok(())
+    }
+    fn require_held(&self) -> Result<()> {
+        if self
+            .held
+            .lock()
+            .map_err(|_| MetadataBackendError::Serde("source writer custody poisoned".into()))?
+            .is_none()
+        {
+            return Err(MetadataBackendError::Serde(
+                "source rows are fenced only under the shard writer that captured them".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// End the capture: the shard's writer and fence are released, and only
+    /// the row fences remain.
+    fn release_shard_writer(&self) -> Result<()> {
+        self.held
+            .lock()
+            .map_err(|_| MetadataBackendError::Serde("source writer custody poisoned".into()))?
+            .take();
+        Ok(())
     }
     pub(crate) fn validate_scope(&self, scope: &DfsPublicationOwnerScope) -> Result<()> {
         if &self.scope != scope {
@@ -74,7 +118,8 @@ impl DfsSourceAdoptionJobCapture {
 }
 
 /// Exact source and original coordinator-job custody. Serializable rows never
-/// create this value, and its locks survive until the exact target outcome.
+/// create this value, and its row fences survive until the exact target
+/// outcome.
 #[derive(Debug)]
 pub struct DfsSourceAdoptionCapture {
     family: DfsCrossShardSourceFamily,
@@ -125,6 +170,15 @@ impl DfsSourceAdoptionCapture {
                 "actual source/job custody differs from captured family".into(),
             ));
         }
+        source.fence_object_family(&family.source_object.object_id, &family.source_object.path)?;
+        job_root
+            .as_ref()
+            .unwrap_or(&source)
+            .fence_job_row(&job.job_id)?;
+        source.release_shard_writer()?;
+        if let Some(root) = job_root.as_ref() {
+            root.release_shard_writer()?;
+        }
         Ok(Self {
             family,
             job,
@@ -139,8 +193,8 @@ impl LocalSobjMetadataBackend {
         fs: &DfsFileSystemId,
     ) -> Result<DfsSourceAdoptionWriterCustody> {
         let scope = self.publication_scope_for_backend(fs, &self.shard_id)?;
-        let fence = Arc::new(shard_fence_guard(&scope));
-        let writer = Arc::new(self.begin_metadata_write()?);
+        let fence = shard_fence_guard(&scope);
+        let writer = self.begin_metadata_write()?;
         let prefix = self.prefix_proof.clone().ok_or_else(|| {
             MetadataBackendError::Serde("source/job capture has no actual certified prefix".into())
         })?;
@@ -155,8 +209,8 @@ impl LocalSobjMetadataBackend {
         Ok(DfsSourceAdoptionWriterCustody {
             scope,
             prefix,
-            writer,
-            fence,
+            held: Arc::new(Mutex::new(Some((writer, fence)))),
+            fences: Arc::default(),
         })
     }
     pub(crate) fn source_adoption_family_while_held(
@@ -235,6 +289,8 @@ impl LocalSobjMetadataBackend {
                 "source object changed while its original physical writer custody queued".into(),
             ));
         }
+        custody.fence_object_family(object_id, &family.source_object.path)?;
+        custody.release_shard_writer()?;
         Ok(DfsSourceAdoptionSourceCapture { family, custody })
     }
 
@@ -259,6 +315,8 @@ impl LocalSobjMetadataBackend {
                 "original coordinator job changed while its writer custody queued".into(),
             ));
         }
+        custody.fence_job_row(job_id)?;
+        custody.release_shard_writer()?;
         Ok(DfsSourceAdoptionJobCapture { job, custody })
     }
 

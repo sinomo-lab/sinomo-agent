@@ -5089,7 +5089,7 @@ fn normal_main_abort_rejects_other_actor_and_fences_actual_late_stage_reply() {
             case.request.file_system_id.clone(),
             case.main.clone(),
             operation,
-            crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+            crate::DFS_NO_CALLER_BUDGET,
             false,
             false,
         )

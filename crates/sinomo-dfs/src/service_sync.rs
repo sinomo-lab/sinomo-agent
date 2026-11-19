@@ -31,8 +31,10 @@ use crate::{
     service_state::PendingMetadataReplicationResponseKind, sifs_file_system_id,
 };
 
-/// Default time budget for a foreground POSIX durability barrier.
-pub const DEFAULT_DFS_POSIX_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
+/// The bound tests put on their own durability waits. No request path uses a
+/// default: a sync is bounded in time only by its caller's budget.
+#[cfg(test)]
+pub(crate) const DEFAULT_DFS_POSIX_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
 
 const DFS_POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
 /// Give every member of a healthy shard one normal round trip to answer before
@@ -1079,6 +1081,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 deadline
                     .checked_duration_since(Instant::now())
                     .filter(|remaining| !remaining.is_zero())
+                    .map(Some)
                     .ok_or_else(|| DfsError::Network {
                         message: "metadata handoff authority read exhausted the caller deadline"
                             .into(),
@@ -1443,16 +1446,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Replicate a frozen local metadata prefix until a configured majority has
     /// durably acknowledged it, or fail without making a durability claim.
+    ///
+    /// `timeout` is a deadline the caller owns. A barrier run for a request
+    /// passes `None`: it adds no deadline, and ends on its certificate, the
+    /// network's verdict that the missing members cannot be reached,
+    /// cancellation, or the operation deadline its requester set.
     pub fn sync_metadata_shard_to_quorum(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
         self.sync_metadata_shard_to_quorum_with_required_intersection(
             target,
             &BTreeSet::new(),
             MetadataQuorumSyncPurpose::OrdinaryDurability,
-            timeout,
+            timeout.into(),
         )
     }
 
@@ -1561,7 +1569,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target,
             &BTreeSet::new(),
             MetadataQuorumSyncPurpose::ExactPrefixFullAssignment,
-            timeout,
+            Some(timeout),
         )
     }
 
@@ -1574,8 +1582,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn sync_metadata_shard_to_write_set(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Option<DfsWriteSetSync>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         if target.authority_epoch.is_none() {
             return Ok(None);
         }
@@ -1628,13 +1637,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         });
         let mut certificate = match admission {
             Some(crate::service_sync_flights::Admission::Join(receiver)) => {
-                let deadline = self
-                    .transport
-                    .operation_deadline()
-                    .map_or(timeout, |limit| {
-                        timeout.min(limit.saturating_duration_since(Instant::now()))
-                    });
-                let certificate = receiver.wait(deadline, self.cancellation.as_ref())?;
+                let budget = match self.transport.operation_deadline() {
+                    Some(limit) => {
+                        let remaining = limit.saturating_duration_since(Instant::now());
+                        Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)))
+                    }
+                    None => timeout,
+                };
+                let certificate = receiver.wait(budget, self.cancellation.as_ref())?;
                 self.revalidate_metadata_quorum_sync_authority(&frozen, &purpose)?;
                 certificate
             }
@@ -1681,7 +1691,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         recovery_node_ids: &[NodeId],
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
         let recovery_node_ids = recovery_node_ids.iter().cloned().collect::<BTreeSet<_>>();
         if recovery_node_ids.is_empty() {
@@ -1696,7 +1706,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target,
             &recovery_node_ids,
             MetadataQuorumSyncPurpose::OrdinaryDurability,
-            timeout,
+            timeout.into(),
         )
     }
 
@@ -1705,25 +1715,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         required_intersection: &BTreeSet<NodeId>,
         purpose: MetadataQuorumSyncPurpose,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
-        // A routed peer may have accepted the request but still be waiting for
-        // its local DFS service lane. Session keepalives are transport progress,
-        // not application progress, so the network's idle timer deliberately
-        // cannot bound that wait. Carry this barrier's semantic deadline into
-        // every routed/direct send instead. This also breaks the cross-node
+        // A caller that owns a deadline for this barrier, as maintenance
+        // does, has it carried into every routed and direct send: a routed
+        // peer may have accepted the request but still be waiting for its
+        // local DFS service lane, and session keepalives are transport
+        // progress, not application progress, so the network's idle timer
+        // cannot bound that wait. This also breaks the cross-node
         // hold-and-wait cycle when several maintenance passes own their local
         // backend lane at the same time.
-        let requested_deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let effective_deadline = previous_deadline
-            .filter(|existing| *existing < requested_deadline)
-            .unwrap_or(requested_deadline);
-        if effective_deadline != requested_deadline {
+        //
+        // A barrier run for a request has no deadline of its own. Its sends
+        // carry the operation deadline its requester set, if any.
+        let previous_deadline = self.transport.operation_deadline();
+        if let Some(timeout) = timeout {
+            let requested_deadline = Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now);
+            let effective_deadline = previous_deadline
+                .filter(|existing| *existing < requested_deadline)
+                .unwrap_or(requested_deadline);
             self.transport
                 .set_operation_deadline(Some(effective_deadline));
         }
@@ -1787,7 +1799,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         required_intersection: &BTreeSet<NodeId>,
         purpose: &MetadataQuorumSyncPurpose,
         probe_barrier_id: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
         #[cfg(any(test, feature = "test-support"))]
         let _native_context =
@@ -1819,7 +1831,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Persisted replication cursors are scheduling hints, not a proof for
         // this barrier. Each non-primary acknowledgement below comes from a
         // fresh exact-checkpoint probe sent and answered during this call.
-        let full_shard_grace = DFS_POSIX_FULL_SHARD_ACK_GRACE.min(timeout);
+        let full_shard_grace = timeout.map_or(DFS_POSIX_FULL_SHARD_ACK_GRACE, |timeout| {
+            DFS_POSIX_FULL_SHARD_ACK_GRACE.min(timeout)
+        });
+        // What ends this barrier in time: the deadline its caller owns, or
+        // the operation deadline of the request it runs for. Neither is set
+        // for a request without a budget.
+        let barrier_deadline = match (
+            timeout.and_then(|timeout| started_at.checked_add(timeout)),
+            self.transport.operation_deadline(),
+        ) {
+            (Some(own), Some(operation)) => Some(own.min(operation)),
+            (deadline, None) | (None, deadline) => deadline,
+        };
+        // Cancellation wakes the wait below at once.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         let mut freshly_acknowledged = BTreeSet::from([self.node_id.clone()]);
         let mut send_diagnostics = MetadataSyncAttemptDiagnostics::for_target(&target);
         let mut pending_prefix_probes = BTreeMap::<String, NodeId>::new();
@@ -2061,7 +2094,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let progress =
                 metadata_sync_progress_from_fresh_acknowledgements(&target, &freshly_acknowledged);
             let elapsed = started_at.elapsed();
-            if elapsed >= timeout {
+            if barrier_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 if matches!(purpose, MetadataQuorumSyncPurpose::MembershipHandoff { .. })
                     && metadata_sync_progress_satisfies(&progress, required_intersection)
                     && let Some(certificate) =
@@ -2123,7 +2156,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsError::Network {
                     message: format!(
                         "timed out after {}ms before metadata shard {} reached a POSIX sync certificate: {}/{} acknowledgements through sequence {}; missing={missing_node_ids:?}; recovery-set intersection={recovery_intersection}; barrier={probe_barrier_id}; epoch={:?}; fingerprint={}; peer_state={peer_state:?}; send_state={send_state}",
-                        timeout.as_millis(),
+                        elapsed.as_millis(),
                         target.shard_id.0,
                         progress.acknowledged_node_ids.len(),
                         required_node_ids.len(),
@@ -2198,7 +2231,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } else {
                 DFS_POSIX_SYNC_IDLE_WAIT
             };
-            let wait = idle.min(timeout.saturating_sub(elapsed));
+            let wait = barrier_deadline.map_or(idle, |deadline| {
+                idle.min(deadline.saturating_duration_since(Instant::now()))
+            });
             self.transport
                 .wait_for_incoming(wait)
                 .map_err(DfsError::from_network)?;

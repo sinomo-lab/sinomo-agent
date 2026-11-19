@@ -13,7 +13,7 @@ use crate::posix_path::{
     posix_path_is_at_or_under_prefix,
 };
 use crate::{
-    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DfsControlPlaneStore, DfsError, DfsMessageTransport,
+    DFS_NO_CALLER_BUDGET, DfsControlPlaneStore, DfsError, DfsMessageTransport,
     DfsMetadataShardConfig, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceOperation,
     DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
     DfsReadRangeData, NetworkedDfsService, PendingRoutedNamespaceResult, sifs_file_system_id,
@@ -34,7 +34,7 @@ enum RoutedNamespaceNetworkRecovery {
 /// Possible owners of an immediate directory child under one exact catalog.
 /// A prefix boundary can own that child; deeper disjoint prefixes cannot.
 /// Hash assignments may select any child and retain the root fallback.
-pub(super) fn directory_child_authority_shards<'a>(
+pub(crate) fn directory_child_authority_shards<'a>(
     path: &str,
     configs: &'a [DfsMetadataShardConfig],
 ) -> Result<Vec<&'a DfsMetadataShardConfig>> {
@@ -348,7 +348,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         shard: &DfsMetadataShardConfig,
     ) -> bool {
-        shard.primary_node_id == self.node_id || shard.replica_node_ids.contains(&self.node_id)
+        (shard.primary_node_id == self.node_id || shard.replica_node_ids.contains(&self.node_id))
+            && !self.metadata_lease_omits_shard(&shard.shard_id)
     }
 
     /// Whether this service answers reads of `path` from its own metadata:
@@ -843,7 +844,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     file_system_id.clone(),
                     primary.clone(),
                     operation.clone(),
-                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                    DFS_NO_CALLER_BUDGET,
                     replay,
                     replay,
                 ) {
@@ -972,7 +973,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 sifs_file_system_id(),
                 primary_node_id,
                 operation.clone(),
-                DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                DFS_NO_CALLER_BUDGET,
                 true,
                 true,
             )
@@ -1771,7 +1772,7 @@ where
             let mut routed = match self
                 .route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
                     operation_id.clone(), file_system_id.clone(), primary.clone(), operation.clone(),
-                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, false, false,
+                    DFS_NO_CALLER_BUDGET, false, false,
                 ).await {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
@@ -1803,7 +1804,7 @@ where
                 routed = self.route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
                     request_id, file_system_id.clone(), primary.clone(),
                     DfsNamespaceOperation::LookupPaths { paths: vec![path.clone()] },
-                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, false, false,
+                    DFS_NO_CALLER_BUDGET, false, false,
                 ).await.map_err(DfsPosixError::Dfs)?;
             }
             match routed.result {

@@ -769,6 +769,30 @@ impl DistributedEventualCoordinator {
     /// Whether any write intent for the object is still awaiting receipts.
     /// Cross-shard moves fence on this: a half-finished write must settle
     /// before its object may change shard authority.
+    /// The write intents for `object_id` still awaiting receipts or their
+    /// commit.
+    pub(crate) fn open_intent_ids_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> impl Iterator<Item = &String> {
+        self.awaiting_intent_ids_by_object_id
+            .get(object_id)
+            .into_iter()
+            .flatten()
+    }
+
+    /// The write intents still awaiting receipts or their commit.
+    pub(crate) fn open_intent_ids(&self) -> impl Iterator<Item = &String> {
+        self.awaiting_intent_ids_by_object_id.values().flatten()
+    }
+
+    /// Whether any write intent is still awaiting receipts or its commit.
+    pub(crate) fn has_open_intents(&self) -> bool {
+        self.awaiting_intent_ids_by_object_id
+            .values()
+            .any(|intent_ids| !intent_ids.is_empty())
+    }
+
     pub fn has_open_intent_for_object(&self, object_id: &DfsObjectId) -> bool {
         self.awaiting_intent_ids_by_object_id
             .get(object_id)

@@ -71,6 +71,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             remote_namespace_phase: None,
             pending_namespace_request_recovery: None,
             completed_remote_namespace_phases: BTreeMap::new(),
+            answered_remote_reads: BTreeMap::new(),
+            read_yield_fresh_requests: Default::default(),
             file_sync_wait_deadline: None,
             prepared_remote_sources: BTreeMap::new(),
             publication_execution: Default::default(),
@@ -78,6 +80,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             source_adoption: Default::default(),
             pending_namespace_request_recovery_cursor: None,
             write_intent_maintenance_scan: std::sync::Arc::new(Default::default()),
+            foreign_live_write_intents: Default::default(),
             maintenance_progress: std::sync::Arc::new(Default::default()),
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: Default::default(),
@@ -117,6 +120,13 @@ where
             Err(error) => Err(DfsError::from_network(error)),
         }
     }
+}
+
+/// The cancellation and operation deadline a service had before it began
+/// serving a request.
+pub(crate) struct DfsServedRequestRestore {
+    cancellation: Option<DfsCancellationFlag>,
+    operation_deadline: Option<std::time::Instant>,
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -256,21 +266,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// and stop with [`DfsError::Cancelled`] once it flips — the caller's way
     /// to abandon budgeted work promptly when the cluster link is degraded.
     pub fn with_cancellation(mut self, cancellation: DfsCancellationFlag) -> Self {
-        self.cancellation = Some(cancellation);
+        self.set_cancellation(Some(cancellation));
         self
     }
 
     pub fn set_cancellation(&mut self, cancellation: Option<DfsCancellationFlag>) {
         self.cancellation = cancellation;
+        // The transport's blocking sends watch the same cancellation.
+        self.transport
+            .set_send_cancellation(self.cancellation.clone());
     }
 
     /// Add a cancellation source without replacing one already installed by
     /// the caller which opened the service.
     pub fn add_cancellation(&mut self, cancellation: DfsCancellationFlag) {
-        self.cancellation = Some(match self.cancellation.take() {
+        let cancellation = match self.cancellation.take() {
             Some(existing) => DfsCancellationFlag::linked([existing, cancellation]),
             None => cancellation,
-        });
+        };
+        self.set_cancellation(Some(cancellation));
+    }
+
+    /// Bound this service's waits by one served request: its requester's
+    /// budget becomes the transport's operation deadline, which every wait and
+    /// routed send already observes, and its requester's departure joins the
+    /// service's cancellation. Returns what [`Self::leave_served_request`]
+    /// restores.
+    pub(crate) fn enter_served_request(
+        &mut self,
+        served: &crate::DfsServedRequestScope,
+    ) -> DfsServedRequestRestore {
+        let cancellation = self.cancellation.clone();
+        self.add_cancellation(served.cancellation().clone());
+        let observed = self.transport.operation_deadline();
+        let replaced = self
+            .transport
+            .set_operation_deadline(served.deadline_within(observed));
+        DfsServedRequestRestore {
+            cancellation,
+            operation_deadline: replaced.or(observed),
+        }
+    }
+
+    pub(crate) fn leave_served_request(&mut self, restore: DfsServedRequestRestore) {
+        self.set_cancellation(restore.cancellation);
+        self.transport
+            .set_operation_deadline(restore.operation_deadline);
     }
 
     /// Wake `waker` when this service's cancellation fires, while the
@@ -283,6 +324,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.cancellation
             .as_ref()
             .map(|cancellation| cancellation.register_waker(waker))
+    }
+
+    /// Wait until a re-send is due, or until this service's cancellation
+    /// fires, whichever is first.
+    pub(crate) fn wait_for_resend(&self, wait: std::time::Duration) {
+        let due = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let cancelled = std::sync::Arc::clone(&due);
+        let waker: crate::service_state::DfsCancellationWaker = std::sync::Arc::new(move || {
+            *cancelled
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            cancelled.1.notify_all();
+        });
+        let _registration = self.register_cancellation_waker(&waker);
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(DfsCancellationFlag::is_cancelled)
+        {
+            return;
+        }
+        let woken = due
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            due.1
+                .wait_timeout_while(woken, wait, |woken| !*woken)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     pub(crate) fn check_cancelled(&self, operation: &'static str) -> Result<(), DfsError> {
@@ -634,6 +706,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || self.committed_work_tracker.is_some();
 
         metadata_lookup_scope_quiescent
+            && !self.coordinator.has_open_intents()
             && self.writes.is_quiescent()
             && self.reads.is_quiescent()
             && self.replication.is_quiescent()
@@ -642,6 +715,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && self.pending_namespace_request_recovery.is_none()
             && self.routed_namespace_settle_depth == 0
             && committed_work_has_durable_owner
+    }
+
+    /// Whether a routed write this service served is unfinished: it still
+    /// awaits receipts or its commit, or still owes its requester a reply.
+    pub(crate) fn has_unfinished_routed_writes(&self) -> bool {
+        self.coordinator.has_open_intents()
+            || !self.writes.pending_writes.is_empty()
+            || !self.writes.pending_remote_write_responses.is_empty()
+    }
+
+    /// The write intents of [`Self::has_unfinished_routed_writes`].
+    pub(crate) fn unfinished_routed_write_intent_ids(&self) -> std::collections::BTreeSet<String> {
+        self.coordinator
+            .open_intent_ids()
+            .chain(self.writes.pending_writes.keys())
+            .chain(self.writes.pending_remote_write_responses.keys())
+            .cloned()
+            .collect()
     }
 
     /// Release a quiescent exact-shard lane's rebuildable metadata mirror.

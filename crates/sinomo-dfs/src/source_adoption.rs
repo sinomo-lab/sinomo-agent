@@ -1407,27 +1407,9 @@ impl DfsSourceAdoptionActor {
                 )?;
                 backend.source_adoption_outcome(scope, hash, expected)
             };
-            // The original coordinator may still retain this very writer.
-            // Borrow its opaque native custody; acquiring a second FD would
-            // turn an exact terminal lookup into a permanent lock cycle.
-            let borrowed = if offer.job_offer.coordinator_node_id == self.node
-                && offer.job_offer.job_config.shard_id == scope.shard_id.0
-            {
-                self.original_job_session(&offer.job_offer, false)
-                    .ok()
-                    .filter(|job| {
-                        job.capture.scope().root() == root.as_path()
-                            && job.capture.scope().file_system_id() == &scope.file_system_id
-                    })
-                    .map(|job| job.capture.writer_custody())
-            } else {
-                None
-            };
-            let outcome = if let Some(custody) = borrowed {
-                let _actual_writer = custody.writer();
-                let _actual_fence = custody.fence();
-                inspect()?
-            } else {
+            // An original coordinator's custody holds row fences, not this
+            // shard's writer, so the lookup takes its own inspection fence.
+            let outcome = {
                 match crate::metadata_lock::try_metadata_inspection_lock(
                     root.clone(),
                     crate::metadata_cursor::journal_write_lock_path(&root),
@@ -1795,12 +1777,23 @@ pub(crate) enum RemoteNamespacePhase {
     PrepareSource {
         actor: Arc<DfsSourceAdoptionActor>,
         plan: SourcePreparationPlan,
-        deadline: std::time::Instant,
+        /// The requester's budget, if the request this phase runs for set one.
+        deadline: Option<std::time::Instant>,
     },
     PublishTarget(RemoteTargetNamespacePhase),
     /// A file sync waits for repair progress on its object's primary with
     /// the lane and admission released, so the executor and its replies run.
     AwaitRepairProgress(AwaitRepairProgressPhase),
+    /// A request on several shard lanes reads another node's shard from that
+    /// shard's primary with its lanes and admission released, so the
+    /// answering primary never waits on a lane the request holds.
+    ReadAtPrimary(RemoteReadNamespacePhase),
+}
+#[derive(Debug)]
+pub(crate) struct RemoteReadNamespacePhase {
+    /// The read's identity within its request, the same on the re-run.
+    pub(crate) key: String,
+    pub(crate) read: RemoteTargetNamespacePhase,
 }
 #[derive(Debug)]
 pub(crate) struct AwaitRepairProgressPhase {
@@ -1808,14 +1801,15 @@ pub(crate) struct AwaitRepairProgressPhase {
     pub(crate) object_id: crate::DfsObjectId,
     pub(crate) version: crate::DfsVersion,
     pub(crate) seen: u64,
-    pub(crate) deadline: std::time::Instant,
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 #[derive(Debug)]
 pub(crate) struct RemoteTargetNamespacePhase {
     pub(crate) actor: Arc<DfsSourceAdoptionActor>,
     pub(crate) command: crate::DfsNamespaceCommand,
     pub(crate) pending: crate::service_state::PendingRoutedNamespaceOp,
-    pub(crate) deadline: std::time::Instant,
+    /// The requester's budget, if the request this phase runs for set one.
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 #[derive(Debug)]
 pub(crate) enum CompletedRemoteNamespacePhase {
@@ -1828,10 +1822,16 @@ pub(crate) enum CompletedRemoteNamespacePhase {
     RepairProgress {
         object_id: crate::DfsObjectId,
         version: crate::DfsVersion,
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
+    },
+    /// A read the request yielded came back from its primary, or failed as
+    /// its send would have failed on the request's own run.
+    ReadAnswered {
+        key: String,
+        answer: std::result::Result<CompletedRemoteTargetNamespacePhase, crate::DfsError>,
     },
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CompletedRemoteTargetNamespacePhase {
     pub(crate) command: crate::DfsNamespaceCommand,
     pub(crate) pending: crate::service_state::PendingRoutedNamespaceOp,
@@ -1853,7 +1853,9 @@ impl RemoteNamespacePhase {
 
     pub(crate) fn cancel_before_dispatch(&self) -> Result<()> {
         match self {
-            Self::PrepareSource { .. } | Self::AwaitRepairProgress(_) => Ok(()),
+            Self::PrepareSource { .. } | Self::AwaitRepairProgress(_) | Self::ReadAtPrimary(_) => {
+                Ok(())
+            }
             Self::PublishTarget(phase) => match phase.source_offer()? {
                 Some(offer) => phase.actor.cancel_unclaimed(offer),
                 None => Ok(()),
@@ -1871,7 +1873,7 @@ impl RemoteNamespacePhase {
                 plan,
                 deadline,
             } => {
-                if deadline <= std::time::Instant::now() {
+                if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
                     return Err(crate::DfsError::NetworkDelivery {
                         delivery_state:
                             sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
@@ -1900,6 +1902,12 @@ impl RemoteNamespacePhase {
                     deadline: phase.deadline,
                 })
             }
+            // The read's own failure is its answer: the re-run meets it where
+            // the read would have been sent.
+            Self::ReadAtPrimary(phase) => Ok(CompletedRemoteNamespacePhase::ReadAnswered {
+                key: phase.key,
+                answer: phase.read.dispatch(),
+            }),
         }
     }
 }
@@ -1935,7 +1943,10 @@ impl RemoteTargetNamespacePhase {
             | crate::DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
             | crate::DfsNamespaceOperation::ParentCountParticipant { .. }
             | crate::DfsNamespaceOperation::ReleaseDirectoryMoveDestination { .. }
-            | crate::DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => Ok(None),
+            | crate::DfsNamespaceOperation::CommitHardlinkTargetFence { .. }
+            | crate::DfsNamespaceOperation::LookupPath { .. }
+            | crate::DfsNamespaceOperation::LookupPaths { .. }
+            | crate::DfsNamespaceOperation::MetadataQuery { .. } => Ok(None),
             _ => Err(error(
                 "owned target phase contains another namespace operation",
             )),
@@ -1943,9 +1954,24 @@ impl RemoteTargetNamespacePhase {
     }
     fn dispatch(self) -> std::result::Result<CompletedRemoteTargetNamespacePhase, crate::DfsError> {
         let actor = self.actor.clone();
-        let local_offer = self.source_offer()?.filter(|offer|
-            offer.source_node_id == actor.node && offer.job_offer.coordinator_node_id == actor.node).cloned();
+        let local_offer = self
+            .source_offer()?
+            .filter(|offer| {
+                offer.source_node_id == actor.node
+                    && offer.job_offer.coordinator_node_id == actor.node
+            })
+            .cloned();
         let outcome = self.dispatch_inner();
+        if outcome.as_ref().is_ok_and(|completed| {
+            !matches!(
+                completed.response.result,
+                crate::DfsNamespaceResult::Applied
+            )
+        }) {
+            // A refused target may have claimed the source before refusing:
+            // settle that claim now so its row fences end with it.
+            actor.wake_reconciliation();
+        }
         if outcome.is_err() {
             // Delivery uncertainty says nothing about current source custody.
             // The existing guarded cancellation can revoke only an exact,
@@ -1967,11 +1993,14 @@ impl RemoteTargetNamespacePhase {
         self,
     ) -> std::result::Result<CompletedRemoteTargetNamespacePhase, crate::DfsError> {
         let offer = self.source_offer()?;
-        let Some(remaining) = self
-            .deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|value| !value.is_zero())
-        else {
+        // Without a budget the call ends on its answer or the network's
+        // verdict.
+        let remaining = self.deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|value| !value.is_zero())
+        });
+        let Some(remaining) = remaining.map_or(Some(None), |remaining| remaining.map(Some)) else {
             if let Some(offer) = offer {
                 self.actor
                     .cancel_unclaimed(offer)
@@ -1998,20 +2027,36 @@ impl RemoteTargetNamespacePhase {
             attachment: None,
         })
         .map_err(crate::DfsError::from_network)?;
+        // A test pauses an owned target phase; a read is not one.
         #[cfg(any(test, feature = "test-support"))]
-        crate::source_adoption_test::capture_and_pause(
-            &self.actor.data_root,
-            &envelope,
-            &self.actor.runtime,
-        );
+        if !matches!(
+            self.command.operation,
+            crate::DfsNamespaceOperation::LookupPath { .. }
+                | crate::DfsNamespaceOperation::LookupPaths { .. }
+                | crate::DfsNamespaceOperation::MetadataQuery { .. }
+        ) {
+            crate::source_adoption_test::capture_and_pause(
+                &self.actor.data_root,
+                &envelope,
+                &self.actor.runtime,
+            );
+        }
+        let options = sinomo_core::network::ClusterObjectRpcOptions::default()
+            .with_destination_process_affinity(
+                sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+            );
+        let (options, call) = match remaining {
+            Some(remaining) => (options.with_overall_timeout(remaining), {
+                let mut call = call;
+                call.request = crate::routes::with_dfs_request_budget(call.request, remaining);
+                call
+            }),
+            None => (options, call),
+        };
         let mut result = match self.actor.transport.call(
             &self.pending.primary_node_id,
             call,
-            sinomo_core::network::ClusterObjectRpcOptions::default()
-                .with_destination_process_affinity(
-                    sinomo_core::network::DestinationProcessAffinity::MainDaemon,
-                )
-                .with_overall_timeout(remaining),
+            options,
             true,
         ) {
             Ok(result) => result,
@@ -2108,6 +2153,14 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         &mut self,
         completed: CompletedRemoteNamespacePhase,
     ) -> std::result::Result<(), crate::DfsError> {
+        if !matches!(
+            completed,
+            CompletedRemoteNamespacePhase::ReadAnswered { .. }
+        ) {
+            // A phase that changed another shard ends what the reads before
+            // it observed: the re-run reads that shard again.
+            self.answered_remote_reads.clear();
+        }
         let completed = match completed {
             CompletedRemoteNamespacePhase::SourcePrepared {
                 request_id,
@@ -2117,6 +2170,11 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 return Ok(());
             }
             CompletedRemoteNamespacePhase::TargetPublished(completed) => completed,
+            CompletedRemoteNamespacePhase::ReadAnswered { key, answer } => {
+                // The re-run's read takes this answer in place of a send.
+                self.answered_remote_reads.insert(key, answer);
+                return Ok(());
+            }
             CompletedRemoteNamespacePhase::RepairProgress {
                 object_id,
                 version,
@@ -2165,10 +2223,10 @@ mod guarded_kernel_terminal_tests {
         let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = Arc::clone(&observed);
         CLAIM_OBSERVERS.lock().unwrap().insert(root.clone(), Box::new(move |actor, offer| {
-            let physical = {
+            let (physical, scope, object_id) = {
                 let session = actor.source_session(offer, false).unwrap();
                 assert!(session.claim.lock().unwrap().is_some(), "actual production target owns the claim");
-                session.capture.scope().root().to_owned()
+                (session.capture.scope().root().to_owned(), session.capture.scope().clone(), session.capture.family().source_object.object_id.clone())
             };
             let mut changed = offer.clone();
             changed.transfer_id.push_str("-changed");
@@ -2178,7 +2236,8 @@ mod guarded_kernel_terminal_tests {
             assert!(!actor.cancel_undispatched_local_offer(&foreign).unwrap());
             assert!(actor.cancel_undispatched_local_offer(offer).is_err(), "claimed actual effect must retain custody");
             assert!(actor.source_session(offer, false).unwrap().claim.lock().unwrap().is_some());
-            assert!(crate::metadata_lock::try_metadata_inspection_lock(physical.clone(), crate::metadata_cursor::journal_write_lock_path(&physical)).unwrap().is_none(), "the real source writer remains held");
+            assert!(crate::metadata_lock::try_metadata_inspection_lock(physical.clone(), crate::metadata_cursor::journal_write_lock_path(&physical)).unwrap().is_some(), "the source holds no shard writer across the adopt step");
+            assert!(crate::publication_guard::source_rows_fenced(&scope, &object_id), "the claimed source family stays fenced");
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
         let mut client = native.client(&node).unwrap();

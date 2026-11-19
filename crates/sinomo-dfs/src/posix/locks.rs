@@ -17,8 +17,6 @@ pub const DEFAULT_DFS_ADVISORY_LOCK_LEASE: Duration = Duration::from_secs(120);
 
 /// Network budget for one lock-manager round trip, including exact metadata
 /// replication of any state transition.
-pub const DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT: Duration = Duration::from_secs(45);
-
 /// Bounded clock-difference assumption used by the epoch warm-up fence. This
 /// is deliberately much larger than normal NTP error because Sinomo nodes may
 /// be intermittently connected mobile devices. Deployments whose clocks can
@@ -54,26 +52,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsAdvisoryLockCommand,
     ) -> Result<DfsAdvisoryLockOutcome> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        self.posix_advisory_lock_for_object_with_timeout(
-            path,
-            object_id,
-            command,
-            DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT,
-        )
+        self.posix_advisory_lock_for_object_with_timeout(path, object_id, command, None)
     }
 
-    /// Bounded variant used by mounted-client renewal lanes. Callers must keep
-    /// their maximum number of live grants consistent with this timeout and
-    /// the configured lease duration.
+    /// The same operation under a budget its caller owns, as mounted-client
+    /// renewal lanes set one. Callers must keep their maximum number of live
+    /// grants consistent with their budget and the configured lease duration.
+    /// `None` is a caller without a budget: the command ends on its outcome,
+    /// a definite failure or the network's verdict.
     pub fn posix_advisory_lock_for_object_with_timeout(
         &mut self,
         path: &str,
         object_id: &DfsObjectId,
         command: DfsAdvisoryLockCommand,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsAdvisoryLockOutcome> {
+        let timeout: Option<Duration> = timeout.into();
         let _namespace_plan = self.namespace_execution.begin_planning();
-        if timeout.is_zero() {
+        if timeout.is_some_and(|timeout| timeout.is_zero()) {
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: "advisory-lock RPC timeout must be greater than zero".to_string(),
             }));
@@ -86,11 +82,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             path: authority_path.clone(),
             object_id: object_id.clone(),
             command,
-            timeout_millis: timeout
-                .saturating_sub(POSIX_LOCK_REMOTE_RESPONSE_MARGIN)
-                .max(Duration::from_millis(1))
-                .as_millis()
-                .min(u64::MAX as u128) as u64,
+            timeout_millis: timeout.map(|timeout| {
+                timeout
+                    .saturating_sub(POSIX_LOCK_REMOTE_RESPONSE_MARGIN)
+                    .max(Duration::from_millis(1))
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            }),
         };
         let file_system_id = object.file_system_id.clone();
         let mut primary = match self.routed_namespace_primary_for_path(&authority_path)? {
@@ -176,7 +174,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         expected_object_id: &DfsObjectId,
         command: &DfsAdvisoryLockCommand,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DfsAdvisoryLockOutcome> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         // Namespace migration holds this path guard across bundle capture,
@@ -629,7 +627,7 @@ mod tests {
                     blocking: false,
                     process_id: Some(7),
                 },
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .expect("full-shard lock grant");
 
@@ -664,7 +662,7 @@ mod tests {
                 &object.path,
                 &object.object_id,
                 &command,
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .expect_err("two acknowledgements cannot publish a three-member lock grant");
         assert!(
@@ -714,7 +712,7 @@ mod tests {
                 &object.path,
                 &object.object_id,
                 &command,
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .expect("full-participant exact lock replay");
         assert!(matches!(outcome, DfsAdvisoryLockOutcome::Acquired { .. }));

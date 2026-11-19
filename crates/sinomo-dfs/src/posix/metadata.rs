@@ -1455,6 +1455,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         resolve_hardlink_target_with(object, |target_id| self.object_by_id(target_id))
     }
 
+    /// Resolve `object`'s canonical target for a request on this service. A
+    /// service on a several-shard lease holds only the shards this node is
+    /// primary of in one filesystem: a target it does not hold is read from
+    /// its shard's primary, as a node outside that shard's replica set reads
+    /// it.
+    pub(super) fn resolve_hardlink_target_held_or_at_primary(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsObjectMetadata> {
+        let several_shard_lease = self
+            .metadata_backend
+            .as_ref()
+            .is_some_and(|backend| backend.resident_selected_shard_ids().is_some());
+        match self.resolve_hardlink_target(object) {
+            Err(DfsPosixError::NotFound { .. })
+                if several_shard_lease && object.kind == DfsObjectKind::Hardlink =>
+            {
+                self.resolve_hardlink_target_distributed(object, None)
+            }
+            resolved => resolved,
+        }
+    }
+
     /// Resolve `object`'s canonical target from the shard authorities. A
     /// target that only a closed shard could hold is unknown, not absent: the
     /// resolution returns the retryable `Busy` (see

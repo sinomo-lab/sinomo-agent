@@ -3449,7 +3449,7 @@ fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
                 sifs_file_system_id(),
                 primary.clone(),
                 operation.clone(),
-                crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                crate::DFS_NO_CALLER_BUDGET,
                 false,
                 false,
             )

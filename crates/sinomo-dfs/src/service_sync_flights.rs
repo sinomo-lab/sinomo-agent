@@ -81,7 +81,7 @@ impl DfsMetadataSyncFlights {
 impl Flight {
     pub(crate) fn wait(
         self: &Arc<Self>,
-        timeout: Duration,
+        timeout: Option<Duration>,
         cancellation: Option<&DfsCancellationFlag>,
     ) -> Outcome {
         let flight = self.clone();
@@ -91,12 +91,15 @@ impl Flight {
         });
         let _registered = cancellation.map(|flag| flag.register_waker(&waker));
         let result = self.result.lock().unwrap_or_else(|e| e.into_inner());
-        let (result, _) = self
-            .ready
-            .wait_timeout_while(result, timeout, |value| {
-                value.is_none() && !cancellation.is_some_and(DfsCancellationFlag::is_cancelled)
-            })
-            .unwrap_or_else(|e| e.into_inner());
+        let pending = |value: &mut Option<Outcome>| {
+            value.is_none() && !cancellation.is_some_and(DfsCancellationFlag::is_cancelled)
+        };
+        let result = match timeout {
+            Some(timeout) => self.ready.wait_timeout_while(result, timeout, pending)
+                .unwrap_or_else(|error| error.into_inner()).0,
+            None => self.ready.wait_while(result, pending)
+                .unwrap_or_else(|error| error.into_inner()),
+        };
         if cancellation.is_some_and(DfsCancellationFlag::is_cancelled) {
             return Err(DfsError::Cancelled {
                 operation: "joining write-set sync",

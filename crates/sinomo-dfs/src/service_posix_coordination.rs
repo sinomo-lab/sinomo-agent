@@ -6,7 +6,6 @@
 //! and response remain separately typed so a lock outcome can never be
 //! mistaken for a namespace mutation acknowledgement.
 
-use crate::posix::locks::DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -132,18 +131,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path,
                     object_id,
                     command,
-                    std::time::Duration::from_millis(*timeout_millis)
-                        .min(DEFAULT_DFS_ADVISORY_LOCK_RPC_TIMEOUT)
-                        .max(std::time::Duration::from_millis(1)),
+                    // The caller's budget as it sent it; no default, no cap.
+                    timeout_millis.map(|millis| {
+                        std::time::Duration::from_millis(millis)
+                            .max(std::time::Duration::from_millis(1))
+                    }),
                 )
                 .map(DfsPosixCoordinationResult::AdvisoryLock)
                 .map(Some),
             DfsNamespaceOperation::FileSync { target, .. } => self
-                .posix_sync_file_local(target, DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
+                .posix_sync_file_local(target, None)
                 .map(DfsPosixCoordinationResult::FileSync)
                 .map(Some),
             DfsNamespaceOperation::DirectorySync { target, .. } => self
-                .posix_sync_directory_local(target, DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
+                .posix_sync_directory_local(target, None)
                 .map(DfsPosixCoordinationResult::DirectorySync)
                 .map(Some),
 
@@ -260,11 +261,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let metadata_target = self
                     .capture_metadata_quorum_sync_target(object)
                     .map_err(DfsPosixError::from)?;
-                self.sync_metadata_shard_to_quorum(
-                    &metadata_target,
-                    DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
-                )
-                .map_err(DfsPosixError::from)?;
+                self.sync_metadata_shard_to_quorum(&metadata_target, None)
+                    .map_err(DfsPosixError::from)?;
                 Ok(Some(DfsPosixCoordinationResult::ObjectFamilyAdoption {
                     object_id: object.object_id.clone(),
                     target_version: object.version.clone(),
@@ -397,11 +395,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let metadata_target = self
                     .capture_metadata_quorum_sync_target(&transfer_object)
                     .map_err(DfsPosixError::from)?;
-                self.sync_metadata_shard_to_quorum(
-                    &metadata_target,
-                    DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
-                )
-                .map_err(DfsPosixError::from)?;
+                self.sync_metadata_shard_to_quorum(&metadata_target, None)
+                    .map_err(DfsPosixError::from)?;
                 Ok(Some(
                     DfsPosixCoordinationResult::ObjectFamilyAdoptionFinalized {
                         object_id: object_id.clone(),
@@ -453,11 +448,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let metadata_target = self
                     .capture_metadata_quorum_sync_target(object)
                     .map_err(DfsPosixError::from)?;
-                self.sync_metadata_shard_to_quorum(
-                    &metadata_target,
-                    DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
-                )
-                .map_err(DfsPosixError::from)?;
+                self.sync_metadata_shard_to_quorum(&metadata_target, None)
+                    .map_err(DfsPosixError::from)?;
                 Ok(Some(DfsPosixCoordinationResult::AdvisoryLockMigration {
                     object_id: object.object_id.clone(),
                     state_fingerprint,

@@ -591,7 +591,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &job.file_system_id, &job.root_path, &job.job_id,
                 )
                 .map_err(DfsPosixError::from)?;
-            self.sync_metadata_shard_to_quorum(&target, crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT)
+            self.sync_metadata_shard_to_quorum(&target, None)
                 .map_err(DfsPosixError::from)?;
         }
         if ended {

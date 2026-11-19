@@ -318,8 +318,17 @@ pub(crate) fn repair_executor_progress(node_id: &NodeId) -> Option<u64> {
 pub(crate) fn repair_executor_wait_for_progress(
     node_id: &NodeId,
     seen: u64,
-    deadline: std::time::Instant,
+    deadline: impl Into<Option<std::time::Instant>>,
 ) -> bool {
+    // Without a deadline the wait ends on the executor's own edge: its
+    // registration, a progress change, or its close.
+    let deadline: Option<std::time::Instant> = deadline.into();
+    let remaining = || match deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(std::time::Instant::now())
+            .map(Some),
+        None => Some(None),
+    };
     let executor = loop {
         let (count, registered) = registrations();
         let observed = *lock(count);
@@ -327,14 +336,23 @@ pub(crate) fn repair_executor_wait_for_progress(
             break executor;
         }
         // No runtime serves this node yet: its registration is the edge.
-        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+        let Some(remaining) = remaining() else {
             return false;
         };
         let guard = lock(count);
         if *guard == observed {
-            let _ = registered
-                .wait_timeout(guard, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match remaining {
+                Some(remaining) => drop(
+                    registered
+                        .wait_timeout(guard, remaining)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                ),
+                None => drop(
+                    registered
+                        .wait(guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                ),
+            }
         }
     };
     let mut progress = lock(&executor.progress);
@@ -342,14 +360,22 @@ pub(crate) fn repair_executor_wait_for_progress(
         if *progress != seen || executor.closed.load(Ordering::SeqCst) {
             return *progress != seen;
         }
-        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+        let Some(remaining) = remaining() else {
             return false;
         };
-        progress = executor
-            .progress_changed
-            .wait_timeout(progress, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .0;
+        progress = match remaining {
+            Some(remaining) => {
+                executor
+                    .progress_changed
+                    .wait_timeout(progress, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            }
+            None => executor
+                .progress_changed
+                .wait(progress)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
     }
 }
 

@@ -194,15 +194,22 @@ impl LocalSobjMetadataBackend {
         } else {
             None
         };
-        let _lock = if let Some(custody) = &source_custody {
-            let scope =
-                self.publication_scope_for_backend(&payload.file_system_id, &payload.shard_id)?;
+        let scope =
+            self.publication_scope_for_backend(&payload.file_system_id, &payload.shard_id)?;
+        if let Some(custody) = &source_custody {
             custody.validate_scope(&scope)?;
-            self.validate_retained_metadata_writer()?;
-            custody.writer()
-        } else {
-            Arc::new(self.begin_metadata_write()?)
-        };
+        }
+        // A source custody holds row fences, not this shard's writer.
+        let _lock = Arc::new(self.begin_metadata_write()?);
+        if !self
+            .tables
+            .prepared_operations_v7
+            .contains_key(&payload.operation_id)
+            && let Some(refusal) =
+                crate::publication_guard::fenced_source_rows_refusal(&scope, &payload)
+        {
+            return Err(refusal);
+        }
         if self
             .instance_authority_epoch
             .is_some_and(|epoch| epoch != payload.owner_epoch)
@@ -457,13 +464,18 @@ impl LocalSobjMetadataBackend {
             .map(|source| source.target_writer_custody(&scope))
             .transpose()?
             .flatten();
-        let lock = if let Some(custody) = &custody {
+        if let Some(custody) = &custody {
             custody.validate_scope(&scope)?;
-            self.validate_retained_metadata_writer()?;
-            custody.writer()
-        } else {
-            Arc::new(self.begin_metadata_write()?)
-        };
+        }
+        // A source custody holds row fences, not this shard's writer.
+        let lock = Arc::new(self.begin_metadata_write()?);
+        if let Some(record) = self.tables.prepared_operations_v7.get(&digest.operation_id)
+            && record.status == crate::DfsPreparedOperationStatus::Prepared
+            && let Some(refusal) =
+                crate::publication_guard::fenced_source_rows_refusal(&scope, &record.payload)
+        {
+            return Err(refusal);
+        }
         if let Some(expected) = clustered
             && self.instance_authority_epoch.is_none()
         {

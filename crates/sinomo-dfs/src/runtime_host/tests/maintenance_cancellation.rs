@@ -44,9 +44,11 @@ fn maintenance_cancellation_is_owned_by_its_root_and_foreground_generation() {
 }
 
 // This reproduces the actual two-owner wait graph. A normal encoded root write
-// owns Global(A), while Routine(B) recovers its saved users prepare and waits
-// for A's authority ACK. The root write then needs B's authority ACK. Neither
-// assignment nor its all-participant publication rule is changed by the test.
+// holds A's root lane while local exact work holds A's users lane, and
+// Routine(B) recovers its saved users prepare and waits for A's authority ACK
+// on that users lane. The root write then needs B's authority ACK, which only
+// B's yield lets through. Neither assignment nor its all-participant
+// publication rule is changed by the test.
 #[test]
 fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
     use crate::test_runtime::{FaultAction, FaultRule, RpcPhase};
@@ -239,6 +241,10 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
         .node_resources()
         .unwrap()
         .latest();
+    let root_lane = DaemonDfsMutationLaneKey {
+        file_system_id: root.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(root.shard_id.clone()),
+    };
     let foreground = std::thread::spawn(move || {
         writer.posix_write_file_with_operation_id(
             PATH,
@@ -260,7 +266,13 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
             .unwrap();
         state.0
     };
-    let source_held = source_scheduler.global_is_exclusively_held();
+    let source_held =
+        source_scheduler.lane_held(&root_lane) && !source_scheduler.global_writer_holds();
+    // Local exact work holds A's users lane, so A cannot answer Routine(B)'s
+    // users probe until it ends; the routed root write holds only its own lane.
+    let users_lane_hold = native
+        .hold_main_exact_admission(&primary, &users.file_system_id, &users.shard_id)
+        .unwrap();
     native.checkpoint_rpc_observation_window().unwrap();
     armed.store(true, Ordering::Release);
     let maintenance = std::thread::spawn(move || {
@@ -307,6 +319,7 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
     let write_result = foreground.join().unwrap();
     let elapsed = released_at.elapsed();
     let maintenance_result = maintenance.join().unwrap();
+    drop(users_lane_hold);
     drop(foreground_hold);
     drop(background_hold);
     let calls = native.rpc_observations();
@@ -454,7 +467,7 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
     native.close().unwrap();
     assert!(
         foreground_entered && source_held,
-        "actual encoded root request must hold Global(A)"
+        "actual encoded root request must hold its root lane on A, not A's global writer"
     );
     assert!(
         reciprocal_queued && routine_waited_for_held_authority,

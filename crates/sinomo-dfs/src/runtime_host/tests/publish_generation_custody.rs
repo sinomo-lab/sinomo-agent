@@ -136,7 +136,7 @@ fn generation_child_is_owned(kind: &'static str) {
                 peer,
                 preflight,
                 task_runtime,
-                deadline,
+                Some(deadline),
             )
             .await
         } else {
@@ -261,6 +261,185 @@ fn native_publish_lane_generation_child_belongs_to_actual_host_drain() {
 #[test]
 fn native_publish_idle_generation_child_belongs_to_actual_host_drain() {
     generation_child_is_owned("idle");
+}
+
+/// A lane publish whose resident generation is current meets a cache another
+/// request holds for a moment. It waits for that cache and finds the lane
+/// current; it does not read the busy cache as a stale generation and take
+/// the refresh that yields to foreground work and leaves the publish for a
+/// later retry.
+#[test]
+fn native_lane_publish_waits_for_a_busy_cache_instead_of_refreshing() {
+    let name = "native-publish-busy-cache";
+    let (native, _) = crate::test_runtime::DfsTestRuntime::start_cluster(name, 2).unwrap();
+    let shard = native.root_shard().unwrap();
+    let node = shard.primary_node_id.clone();
+    let data = native.data_dir(&node).clone();
+    let paths = DfsRuntimePaths::new(&data);
+    let cluster_paths = ClusterPaths::new(&data);
+    let runtime = native.runtime_handle();
+    let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
+    let owner = require_daemon_dfs_data_owner_lock(&paths).unwrap();
+    let lane = DaemonDfsMutationLaneKey {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+    };
+    let publish = || {
+        super::super::publish_host::ensure_daemon_dfs_metadata_publish_resident_generation(
+            Arc::clone(&scheduler),
+            data.clone(),
+            cluster_paths.clone(),
+            lane.clone(),
+            runtime.clone(),
+            Arc::clone(&owner),
+        )
+    };
+    // The resident generation serves the lane before the cache is held.
+    runtime.block_on(publish()).unwrap();
+    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_refreshes = Arc::clone(&refreshes);
+    let hook = install_daemon_dfs_pre_dispatch_test_hook(
+        &data,
+        Arc::new(move |point, _, _| {
+            if matches!(
+                point,
+                DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { .. }
+            ) {
+                hook_refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+    );
+    let slot = daemon_dfs_message_service_cache()
+        .root(&data.root())
+        .unwrap();
+    let held = slot.lock().unwrap();
+    assert!(held.is_some(), "the resident cache entry exists");
+    let waiting = runtime.spawn(publish());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !waiting.is_finished(),
+        "the publish waits for the busy cache"
+    );
+    drop(held);
+    runtime.block_on(waiting).unwrap().unwrap();
+    assert_eq!(
+        refreshes.load(Ordering::SeqCst),
+        0,
+        "a busy cache is not read as a stale generation"
+    );
+    drop(hook);
+    drop(owner);
+    native.close().unwrap();
+}
+
+/// A lane publish whose generation refresh yields to waiting foreground work
+/// is requested again when that work releases its admission. Nothing
+/// requests it while the foreground work still holds the node, and it does
+/// not wait out the publish scheduler's retry timer, which stays a fallback.
+#[test]
+fn native_lane_publish_that_yielded_is_requested_again_when_foreground_work_ends() {
+    let name = "native-publish-yield-wake";
+    let (native, _) = crate::test_runtime::DfsTestRuntime::start_cluster(name, 2).unwrap();
+    let shard = native.root_shard().unwrap();
+    let node = shard.primary_node_id.clone();
+    let data = native.data_dir(&node).clone();
+    let paths = DfsRuntimePaths::new(&data);
+    let cluster_paths = ClusterPaths::new(&data);
+    let runtime = native.runtime_handle();
+    let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
+    let owner = require_daemon_dfs_data_owner_lock(&paths).unwrap();
+    let lane = DaemonDfsMutationLaneKey {
+        file_system_id: shard.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+    };
+    let publish = || {
+        super::super::publish_host::ensure_daemon_dfs_metadata_publish_resident_generation(
+            Arc::clone(&scheduler),
+            data.clone(),
+            cluster_paths.clone(),
+            lane.clone(),
+            runtime.clone(),
+            Arc::clone(&owner),
+        )
+    };
+    runtime.block_on(publish()).unwrap();
+    // Every time a lane publish asks for the refresh's admission.
+    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_refreshes = Arc::clone(&refreshes);
+    let hook = install_daemon_dfs_pre_dispatch_test_hook(
+        &data,
+        Arc::new(move |point, _, _| {
+            if matches!(
+                point,
+                DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested {
+                    owner: "lane",
+                    ..
+                }
+            ) {
+                hook_refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+    );
+    let refreshes_reach = |count: usize, what: &str| {
+        let started = Instant::now();
+        while refreshes.load(Ordering::SeqCst) < count {
+            assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Foreground work holds the node. Under its fence the derived cache
+    // entry is evicted, so the lane's generation must be refreshed.
+    let foreground = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    {
+        let slot = daemon_dfs_message_service_cache()
+            .root(&data.root())
+            .unwrap();
+        assert!(slot.lock().unwrap().take().is_some());
+    }
+    let attempt = runtime.spawn(publish());
+    refreshes_reach(1, "the lane publish asks for its refresh admission");
+    // More foreground work asks for admission: the refresh yields to it.
+    let yielded = Instant::now();
+    loop {
+        scheduler.request_foreground_admission();
+        if attempt.is_finished() {
+            break;
+        }
+        assert!(
+            yielded.elapsed() < Duration::from_secs(20),
+            "the refresh yields to waiting foreground work"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let refusal = runtime
+        .block_on(attempt)
+        .unwrap()
+        .expect_err("the refresh yielded");
+    assert!(refusal.contains("yielded to foreground"), "{refusal}");
+    // While the foreground work holds the node, nothing requests the publish.
+    let requests =
+        || super::super::message_host::daemon_dfs_metadata_publish_lane_request_count(&data, &lane);
+    let before = requests();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(requests(), before);
+    // The foreground work ends: the lane publish is requested again, far
+    // inside the scheduler's 30 s retry delay.
+    let ended = Instant::now();
+    drop(foreground);
+    while requests() == before {
+        assert!(
+            ended.elapsed() < Duration::from_secs(10),
+            "the yielded lane publish is requested again when foreground work ends"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(hook);
+    drop(owner);
+    native.close().unwrap();
 }
 
 #[test]

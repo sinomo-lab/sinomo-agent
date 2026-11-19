@@ -1072,12 +1072,17 @@ pub trait DfsDataPlaneHost: Send + Sync {
     /// response envelope but cannot validate host-owned authority state.
     /// `encoded_value_bytes` is captured from that envelope before decoding;
     /// it bounds response custody and is never metadata authority evidence.
+    /// `budget` is the requester's remaining budget as its request carried it,
+    /// measured from arrival; `None` means the requester set none. Dropping
+    /// the returned future is the requester's departure: both end the waits
+    /// of the served request.
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
         attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
         encoded_value_bytes: Option<u64>,
+        budget: Option<std::time::Duration>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse>;
 }
 
@@ -1449,6 +1454,7 @@ impl Service for DfsDataPlaneService {
                     let authenticated_source_node_id =
                         authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
+                    let budget = crate::routes::dfs_request_budget(&request);
                     let encoded_value_bytes = ctx.request_value_encoded_bytes(&request);
                     let (command, attachment) = if !ctx.has_request_attachment() {
                         (
@@ -1518,7 +1524,13 @@ impl Service for DfsDataPlaneService {
                     }
                     let message_response = service
                         .host
-                        .handle_message(command, attachment, traceparent, encoded_value_bytes)
+                        .handle_message(
+                            command,
+                            attachment,
+                            traceparent,
+                            encoded_value_bytes,
+                            budget,
+                        )
                         .await
                         .map_err(service_error)?;
                     if let Some(attachment) = message_response.attachment {

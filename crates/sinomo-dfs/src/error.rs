@@ -411,6 +411,7 @@ impl From<MetadataBackendError> for DfsError {
             },
             MetadataBackendError::AlreadyExists { path } => Self::AlreadyExists { path },
             MetadataBackendError::DirectoryNotEmpty { path } => Self::DirectoryNotEmpty { path },
+            MetadataBackendError::SourceFamilyFenced { path } => Self::Busy { path },
             error => Self::Metadata {
                 message: error.to_string(),
             },

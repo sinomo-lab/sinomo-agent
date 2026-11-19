@@ -96,11 +96,6 @@ fn take_metadata_direct_encoding_test_delay() -> Duration {
 /// idleness.
 const DFS_DETACHED_SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DFS_DETACHED_SEND_RETRY_MAX_EXPONENT: u32 = 6;
-/// A deadline-bounded, idempotent DFS mutation must retain enough of its
-/// caller budget to ask the authority for the durable result when the first
-/// response is lost. Five seconds matches one normal network health phase;
-/// short operations reserve one quarter instead of starving the first try.
-const DFS_EXACT_RESPONSE_REPLAY_MAX_RESERVE: Duration = Duration::from_secs(5);
 
 fn dfs_detached_send_retry_delay(retry_attempts: u32) -> Duration {
     let exponent = retry_attempts
@@ -651,6 +646,7 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
         let native_context = crate::native_shard_trace::rpc_attempt_context();
         Box::pin(async move {
             let call = dfs_message_rpc_call(command)
+                .map(|call| dfs_rpc_call_with_request_budget(call, options))
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             #[cfg(any(test, feature = "test-support"))]
             let mut native_attempt =
@@ -704,6 +700,37 @@ pub async fn dfs_message_response_from_rpc_result(
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
     crate::body_rpc::attach_dfs_message_response_attachment(head, bytes)
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A budget this thread's sends stamp while their own calls stay
+    /// unbounded: the serving node then reaches the budget first, so a test
+    /// reads the answer it gives at the budget.
+    static DFS_TEST_STAMPED_REQUEST_BUDGET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn stamp_request_budget_for_test(budget: Option<Duration>) {
+    DFS_TEST_STAMPED_REQUEST_BUDGET.with(|stamped| stamped.set(budget));
+}
+
+/// Stamps the send's whole-call deadline, which is the requester's remaining
+/// budget, on the request so the serving node ends its wait with the requester.
+fn dfs_rpc_call_with_request_budget(
+    mut call: ObjectRpcCall,
+    options: DfsObjectRpcSendOptions,
+) -> ObjectRpcCall {
+    #[cfg(test)]
+    if let Some(remaining) = DFS_TEST_STAMPED_REQUEST_BUDGET.with(std::cell::Cell::get) {
+        call.request = crate::routes::with_dfs_request_budget(call.request, remaining);
+        return call;
+    }
+    if let Some(remaining) = options.overall_timeout {
+        call.request = crate::routes::with_dfs_request_budget(call.request, remaining);
+    }
+    call
 }
 
 /// Encodes one routed DFS call as a stream-native object-RPC call.
@@ -858,6 +885,7 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
             return result;
         }
         let call = dfs_message_rpc_call(command)
+            .map(|call| dfs_rpc_call_with_request_budget(call, options))
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         #[cfg(any(test, feature = "test-support"))]
         let mut native_attempt =
@@ -1414,8 +1442,39 @@ pub struct DfsNodeTransport {
     next_content_root_catalog_frame_id: Arc<AtomicU64>,
     operation_deadline: Option<Instant>,
     incoming_wait_interrupt: Arc<DfsIncomingWaitInterrupt>,
+    /// The cancellation of the caller this transport sends for.
+    send_cancellation: Option<crate::DfsCancellationFlag>,
     #[cfg(any(test, feature = "test-support"))]
     test_drain_counter: Option<Arc<std::sync::Mutex<usize>>>,
+}
+
+std::thread_local! {
+    /// The cancellation of the caller whose blocking send runs on this thread.
+    static DFS_SEND_CANCELLATION: std::cell::RefCell<Option<crate::DfsCancellationFlag>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names, for the blocking sends this thread makes while the scope lives, the
+/// caller whose departure must end them.
+pub(crate) struct DfsSendCancellationScope(Option<crate::DfsCancellationFlag>);
+
+impl DfsSendCancellationScope {
+    pub(crate) fn enter(cancellation: Option<crate::DfsCancellationFlag>) -> Self {
+        Self(DFS_SEND_CANCELLATION.with(|current| current.replace(cancellation)))
+    }
+}
+
+impl Drop for DfsSendCancellationScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        DFS_SEND_CANCELLATION.with(|current| *current.borrow_mut() = previous);
+    }
+}
+
+/// The cancellation a blocking send on this thread watches, if its caller
+/// installed one.
+pub(crate) fn current_dfs_send_cancellation() -> Option<crate::DfsCancellationFlag> {
+    DFS_SEND_CANCELLATION.with(|current| current.borrow().clone())
 }
 
 /// Lets a waker end a [`DfsMessageTransport::wait_for_incoming`] that has no
@@ -1425,6 +1484,8 @@ pub struct DfsNodeTransport {
 struct DfsIncomingWaitInterrupt {
     interrupted: std::sync::Mutex<bool>,
     ready: std::sync::Condvar,
+    /// Wakes an asynchronous waiter on the same interrupt.
+    ready_async: tokio::sync::Notify,
 }
 
 impl DfsIncomingWaitInterrupt {
@@ -1440,12 +1501,37 @@ impl DfsIncomingWaitInterrupt {
         *interrupted = false;
     }
 
+    /// The asynchronous form of [`Self::wait`]: an interrupt ends it at once.
+    async fn wait_async(&self, timeout: Duration) {
+        let interrupted = self.ready_async.notified();
+        tokio::pin!(interrupted);
+        // Register before the check, so an interrupt between the two is seen.
+        interrupted.as_mut().enable();
+        let take = || {
+            std::mem::take(
+                &mut *self
+                    .interrupted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        if take() {
+            return;
+        }
+        tokio::select! {
+            () = interrupted => {}
+            () = tokio::time::sleep(timeout) => {}
+        }
+        take();
+    }
+
     fn interrupt(&self) {
         *self
             .interrupted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.ready.notify_all();
+        self.ready_async.notify_waiters();
     }
 }
 
@@ -1988,6 +2074,7 @@ impl Clone for DfsNodeTransport {
             operation_deadline: self.operation_deadline,
             // Waits belong to one transport; a clone has its own.
             incoming_wait_interrupt: Arc::default(),
+            send_cancellation: None,
             #[cfg(any(test, feature = "test-support"))]
             test_drain_counter: self.test_drain_counter.clone(),
         }
@@ -2426,6 +2513,7 @@ impl DfsNodeTransport {
             next_content_root_catalog_frame_id: Arc::new(AtomicU64::new(1_u64 << 63)),
             operation_deadline: None,
             incoming_wait_interrupt: Arc::default(),
+            send_cancellation: None,
             #[cfg(any(test, feature = "test-support"))]
             test_drain_counter: None,
         }
@@ -2862,9 +2950,11 @@ impl DfsNodeTransport {
         let (command, call) = dfs_routed_call_rpc_call(call)?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
+        let call = dfs_rpc_call_with_request_budget(call, options);
         #[cfg(any(test, feature = "test-support"))]
         let mut native_attempt =
             native_context.and_then(|context| context.begin(target_node_id, &command));
+        let _send_cancellation = DfsSendCancellationScope::enter(self.send_cancellation.clone());
         let result = peer_transport.call_object_rpc(
             target_node_id,
             call,
@@ -3213,6 +3303,7 @@ impl DfsNodeTransport {
         // transport clone independently. One worker owns ready work while
         // retaining cap-two concurrency inside its drain. A competing worker
         // never blocks a Tokio blocking-pool thread behind the global gate.
+        let _send_cancellation = DfsSendCancellationScope::enter(self.send_cancellation.clone());
         let drain_gate = Arc::clone(&self.detached_send_state.drain_gate);
         let drain_lock_error = || NetworkError::Io {
             operation: "serialize detached DFS message drains".to_string(),
@@ -3871,6 +3962,7 @@ impl DfsNodeTransport {
         let (command, call) = dfs_routed_call_rpc_call(call)?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
+        let call = dfs_rpc_call_with_request_budget(call, options);
         #[cfg(any(test, feature = "test-support"))]
         let mut native_attempt =
             native_context.and_then(|context| context.begin(target_node_id, &command));
@@ -3959,6 +4051,13 @@ fn dfs_direct_read_response_routed_message(
     }
 }
 
+/// The first attempt of a response-retry-safe request carries the caller's
+/// whole remaining budget, and so does the request it stamps for the serving
+/// node. An attempt whose response is lost before that budget ends lost it to
+/// a broken stream: the serving node sees the stream end, which ends that
+/// attempt's served wait and releases its admission, and the identical request
+/// is replayed in what remains. Two attempts therefore never hold admission
+/// together. A request without a budget is not replayed here.
 fn dfs_exact_response_replay_attempt_options(
     message: &DfsNetworkMessage,
     options: DfsObjectRpcSendOptions,
@@ -3966,21 +4065,7 @@ fn dfs_exact_response_replay_attempt_options(
     if !crate::routes::dfs_network_message_response_retry_safe(message) {
         return (options, None);
     }
-    let Some(total_timeout) = options.overall_timeout else {
-        return (options, None);
-    };
-    let reserve = (total_timeout / 4).min(DFS_EXACT_RESPONSE_REPLAY_MAX_RESERVE);
-    let first_timeout = total_timeout.saturating_sub(reserve);
-    if reserve.is_zero() || first_timeout.is_zero() {
-        return (options, None);
-    }
-    (
-        DfsObjectRpcSendOptions {
-            overall_timeout: Some(first_timeout),
-            ..options
-        },
-        Some(total_timeout),
-    )
+    (options, options.overall_timeout)
 }
 
 fn dfs_exact_response_replay_options(
@@ -4403,7 +4488,7 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
                     return Ok(true);
                 }
                 if !timeout.is_zero() {
-                    tokio::time::sleep(timeout).await;
+                    self.incoming_wait_interrupt.wait_async(timeout).await;
                 }
                 return Ok(DfsMessageTransport::pending_incoming_count(self)?
                     .is_some_and(|count| count > 0));
@@ -4415,7 +4500,7 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
                 return inbox.wait_async(timeout).await;
             }
             if !timeout.is_zero() {
-                tokio::time::sleep(timeout).await;
+                self.incoming_wait_interrupt.wait_async(timeout).await;
             }
             Ok(self.owned_incoming_count()? > 0)
         })
@@ -5958,6 +6043,9 @@ impl DfsMessageTransport for DfsNodeTransport {
     }
     fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
         DfsNodeTransport::set_operation_deadline(self, deadline)
+    }
+    fn set_send_cancellation(&mut self, cancellation: Option<crate::DfsCancellationFlag>) {
+        self.send_cancellation = cancellation;
     }
     fn operation_deadline(&self) -> Option<Instant> {
         DfsNodeTransport::operation_deadline(self)
@@ -8183,8 +8271,10 @@ mod tests {
         let first_budget = observed[0].1.overall_timeout.expect("first budget");
         let replay_budget = observed[1].1.overall_timeout.expect("replay budget");
         assert!(
-            first_budget < replay_budget && replay_budget <= Duration::from_secs(2),
-            "the first attempt must leave a bounded tail for exact replay: first={first_budget:?}, replay={replay_budget:?}"
+            replay_budget <= first_budget
+                && first_budget <= Duration::from_secs(2)
+                && first_budget > Duration::from_millis(1_900),
+            "the first attempt carries the whole budget and the replay what remains: first={first_budget:?}, replay={replay_budget:?}"
         );
     }
 

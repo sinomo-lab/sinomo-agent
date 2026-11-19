@@ -129,10 +129,11 @@ impl TransientMetadataObjectIndex {
     }
 }
 
-// Namespace RPCs are on the app-visible critical path and may include a
-// durable WAN metadata mutation plus bounded journal replay. The authority's
-// durable request ledger prevents blind re-execution after this deadline.
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// The budget of a request whose caller set none. DFS adds no deadline of its
+/// own: such a request ends on its answer, a definite failure, the network's
+/// verdict or cancellation. A caller that wants a bound passes its own budget,
+/// which travels with the request to the node serving it.
+pub const DFS_NO_CALLER_BUDGET: Option<Duration> = None;
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
@@ -160,7 +161,6 @@ pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT: usize = 2048
 pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT: usize =
     crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
 pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 
@@ -604,6 +604,18 @@ impl DfsCancellationFlag {
                 .is_some_and(|(source, observed)| source.current() != *observed)
     }
 
+    /// Resolves once this flag or a source it observes is cancelled.
+    pub(crate) async fn cancelled(&self) {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::clone(&notify);
+        let waker: DfsCancellationWaker = Arc::new(move || wake.notify_one());
+        let _registration = self.register_waker(&waker);
+        if self.is_cancelled() {
+            return;
+        }
+        notify.notified().await;
+    }
+
     /// Run `waker` whenever this flag or a source it observes is cancelled,
     /// until the returned registration drops.
     ///
@@ -695,6 +707,15 @@ impl AsMut<dyn DfsMetadataBackend> for DfsMetadataBackendOwner {
 }
 
 impl DfsMetadataBackendOwner {
+    /// The shards a several-shard resident lease holds. A service on such a
+    /// lease treats every other shard as a node without its copy does.
+    pub(crate) fn resident_selected_shard_ids(&self) -> Option<&BTreeSet<DfsMetadataShardId>> {
+        match self {
+            Self::ResidentSharded(lease) => lease.selected_shard_ids(),
+            Self::Owned(_) | Self::ResidentShard(_) => None,
+        }
+    }
+
     pub(crate) fn resident_exact_shard_id(&self) -> Option<&DfsMetadataShardId> {
         match self {
             Self::ResidentShard(lease) => Some(lease.shard_id()),
@@ -748,9 +769,22 @@ pub struct NetworkedDfsService<T> {
     /// SAME durable request retained across the existing host's remote-phase yield.
     pub(crate) pending_namespace_request_recovery: Option<Box<crate::DfsNamespaceRequestRecord>>,
     pub(crate) completed_remote_namespace_phases: BTreeMap<String, PendingRoutedNamespaceResult>,
+    /// Answers to the reads a request on several shard lanes sent to other
+    /// nodes' primaries with its lanes released, keyed by the request and
+    /// the read; its re-run takes each in place of sending that read.
+    pub(crate) answered_remote_reads: BTreeMap<
+        String,
+        std::result::Result<crate::source_adoption::CompletedRemoteTargetNamespacePhase, DfsError>,
+    >,
+    /// Requests whose runs so far only yielded reads: their re-run is still
+    /// the request's first execution.
+    pub(crate) read_yield_fresh_requests: BTreeSet<(NodeId, String)>,
     /// The deadline a file sync's repair wait yielded with, for its re-run.
-    pub(crate) file_sync_wait_deadline:
-        Option<(crate::DfsObjectId, crate::DfsVersion, std::time::Instant)>,
+    pub(crate) file_sync_wait_deadline: Option<(
+        crate::DfsObjectId,
+        crate::DfsVersion,
+        Option<std::time::Instant>,
+    )>,
     pub(crate) prepared_remote_sources:
         BTreeMap<String, crate::source_adoption::PreparedSourceAdoption>,
     pub(crate) publication_execution: crate::publication_guard::DfsPublicationContextSlot,
@@ -764,6 +798,10 @@ pub struct NetworkedDfsService<T> {
     /// preemption or shell destruction cannot repeatedly rewind a settled prefix.
     pub(crate) write_intent_maintenance_scan:
         Arc<crate::metadata_intent_maintenance::DfsWriteIntentMaintenanceScanState>,
+    /// Write intents another service of this node still serves: a shard
+    /// lane's write service owns an unfinished routed write. This service's
+    /// intent recovery leaves them to that service.
+    pub(crate) foreign_live_write_intents: BTreeSet<String>,
     pub(crate) maintenance_progress: Arc<crate::maintenance::DfsMaintenanceProgressState>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,

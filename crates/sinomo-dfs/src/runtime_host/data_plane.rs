@@ -343,7 +343,9 @@ where
 {
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
     let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-    let peer_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    // A member answering a prepare waits for its own authority projection;
+    // the sender leaving drops this future. No deadline of this node's own.
+    let peer_deadline = None::<tokio::time::Instant>;
     let Some(peer_snapshot) =
         read_daemon_dfs_replica_owner_snapshot_before(&cluster_paths, runtime, peer_deadline)
             .await?
@@ -1158,8 +1160,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             let _data_owner = data_owner?;
             validation?;
             let cluster_paths = ClusterPaths::new(data_dir.as_ref());
-            let peer_deadline =
-                tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let peer_deadline = None::<tokio::time::Instant>;
             let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot_before(
                 &cluster_paths,
                 &runtime,
@@ -1579,6 +1580,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
         encoded_value_bytes: Option<u64>,
+        budget: Option<Duration>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
         let data_owner = self.require_data_owner();
         let paths = self.paths.clone();
@@ -1662,6 +1664,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                 attachment,
                 traceparent,
                 encoded_value_bytes,
+                budget,
                 &runtime,
             )
             .await
@@ -1975,6 +1978,9 @@ impl DfsPeerTransport for DaemonDfsPeerTransport {
                     None,
                     crate::current_dfs_traceparent(),
                     None,
+                    // The caller's own remaining budget; the timeout below is
+                    // that caller leaving, which drops this served future.
+                    options.overall_timeout,
                 );
                 let reply = match options.overall_timeout {
                     Some(timeout) => tokio::time::timeout(timeout, call).await.map_err(|e| {
@@ -2016,6 +2022,39 @@ impl DfsPeerTransport for DaemonDfsPeerTransport {
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        // A caller that can leave has its call driven as a future, so its
+        // departure drops the call and the serving node sees the stream end.
+        if let Some(cancellation) = crate::node_transport::current_dfs_send_cancellation()
+            && let Some(context) = self.native_prefix.as_ref()
+            && !tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+            })
+        {
+            let run = || {
+                context.runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => Err(
+                            DfsPeerTransportError::with_delivery_state(
+                                "the caller left before the DFS call answered",
+                                Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                            ),
+                        ),
+                        result = self.host.object_rpc.call_async(
+                            target_node_id,
+                            call,
+                            options.cluster_rpc_options(),
+                            options.observe_connectivity,
+                        ) => result.map_err(DfsPeerTransportError::from_network),
+                    }
+                })
+            };
+            return if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(run)
+            } else {
+                run()
+            };
+        }
         self.host
             .object_rpc
             .call(

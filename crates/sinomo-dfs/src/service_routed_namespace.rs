@@ -1187,9 +1187,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn wait_for_stable_namespace_reconciliation(
         &mut self,
         request_id: &str,
-        timeout: std::time::Duration,
+        deadline: Option<std::time::Instant>,
     ) -> Result<DfsStableNamespaceOperationReconciliation, DfsError> {
-        let started = std::time::Instant::now();
+        // The probe ends on the authority's answer, on the network's verdict
+        // for its send (an error from processing incoming work), on
+        // cancellation, or at the caller's deadline if it set one.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         loop {
             self.process_incoming()?;
             if let Some(result) = self
@@ -1200,7 +1210,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .remove(request_id);
                 return Ok(result);
             }
-            if started.elapsed() >= timeout {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 self.stable_namespace_reconciliation_targets
                     .remove(request_id);
                 return Ok(
@@ -1212,9 +1222,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
             self.check_cancelled("stable namespace reconciliation")?;
-            let remaining = timeout.saturating_sub(started.elapsed());
+            let wait = deadline.map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            });
             self.transport
-                .wait_for_incoming(std::time::Duration::from_millis(10).min(remaining))
+                .wait_for_incoming(wait)
                 .map_err(DfsError::from_network)?;
         }
     }
@@ -1299,7 +1311,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let reconciliation = self.wait_for_stable_namespace_reconciliation(
             &request_id,
-            std::time::Duration::from_secs(5),
+            self.transport.operation_deadline(),
         )?;
         if let DfsStableNamespaceOperationReconciliation::Applied { receipt } = &reconciliation {
             let command = DfsNamespaceCommand {
@@ -2693,7 +2705,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     current_primary_node_id: None,
                                 }
                             }
-                            durable_execute => {
+                            mut durable_execute => {
+                                // A request whose earlier runs only yielded
+                                // reads runs again as the fresh request it was:
+                                // its pending row records no execution yet.
+                                if let Some(DurableNamespaceRequestAdmission::Execute {
+                                    record,
+                                    replaying_pending,
+                                    ..
+                                }) = durable_execute.as_mut()
+                                    && *replaying_pending
+                                    && self.read_yield_fresh_requests.contains(&(
+                                        record.requester_node_id.clone(),
+                                        record.request_id.clone(),
+                                    ))
+                                {
+                                    *replaying_pending = false;
+                                }
                                 let replaying_pending_request = durable_execute.as_ref().and_then(
                                     |admission| match admission {
                                         DurableNamespaceRequestAdmission::Execute {
@@ -2965,14 +2993,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         &outcome,
                                         Err(posix_model::DfsPosixError::Dfs(DfsError::Busy { .. }))
                                     );
-                                let retryable_error = !fresh_busy_rejection
-                                    && outcome.as_ref().err().is_some_and(|error| {
-                                        namespace_execution_must_remain_pending(
-                                            error,
-                                            durable_prepare_recorded,
-                                            durable_job_recorded,
-                                        )
-                                    });
+                                // A run that yielded a read and recorded no
+                                // prepare or job took no effect: the host runs
+                                // the request again with the read's answer, so
+                                // this run records neither a pending request nor
+                                // an outcome.
+                                let read_yield_without_effects = !durable_prepare_recorded
+                                    && !durable_job_recorded
+                                    && matches!(
+                                        self.remote_namespace_phase.as_deref(),
+                                        Some(crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(_))
+                                    );
+                                if let Some(DurableNamespaceRequestAdmission::Execute {
+                                    record,
+                                    replaying_pending,
+                                    ..
+                                }) = durable_execute.as_ref()
+                                {
+                                    let key = (
+                                        record.requester_node_id.clone(),
+                                        record.request_id.clone(),
+                                    );
+                                    if read_yield_without_effects && !*replaying_pending {
+                                        self.read_yield_fresh_requests.insert(key);
+                                    } else {
+                                        self.read_yield_fresh_requests.remove(&key);
+                                    }
+                                }
+                                let retryable_error = read_yield_without_effects
+                                    || (!fresh_busy_rejection
+                                        && outcome.as_ref().err().is_some_and(|error| {
+                                            namespace_execution_must_remain_pending(
+                                                error,
+                                                durable_prepare_recorded,
+                                                durable_job_recorded,
+                                            )
+                                        }));
                                 // Native write openings already retain the exact bytes, owner,
                                 // and original condition. Writing another Pending row here can
                                 // overlap that prepare and obscure its typed unknown outcome.
@@ -2995,6 +3051,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     _ => false,
                                 };
                                 if retryable_error
+                                    && !read_yield_without_effects
                                     && !has_write_opening
                                     && !durable_prepare_recorded
                                     && let Some(DurableNamespaceRequestAdmission::Execute {
@@ -3311,7 +3368,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     file_system_id,
                     self.node_id.clone(),
                     operation,
-                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                    DFS_NO_CALLER_BUDGET,
                     false,
                     false,
                 )
@@ -3796,8 +3853,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requested_shards: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        // Only shards this node replicates are fed by response batches. A
+        // service on a several-shard lease replicates only the shards it holds.
         let shards = match requested_shards {
-            // Only shards this node replicates are fed by response batches.
             Some(requested) => requested
                 .iter()
                 .filter(|shard| {
@@ -3812,7 +3870,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .chain(self.replication.routed_replica_projections.keys())
                 .cloned()
                 .collect(),
-        };
+        }
+        .into_iter()
+        .filter(|shard_id| !self.metadata_lease_omits_shard(&shard_id.0))
+        .collect::<BTreeSet<_>>();
         for shard_id in &shards {
             self.refresh_routed_replica_projection(shard_id)?;
         }
@@ -3846,7 +3907,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id,
             root_path,
             cursors,
-            DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+            DFS_NO_CALLER_BUDGET,
         )
     }
 
@@ -3855,8 +3916,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         root_path: &str,
         cursors: &[DfsNamespaceChangeCursor],
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Vec<DfsNamespaceChangeBatch>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         let root_path = posix_path::normalize_posix_path(root_path)
             .map_err(dfs_error_from_posix_namespace_sync)?;
         if self.control_plane.is_none() {
@@ -4029,8 +4091,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsNamespaceResult, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         Ok(self
             .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                 file_system_id,
@@ -4048,8 +4111,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         path: String,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         self.route_namespace_lookup_path_to_metadata_primary_with_inline_range(
             file_system_id,
             primary_node_id,
@@ -4067,8 +4131,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: String,
         offset: u64,
         max_bytes: usize,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         self.route_namespace_lookup_path_to_metadata_primary_with_inline_range(
             file_system_id,
             primary_node_id,
@@ -4085,8 +4150,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         path: String,
         inline_range: Option<DfsNamespaceLookupRangeRequest>,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         let mut primary = primary_node_id;
         let operation = DfsNamespaceOperation::LookupPath { path, inline_range };
         for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
@@ -4167,8 +4233,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         paths: Vec<String>,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -4243,7 +4310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 file_system_id,
                 primary_node_id,
                 operation,
-                DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                DFS_NO_CALLER_BUDGET,
                 false,
                 false,
             )?
@@ -4284,10 +4351,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let timeout: Option<Duration> = timeout.into();
         let request_id = self.next_request_id();
         self.route_namespace_operation_to_metadata_primary_with_request_id_and_options(
             request_id,
@@ -4310,22 +4378,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         validate_namespace_operation_id(&request_id)?;
-        let requested_deadline = Instant::now() + timeout;
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let effective_deadline = previous_deadline
-            .filter(|existing| *existing < requested_deadline)
-            .unwrap_or(requested_deadline);
-        if effective_deadline != requested_deadline {
-            self.transport
-                .set_operation_deadline(Some(effective_deadline));
-        }
+        // `timeout` is a budget the caller owns for this request. Together
+        // with the operation deadline already installed, it is the only bound
+        // in time: without either, the request ends on its answer, a network
+        // verdict or cancellation.
+        let previous_deadline = self.transport.operation_deadline();
+        let effective_deadline = match (
+            timeout
+                .into()
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+            previous_deadline,
+        ) {
+            (Some(own), Some(existing)) => Some(own.min(existing)),
+            (deadline, None) | (None, deadline) => deadline,
+        };
+        self.transport.set_operation_deadline(effective_deadline);
         let result = self.route_namespace_operation_to_metadata_primary_with_deadline(
             request_id,
             file_system_id,
@@ -4345,10 +4417,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        deadline: Instant,
+        deadline: Option<Instant>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        if matches!(
+            operation,
+            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
+        ) && self.routed_read_waits_with_lanes_released(&primary_node_id)
+        {
+            let key = self.routed_read_key(&primary_node_id, &file_system_id, &operation)?;
+            if let Some(result) = self.take_answered_remote_read(&key, &primary_node_id)? {
+                return Ok(result);
+            }
+            let (command, pending) = self.prepare_routed_namespace_request(
+                &request_id,
+                file_system_id,
+                &primary_node_id,
+                operation,
+                replay_journal_batches,
+                apply_synced_path_object,
+            )?;
+            return Err(self.yield_routed_read(key, command, pending, deadline));
+        }
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
             file_system_id,
@@ -4368,10 +4459,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let Some(remaining) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-        else {
+        let remaining = deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+        });
+        let Some(remaining) = remaining.map_or(Some(None), |remaining| remaining.map(Some)) else {
             // The request was dispatched; it may have applied.
             return Err(DfsError::NetworkDelivery {
                 message: format!(
@@ -4383,6 +4476,124 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.pending_routed_namespace_ops
             .insert(request_id.clone(), pending);
         self.settle_routed_namespace_op(&request_id, remaining)
+    }
+
+    /// Whether a read this service routes to `primary` waits with its lanes
+    /// released. A served request on a several-shard lease holds the lanes of
+    /// every shard this node is primary of in its filesystem, and the shard
+    /// it reads may have a lane on its primary that a request there holds
+    /// while it waits on this node. The read therefore yields to the host,
+    /// which sends it once this request's lanes and admission have ended and
+    /// re-runs the request with the answer.
+    pub(crate) fn routed_read_waits_with_lanes_released(&self, primary: &NodeId) -> bool {
+        primary != &self.node_id
+            && self.transport.serves_routed_request()
+            && self.publication_execution.current().is_some()
+            && self
+                .metadata_backend
+                .as_ref()
+                .is_some_and(|backend| backend.resident_selected_shard_ids().is_some())
+    }
+
+    /// Forget the answers a request's yielded reads brought back once a run
+    /// of that request ends without yielding again.
+    pub(crate) fn forget_answered_remote_reads(&mut self, request_id: &str) {
+        let marker = format!("/{request_id}|");
+        self.answered_remote_reads
+            .retain(|key, _| !key.starts_with('|') && !key.contains(&marker));
+    }
+
+    /// One routed read's identity within the request it serves: the same
+    /// read on the request's re-run has the same key.
+    pub(crate) fn routed_read_key(
+        &self,
+        primary: &NodeId,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<String, DfsError> {
+        let request = self
+            .namespace_execution
+            .request()
+            .map(|request| format!("{}/{}", request.requester_node_id, request.request_id))
+            .unwrap_or_default();
+        let operation = serde_json::to_string(operation).map_err(|error| DfsError::Metadata {
+            message: format!("routed read has no stable identity: {error}"),
+        })?;
+        Ok(format!("{request}|{primary}|{file_system_id}|{operation}"))
+    }
+
+    /// Settle the answer a yielded read brought back as its response would
+    /// have settled; `None` while that read has no answer.
+    fn take_answered_remote_read(
+        &mut self,
+        key: &str,
+        primary: &NodeId,
+    ) -> Result<Option<PendingRoutedNamespaceResult>, DfsError> {
+        // The answer stays for the request's later re-runs, which repeat
+        // this read before reaching a read that has yet to be answered.
+        let Some(answer) = self.answered_remote_reads.get(key).cloned() else {
+            return Ok(None);
+        };
+        let answer = answer?;
+        if &answer.target != primary {
+            return Err(DfsError::Distributed {
+                message: "routed read answer came from another primary".into(),
+            });
+        }
+        let request = answer.command.request_id.clone();
+        self.pending_routed_namespace_ops
+            .insert(request.clone(), answer.pending);
+        let handled = self.handle_namespace_response(answer.target, answer.response);
+        let pending = self.pending_routed_namespace_ops.remove(&request);
+        handled?;
+        pending
+            .and_then(|pending| pending.result)
+            .map(Some)
+            .ok_or_else(|| DfsError::Distributed {
+                message: "routed read answer did not settle its request".into(),
+            })
+    }
+
+    /// Yield one routed read to the host: it is sent to its primary once this
+    /// request's lanes and admission have ended. The returned error ends this
+    /// run; the host discards its outcome and re-runs the request.
+    pub(crate) fn yield_routed_read(
+        &mut self,
+        key: String,
+        command: DfsNamespaceCommand,
+        pending: PendingRoutedNamespaceOp,
+        deadline: Option<Instant>,
+    ) -> DfsError {
+        let waits = || DfsError::Network {
+            message: "routed read waits for its primary with the request's lanes released".into(),
+        };
+        // One yield per run: a second read waits for the re-run.
+        if self.remote_namespace_phase.is_some() {
+            return waits();
+        }
+        let Some(owners) = self.publication_execution.current() else {
+            return DfsError::Metadata {
+                message: "routed read has no runtime custody to yield to".into(),
+            };
+        };
+        let actor = match crate::source_adoption::actor_for_root(owners.data_root()) {
+            Ok(actor) => actor,
+            Err(error) => return DfsError::from(error),
+        };
+        self.remote_namespace_phase = Some(Box::new(
+            crate::source_adoption::RemoteNamespacePhase::ReadAtPrimary(
+                crate::source_adoption::RemoteReadNamespacePhase {
+                    key,
+                    read: crate::source_adoption::RemoteTargetNamespacePhase {
+                        actor,
+                        command,
+                        pending,
+                        deadline,
+                    },
+                },
+            ),
+        ));
+        waits()
     }
 
     /// Build the request and its response fence from the same authority cut.
@@ -4480,7 +4691,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_routed_namespace_op(
         &mut self,
         request_id: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
         let result = self.settle_routed_namespace_op_inner(request_id, timeout);
@@ -4491,9 +4702,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_routed_namespace_op_inner(
         &mut self,
         request_id: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let started_at = Instant::now();
+        // Cancellation wakes the wait below at once.
+        let incoming_waker = self.transport.incoming_wait_waker();
+        let cancellation_waker: crate::service_state::DfsCancellationWaker =
+            std::sync::Arc::new(move || {
+                if let Some(waker) = &incoming_waker {
+                    waker();
+                }
+            });
+        let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         loop {
             if let Err(cancelled) = self.check_cancelled("routed namespace settle") {
                 self.pending_routed_namespace_ops.remove(request_id);
@@ -4518,7 +4738,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(pending.result.expect("settled result checked above"));
             }
             let elapsed = started_at.elapsed();
-            if elapsed >= timeout {
+            if timeout.is_some_and(|timeout| elapsed >= timeout) {
                 self.pending_routed_namespace_ops.remove(request_id);
                 // The request was dispatched; it may have applied, so a
                 // retry must reuse the same request id.
@@ -4530,7 +4750,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             if events.is_empty() {
-                let wait = DFS_ROUTED_NAMESPACE_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
+                // The answer's arrival or cancellation wakes this wait; its
+                // length is the caller's remaining budget, or the network's
+                // liveness interval when the caller set none.
+                let wait = timeout
+                    .map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |timeout| {
+                        timeout.saturating_sub(elapsed)
+                    });
                 self.transport
                     .wait_for_incoming(wait)
                     .map_err(DfsError::from_network)?;
@@ -4545,7 +4771,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 struct AsyncPlacementNamespaceSession<'a, T: DfsMessageTransport> {
     service: &'a mut NetworkedDfsService<T>,
     request_id: String,
-    deadline: Instant,
+    deadline: Option<Instant>,
     previous_deadline: Option<Instant>,
     previous_settle_depth: usize,
     pending_owned: bool,
@@ -4566,7 +4792,25 @@ impl<T: DfsMessageTransport> Drop for AsyncPlacementNamespaceSession<'_, T> {
     }
 }
 
+/// Drive `work` until it finishes or the caller's deadline, if it set one.
+async fn within_caller_deadline<F: std::future::Future>(
+    deadline: Option<Instant>,
+    work: F,
+) -> Result<F::Output, ()> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work)
+            .await
+            .map_err(drop),
+        None => Ok(work.await),
+    }
+}
+
 impl<T: DfsMessageTransport> AsyncPlacementNamespaceSession<'_, T> {
+    fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     fn timeout_error(&self, phase: &str) -> DfsError {
         DfsError::NetworkDelivery {
             delivery_state: if self.dispatch_started {
@@ -4597,7 +4841,7 @@ where
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
@@ -4624,17 +4868,20 @@ where
                 message: format!("placement namespace request {request_id} is already pending"),
             });
         }
-        let requested_deadline = Instant::now() + timeout;
         let previous_settle_depth = self.routed_namespace_settle_depth;
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(requested_deadline));
-        let deadline = previous_deadline
-            .filter(|existing| *existing < requested_deadline)
-            .unwrap_or(requested_deadline);
-        if deadline != requested_deadline {
-            self.transport.set_operation_deadline(Some(deadline));
-        }
+        let previous_deadline = self.transport.operation_deadline();
+        // Only the caller's budget and the operation deadline already
+        // installed bound this request in time.
+        let deadline = match (
+            timeout
+                .into()
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
+            previous_deadline,
+        ) {
+            (Some(own), Some(existing)) => Some(own.min(existing)),
+            (deadline, None) | (None, deadline) => deadline,
+        };
+        self.transport.set_operation_deadline(deadline);
         let mut session = AsyncPlacementNamespaceSession {
             service: self,
             request_id,
@@ -4652,12 +4899,12 @@ where
             replay_journal_batches,
             apply_synced_path_object,
         )?;
-        if Instant::now() >= session.deadline {
+        if session.deadline_passed() {
             return Err(session.timeout_error("before dispatch"));
         }
         session.dispatch_started = true;
-        let sent = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(session.deadline),
+        let sent = within_caller_deadline(
+            session.deadline,
             session.service.send_dfs_message_if_routable_async(
                 &primary_node_id,
                 DfsNetworkMessage::NamespaceRequest(command),
@@ -4675,7 +4922,7 @@ where
                 ),
             });
         }
-        if Instant::now() >= session.deadline {
+        if session.deadline_passed() {
             return Err(session.timeout_error("before response settle"));
         }
         session
@@ -4686,11 +4933,9 @@ where
         session.service.routed_namespace_settle_depth = previous_settle_depth.saturating_add(1);
         loop {
             session.service.check_cancelled("routed namespace settle")?;
-            let events = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(session.deadline),
-                session.service.process_incoming_async(),
-            )
-            .await;
+            let events =
+                within_caller_deadline(session.deadline, session.service.process_incoming_async())
+                    .await;
             let events = match events {
                 Ok(result) => result?,
                 Err(_) => return Err(session.timeout_error("response processing")),
@@ -4710,20 +4955,21 @@ where
                     .result
                     .expect("settled placement result checked above"));
             }
-            let Some(remaining) = session
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-            else {
+            if session.deadline_passed() {
                 return Err(session.timeout_error("metadata primary response"));
-            };
+            }
             if events.is_empty() {
-                let waiting = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(session.deadline),
-                    session
-                        .service
-                        .transport
-                        .wait_for_incoming_async(DFS_ROUTED_NAMESPACE_IDLE_WAIT.min(remaining)),
+                // The answer's arrival wakes this wait; its length is the
+                // caller's remaining budget, or the network's liveness
+                // interval when the caller set none.
+                let wait = session
+                    .deadline
+                    .map_or(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                let waiting = within_caller_deadline(
+                    session.deadline,
+                    session.service.transport.wait_for_incoming_async(wait),
                 )
                 .await;
                 match waiting {

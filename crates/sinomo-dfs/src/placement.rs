@@ -3228,7 +3228,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             object.file_system_id.clone(),
                             primary.primary_node_id,
                             vec![object.path.clone()],
-                            crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                            crate::DFS_NO_CALLER_BUDGET,
                         )?;
                         objects.as_slice() == std::slice::from_ref(object)
                     }
@@ -4925,7 +4925,7 @@ where
                         shard.file_system_id.clone(),
                         shard.primary_node_id.clone(),
                         DfsNamespaceOperation::MetadataQuery { query: query.clone() },
-                        crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                        crate::DFS_NO_CALLER_BUDGET,
                         false,
                         false,
                     )
@@ -5012,7 +5012,7 @@ where
                 let response = self.route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
                     request_id, config.file_system_id.clone(), primary.clone(),
                     DfsNamespaceOperation::LookupPaths { paths: batch.iter().map(|(object, _)| object.path.clone()).collect() },
-                    crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT, false, false,
+                    crate::DFS_NO_CALLER_BUDGET, false, false,
                 ).await?;
                 if response.result != crate::DfsNamespaceResult::Applied {
                     continue;

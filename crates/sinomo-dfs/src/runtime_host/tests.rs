@@ -8899,6 +8899,186 @@ fn daemon_dfs_message_processes_stage_blob_and_returns_response() {
     native.close().unwrap();
 }
 
+/// A stamped routed write runs on its shard's exact lane, and its pending
+/// write stays in that lane's write service. A stage reply that returns on its
+/// own rather than inline with its stage carries no shard; it is matched to
+/// that write and runs under the write's lane: its receipt completes W, and
+/// the commit waits for the replica's acknowledgement holding that lane, not
+/// the node's global writer. The global service never held the write.
+#[test]
+fn daemon_dfs_stage_reply_on_its_own_reaches_the_lane_serving_its_write() {
+    let (native, initial, shard) = crate::test_support::current_native_metadata_service(
+        "native-stage-reply-lane",
+        2,
+        "/services",
+    )
+    .expect("actual mounted DFS owners");
+    let owner = shard.primary_node_id.clone();
+    let replica = shard.replica_node_ids[0].clone();
+    drop(initial);
+    let candidates = vec![owner.clone(), replica.clone()];
+    let path = "/services/stage-reply-lane.bin";
+    let mut placement =
+        crate::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    placement.required_node_ids = candidates.clone();
+    native
+        .apply_placement_policy(&owner, path, crate::DfsPlacementScope::SelfOnly, placement)
+        .expect("normal native W2/N2 placement Apply");
+    let captured = Arc::new(Mutex::new(
+        crate::test_runtime::StageExchangeCapture::default(),
+    ));
+    // Every stage to the replica, retries included, loses its inline reply.
+    native.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.to_string()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 32,
+        action: crate::test_runtime::FaultAction::CaptureStageExchangeAndLoseAfterDispatch(
+            Arc::clone(&captured),
+        ),
+    });
+    let bytes = b"stage reply returning on its own".to_vec();
+    let mut writer = native.client(&owner).expect("normal Main writer");
+    let mut policy = DfsReplicationPolicy::new(2, 2).unwrap();
+    policy.required_node_ids = candidates.clone();
+    let pending = writer
+        .posix_write_file_from_reader(
+            path,
+            std::io::Cursor::new(&bytes),
+            DfsWriteOptions {
+                policy,
+                replica_candidates: candidates,
+                wait_for_commit: false,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect_err("a create missing one stage reply stays below W2");
+    assert!(
+        matches!(pending, crate::DfsPosixError::PendingWrite { .. }),
+        "{pending}"
+    );
+    let exchange = {
+        let captured = captured.lock().expect("actual Stage exchange capture");
+        assert!(!captured.exchanges.is_empty(), "Main dispatched its Stage");
+        captured.exchanges[0].clone()
+    };
+    let DfsNetworkMessage::StageBlob(stage) = &exchange.command.routed_message.message else {
+        panic!("the captured command is the Stage");
+    };
+    let data_dir = native.data_dir(&owner).clone();
+    {
+        let cache_slot = daemon_dfs_message_service_cache()
+            .root(&data_dir.root())
+            .expect("actual root cache slot");
+        let cache = cache_slot.lock().expect("message service cache lock");
+        let entry = cache.as_ref().expect("Main's message cache entry");
+        let lane = entry
+            .exact_write_services
+            .get(&DaemonDfsMutationLaneKey {
+                file_system_id: shard.file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new(&shard.shard_id),
+            })
+            .expect("the routed write ran on its shard lane's write service")
+            .lock()
+            .expect("exact lane lock");
+        assert!(
+            lane.service
+                .writes
+                .pending_writes
+                .get(&stage.intent_id)
+                .is_some_and(|pending| pending.stage_inflight_request_ids.get(&replica)
+                    == Some(&stage.request_id)),
+            "the lane serving the write awaits this stage's reply"
+        );
+        drop(lane);
+        if let Some(global) = entry.primary_service.as_ref() {
+            assert!(
+                !global
+                    .lock()
+                    .expect("global lane lock")
+                    .service
+                    .writes
+                    .pending_writes
+                    .contains_key(&stage.intent_id),
+                "the global service never held the write"
+            );
+        }
+    }
+    // Hold the commit's prepare on its way to the replica.
+    native.checkpoint_rpc_observation_window().unwrap();
+    let commit_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    for route in [
+        crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    ] {
+        native.install_fault(crate::test_runtime::FaultRule {
+            source: Some(owner.clone()),
+            target: Some(replica.clone()),
+            route: Some(route.to_string()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: crate::test_runtime::FaultAction::PauseBeforeDispatch(Arc::clone(&commit_gate)),
+        });
+    }
+    let reply = test_dfs_message_command("dfs-stage-reply-on-its-own", exchange.response.clone());
+    let reply_delivery = crate::test_runtime::executor().spawn(native.rpc_result_future(
+        &replica,
+        &owner,
+        sinomo_core::network::ObjectRpcCall::value(crate::dfs_message_rpc_request(&reply).unwrap()),
+        Duration::from_secs(30),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !native.rpc_observations().iter().any(|call| {
+        call.source == owner
+            && call.target == replica
+            && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            && [
+                crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+            ]
+            .contains(&call.route.as_str())
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "the reply's receipt completes W2 and its commit sends the prepare"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        native
+            .main_lane_held(&owner, &shard.file_system_id, &shard.shard_id)
+            .unwrap()
+            && !native.main_global_writer_holds(&owner).unwrap(),
+        "the reply's commit waits on the replica under its write's lane, not the global writer"
+    );
+    native.clear_faults();
+    commit_gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    crate::test_runtime::executor()
+        .block_on(reply_delivery)
+        .unwrap()
+        .expect("Main executes the returning stage reply");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while native
+        .node_metadata(&owner)
+        .unwrap()
+        .get_object(&stage.object_id)
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the reply's receipt completes W2 and the write commits"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    native.clear_faults();
+    drop(writer);
+    native.close().unwrap();
+}
+
 #[test]
 fn daemon_dfs_message_rejects_wrong_target_node() {
     let (native, nodes) =
@@ -9662,6 +9842,16 @@ fn daemon_dfs_exact_service_lane_requires_complete_single_shard_state() {
 
     let mut distributed_write =
         test_dfs_write_routed_message(&source, &target, 2, "/services/exact-write.txt");
+    let unstamped_write =
+        test_dfs_message_command("dfs-unstamped-write", distributed_write.clone());
+    assert_eq!(
+        dfs_message_execution_scope(&unstamped_write),
+        DfsMessageExecutionScope::GlobalExclusive
+    );
+    assert!(
+        !daemon_dfs_message_supports_exact_service_lane(&unstamped_write),
+        "a write without an authority stamp has no proven shard lane"
+    );
     let DfsNetworkMessage::DistributedWriteRequest(write) = &mut distributed_write.message else {
         unreachable!("test helper builds a distributed write")
     };
@@ -9677,8 +9867,8 @@ fn daemon_dfs_exact_service_lane_requires_complete_single_shard_state() {
         DfsMessageExecutionScope::ExactShard { .. }
     ));
     assert!(
-        !daemon_dfs_message_supports_exact_service_lane(&distributed_write),
-        "distributed-write coordinator and repair state is not shard-owned yet"
+        daemon_dfs_message_supports_exact_service_lane(&distributed_write),
+        "a stamped routed write owns its coordinator and write state in its shard lane"
     );
 }
 
@@ -16199,21 +16389,25 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         persisted.path,
         "/services/daemon-write-skips-cold-hydrate.txt"
     );
-    let primary_service = {
+    // A stamped routed write runs on its shard lane's write service.
+    let root_key = DaemonDfsMutationLaneKey {
+        file_system_id: root_shard.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(root_shard.shard_id.clone()),
+    };
+    let cached_write_service = || {
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&cache_key)
             .expect("actual root cache slot");
         let cache = cache_slot.lock().expect("cache lock");
-        Arc::clone(
-            cache
-                .as_ref()
-                .expect("cache entry")
-                .primary_service
-                .as_ref()
-                .expect("mutation service lane"),
-        )
+        cache
+            .as_ref()
+            .expect("cache entry")
+            .exact_write_services
+            .get(&root_key)
+            .cloned()
     };
-    let lane = primary_service.lock().expect("primary service lock");
+    let write_service = cached_write_service().expect("the shard lane's write service");
+    let lane = write_service.lock().expect("write service lock");
     assert!(
         lane.service
             .metadata()
@@ -16222,24 +16416,14 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         "cold message-lane construction must not eagerly load unrelated metadata"
     );
     drop(lane);
-    let cache_slot = daemon_dfs_message_service_cache()
-        .root(&cache_key)
-        .expect("actual root cache slot");
-    let cache = cache_slot.lock().expect("cache lock");
     assert!(Arc::ptr_eq(
-        &primary_service,
-        cache
-            .as_ref()
-            .expect("cache entry")
-            .primary_service
-            .as_ref()
-            .expect("mutation service lane")
+        &write_service,
+        &cached_write_service().expect("the shard lane's write service")
     ));
-    drop(cache);
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
         lane_opens_before_write + 1,
-        "a cold routed mutation must reuse the one backend-bearing cache lane"
+        "a cold routed mutation must open only its shard lane's write service"
     );
     let allocator_trims_before_status = daemon_dfs_allocator_trim_completion_count(&data_dir);
     for _ in 0..2 {
@@ -16296,10 +16480,10 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         let detached = cache
             .as_mut()
             .expect("cache entry")
-            .primary_service
-            .take()
+            .exact_write_services
+            .remove(&root_key)
             .expect("detach mutation service shell");
-        assert!(Arc::ptr_eq(&detached, &primary_service));
+        assert!(Arc::ptr_eq(&detached, &write_service));
     }
     let lane_opens_before_detached_status =
         daemon_dfs_test_message_service_lane_open_count(&data_dir);
@@ -16313,10 +16497,12 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         let mut cache = cache_slot.lock().expect("cache lock");
         let entry = cache.as_mut().expect("cache entry");
         assert!(
-            entry.primary_service.is_none(),
+            entry.primary_service.is_none() && !entry.exact_write_services.contains_key(&root_key),
             "bounded status must not initialize a service shell"
         );
-        entry.primary_service = Some(Arc::clone(&primary_service));
+        entry
+            .exact_write_services
+            .insert(root_key.clone(), Arc::clone(&write_service));
     }
     assert_eq!(
         daemon_dfs_test_message_service_lane_open_count(&data_dir),
@@ -16433,21 +16619,28 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         ),
     ))
     .expect("lightweight lookup DFS message");
-    {
+    assert!(
+        Arc::ptr_eq(
+            &write_service,
+            &cached_write_service().expect("resident metadata lane")
+        ),
+        "a lookup leaves the shard lane's write service in place"
+    );
+    // The unstamped lookup ran on the global service, which maintenance uses.
+    let primary_service = {
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&cache_key)
             .expect("actual root cache slot");
         let cache = cache_slot.lock().expect("cache lock");
-        assert!(Arc::ptr_eq(
-            &primary_service,
+        Arc::clone(
             cache
                 .as_ref()
                 .expect("cache entry")
                 .primary_service
                 .as_ref()
-                .expect("resident metadata lane"),
-        ));
-    }
+                .expect("the lookup's global service"),
+        )
+    };
     let lane_open_count_before_maintenance =
         daemon_dfs_test_message_service_lane_open_count(&data_dir);
     let weak_primary = Arc::downgrade(&primary_service);
@@ -16458,6 +16651,14 @@ fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
         weak_primary.upgrade().is_none(),
         "maintenance transfers ownership out of the old cache handle"
     );
+    assert!(
+        Arc::ptr_eq(
+            &write_service,
+            &cached_write_service().expect("finished write service")
+        ),
+        "maintenance takes a write service only while it holds an unfinished write"
+    );
+    drop(write_service);
     {
         let cache_slot = daemon_dfs_message_service_cache()
             .root(&cache_key)

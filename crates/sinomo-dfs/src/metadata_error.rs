@@ -114,6 +114,10 @@ pub enum MetadataBackendError {
     AlreadyExists { path: String },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
+    /// A cross-shard move's source holds this family while the move waits on
+    /// another node. The caller retries, as for a path in cross-shard flight.
+    #[error("path {path} is moving between metadata shards; retry the operation")]
+    SourceFamilyFenced { path: String },
 }
 
 pub type Result<T> = std::result::Result<T, MetadataBackendError>;

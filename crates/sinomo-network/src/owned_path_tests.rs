@@ -679,3 +679,160 @@ async fn received_rpc_chunks_keep_slab_identity_when_forwarded_to_another_rpc() 
         "no received slab retained its identity through forwarding: {stages_by_slab:?}"
     );
 }
+
+/// A caller that leaves in the middle of a call ends the call on the serving
+/// side: its dropped logical stream answers the server's next progress record
+/// with a reset, the progress write after that fails, and the server drops the
+/// handler it was driving. A service observes its caller's departure as that
+/// drop. A sibling call on the same carrier is not disturbed.
+#[tokio::test]
+async fn a_departed_caller_drops_the_handler_serving_its_call() {
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    let source_node = node("node_departed_caller_source");
+    let destination_node = node("node_departed_caller_destination");
+    let (source_carrier, destination_carrier) =
+        owned_carrier_pair(&source_node, &destination_node, "session_departed_caller");
+    let client = Arc::new(OwnedRoutedStreamClient::new(source_carrier).expect("owned mux client"));
+    let mut acceptor =
+        accept_owned_routed_stream_carrier(destination_carrier).expect("owned mux acceptor");
+    let options = ObjectFrameIoOptions::idle_timeout(IDLE_TIMEOUT);
+    let (started_sender, started) = tokio::sync::oneshot::channel();
+    let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let stream = acceptor
+            .accept()
+            .await
+            .expect("accept the abandoned logical stream")
+            .expect("abandoned logical stream");
+        let context = RpcPeerContext::authenticated(
+            stream.local_node_id.clone(),
+            stream.peer_node_id.clone(),
+            stream.session_id.clone(),
+            stream.channel_binding,
+        )
+        .expect("server RPC context");
+        let abandoned = tokio::spawn(async move {
+            serve_object_rpc_chunk_stream(
+                stream.into_chunk_stream().expect("abandoned chunks"),
+                &context,
+                options,
+                move |incoming, _| async move {
+                    let _dropped = Dropped(Some(dropped_sender));
+                    let _ = started_sender.send(());
+                    // The handler waits for something that never comes.
+                    std::future::pending::<()>().await;
+                    Ok(ObjectRpcStreamReply {
+                        request_id: incoming.request_id.clone(),
+                        metadata: BTreeMap::new(),
+                        application_head: Vec::new(),
+                        body: ObjectRpcStreamBody::bytes(Vec::new()),
+                        timeline_trace: None,
+                    })
+                },
+            )
+            .await
+        });
+        // A sibling call on the same carrier is served normally.
+        let sibling = acceptor
+            .accept()
+            .await
+            .expect("accept the sibling logical stream")
+            .expect("sibling logical stream");
+        let context = RpcPeerContext::authenticated(
+            sibling.local_node_id.clone(),
+            sibling.peer_node_id.clone(),
+            sibling.session_id.clone(),
+            sibling.channel_binding,
+        )
+        .expect("sibling RPC context");
+        serve_object_rpc_chunk_stream(
+            sibling.into_chunk_stream().expect("sibling chunks"),
+            &context,
+            options,
+            |incoming, _| async move {
+                Ok(ObjectRpcStreamReply {
+                    request_id: incoming.request_id.clone(),
+                    metadata: BTreeMap::new(),
+                    application_head: Vec::new(),
+                    body: ObjectRpcStreamBody::bytes(Vec::new()),
+                    timeline_trace: None,
+                })
+            },
+        )
+        .await
+        .expect("serve the sibling call");
+        abandoned.await.expect("join the abandoned call's server")
+    });
+
+    let call = |method: &str| ObjectRpcStreamCall {
+        request_id: Id::generate(),
+        method: method.to_string(),
+        operation_id: None,
+        metadata: BTreeMap::new(),
+        application_head: Vec::new(),
+        body: ObjectRpcStreamBody::bytes(Vec::new()),
+        timeline_trace: None,
+    };
+    let abandoned_stream = client.open().expect("open the abandoned logical stream");
+    let abandoned_call = tokio::spawn(call_object_rpc_chunk_stream_with_consumption(
+        abandoned_stream
+            .into_chunk_stream()
+            .expect("abandoned client chunks"),
+        call("test.departed-caller"),
+        options,
+        |response| async move {
+            response.body.materialize_to_vec().await?;
+            Ok(RpcResponseConsumption::Complete(()))
+        },
+    ));
+    started.await.expect("the handler started");
+    // Progress keeps the pending call alive well past its idle timeout.
+    tokio::time::sleep(IDLE_TIMEOUT * 3).await;
+    assert!(!abandoned_call.is_finished());
+
+    // The caller leaves: its call future and its logical stream are dropped.
+    let left = tokio::time::Instant::now();
+    abandoned_call.abort();
+    let _ = abandoned_call.await;
+    tokio::time::timeout(IDLE_TIMEOUT * 10, dropped)
+        .await
+        .expect("the server drops the handler of a call whose caller left")
+        .expect("the handler's drop is observed");
+    assert!(
+        left.elapsed() >= IDLE_TIMEOUT / 4,
+        "the departure is learned from a progress record, not before one"
+    );
+
+    let sibling_stream = client.open().expect("open the sibling logical stream");
+    let outcome = call_object_rpc_chunk_stream_with_consumption(
+        sibling_stream
+            .into_chunk_stream()
+            .expect("sibling client chunks"),
+        call("test.departed-caller.sibling"),
+        options,
+        |response| async move {
+            response.body.materialize_to_vec().await?;
+            Ok(RpcResponseConsumption::Complete(()))
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, RpcDeliveryOutcome::Completed(())),
+        "the carrier still serves a sibling call: {outcome:?}"
+    );
+    let abandoned_result = server.await.expect("join server");
+    assert!(
+        abandoned_result.is_err(),
+        "serving the abandoned call ends with its failed progress write"
+    );
+}

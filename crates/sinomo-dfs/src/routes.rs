@@ -331,10 +331,20 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
                 .unwrap_or(DfsMessageExecutionScope::ReadOnly)
         }
         DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(command.operation, DfsNamespaceOperation::WriteFile { .. }) =>
+        {
+            // An owner write publishes only on its stamped shard: a hardlink,
+            // a symlink or a parent on another shard gets a path-resolution
+            // reply before any effect. It runs on that shard's write lane, as
+            // a routed write does; without exactly one stamp it is an
+            // unstamped write.
+            namespace_authority_shard_execution_scope(command)
+                .unwrap_or(DfsMessageExecutionScope::GlobalExclusive)
+        }
+        DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
-                DfsNamespaceOperation::WriteFile { .. }
-                    | DfsNamespaceOperation::Unlink { .. }
+                DfsNamespaceOperation::Unlink { .. }
                     | DfsNamespaceOperation::ConditionalUnlink { .. }
                     | DfsNamespaceOperation::Rename { .. }
                     | DfsNamespaceOperation::ConditionalRename { .. }
@@ -585,6 +595,37 @@ pub fn dfs_message_rpc_call(command: &DfsMessageCommand) -> Result<ObjectRpcCall
     )?;
     call.request = prepare_dfs_message_request(call.request, command);
     Ok(call)
+}
+
+/// Request metadata key carrying the requester's remaining budget, in whole
+/// milliseconds, at the moment the request was sent.
+///
+/// The value is a relative duration, so no clock is shared between nodes: the
+/// serving node measures it from the request's arrival. A request without the
+/// key has no budget and is served until an event ends it.
+pub const DFS_REQUEST_BUDGET_METADATA_KEY: &str = "sinomo.dfs.request.budget-millis";
+
+/// Stamps `remaining` as the requester's budget for this send.
+pub fn with_dfs_request_budget(
+    request: ObjectRpcRequest,
+    remaining: std::time::Duration,
+) -> ObjectRpcRequest {
+    // Round up: a served wait may outlast its requester by the transit time,
+    // never end before it.
+    let millis = remaining.as_micros().saturating_add(999) / 1_000;
+    request.with_metadata(
+        DFS_REQUEST_BUDGET_METADATA_KEY,
+        u64::try_from(millis).unwrap_or(u64::MAX).to_string(),
+    )
+}
+
+/// The requester's remaining budget carried by `request`, if it set one.
+pub fn dfs_request_budget(request: &ObjectRpcRequest) -> Option<std::time::Duration> {
+    request
+        .metadata
+        .get(DFS_REQUEST_BUDGET_METADATA_KEY)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
 }
 
 fn prepare_dfs_message_request(
