@@ -604,6 +604,18 @@ impl DfsCancellationFlag {
                 .is_some_and(|(source, observed)| source.current() != *observed)
     }
 
+    /// Resolves once this flag or a source it observes is cancelled.
+    pub(crate) async fn cancelled(&self) {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::clone(&notify);
+        let waker: DfsCancellationWaker = Arc::new(move || wake.notify_one());
+        let _registration = self.register_waker(&waker);
+        if self.is_cancelled() {
+            return;
+        }
+        notify.notified().await;
+    }
+
     /// Run `waker` whenever this flag or a source it observes is cancelled,
     /// until the returned registration drops.
     ///
@@ -768,8 +780,11 @@ pub struct NetworkedDfsService<T> {
     /// the request's first execution.
     pub(crate) read_yield_fresh_requests: BTreeSet<(NodeId, String)>,
     /// The deadline a file sync's repair wait yielded with, for its re-run.
-    pub(crate) file_sync_wait_deadline:
-        Option<(crate::DfsObjectId, crate::DfsVersion, std::time::Instant)>,
+    pub(crate) file_sync_wait_deadline: Option<(
+        crate::DfsObjectId,
+        crate::DfsVersion,
+        Option<std::time::Instant>,
+    )>,
     pub(crate) prepared_remote_sources:
         BTreeMap<String, crate::source_adoption::PreparedSourceAdoption>,
     pub(crate) publication_execution: crate::publication_guard::DfsPublicationContextSlot,

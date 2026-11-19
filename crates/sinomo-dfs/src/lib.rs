@@ -224,6 +224,10 @@ mod service_restore_jobs;
 mod service_routed_journal;
 mod service_routed_namespace;
 pub use service_routed_namespace::namespace_command_digest;
+mod served_request;
+pub use served_request::{
+    DfsRequestBudgetEnded, DfsServedRequestDeparture, DfsServedRequestScope,
+};
 mod service_routed_write;
 mod service_stage_transfer;
 mod service_state;

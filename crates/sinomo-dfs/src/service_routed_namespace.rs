@@ -4415,7 +4415,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replay_journal_batches,
                 apply_synced_path_object,
             )?;
-            return Err(self.yield_routed_read(key, command, pending, deadline));
+            return Err(self.yield_routed_read(key, command, pending, Some(deadline)));
         }
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
@@ -4537,7 +4537,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         key: String,
         command: DfsNamespaceCommand,
         pending: PendingRoutedNamespaceOp,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> DfsError {
         let waits = || DfsError::Network {
             message: "routed read waits for its primary with the request's lanes released".into(),

@@ -549,6 +549,10 @@ pub enum FaultAction {
     },
     /// Hold the actual receiver's response after its native execution completes.
     PauseAfterDispatch(Arc<Semaphore>),
+    /// End the call's carrier while its receiver still runs, once the gate
+    /// opens: the caller sees an ambiguous delivery, and the receiver sees its
+    /// handler dropped, as when a stream breaks in the middle of a call.
+    BreakStreamDuringDispatch(Arc<Semaphore>),
     /// Retain the actual native read head while pausing its original body source.
     PauseNativeReadBody {
         gate: Arc<Semaphore>,
@@ -703,6 +707,7 @@ impl Fabric {
                 | FaultAction::PauseWriteCommitCarriage { gate, .. }
                 | FaultAction::PauseExactWriteCommitPublication { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
+                | FaultAction::BreakStreamDuringDispatch(gate)
                 | FaultAction::PauseStatMetadataReplyAfterDispatch { gate, .. }
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
                 {
@@ -1157,12 +1162,34 @@ impl Carrier {
             observation: observation.clone(),
             write_reply_capture: write_reply_capture.clone(),
         };
+        let dispatch = endpoint.registry.dispatch(context, incoming.request);
         let dispatched = NATIVE_RPC_CALL_CONTEXT
-            .scope(
-                native_call,
-                endpoint.registry.dispatch(context, incoming.request),
-            )
+            .scope(native_call, async {
+                let Some(FaultAction::BreakStreamDuringDispatch(gate)) = &fault else {
+                    return Some(dispatch.await);
+                };
+                tokio::pin!(dispatch);
+                tokio::select! {
+                    biased;
+                    dispatched = &mut dispatch => Some(dispatched),
+                    permit = gate.acquire() => match permit {
+                        Ok(permit) => {
+                            permit.forget();
+                            None
+                        }
+                        // The rule was cleared: the call runs to its answer.
+                        Err(_) => Some(dispatch.await),
+                    },
+                }
+            })
             .await;
+        let Some(dispatched) = dispatched else {
+            return Err(NetworkError::delivery_failed(
+                "shared DFS test broken stream",
+                NetworkDeliveryState::PossiblyApplied,
+                "the carrier ended while the receiver was serving the call",
+            ));
+        };
         let mut outgoing = match dispatched {
             // A KV handler's refusal reaches the caller as the daemon sends
             // it: an error response the caller types again, so a busy or

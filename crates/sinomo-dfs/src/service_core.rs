@@ -122,6 +122,13 @@ where
     }
 }
 
+/// The cancellation and operation deadline a service had before it began
+/// serving a request.
+pub(crate) struct DfsServedRequestRestore {
+    cancellation: Option<DfsCancellationFlag>,
+    operation_deadline: Option<std::time::Instant>,
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Share the live cross-shard namespace admission projection with another
     /// request shell over the same resident metadata generation.
@@ -259,21 +266,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// and stop with [`DfsError::Cancelled`] once it flips — the caller's way
     /// to abandon budgeted work promptly when the cluster link is degraded.
     pub fn with_cancellation(mut self, cancellation: DfsCancellationFlag) -> Self {
-        self.cancellation = Some(cancellation);
+        self.set_cancellation(Some(cancellation));
         self
     }
 
     pub fn set_cancellation(&mut self, cancellation: Option<DfsCancellationFlag>) {
         self.cancellation = cancellation;
+        // The transport's blocking sends watch the same cancellation.
+        self.transport
+            .set_send_cancellation(self.cancellation.clone());
     }
 
     /// Add a cancellation source without replacing one already installed by
     /// the caller which opened the service.
     pub fn add_cancellation(&mut self, cancellation: DfsCancellationFlag) {
-        self.cancellation = Some(match self.cancellation.take() {
+        let cancellation = match self.cancellation.take() {
             Some(existing) => DfsCancellationFlag::linked([existing, cancellation]),
             None => cancellation,
-        });
+        };
+        self.set_cancellation(Some(cancellation));
+    }
+
+    /// Bound this service's waits by one served request: its requester's
+    /// budget becomes the transport's operation deadline, which every wait and
+    /// routed send already observes, and its requester's departure joins the
+    /// service's cancellation. Returns what [`Self::leave_served_request`]
+    /// restores.
+    pub(crate) fn enter_served_request(
+        &mut self,
+        served: &crate::DfsServedRequestScope,
+    ) -> DfsServedRequestRestore {
+        let cancellation = self.cancellation.clone();
+        self.add_cancellation(served.cancellation().clone());
+        let observed = self.transport.operation_deadline();
+        let replaced = self
+            .transport
+            .set_operation_deadline(served.deadline_within(observed));
+        DfsServedRequestRestore {
+            cancellation,
+            operation_deadline: replaced.or(observed),
+        }
+    }
+
+    pub(crate) fn leave_served_request(&mut self, restore: DfsServedRequestRestore) {
+        self.set_cancellation(restore.cancellation);
+        self.transport
+            .set_operation_deadline(restore.operation_deadline);
     }
 
     /// Wake `waker` when this service's cancellation fires, while the

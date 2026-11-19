@@ -1398,7 +1398,7 @@ where
 fn with_idle_resident_raft_node_before<T, F>(
     paths: &KvWalPaths,
     node_id: &NodeId,
-    deadline: Instant,
+    deadline: Option<Instant>,
     read: F,
 ) -> Option<Result<KvLocalRead<T>, KvError>>
 where
@@ -1416,6 +1416,12 @@ where
         if !state.checked_out && !state.read_loading && state.checkout_waiters.is_empty() {
             break;
         }
+        // Without a deadline the wait ends only on the slot's own event: the
+        // mutation that owns the resident node returning it.
+        let Some(deadline) = deadline else {
+            state = slot.ready.wait(state).ok()?;
+            continue;
+        };
         let now = Instant::now();
         if now >= deadline {
             metrics::histogram!(
@@ -1671,6 +1677,26 @@ pub fn with_cluster_kv_resident_read_projection_before<T, F>(
 where
     F: FnOnce(&mut ClusterKvRaftResidentReadProjection<'_>) -> T,
 {
+    with_cluster_kv_resident_read_projection_when_idle(paths, node_id, Some(deadline), read)
+}
+
+/// Wait for a transient resident mutation to finish, then borrow the exact
+/// canonical Raft view.
+///
+/// With a `deadline` this is [`with_cluster_kv_resident_read_projection_before`].
+/// Without one the wait ends only when the mutation that owns the resident node
+/// returns it; the caller owns any budget or cancellation around the call.
+/// `None` still means the resident is cold, invalid, or, with a deadline, was
+/// owned by a mutation until that deadline.
+pub fn with_cluster_kv_resident_read_projection_when_idle<T, F>(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+    deadline: Option<Instant>,
+    read: F,
+) -> Option<Result<KvLocalRead<T>, KvError>>
+where
+    F: FnOnce(&mut ClusterKvRaftResidentReadProjection<'_>) -> T,
+{
     with_idle_resident_raft_node_before(paths, node_id, deadline, |node| {
         let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
             &paths.root,
@@ -1691,7 +1717,7 @@ pub fn read_cluster_kv_raft_anchored_snapshot_before(
     node_id: &NodeId,
     deadline: Instant,
 ) -> Option<Result<RaftSnapshot, KvError>> {
-    let read = with_idle_resident_raft_node_before(paths, node_id, deadline, |node| {
+    let read = with_idle_resident_raft_node_before(paths, node_id, Some(deadline), |node| {
         let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
             &paths.root,
             Some(node.hard_state.current_term),

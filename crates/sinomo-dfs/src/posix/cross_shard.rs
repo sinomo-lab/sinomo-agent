@@ -1649,9 +1649,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 crate::source_adoption::RemoteNamespacePhase::PrepareSource {
                     actor: source_actor.clone().expect("checked actual actor"),
                     plan,
-                    deadline: self.transport.operation_deadline().unwrap_or_else(|| {
-                        std::time::Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT
-                    }),
+                    // The requester's budget, if it set one, and nothing else.
+                    deadline: self.transport.operation_deadline(),
                 },
             ));
             return Err(DfsPosixError::Dfs(DfsError::Distributed {
@@ -2464,14 +2463,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         actor,
                         command,
                         pending,
-                        deadline: self.transport.operation_deadline().unwrap_or_else(|| {
-                            let timeout = if canonical_fence_phase.is_some() {
-                                crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT
-                            } else {
-                                crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT
-                            };
-                            std::time::Instant::now() + timeout
-                        }),
+                        deadline: self.transport.operation_deadline(),
                     },
                 ),
             ));

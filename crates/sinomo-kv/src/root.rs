@@ -427,6 +427,7 @@ pub use raft::{
     replicate_cluster_kv_raft_to_target_async_with_host,
     replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
     with_cluster_kv_resident_read_projection, with_cluster_kv_resident_read_projection_before,
+    with_cluster_kv_resident_read_projection_when_idle,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use raft::{

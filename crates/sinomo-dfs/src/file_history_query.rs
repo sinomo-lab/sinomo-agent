@@ -1457,7 +1457,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             key,
                             command.clone(),
                             pending,
-                            deadline,
+                            Some(deadline),
                         ));
                     }
                 }

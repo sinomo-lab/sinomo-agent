@@ -854,10 +854,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Catch one member up to `prefix` through the existing durability path
     /// and report whether it got there.
     ///
-    /// A caller deadline bounds the catch-up. Without one it runs in slices of
-    /// the network layer's liveness interval and continues for as long as the
-    /// member's acknowledged cursor advances, so elapsed time alone never ends
-    /// a catch-up that is making progress.
+    /// Only a caller deadline bounds the catch-up in time. Without one it ends
+    /// when the member holds the prefix, when the network reports the member
+    /// unreachable, or on cancellation: a slow member is waited for.
     fn catch_up_metadata_authority_member(
         &mut self,
         shard: &DfsMetadataShardConfig,
@@ -866,7 +865,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         member: &NodeId,
         deadline: Option<Instant>,
     ) -> Result<bool, DfsError> {
-        self.catch_up_metadata_shard_member(
+        self.catch_up_metadata_shard_member_for_request(
             shard,
             &prepared_batch.shard_id,
             prefix,
@@ -879,7 +878,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Catch one member of `shard` up to `prefix` through the existing
     /// durability barrier and report whether it got there.
     ///
-    /// A caller deadline bounds the catch-up. Without one it runs in slices of
+    /// This is the form the write-set keeper and takeover use, outside any
+    /// request. A caller deadline bounds the catch-up. Without one it runs in slices of
     /// the network layer's liveness interval and continues for as long as the
     /// member's acknowledged cursor advances, so elapsed time alone never ends
     /// a catch-up that is making progress.
@@ -953,6 +953,70 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Catch one member of `shard` up to `prefix` for a request's commit and
+    /// report whether it got there.
+    ///
+    /// Only the caller's deadline bounds the catch-up in time. Without one it
+    /// ends when the member holds the prefix, when the network reports the
+    /// member unreachable, or on cancellation: a slow member is waited for.
+    fn catch_up_metadata_shard_member_for_request(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+        shard_id: &DfsMetadataShardId,
+        prefix: &crate::DfsMetadataPrefixProof,
+        member: &NodeId,
+        deadline: Option<Instant>,
+        only_member: bool,
+    ) -> Result<bool, DfsError> {
+        if metadata_authority_deadline_passed(deadline) {
+            return Ok(false);
+        }
+        // The barrier names the shard's whole replica set, as its
+        // authority check requires, and must include this member.
+        let mut replica_node_ids = if only_member {
+            vec![member.clone()]
+        } else {
+            shard
+                .replica_node_ids
+                .iter()
+                .filter(|node_id| **node_id != shard.primary_node_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        replica_node_ids.sort();
+        replica_node_ids.dedup();
+        let target = DfsMetadataQuorumSyncTarget {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            primary_node_id: self.node_id.clone(),
+            authority_epoch: Some(shard.epoch),
+            replica_node_ids,
+            expected_shard: Some(shard.clone()),
+            journal_sequence: prefix.journal_sequence,
+            barrier_id: sinomo_core::Id::generate().to_string(),
+            state_fingerprint: prefix.digest.clone(),
+            checkpoint_snapshot: None,
+        };
+        self.check_cancelled("metadata authority catch-up")?;
+        // This invocation already validates the retained assignment, native
+        // owner/freeze and response identities, and restores/cleans up only
+        // its own pending requests. Its certificate is not write authority.
+        //
+        // The barrier has no deadline of its own: it re-sends to the member on
+        // its own timer and ends on the certificate, the network's verdict
+        // that the member cannot be reached, cancellation, or the caller's
+        // deadline, which is this service's operation deadline.
+        match self.sync_metadata_shard_to_quorum_intersecting(
+            &target,
+            std::slice::from_ref(member),
+            None,
+        ) {
+            Ok(_) => Ok(true),
+            Err(DfsError::Network { .. } | DfsError::NetworkDelivery { .. }) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 

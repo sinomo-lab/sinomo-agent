@@ -361,18 +361,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_sync_file_local(
         &mut self,
         target: &DfsPosixFileSyncTarget,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsPosixFileSyncCertificate> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let started_at = Instant::now();
-        // A re-run after a repair wait keeps that wait's deadline.
+        // Only the caller bounds a sync in time: by `timeout`, or by the
+        // operation deadline of the request this sync serves. With neither,
+        // the sync ends on its certificate, a definite failure or a network
+        // verdict. A re-run after a repair wait keeps that wait's deadline.
         let deadline = match self.file_sync_wait_deadline.take() {
             Some((object_id, version, deadline))
                 if object_id == target.object_id && version == target.version =>
             {
                 deadline
             }
-            _ => started_at + timeout,
+            _ => match (
+                timeout
+                    .into()
+                    .and_then(|timeout| started_at.checked_add(timeout)),
+                self.transport.operation_deadline(),
+            ) {
+                (Some(own), Some(operation)) => Some(own.min(operation)),
+                (deadline, None) | (None, deadline) => deadline,
+            },
         };
         // This is only a scheduling cursor within the existing request budget.
         // Every visit reloads exact durable owners; it grants no publication
@@ -422,7 +433,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if let Ok(evidence) = self.posix_validate_file_sync_target_local(target) {
                         break evidence;
                     }
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         let (intent_id, durable_receipts, required_receipts) = self
                             .pending_file_sync_receipt_state(target)?
                             .unwrap_or((intent_id, durable_receipts, required_receipts));
@@ -465,10 +476,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         // No executor serves this node: only this lane's own
                         // incoming messages can change the receipts.
                         None => {
+                            // An arrival wakes this wait; without a
+                            // deadline it re-checks at the network's own
+                            // liveness interval.
                             self.transport
-                                .wait_for_incoming(
-                                    deadline.saturating_duration_since(Instant::now()),
-                                )
+                                .wait_for_incoming(deadline.map_or(
+                                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                                    |deadline| deadline.saturating_duration_since(Instant::now()),
+                                ))
                                 .map_err(crate::DfsError::from_network)?;
                         }
                     }
@@ -477,7 +492,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let object = self.current_object_for_file_sync_target(target)?;
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let metadata_certificate = match self
             .sync_metadata_shard_to_write_set(&metadata_target, remaining)
             .map_err(DfsPosixError::from)?
@@ -544,8 +559,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_sync_directory_local(
         &mut self,
         target: &DfsPosixDirectorySyncTarget,
-        timeout: Duration,
+        timeout: impl Into<Option<Duration>>,
     ) -> Result<DfsPosixDirectorySyncCertificate> {
+        let timeout: Option<Duration> = timeout.into();
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self.current_object_for_directory_sync_target(target)?;
         let metadata_target = self.capture_metadata_quorum_sync_target(&object)?;

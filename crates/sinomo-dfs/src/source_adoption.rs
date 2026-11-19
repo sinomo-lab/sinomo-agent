@@ -1777,7 +1777,8 @@ pub(crate) enum RemoteNamespacePhase {
     PrepareSource {
         actor: Arc<DfsSourceAdoptionActor>,
         plan: SourcePreparationPlan,
-        deadline: std::time::Instant,
+        /// The requester's budget, if the request this phase runs for set one.
+        deadline: Option<std::time::Instant>,
     },
     PublishTarget(RemoteTargetNamespacePhase),
     /// A file sync waits for repair progress on its object's primary with
@@ -1800,14 +1801,15 @@ pub(crate) struct AwaitRepairProgressPhase {
     pub(crate) object_id: crate::DfsObjectId,
     pub(crate) version: crate::DfsVersion,
     pub(crate) seen: u64,
-    pub(crate) deadline: std::time::Instant,
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 #[derive(Debug)]
 pub(crate) struct RemoteTargetNamespacePhase {
     pub(crate) actor: Arc<DfsSourceAdoptionActor>,
     pub(crate) command: crate::DfsNamespaceCommand,
     pub(crate) pending: crate::service_state::PendingRoutedNamespaceOp,
-    pub(crate) deadline: std::time::Instant,
+    /// The requester's budget, if the request this phase runs for set one.
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 #[derive(Debug)]
 pub(crate) enum CompletedRemoteNamespacePhase {
@@ -1820,7 +1822,7 @@ pub(crate) enum CompletedRemoteNamespacePhase {
     RepairProgress {
         object_id: crate::DfsObjectId,
         version: crate::DfsVersion,
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
     },
     /// A read the request yielded came back from its primary, or failed as
     /// its send would have failed on the request's own run.
@@ -1871,7 +1873,7 @@ impl RemoteNamespacePhase {
                 plan,
                 deadline,
             } => {
-                if deadline <= std::time::Instant::now() {
+                if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
                     return Err(crate::DfsError::NetworkDelivery {
                         delivery_state:
                             sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
@@ -1991,11 +1993,14 @@ impl RemoteTargetNamespacePhase {
         self,
     ) -> std::result::Result<CompletedRemoteTargetNamespacePhase, crate::DfsError> {
         let offer = self.source_offer()?;
-        let Some(remaining) = self
-            .deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|value| !value.is_zero())
-        else {
+        // Without a budget the call ends on its answer or the network's
+        // verdict.
+        let remaining = self.deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|value| !value.is_zero())
+        });
+        let Some(remaining) = remaining.map_or(Some(None), |remaining| remaining.map(Some)) else {
             if let Some(offer) = offer {
                 self.actor
                     .cancel_unclaimed(offer)
@@ -2036,14 +2041,22 @@ impl RemoteTargetNamespacePhase {
                 &self.actor.runtime,
             );
         }
+        let options = sinomo_core::network::ClusterObjectRpcOptions::default()
+            .with_destination_process_affinity(
+                sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+            );
+        let (options, call) = match remaining {
+            Some(remaining) => (options.with_overall_timeout(remaining), {
+                let mut call = call;
+                call.request = crate::routes::with_dfs_request_budget(call.request, remaining);
+                call
+            }),
+            None => (options, call),
+        };
         let mut result = match self.actor.transport.call(
             &self.pending.primary_node_id,
             call,
-            sinomo_core::network::ClusterObjectRpcOptions::default()
-                .with_destination_process_affinity(
-                    sinomo_core::network::DestinationProcessAffinity::MainDaemon,
-                )
-                .with_overall_timeout(remaining),
+            options,
             true,
         ) {
             Ok(result) => result,

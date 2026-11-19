@@ -634,6 +634,11 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         None
     }
 
+    /// The cancellation of the caller this transport sends for. A blocking
+    /// send watches it and drops its call when the caller leaves, so the
+    /// serving node learns of the departure from the dropped stream.
+    fn set_send_cancellation(&mut self, _cancellation: Option<crate::DfsCancellationFlag>) {}
+
     /// Returns the absolute deadline currently bounding the caller's DFS
     /// operation, when one was installed through [`Self::set_operation_deadline`].
     ///

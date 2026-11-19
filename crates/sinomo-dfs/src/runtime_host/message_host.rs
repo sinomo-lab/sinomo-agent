@@ -1704,15 +1704,15 @@ pub(crate) fn read_daemon_dfs_message_peer_snapshot(
 pub(super) fn read_native_dfs_peer_configuration(
     cluster_paths: &ClusterPaths,
     state: &sinomo_core::ClusterBootstrapState,
-    deadline: Instant,
+    deadline: impl Into<Option<Instant>>,
 ) -> Result<(Vec<sinomo_core::kv::KvEntry>, Vec<sinomo_core::kv::KvEntry>), sinomo_dfs::DfsError> {
     let wal_paths = cluster_paths
         .kv_paths()
         .raft_wal_paths(&state.local_node_id);
-    let read = sinomo_core::kv::with_cluster_kv_resident_read_projection_before(
+    let read = sinomo_core::kv::with_cluster_kv_resident_read_projection_when_idle(
         &wal_paths,
         &state.local_node_id,
-        deadline,
+        deadline.into(),
         |projection| {
             let members = projection.read_index_prefix_limited_by_payload_bytes(
                 "/cluster/members/",
@@ -1763,8 +1763,9 @@ fn peer_snapshot_from_configuration_entries(
 pub(super) async fn read_daemon_dfs_replica_owner_snapshot_before(
     cluster_paths: &ClusterPaths,
     runtime: &tokio::runtime::Handle,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
 ) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
+    let deadline: Option<tokio::time::Instant> = deadline.into();
     let state =
         match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths) {
             Ok(state) => state,
@@ -1786,7 +1787,7 @@ pub(super) async fn read_daemon_dfs_replica_owner_snapshot_before(
             && entry.resident_metadata_initialized
             && entry.signature.cluster_id == state.cluster_id
             && entry.signature.local_node_id == state.local_node_id
-            && tokio::time::Instant::now() < deadline
+            && deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline)
         {
             return Ok(Some(DaemonDfsMessagePeerSnapshot {
                 cluster_id: entry.signature.cluster_id.clone(),
@@ -1805,8 +1806,11 @@ pub(super) async fn read_daemon_dfs_replica_owner_snapshot_before(
 pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
     cluster_paths: &ClusterPaths,
     runtime: &tokio::runtime::Handle,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
 ) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
+    // No deadline means the read waits for the resident Raft node to be idle:
+    // the caller's budget or departure is the only other end of this wait.
+    let deadline: Option<tokio::time::Instant> = deadline.into();
     let state =
         match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths) {
             Ok(state) => state,
@@ -1843,8 +1847,11 @@ pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
     // not detach native/data-owner custody from the component's ordinary drain.
     let task = runtime.spawn_blocking(move || {
         let result = (|| -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
-            let (members, services) =
-                read_native_dfs_peer_configuration(&peer_paths, &state, deadline.into_std())?;
+            let (members, services) = read_native_dfs_peer_configuration(
+                &peer_paths,
+                &state,
+                deadline.map(tokio::time::Instant::into_std),
+            )?;
             if host.shutting_down.is_cancelled()
                 || !registered_dfs_runtime_host(&data_dir)
                     .map_err(|error| sinomo_dfs::DfsError::Network {
@@ -1854,7 +1861,7 @@ pub(crate) async fn read_daemon_dfs_message_peer_snapshot_before(
             {
                 return Ok(None);
             }
-            if tokio::time::Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 return Err(KvError::Busy {
                     path: peer_paths
                         .kv_paths()
@@ -2966,48 +2973,57 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_identity_async(
 /// replans and reactive owner handoffs. Shared readiness remains deadline-free.
 pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     warm_daemon_dfs_metadata_projection_before_deadline(authority_generation, deadline, true).await
 }
 
 async fn warm_daemon_dfs_metadata_projection_before_deadline(
     authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
     require_write_configuration: bool,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
+    let deadline: Option<tokio::time::Instant> = deadline.into();
     let timeout_authority = Arc::clone(&authority_generation);
     let expected_generation = authority_generation.generation();
-    tokio::time::timeout_at(deadline, async move {
-    for replan in 0..=2 {
-        let expected_generation = authority_generation.generation();
-        let proof = authority_generation
-            .ensure_complete_prefix_for_generation_async(expected_generation)
-            .await;
-        if proof.is_some() && require_write_configuration {
-            // The shared refresh publishes its filesystem prefix before the
-            // complete configuration bundle. Join that same owner before
-            // handing a supposedly ready service to synchronous execution.
-            // This await retains the caller's original deadline and replan cap.
-            authority_generation.ensure_write_configuration_ready_async().await?;
+    let warm = async move {
+        for replan in 0..=2 {
+            let expected_generation = authority_generation.generation();
+            let proof = authority_generation
+                .ensure_complete_prefix_for_generation_async(expected_generation)
+                .await;
+            if proof.is_some() && require_write_configuration {
+                // The shared refresh publishes its filesystem prefix before the
+                // complete configuration bundle. Join that same owner before
+                // handing a supposedly ready service to synchronous execution.
+                // This await retains the caller's original deadline and replan cap.
+                authority_generation
+                    .ensure_write_configuration_ready_async()
+                    .await?;
+            }
+            if proof.is_some() && authority_generation.generation() == expected_generation {
+                return Ok(DaemonDfsMetadataAuthorityPreflight {
+                    authority: authority_generation,
+                    generation: expected_generation,
+                });
+            }
+            if authority_generation.generation() == expected_generation || replan == 2 {
+                return Err(
+                    daemon_dfs_stale_authority(&authority_generation, expected_generation)
+                        .into_dfs_error(),
+                );
+            }
+            // Only a superseded expected generation replans here. An unavailable
+            // current proof remains an error; the existing refresh owner owns I/O.
         }
-        if proof.is_some() && authority_generation.generation() == expected_generation {
-            return Ok(DaemonDfsMetadataAuthorityPreflight {
-                authority: authority_generation,
-                generation: expected_generation,
-            });
-        }
-        if authority_generation.generation() == expected_generation || replan == 2 {
-            return Err(
-                daemon_dfs_stale_authority(&authority_generation, expected_generation)
-                    .into_dfs_error(),
-            );
-        }
-        // Only a superseded expected generation replans here. An unavailable
-        // current proof remains an error; the existing refresh owner owns I/O.
-    }
-    unreachable!("bounded authority preflight always returns")
-    }).await.map_err(|_| {
+        unreachable!("bounded authority preflight always returns")
+    };
+    // Without a deadline the warm waits for the projection's own publication
+    // or failure; the caller's departure drops this future.
+    let Some(deadline) = deadline else {
+        return warm.await;
+    };
+    tokio::time::timeout_at(deadline, warm).await.map_err(|_| {
         let current_generation = timeout_authority.generation();
         let current_ready = timeout_authority.retained_complete_prefix_revision_for_generation(current_generation).is_some();
         sinomo_dfs::DfsError::Network {
@@ -3024,7 +3040,7 @@ pub(super) async fn warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
     cluster_paths: &ClusterPaths,
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let authority = daemon_dfs_metadata_authority_generation_for_identity(
         cluster_paths,
@@ -3055,7 +3071,7 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
     cluster_paths: &ClusterPaths,
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
     #[cfg(test)] observed_command: Option<&DfsMessageCommand>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let authority = daemon_dfs_metadata_authority_generation_for_identity(
@@ -3985,6 +4001,7 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         None,
         false,
         false,
+        None,
     )
 }
 
@@ -4009,6 +4026,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     placement: Option<crate::placement::AdmittedPlacement>,
     retain_write: bool,
     readmit_owned_replies: bool,
+    served: Option<&sinomo_dfs::DfsServedRequestScope>,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     match reject_daemon_dfs_incomplete_genesis_before_effects(
@@ -4229,6 +4247,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         stage_shard,
         prepared_write,
         write_attempt.as_ref().map(|(command, _)| command),
+        served,
     );
     if let Some(scope) = publication_scope.take() {
         scope.finish()?;
@@ -4650,6 +4669,7 @@ pub(crate) async fn handle_daemon_dfs_message_async(
         attachment,
         traceparent,
         u64::try_from(encoded_value_bytes).ok(),
+        None,
         runtime,
     )
     .await
@@ -5035,10 +5055,56 @@ async fn prepare_daemon_dfs_genesis_ingress(
 
 pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     paths: &DaemonPaths,
+    command: DfsMessageCommand,
+    attachment: Option<DfsInboundAttachment>,
+    traceparent: Option<String>,
+    encoded_value_bytes: Option<u64>,
+    budget: Option<Duration>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsDataPlaneResponse, DaemonError> {
+    // The requester's budget is measured from here, and this future's drop is
+    // its departure. Both reach the blocking mutation through `served`.
+    let (served, _departure) = sinomo_dfs::DfsServedRequestScope::at_arrival(budget);
+    served
+        .until_budget(handle_served_daemon_dfs_message(
+            paths,
+            command,
+            attachment,
+            traceparent,
+            encoded_value_bytes,
+            &served,
+            runtime,
+        ))
+        .await
+        .unwrap_or_else(|sinomo_dfs::DfsRequestBudgetEnded| {
+            Err(sinomo_dfs::DfsError::Cancelled {
+                operation: "DFS request: its requester's budget ended before it ran",
+            }
+            .into())
+        })
+}
+
+/// The continuation of a prepared write waits for its shard's publication. The
+/// requester's budget ends that wait with the outcome the write already has.
+async fn served_write_continuation(
+    served: &sinomo_dfs::DfsServedRequestScope,
+    wait: impl Future<Output = bool>,
+) -> bool {
+    match served.tokio_deadline() {
+        Some(deadline) => tokio::time::timeout_at(deadline, wait)
+            .await
+            .unwrap_or(false),
+        None => wait.await,
+    }
+}
+
+async fn handle_served_daemon_dfs_message(
+    paths: &DaemonPaths,
     mut command: DfsMessageCommand,
     mut attachment: Option<DfsInboundAttachment>,
     traceparent: Option<String>,
     encoded_value_bytes: Option<u64>,
+    served: &sinomo_dfs::DfsServedRequestScope,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsDataPlaneResponse, DaemonError> {
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
@@ -5090,7 +5156,9 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         }
     }
     let peer_snapshot_started = Instant::now();
-    let peer_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    // Only the requester's budget bounds the authority reads before
+    // admission. Without one they wait for the projection's own event.
+    let peer_deadline = served.tokio_deadline();
     let Some(peer_snapshot) =
         read_daemon_dfs_message_peer_snapshot_before(&cluster_paths, runtime, peer_deadline)
             .await?
@@ -5676,6 +5744,10 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
             stage = "dfs.message.blocking", traceparent = traceparent.as_deref().unwrap_or_default());
         let queue_span = tracing::trace_span!(target: "sinomo.perf", parent: &blocking_span,
             "dfs.message.queue", stage = "dfs.message.queue");
+        // The blocking mutation observes the requester's budget and departure
+        // at its waits, so either ends the served wait and releases admission.
+        let process_served = served.clone();
+        let execution = served.enter_execution();
         let (result, blocking_queue, blocking_work) = tokio::task::spawn_blocking(move || {
             let _entered = blocking_span.enter();
             drop(queue_span);
@@ -5715,6 +5787,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                         .and_then(placement_admission::PlacementDispatch::take_cut),
                     true,
                     process_reply_readmission,
+                    Some(&process_served),
                 )
             });
             // A blocking task keeps running when its async JoinHandle is dropped.
@@ -5760,6 +5833,12 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 None => return Err(error.into()),
             },
         };
+        // A finished execution stays "running" until its answer is returned
+        // below, so the budget cannot end the request between the two. An
+        // execution that leaves the request waiting again ends here.
+        if !matches!(result, DaemonDfsMessageDispatchAttempt::Complete(_)) {
+            drop(execution);
+        }
         let result = match result {
             DaemonDfsMessageDispatchAttempt::Complete(result) => result,
             DaemonDfsMessageDispatchAttempt::WriteSetPending {
@@ -5776,7 +5855,11 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 )?;
                 let host = registered_dfs_runtime_host(&data_dir)?;
                 if let Some(host) = host
-                    && write_continuation::wait(&authority, &original, &write_set, &host).await
+                    && served_write_continuation(
+                        served,
+                        write_continuation::wait(&authority, &original, &write_set, &host),
+                    )
+                    .await
                 {
                     last_unknown = Some(result);
                     command = *original;
@@ -5801,10 +5884,13 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 preingested_blob = reply_blob;
                 reply_lane = Some(key);
                 metadata_authority_preflight = Some(
-                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                         &cluster_paths,
                         &peer_snapshot,
                         runtime,
+                        peer_deadline,
+                        #[cfg(test)]
+                        None,
                     )
                     .await?,
                 );
@@ -5818,10 +5904,13 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                 );
                 command = original;
                 metadata_authority_preflight = Some(
-                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                         &cluster_paths,
                         &peer_snapshot,
                         runtime,
+                        peer_deadline,
+                        #[cfg(test)]
+                        None,
                     )
                     .await?,
                 );
@@ -5865,10 +5954,13 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     )?;
                 }
                 metadata_authority_preflight = Some(
-                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                    warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                         &cluster_paths,
                         &peer_snapshot,
                         runtime,
+                        peer_deadline,
+                        #[cfg(test)]
+                        None,
                     )
                     .await?,
                 );
@@ -6142,6 +6234,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
         None,
         false,
         background_response,
+        None,
     )?;
     if let DaemonDfsMessageDispatchAttempt::ReadmitOnWriteLane(reply) = attempt {
         // Run the reply under its owner's shard lane instead of the global
@@ -6182,6 +6275,7 @@ fn handle_daemon_dfs_message_on_runtime_with_native_return(
             None,
             false,
             false,
+            None,
         )?;
     }
     let result = match attempt {

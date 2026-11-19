@@ -1292,6 +1292,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
     stage_shard: Option<ResidentLocalMetadataShardHandle>,
     prepared: Option<crate::DfsPreparedOperationDigest>,
     retained_write_command: Option<&DfsMessageCommand>,
+    served: Option<&crate::DfsServedRequestScope>,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError> {
     let completes_fetch = matches!(
         &command.routed_message.message,
@@ -1382,6 +1383,9 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
     service_lane.service.namespace_execution.placement = placement;
+    // The lane is cached across requests: this request's budget and its
+    // requester's departure bound only this execution.
+    let served_request = served.map(|served| service_lane.service.enter_served_request(served));
     let mut process_report = match verified_fetch {
         Some(verified) => service_lane
             .service
@@ -1394,6 +1398,9 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 prepared.as_ref(),
             ),
     };
+    if let Some(served_request) = served_request {
+        service_lane.service.leave_served_request(served_request);
+    }
     service_lane.service.namespace_execution.placement = Default::default();
     let prepared_write = retained_write_command.and_then(|original| {
         let requester = &original.routed_message.source_node_id;

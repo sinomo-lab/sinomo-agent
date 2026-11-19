@@ -1188,7 +1188,7 @@ impl DfsSourceAdoptionActor {
     pub(crate) fn prepare_cross_node_source(
         self: &Arc<Self>,
         plan: SourcePreparationPlan,
-        deadline: std::time::Instant,
+        deadline: Option<std::time::Instant>,
     ) -> Result<PreparedSourceAdoption> {
         if plan.job_config.primary_node_id != self.node {
             return Err(error("source phase is not at its actual coordinator"));
@@ -1196,7 +1196,7 @@ impl DfsSourceAdoptionActor {
         match self.call_rpc_before(
             &plan.source_config.primary_node_id,
             &DfsSourceAdoptionRequest::InspectSourcePreparation { plan: plan.clone() },
-            Some(deadline),
+            deadline,
         )? {
             DfsSourceAdoptionRpcResponse::SourcePreparationInspected {
                 prepared: Some(prepared),
@@ -1211,7 +1211,7 @@ impl DfsSourceAdoptionActor {
         let acquire_source = || match self.call_rpc_before(
             &plan.source_config.primary_node_id,
             &DfsSourceAdoptionRequest::AcquireSource { plan: plan.clone() },
-            Some(deadline),
+            deadline,
         )? {
             DfsSourceAdoptionRpcResponse::SourcePrepared(token) => Ok(token),
             _ => Err(error(
@@ -1295,7 +1295,7 @@ impl DfsSourceAdoptionActor {
                     &DfsSourceAdoptionRequest::RevokeSourcePreparation {
                         token: token.clone(),
                     },
-                    Some(deadline),
+                    deadline,
                 )? {
                     DfsSourceAdoptionRpcResponse::SourcePreparationRevoked(
                         SourcePreparationRevocation::Revoked(actual),
@@ -1341,7 +1341,7 @@ impl DfsSourceAdoptionActor {
                 token: token.clone(),
                 job_offer: job_offer.clone(),
             },
-            Some(deadline),
+            deadline,
         );
         let reply = match binding {
             Ok(reply) => reply,
@@ -1354,7 +1354,7 @@ impl DfsSourceAdoptionActor {
                     &DfsSourceAdoptionRequest::RevokeSourcePreparation {
                         token: token.clone(),
                     },
-                    Some(deadline),
+                    deadline,
                 )? {
                     DfsSourceAdoptionRpcResponse::SourcePreparationRevoked(
                         SourcePreparationRevocation::Revoked(actual),

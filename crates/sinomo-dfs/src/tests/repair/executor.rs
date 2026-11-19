@@ -617,7 +617,7 @@ fn a_file_sync_rerun_keeps_its_wait_deadline_and_no_later_command_inherits_it() 
     let completed_wait = || crate::source_adoption::CompletedRemoteNamespacePhase::RepairProgress {
         object_id: target.object_id.clone(),
         version: target.version.clone(),
-        deadline: Instant::now(),
+        deadline: Some(Instant::now()),
     };
     // The re-run after the repair wait ends at the original deadline, not
     // at a fresh one.
