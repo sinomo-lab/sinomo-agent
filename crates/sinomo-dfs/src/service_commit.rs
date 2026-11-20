@@ -2566,6 +2566,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return match &pending.result {
                 Some(Ok(outcome)) => Ok(outcome.clone()),
                 Some(Err(error)) => Err(error.clone()),
+                // A held write reports its evidence until it is sent again.
+                None if pending.follow.is_some() => Err(pending
+                    .follow
+                    .as_ref()
+                    .expect("held write checked above")
+                    .evidence
+                    .clone()),
                 None => Ok(NetworkedDfsWriteOutcome::Pending {
                     intent_id: pending
                         .remote_intent_id

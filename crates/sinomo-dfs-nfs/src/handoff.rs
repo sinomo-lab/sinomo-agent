@@ -58,8 +58,7 @@ impl NfsMountedMutationHandoff {
     }
 
     fn admit(&self) -> Result<MutexGuard<'_, ()>> {
-        self.lane
-            .lock()
+        dfs::MountedSifsCall::lock(&self.lane)
             .map_err(|_| DfsNfsError::Dfs("NFS mounted-mutation lane is poisoned".to_string()))
     }
 
@@ -85,13 +84,16 @@ impl NfsMountedMutationHandoff {
     ) -> Result<dfs::MountedSifsMutationArmRequestId> {
         let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
         let marker = lease.marker();
-        self.client
-            .arm(
+        // Prepare created a durable obligation. Arm runs under the handoff
+        // client's own timeout even if the NFS caller has already left.
+        dfs::MountedSifsCall::finish_handoff(|| {
+            self.client.arm(
                 marker.marker_id.clone(),
                 marker.marker_nonce.clone(),
                 arm_request_id.clone(),
             )
-            .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
+        })
+        .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
         Ok(arm_request_id)
     }
 
@@ -145,17 +147,28 @@ impl NfsMountedMutationHandoff {
         let lease = self
             .prepare(operation, stable_operation_id)
             .map_err(handoff_posix_error)?;
-        let arm_request_id = self.arm(&lease).map_err(handoff_posix_error)?;
+        let arm_request_id = self.arm(&lease).map_err(|error| {
+            self.gate("daemon did not acknowledge NFS Arm");
+            handoff_posix_error(error)
+        })?;
         let report = {
-            let mut service = service.lock().map_err(|_| {
-                handoff_posix_error(DfsNfsError::Dfs(
-                    "NFS mounted SIFS service is poisoned".to_string(),
-                ))
-            })?;
+            let mut service = match dfs::MountedSifsCall::lock_service(service) {
+                Ok(service) => service,
+                Err(error) => {
+                    dfs::MountedSifsCall::finish_handoff(|| {
+                        self.finish_no_write(lease, &arm_request_id, "nfs-service-not-entered")
+                    })
+                    .map_err(|failure| {
+                        self.gate("daemon did not acknowledge NFS no-write proof");
+                        handoff_posix_error(failure)
+                    })?;
+                    return Err(handoff_posix_error(DfsNfsError::Dfs(error.to_string())));
+                }
+            };
             service.capture_mounted_mutation(mutation)
         };
         let captured = dfs::MountedSifsMutationCapturedWork::new(report.committed_work);
-        match report.outcome {
+        dfs::MountedSifsCall::finish_handoff(|| match report.outcome {
             Ok(value) => {
                 self.finish_captured(lease, &arm_request_id, &captured)
                     .map_err(|error| {
@@ -173,17 +186,22 @@ impl NfsMountedMutationHandoff {
                 Err(error)
             }
             Err(error) => {
-                self.gate("NFS mutation returned an ambiguous error after service entry");
+                // The error is this request's answer. What it may have left
+                // behind is handed to the daemon as observed, and the export
+                // keeps serving.
                 let observation =
                     dfs::MountedSifsMutationErrorObservation::new(captured, nfs_error_code(&error))
                         .map_err(|source| {
                             handoff_posix_error(DfsNfsError::Dfs(source.to_string()))
                         })?;
                 self.finish_unknown(lease, &arm_request_id, &observation)
-                    .map_err(handoff_posix_error)?;
+                    .map_err(|handoff_error| {
+                        self.gate("daemon did not acknowledge the NFS error observation");
+                        handoff_posix_error(handoff_error)
+                    })?;
                 Err(error)
             }
-        }
+        })
     }
 
     fn finish_captured(
@@ -322,4 +340,45 @@ fn handoff_posix_error(error: DfsNfsError) -> dfs::DfsPosixError {
     dfs::DfsPosixError::Dfs(dfs::DfsError::Distributed {
         message: error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_prepared_arm_still_reaches_main_when_the_request_budget_expires() {
+        let dir = sinomo_testdir::TestDir::new("nfs-prepared-arm-budget");
+        let data = SinomoDataDir::new(dir.path());
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data).unwrap();
+        let session = store
+            .open_host_mount_session(dfs::MountedSifsMutationAdapter::Nfs, "nfs:test")
+            .unwrap();
+        let peer = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let client = DaemonDfsMountedMutationHandoffClient::new(
+            data,
+            peer.local_addr().unwrap().to_string(),
+        )
+        .unwrap()
+        .with_timeout(Duration::from_millis(250))
+        .unwrap();
+        let handoff = NfsMountedMutationHandoff {
+            store,
+            session: Some(session),
+            client,
+            gated: AtomicBool::new(false),
+            lane: Mutex::new(()),
+        };
+        let lease = handoff.prepare("nfs.mkdir", None).unwrap();
+        let deadline = Instant::now();
+        let _call = dfs::MountedSifsCall::enter(Some(deadline));
+        // The listener deliberately withholds the acknowledgement. The worker
+        // must contact it, and must still refuse to enter the mutation.
+        assert!(handoff.arm(&lease).is_err());
+        assert!(peer.accept().is_ok(), "the prepared Arm was never sent");
+        assert_eq!(dfs::MountedSifsCall::deadline(), Some(deadline));
+    }
 }

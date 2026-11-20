@@ -1623,29 +1623,43 @@ mod cancelled_catalog_tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(before.get(&actual.file_system_id), Some(&actual));
-            let checked = AtomicUsize::new(0);
-            let completed = service
-                .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
-                    &|| checked.fetch_add(1, Ordering::SeqCst) + 1 >= cancel_at,
-                )
-                .unwrap();
-            assert!(
-                !completed,
-                "the requested native cancellation point must be exercised"
-            );
-            assert_eq!(checked.load(Ordering::SeqCst), cancel_at);
-            assert_eq!(
-                service.metadata.filesystems, before,
-                "cancellation at native checkpoint {cancel_at} must hand back a complete catalog"
-            );
-            assert_eq!(
-                service
-                    .metadata_backend()
-                    .unwrap()
-                    .get_file_system(&actual.file_system_id)
-                    .unwrap(),
-                Some(actual)
-            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let checked = AtomicUsize::new(0);
+                let completed = service
+                    .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+                        &|| checked.fetch_add(1, Ordering::SeqCst) + 1 >= cancel_at,
+                    )
+                    .unwrap();
+                assert!(
+                    !completed,
+                    "the requested native cancellation point must be exercised"
+                );
+
+                assert_eq!(
+                    service.metadata.filesystems, before,
+                    "cancellation at native checkpoint {cancel_at} must hand back a complete catalog"
+                );
+                assert_eq!(
+                    service
+                        .metadata_backend()
+                        .unwrap()
+                        .get_file_system(&actual.file_system_id)
+                        .unwrap()
+                        .as_ref(),
+                    Some(&actual)
+                );
+                if checked.load(Ordering::SeqCst) == cancel_at {
+                    break;
+                }
+                // The recovery variant also yields if a resident writer holds
+                // its snapshot. The unchanged catalog is checked on every yield.
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hydration never reached cancellation checkpoint {cancel_at}"
+                );
+                std::thread::yield_now();
+            }
             drop(service);
         }
         runtime.close().unwrap();

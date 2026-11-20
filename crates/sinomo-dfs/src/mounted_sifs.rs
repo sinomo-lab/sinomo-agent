@@ -31,6 +31,106 @@ use crate::{
 
 pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
 
+thread_local! {
+    static MOUNTED_CALL_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Deadline of one synchronous adapter callback. Async adapters carry its absolute
+/// value across scheduling and enter it only inside the blocking worker.
+#[must_use]
+pub struct MountedSifsCall {
+    previous: Option<Instant>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl MountedSifsCall {
+    pub fn enter(deadline: Option<Instant>) -> Self {
+        let deadline = Self::earliest(deadline);
+        let previous = MOUNTED_CALL_DEADLINE.replace(deadline);
+        Self {
+            previous,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    /// A worker that owes Main a durable handoff finishes it under the handoff
+    /// client's own bound, independently of the syscall that has ended.
+    pub fn finish_handoff<R>(work: impl FnOnce() -> R) -> R {
+        let _restore = Self {
+            previous: MOUNTED_CALL_DEADLINE.replace(None),
+            _thread: std::marker::PhantomData,
+        };
+        work()
+    }
+
+    pub fn deadline() -> Option<Instant> {
+        MOUNTED_CALL_DEADLINE.get()
+    }
+
+    pub fn earliest(other: Option<Instant>) -> Option<Instant> {
+        Self::deadline().into_iter().chain(other).min()
+    }
+
+    pub fn lock<T>(mutex: &Mutex<T>) -> std::io::Result<std::sync::MutexGuard<'_, T>> {
+        let poisoned = || std::io::Error::other("mounted filesystem lock poisoned");
+        let Some(deadline) = Self::deadline() else {
+            return mutex.lock().map_err(|_| poisoned());
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            match mutex.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(poisoned()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(remaining.min(Duration::from_millis(2)));
+                }
+            }
+        }
+    }
+
+    pub fn lock_service(
+        service: &Mutex<MountedSifsService>,
+    ) -> std::io::Result<MountedSifsServiceGuard<'_>> {
+        let mut service = Self::lock(service)?;
+        let deadline = Self::earliest(service.transport.operation_deadline());
+        let previous = service.set_transport_operation_deadline(deadline);
+        Ok(MountedSifsServiceGuard { service, previous })
+    }
+}
+
+impl Drop for MountedSifsCall {
+    fn drop(&mut self) {
+        MOUNTED_CALL_DEADLINE.set(self.previous);
+    }
+}
+
+pub struct MountedSifsServiceGuard<'a> {
+    service: std::sync::MutexGuard<'a, MountedSifsService>,
+    previous: Option<Instant>,
+}
+
+impl std::ops::Deref for MountedSifsServiceGuard<'_> {
+    type Target = MountedSifsService;
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
+impl std::ops::DerefMut for MountedSifsServiceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.service
+    }
+}
+
+impl Drop for MountedSifsServiceGuard<'_> {
+    fn drop(&mut self) {
+        self.service.set_transport_operation_deadline(self.previous);
+    }
+}
+
 /// Outcome plus the exact durable work produced by one mounted mutation.
 ///
 /// Mounted adapters use this public seam instead of reaching into the
@@ -102,6 +202,9 @@ impl MountedSifsContentReadContext {
             self.content.clone(),
         );
         request.set_cancellation(self.cancellation.clone());
+        request.set_transport_operation_deadline(MountedSifsCall::earliest(
+            request.transport.operation_deadline(),
+        ));
         // A queued FUSE read can begin after unmount cancellation. Observe it
         // before the exact-content helper has any opportunity to send its
         // first remote request.
@@ -1974,6 +2077,18 @@ mod tests {
     }
 
     #[test]
+    fn the_first_configuration_publication_wait_observes_the_mount_deadline() {
+        let shared = MountedSifsConfigurationShared::new();
+        let start = Instant::now();
+        let _call = MountedSifsCall::enter(Some(start + Duration::from_millis(25)));
+        assert!(matches!(
+            shared.current(),
+            MountedSifsConfiguration::Disconnected
+        ));
+        assert!(start.elapsed() < sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+    }
+
+    #[test]
     fn mounted_authority_absolute_deadline_bounds_dispatch() {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-authority-deadline");
         let data_dir = SinomoDataDir::new(&root);
@@ -2624,10 +2739,12 @@ impl MountedSifsConfigurationShared {
     /// The current state. Only a use before the first subscription settled
     /// waits, and only under one network deadline.
     fn current(&self) -> MountedSifsConfiguration {
-        let Ok(mut state) = self.state.lock() else {
+        let Ok(mut state) = MountedSifsCall::lock(&self.state) else {
             return MountedSifsConfiguration::Disconnected;
         };
-        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let network_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let deadline =
+            MountedSifsCall::deadline().map_or(network_deadline, |call| call.min(network_deadline));
         while matches!(state.0, MountedSifsConfiguration::Connecting) {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return MountedSifsConfiguration::Disconnected;
@@ -3230,7 +3347,7 @@ impl MountedSifsControlPlaneKvClient {
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         // Compute the remaining budget immediately before transport dispatch;
         // reading local cluster state consumes the same operation deadline.
-        let options = match deadline {
+        let options = match MountedSifsCall::earliest(deadline) {
             Some(deadline) => {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     return Err(DfsPeerTransportError::new(
@@ -3396,12 +3513,77 @@ impl MountedSifsControlPlaneKvClient {
     }
 }
 
+/// A mounted requester's wait on its configuration feed. It holds the feed,
+/// so the subscription outlives the client's other clones for the wait.
+struct MountedSifsConfigurationChangeWatch {
+    configuration: Arc<MountedSifsConfigurationFeed>,
+    seen_transitions: u64,
+    woken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::DfsConfigurationChangeWatch for MountedSifsConfigurationChangeWatch {
+    fn wait_for_change(&mut self, wait: Duration) -> Result<bool, KvError> {
+        let shared = &self.configuration.shared;
+        let deadline = Instant::now().checked_add(wait);
+        let poisoned = || KvError::AuthorityUnavailable {
+            detail: "mounted SIFS configuration state is poisoned".into(),
+        };
+        let mut state = shared.state.lock().map_err(|_| poisoned())?;
+        loop {
+            if state.1 != self.seen_transitions {
+                self.seen_transitions = state.1;
+                return Ok(true);
+            }
+            if self.woken.swap(false, AtomicOrdering::AcqRel) {
+                return Ok(false);
+            }
+            state = match deadline {
+                Some(deadline) => {
+                    let Some(remaining) = deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                    else {
+                        return Ok(false);
+                    };
+                    shared
+                        .settled
+                        .wait_timeout(state, remaining)
+                        .map_err(|_| poisoned())?
+                        .0
+                }
+                None => shared.settled.wait(state).map_err(|_| poisoned())?,
+            };
+        }
+    }
+
+    fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let configuration = Arc::clone(&self.configuration);
+        let woken = Arc::clone(&self.woken);
+        Arc::new(move || {
+            woken.store(true, AtomicOrdering::Release);
+            // Taking the state lock orders this wake after a waiter's check.
+            drop(configuration.shared.state.lock());
+            configuration.shared.settled.notify_all();
+        })
+    }
+}
+
 impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
     /// sinomo:kv-configuration: Lend the snapshot the local daemon floor-checked and published, as last announced on its event stream.
     fn configuration_snapshot(
         &self,
     ) -> Result<Option<Arc<crate::DfsConfigurationSnapshot>>, KvError> {
         self.published_configuration()
+    }
+
+    /// sinomo:kv-configuration: Observe replacements of the snapshot held from the local daemon's event stream.
+    fn watch_configuration_changes(&self) -> Option<Box<dyn crate::DfsConfigurationChangeWatch>> {
+        let seen_transitions = self.configuration.shared.state.lock().ok()?.1;
+        Some(Box::new(MountedSifsConfigurationChangeWatch {
+            configuration: Arc::clone(&self.configuration),
+            seen_transitions,
+            woken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }))
     }
 
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {

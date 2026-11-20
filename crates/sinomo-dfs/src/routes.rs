@@ -210,6 +210,7 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
             DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE
         }
+        DfsNetworkMessage::PrimaryVerificationRequest(_) => DFS_DATA_READ_ROUTE,
     }
 }
 
@@ -312,7 +313,8 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         DfsNetworkMessage::ReadRequest(_)
         | DfsNetworkMessage::BulkReadRequest(_)
         | DfsNetworkMessage::StableWriteReconciliationRequest(_)
-        | DfsNetworkMessage::ContentRootCatalogPageRequest(_) => DfsMessageExecutionScope::ReadOnly,
+        | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
+        | DfsNetworkMessage::PrimaryVerificationRequest(_) => DfsMessageExecutionScope::ReadOnly,
         DfsNetworkMessage::StableNamespaceReconciliationRequest(request) => {
             authority_shard_execution_scope(
                 Some(&request.dispatch_authority_shard),
@@ -445,6 +447,7 @@ fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool
         DfsNetworkMessage::ReadRequest(_)
             | DfsNetworkMessage::BulkReadRequest(_)
             | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
+            | DfsNetworkMessage::PrimaryVerificationRequest(_)
             | DfsNetworkMessage::StableWriteReconciliationRequest(_)
             | DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
             | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
@@ -470,6 +473,7 @@ pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessag
             | DfsNetworkMessage::CommitVersion(_)
             | DfsNetworkMessage::RepairReplica(_)
             | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
+            | DfsNetworkMessage::PrimaryVerificationRequest(_)
     ) || matches!(
         message,
         DfsNetworkMessage::NamespaceRequest(command)

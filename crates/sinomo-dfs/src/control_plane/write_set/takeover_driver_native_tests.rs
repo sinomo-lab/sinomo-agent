@@ -97,17 +97,31 @@ pub(super) fn write_via(
     path: &str,
 ) -> crate::DfsObjectId {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let operation = sinomo_core::Id::generate().to_string();
     loop {
         let primary = record_from(runtime, config, reader).shard.primary_node_id;
-        let written = runtime.client(node).unwrap().posix_write_file(
+        let mut client = runtime.client(node).unwrap();
+        client.set_transport_operation_deadline(Some(deadline));
+        let written = client.posix_write_file_with_operation_id(
             path,
             path.as_bytes(),
             crate::DfsWriteOptions::replicated_eventual(vec![primary]),
+            &operation,
         );
         match written {
             Ok(written) => return written.object_id,
             Err(error) => {
-                assert!(Instant::now() < deadline, "{path} was not written: {error}");
+                assert!(
+                    Instant::now() < deadline,
+                    "{path} ({operation}) was not written: {error}; {:?}",
+                    runtime
+                        .rpc_observations()
+                        .iter()
+                        .rev()
+                        .filter(|rpc| rpc.dfs_request_id.as_deref() == Some(&operation))
+                        .take(6)
+                        .collect::<Vec<_>>()
+                );
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -338,14 +352,14 @@ fn native_takeover_of_a_two_member_write_set_asks_nobody() {
         takeover_events(
             &runtime,
             &c,
-            DfsMetadataTakeoverEvent::CORROBORATION_STARTED
+            DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED
         )
         .is_empty()
     );
     let started = takeover_events(
         &runtime,
         &b,
-        DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+        DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED,
     );
     assert!(
         started.iter().all(|event| event.node_ids.is_empty()),
@@ -519,10 +533,10 @@ fn native_takeover_delivery_failure_asks_the_network_to_verify_the_primary() {
         remaining_hits: 16,
         action: crate::test_runtime::FaultAction::TransientRouteFailureBeforeDispatch,
     });
-    let refused = runtime
-        .client(&b)
-        .unwrap()
-        .posix_mkdir_all("/services/hint");
+    let mut requester = runtime.client(&b).unwrap();
+    requester.set_transport_operation_deadline(Some(Instant::now() + Duration::from_secs(2)));
+    let refused = requester.posix_mkdir_all("/services/hint");
+    drop(requester);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !runtime.peer_verification_requests(&b).contains(&p) {
         assert!(

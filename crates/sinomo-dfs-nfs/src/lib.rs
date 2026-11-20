@@ -27,6 +27,11 @@ pub struct DfsNfsServerOptions {
     pub export_name: String,
     pub root_path: String,
     pub read_only: bool,
+    /// The longest one request waits for its DFS work. `None`, the default,
+    /// sets no deadline: a request waits for its outcome. The budget is the
+    /// export operator's own deadline and travels with every DFS request
+    /// the NFS request sends.
+    pub operation_budget: Option<std::time::Duration>,
 }
 
 impl Default for DfsNfsServerOptions {
@@ -41,6 +46,7 @@ impl Default for DfsNfsServerOptions {
             export_name: "sifs".to_string(),
             root_path: "/".to_string(),
             read_only: false,
+            operation_budget: None,
         }
     }
 }
@@ -82,8 +88,10 @@ impl DfsNfsServer {
         let data_dir = options.data_dir.clone();
         let root_path = options.root_path.clone();
         let read_only = options.read_only;
+        let operation_budget = options.operation_budget;
         let filesystem = tokio::task::spawn_blocking(move || {
             SifsNfsFileSystem::open(data_dir, root_path, read_only)
+                .map(|filesystem| filesystem.with_operation_budget(operation_budget))
         })
         .await
         .map_err(|source| DfsNfsError::Dfs(format!("NFS open worker failed: {source}")))??;
@@ -231,6 +239,7 @@ mod tests {
             export_name: "wire-test".to_string(),
             root_path: "/".to_string(),
             read_only: false,
+            operation_budget: None,
         })
         .await
         .expect("bind NFS server");

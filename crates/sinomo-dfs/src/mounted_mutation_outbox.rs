@@ -671,6 +671,19 @@ impl MountedSifsMutationLease<'_> {
         &self.marker
     }
 
+    /// Detach this lease from its session borrow, for an owner that finishes
+    /// the operation's handoff after the call that prepared it has returned.
+    /// The lease holds its own operation lock; the daemon still accepts its
+    /// transitions only while the host-mount session is live.
+    pub fn into_owned(self) -> MountedSifsMutationLease<'static> {
+        MountedSifsMutationLease {
+            store: self.store,
+            marker: self.marker,
+            _lease: self._lease,
+            _session: PhantomData,
+        }
+    }
+
     /// Persist the exact successful mutation delta before asking the daemon to
     /// accept it. This transition is legal only after the daemon's durable Arm
     /// acknowledgement.
@@ -754,8 +767,13 @@ impl MountedSifsMutationLease<'_> {
         let marker_nonce = self.marker.marker_nonce.clone();
         let updated = self.store.mutate_operation_marker(&marker_id, |marker| {
             verify_marker_identity(marker, &marker_id, &marker_nonce)?;
-            require_matching_armed(marker, arm_request_id)?;
-            transition(marker)
+            let previous = marker.phase.clone();
+            let armed = require_matching_armed(marker, arm_request_id);
+            transition(marker)?;
+            if previous == marker.phase {
+                return Ok(());
+            }
+            armed
         })?;
         self.marker = updated;
         Ok(())
@@ -1284,7 +1302,9 @@ impl MountedSifsMutationOutboxStore {
         let recovery_kind = match marker_recovery_kind(&marker.phase) {
             Some(MountedSifsMutationRecoveryKind::Exact) => MountedSifsMutationRecoveryKind::Exact,
             Some(MountedSifsMutationRecoveryKind::Full) => {
-                if !self.all_host_mount_sessions_proven_dead()? {
+                if !daemon_owns_finished_mount_error(&marker)
+                    && !self.all_host_mount_sessions_proven_dead()?
+                {
                     return Ok(None);
                 }
                 MountedSifsMutationRecoveryKind::Full
@@ -1540,6 +1560,12 @@ impl MountedSifsMutationOutboxStore {
                 LeaseLiveness::Dead => match marker_recovery_kind(&marker.phase) {
                     Some(MountedSifsMutationRecoveryKind::Exact) => {
                         status.exact_recovery_marker_count += 1;
+                        recovery_candidate_marker_ids.push(marker.marker_id.clone());
+                    }
+                    Some(MountedSifsMutationRecoveryKind::Full)
+                        if daemon_owns_finished_mount_error(&marker) =>
+                    {
+                        status.full_recovery_marker_count += 1;
                         recovery_candidate_marker_ids.push(marker.marker_id.clone());
                     }
                     Some(MountedSifsMutationRecoveryKind::Full) => {
@@ -2518,7 +2544,8 @@ fn lock_file_exclusive_with_timeout(
     let caller = std::panic::Location::caller();
     let file = open_lock_file(path)?;
     let started = Instant::now();
-    let deadline = started.checked_add(timeout).unwrap_or(started);
+    let deadline =
+        crate::MountedSifsCall::earliest(started.checked_add(timeout)).unwrap_or(started);
     loop {
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => {
@@ -2895,6 +2922,22 @@ fn verify_marker_identity(
         ));
     }
     Ok(())
+}
+
+/// The adapter recorded the end of service entry and Main fsynced acceptance.
+/// The operation lease must also have been released before a claim can start.
+fn daemon_owns_finished_mount_error(marker: &MountedSifsMutationOutboxMarker) -> bool {
+    matches!(
+        marker.origin.adapter,
+        MountedSifsMutationAdapter::Fuse | MountedSifsMutationAdapter::Nfs
+    ) && matches!(
+        marker.phase,
+        MountedSifsMutationOutboxPhase::DaemonAccepted {
+            requires_full_recovery: true,
+            error_observation: Some(_),
+            ..
+        }
+    )
 }
 
 fn marker_recovery_kind(
@@ -3537,6 +3580,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn acknowledged_error_recovery_drains_while_its_mount_keeps_serving() {
+        let (_root, store) = store("mounted-live-error-recovery");
+        let session = store
+            .open_host_mount_session(MountedSifsMutationAdapter::Fuse, "/mnt/sifs")
+            .unwrap();
+        let observation = MountedSifsMutationErrorObservation::new(
+            MountedSifsMutationCapturedWork::default(),
+            "unknown",
+        )
+        .unwrap();
+        for _ in 0..=MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
+            let mut lease = store.prepare(&session, None, "mkdir").unwrap();
+            let arm = arm(&store, &lease);
+            let id = lease.marker().marker_id.clone();
+            lease
+                .record_unknown_after_error(&arm, observation.clone())
+                .unwrap();
+            store
+                .accept_unknown_live(&id, &lease.marker().marker_nonce, &arm, &observation)
+                .unwrap();
+            assert!(store.try_claim_recovery(&id).unwrap().is_none());
+            lease.release_after_daemon_ack().unwrap();
+            assert_eq!(store.status().unwrap().full_recovery_marker_count, 1);
+            let claim = store
+                .try_claim_recovery(&id)
+                .unwrap()
+                .expect("closed operation");
+            assert_eq!(claim.recovery_kind(), MountedSifsMutationRecoveryKind::Full);
+            claim.terminalize(full_recovery_receipt()).unwrap();
+        }
+        assert_eq!(store.status().unwrap().pending_marker_count, 0);
     }
 
     #[test]

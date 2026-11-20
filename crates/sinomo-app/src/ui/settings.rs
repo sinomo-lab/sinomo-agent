@@ -413,6 +413,8 @@ struct SifsMountForm {
     read_only: bool,
     allow_other: bool,
     sync_local_changes: bool,
+    /// Carried through unchanged; this form has no control for it.
+    operation_budget: Option<String>,
 }
 
 impl From<&SifsMountConfig> for SifsMountForm {
@@ -430,6 +432,7 @@ impl SifsMountForm {
             read_only: config.read_only,
             allow_other: config.allow_other,
             sync_local_changes: config.sync_local_changes,
+            operation_budget: config.operation_budget.clone(),
         };
         match platform {
             SifsMountPlatform::UnixFuse => form.sync_local_changes = false,
@@ -454,6 +457,7 @@ impl SifsMountForm {
             read_only: self.read_only,
             allow_other: self.allow_other,
             sync_local_changes: self.sync_local_changes,
+            operation_budget: self.operation_budget.clone(),
         }
     }
 }
@@ -17263,6 +17267,7 @@ mod tests {
             read_only: false,
             allow_other: false,
             sync_local_changes: true,
+            operation_budget: None,
         };
         let status = sinomo_runtime::dfs::SifsMountRuntimeStatus {
             phase: SifsMountRuntimePhase::Connected,

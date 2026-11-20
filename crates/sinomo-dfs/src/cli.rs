@@ -60,6 +60,7 @@ pub struct DfsNfsServerCliOptions {
     pub root_path: String,
     pub data_dir: Option<PathBuf>,
     pub read_only: bool,
+    pub operation_budget: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -108,6 +109,7 @@ pub struct DfsHostMountOptions {
     pub allow_other: bool,
     pub foreground: bool,
     pub sync_local_changes: bool,
+    pub operation_budget: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -244,6 +246,11 @@ pub fn dfs_cli_spec() -> CliCommandSpec {
             option("--root", "SIFS root path", "path").with_aliases(["--path"]),
             option("--data-dir", "Sinomo data directory", "path"),
             CliOptionSpec::flag("--read-only", "serve the export read-only").with_aliases(["--ro"]),
+            option(
+                "--operation-budget",
+                "longest one request waits for its DFS work, such as 30s; absent waits for the outcome",
+                "duration",
+            ),
         ]
     };
     CliCommandSpec::new("dfs", "inspect and manage SIFS and DFS state")
@@ -386,6 +393,11 @@ pub fn dfs_cli_spec() -> CliCommandSpec {
                     CliOptionSpec::flag(
                         "--no-sync-local-changes",
                         "disable local change synchronization",
+                    ),
+                    option(
+                        "--operation-budget",
+                        "longest one filesystem call waits for its DFS work, such as 30s (Unix FUSE); absent waits for the outcome",
+                        "duration",
                     ),
                 ])
                 .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
@@ -672,12 +684,12 @@ pub fn parse_dfs_matches<C>(
         }
         ["dfs", "mount"] => parse_dfs_mount_matches(matches).map(DfsCliCommand::Mount),
         ["dfs", "nfs", "serve"] => Ok(DfsCliCommand::Nfs(DfsNfsCliCommand::Serve(
-            parse_dfs_nfs_server_matches(matches, "127.0.0.1:111"),
+            parse_dfs_nfs_server_matches(matches, "127.0.0.1:111")?,
         ))),
         ["dfs", "nfs", "mount"] => Ok(DfsCliCommand::Nfs(DfsNfsCliCommand::Mount(
             DfsNfsMountCliOptions {
                 target: required_positional(matches, 0)?.to_string(),
-                server: parse_dfs_nfs_server_matches(matches, default_nfs_mount_bind()),
+                server: parse_dfs_nfs_server_matches(matches, default_nfs_mount_bind())?,
             },
         ))),
         ["dfs", "nfs", "unmount"] => Ok(DfsCliCommand::Nfs(DfsNfsCliCommand::Unmount {
@@ -690,17 +702,27 @@ pub fn parse_dfs_matches<C>(
     }
 }
 
+fn parse_operation_budget(
+    matches: &CliCommandMatches,
+) -> Result<Option<std::time::Duration>, CliParseError> {
+    sinomo_api::dfs::parse_mount_operation_budget(
+        matches.value("--operation-budget").unwrap_or_default(),
+    )
+    .map_err(|detail| CliParseError::Parse { detail })
+}
+
 fn parse_dfs_nfs_server_matches(
     matches: &CliCommandMatches,
     default_bind: &str,
-) -> DfsNfsServerCliOptions {
-    DfsNfsServerCliOptions {
+) -> Result<DfsNfsServerCliOptions, CliParseError> {
+    Ok(DfsNfsServerCliOptions {
         bind: matches.value("--bind").unwrap_or(default_bind).to_string(),
         export_name: matches.value("--export").unwrap_or("sifs").to_string(),
         root_path: matches.value("--root").unwrap_or("/").to_string(),
         data_dir: matches.value("--data-dir").map(PathBuf::from),
         read_only: matches.contains("--read-only"),
-    }
+        operation_budget: parse_operation_budget(matches)?,
+    })
 }
 
 pub const fn default_nfs_mount_bind() -> &'static str {
@@ -738,7 +760,8 @@ fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOption
                 detail: "dfs mount control operations do not accept a mount-point".to_string(),
             });
         }
-        const MOUNT_ONLY_OPTIONS: [&str; 8] = [
+        const MOUNT_ONLY_OPTIONS: [&str; 9] = [
+            "--operation-budget",
             "--root",
             "--data-dir",
             "--read-only",
@@ -834,6 +857,7 @@ fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOption
         allow_other: matches.contains("--allow-other"),
         foreground: !matches.contains("--background"),
         sync_local_changes,
+        operation_budget: parse_operation_budget(matches)?,
     }))
 }
 

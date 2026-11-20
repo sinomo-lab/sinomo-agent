@@ -463,6 +463,7 @@ struct BrowserMutation<'a> {
     service: std::sync::MutexGuard<'a, crate::MountedSifsService>,
     tracker: crate::DfsCommittedWorkTracker,
     previous: Option<crate::DfsCommittedWorkTracker>,
+    served_request: Option<crate::service_core::DfsServedRequestRestore>,
     _publication_scope: Option<crate::publication_guard::DfsPublicationProviderRestore>,
     host: &'a dyn DfsBrowserServiceHost,
     origin_node_id: &'a sinomo_core::node::NodeId,
@@ -480,6 +481,9 @@ impl std::ops::DerefMut for BrowserMutation<'_> {
 }
 impl Drop for BrowserMutation<'_> {
     fn drop(&mut self) {
+        if let Some(restore) = self.served_request.take() {
+            self.service.leave_served_request(restore);
+        }
         let work = self.tracker.take();
         let owns_effects = self.previous.is_none();
         if let Some(previous) = &self.previous {
@@ -984,6 +988,7 @@ impl DfsBrowserBackend {
             service,
             tracker,
             previous,
+            served_request: None,
             _publication_scope: publication_scope,
             host: self.host.as_ref(),
             origin_node_id: &self.node_id,
@@ -1421,7 +1426,7 @@ impl DfsBrowserBackend {
         &self,
         request: crate::DaemonDfsBrowserWriteFileRequest,
     ) -> Result<crate::DaemonDfsBrowserWriteFileResponse, ServiceError> {
-        match self.try_write_file(request)? {
+        match self.try_write_file(request, &crate::DfsServedRequestScope::default())? {
             DfsBrowserWriteAttempt::Complete(response) => Ok(response),
             DfsBrowserWriteAttempt::ConfigurationPending(_) => Err(dfs_browser_service_error(
                 "DFS write configuration is awaiting a coherent authoritative projection",
@@ -1439,6 +1444,7 @@ impl DfsBrowserBackend {
     fn try_write_file(
         &self,
         request: crate::DaemonDfsBrowserWriteFileRequest,
+        served: &crate::DfsServedRequestScope,
     ) -> Result<DfsBrowserWriteAttempt, ServiceError> {
         let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
         let mut phase_started = trace_started;
@@ -1452,6 +1458,16 @@ impl DfsBrowserBackend {
         };
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_mutation()?;
+        let _execution = served.enter_execution();
+        service.served_request = Some(service.enter_served_request(served));
+        service
+            .check_cancelled("browser write before execution")
+            .map_err(dfs_browser_service_error)?;
+        if served.deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(dfs_browser_service_error(
+                "browser write deadline expired before execution",
+            ));
+        }
         let lock_us = phase_elapsed();
         // One coherent, already-published view supplies provider eligibility
         // and the complete zone identity. Reject an unknown floor before any
@@ -2648,7 +2664,11 @@ impl Service for HostedDfsBrowserService {
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE => {
-                    tracing::Instrument::instrument(async {
+                    // The handler owns departure; a blocking worker can outlive its caller.
+                    let (served, _departure) = crate::DfsServedRequestScope::at_arrival(
+                        crate::routes::dfs_request_budget(&request),
+                    );
+                    tracing::Instrument::instrument(served.until_budget(async {
                     let mut payload: crate::DaemonDfsBrowserWriteFileRequest =
                         ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
@@ -2673,6 +2693,7 @@ impl Service for HostedDfsBrowserService {
                         let backend_runtime = runtime.clone();
                         let attempt_host = Arc::clone(&backend_host);
                         let traceparent = request_traceparent.clone();
+                        let worker_scope = served.clone();
                         let attempt = run_blocking_browser_task(
                             Arc::clone(&data_dir),
                             route.clone(),
@@ -2684,7 +2705,7 @@ impl Service for HostedDfsBrowserService {
                                         &backend_runtime,
                                         attempt_host,
                                     )?;
-                                    match backend.try_write_file(payload)? {
+                                    match backend.try_write_file(payload, &worker_scope)? {
                                         DfsBrowserWriteAttempt::Complete(response) => Ok((
                                             DfsBrowserWriteAttempt::Complete(response),
                                             Some(backend.event_origin_node_id()?),
@@ -2735,8 +2756,9 @@ impl Service for HostedDfsBrowserService {
                     );
                     ctx.respond_value(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, result.0)?;
                     Ok::<(), ServiceError>(())
-                    }, tracing::trace_span!(target: "sinomo.perf", "dfs.browser.write", stage = "dfs.browser.write"))
-                    .await?;
+                    }), tracing::trace_span!(target: "sinomo.perf", "dfs.browser.write", stage = "dfs.browser.write"))
+                    .await
+                    .map_err(|_| dfs_browser_service_error("browser write deadline elapsed"))??;
                 }
                 DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE => {
                     let payload: crate::DaemonDfsBrowserReplaceFileIfVersionRequest =

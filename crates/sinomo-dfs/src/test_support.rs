@@ -208,6 +208,13 @@ pub fn now_unix_nanos() -> u64 {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Pin what one attempt returns: the requester reads its projection once
+    /// and returns the unknown outcome, refusal or delivery failure it holds,
+    /// instead of following its shard's record.
+    pub fn single_attempt_for_test(&mut self, single_attempt: bool) {
+        self.writes.single_attempt_for_test = single_attempt;
+    }
+
     pub fn test_pending_write_contains(&self, intent: &str) -> bool {
         self.writes.pending_writes.contains_key(intent)
     }

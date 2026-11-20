@@ -789,6 +789,7 @@ fn peer_reachability_event_entry(
             "verdict": entry.verdict,
             "verifying": entry.verifying,
             "relayed_only": entry.relayed_only,
+            "examined_generation": entry.examined_generation,
         })
     })
 }

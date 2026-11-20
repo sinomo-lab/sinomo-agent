@@ -1091,6 +1091,30 @@ fn native_parent_job_survives_handoff(coordinator_handoff: bool) {
     } else {
         cluster.replica_node.clone()
     };
+    let mut stale_sender = cluster
+        ._runtime
+        .client(if coordinator_handoff {
+            &old_owner
+        } else {
+            &cluster.users_primary_node
+        })
+        .unwrap();
+    // Hold the actual command and its reply fence across reassignment. A
+    // normal requester would bind a fresh dispatch to the successor.
+    let (stale_command, pending) = stale_sender
+        .prepare_routed_namespace_request(
+            &sinomo_core::Id::generate().to_string(),
+            sifs_file_system_id(),
+            &cluster.replica_node,
+            DfsNamespaceOperation::ParentCountParticipant {
+                coordinator_job: Box::new(original),
+                participant: Box::new(participant.clone()),
+                action: crate::DfsParentCountAction::Reserve,
+            },
+            false,
+            false,
+        )
+        .unwrap();
     let moved_shard = if coordinator_handoff { "users" } else { "root" };
     let current = cluster
         ._runtime
@@ -1109,28 +1133,14 @@ fn native_parent_job_survives_handoff(coordinator_handoff: bool) {
                 participant.parent_scope.epoch
             }
     );
-    let mut stale_sender = cluster
-        ._runtime
-        .client(if coordinator_handoff {
-            &old_owner
-        } else {
-            &cluster.users_primary_node
-        })
-        .unwrap();
-    let stale_target = cluster.replica_node.clone();
+    let refused = stale_sender.dispatch_prepared_namespace_request(
+        stale_command,
+        pending,
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+    );
     assert!(
-        stale_sender
-            .route_namespace_operation_with_request_id_and_result(
-                sinomo_core::Id::generate().to_string(),
-                stale_target,
-                DfsNamespaceOperation::ParentCountParticipant {
-                    coordinator_job: Box::new(original),
-                    participant: Box::new(participant.clone()),
-                    action: crate::DfsParentCountAction::Reserve
-                }
-            )
-            .is_err(),
-        "old coordinator or parent owner cannot authorize even exact phase replay"
+        !matches!(refused, Ok(ref reply) if matches!(reply.result, DfsNamespaceResult::Applied)),
+        "old coordinator or parent owner cannot authorize exact phase replay: {refused:?}"
     );
     drop(stale_sender);
     let coordinator = if coordinator_handoff {
@@ -1303,6 +1313,7 @@ fn native_hidden_parent_prepare_handoff_and_restart_preserve_one_logical_success
         from: "/users/hidden-source".into(),
         to: "/services".into(),
     };
+    cluster.replica.single_attempt_for_test(true);
     let initial_outcome = cluster.replica.route_namespace_operation_with_request_id(
         request.clone(),
         cluster.users_primary_node.clone(),

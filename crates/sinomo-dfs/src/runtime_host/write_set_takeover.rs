@@ -54,8 +54,9 @@ pub(crate) const DFS_TAKEOVER_EVENT_SCHEMA_ID: &str = "sinomo.dfs.metadata-takeo
 pub(crate) const DFS_TAKEOVER_EVENT_SCHEMA_VERSION: &str = "1.0.0";
 
 /// Every takeover event kind this component publishes.
-pub(crate) const DFS_TAKEOVER_EVENT_KINDS: [&str; 9] = [
+pub(crate) const DFS_TAKEOVER_EVENT_KINDS: [&str; 10] = [
     DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+    DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED,
     DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
     DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF,
     DfsMetadataTakeoverEvent::PROMISED,
@@ -247,18 +248,26 @@ async fn judge_takeover_primary(
     primary: &NodeId,
     departed: bool,
 ) -> (DfsTakeoverPrimaryReach, DfsTakeoverVerdictEvidence) {
-    let settled_lost = verdicts.current().reach(primary) == DfsWriteSetMemberReach::NoPath;
+    let asked = verdicts.current();
+    let settled_lost = asked.reach(primary) == DfsWriteSetMemberReach::NoPath;
+    let examined_before = asked.examined_generation(primary);
     let requested = !departed && !settled_lost && verdicts.request_verification(primary);
     let mut episode_seen = false;
     loop {
         let snapshot = verdicts.current();
         let (verdict, verifying) = snapshot.entry(primary);
-        episode_seen |= verifying;
+        // An episode this wait saw running, or one that settled since the
+        // question arrived. The second also covers an episode that began and
+        // settled between two wakes, which the first never sees.
+        episode_seen |= snapshot.examined_generation(primary) > examined_before;
         let evidence = DfsTakeoverVerdictEvidence {
             snapshot_generation: snapshot.generation,
             verification_generation: snapshot.verification_generation,
         };
-        if (departed || !requested || episode_seen)
+        if (departed
+            || !requested
+            || episode_seen
+            || (!verifying && !verdicts.request_verification(primary)))
             && let Some(answer) = takeover_corroboration_judgement(departed, verdict, verifying)
         {
             return (answer, evidence);

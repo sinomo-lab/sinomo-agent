@@ -1,7 +1,7 @@
 //! The candidate role: per-shard takeover attempts, driven from the keeper's
 //! evaluation and from the completions of the steps they start.
 
-use super::super::peer_verdicts::DfsPeerVerdictSnapshot;
+use super::super::peer_verdicts::{DfsPeerVerdictSnapshot, DfsPeerVerdicts};
 use super::super::write_set_keeping::MemberRecord;
 use super::super::*;
 use super::ShardKey;
@@ -250,6 +250,7 @@ impl TakeoverRole {
         shards: &[TakeoverShard],
         members: &BTreeMap<NodeId, MemberRecord>,
         verdicts: &DfsPeerVerdictSnapshot,
+        source: &mut DfsPeerVerdicts,
         unreachable_primaries: &BTreeSet<ShardKey>,
         publication_generation: u64,
     ) -> Vec<NodeId> {
@@ -306,6 +307,10 @@ impl TakeoverRole {
                 continue;
             }
             let facts = takeover_member_facts(shard, members, verdicts);
+            // Judged on every evaluation, so the epoch is noted when this
+            // node first reads it as a write-set member, whatever else runs.
+            let primary_examined =
+                source.examined_under(verdicts, &shard.key, shard.shard.epoch, primary);
             if self.attempts.contains_key(&shard.key) {
                 self.drive(shard, write_set, &facts, verdicts);
                 continue;
@@ -315,6 +320,7 @@ impl TakeoverRole {
                 shard: &shard.shard,
                 state: &shard.state,
                 members: &facts,
+                primary_examined,
                 // A store that cannot promise from its exact materialized head
                 // refuses inside the promise itself.
                 store_ready: true,
@@ -515,7 +521,11 @@ impl TakeoverRole {
         };
         self.publish(
             &shard.key,
-            DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+            if asked.is_empty() {
+                DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED
+            } else {
+                DfsMetadataTakeoverEvent::CORROBORATION_STARTED
+            },
             started,
             vec![
                 primary_evidence,

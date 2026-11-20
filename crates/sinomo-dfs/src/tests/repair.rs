@@ -889,15 +889,19 @@ fn served_lookup_path_does_not_retry_repairs_inline() {
     let mut client = runtime.client(&requester).unwrap();
     let before = runtime.rpc_observations().len();
     let result = client
-        .route_namespace_operation_to_metadata_primary_without_local_replay(
+        .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
             sifs_file_system_id(),
             primary.clone(),
             DfsNamespaceOperation::LookupPath {
                 path: "/services".into(),
                 inline_range: None,
             },
+            crate::DFS_NO_CALLER_BUDGET,
+            false,
+            false,
         )
-        .unwrap();
+        .unwrap()
+        .result;
     assert!(matches!(result, DfsNamespaceResult::Applied));
     assert!(
         runtime.rpc_observations()[before..]

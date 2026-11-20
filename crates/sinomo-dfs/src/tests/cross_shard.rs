@@ -582,9 +582,11 @@ fn content_reference_remains_fenced_by_an_actual_pending_move() {
     );
     // Use the existing native carrier-failure choreography: the real owner
     // persists its job and returns admission, while the target remains blocked.
+    cluster.users_primary.single_attempt_for_test(true);
     let moved = cluster
         .users_primary
         .posix_rename_with_operation_id(from, to, &move_id);
+    cluster.users_primary.single_attempt_for_test(false);
     assert!(
         moved.is_err(),
         "the actual target carrier is unavailable: {moved:?}"
@@ -3474,12 +3476,14 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
         &cluster._runtime, &cluster.users_primary_node, &cluster.services_primary_node, from, to,
     );
     let operation = sinomo_core::Id::generate().to_string();
+    cluster.users_primary.single_attempt_for_test(true);
     assert!(
         cluster
             .users_primary
             .posix_rename_with_operation_id(from, to, &operation)
             .is_err()
     );
+    cluster.users_primary.single_attempt_for_test(false);
     let blocked_write =
         cluster
             .users_primary
@@ -3995,12 +3999,14 @@ fn native_cross_shard_move_recovers_from_real_carrier_failure(
         &cluster._runtime, &cluster.users_primary_node, &cluster.services_primary_node, from, to,
     );
     let started = Instant::now();
+    cluster.users_primary.single_attempt_for_test(true);
     assert!(
         cluster
             .users_primary
             .posix_rename_with_operation_id(from, to, &operation)
             .is_err()
     );
+    cluster.users_primary.single_attempt_for_test(false);
     assert!(
         started.elapsed() < DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
         "failed real carrier is bounded by the normal operation deadline"

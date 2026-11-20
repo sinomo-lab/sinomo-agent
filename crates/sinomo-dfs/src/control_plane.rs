@@ -1241,6 +1241,18 @@ pub enum DfsWriteConfigurationReadiness {
     Pending,
 }
 
+/// One requester's wait on replacements of the published configuration it
+/// routes by. Creating the watch marks the current publication as seen, so a
+/// requester creates it before it reads the record it compares.
+pub trait DfsConfigurationChangeWatch: Send {
+    /// Block until the publication is replaced, the wake handle fires, or
+    /// `wait` has passed. Returns whether a replacement was observed.
+    fn wait_for_change(&mut self, wait: std::time::Duration) -> Result<bool, KvError>;
+
+    /// A handle that ends a wait in progress, or the next one, at once.
+    fn waker(&self) -> Arc<dyn Fn() + Send + Sync>;
+}
+
 pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     /// Borrow this same client's native asynchronous transport, when supported.
     /// Maintenance uses it while retaining its existing admission/generation
@@ -1286,6 +1298,15 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
 
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         Ok(())
+    }
+
+    /// Watch this client's published configuration for replacement. A
+    /// requester whose evidence says a shard record is changing waits on this
+    /// watch for its own projection to show the change. `None` means the
+    /// client has no publication events; its requester does not wait.
+    /// sinomo:kv-configuration: Observe replacements of the host-owned published configuration without fetching KV state.
+    fn watch_configuration_changes(&self) -> Option<Box<dyn DfsConfigurationChangeWatch>> {
+        None
     }
 
     /// Identify a host process which is authorized to execute placement
@@ -1594,6 +1615,10 @@ where
                 detail: "control-plane KV client lock poisoned".to_string(),
             })?
             .refresh_latest()
+    }
+
+    fn watch_configuration_changes(&self) -> Option<Box<dyn DfsConfigurationChangeWatch>> {
+        self.inner.lock().ok()?.watch_configuration_changes()
     }
 
     fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
@@ -11035,6 +11060,7 @@ mod tests {
                 Arc::clone(&captured),
                 Some(Box::new(trigger)),
             );
+            self.service.single_attempt_for_test(true);
             let created = self
                 .service
                 .posix_create_file_with_contents_and_attrs_and_operation_id(

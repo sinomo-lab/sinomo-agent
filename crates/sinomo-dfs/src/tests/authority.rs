@@ -4733,7 +4733,7 @@ fn routed_w2_create_with_an_unknown_final_prepare_completes_the_original_on_repl
         wait_for_commit: true,
         foreground_replica_repair: false,
     };
-    let mut client = runtime.client(&primary).unwrap();
+    let mut client = runtime.single_attempt_client(&primary).unwrap();
     // Main is the only publisher behind its delegating caller, and it serves
     // committed work promptly: each setup pass publishes, then confirms its
     // replicas with journal batches after the pass returns. Drive that work to

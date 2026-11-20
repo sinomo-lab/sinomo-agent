@@ -63,6 +63,7 @@ fn native_parent_supersession_rejects_missing_foreign_forked_and_changed_ancestr
         from: "/users".into(),
         to: "/services/chain-negative-users".into(),
     };
+    cluster.replica.single_attempt_for_test(true);
     assert!(
         cluster
             .replica
@@ -439,6 +440,7 @@ fn native_parent_supersession_rejects_missing_foreign_forked_and_changed_ancestr
                 || row.operation_id == middle.operation_id)
     );
     drop(hold);
+    cluster.replica.single_attempt_for_test(false);
     cluster
         .replica
         .route_namespace_operation_with_request_id(

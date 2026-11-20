@@ -2603,7 +2603,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command: None,
             attachment_bytes: None,
             patch_attachment: None,
-            authority_redirects_remaining: canonical.authority_redirects_remaining,
+            follow: None,
             remote_intent_id: canonical.remote_intent_id.clone(),
             durable_receipts: canonical.durable_receipts,
             required_receipts: canonical.required_receipts,
@@ -2661,6 +2661,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending.command = None;
             pending.attachment_bytes = None;
             pending.patch_attachment = None;
+            pending.follow = None;
             pending.result = Some(result.clone());
             pending.compact_retained_at = Some(Instant::now());
         }
@@ -2735,14 +2736,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending.command = None;
             pending.attachment_bytes = None;
             pending.patch_attachment = None;
+            // Keep the last observation separate from a definitive result so a
+            // late response can settle this identity after its caller leaves.
             pending.compact_retained_at = Some(Instant::now());
         }
         self.prune_retained_routed_writes();
     }
 
     /// Bound the requester-side late-response ledger by both age and request
-    /// count. Aliases are removed with their canonical request so a surviving
-    /// key can never point at an evicted operation.
+    /// count. An entry is compact only after the call that owned its write
+    /// has ended, so its age bounds no wait. Aliases are removed with their
+    /// canonical request so a surviving key can never point at an evicted
+    /// operation.
     pub(crate) fn prune_retained_routed_writes(&mut self) {
         let mut compact_requests = self
             .writes
@@ -2787,6 +2792,100 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.writes
             .pending_routed_writes
             .retain(|_, pending| !expired.contains(&pending.canonical_request_id));
+    }
+
+    /// Hold an unresolved routed write, with its body, for the newer shard
+    /// record its evidence announces. The call that owns the write follows
+    /// the record; a caller that does not wait takes the evidence as the
+    /// write's outcome.
+    fn hold_pending_routed_write(
+        &mut self,
+        canonical_request_id: &str,
+        evidence: DfsError,
+        floor_epoch: Option<u64>,
+    ) {
+        if let Some(pending) = self
+            .writes
+            .pending_routed_writes
+            .get_mut(canonical_request_id)
+        {
+            pending.follow = Some(crate::service_state::RoutedWriteFollow {
+                evidence,
+                floor_epoch,
+            });
+        }
+    }
+
+    /// The record-change evidence a held routed write waits on.
+    fn held_routed_write(
+        &self,
+        request_id: &str,
+    ) -> Option<(
+        String,
+        crate::service_record_follow::DfsRecordChangeEvidence,
+    )> {
+        let canonical = self.canonical_pending_routed_write_request_id(request_id)?;
+        let pending = self.writes.pending_routed_writes.get(&canonical)?;
+        let follow = pending.follow.as_ref()?;
+        (pending.result.is_none() && pending.command.is_some()).then(|| {
+            (
+                canonical,
+                crate::service_record_follow::DfsRecordChangeEvidence {
+                    dispatched: pending.authority_shard.clone(),
+                    floor_epoch: follow.floor_epoch,
+                    undelivered: false,
+                },
+            )
+        })
+    }
+
+    /// Follow the shard record for a held routed write: wait for the newer
+    /// record, or for the re-send timer, and send the write again. Returns
+    /// whether the write was sent again; `false` leaves its evidence as the
+    /// outcome the caller takes.
+    pub(crate) fn follow_held_routed_write(
+        &mut self,
+        request_id: &str,
+        resend: &mut crate::service_record_follow::DfsRecordFollowResend,
+    ) -> Result<bool, DfsError> {
+        let Some((canonical, evidence)) = self.held_routed_write(request_id) else {
+            return Ok(false);
+        };
+        let record = match self.await_newer_shard_record(&evidence, resend)? {
+            crate::service_record_follow::DfsRecordFollowed::Newer(record) => record,
+            crate::service_record_follow::DfsRecordFollowed::ResendDue(record) => record,
+            crate::service_record_follow::DfsRecordFollowed::Ended => return Ok(false),
+        };
+        self.dispatch_held_routed_write(&canonical, &record, true)?;
+        Ok(true)
+    }
+
+    /// Send a held routed write to the primary `record` names.
+    fn dispatch_held_routed_write(
+        &mut self,
+        canonical_request_id: &str,
+        record: &DfsMetadataShardConfig,
+        follow: bool,
+    ) -> Result<(), DfsError> {
+        let (sent, previous) = self.resend_pending_routed_write(canonical_request_id, record)?;
+        self.finish_routed_write_dispatch(
+            canonical_request_id,
+            previous,
+            record,
+            &record.primary_node_id,
+            sent,
+            follow,
+        )
+        .map_err(|error| match error {
+            // The held attempt may have applied, whatever this send did.
+            DfsError::NetworkDelivery { message, .. } | DfsError::Network { message } => {
+                DfsError::NetworkDelivery {
+                    message,
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                }
+            }
+            error => error,
+        })
     }
 
     pub(crate) fn take_write_outcome(
@@ -2931,220 +3030,58 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if let DfsDistributedWriteResult::Rejected {
             reason,
-            current_primary_node_id: Some(current_primary_node_id),
+            current_primary_node_id: Some(_),
         } = &response.result
-        {
-            let redirect = self
+            && let Some(dispatched) = self
                 .writes
                 .pending_routed_writes
                 .get(&canonical_request_id)
-                .and_then(|pending| {
-                    let command = pending.command.as_ref()?;
-                    Some((
-                        current_primary_node_id.clone(),
-                        command.clone(),
-                        pending.attachment_bytes.clone(),
-                        pending.patch_attachment.clone(),
-                        pending.authority_shard.clone(),
-                        pending.authority_redirects_remaining,
-                    ))
-                });
-            if let Some((
-                current_primary_node_id,
-                mut command,
-                attachment_bytes,
-                patch_attachment,
-                previous_authority,
-                redirects_remaining,
-            )) = redirect
-            {
-                if redirects_remaining == 0 {
-                    self.complete_pending_routed_write(
-                        &canonical_request_id,
-                        Err(DfsError::Distributed {
-                            message: format!(
-                                "routed distributed write exceeded {DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT} authority redirects: {reason}"
-                            ),
-                        }),
-                    );
-                    return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
-                        request_id: response.request_id,
-                        object_id: response.object_id,
-                        primary_node_id,
-                        result: response.result,
-                    });
-                } else {
-                    if let Err(error) = self.refresh_control_plane_latest() {
-                        let reason = format!(
-                            "distributed write authority redirect could not refresh the committed shard assignment: {error}"
-                        );
-                        self.complete_pending_routed_write(
-                            &canonical_request_id,
-                            Err(DfsError::Distributed {
-                                message: reason.clone(),
-                            }),
-                        );
-                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                            request_id: response.request_id,
-                            source_node_id: primary_node_id,
-                            reason,
-                        });
-                    }
-                    let redirected_authority = self
-                        .control_plane
-                        .as_mut()
-                        .map(|control_plane| {
-                            DfsControlPlaneStore::new(control_plane.as_mut()).get_metadata_shard(
-                                &previous_authority.file_system_id,
-                                &previous_authority.shard_id,
-                            )
-                        })
-                        .transpose();
-                    let redirected_authority = match redirected_authority {
-                        Ok(authority) => authority.flatten(),
-                        Err(error) => {
-                            let reason = format!(
-                                "distributed write authority redirect could not read the committed shard assignment: {error}"
-                            );
-                            self.complete_pending_routed_write(
-                                &canonical_request_id,
-                                Err(DfsError::Distributed {
-                                    message: reason.clone(),
-                                }),
-                            );
-                            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                                request_id: response.request_id,
-                                source_node_id: primary_node_id,
-                                reason,
-                            });
-                        }
-                    };
-                    let Some(redirected_authority) = redirected_authority else {
-                        self.complete_pending_routed_write(
-                            &canonical_request_id,
-                            Err(DfsError::Distributed {
-                                message: format!(
-                                    "redirected distributed write has no current shard assignment for {}",
-                                    previous_authority.shard_id
-                                ),
-                            }),
-                        );
-                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                            request_id: response.request_id,
-                            source_node_id: primary_node_id,
-                            reason: "distributed write authority redirect could not be bound to a current shard assignment"
-                                .to_string(),
-                            });
-                    };
-                    if redirected_authority == previous_authority {
-                        // A rejection that still names the exact assignment
-                        // already used for dispatch is not a topology redirect.
-                        // Retrying it recursively would only burn the redirect
-                        // budget against an identical command.
-                        self.complete_pending_routed_write(
-                            &canonical_request_id,
-                            Err(routed_write_rejection_error(reason)),
-                        );
-                        return Ok(NetworkedDfsServiceEvent::RemoteWriteCompleted {
-                            request_id: response.request_id,
-                            object_id: response.object_id,
-                            primary_node_id,
-                            result: response.result,
-                        });
-                    }
-                    if redirected_authority.primary_node_id != current_primary_node_id {
-                        self.complete_pending_routed_write(
-                            &canonical_request_id,
-                            Err(DfsError::Distributed {
-                                message: format!(
-                                    "distributed write redirect named primary {current_primary_node_id} but current shard {} epoch {} names {}",
-                                    redirected_authority.shard_id,
-                                    redirected_authority.epoch,
-                                    redirected_authority.primary_node_id
-                                ),
-                            }),
-                        );
-                        return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                            request_id: response.request_id,
-                            source_node_id: primary_node_id,
-                            reason: "distributed write authority redirect does not match the current committed assignment"
-                                .to_string(),
-                            });
-                    }
-                    command.authority_shard = Some(redirected_authority.clone());
-                    if current_primary_node_id == self.node_id {
-                        // The requester has become the authority. Its loopback
-                        // write updates the authoritative backend directly;
-                        // asking it for replica catch-up would replay its own
-                        // journal through a deliberately forbidden path.
-                        command.metadata_journal_after_sequence = None;
-                    }
-                    let message = command.clone().into_network_message();
-                    // The corroborated new assignment must own responses before
-                    // dispatch. A lost reply can still be followed by its late
-                    // authoritative completion; keeping the retiring primary
-                    // here would discard that completion as mismatched.
-                    let (_, previous_pending) = self.track_pending_routed_write(
-                        canonical_request_id.clone(),
-                        command.request.object_id.clone(),
-                        current_primary_node_id.clone(),
-                        redirected_authority.clone(),
-                        command,
-                        attachment_bytes.clone(),
-                    )?;
-                    if let Some(pending) = self
-                        .writes
-                        .pending_routed_writes
-                        .get_mut(&canonical_request_id)
-                    {
-                        pending.authority_redirects_remaining = redirects_remaining - 1;
-                        pending.patch_attachment = patch_attachment.clone();
-                    }
-                    let sent = if let Some(bytes) = attachment_bytes {
-                        let routed =
-                            self.next_dfs_routed_message(&current_primary_node_id, message);
-                        self.transport.send_routed_call(
-                            &current_primary_node_id,
-                            DfsRoutedCall::with_attachment(routed,
-                                DfsOutboundAttachment::from_shared_bytes_with_transport_integrity(bytes)),
-                        ).map(|()| true).or_else(|error| match error {
-                            sinomo_core::network::NetworkError::UnknownNode { .. } => Ok(false),
-                            error => Err(DfsError::from_network(error)),
-                        })
-                    } else if let Some(attachment) = patch_attachment {
-                        let routed =
-                            self.next_dfs_routed_message(&current_primary_node_id, message);
-                        let body = DfsOutboundAttachment::from_quarantined_patch(attachment.0)?;
-                        self.transport
-                            .send_routed_call(
-                                &current_primary_node_id,
-                                DfsRoutedCall::with_attachment(routed, body),
-                            )
-                            .map(|()| true)
-                            .or_else(|error| match error {
-                                sinomo_core::network::NetworkError::UnknownNode { .. } => Ok(false),
-                                error => Err(DfsError::from_network(error)),
-                            })
-                    } else {
-                        self.send_dfs_message_if_routable(&current_primary_node_id, message)
-                    };
-                    self.finish_routed_write_dispatch(
-                        &canonical_request_id,
-                        previous_pending,
-                        &redirected_authority,
-                        &current_primary_node_id,
-                        sent,
-                    )?;
-
-                    return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
-                        request_id: response.request_id,
-                        source_node_id: primary_node_id,
-                        reason: format!(
-                            "distributed write authority moved to {current_primary_node_id}; retrying"
-                        ),
-                    });
+                .filter(|pending| pending.command.is_some())
+                .map(|pending| pending.authority_shard.clone())
+        {
+            // The refusal names another primary. That is evidence the record
+            // is changing, never a route: the write goes only to the primary
+            // a strictly newer record of this requester's projection names.
+            let evidence = crate::service_record_follow::DfsRecordChangeEvidence {
+                dispatched,
+                floor_epoch: None,
+                undelivered: false,
+            };
+            let newer = self
+                .projected_shard_record(
+                    &evidence.dispatched.file_system_id,
+                    &evidence.dispatched.shard_id,
+                )
+                .ok()
+                .flatten()
+                .filter(|current| evidence.satisfied_by(current));
+            let reason = match newer {
+                Some(record) => {
+                    // The newer assignment must own responses before
+                    // dispatch. A lost reply can still be followed by its
+                    // late authoritative completion; keeping the retiring
+                    // primary here would discard that completion as
+                    // mismatched.
+                    self.dispatch_held_routed_write(&canonical_request_id, &record, false)?;
+                    format!(
+                        "distributed write authority moved to {}; retrying",
+                        record.primary_node_id
+                    )
                 }
-            }
+                None => {
+                    self.hold_pending_routed_write(
+                        &canonical_request_id,
+                        routed_write_rejection_error(reason),
+                        None,
+                    );
+                    "distributed write awaits its shard's newer record".to_string()
+                }
+            };
+            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                request_id: response.request_id,
+                source_node_id: primary_node_id,
+                reason,
+            });
         }
         let mut committed_manifest_publish = None;
         match &response.result {
@@ -3197,17 +3134,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 current_primary_node_id,
                 ..
             } => {
-                self.complete_pending_routed_write(
-                    &canonical_request_id,
-                    Err(DfsError::MetadataCommitOutcomeUnknown {
-                        file_system_id: file_system_id.clone(),
-                        shard_id: shard_id.clone(),
-                        epoch: *epoch,
-                        operation_id: operation_id.clone(),
-                        cause: cause.clone(),
-                        current_primary_node_id: current_primary_node_id.clone(),
-                    }),
-                );
+                let unknown = DfsError::MetadataCommitOutcomeUnknown {
+                    file_system_id: file_system_id.clone(),
+                    shard_id: shard_id.clone(),
+                    epoch: *epoch,
+                    operation_id: operation_id.clone(),
+                    cause: cause.clone(),
+                    current_primary_node_id: current_primary_node_id.clone(),
+                };
+                let floor_epoch = match cause {
+                    crate::DfsCommitOutcomeUnknownCause::RecordChanged { epoch } => Some(*epoch),
+                    _ => None,
+                };
+                self.hold_pending_routed_write(&canonical_request_id, unknown, floor_epoch);
             }
             DfsDistributedWriteResult::PreconditionFailed { failure } => {
                 failure.validate().map_err(|message| DfsError::Serialization { message })?;

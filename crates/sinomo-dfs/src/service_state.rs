@@ -160,7 +160,6 @@ pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT: usize = 2048
 /// Maximum encoded bytes in one foreground namespace response journal batch.
 pub(crate) const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT: usize =
     crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
-pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 
@@ -1207,7 +1206,9 @@ pub(crate) struct PendingRoutedWrite {
     /// Actual immutable reader capture retained only for an unresolved patch.
     /// It is content DATA, not a metadata version or publication receipt.
     pub(crate) patch_attachment: Option<OwnedRoutedPatchAttachment>,
-    pub(crate) authority_redirects_remaining: usize,
+    /// Evidence that the shard record is changing, held with the retry body
+    /// while the call that owns this write waits for the newer record.
+    pub(crate) follow: Option<RoutedWriteFollow>,
     pub(crate) remote_intent_id: Option<String>,
     pub(crate) durable_receipts: usize,
     pub(crate) required_receipts: usize,
@@ -1216,6 +1217,15 @@ pub(crate) struct PendingRoutedWrite {
     /// authoritative completion only for a bounded recovery window; durable
     /// intent receipts own reconciliation after this compact state expires.
     pub(crate) compact_retained_at: Option<Instant>,
+}
+
+/// What an unresolved routed write waits for before it is sent again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RoutedWriteFollow {
+    /// What the caller gets if its wait ends without a newer record.
+    pub(crate) evidence: DfsError,
+    /// The lowest epoch the evidence says the record reaches.
+    pub(crate) floor_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -58,6 +58,9 @@ fn write_from(
             Some(crate::test_runtime::executor().handle()),
         )
         .expect("the requester opens its client");
+        // These cases are about the wait of the primary serving the request:
+        // the requester reports what its one attempt returned.
+        client.single_attempt_for_test(true);
         if let Some(cancellation) = requester.cancellation {
             client.set_cancellation(Some(cancellation));
         }

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::advisory_lock::observe_advisory_lock_outcome_at;
 use crate::posix_model::{DfsPosixError, Result, posix_error_for_namespace_rejection};
+use crate::service_record_follow::DfsFollowedNamespaceRoute;
 use crate::*;
 
 /// Locks and blocking waiters are renewed by clients before this lease ends.
@@ -23,7 +24,6 @@ pub const DEFAULT_DFS_ADVISORY_LOCK_LEASE: Duration = Duration::from_secs(120);
 /// differ by more than this bound must not enable renewable strong locks.
 pub const DEFAULT_DFS_ADVISORY_LOCK_MAX_CLOCK_SKEW: Duration = Duration::from_secs(300);
 
-const POSIX_LOCK_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 const POSIX_LOCK_REMOTE_RESPONSE_MARGIN: Duration = Duration::from_secs(1);
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -91,7 +91,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }),
         };
         let file_system_id = object.file_system_id.clone();
-        let mut primary = match self.routed_namespace_primary_for_path(&authority_path)? {
+        let primary = match self.routed_namespace_primary_for_path(&authority_path)? {
             Some(primary) => primary,
             None => {
                 return self.posix_apply_advisory_lock_local(
@@ -106,67 +106,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
 
-        for _ in 0..POSIX_LOCK_AUTHORITY_REDIRECT_LIMIT {
-            let settled = self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    timeout,
-                    false,
-                    false,
-                )
-                .map_err(DfsPosixError::from)?;
-            match settled.result {
-                DfsNamespaceResult::Applied => {
-                    return match settled.posix_coordination_result {
-                        Some(DfsPosixCoordinationResult::AdvisoryLock(outcome)) => Ok(outcome),
-                        _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
-                            message: "advisory-lock response omitted its typed outcome".to_string(),
-                        })),
-                    };
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current == self.node_id
-                    && !self.transport.delegates_local_namespace_authority() =>
-                {
-                    return self.posix_apply_advisory_lock_local(
-                        &authority_path,
-                        object_id,
-                        match &operation {
-                            DfsNamespaceOperation::AdvisoryLock { command, .. } => command,
-                            _ => unreachable!(),
-                        },
-                        timeout,
-                    );
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current != primary => {
-                    primary = self
-                        .refreshed_primary_after_authority_redirect(
-                            &file_system_id,
-                            &operation,
-                            &primary,
-                            current,
-                        )
-                        .map_err(DfsPosixError::from)?;
-                }
+        let followed = self
+            .route_namespace_following_record(
+                None,
+                &file_system_id,
+                primary,
+                &operation,
+                timeout,
+                false,
+                false,
+            )
+            .map_err(DfsPosixError::from)?;
+        match followed {
+            DfsFollowedNamespaceRoute::LocalAuthority => self.posix_apply_advisory_lock_local(
+                &authority_path,
+                object_id,
+                match &operation {
+                    DfsNamespaceOperation::AdvisoryLock { command, .. } => command,
+                    _ => unreachable!(),
+                },
+                timeout,
+            ),
+            DfsFollowedNamespaceRoute::Settled(settled) => match settled.result {
+                DfsNamespaceResult::Applied => match settled.posix_coordination_result {
+                    Some(DfsPosixCoordinationResult::AdvisoryLock(outcome)) => Ok(outcome),
+                    _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "advisory-lock response omitted its typed outcome".to_string(),
+                    })),
+                },
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
                     ..
-                } => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
-            }
+                } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+            },
         }
-        Err(DfsPosixError::Dfs(DfsError::Distributed {
-            message: format!(
-                "advisory-lock operation exceeded {POSIX_LOCK_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        }))
     }
 
     pub(crate) fn posix_apply_advisory_lock_local(

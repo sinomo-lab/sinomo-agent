@@ -101,8 +101,11 @@ local daemon and open a mounted-mutation outbox session using the `Nfs`
 adapter identity. Service construction, export-root discovery, directory
 refreshes, writes, namespace mutations, and attribute changes use the same
 Prepare, Arm, capture, daemon-acknowledgement, and fencing protocol as other
-mounted adapters. An ambiguous post-Arm error fences the export and leaves
-durable evidence for daemon recovery.
+mounted adapters. An error from the operation itself, an unknown outcome
+included, is that request's answer: the adapter hands what it observed to the
+daemon and the export keeps serving. The export is fenced, and answers
+`NFS3ERR_IO` until it is restarted, only when the daemon does not acknowledge
+a handoff.
 
 NFS WRITE requests are bounded to 1 MiB at the adapter and are published to
 DFS immediately using a wait-for-commit write. A successful reply reports

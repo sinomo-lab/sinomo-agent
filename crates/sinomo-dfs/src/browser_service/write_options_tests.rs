@@ -1476,13 +1476,14 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         bytes: bytes.clone(),
     };
     let allocation = request.bytes.as_ptr();
+    let served = crate::DfsServedRequestScope::default();
     let before = native_observer
         .metadata_backend()
         .unwrap()
         .journal_last_sequence()
         .unwrap();
     for _ in 0..2 {
-        request = match backend.try_write_file(request).unwrap() {
+        request = match backend.try_write_file(request, &served).unwrap() {
             DfsBrowserWriteAttempt::ConfigurationPending(original) => original,
             DfsBrowserWriteAttempt::Complete(_) => {
                 panic!("native configuration gap admitted a write")
@@ -1524,7 +1525,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         .unwrap();
     });
     assert!(matches!(
-        backend.try_write_file(request).unwrap(),
+        backend.try_write_file(request, &served).unwrap(),
         DfsBrowserWriteAttempt::Complete(_)
     ));
     let mut service = backend.lock_service().unwrap();

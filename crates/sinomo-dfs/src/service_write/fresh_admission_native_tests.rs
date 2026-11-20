@@ -162,6 +162,7 @@ fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_hea
         });
         let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         let previous = writer.set_transport_operation_deadline(Some(deadline));
+        writer.single_attempt_for_test(true);
         let written =
             writer.posix_create_file_with_operation_id(path, &bytes, options.clone(), operation);
         let lost = written.expect_err("actual original Main write reply must be lost");

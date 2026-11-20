@@ -4330,12 +4330,9 @@ impl DfsTestRuntime {
     ) -> Result<DfsPlacementReconciliationJob, String> {
         let rule = crate::normalize_placement_rule(path, scope, policy)
             .map_err(|error| error.to_string())?;
-        let control = self.shared_control_plane()?;
-        let expected = control
-            .with_client(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut())
-                    .get_file_system_config(&crate::sifs_file_system_id())
-            })
+        let mut control = self.configuration_publisher(actor);
+        let expected = DfsControlPlaneStore::new(control.as_mut())
+            .get_file_system_config(&crate::sifs_file_system_id())
             .map_err(|error| error.to_string())?
             .ok_or("normal native fixture filesystem configuration is absent")?;
         let mut planner = self.client(actor)?;
@@ -4360,11 +4357,8 @@ impl DfsTestRuntime {
             crate::metadata_records::dfs_now_unix_nanos(),
         )
         .map_err(|error| error.to_string())?;
-        let committed = control
-            .with_client(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut())
-                    .compare_and_put_placement_update(&expected, &desired, &job)
-            })
+        let committed = DfsControlPlaneStore::new(control.as_mut())
+            .compare_and_put_placement_update(&expected, &desired, &job)
             .map_err(|error| error.to_string())?;
         let Some(committed) = committed else {
             return Err("normal placement Apply rejected a changed current configuration".into());
@@ -4525,6 +4519,19 @@ impl DfsTestRuntime {
             Some(executor().handle()),
         )
         .map_err(|e| e.to_string())
+    }
+    /// A client for a case whose subject is what one attempt returns: it
+    /// reads its projection once and returns the unknown outcome, refusal or
+    /// delivery failure it holds, where [`Self::client`], like every real
+    /// caller, would follow its shard's record until a definite answer or its
+    /// own budget.
+    pub fn single_attempt_client(
+        &self,
+        node: &NodeId,
+    ) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
+        let mut client = self.client(node)?;
+        client.single_attempt_for_test(true);
+        Ok(client)
     }
     /// One ordinary client-open attempt with the caller's startup deadline and
     /// typed Pending result intact. No admission is retained on a yielded open;
@@ -6223,6 +6230,9 @@ impl DfsControlPlaneKvClient for ProbedNormalControlPlane {
     fn refresh_latest(&mut self) -> Result<(), sinomo_core::kv::KvError> {
         self.inner.refresh_latest()
     }
+    fn watch_configuration_changes(&self) -> Option<Box<dyn crate::DfsConfigurationChangeWatch>> {
+        self.inner.watch_configuration_changes()
+    }
     fn placement_authority_process_identity(&self) -> Option<DfsPlacementAuthorityProcessIdentity> {
         self.inner.placement_authority_process_identity()
     }
@@ -6470,6 +6480,29 @@ impl DfsTestRuntime {
             peer.clone(),
             verdict,
             verifying,
+        );
+    }
+
+    /// Give `observer` a connectivity probe owner, or take it away. With
+    /// one, its verification requests are accepted and stay open until
+    /// [`Self::settle_peer_verification`]; without one, as by default, they
+    /// are refused and the verdict the test set answers.
+    pub fn set_probe_owner(&self, observer: &NodeId, owner: bool) {
+        crate::runtime_host::set_test_probe_owner(self.data_dir(observer).root(), owner);
+    }
+
+    /// Settle `observer`'s verification episode of `peer` with `verdict`, as
+    /// the network does when its probe of the peer ends.
+    pub fn settle_peer_verification(
+        &self,
+        observer: &NodeId,
+        peer: &NodeId,
+        verdict: sinomo_core::network::PeerPathVerdict,
+    ) {
+        crate::runtime_host::settle_test_peer_verification(
+            self.data_dir(observer).root(),
+            peer.clone(),
+            verdict,
         );
     }
 

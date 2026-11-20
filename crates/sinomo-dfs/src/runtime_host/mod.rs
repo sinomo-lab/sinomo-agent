@@ -3914,9 +3914,9 @@ pub(crate) use write_set_keeping::{JoinRendezvousGuard, hold_joins_until_all_adm
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use write_set_keeping::{
     keeping_events_for_test, keeping_failures_for_test, keeping_reachability_interest_for_test,
-    set_test_peer_verdict,
-    set_write_set_keeping_suspended,
-    suspend_write_set_keeping_unless_enabled, test_verification_requests,
+    set_test_peer_verdict, set_test_probe_owner, settle_test_peer_verification,
+    set_write_set_keeping_suspended, suspend_write_set_keeping_unless_enabled,
+    test_verification_requests,
 };
 pub(crate) use write_set_keeping::{
     DFS_WRITE_SET_EVENT_KINDS, dfs_write_set_event_publication, run_dfs_write_set_keeping,

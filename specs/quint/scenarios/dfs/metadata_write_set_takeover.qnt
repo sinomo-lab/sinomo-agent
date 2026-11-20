@@ -81,6 +81,39 @@ module dfs_write_set_align_tail_scenario {
   def terminalWitness: bool = all { phase == 24, W::s.kv.primary == W::M2, W::s.kv.writeSet == Set(W::M1, W::M2, W::M3), W::s.log.get(W::M1) == W::s.log.get(W::M2), W::s.log.get(W::M3) == W::s.log.get(W::M2), W::s.commits.exists(c => c.epoch == 2 and c.entries.length() == 2), C::witnessFollowerDropsTail }
 }
 
+/// Two candidates promise against the same record. M3 wins the first swap.
+/// M2 must learn that its original swap was rejected and confirm the new
+/// record before it can take over the next epoch.
+module dfs_write_set_successive_candidates_scenario {
+  import common.* from "../../lib/common"
+  import dfs_metadata_write_set_takeover as W from "../../models/dfs/metadata_write_set_takeover"
+  import dfs_metadata_write_set_takeover_safety as C from "../../checks/dfs/metadata_write_set_takeover_safety"
+  var phase: int
+  action init = all { W::initWithBounds(W::Design, 1, 3), phase' = 0 }
+  action step = any {
+    all { phase == 0, W::confirmQuorum(W::M2), phase' = 1 },
+    all { phase == 1, W::promise(W::M2), phase' = 2 },
+    all { phase == 2, W::confirmQuorum(W::M3), phase' = 3 },
+    all { phase == 3, W::promise(W::M3), phase' = 4 },
+    all { phase == 4, W::submitSwap(W::M3), phase' = 5 },
+    all { phase == 5, W::resolveAnySwap(true), phase' = 6 },
+    all { phase == 6, W::learnAnySwap, phase' = 7 },
+    all { phase == 7, W::activate(W::M3), phase' = 8 },
+    all { phase == 8, W::submitSwap(W::M2), phase' = 9 },
+    all { phase == 9, W::resolveAnySwap(true), phase' = 10 },
+    all { phase == 10, W::learnAnySwap, phase' = 11 },
+    all { phase == 11, W::confirmQuorum(W::M2), phase' = 12 },
+    all { phase == 12, W::promise(W::M2), phase' = 13 },
+    all { phase == 13, W::submitSwap(W::M2), phase' = 14 },
+    all { phase == 14, W::resolveAnySwap(true), phase' = 15 },
+    all { phase == 15, W::learnAnySwap, phase' = 16 },
+    all { phase == 16, W::activate(W::M2), phase' = 17 },
+    all { phase == 17, W::s' = W::s, phase' = phase },
+  }
+  def safety: bool = C::safety
+  def terminalWitness: bool = all { phase == 17, W::s.kv.epoch == 3, W::s.kv.primary == W::M2, W::s.kv.writeSet == Set(W::M2), W::s.promise.get(W::M2) == None }
+}
+
 /// M3 reads the record and promises, but M1 removes M3 from the write set and
 /// commits at the W floor without it. M3's swap is rejected; M3 releases its
 /// promise, catches up and is added back.

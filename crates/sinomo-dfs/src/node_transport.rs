@@ -832,13 +832,35 @@ pub(crate) fn collect_dfs_incoming_body_sync(
     body: ObjectRpcIncomingBody,
     max_bytes: usize,
 ) -> Result<Vec<u8>, DfsPeerTransportError> {
+    collect_dfs_response_sync(body.collect_to_vec(max_bytes))
+}
+
+// Receiving the head does not finish a streamed call. Keep the same mount
+// deadline until the bytes of a value or direct read have arrived.
+fn collect_dfs_response_sync<T>(
+    receive: impl Future<Output = Result<T, NetworkError>>,
+) -> Result<T, DfsPeerTransportError> {
+    let deadline = crate::MountedSifsCall::deadline();
+    let collect = async move {
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), receive)
+                .await
+                .map_err(|_| {
+                    DfsPeerTransportError::with_delivery_state(
+                        "mounted filesystem response body exceeded its deadline",
+                        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                    )
+                })?,
+            None => receive.await,
+        }
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    };
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if matches!(
             handle.runtime_flavor(),
             tokio::runtime::RuntimeFlavor::MultiThread
         ) {
-            return tokio::task::block_in_place(|| handle.block_on(body.collect_to_vec(max_bytes)))
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()));
+            return tokio::task::block_in_place(|| handle.block_on(collect));
         }
         return Err(DfsPeerTransportError::new(
             "sync DFS response body collector cannot run inside a current-thread Tokio runtime",
@@ -848,9 +870,7 @@ pub(crate) fn collect_dfs_incoming_body_sync(
         .enable_all()
         .build()
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-    let result = runtime
-        .block_on(body.collect_to_vec(max_bytes))
-        .map_err(|source| DfsPeerTransportError::new(source.to_string()));
+    let result = runtime.block_on(collect);
     runtime.shutdown_timeout(Duration::from_millis(250));
     result
 }
@@ -921,29 +941,7 @@ pub(crate) fn dfs_direct_read_sender_from_peer_transport(
 fn collect_dfs_direct_read_response_sync(
     response: DfsDirectReadClientResponse,
 ) -> Result<DfsReadResponse, DfsPeerTransportError> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| {
-                handle.block_on(response.collect_to_read_response())
-            })
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()));
-        }
-        return Err(DfsPeerTransportError::new(
-            "sync DFS direct-read collector cannot run inside a current-thread Tokio runtime",
-        ));
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-    let result = runtime
-        .block_on(response.collect_to_read_response())
-        .map_err(|source| DfsPeerTransportError::new(source.to_string()));
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    result
+    collect_dfs_response_sync(response.collect_to_read_response())
 }
 
 #[derive(Clone)]
@@ -2835,6 +2833,7 @@ impl DfsNodeTransport {
                     | DfsNetworkMessage::ExclusiveCreateRequest(_)
                     | DfsNetworkMessage::StableWriteReconciliationRequest(_)
                     | DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
+                    | DfsNetworkMessage::PrimaryVerificationRequest(_)
             )
     }
 
@@ -2844,6 +2843,7 @@ impl DfsNodeTransport {
         routed_message: DfsRoutedMessage,
         require_local_source: bool,
     ) -> Result<(), NetworkError> {
+        let _send_cancellation = DfsSendCancellationScope::enter(self.send_cancellation.clone());
         let mut pending =
             VecDeque::from([(target_node_id.clone(), routed_message, require_local_source)]);
         while let Some((target_node_id, routed_message, require_local_source)) = pending.pop_front()
@@ -6158,6 +6158,18 @@ mod tests {
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+    #[test]
+    fn a_mounted_read_budget_includes_waiting_for_streamed_bytes() {
+        let (_sender, body) = ObjectRpcIncomingBody::test_channel(Some(1), 1);
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let _call = crate::MountedSifsCall::enter(Some(deadline));
+        let error = collect_dfs_incoming_body_sync(body, 1).expect_err("the body is still open");
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+        );
+    }
 
     #[test]
     fn dfs_peer_rpc_options_require_a_main_daemon_terminal() {

@@ -11091,6 +11091,7 @@ dependencies = [
 name = "sinomo-dfs-fuse"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "fuser",
  "libc",
  "sinomo-runtime",

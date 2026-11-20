@@ -98,7 +98,7 @@ fn native_routed_write_unknown_outcome_is_typed_and_its_retry_commits_once() {
     let c = config.replica_node_ids[1].clone();
     let path = "/services/routed-unknown-write.bin";
     let operation = "routed-unknown-write";
-    let mut requester = runtime.client(&b).unwrap();
+    let mut requester = runtime.single_attempt_client(&b).unwrap();
     fail_member_journal_calls(&runtime, &config, &c);
     let error = requester
         .posix_write_file_with_operation_id(
@@ -115,8 +115,8 @@ fn native_routed_write_unknown_outcome_is_typed_and_its_retry_commits_once() {
             .pending_routed_writes
             .values()
             .any(|pending| matches!(
-                &pending.result,
-                Some(Err(DfsError::MetadataCommitOutcomeUnknown { .. }))
+                pending.follow.as_ref().map(|held| &held.evidence),
+                Some(DfsError::MetadataCommitOutcomeUnknown { .. })
             )),
         "the requester keeps its pending write with the unknown outcome"
     );
@@ -154,7 +154,7 @@ fn native_routed_conditional_rename_stays_pending_and_its_retry_replays_applied(
     let to = "/services/unknown-rename-target";
     let operation = "routed-unknown-rename";
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
-    let mut requester = runtime.client(&b).unwrap();
+    let mut requester = runtime.single_attempt_client(&b).unwrap();
     let source = requester
         .posix_write_file(from, b"rename me", write_options(&config))
         .unwrap();
@@ -246,7 +246,7 @@ fn native_lost_write_reply_after_commit_is_possibly_applied_and_commits_once() {
     let b = config.replica_node_ids[0].clone();
     let path = "/services/lost-write-reply.bin";
     let operation = "lost-write-reply";
-    let mut requester = runtime.client(&b).unwrap();
+    let mut requester = runtime.single_attempt_client(&b).unwrap();
     runtime.install_fault(crate::test_runtime::FaultRule {
         source: Some(b.clone()),
         target: Some(config.primary_node_id.clone()),

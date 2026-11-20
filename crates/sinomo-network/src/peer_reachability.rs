@@ -48,6 +48,11 @@ pub struct PeerReachability {
     pub relayed_only: bool,
     /// The connectivity probe owner is verifying this peer's direct edges.
     pub verifying: bool,
+    /// Changes each time a verification episode for this peer settles,
+    /// whatever it found; zero while none has. Equal values mean no episode
+    /// settled in between, so a subscriber that noted the value can tell a
+    /// verdict the network examined since from one that only stood.
+    pub examined_generation: u64,
 }
 
 /// Generations of every input a snapshot was computed from.
@@ -137,7 +142,7 @@ fn current_inputs(
     let module_routing_generation = crate::network_module_routing_generation();
     let local_routing_generation =
         crate::connectivity_store::local_cluster_connectivity_routing_generation(paths);
-    let (verification_generation, _) = peer_verification_state(paths);
+    let verification_generation = peer_verification_state(paths).generation;
     let directory = cluster_directory_with_bootstrap_state(cluster_directory_for(paths), state);
     Ok(PeerReachabilityInputs {
         directory_routing_version: directory.routing_version()?.0,
@@ -162,7 +167,7 @@ fn compute_peers(
     if let Ok(mut computations) = PEER_REACHABILITY_COMPUTATIONS.lock() {
         *computations.entry(paths.root.clone()).or_default() += 1;
     }
-    let (_, verifying) = peer_verification_state(paths);
+    let verification = peer_verification_state(paths);
     let directory = cluster_directory_with_bootstrap_state(cluster_directory_for(paths), state);
     let (version, members, endpoints, committed) =
         directory.routing_records_snapshot()?.into_parts();
@@ -185,7 +190,12 @@ fn compute_peers(
         .into_iter()
         .map(|(peer_node_id, classification)| {
             let entry = PeerReachability {
-                verifying: verifying.contains(&peer_node_id),
+                verifying: verification.verifying.contains(&peer_node_id),
+                examined_generation: verification
+                    .examined
+                    .get(&peer_node_id)
+                    .copied()
+                    .unwrap_or_default(),
                 peer_node_id: peer_node_id.clone(),
                 verdict: classification.verdict,
                 relayed_only: classification.relayed_only,
@@ -371,14 +381,26 @@ impl PeerReachabilitySubscription {
     /// Waits until at least one peer's entry differs from [`Self::current`]
     /// and returns exactly those peers. Never returns an empty list.
     pub async fn changed(&mut self) -> Vec<PeerReachabilityChange> {
+        self.wait_for_change(false).await
+    }
+
+    /// Also wake on verification activity, including a probe owner becoming
+    /// available to examine a verdict that was already standing.
+    pub async fn changed_or_verification_activity(&mut self) -> Vec<PeerReachabilityChange> {
+        self.wait_for_change(true).await
+    }
+
+    async fn wait_for_change(&mut self, watch_verification: bool) -> Vec<PeerReachabilityChange> {
         loop {
             if self.dirty {
                 self.dirty = false;
                 match refresh_view(&self.paths, &self.state, &self.key) {
                     Ok(current) => {
                         let changes = peer_reachability_changes(&self.last, &current);
+                        let verification_changed = self.last.inputs.verification_generation
+                            != current.inputs.verification_generation;
                         self.last = current;
-                        if !changes.is_empty() {
+                        if !changes.is_empty() || (watch_verification && verification_changed) {
                             return changes;
                         }
                     }

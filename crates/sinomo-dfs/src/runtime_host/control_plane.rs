@@ -732,6 +732,37 @@ pub(super) fn daemon_dfs_txn_puts_membership_handoff_for_node(
     })
 }
 
+/// A requester's wait on the process-wide published configuration.
+struct DaemonDfsConfigurationChangeWatch {
+    published: tokio::sync::watch::Receiver<Arc<sinomo_dfs::DfsConfigurationSnapshot>>,
+    runtime: tokio::runtime::Handle,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl sinomo_dfs::DfsConfigurationChangeWatch for DaemonDfsConfigurationChangeWatch {
+    fn wait_for_change(&mut self, wait: std::time::Duration) -> Result<bool, KvError> {
+        let published = &mut self.published;
+        let wake = Arc::clone(&self.wake);
+        block_on_dfs_cluster_future(&self.runtime, async move {
+            tokio::select! {
+                changed = tokio::time::timeout(wait, published.changed()) => match changed {
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(_)) => Err(sinomo_core::service::ServiceError::Service(
+                        "daemon DFS configuration publication closed".into(),
+                    )),
+                    Err(_) => Ok(false),
+                },
+                () = wake.notified() => Ok(false),
+            }
+        })
+    }
+
+    fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let wake = Arc::clone(&self.wake);
+        Arc::new(move || wake.notify_one())
+    }
+}
+
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     fn async_client(&mut self) -> Option<&mut dyn sinomo_dfs::AsyncDfsControlPlaneKvClient> {
         Some(self)
@@ -807,10 +838,17 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         snapshot.metadata_shards(file_system_id)
     }
 
-    fn refresh_latest(&mut self) -> Result<(), KvError> {
-        // Nothing read through this client is retained. Published scopes are
-        // already current, and every other key is its own ReadIndex request.
-        Ok(())
+    /// Nothing read through this client is retained, so it has nothing to
+    /// refresh: a requester waits for the shared publication to be replaced.
+    fn watch_configuration_changes(
+        &self,
+    ) -> Option<Box<dyn sinomo_dfs::DfsConfigurationChangeWatch>> {
+        let authority = self.retained_metadata_authority.as_ref()?;
+        Some(Box::new(DaemonDfsConfigurationChangeWatch {
+            published: authority.subscribe_configuration_snapshot(),
+            runtime: self.runtime.clone(),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }))
     }
 
     fn placement_authority_process_identity(

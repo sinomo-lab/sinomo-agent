@@ -23,6 +23,10 @@ pub const MAX_PENDING_PEER_VERIFICATIONS: usize = 256;
 static NEXT_PEER_VERIFICATION_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static PEER_VERIFICATIONS: LazyLock<Mutex<HashMap<PathBuf, RootPeerVerifications>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Source of [`RootPeerVerifications::examined`] values: process-wide and
+/// never zero, so a value is never reused after a root's registry is dropped.
+static NEXT_VERIFICATION_CHANGE: AtomicU64 = AtomicU64::new(1);
+static NEXT_PEER_EXAMINATION: AtomicU64 = AtomicU64::new(1);
 
 /// Why a peer's direct edges should be verified now.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -82,6 +86,9 @@ struct RootPeerVerifications {
     pending: BTreeMap<NodeId, PeerVerificationCause>,
     in_progress: BTreeSet<NodeId>,
     generation: u64,
+    /// Per peer, a value that changes each time an episode for it settles.
+    /// An episode abandoned because the owner went away settles nothing.
+    examined: BTreeMap<NodeId, u64>,
 }
 
 impl RootPeerVerifications {
@@ -199,11 +206,8 @@ impl Drop for PeerVerificationOwner {
             root.owners.remove(&self.id);
             if root.owners.is_empty() {
                 root.pending.clear();
-                if !root.in_progress.is_empty() {
-                    root.in_progress.clear();
-                    root.generation = root.generation.wrapping_add(1);
-                    crate::route_input_watch::notify_route_input_changed(&self.root);
-                }
+                root.in_progress.clear();
+                crate::route_input_watch::notify_route_input_changed(&self.root);
             }
             if root.is_unused() {
                 roots.remove(&self.root);
@@ -219,7 +223,12 @@ pub fn register_peer_verification_owner(paths: &ClusterPaths) -> PeerVerificatio
     let notify = Arc::new(tokio::sync::Notify::new());
     if let Ok(mut roots) = PEER_VERIFICATIONS.lock() {
         let root = roots.entry(paths.root.clone()).or_default();
+        let first_owner = root.owners.is_empty();
         root.owners.insert(id, Arc::clone(&notify));
+        if first_owner {
+            root.generation = NEXT_VERIFICATION_CHANGE.fetch_add(1, Ordering::Relaxed);
+            crate::route_input_watch::notify_route_input_changed(&paths.root);
+        }
         if !root.pending.is_empty() {
             notify.notify_one();
         }
@@ -248,18 +257,28 @@ pub fn take_pending_peer_verifications(
 /// Marks a verification episode for `peer` as running.
 #[doc(hidden)]
 pub fn begin_peer_verification(paths: &ClusterPaths, peer_node_id: &NodeId) {
-    update_in_progress(paths, |in_progress| {
-        in_progress.insert(peer_node_id.clone())
-    });
+    update_in_progress(paths, |root| root.in_progress.insert(peer_node_id.clone()));
 }
 
 /// Marks the verification episode for `peer` as settled.
 #[doc(hidden)]
 pub fn settle_peer_verification(paths: &ClusterPaths, peer_node_id: &NodeId) {
-    update_in_progress(paths, |in_progress| in_progress.remove(peer_node_id));
+    update_in_progress(paths, |root| {
+        let settled = root.in_progress.remove(peer_node_id);
+        if settled {
+            root.examined.insert(
+                peer_node_id.clone(),
+                NEXT_PEER_EXAMINATION.fetch_add(1, Ordering::Relaxed),
+            );
+        }
+        settled
+    });
 }
 
-fn update_in_progress(paths: &ClusterPaths, update: impl FnOnce(&mut BTreeSet<NodeId>) -> bool) {
+fn update_in_progress(
+    paths: &ClusterPaths,
+    update: impl FnOnce(&mut RootPeerVerifications) -> bool,
+) {
     let changed = {
         let Ok(mut roots) = PEER_VERIFICATIONS.lock() else {
             return;
@@ -267,9 +286,9 @@ fn update_in_progress(paths: &ClusterPaths, update: impl FnOnce(&mut BTreeSet<No
         let Some(root) = roots.get_mut(&paths.root) else {
             return;
         };
-        let changed = update(&mut root.in_progress);
+        let changed = update(root);
         if changed {
-            root.generation = root.generation.wrapping_add(1);
+            root.generation = NEXT_VERIFICATION_CHANGE.fetch_add(1, Ordering::Relaxed);
         }
         changed
     };
@@ -278,15 +297,30 @@ fn update_in_progress(paths: &ClusterPaths, update: impl FnOnce(&mut BTreeSet<No
     }
 }
 
-/// Generation of the running-verification set for `paths` plus that set.
-pub(crate) fn peer_verification_state(paths: &ClusterPaths) -> (u64, BTreeSet<NodeId>) {
+/// The verification state a reachability snapshot is computed from.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PeerVerificationState {
+    /// Advances whenever an episode begins or ends.
+    pub(crate) generation: u64,
+    /// Peers whose episode is running.
+    pub(crate) verifying: BTreeSet<NodeId>,
+    /// Per peer, a value that changes each time an episode for it settles;
+    /// absent while none has.
+    pub(crate) examined: BTreeMap<NodeId, u64>,
+}
+
+/// The running-verification set for `paths`, its generation and every peer's
+/// last settled episode.
+pub(crate) fn peer_verification_state(paths: &ClusterPaths) -> PeerVerificationState {
     PEER_VERIFICATIONS
         .lock()
         .ok()
         .and_then(|roots| {
-            roots
-                .get(&paths.root)
-                .map(|root| (root.generation, root.in_progress.clone()))
+            roots.get(&paths.root).map(|root| PeerVerificationState {
+                generation: root.generation,
+                verifying: root.in_progress.clone(),
+                examined: root.examined.clone(),
+            })
         })
         .unwrap_or_default()
 }
@@ -409,13 +443,39 @@ mod tests {
             take_pending_peer_verifications(&paths).is_empty(),
             "a running episode absorbs further requests"
         );
-        let (generation, running) = peer_verification_state(&paths);
-        assert!(running.contains(&peer));
+        let running = peer_verification_state(&paths);
+        assert!(running.verifying.contains(&peer));
+        assert!(
+            !running.examined.contains_key(&peer),
+            "a running episode has examined nothing yet"
+        );
         settle_peer_verification(&paths, &peer);
-        let (settled_generation, running) = peer_verification_state(&paths);
-        assert!(running.is_empty());
-        assert_ne!(generation, settled_generation);
+        let settled = peer_verification_state(&paths);
+        assert!(settled.verifying.is_empty());
+        assert_ne!(running.generation, settled.generation);
+        let examined = settled.examined.get(&peer).copied();
+        assert!(examined.is_some_and(|examined| examined != 0));
+        // Settling a peer that has no running episode examines nothing.
+        settle_peer_verification(&paths, &peer);
+        assert_eq!(
+            peer_verification_state(&paths).examined.get(&peer).copied(),
+            examined
+        );
+        // Each settled episode changes the peer's value, and only its own.
+        let other = node("node_peer_verification_other_peer");
+        begin_peer_verification(&paths, &other);
+        begin_peer_verification(&paths, &peer);
+        settle_peer_verification(&paths, &peer);
+        let again = peer_verification_state(&paths);
+        assert_ne!(again.examined.get(&peer).copied(), examined);
+        assert!(!again.examined.contains_key(&other));
+        // An episode abandoned with its owner settles nothing.
         drop(owner);
+        assert!(
+            !peer_verification_state(&paths)
+                .examined
+                .contains_key(&other)
+        );
         assert!(!request_peer_verification_for_node(
             &paths,
             &local,

@@ -84,7 +84,7 @@ fn commit_mode_at(
 /// leader it reaches. Tests that cut voters off from cluster KV use it before
 /// closing, so the election a returning voter's higher term forces has
 /// settled and no KV call outlives the close.
-fn reelect(runtime: &DfsTestRuntime, survivor: &NodeId) {
+pub(super) fn reelect(runtime: &DfsTestRuntime, survivor: &NodeId) {
     let cluster = runtime
         .component_context(survivor)
         .unwrap()
@@ -117,7 +117,7 @@ fn reelect(runtime: &DfsTestRuntime, survivor: &NodeId) {
 /// The shard record as `reader` reads it. A stopped, cut-off or returning
 /// voter makes the survivors elect again, and an authoritative read during
 /// that election fails transiently, so a failed read is retried.
-fn record_from(
+pub(super) fn record_from(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     reader: &NodeId,
@@ -136,7 +136,7 @@ fn record_from(
 }
 
 /// The shard record as `reader` reads it, or `None` while its read fails.
-fn try_record_from(
+pub(super) fn try_record_from(
     runtime: &DfsTestRuntime,
     config: &DfsMetadataShardConfig,
     reader: &NodeId,
@@ -323,7 +323,7 @@ fn hold_swaps(
 /// over every switched shard whose primary it judges lost, and the default
 /// root and users shards switch too once every member advertises the
 /// capability.
-fn shard_events(
+pub(super) fn shard_events(
     runtime: &DfsTestRuntime,
     node: &NodeId,
     config: &DfsMetadataShardConfig,
@@ -335,7 +335,7 @@ fn shard_events(
         .collect()
 }
 
-fn the_other(one: &NodeId, b: &NodeId, c: &NodeId) -> NodeId {
+pub(super) fn the_other(one: &NodeId, b: &NodeId, c: &NodeId) -> NodeId {
     if one == b { c.clone() } else { b.clone() }
 }
 
@@ -344,7 +344,7 @@ fn sorted(mut nodes: Vec<NodeId>) -> Vec<NodeId> {
     nodes
 }
 
-fn wait_until(
+pub(super) fn wait_until(
     what: &str,
     runtime: &DfsTestRuntime,
     nodes: &[&NodeId],
@@ -522,7 +522,7 @@ fn native_second_takeover_after_the_first_successor_stops() {
         &runtime,
         &second,
         &config,
-        DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+        DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED,
     );
     let last = started
         .last()
@@ -855,9 +855,10 @@ fn native_takeover_never_deposes_a_slow_primary() {
 
 /// TK13 (b): with the primary stopped, two members that judge each other
 /// unreachable both judge it lost, each ranks alone, and both promise from
-/// the same cut before either swap reaches cluster KV. Exactly one swap applies; the
-/// other settles rejected with the epoch advanced. Neither keeps a promise,
-/// and the winner commits with the other once they reach each other.
+/// the same cut before either swap reaches cluster KV. They reach each other
+/// again before the swaps are submitted. Exactly one swap applies; the other
+/// settles rejected with the epoch advanced and its candidate follows the
+/// winner. Neither keeps a promise, and the winner commits with the other.
 #[test]
 fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
     let (mut runtime, config) = switched_with_kv_voters("native-loss-race", None);
@@ -889,14 +890,11 @@ fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
     );
     assert_eq!(at_b.cut, at_c.cut, "both promised from the same cut");
     assert_ne!(at_b.swap_request_id, at_c.swap_request_id);
-    // They stay unable to reach each other until the race is settled.
-    runtime.partition_node(
-        &b,
-        Partition {
-            kv: false,
-            dfs: true,
-        },
-    );
+    // Judging each other unreachable only made both rank alone. They reach
+    // each other again before either swap is submitted, so the one that is
+    // superseded has no reason to judge the winner lost.
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::Path, false);
+    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::Path, false);
     drop(held);
 
     wait_until(
@@ -948,12 +946,10 @@ fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
     wait_until("no promise is left", &runtime, &[&b, &c], || {
         promise_of(&runtime, &b, &config).is_none() && promise_of(&runtime, &c, &config).is_none()
     });
-
-    runtime.partition_node(&b, Partition::default());
-    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::Path, false);
-    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::Path, false);
-    // The winner aligns the other once it reaches it; until then a commit
-    // that needs the other's acknowledgement ends unknown.
+    assert!(
+        attempts_started_at(&runtime, &loser, &config, config.epoch + 1).is_empty(),
+        "the superseded candidate follows the winner"
+    );
     let after = commit_mode_eventually(
         &runtime,
         &record.shard,
@@ -973,6 +969,753 @@ fn native_concurrent_candidates_promise_from_one_cut_and_one_swap_applies() {
                 .all(|member| object_mode(&runtime, member, &config, &after) == Some(0o600))
         },
     );
+    runtime.close().unwrap();
+}
+
+/// Refuse `node`'s writes of the shard's write-set record before they reach
+/// cluster KV unless `admit` passes the request.
+fn gate_write_set_writes(
+    runtime: &DfsTestRuntime,
+    config: &DfsMetadataShardConfig,
+    node: &NodeId,
+    admit: impl Fn(&sinomo_core::kv::KvTxnRequest) -> bool + Send + Sync + 'static,
+) -> crate::test_support::DfsTestNativeKvHookRegistration {
+    let config = config.clone();
+    runtime
+        .native_kv_request_hook(node, move |request| {
+            if writes_the_write_set(&config, request) && !admit(request) {
+                Err(ServiceError::Network(NetworkError::delivery_failed(
+                    "native fixture held swap",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "the test holds this write-set write",
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap()
+}
+
+/// `node`'s attempts for this shard that started at `epoch`, asked or not.
+fn attempts_started_at(
+    runtime: &DfsTestRuntime,
+    node: &NodeId,
+    config: &DfsMetadataShardConfig,
+    epoch: u64,
+) -> Vec<DfsMetadataTakeoverEvent> {
+    [
+        DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
+        DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED,
+    ]
+    .into_iter()
+    .flat_map(|name| shard_events(runtime, node, config, name))
+    .filter(|event| event.epoch == epoch)
+    .collect()
+}
+
+/// Two survivors of a stopped primary, one superseded by the other in a
+/// fixed order.
+struct Superseded {
+    runtime: DfsTestRuntime,
+    config: DfsMetadataShardConfig,
+    /// The candidate whose swap is still held: it settles superseded once
+    /// `b_open` is set.
+    b: NodeId,
+    /// The candidate whose swap applied: primary at the next epoch.
+    c: NodeId,
+    b_open: Arc<std::sync::atomic::AtomicBool>,
+    /// C writes the record again (a shrink, an add) only once this is set.
+    c_open: Arc<std::sync::atomic::AtomicBool>,
+    _gates: [crate::test_support::DfsTestNativeKvHookRegistration; 2],
+}
+
+impl Superseded {
+    fn release_b(&self) {
+        self.b_open.store(true, Ordering::SeqCst);
+        wait_until(
+            "B is superseded",
+            &self.runtime,
+            &[&self.b, &self.c],
+            || {
+                !shard_events(
+                    &self.runtime,
+                    &self.b,
+                    &self.config,
+                    DfsMetadataTakeoverEvent::SWAP_SUPERSEDED,
+                )
+                .is_empty()
+            },
+        );
+    }
+
+    fn heal(&self) {
+        self.runtime.partition_node(&self.b, Partition::default());
+        self.runtime
+            .set_peer_verdict(&self.b, &self.c, PeerPathVerdict::Path, false);
+        self.runtime
+            .set_peer_verdict(&self.c, &self.b, PeerPathVerdict::Path, false);
+    }
+
+    fn record(&self) -> DfsMetadataShardRecordCut {
+        record_from(&self.runtime, &self.config, &self.b)
+    }
+
+    fn write_set(&self) -> Vec<NodeId> {
+        self.record()
+            .write_set_state()
+            .switched()
+            .unwrap()
+            .write_set
+            .clone()
+    }
+
+    /// Wait until `observer`'s keeper has asked the network to verify `peer`
+    /// once more than `seen` times: it evaluated again and is still waiting.
+    fn asks_again(&self, observer: &NodeId, peer: &NodeId, seen: usize) -> usize {
+        let asked = || {
+            self.runtime
+                .peer_verification_requests(observer)
+                .iter()
+                .filter(|asked| *asked == peer)
+                .count()
+        };
+        wait_until(
+            "the keeper asks the network to verify the peer",
+            &self.runtime,
+            &[&self.b, &self.c],
+            || asked() > seen,
+        );
+        asked()
+    }
+
+    /// The winner commits a change that the other acknowledges.
+    fn commits_on_both(&self, operation: &str) {
+        let record = self.record();
+        let primary = record.shard.primary_node_id.clone();
+        let other = the_other(&primary, &self.b, &self.c);
+        let after = commit_mode_eventually(
+            &self.runtime,
+            &record.shard,
+            &primary,
+            "/services/race",
+            0o600,
+            operation,
+        );
+        catch_up_from(&self.runtime, &record.shard, &primary, &[&other]);
+        wait_until(
+            "the primary commits with the other",
+            &self.runtime,
+            &[&self.b, &self.c],
+            || {
+                [&self.b, &self.c].into_iter().all(|member| {
+                    object_mode(&self.runtime, member, &self.config, &after) == Some(0o600)
+                })
+            },
+        );
+    }
+
+    fn close(self) {
+        self.c_open.store(true, Ordering::SeqCst);
+        self.b_open.store(true, Ordering::SeqCst);
+        self.runtime.close().unwrap();
+    }
+}
+
+/// Both survivors promise from one cut with every write of the record held.
+/// C's own swap alone is then admitted and applies; B's stays held. With
+/// `probe_owners` each survivor's network accepts verification requests and
+/// the test settles them; without a probe owner, a standing verdict cannot start a new campaign.
+/// With `healed_first` the two reach each other again before C's swap is
+/// admitted, so B first reads C's epoch with a path to it.
+fn one_candidate_superseded_by_the_other(
+    name: &str,
+    probe_owners: bool,
+    healed_first: bool,
+) -> Superseded {
+    use std::sync::atomic::AtomicBool;
+    let (mut runtime, config) = switched_with_kv_voters(name, None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/race");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    for node in [&b, &c] {
+        runtime.set_probe_owner(node, probe_owners);
+    }
+    let b_open = Arc::new(AtomicBool::new(false));
+    let c_open = Arc::new(AtomicBool::new(false));
+    let c_swap = Arc::new(std::sync::Mutex::new(None::<sinomo_core::kv::KvRequestId>));
+    let gates = [
+        gate_write_set_writes(&runtime, &config, &b, {
+            let b_open = Arc::clone(&b_open);
+            move |_| b_open.load(Ordering::SeqCst)
+        }),
+        // C: only its own promised swap, or everything once opened.
+        gate_write_set_writes(&runtime, &config, &c, {
+            let (c_open, c_swap) = (Arc::clone(&c_open), Arc::clone(&c_swap));
+            move |request| {
+                c_open.load(Ordering::SeqCst)
+                    || c_swap.lock().unwrap().as_ref() == Some(&request.request_id)
+            }
+        }),
+    ];
+    runtime.stop_node(&p).unwrap();
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::NoPath, false);
+    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::NoPath, false);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("both promise", &runtime, &[&b, &c], || {
+        promise_of(&runtime, &b, &config).is_some() && promise_of(&runtime, &c, &config).is_some()
+    });
+    let (at_b, at_c) = (
+        promise_of(&runtime, &b, &config).unwrap(),
+        promise_of(&runtime, &c, &config).unwrap(),
+    );
+    assert_eq!(at_b.cut, at_c.cut, "both promised from the same cut");
+    assert!(
+        !runtime.peer_verification_requests(&b).contains(&c)
+            && !runtime.peer_verification_requests(&b).contains(&p),
+        "a verdict that turned no-path under the record needs no examination"
+    );
+    if healed_first {
+        runtime.set_peer_verdict(&b, &c, PeerPathVerdict::Path, false);
+        runtime.set_peer_verdict(&c, &b, PeerPathVerdict::Path, false);
+    } else {
+        runtime.partition_node(
+            &b,
+            Partition {
+                kv: false,
+                dfs: true,
+            },
+        );
+    }
+    // C's swap alone reaches cluster KV: C wins.
+    *c_swap.lock().unwrap() = Some(at_c.swap_request_id.clone());
+    wait_until("C's swap applies", &runtime, &[&b, &c], || {
+        !shard_events(&runtime, &c, &config, DfsMetadataTakeoverEvent::SWAPPED).is_empty()
+    });
+    let record = record_from(&runtime, &config, &c);
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (c.clone(), config.epoch + 1)
+    );
+    assert_eq!(
+        record.write_set_state().switched().unwrap().write_set,
+        sorted(vec![b.clone(), c.clone()]),
+        "the stopped primary left the write set; B stays in it"
+    );
+    assert!(
+        shard_events(
+            &runtime,
+            &b,
+            &config,
+            DfsMetadataTakeoverEvent::SWAP_SUPERSEDED
+        )
+        .is_empty(),
+        "B's swap is still held"
+    );
+    Superseded {
+        runtime,
+        config,
+        b,
+        c,
+        b_open,
+        c_open,
+        _gates: gates,
+    }
+}
+
+/// TK13 (c): two survivors that cannot reach each other and both reach
+/// cluster KV. Each network owner confirms the standing verdict under
+/// the new epoch. The elected one removes the other, the other takes
+/// the elected one over, and cluster KV orders the two guarded transactions:
+/// whichever applies first leaves its node primary and sole write-set
+/// member, and the other's is refused. Once they reach each other the
+/// primary adds the other back.
+#[test]
+fn native_partitioned_survivors_settle_on_the_first_guarded_transaction() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-partitioned", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/race");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[&b, &c]);
+    let held = [
+        hold_swaps(&runtime, &config, &b),
+        hold_swaps(&runtime, &config, &c),
+    ];
+    runtime.stop_node(&p).unwrap();
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::NoPath, false);
+    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::NoPath, false);
+    lose(&runtime, &[&b, &c], &p);
+    wait_until("both promise", &runtime, &[&b, &c], || {
+        promise_of(&runtime, &b, &config).is_some() && promise_of(&runtime, &c, &config).is_some()
+    });
+    runtime.partition_node(
+        &b,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    for member in [&b, &c] {
+        runtime.set_probe_owner(member, true);
+    }
+    drop(held);
+    // The two roles can race only after the new epoch is visible locally.
+    // Answer each actual request for examination under that epoch.
+    let mut answered = std::collections::BTreeSet::new();
+    let alone = || {
+        try_record_from(&runtime, &config, &b).filter(|record| {
+            record
+                .write_set_state()
+                .switched()
+                .is_some_and(|write_set| {
+                    write_set.write_set == vec![record.shard.primary_node_id.clone()]
+                })
+        })
+    };
+    wait_until(
+        "one survivor is primary and alone in the write set",
+        &runtime,
+        &[&b, &c],
+        || {
+            for (observer, peer) in [(&b, &c), (&c, &b)] {
+                if !answered.contains(observer)
+                    && runtime.peer_verification_requests(observer).contains(peer)
+                {
+                    runtime.settle_peer_verification(observer, peer, PeerPathVerdict::NoPath);
+                    answered.insert(observer.clone());
+                }
+            }
+            alone().is_some()
+        },
+    );
+    wait_until("no promise is left", &runtime, &[&b, &c], || {
+        promise_of(&runtime, &b, &config).is_none() && promise_of(&runtime, &c, &config).is_none()
+    });
+    let record = alone().expect("the record stays settled while they are partitioned");
+    let primary_node = record.shard.primary_node_id.clone();
+    let other = the_other(&primary_node, &b, &c);
+    assert!(primary_node == b || primary_node == c);
+    let swaps = [&b, &c]
+        .into_iter()
+        .map(|node| shard_events(&runtime, node, &config, DfsMetadataTakeoverEvent::SWAPPED).len())
+        .sum::<usize>();
+    assert_eq!(
+        record.shard.epoch,
+        config.epoch + swaps as u64,
+        "one epoch per applied swap"
+    );
+    assert!(
+        (1..=2).contains(&swaps),
+        "the first election, and at most the superseded candidate's own:\n{}",
+        event_log(&runtime, &[&b, &c])
+    );
+
+    runtime.partition_node(&b, Partition::default());
+    runtime.set_peer_verdict(&b, &c, PeerPathVerdict::Path, false);
+    runtime.set_peer_verdict(&c, &b, PeerPathVerdict::Path, false);
+    // The primary's writes bring the other back; a join that fails waits for
+    // the next change, so the write is repeated until it is added.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    for round in 0.. {
+        let record = record_from(&runtime, &config, &primary_node);
+        commit_mode_eventually(
+            &runtime,
+            &record.shard,
+            &primary_node,
+            "/services/race",
+            0o600,
+            &format!("partitioned-after-{round}"),
+        );
+        let settle = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < settle
+            && !record_from(&runtime, &config, &primary_node)
+                .write_set_state()
+                .switched()
+                .unwrap()
+                .contains(&other)
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if record_from(&runtime, &config, &primary_node)
+            .write_set_state()
+            .switched()
+            .unwrap()
+            .contains(&other)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the primary adds the other back:\n{}\nkeeping {:?}",
+            event_log(&runtime, &[&b, &c]),
+            runtime.write_set_keeping_events(&primary_node)
+        );
+    }
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (primary_node, config.epoch + swaps as u64),
+        "healing changes no primary"
+    );
+    runtime.close().unwrap();
+}
+
+/// The partition of TK13 (c) with the superseded candidate's transaction
+/// first: B's verdict for C answers as it stands, the write set has two
+/// members so B asks nobody, and B's swap applies. C leaves the write set.
+#[test]
+fn native_partitioned_superseded_candidate_takes_over_when_its_swap_applies_first() {
+    let race = one_candidate_superseded_by_the_other("native-loss-recampaign", true, false);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    race.release_b();
+    race.asks_again(b, c, 0);
+    runtime.settle_peer_verification(b, c, PeerPathVerdict::NoPath);
+    wait_until("B takes over C", runtime, &[b, c], || {
+        !shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty()
+    });
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (b.clone(), config.epoch + 2),
+        "a second epoch advance: B deposed C"
+    );
+    assert_eq!(race.write_set(), vec![b.clone()], "C left the write set");
+    let started = attempts_started_at(runtime, b, config, config.epoch + 1);
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0].previous_primary_node_id, *c);
+    assert_eq!(started[0].cause, "primary-no-path");
+    assert!(
+        shard_events(
+            runtime,
+            b,
+            config,
+            DfsMetadataTakeoverEvent::CORROBORATION_STARTED
+        )
+        .is_empty(),
+        "B asked nobody in either attempt, and no event says it did"
+    );
+    assert_eq!(
+        shard_events(
+            runtime,
+            b,
+            config,
+            DfsMetadataTakeoverEvent::UNCORROBORATED_STARTED
+        )
+        .len(),
+        2
+    );
+    race.heal();
+    race.close();
+}
+
+/// The partition of TK13 (c) with the elected primary's transaction first:
+/// C removes B on its own verdict before B's swap settles. B is then no
+/// write-set member and starts nothing.
+#[test]
+fn native_partitioned_elected_primary_removes_the_other_when_its_shrink_applies_first() {
+    let race = one_candidate_superseded_by_the_other("native-loss-recampaign-shrink", true, false);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    race.c_open.store(true, Ordering::SeqCst);
+    race.asks_again(c, b, 0);
+    runtime.settle_peer_verification(c, b, PeerPathVerdict::NoPath);
+    wait_until("C removes B", runtime, &[b, c], || {
+        race.write_set() == vec![c.clone()]
+    });
+    race.release_b();
+    wait_until("no promise is left", runtime, &[b, c], || {
+        promise_of(runtime, b, config).is_none() && promise_of(runtime, c, config).is_none()
+    });
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (c.clone(), config.epoch + 1)
+    );
+    assert_eq!(race.write_set(), vec![c.clone()]);
+    assert!(shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    assert!(attempts_started_at(runtime, b, config, config.epoch + 1).is_empty());
+    race.heal();
+    race.close();
+}
+
+/// A superseded candidate that reaches the winner again before its swap
+/// settles follows it and starts nothing.
+#[test]
+fn native_superseded_candidate_that_reaches_the_winner_follows_it() {
+    let race = one_candidate_superseded_by_the_other("native-loss-follows", false, false);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    race.heal();
+    race.release_b();
+    wait_until("no promise is left", runtime, &[b, c], || {
+        promise_of(runtime, b, config).is_none() && promise_of(runtime, c, config).is_none()
+    });
+    race.c_open.store(true, Ordering::SeqCst);
+    // C commits with B: B acknowledges at C's epoch, so B never left it.
+    race.commits_on_both("follows-after");
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (c.clone(), config.epoch + 1),
+        "exactly one epoch advance"
+    );
+    assert!(shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    assert!(attempts_started_at(runtime, b, config, config.epoch + 1).is_empty());
+    race.close();
+}
+
+/// TK13 (d): B's no-path verdict for C already stood when C was elected, so
+/// only the record changed. On a node whose network can examine C, B asks it
+/// to and starts nothing while that episode is open: not when another peer's
+/// verdict changes, not when the configuration is published again, not
+/// however long the episode takes. C, elected with the same standing verdict
+/// for B, removes nobody either. The episodes settle with a path, and B
+/// follows C.
+#[test]
+fn native_superseded_candidate_waits_for_the_network_to_examine_the_winner() {
+    let race = one_candidate_superseded_by_the_other("native-loss-examine-path", true, false);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    let p = config.primary_node_id.clone();
+    // C may write the record: it removes B only on evidence.
+    race.c_open.store(true, Ordering::SeqCst);
+    race.release_b();
+    let nothing_started = |when: &str| {
+        assert!(
+            attempts_started_at(runtime, b, config, config.epoch + 1).is_empty()
+                && promise_of(runtime, b, config).is_none(),
+            "B starts nothing {when}:\n{}",
+            event_log(runtime, &[b, c])
+        );
+        assert_eq!(
+            race.write_set(),
+            sorted(vec![b.clone(), c.clone()]),
+            "C removes nobody {when}:\n{:?}",
+            runtime.write_set_keeping_events(c)
+        );
+    };
+    wait_until("B's promise ends", runtime, &[b, c], || {
+        promise_of(runtime, b, config).is_none()
+    });
+    let asked_by_b = race.asks_again(b, c, 0);
+    let asked_by_c = race.asks_again(c, b, 0);
+    nothing_started("while the network has examined nothing");
+    // Another peer's verdict changes: the snapshot's generation moves.
+    runtime.set_peer_verdict(b, &p, PeerPathVerdict::Unknown, false);
+    runtime.set_peer_verdict(c, &p, PeerPathVerdict::Unknown, false);
+    let asked_by_b = race.asks_again(b, c, asked_by_b);
+    let asked_by_c = race.asks_again(c, b, asked_by_c);
+    nothing_started("when another peer's verdict changes");
+    // The configuration is published again.
+    runtime
+        .apply_placement_policy(
+            c,
+            "/unrelated",
+            crate::DfsPlacementScope::Subtree,
+            crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 3)
+                .unwrap(),
+        )
+        .unwrap();
+    let asked_by_b = race.asks_again(b, c, asked_by_b);
+    race.asks_again(c, b, asked_by_c);
+    nothing_started("when an unrelated configuration revision is published");
+    // An episode that is still running settles nothing.
+    runtime.set_peer_verdict(b, c, PeerPathVerdict::NoPath, true);
+    runtime.set_peer_verdict(b, &p, PeerPathVerdict::NoPath, false);
+    race.asks_again(b, c, asked_by_b);
+    nothing_started("while the episode runs");
+
+    // Both episodes settle: the two reach each other.
+    runtime.partition_node(b, Partition::default());
+    runtime.settle_peer_verification(b, c, PeerPathVerdict::Path);
+    runtime.settle_peer_verification(c, b, PeerPathVerdict::Path);
+    race.commits_on_both("examined-path-after");
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (c.clone(), config.epoch + 1),
+        "exactly one epoch advance"
+    );
+    assert!(shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    assert!(attempts_started_at(runtime, b, config, config.epoch + 1).is_empty());
+    race.close();
+}
+
+/// TK13 (e): the same wait, and the network confirms the loss: its episode
+/// for C settles with no path. B then takes C over, asking nobody.
+#[test]
+fn native_superseded_candidate_takes_over_a_winner_the_network_confirms_lost() {
+    let race = one_candidate_superseded_by_the_other("native-loss-examine-lost", true, false);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    race.release_b();
+    wait_until("B's promise ends", runtime, &[b, c], || {
+        promise_of(runtime, b, config).is_none()
+    });
+    race.asks_again(b, c, 0);
+    assert!(
+        attempts_started_at(runtime, b, config, config.epoch + 1).is_empty(),
+        "B starts nothing before the network examined C:\n{}",
+        event_log(runtime, &[b, c])
+    );
+    runtime.settle_peer_verification(b, c, PeerPathVerdict::NoPath);
+    wait_until("B takes over C", runtime, &[b, c], || {
+        !shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty()
+    });
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (b.clone(), config.epoch + 2)
+    );
+    assert_eq!(race.write_set(), vec![b.clone()]);
+    race.heal();
+    race.close();
+}
+
+/// A successor B reached when it first read its epoch, and lost afterwards:
+/// the verdict turned no-path under the record, so B takes over at once and
+/// asks the network nothing.
+#[test]
+fn native_successor_lost_after_it_was_reached_is_taken_over_without_an_examination() {
+    let race = one_candidate_superseded_by_the_other("native-loss-later", true, true);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    race.release_b();
+    wait_until("no promise is left", runtime, &[b, c], || {
+        promise_of(runtime, b, config).is_none() && promise_of(runtime, c, config).is_none()
+    });
+    assert!(attempts_started_at(runtime, b, config, config.epoch + 1).is_empty());
+    let previous_requests = runtime
+        .peer_verification_requests(b)
+        .into_iter()
+        .filter(|peer| peer == c)
+        .count();
+    runtime.partition_node(
+        b,
+        Partition {
+            kv: false,
+            dfs: true,
+        },
+    );
+    runtime.set_peer_verdict(b, c, PeerPathVerdict::NoPath, false);
+    wait_until("B takes over C", runtime, &[b, c], || {
+        !shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty()
+    });
+    assert_eq!(
+        runtime
+            .peer_verification_requests(b)
+            .into_iter()
+            .filter(|peer| peer == c)
+            .count(),
+        previous_requests,
+        "the loss after the election requires no second examination"
+    );
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (b.clone(), config.epoch + 2)
+    );
+    race.heal();
+    race.close();
+}
+
+/// The elected primary's side of TK13 (d) and (e): C's no-path verdict for B
+/// already stood when C became primary. C asks its network to examine B and
+/// removes nobody until that episode settles with no path.
+#[test]
+fn native_elected_primary_has_a_standing_no_path_member_examined_before_removing_it() {
+    let race = one_candidate_superseded_by_the_other("native-loss-examine-shrink", true, false);
+    let (runtime, config, b, c) = (&race.runtime, &race.config, &race.b, &race.c);
+    let p = config.primary_node_id.clone();
+    race.c_open.store(true, Ordering::SeqCst);
+    let asked = race.asks_again(c, b, 0);
+    runtime.set_peer_verdict(c, &p, PeerPathVerdict::Unknown, false);
+    race.asks_again(c, b, asked);
+    assert_eq!(
+        race.write_set(),
+        sorted(vec![b.clone(), c.clone()]),
+        "C removes nobody before the network examined B: {:?}",
+        runtime.write_set_keeping_events(c)
+    );
+    runtime.settle_peer_verification(c, b, PeerPathVerdict::NoPath);
+    wait_until("C removes B", runtime, &[b, c], || {
+        race.write_set() == vec![c.clone()]
+    });
+    race.release_b();
+    wait_until("no promise is left", runtime, &[b, c], || {
+        promise_of(runtime, b, config).is_none() && promise_of(runtime, c, config).is_none()
+    });
+    assert!(shard_events(runtime, b, config, DfsMetadataTakeoverEvent::SWAPPED).is_empty());
+    let record = race.record();
+    assert_eq!(
+        (record.shard.primary_node_id.clone(), record.shard.epoch),
+        (c.clone(), config.epoch + 1)
+    );
+    race.heal();
+    race.close();
+}
+
+/// A keeper that starts with the primary's no-path verdict already standing,
+/// as after a restart, first reads the record with it: the network examines
+/// the primary once, and the takeover follows the episode's own result.
+#[test]
+fn native_keeper_that_starts_with_the_primary_unreachable_has_it_examined_first() {
+    let (mut runtime, config) = switched_with_kv_voters("native-loss-examine-start", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    {
+        let mut service = primary(&runtime);
+        directory(&mut service, "/services/start");
+    }
+    for member in [&b, &c] {
+        catch_up(&runtime, &config, member);
+    }
+    keep_with_paths(&runtime, &config, &[]);
+    for node in [&b, &c] {
+        runtime.set_probe_owner(node, true);
+    }
+    runtime.stop_node(&p).unwrap();
+    lose(&runtime, &[&b, &c], &p);
+    for keeper in [&b, &c] {
+        runtime.enable_write_set_keeping(keeper);
+    }
+    wait_until(
+        "both ask the network to verify P",
+        &runtime,
+        &[&b, &c],
+        || {
+            [&b, &c]
+                .into_iter()
+                .all(|node| runtime.peer_verification_requests(node).contains(&p))
+        },
+    );
+    for node in [&b, &c] {
+        assert!(
+            attempts_started_at(&runtime, node, &config, config.epoch).is_empty()
+                && promise_of(&runtime, node, &config).is_none(),
+            "{node} starts nothing before the network examined P:\n{}",
+            event_log(&runtime, &[&b, &c])
+        );
+    }
+    for node in [&b, &c] {
+        runtime.settle_peer_verification(node, &p, PeerPathVerdict::NoPath);
+    }
+    wait_until("a survivor takes over", &runtime, &[&b, &c], || {
+        try_record_from(&runtime, &config, &b)
+            .is_some_and(|record| record.shard.primary_node_id != p)
+    });
+    let record = record_from(&runtime, &config, &b);
+    assert_eq!(record.shard.epoch, config.epoch + 1);
     runtime.close().unwrap();
 }
 

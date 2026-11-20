@@ -91,12 +91,6 @@ The implementation differs from these requirements:
   nothing cancels it.
 - On a shard that has not switched, an epoch change also advances the store
   generation, which makes the metadata service reopen.
-- A caller whose primary is unreachable gets an unknown outcome or a not-sent
-  error at the first network error. It does not yet wait for the shard record
-  to name a new primary. The unknown outcome names the new primary when the
-  attempt learned it, but callers do not act on that yet.
-- Only a routed namespace request that cannot be delivered to the primary asks
-  the network to verify it; a routed write does not.
 - Namespace-job resume selects jobs on every locally replicated shard rather than
   only on shards this node is primary for. Cross-shard source-adoption sessions
   exist only in memory.
@@ -198,7 +192,14 @@ when the network layer's own probing reports the primary unreachable.
 
 ### Takeover
 
-A candidate is a write-set member that can commit to cluster KV.
+A candidate is a write-set member that can commit to cluster KV. If its verdict
+already said the primary had no path when it first observed that primary at the
+current epoch, it asks the network to examine the peer. The campaign can start
+once a later examination of that peer settles with no path. A path lost while
+the primary already holds that epoch qualifies directly. The primary uses the
+same rule to remove a write-set member. If two surviving members lose their
+path to each other but both can commit to cluster KV, the first guarded change
+to the shard record wins.
 
 1. **Corroborate.** The candidate asks the other reachable write-set members, in
    one round, whether they still have a path to the primary and how far their

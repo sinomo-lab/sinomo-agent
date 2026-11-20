@@ -103,6 +103,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.content_hash = base.content_hash.clone();
         object.content_size_bytes = Some(base_size);
         object.version = base.version.clone();
+        self.writes.follow_next_dispatch = true;
         let outcome = self.publish_packed_range_write(
             request,
             object,

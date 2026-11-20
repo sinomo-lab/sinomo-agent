@@ -50,6 +50,11 @@ pub(crate) struct DfsTakeoverView<'a> {
     pub(crate) state: &'a DfsMetadataShardWriteSetState,
     /// Every member the publication knows, with this node's verdicts.
     pub(crate) members: &'a BTreeMap<NodeId, DfsWriteSetMemberFacts>,
+    /// The primary's no-path verdict is evidence gathered under this record:
+    /// it became no-path while this node already read the primary at this
+    /// epoch, or the network examined the primary since. A verdict that only
+    /// stood while the record changed starts nothing.
+    pub(crate) primary_examined: bool,
     /// The local store is open normally, not for repair only: a repair-only
     /// store may lack acknowledged changes.
     pub(crate) store_ready: bool,
@@ -102,9 +107,11 @@ pub(crate) fn plan_metadata_takeover(view: &DfsTakeoverView<'_>) -> DfsTakeoverP
     let no_path = |node: &NodeId| {
         facts(node).is_some_and(|facts| facts.reach == DfsWriteSetMemberReach::NoPath)
     };
+    // Departure is a membership fact cluster KV ordered; it needs no
+    // examination.
     let cause = if departed(primary) {
         DfsTakeoverCause::PrimaryDeparted
-    } else if no_path(primary) {
+    } else if no_path(primary) && view.primary_examined {
         DfsTakeoverCause::PrimaryNoPath
     } else {
         return DfsTakeoverPlan::Idle;
@@ -299,6 +306,7 @@ mod tests {
         store_ready: bool,
         busy: bool,
         standing: Option<DfsTakeoverStanding>,
+        primary_examined: bool,
     }
 
     impl Case {
@@ -347,6 +355,7 @@ mod tests {
                 store_ready: true,
                 busy: false,
                 standing: None,
+                primary_examined: true,
             }
         }
 
@@ -361,6 +370,7 @@ mod tests {
                 shard: &self.shard,
                 state: &self.state,
                 members: &self.members,
+                primary_examined: self.primary_examined,
                 store_ready: self.store_ready,
                 busy: self.busy,
                 standing: self.standing,
@@ -435,6 +445,35 @@ mod tests {
                 asked: BTreeSet::new(),
             }
         );
+    }
+
+    #[test]
+    fn a_no_path_verdict_that_only_stood_while_the_record_changed_starts_nothing() {
+        let mut case = Case::new(&["a", "b", "c"]).reach("a", DfsWriteSetMemberReach::NoPath);
+        case.primary_examined = false;
+        assert_eq!(
+            case.plan_from("b"),
+            DfsTakeoverPlan::Idle,
+            "the network has not examined the primary under this record"
+        );
+        case.primary_examined = true;
+        assert!(matches!(
+            case.plan_from("b"),
+            DfsTakeoverPlan::Start {
+                cause: DfsTakeoverCause::PrimaryNoPath,
+                ..
+            }
+        ));
+        // A departed primary is taken over without an examination.
+        case.primary_examined = false;
+        case.members.get_mut(&node("a")).unwrap().departed = true;
+        assert!(matches!(
+            case.plan_from("b"),
+            DfsTakeoverPlan::Start {
+                cause: DfsTakeoverCause::PrimaryDeparted,
+                ..
+            }
+        ));
     }
 
     #[test]

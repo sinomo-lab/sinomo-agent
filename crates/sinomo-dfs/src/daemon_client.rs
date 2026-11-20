@@ -216,7 +216,15 @@ impl DaemonDfsMountedMutationHandoffClient {
         let call = daemon_dfs_mounted_mutation_handoff_call(&request)?;
         let data_dir = self.data_dir.clone();
         let address = self.address.clone();
-        let timeout = self.timeout;
+        let timeout = crate::MountedSifsCall::deadline().map_or(self.timeout, |deadline| {
+            self.timeout
+                .min(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
+        if timeout.is_zero() {
+            return Err(DaemonApiError::Parse {
+                detail: "mounted filesystem operation deadline expired".into(),
+            });
+        }
         block_on_daemon_client(Box::pin(async move {
             let runtime = tokio::runtime::Handle::current();
             let deadline = daemon_api_overall_deadline(Some(timeout));

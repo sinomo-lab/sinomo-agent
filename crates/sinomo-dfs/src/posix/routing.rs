@@ -12,24 +12,14 @@ use crate::posix_path::{
     normalize_posix_path, normalized_posix_path_key, parent_posix_path,
     posix_path_is_at_or_under_prefix,
 };
+use crate::service_record_follow::DfsFollowedNamespaceRoute;
 use crate::{
     DFS_NO_CALLER_BUDGET, DfsControlPlaneStore, DfsError, DfsMessageTransport,
     DfsMetadataShardConfig, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceOperation,
     DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
-    DfsReadRangeData, NetworkedDfsService, PendingRoutedNamespaceResult, sifs_file_system_id,
+    DfsReadRangeData, NetworkedDfsService, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
-
-/// Routed-operation attempts when authority rejections redirect to the
-/// current shard primary (a stale local shard view names a former primary).
-const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RoutedNamespaceNetworkRecovery {
-    Completed,
-    Retry,
-    Unchanged,
-}
 
 /// Possible owners of an immediate directory child under one exact catalog.
 /// A prefix boundary can own that child; deeper disjoint prefixes cannot.
@@ -202,6 +192,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => None,
         })
+    }
+
+    /// The shard this requester's projection routes `path` to.
+    pub(crate) fn projected_namespace_shard_for_path(
+        &mut self,
+        path: &str,
+    ) -> std::result::Result<Option<DfsMetadataShardConfig>, DfsError> {
+        self.select_sifs_metadata_shard_for_path_fresh(path)
+            .map_err(crate::service_routed_namespace::dfs_error_from_posix_namespace_sync)
     }
 
     fn select_sifs_metadata_shard_for_path_fresh(
@@ -517,9 +516,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         let object = self.record_selected_synced_path(&resolved, local_object);
                         return Ok((resolved, object, None));
                     }
-                    if !namespace_lookup_error_allows_local_replica_fallback(&error) {
-                        return Err(error.into());
-                    }
+                    return Err(error.into());
                 }
             }
         }
@@ -771,9 +768,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if self.replica_redirect_keeps_local_object(&path, &error, &local_object)? {
                         return Ok(self.record_selected_synced_path(&path, local_object));
                     }
-                    if !namespace_lookup_error_allows_local_replica_fallback(&error) {
-                        return Err(error.into());
-                    }
+                    return Err(error.into());
                 }
             }
         }
@@ -836,108 +831,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Option<DfsPosixCoordinationResult>> {
         let file_system_id = sifs_file_system_id();
         let replay = !matches!(operation, DfsNamespaceOperation::WriteFile { .. });
-        let mut primary = primary_node_id;
-        for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            let routed = match self
-                .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
-                    operation_id.clone(),
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    DFS_NO_CALLER_BUDGET,
-                    replay,
-                    replay,
-                ) {
-                Ok(result) => result,
-                // A stable request id makes a retry after a possibly applied
-                // dispatch safe: the primary answers it from durable admission.
-                Err(
-                    error @ (DfsError::Network { .. }
-                    | DfsError::NetworkDelivery {
-                        delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-                        ..
-                    }),
-                ) => {
-                    let recovery = self.refresh_routed_namespace_primary_after_network_error(
-                        Some(&operation_id),
-                        &operation,
-                        &mut primary,
-                    )?;
-                    match recovery {
-                        RoutedNamespaceNetworkRecovery::Completed => {
-                            validate_cross_shard_adoption_receipt(&operation, None)?;
-                            validate_cross_shard_adoption_source_pin_set(
-                                &operation,
-                                self.metadata_backend.as_deref(),
-                            )?;
-                            return Ok(None);
-                        }
-                        RoutedNamespaceNetworkRecovery::Retry => continue,
-                        RoutedNamespaceNetworkRecovery::Unchanged => {
-                            return Err(DfsPosixError::Dfs(error));
-                        }
-                    }
-                }
-                Err(error @ DfsError::NetworkDelivery { .. }) => {
-                    self.post_routed_namespace_delivery_hint(&operation);
-                    return Err(DfsPosixError::Dfs(error));
-                }
-                Err(error) => return Err(DfsPosixError::Dfs(error)),
-            };
-            match routed.result.clone() {
-                DfsNamespaceResult::Applied => {
-                    validate_cross_shard_adoption_receipt(
-                        &operation,
-                        routed.posix_coordination_result.as_ref(),
-                    )?;
-                    validate_cross_shard_adoption_source_pin_set(
-                        &operation,
-                        self.metadata_backend.as_deref(),
-                    )?;
-                    return Ok(routed.posix_coordination_result);
-                }
-                DfsNamespaceResult::Rejected {
-                    reason,
-                    posix_error,
-                    current_primary_node_id,
-                } => match current_primary_node_id {
-                    Some(current)
-                        if current == self.node_id
-                            && !self.transport.delegates_local_namespace_authority() =>
-                    {
-                        // Authority moved to this node; execute locally.
-                        return self.execute_routed_namespace_operation_locally(
-                            Some(&operation_id),
-                            &operation,
-                        );
-                    }
-                    Some(current) if current != primary => {
-                        primary = self
-                            .refreshed_primary_after_authority_redirect(
-                                &file_system_id,
-                                &operation,
-                                &primary,
-                                current,
-                            )
-                            .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id
-                            && !self.transport.delegates_local_namespace_authority()
-                        {
-                            return self.execute_routed_namespace_operation_locally(
-                                Some(&operation_id),
-                                &operation,
-                            );
-                        }
-                    }
-                    _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
-                },
+        // A stable request id makes every re-send exact: the primary answers
+        // it from durable admission, at whichever node the record names.
+        let followed = self
+            .route_namespace_following_record(
+                Some(&operation_id),
+                &file_system_id,
+                primary_node_id,
+                &operation,
+                DFS_NO_CALLER_BUDGET,
+                replay,
+                replay,
+            )
+            .map_err(DfsPosixError::Dfs)?;
+        let routed = match followed {
+            DfsFollowedNamespaceRoute::Settled(routed) => routed,
+            DfsFollowedNamespaceRoute::LocalAuthority => {
+                // Authority moved to this node; execute locally.
+                return self
+                    .execute_routed_namespace_operation_locally(Some(&operation_id), &operation);
             }
+        };
+        match routed.result {
+            DfsNamespaceResult::Applied => {
+                validate_cross_shard_adoption_receipt(
+                    &operation,
+                    routed.posix_coordination_result.as_ref(),
+                )?;
+                validate_cross_shard_adoption_source_pin_set(
+                    &operation,
+                    self.metadata_backend.as_deref(),
+                )?;
+                Ok(routed.posix_coordination_result)
+            }
+            DfsNamespaceResult::Rejected {
+                reason,
+                posix_error,
+                ..
+            } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
         }
-        Err(DfsPosixError::Dfs(DfsError::Distributed {
-            message: format!(
-                "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        }))
     }
 
     /// Keep caller-owned stable admission when routing discovers local
@@ -999,114 +931,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
         let file_system_id = sifs_file_system_id();
-        let mut primary = primary_node_id;
-        for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            let routed = match self
-                .route_namespace_operation_to_metadata_primary_without_local_replay(
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                ) {
-                Ok(result) => result,
-                // Each attempt here has a new request id, so only an error
-                // before dispatch is retried. A possibly applied dispatch is
-                // returned unchanged, never repeated under a new id.
-                Err(error @ DfsError::Network { .. }) => {
-                    match self.refresh_routed_namespace_primary_after_network_error(
-                        None,
-                        &operation,
-                        &mut primary,
-                    )? {
-                        RoutedNamespaceNetworkRecovery::Completed => return Ok(()),
-                        RoutedNamespaceNetworkRecovery::Retry => continue,
-                        RoutedNamespaceNetworkRecovery::Unchanged => {
-                            return Err(DfsPosixError::Dfs(error));
-                        }
-                    }
-                }
-                Err(error @ DfsError::NetworkDelivery { .. }) => {
-                    self.post_routed_namespace_delivery_hint(&operation);
-                    return Err(DfsPosixError::Dfs(error));
-                }
-                Err(error) => return Err(DfsPosixError::Dfs(error)),
-            };
-            match routed {
-                DfsNamespaceResult::Applied => return Ok(()),
+        // Each attempt here has a new request id, so only an attempt that was
+        // not delivered, or was refused for its authority, is sent again. A
+        // possibly applied dispatch is returned unchanged.
+        let followed = self
+            .route_namespace_following_record(
+                None,
+                &file_system_id,
+                primary_node_id,
+                &operation,
+                DFS_NO_CALLER_BUDGET,
+                false,
+                false,
+            )
+            .map_err(DfsPosixError::Dfs)?;
+        match followed {
+            DfsFollowedNamespaceRoute::LocalAuthority => self
+                .execute_routed_namespace_operation_locally(None, &operation)
+                .map(drop),
+            DfsFollowedNamespaceRoute::Settled(routed) => match routed.result {
+                DfsNamespaceResult::Applied => Ok(()),
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
-                    current_primary_node_id,
-                } => match current_primary_node_id {
-                    Some(current)
-                        if current == self.node_id
-                            && !self.transport.delegates_local_namespace_authority() =>
-                    {
-                        return self
-                            .execute_routed_namespace_operation_locally(None, &operation)
-                            .map(drop);
-                    }
-                    Some(current) if current != primary => {
-                        primary = self
-                            .refreshed_primary_after_authority_redirect(
-                                &file_system_id,
-                                &operation,
-                                &primary,
-                                current,
-                            )
-                            .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id
-                            && !self.transport.delegates_local_namespace_authority()
-                        {
-                            return self
-                                .execute_routed_namespace_operation_locally(None, &operation)
-                                .map(drop);
-                        }
-                    }
-                    _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
-                },
-            }
-        }
-        Err(DfsPosixError::Dfs(DfsError::Distributed {
-            message: format!(
-                "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        }))
-    }
-
-    fn refresh_routed_namespace_primary_after_network_error(
-        &mut self,
-        operation_id: Option<&str>,
-        operation: &DfsNamespaceOperation,
-        primary: &mut NodeId,
-    ) -> Result<RoutedNamespaceNetworkRecovery> {
-        let Some(path) = operation.routing_path() else {
-            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
-        };
-        let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
-            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
-        };
-        if shard.primary_node_id == self.node_id
-            && !self.transport.delegates_local_namespace_authority()
-        {
-            self.execute_routed_namespace_operation_locally(operation_id, operation)?;
-            return Ok(RoutedNamespaceNetworkRecovery::Completed);
-        }
-        if shard.primary_node_id != *primary {
-            *primary = shard.primary_node_id;
-            return Ok(RoutedNamespaceNetworkRecovery::Retry);
-        }
-        post_namespace_primary_unreachable(&self.node_id, &shard);
-        Ok(RoutedNamespaceNetworkRecovery::Unchanged)
-    }
-
-    /// A request that could not be delivered to the shard primary is a hint
-    /// for this node's candidate role, which asks the network to verify the
-    /// primary when this node may take the shard over.
-    fn post_routed_namespace_delivery_hint(&mut self, operation: &DfsNamespaceOperation) {
-        if let Some(path) = operation.routing_path()
-            && let Ok(Some(shard)) = self.select_sifs_metadata_shard_for_path_fresh(path)
-        {
-            post_namespace_primary_unreachable(&self.node_id, &shard);
+                    ..
+                } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+            },
         }
     }
 
@@ -1480,6 +1330,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.posix_lstat_distributed(path)
         }
+        .map_err(super::metadata::committed_write_observation_error)
     }
 
     /// Tombstone stat for routed unlink/rmdir results, read from the authority
@@ -1527,21 +1378,15 @@ fn default_sifs_split_shard_for_path(path: &str) -> Option<(&'static str, &'stat
     }
 }
 
-fn namespace_lookup_error_allows_local_replica_fallback(error: &DfsError) -> bool {
-    matches!(
-        error,
-        DfsError::Distributed { message }
-            if message.starts_with("routed namespace lookup exceeded ")
-                && message.ends_with(" authority redirects")
-    )
-}
-
+/// A lookup its target refused for its authority while this requester's own
+/// projection names no other primary to ask.
 fn namespace_lookup_error_is_uncorroborated_redirect(error: &DfsError) -> bool {
-    matches!(
-        error,
-        DfsError::Distributed { message }
-            if message.starts_with("routed namespace authority redirect is uncorroborated:")
-    )
+    crate::service_routed_namespace::is_namespace_lookup_redirect_without_newer_record(error)
+        || matches!(
+            error,
+            DfsError::Distributed { message }
+                if message.starts_with("routed namespace authority redirect is uncorroborated:")
+        )
 }
 
 pub(super) fn validate_cross_shard_adoption_receipt(
@@ -1775,13 +1620,14 @@ where
         };
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
-        for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
+        loop {
             if primary == self.node_id && !self.transport.delegates_local_namespace_authority() {
                 self.execute_posix_coordination_operation_local(&operation)?;
                 return self
                     .current_read_object_metadata(object_id)
                     .map(|object| vec![object])
-                    .map_err(DfsPosixError::Dfs);
+                    .map_err(DfsPosixError::Dfs)
+                    .map_err(super::metadata::committed_write_observation_error);
             }
             // Placement consumes the owner's committed object result. It does
             // not serve a requester read and has no journal-replay obligation.
@@ -1792,21 +1638,14 @@ where
                 ).await {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    match self.refresh_routed_namespace_primary_after_network_error(None, &operation, &mut primary)? {
-                        RoutedNamespaceNetworkRecovery::Completed => {
-                            if primary == self.node_id { continue; }
-                            // Recovery proved completion, but the current
-                            // object result still comes from its owning primary.
-                            PendingRoutedNamespaceResult {
-                                result: DfsNamespaceResult::Applied,
-                                posix_coordination_result: None,
-                                synced_path_object: None,
-                                synced_path_objects: Vec::new(),
-                                metadata_journal_has_more: false,
-                            }
+                    // Placement runs under its coordinator's own retries: it
+                    // goes on only when the record already moved.
+                    match self.primary_after_record_change(&file_system_id, &operation, &primary, true) {
+                        Some(next) => {
+                            primary = next;
+                            continue;
                         }
-                        RoutedNamespaceNetworkRecovery::Retry => continue,
-                        RoutedNamespaceNetworkRecovery::Unchanged => return Err(DfsPosixError::Dfs(error)),
+                        None => return Err(DfsPosixError::Dfs(error)),
                     }
                 }
                 Err(error) => return Err(DfsPosixError::Dfs(error)),
@@ -1821,7 +1660,8 @@ where
                     request_id, file_system_id.clone(), primary.clone(),
                     DfsNamespaceOperation::LookupPaths { paths: vec![path.clone()] },
                     DFS_NO_CALLER_BUDGET, false, false,
-                ).await.map_err(DfsPosixError::Dfs)?;
+                ).await.map_err(DfsPosixError::Dfs)
+                    .map_err(super::metadata::committed_write_observation_error)?;
             }
             match routed.result {
                 DfsNamespaceResult::Applied => {
@@ -1848,35 +1688,27 @@ where
                     posix_error,
                     current_primary_node_id,
                 } => match current_primary_node_id {
-                    Some(current) if current == self.node_id => primary = current,
+                    // A redirect is followed only to the primary a strictly
+                    // newer record of this node's own projection names.
                     Some(current) if current != primary => {
-                        primary = self
-                            .refreshed_primary_after_authority_redirect(
-                                &file_system_id,
-                                &operation,
-                                &primary,
-                                current,
-                            )
-                            .map_err(DfsPosixError::Dfs)?;
+                        match self.primary_after_record_change(
+                            &file_system_id,
+                            &operation,
+                            &primary,
+                            false,
+                        ) {
+                            Some(next) => primary = next,
+                            None => {
+                                return Err(posix_error_for_namespace_rejection(
+                                    reason,
+                                    posix_error,
+                                ));
+                            }
+                        }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
                 },
             }
         }
-        Err(DfsPosixError::Dfs(DfsError::Distributed {
-            message: format!(
-                "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        }))
     }
-}
-
-/// Tell this node's candidate role it could not deliver to `shard`'s primary.
-fn post_namespace_primary_unreachable(local: &NodeId, shard: &DfsMetadataShardConfig) {
-    crate::write_set_keeping_signals::post_commit_demand(
-        local,
-        &shard.file_system_id,
-        &crate::DfsMetadataShardId::new(shard.shard_id.clone()),
-        crate::write_set_keeping_signals::DfsWriteSetCommitDemand::PrimaryUnreachable,
-    );
 }

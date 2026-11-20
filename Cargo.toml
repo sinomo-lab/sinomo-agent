@@ -228,6 +228,7 @@ arc-swap = "1.9.2"
 base64 = "0.22.1"
 blake3 = "1.8.5"
 bytes = { version = "1.12.1", features = ["serde"] }
+crossbeam-channel = "0.5.16"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 cpal = "0.18.1"

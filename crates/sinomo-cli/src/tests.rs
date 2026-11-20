@@ -8377,6 +8377,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             allow_other: true,
             foreground: true,
             sync_local_changes: false,
+            operation_budget: None,
         }))
     );
     assert!(matches!(

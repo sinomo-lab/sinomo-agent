@@ -1397,6 +1397,62 @@ fn routed_write_response_tracks_remote_intent_alias() {
 }
 
 #[test]
+fn late_authoritative_completion_settles_an_already_returned_unknown_write() {
+    let (runtime, mut client, request, base, bytes, nodes, operation, mut observation) =
+        native_pending_routed_write("native-late-commit-after-unknown");
+    let (primary, terminal) = complete_native_routed_write(
+        &runtime,
+        &mut client,
+        &request,
+        &base,
+        &bytes,
+        &nodes,
+        &operation,
+    );
+    let DfsDistributedWriteResult::Outcome {
+        outcome: NetworkedDfsWriteOutcome::Committed {
+            intent_id, version, ..
+        },
+    } = &terminal.result
+    else {
+        panic!("expected the real authoritative completion")
+    };
+    let alias = intent_id.clone();
+    let committed_version = version.clone();
+    let shard = &client.writes.pending_routed_writes[&operation].authority_shard;
+    // Deliver uncertainty first. Only the genuine response held above can
+    // settle the write; the caller does not re-register or re-send after it leaves.
+    observation.metadata_journal_batches.clear();
+    observation.result = DfsDistributedWriteResult::CommitOutcomeUnknown {
+        intent_id: alias.clone(),
+        file_system_id: request.file_system_id.clone(),
+        shard_id: shard.shard_id.clone(),
+        epoch: shard.epoch,
+        operation_id: operation.clone(),
+        cause: crate::DfsCommitOutcomeUnknownCause::Deadline,
+        current_primary_node_id: None,
+    };
+    client
+        .handle_distributed_write_response(primary.clone(), observation)
+        .unwrap();
+    assert!(
+        client
+            .take_write_outcome(&operation)
+            .unwrap_err()
+            .is_commit_outcome_unknown()
+    );
+    let compact = &client.writes.pending_routed_writes[&operation];
+    assert!(compact.command.is_none() && compact.compact_retained_at.is_some());
+    client
+        .handle_distributed_write_response(primary, terminal)
+        .unwrap();
+    assert!(matches!(client.take_write_outcome(&alias).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, .. } if version == committed_version));
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn routed_write_stale_pending_response_does_not_downgrade_completion() {
     let (runtime, mut client, request, base, bytes, nodes, operation, pending_response) =
         native_pending_routed_write("native-routed-late-pending");
@@ -3588,9 +3644,13 @@ fn sifs_cluster_posix_mkdir_all_delegating_caller_has_no_local_chain_fallback() 
         remaining_hits: 32,
         action: crate::test_runtime::FaultAction::BudgetExhausted,
     });
+    // The caller waits for its primary within its own budget, then gets the
+    // delivery failure it holds.
+    local.set_transport_operation_deadline(Some(Instant::now() + Duration::from_secs(2)));
     let error = local
         .posix_mkdir_all(path)
         .expect_err("a delegating caller has no local chain to fall back on");
+    local.set_transport_operation_deadline(None);
     assert!(
         matches!(
             &error,

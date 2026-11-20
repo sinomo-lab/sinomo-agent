@@ -2817,7 +2817,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 command: Some(command),
                 attachment_bytes,
                 patch_attachment: None,
-                authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+                follow: None,
                 remote_intent_id: None,
                 durable_receipts: 0,
                 required_receipts,
@@ -2842,11 +2842,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ))
     }
 
-    /// Dispatch failure cannot erase an earlier attempt with the same stable
-    /// identity. In particular, a definitely-unsent retry says nothing about
-    /// whether its predecessor committed. Keep the compact late-response owner
-    /// for ambiguous delivery, without retaining or automatically resending the
-    /// body; an explicit exact-ID retry reconciles the primary's durable record.
+    /// Settle one dispatch of a routed write.
+    ///
+    /// A dispatch that could not be delivered asks this node's candidate role
+    /// to have the network verify the primary. With `follow`, the requester
+    /// then waits for its shard's record to change and sends the same write,
+    /// under the same id and with the body it kept, to the primary the newer
+    /// record names; while the record has not changed, the re-send timer
+    /// sends it to the current primary again. The wait ends once a dispatch
+    /// is delivered, at the caller's operation deadline or on cancellation.
+    ///
+    /// A dispatch failure cannot erase an earlier attempt with the same
+    /// stable identity: a definitely-unsent retry says nothing about whether
+    /// its predecessor committed. When the call ends undelivered, the compact
+    /// late-response owner is kept for ambiguous delivery and the body is
+    /// released; an explicit exact-ID retry reconciles the primary's durable
+    /// record.
     pub(crate) fn finish_routed_write_dispatch(
         &mut self,
         request_id: &str,
@@ -2854,17 +2865,86 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: &DfsMetadataShardConfig,
         primary_node_id: &NodeId,
         sent: Result<bool, DfsError>,
+        follow: bool,
     ) -> Result<(), DfsError> {
-        let unroutable = matches!(sent, Ok(false));
-        let error = match sent {
-            Ok(true) => return Ok(()),
-            Ok(false) => Self::metadata_primary_unroutable_error(shard, primary_node_id),
-            Err(error) => error,
+        let mut previous = previous;
+        let mut shard = shard.clone();
+        let mut primary_node_id = primary_node_id.clone();
+        let mut sent = sent;
+        let mut resend = None;
+        // An earlier dispatch of this call that may have reached a primary.
+        let mut earlier_ambiguous = false;
+        let (unroutable, error) = loop {
+            let unroutable = matches!(sent, Ok(false));
+            let error = match sent {
+                Ok(true) => return Ok(()),
+                Ok(false) => Self::metadata_primary_unroutable_error(&shard, &primary_node_id),
+                Err(error) => error,
+            };
+            let undelivered = unroutable
+                || matches!(
+                    error,
+                    DfsError::Network { .. } | DfsError::NetworkDelivery { .. }
+                );
+            if !undelivered {
+                break (unroutable, error);
+            }
+            self.request_primary_verification(&shard);
+            let has_retry_body = self
+                .writes
+                .pending_routed_writes
+                .get(request_id)
+                .is_some_and(|pending| pending.command.is_some());
+            if !(follow && has_retry_body && self.follows_record_changes()) {
+                break (unroutable, error);
+            }
+            let evidence = crate::service_record_follow::DfsRecordChangeEvidence {
+                dispatched: shard.clone(),
+                floor_epoch: None,
+                undelivered: true,
+            };
+            let resend =
+                resend.get_or_insert_with(crate::service_record_follow::DfsRecordFollowResend::new);
+            let record = match self.await_newer_shard_record(&evidence, resend) {
+                Ok(crate::service_record_follow::DfsRecordFollowed::Newer(record)) => record,
+                Ok(crate::service_record_follow::DfsRecordFollowed::ResendDue(record)) => record,
+                Ok(crate::service_record_follow::DfsRecordFollowed::Ended) => {
+                    break (unroutable, error);
+                }
+                Err(cancelled) => {
+                    self.compact_pending_routed_write(request_id);
+                    return Err(cancelled);
+                }
+            };
+            let ambiguous = !(unroutable
+                || matches!(
+                    error,
+                    DfsError::NetworkDelivery {
+                        delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                        ..
+                    }
+                ));
+            sent = match self.resend_pending_routed_write(request_id, &record) {
+                Ok((sent, replaced)) => {
+                    if ambiguous {
+                        earlier_ambiguous = true;
+                        previous = replaced;
+                    }
+                    sent
+                }
+                Err(error) => {
+                    self.compact_pending_routed_write(request_id);
+                    return Err(error);
+                }
+            };
+            primary_node_id = record.primary_node_id.clone();
+            shard = record;
         };
-        let earlier_unresolved = previous
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.result.is_none());
+        let earlier_unresolved = earlier_ambiguous
+            || previous
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.result.is_none());
         let object_id = self.writes.pending_routed_writes[request_id]
             .object_id
             .clone();
@@ -2917,6 +2997,86 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsError::Network { .. } => Err(DfsError::Network { message }),
             error => Err(error),
         }
+    }
+
+    /// Send an unresolved routed write again, with the body the requester
+    /// kept and under its original id, to the primary `record` names. The
+    /// record owns the write's responses from before the send.
+    pub(crate) fn resend_pending_routed_write(
+        &mut self,
+        canonical_request_id: &str,
+        record: &DfsMetadataShardConfig,
+    ) -> Result<(Result<bool, DfsError>, PreviousRoutedWriteState), DfsError> {
+        let Some((mut command, attachment_bytes, patch_attachment)) = self
+            .writes
+            .pending_routed_writes
+            .get(canonical_request_id)
+            .and_then(|pending| {
+                Some((
+                    pending.command.clone()?,
+                    pending.attachment_bytes.clone(),
+                    pending.patch_attachment.clone(),
+                ))
+            })
+        else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed write {canonical_request_id} has no body left to send again"
+                ),
+            });
+        };
+        let primary = record.primary_node_id.clone();
+        command.authority_shard = Some(record.clone());
+        if primary == self.node_id {
+            // The requester has become the authority. Its loopback write
+            // updates the authoritative backend directly; asking it for
+            // replica catch-up would replay its own journal through a
+            // deliberately forbidden path.
+            command.metadata_journal_after_sequence = None;
+        }
+        let message = command.clone().into_network_message();
+        let (_, previous) = self.track_pending_routed_write(
+            canonical_request_id.to_string(),
+            command.request.object_id.clone(),
+            primary.clone(),
+            record.clone(),
+            command,
+            attachment_bytes.clone(),
+        )?;
+        if let Some(pending) = self
+            .writes
+            .pending_routed_writes
+            .get_mut(canonical_request_id)
+        {
+            pending.patch_attachment = patch_attachment.clone();
+        }
+        let unknown_node = |error| match error {
+            NetworkError::UnknownNode { .. } => Ok(false),
+            error => Err(DfsError::from_network(error)),
+        };
+        let sent = if let Some(bytes) = attachment_bytes {
+            let routed = self.next_dfs_routed_message(&primary, message);
+            self.transport
+                .send_routed_call(
+                    &primary,
+                    DfsRoutedCall::with_attachment(
+                        routed,
+                        DfsOutboundAttachment::from_shared_bytes_with_transport_integrity(bytes),
+                    ),
+                )
+                .map(|()| true)
+                .or_else(unknown_node)
+        } else if let Some(attachment) = patch_attachment {
+            let routed = self.next_dfs_routed_message(&primary, message);
+            let body = DfsOutboundAttachment::from_quarantined_patch(attachment.0)?;
+            self.transport
+                .send_routed_call(&primary, DfsRoutedCall::with_attachment(routed, body))
+                .map(|()| true)
+                .or_else(unknown_node)
+        } else {
+            self.send_dfs_message_if_routable(&primary, message)
+        };
+        Ok((sent, previous))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3054,7 +3214,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis(),
             matches!(sent, Ok(true))
         ));
-        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary_node_id, sent)?;
+        let follow = std::mem::take(&mut self.writes.follow_next_dispatch) && !detach_request;
+        self.finish_routed_write_dispatch(
+            &request_id,
+            previous,
+            &shard,
+            &primary_node_id,
+            sent,
+            follow,
+        )?;
         Ok(outcome)
     }
 
@@ -3284,7 +3452,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 NetworkError::UnknownNode { .. } => Ok(false),
                 error => Err(DfsError::from_network(error)),
             });
-        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary, sent)?;
+        let follow = std::mem::take(&mut self.writes.follow_next_dispatch);
+        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary, sent, follow)?;
         Ok(outcome)
     }
 
@@ -3395,7 +3564,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.send_dfs_message_if_routable(&primary_node_id, message)
         };
-        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary_node_id, sent)?;
+        let follow = std::mem::take(&mut self.writes.follow_next_dispatch) && !detach_request;
+        self.finish_routed_write_dispatch(
+            &request_id,
+            previous,
+            &shard,
+            &primary_node_id,
+            sent,
+            follow,
+        )?;
         Ok(outcome)
     }
 
@@ -3631,7 +3808,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             trace_started.elapsed().as_millis(),
             matches!(sent, Ok(true))
         ));
-        self.finish_routed_write_dispatch(&request_id, previous, &shard, &primary_node_id, sent)?;
+        let follow = std::mem::take(&mut self.writes.follow_next_dispatch);
+        self.finish_routed_write_dispatch(
+            &request_id,
+            previous,
+            &shard,
+            &primary_node_id,
+            sent,
+            follow,
+        )?;
         Ok(outcome)
     }
 }

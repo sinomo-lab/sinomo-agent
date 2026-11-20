@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 
 use sinomo_core::node::NodeId;
 
-use crate::protocol::{
-    DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES, DfsNamespaceLookupRangeRequest,
-};
+use crate::protocol::{DFS_NAMESPACE_INLINE_CONTENT_MAX_BYTES, DfsNamespaceLookupRangeRequest};
+use crate::service_record_follow::DfsFollowedNamespaceRoute;
 use crate::*;
 use crate::{posix_model, posix_path};
 
@@ -40,7 +39,26 @@ fn namespace_change_poll_shard_from_snapshot(
         })
 }
 
-fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> DfsError {
+const NAMESPACE_LOOKUP_REDIRECT_WITHOUT_NEWER_RECORD: &str =
+    "routed namespace lookup was refused for its authority and no newer shard record followed";
+
+/// A lookup its target refused, naming another primary, while this
+/// requester's projection showed no newer record within the lookup's budget.
+fn namespace_lookup_redirect_without_newer_record() -> DfsError {
+    DfsError::Distributed {
+        message: NAMESPACE_LOOKUP_REDIRECT_WITHOUT_NEWER_RECORD.to_string(),
+    }
+}
+
+pub(crate) fn is_namespace_lookup_redirect_without_newer_record(error: &DfsError) -> bool {
+    matches!(
+        error,
+        DfsError::Distributed { message }
+            if message == NAMESPACE_LOOKUP_REDIRECT_WITHOUT_NEWER_RECORD
+    )
+}
+
+pub(crate) fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> DfsError {
     match error {
         posix_model::DfsPosixError::Dfs(error) => error,
         other => DfsError::Distributed {
@@ -983,7 +1001,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Reference commands keep their requested locator in the durable digest.
     /// Fresh effects are scheduled at the stable object's canonical authority;
     /// stable reconciliation continues to use the original locator's history.
-    fn namespace_operation_effect_authority_shards(
+    pub(crate) fn namespace_operation_effect_authority_shards(
         &mut self,
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
@@ -1070,7 +1088,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    fn namespace_operation_dispatch_shard(
+    pub(crate) fn namespace_operation_dispatch_shard(
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
         authority_shards: &[DfsMetadataShardConfig],
@@ -3750,15 +3768,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// Refresh and bind a rejected response's redirect claim to the exact
-    /// shard authority that selected the dispatch target. Other shards may be
-    /// involved in a coordinated operation and legitimately have different
-    /// primaries; they must not be mistaken for successors of the dispatch
-    /// authority. Doing this while settling the response protects every
-    /// caller, including branches that execute locally when the corroborated
-    /// new primary is this node.
+    /// Bind a rejected response's redirect claim to the exact shard authority
+    /// that selected the dispatch target. Other shards may be involved in a
+    /// coordinated operation and legitimately have different primaries; they
+    /// must not be mistaken for successors of the dispatch authority. A bound
+    /// claim is evidence only: the requester follows its own projection of
+    /// that shard's record, never the node the claim names.
     pub(crate) fn validate_routed_namespace_authority_redirect(
-        &mut self,
+        &self,
         attempted_primary: &NodeId,
         dispatch_authority_shard: Option<&DfsMetadataShardConfig>,
         expected_authority_shards: &[DfsMetadataShardConfig],
@@ -3784,37 +3801,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!(
                     "routing shard {} is missing from the immutable affected-shard authority snapshot",
                     dispatch_authority_shard.shard_id
-                ),
-            });
-        }
-        self.refresh_control_plane_latest()?;
-        let Some(control_plane) = self.control_plane.as_mut() else {
-            return Err(DfsError::Distributed {
-                message:
-                    "namespace authority redirect requires a committed control-plane shard view"
-                        .to_string(),
-            });
-        };
-        // Shards that shared one bootstrap primary can later split between
-        // different nodes. Only the operation's routing shard selects its
-        // coordinator; co-owned destination shards are not redirect targets.
-        let Some(current) = DfsControlPlaneStore::new(control_plane.as_mut()).get_metadata_shard(
-            &dispatch_authority_shard.file_system_id,
-            &dispatch_authority_shard.shard_id,
-        )?
-        else {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "redirected dispatch namespace shard {} has no current committed assignment",
-                    dispatch_authority_shard.shard_id
-                ),
-            });
-        };
-        if &current.primary_node_id != redirected_primary {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "response named primary {redirected_primary}, but current dispatch namespace shard {} epoch {} names {}",
-                    current.shard_id, current.epoch, current.primary_node_id
                 ),
             });
         }
@@ -4153,19 +4139,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         timeout: impl Into<Option<Duration>>,
     ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
         let timeout: Option<Duration> = timeout.into();
-        let mut primary = primary_node_id;
         let operation = DfsNamespaceOperation::LookupPath { path, inline_range };
-        for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
-            let settled = self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    timeout,
-                    false,
-                    false,
-                )?;
-            match settled.result {
+        match self.route_namespace_read_following_record(
+            &file_system_id,
+            primary_node_id,
+            &operation,
+            timeout,
+        )? {
+            DfsFollowedNamespaceRoute::LocalAuthority => self
+                .synced_namespace_object_for_operation(&file_system_id, &operation)
+                .map(|object| (object, None)),
+            DfsFollowedNamespaceRoute::Settled(settled) => match settled.result {
                 DfsNamespaceResult::Applied => {
                     let inline_range = match settled.posix_coordination_result {
                         Some(DfsPosixCoordinationResult::LookupPathRange(data)) => Some(data),
@@ -4178,54 +4162,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             });
                         }
                     };
-                    return Ok((settled.synced_path_object, inline_range));
+                    Ok((settled.synced_path_object, inline_range))
                 }
                 DfsNamespaceResult::Rejected {
-                    reason: _,
-                    current_primary_node_id: Some(current),
+                    current_primary_node_id: Some(_),
                     ..
-                } if current == self.node_id
-                    && !self.transport.delegates_local_namespace_authority() =>
-                {
-                    return self
-                        .synced_namespace_object_for_operation(&file_system_id, &operation)
-                        .map(|object| (object, None));
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current != primary => {
-                    let next_primary = self.refreshed_primary_after_authority_redirect(
-                        &file_system_id,
-                        &operation,
-                        &primary,
-                        current,
-                    )?;
-                    if next_primary == self.node_id
-                        && !self.transport.delegates_local_namespace_authority()
-                    {
-                        return self
-                            .synced_namespace_object_for_operation(&file_system_id, &operation)
-                            .map(|object| (object, None));
-                    }
-                    primary = next_primary;
-                }
+                } => Err(namespace_lookup_redirect_without_newer_record()),
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
                     ..
-                } => {
-                    return Err(dfs_error_from_posix_namespace_sync(
-                        posix_model::posix_error_for_namespace_rejection(reason, posix_error),
-                    ));
-                }
-            }
+                } => Err(dfs_error_from_posix_namespace_sync(
+                    posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+                )),
+            },
         }
-        Err(DfsError::Distributed {
-            message: format!(
-                "routed namespace lookup exceeded {DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        })
     }
 
     pub(crate) fn route_namespace_lookup_paths_to_metadata_primary(
@@ -4239,111 +4190,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let mut primary = primary_node_id;
         let operation = DfsNamespaceOperation::LookupPaths { paths };
-        for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
-            let settled = self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    timeout,
-                    false,
-                    false,
-                )?;
-            match settled.result {
-                DfsNamespaceResult::Applied => return Ok(settled.synced_path_objects),
+        match self.route_namespace_read_following_record(
+            &file_system_id,
+            primary_node_id,
+            &operation,
+            timeout,
+        )? {
+            DfsFollowedNamespaceRoute::LocalAuthority => {
+                self.synced_namespace_objects_for_operation(&file_system_id, &operation)
+            }
+            DfsFollowedNamespaceRoute::Settled(settled) => match settled.result {
+                DfsNamespaceResult::Applied => Ok(settled.synced_path_objects),
                 DfsNamespaceResult::Rejected {
-                    reason: _,
-                    current_primary_node_id: Some(current),
+                    current_primary_node_id: Some(_),
                     ..
-                } if current == self.node_id
-                    && !self.transport.delegates_local_namespace_authority() =>
-                {
-                    return self
-                        .synced_namespace_objects_for_operation(&file_system_id, &operation);
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current != primary => {
-                    let next_primary = self.refreshed_primary_after_authority_redirect(
-                        &file_system_id,
-                        &operation,
-                        &primary,
-                        current,
-                    )?;
-                    if next_primary == self.node_id
-                        && !self.transport.delegates_local_namespace_authority()
-                    {
-                        return self
-                            .synced_namespace_objects_for_operation(&file_system_id, &operation);
-                    }
-                    primary = next_primary;
-                }
+                } => Err(namespace_lookup_redirect_without_newer_record()),
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
                     ..
-                } => {
-                    return Err(dfs_error_from_posix_namespace_sync(
-                        posix_model::posix_error_for_namespace_rejection(reason, posix_error),
-                    ));
-                }
-            }
+                } => Err(dfs_error_from_posix_namespace_sync(
+                    posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+                )),
+            },
         }
-        Err(DfsError::Distributed {
-            message: format!(
-                "routed namespace lookup exceeded {DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        })
-    }
-
-    pub(crate) fn route_namespace_operation_to_metadata_primary_without_local_replay(
-        &mut self,
-        file_system_id: DfsFileSystemId,
-        primary_node_id: NodeId,
-        operation: DfsNamespaceOperation,
-    ) -> Result<DfsNamespaceResult, DfsError> {
-        Ok(self
-            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                file_system_id,
-                primary_node_id,
-                operation,
-                DFS_NO_CALLER_BUDGET,
-                false,
-                false,
-            )?
-            .result)
-    }
-
-    pub(crate) fn refreshed_primary_after_authority_redirect(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        operation: &DfsNamespaceOperation,
-        attempted_primary: &NodeId,
-        redirected_primary: NodeId,
-    ) -> Result<NodeId, DfsError> {
-        self.refresh_control_plane_latest()?;
-        let shards = self.namespace_operation_effect_authority_shards(file_system_id, operation)?;
-        let Some(dispatch_shard) =
-            Self::namespace_operation_dispatch_shard(file_system_id, operation, &shards)?
-        else {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "namespace authority redirect from {attempted_primary} to {redirected_primary} has no current routing-shard assignment"
-                ),
-            });
-        };
-        if dispatch_shard.primary_node_id != redirected_primary {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "namespace authority redirect from {attempted_primary} named {redirected_primary}, but current routing shard {} names {}",
-                    dispatch_shard.shard_id, dispatch_shard.primary_node_id
-                ),
-            });
-        }
-        Ok(redirected_primary)
     }
 
     pub fn route_namespace_operation_to_metadata_primary_with_timeout_and_options(
@@ -4421,25 +4292,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
-        if matches!(
-            operation,
-            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
-        ) && self.routed_read_waits_with_lanes_released(&primary_node_id)
-        {
-            let key = self.routed_read_key(&primary_node_id, &file_system_id, &operation)?;
-            if let Some(result) = self.take_answered_remote_read(&key, &primary_node_id)? {
-                return Ok(result);
-            }
-            let (command, pending) = self.prepare_routed_namespace_request(
-                &request_id,
-                file_system_id,
-                &primary_node_id,
-                operation,
-                replay_journal_batches,
-                apply_synced_path_object,
-            )?;
-            return Err(self.yield_routed_read(key, command, pending, deadline));
-        }
         let (command, pending) = self.prepare_routed_namespace_request(
             &request_id,
             file_system_id,
@@ -4448,12 +4300,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             replay_journal_batches,
             apply_synced_path_object,
         )?;
+        self.dispatch_prepared_namespace_request(command, pending, deadline)
+    }
+
+    pub(crate) fn dispatch_prepared_namespace_request(
+        &mut self,
+        command: DfsNamespaceCommand,
+        pending: PendingRoutedNamespaceOp,
+        deadline: Option<Instant>,
+    ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let primary_node_id = pending.primary_node_id.clone();
+        let request_id = command.request_id.clone();
+        if matches!(
+            command.operation,
+            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
+        ) && self.routed_read_waits_with_lanes_released(&primary_node_id)
+        {
+            let key = self.routed_read_key(
+                &primary_node_id,
+                &command.file_system_id,
+                &command.operation,
+            )?;
+            if let Some(result) = self.take_answered_remote_read(&key, &primary_node_id)? {
+                return Ok(result);
+            }
+            return Err(self.yield_routed_read(key, command, pending, deadline));
+        }
         let sent = self.send_dfs_message_if_routable(
             &primary_node_id,
             DfsNetworkMessage::NamespaceRequest(command),
         )?;
         if !sent {
-            return Err(DfsError::Network {
+            return Err(DfsError::NetworkDelivery {
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
                 message: format!(
                     "metadata primary {primary_node_id} is not routable for namespace operation"
                 ),
@@ -4608,6 +4487,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<(DfsNamespaceCommand, PendingRoutedNamespaceOp), DfsError> {
+        let (command, pending) = self.prepare_projected_namespace_request(
+            request_id,
+            file_system_id,
+            primary_node_id,
+            operation,
+            replay_journal_batches,
+            apply_synced_path_object,
+        )?;
+        if let Some(dispatch) = &pending.dispatch_authority_shard
+            && &dispatch.primary_node_id != primary_node_id
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "routed namespace target {primary_node_id} is not current dispatch authority {} for routing shard {} epoch {}",
+                    dispatch.primary_node_id, dispatch.shard_id, dispatch.epoch
+                ),
+            });
+        }
+        Ok((command, pending))
+    }
+
+    /// Bind the target, command and reply fence to one configuration observation.
+    pub(crate) fn prepare_projected_namespace_request(
+        &mut self,
+        request_id: &str,
+        file_system_id: DfsFileSystemId,
+        fallback_primary: &NodeId,
+        operation: DfsNamespaceOperation,
+        replay_journal_batches: bool,
+        apply_synced_path_object: bool,
+    ) -> Result<(DfsNamespaceCommand, PendingRoutedNamespaceOp), DfsError> {
         // A routed request other than a read can change what its authority
         // answers, on a request shell that cannot reach this caller's
         // lookup-cache scope. Drop earlier observations before dispatch.
@@ -4655,14 +4565,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "clustered routed namespace operation has no dispatch shard assignment"
                     .to_string(),
             })?;
-            if &dispatch.primary_node_id != primary_node_id {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "routed namespace target {primary_node_id} is not current dispatch authority {} for routing shard {} epoch {}",
-                        dispatch.primary_node_id, dispatch.shard_id, dispatch.epoch
-                    ),
-                });
-            }
             Some(dispatch)
         } else {
             None
@@ -4678,7 +4580,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 operation,
             },
             PendingRoutedNamespaceOp {
-                primary_node_id: primary_node_id.clone(),
+                primary_node_id: dispatch_authority_shard
+                    .as_ref()
+                    .map_or(fallback_primary, |shard| &shard.primary_node_id)
+                    .clone(),
                 dispatch_authority_shard,
                 authority_shards,
                 replay_journal_batches,
@@ -4696,7 +4601,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
         let result = self.settle_routed_namespace_op_inner(request_id, timeout);
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
-        result
+        self.pending_routed_namespace_ops.remove(request_id);
+        result.map_err(|error| namespace_reply_collection_error(request_id, error))
     }
 
     fn settle_routed_namespace_op_inner(
@@ -4715,31 +4621,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         let _cancellation_wake = self.register_cancellation_waker(&cancellation_waker);
         loop {
-            if let Err(cancelled) = self.check_cancelled("routed namespace settle") {
-                self.pending_routed_namespace_ops.remove(request_id);
-                return Err(cancelled);
-            }
-            let events = match self.process_incoming() {
-                Ok(events) => events,
-                Err(error) => {
-                    self.pending_routed_namespace_ops.remove(request_id);
-                    return Err(error);
-                }
-            };
-            if self
+            self.check_cancelled("routed namespace settle")?;
+            let events = self.process_incoming();
+            if let Some(result) = self
                 .pending_routed_namespace_ops
-                .get(request_id)
-                .is_some_and(|pending| pending.result.is_some())
+                .get_mut(request_id)
+                .and_then(|pending| pending.result.take())
             {
-                let pending = self
-                    .pending_routed_namespace_ops
-                    .remove(request_id)
-                    .expect("pending routed namespace op checked above");
-                return Ok(pending.result.expect("settled result checked above"));
+                return Ok(result);
             }
+            let events = events?;
             let elapsed = started_at.elapsed();
             if timeout.is_some_and(|timeout| elapsed >= timeout) {
-                self.pending_routed_namespace_ops.remove(request_id);
                 // The request was dispatched; it may have applied, so a
                 // retry must reuse the same request id.
                 return Err(DfsError::NetworkDelivery {
@@ -4762,6 +4655,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map_err(DfsError::from_network)?;
             }
         }
+    }
+}
+
+// Delivery of the original request succeeded. An auxiliary send while
+// collecting its reply cannot establish that the original was never sent.
+fn namespace_reply_collection_error(request_id: &str, error: DfsError) -> DfsError {
+    match error {
+        DfsError::NetworkDelivery {
+            message,
+            delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+        } => DfsError::NetworkDelivery {
+            message: format!(
+                "routed namespace operation {request_id} was dispatched; collecting its reply failed: {message}"
+            ),
+            delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        },
+        other => other,
     }
 }
 
@@ -4916,7 +4826,8 @@ where
             Err(_) => return Err(session.timeout_error("dispatch")),
         };
         if !sent {
-            return Err(DfsError::Network {
+            return Err(DfsError::NetworkDelivery {
+                delivery_state: sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
                 message: format!(
                     "metadata primary {primary_node_id} is not routable for namespace operation"
                 ),
@@ -4936,25 +4847,20 @@ where
             let events =
                 within_caller_deadline(session.deadline, session.service.process_incoming_async())
                     .await;
-            let events = match events {
-                Ok(result) => result?,
-                Err(_) => return Err(session.timeout_error("response processing")),
-            };
-            if session
+            if let Some(result) = session
                 .service
                 .pending_routed_namespace_ops
-                .get(&session.request_id)
-                .is_some_and(|pending| pending.result.is_some())
+                .get_mut(&session.request_id)
+                .and_then(|pending| pending.result.take())
             {
-                let pending = session
-                    .service
-                    .pending_routed_namespace_ops
-                    .remove(&session.request_id)
-                    .expect("pending placement namespace op checked above");
-                return Ok(pending
-                    .result
-                    .expect("settled placement result checked above"));
+                return Ok(result);
             }
+            let events = match events {
+                Ok(result) => result.map_err(|error| {
+                    namespace_reply_collection_error(&session.request_id, error)
+                })?,
+                Err(_) => return Err(session.timeout_error("response processing")),
+            };
             if session.deadline_passed() {
                 return Err(session.timeout_error("metadata primary response"));
             }
@@ -4974,7 +4880,12 @@ where
                 .await;
                 match waiting {
                     Ok(result) => {
-                        result.map_err(DfsError::from_network)?;
+                        result.map_err(|error| {
+                            namespace_reply_collection_error(
+                                &session.request_id,
+                                DfsError::from_network(error),
+                            )
+                        })?;
                     }
                     Err(_) => return Err(session.timeout_error("incoming wait")),
                 }

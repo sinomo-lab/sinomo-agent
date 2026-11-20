@@ -9,6 +9,7 @@
 pub mod cli;
 pub use sinomo_api::dfs::attachments::*;
 pub use sinomo_api::dfs::file_history::*;
+pub use sinomo_api::dfs::parse_mount_operation_budget;
 
 pub mod daemon_client;
 pub use daemon_client::{
@@ -219,6 +220,7 @@ pub use publication_guard::{
     DfsPublicationExecutionOwners, DfsPublicationExecutionProvider, DfsPublicationGuard,
     DfsPublicationOwnerScope, DfsPublicationWriterSession,
 };
+mod service_record_follow;
 mod service_replica_transfer;
 mod service_restore_jobs;
 mod service_routed_journal;
@@ -392,12 +394,12 @@ pub use content_store::{
 };
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
-    DfsAuthoritativePrefixProjection, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
-    DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardHandoffCause, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
-    DfsMetadataShardMembershipHandoffProof, DfsNativeTxnCommit,
-    DfsPlacementAuthorityPermitStatus, DfsPlacementAuthorityProcessIdentity,
+    DfsAuthoritativePrefixProjection, DfsConfigurationChangeWatch, DfsControlPlaneAsyncStore,
+    DfsControlPlaneKvClient, DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHandoffCause,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
+    DfsNativeTxnCommit, DfsPlacementAuthorityPermitStatus, DfsPlacementAuthorityProcessIdentity,
     DfsPlacementAuthorityRecoveryOutcome, DfsPlacementAuthorityRecoveryRefusal,
     DfsPlacementUpdateCommit, DfsWriteConfigurationReadiness, SharedDfsControlPlaneKvClient,
     file_system_config_key, metadata_shard_authority_barrier_key,
@@ -730,8 +732,9 @@ pub use mounted_mutation_outbox::{
     inspect_mounted_sifs_mutation_outbox_for_cursor_recovery,
 };
 pub use mounted_sifs::{
-    MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsMutationReport,
-    MountedSifsService, OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
+    MountedSifsCall, MountedSifsContentReadContext, MountedSifsControlPlaneKvClient,
+    MountedSifsMutationReport, MountedSifsService, MountedSifsServiceGuard,
+    OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
     discover_mounted_sifs_content_replica_candidates_with_control_plane, open_mounted_sifs_service,
     open_mounted_sifs_service_with_cancellation, open_mounted_sifs_service_with_peer_transports,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
@@ -816,7 +819,7 @@ pub use protocol::{
     DfsCommitVersionResponse, DfsDirectReadRequest, DfsDistributedWriteCommand,
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof,
-    DfsMessageCommand, DfsMessageResponse, DfsOwnerWriteContent, DfsMetadataAuthorityOperation,
+    DfsMessageCommand, DfsMessageResponse, DfsMetadataAuthorityOperation,
     DfsMetadataAuthorityProbe, DfsMetadataDurableReplication, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataMemberAckView,
     DfsMetadataMemberRecordView, DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe,
@@ -825,9 +828,9 @@ pub use protocol::{
     DfsNamespaceChangePollResponse, DfsNamespaceCommand, DfsNamespaceDestinationPrecondition,
     DfsNamespaceObjectPrecondition, DfsNamespaceOperation, DfsNamespacePosixError,
     DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor, DfsNetworkMessage,
-    DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
-    DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsRoutedMessage,
-    DfsStableNamespaceOperationReceipt,
+    DfsOwnerWriteContent, DfsPosixCoordinationResult, DfsPrimaryVerificationRequest, DfsReadData,
+    DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand,
+    DfsRepairReplicaResponse, DfsRoutedMessage, DfsStableNamespaceOperationReceipt,
     DfsStableNamespaceOperationReconciliation, DfsStableNamespaceReconciliationRequest,
     DfsStableNamespaceReconciliationResponse, DfsStableWriteOperationReceipt,
     DfsStableWriteOperationReconciliation, DfsStableWriteReconciliationRequest,
@@ -873,6 +876,7 @@ pub use routes::{
     dfs_metadata_snapshot_install_execution_scope, dfs_metadata_snapshot_install_rpc_call,
     dfs_metadata_snapshot_install_rpc_request, dfs_route_is_message_data_plane,
     dfs_routed_message_rpc_request, dfs_smoke_rpc_request, dfs_status_rpc_request,
+    with_dfs_request_budget,
 };
 pub(crate) use routes::build_dfs_routed_message;
 pub(crate) use service_content::object_content_identity;
@@ -925,7 +929,7 @@ pub(crate) use service_state::{
     DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE, DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
     DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
-    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT, DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
     DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT, NetworkedDfsRangeReadStream,
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream, NetworkedDfsReadStreamOutcome,
     PendingMetadataAuthorityProbe, PendingMetadataReplication, PendingRemoteWriteResponse,

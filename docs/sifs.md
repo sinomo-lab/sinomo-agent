@@ -138,6 +138,28 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   While a cross-shard directory move runs, creates, writes, renames and
   unlinks under its destination return the same error until the move finishes
   or aborts; reads there are not blocked.
+- A FUSE mount or NFS export waits for an operation whose metadata-shard
+  primary is unreachable or changing. The call follows the shard to the
+  primary its record names next, under one operation id, and returns the
+  operation's own result, so a primary change shows only as latency. A call
+  waits without a timeout unless the mount has an operation budget:
+  `--operation-budget <duration>` on `sinomo dfs mount`, `sinomo dfs nfs
+  serve` and `sinomo dfs nfs mount`, or `operation_budget` in the supervised
+  mount's configuration (`storage.sifs-mount`, `storage.sifs-nfs-mount`). The
+  duration is a whole number with a unit: `500ms`, `30s`, `5m` or `1h`. A
+  call that reaches its budget without a result returns `EIO`
+  (`NFS3ERR_IO`): the change was not delivered, or its outcome is unknown and
+  it can still commit. A definite refusal returns its own error. No such error
+  unmounts or fences the mount, which serves the next call.
+- A FUSE mount stays mounted while the local daemon does not answer. Each
+  mutation hands its work to the daemon through a durable marker; a step the
+  daemon has not acknowledged is sent again until it is, and the call waits
+  for that within the mount's operation budget. A call whose budget ends
+  first returns `EIO`, and the mount keeps sending the step. While 64 markers
+  occupy the outbox, the next mutation waits for room. Once the daemon has
+  accepted an error report and the call releases its lease, the daemon can
+  complete recovery for that operation while the mount stays live. Only an unmount or
+  the end of the mount process ends a FUSE mount.
 - Unix FUSE mounts support distributed whole-file shared and exclusive POSIX
   advisory locks. Partial byte ranges are rejected with `EOPNOTSUPP`; a lock
   that loses its authority epoch or expires poisons its associated handles and

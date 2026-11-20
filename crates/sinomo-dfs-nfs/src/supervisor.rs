@@ -203,6 +203,10 @@ async fn start_active_mount(
         export_name: config.export_name.clone(),
         root_path: config.root_path.clone(),
         read_only: config.read_only,
+        operation_budget: sinomo_api::dfs::parse_mount_operation_budget(
+            config.operation_budget.as_deref().unwrap_or_default(),
+        )
+        .map_err(|detail| StartMountError::Server(DfsNfsError::InvalidConfiguration(detail)))?,
     })
     .await
     .map_err(StartMountError::Server)?;

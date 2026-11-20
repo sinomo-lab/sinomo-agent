@@ -15,7 +15,7 @@ use sinomo_dfs::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_NFS_IO_BYTES: usize = 1024 * 1024;
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
@@ -121,6 +121,9 @@ pub struct SifsNfsFileSystem {
     state: Arc<Mutex<SifsNfsState>>,
     handoff: Option<Arc<NfsMountedMutationHandoff>>,
     root: SifsNfsHandle,
+    /// The operator's bound on one request's DFS work; `None` waits for
+    /// events only.
+    operation_budget: Option<Duration>,
 }
 
 impl SifsNfsFileSystem {
@@ -186,6 +189,13 @@ impl SifsNfsFileSystem {
         Self::from_opened(opened, root_stat, root_path, read_only, handoff)
     }
 
+    /// Bound each request's DFS work by the export operator's own budget.
+    /// Without one a request waits for its outcome.
+    pub fn with_operation_budget(mut self, operation_budget: Option<Duration>) -> Self {
+        self.operation_budget = operation_budget;
+        self
+    }
+
     fn from_opened(
         opened: dfs::OpenedMountedSifsService,
         root_stat: DfsStat,
@@ -222,24 +232,37 @@ impl SifsNfsFileSystem {
             })),
             handoff,
             root: SifsNfsHandle::new(root_stat.object_id),
+            operation_budget: None,
         })
     }
 
-    async fn with_state<R, F>(&self, operation: F) -> std::result::Result<R, nfsstat3>
+    fn deadline(&self) -> Option<Instant> {
+        self.operation_budget
+            .and_then(|budget| Instant::now().checked_add(budget))
+    }
+
+    async fn with_state<R, F>(
+        &self,
+        deadline: Option<Instant>,
+        operation: F,
+    ) -> std::result::Result<R, nfsstat3>
     where
         R: Send + 'static,
         F: FnOnce(&mut SifsNfsState) -> std::result::Result<R, nfsstat3> + Send + 'static,
     {
         let state = Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || {
-            let mut state = state.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
+        blocking_request(deadline, move || {
+            let mut state = dfs::MountedSifsCall::lock(&state).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             operation(&mut state)
         })
         .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
     }
 
-    async fn with_service_state<R, F>(&self, operation: F) -> std::result::Result<R, nfsstat3>
+    async fn with_service_state<R, F>(
+        &self,
+        deadline: Option<Instant>,
+        operation: F,
+    ) -> std::result::Result<R, nfsstat3>
     where
         R: Send + 'static,
         F: FnOnce(&mut MountedSifsService, &mut SifsNfsState) -> std::result::Result<R, nfsstat3>
@@ -255,17 +278,18 @@ impl SifsNfsFileSystem {
         }
         let service = Arc::clone(&self.service);
         let state = Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || {
-            let mut service = service.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
-            let mut state = state.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
+        blocking_request(deadline, move || {
+            let mut service =
+                dfs::MountedSifsCall::lock_service(&service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let mut state = dfs::MountedSifsCall::lock(&state).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             operation(&mut service, &mut state)
         })
         .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
     }
 
     async fn mutate<R, F>(
         &self,
+        deadline: Option<Instant>,
         operation: &'static str,
         stable_operation_id: Option<String>,
         mutation: F,
@@ -278,19 +302,39 @@ impl SifsNfsFileSystem {
     {
         let service = Arc::clone(&self.service);
         let handoff = self.handoff.clone();
-        tokio::task::spawn_blocking(move || {
+        blocking_request(deadline, move || {
             if let Some(handoff) = handoff {
                 handoff
                     .run_operation(operation, stable_operation_id, &service, mutation)
                     .map_err(map_posix_error)
             } else {
-                let mut service = service.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
+                let mut service = dfs::MountedSifsCall::lock_service(&service)
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
                 mutation(&mut service).map_err(map_posix_error)
             }
         })
         .await
-        .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
     }
+}
+
+async fn blocking_request<R: Send + 'static>(
+    deadline: Option<Instant>,
+    work: impl FnOnce() -> std::result::Result<R, nfsstat3> + Send + 'static,
+) -> std::result::Result<R, nfsstat3> {
+    let worker = tokio::task::spawn_blocking(move || {
+        let _call = dfs::MountedSifsCall::enter(deadline);
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
+        work()
+    });
+    let result = match deadline {
+        Some(at) => tokio::time::timeout_at(at.into(), worker)
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?,
+        None => worker.await,
+    };
+    result.map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
 }
 
 impl NfsReadFileSystem for SifsNfsFileSystem {
@@ -305,9 +349,10 @@ impl NfsReadFileSystem for SifsNfsFileSystem {
         dirid: &Self::Handle,
         filename: &filename3<'_>,
     ) -> std::result::Result<Self::Handle, nfsstat3> {
+        let deadline = self.deadline();
         let dirid = dirid.clone();
         let name = filename.as_ref().to_vec();
-        self.with_service_state(move |service, state| {
+        self.with_service_state(deadline, move |service, state| {
             match name.as_slice() {
                 b"." => return Ok(dirid.clone()),
                 b".." => {
@@ -336,8 +381,9 @@ impl NfsReadFileSystem for SifsNfsFileSystem {
     }
 
     async fn getattr(&self, id: &Self::Handle) -> std::result::Result<fattr3, nfsstat3> {
+        let deadline = self.deadline();
         let id = id.clone();
-        self.with_service_state(move |service, state| {
+        self.with_service_state(deadline, move |service, state| {
             let stat = state.stat_handle(service, &id)?;
             Ok(stat_to_fattr(&stat))
         })
@@ -350,11 +396,12 @@ impl NfsReadFileSystem for SifsNfsFileSystem {
         offset: u64,
         count: u32,
     ) -> std::result::Result<(Vec<u8>, bool), nfsstat3> {
+        let deadline = self.deadline();
         let id = id.clone();
         let count = usize::try_from(count)
             .unwrap_or(usize::MAX)
             .min(MAX_NFS_IO_BYTES);
-        self.with_service_state(move |service, state| {
+        self.with_service_state(deadline, move |service, state| {
             let stat = state.stat_handle(service, &id)?;
             if !matches!(
                 stat.kind,
@@ -380,7 +427,9 @@ impl NfsReadFileSystem for SifsNfsFileSystem {
         dirid: &Self::Handle,
         cookie: u64,
     ) -> std::result::Result<impl ReadDirIterator, nfsstat3> {
+        let deadline = self.deadline();
         let iterator = directory_iterator(
+            deadline,
             Arc::clone(&self.service),
             Arc::clone(&self.state),
             self.handoff.clone(),
@@ -396,7 +445,9 @@ impl NfsReadFileSystem for SifsNfsFileSystem {
         dirid: &Self::Handle,
         cookie: u64,
     ) -> std::result::Result<impl ReadDirPlusIterator<Self::Handle>, nfsstat3> {
+        let deadline = self.deadline();
         let iterator = directory_iterator(
+            deadline,
             Arc::clone(&self.service),
             Arc::clone(&self.state),
             self.handoff.clone(),
@@ -408,8 +459,9 @@ impl NfsReadFileSystem for SifsNfsFileSystem {
     }
 
     async fn readlink(&self, id: &Self::Handle) -> std::result::Result<nfspath3<'_>, nfsstat3> {
+        let deadline = self.deadline();
         let id = id.clone();
-        self.with_service_state(move |service, state| {
+        self.with_service_state(deadline, move |service, state| {
             let stat = state.stat_handle(service, &id)?;
             let target = service
                 .posix_readlink_distributed(&stat.path)
@@ -439,9 +491,10 @@ impl NfsFileSystem for SifsNfsFileSystem {
         id: &Self::Handle,
         setattr: sattr3,
     ) -> std::result::Result<fattr3, nfsstat3> {
+        let deadline = self.deadline();
         let id = id.clone();
         let (mut stat, write_options) = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 let stat = state.stat_handle(service, &id)?;
                 if setattr.mode.is_some() && stat.kind == DfsObjectKind::Symlink {
@@ -452,7 +505,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
             .await?;
         let stat_kind = stat.kind.clone();
         let stat = self
-            .mutate("nfs.setattr", None, move |service| {
+            .mutate(deadline, "nfs.setattr", None, move |service| {
                 if let Nfs3Option::Some(size) = setattr.size {
                     stat = service.posix_truncate_file_for_object(
                         &stat.object_id,
@@ -500,12 +553,13 @@ impl NfsFileSystem for SifsNfsFileSystem {
         data: &[u8],
         _stable: stable_how,
     ) -> std::result::Result<(fattr3, stable_how), nfsstat3> {
+        let deadline = self.deadline();
         if data.len() > MAX_NFS_IO_BYTES {
             return Err(nfsstat3::NFS3ERR_FBIG);
         }
         let id = id.clone();
         let (object_id, write_options) = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 let stat = state.stat_handle(service, &id)?;
                 Ok((stat.object_id, state.write_options()))
@@ -513,7 +567,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
             .await?;
         let data = data.to_vec();
         let stat = self
-            .mutate("nfs.write", None, move |service| {
+            .mutate(deadline, "nfs.write", None, move |service| {
                 service.posix_write_file_at_for_object(&object_id, offset, &data, write_options)
             })
             .await?;
@@ -526,10 +580,11 @@ impl NfsFileSystem for SifsNfsFileSystem {
         filename: &filename3<'_>,
         attr: sattr3,
     ) -> std::result::Result<(Self::Handle, fattr3), nfsstat3> {
+        let deadline = self.deadline();
         let dirid = dirid.clone();
         let name = filename.as_ref().to_vec();
         let (path, write_options) = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 Ok((
                     state.child_path(service, &dirid, &name)?,
@@ -539,12 +594,12 @@ impl NfsFileSystem for SifsNfsFileSystem {
             .await?;
         let attrs = create_attrs(&attr, false);
         let stat = self
-            .mutate("nfs.create", None, move |service| {
+            .mutate(deadline, "nfs.create", None, move |service| {
                 service.posix_create_file_with_attrs(&path, write_options, attrs)
             })
             .await?;
         let handle = self
-            .with_state({
+            .with_state(deadline, {
                 let stat = stat.clone();
                 move |state| Ok(state.handle_for_stat(&stat))
             })
@@ -569,16 +624,17 @@ impl NfsFileSystem for SifsNfsFileSystem {
         dirid: &Self::Handle,
         dirname: &filename3<'_>,
     ) -> std::result::Result<(Self::Handle, fattr3), nfsstat3> {
+        let deadline = self.deadline();
         let dirid = dirid.clone();
         let name = dirname.as_ref().to_vec();
         let path = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 state.child_path(service, &dirid, &name)
             })
             .await?;
         let stat = self
-            .mutate("nfs.mkdir", None, move |service| {
+            .mutate(deadline, "nfs.mkdir", None, move |service| {
                 service.posix_mkdir_with_create_attrs(
                     &path,
                     DfsPosixCreateAttrs::new(DEFAULT_DIRECTORY_MODE, 0, 0),
@@ -586,7 +642,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let handle = self
-            .with_state({
+            .with_state(deadline, {
                 let stat = stat.clone();
                 move |state| Ok(state.handle_for_stat(&stat))
             })
@@ -599,10 +655,11 @@ impl NfsFileSystem for SifsNfsFileSystem {
         dirid: &Self::Handle,
         filename: &filename3<'_>,
     ) -> std::result::Result<(), nfsstat3> {
+        let deadline = self.deadline();
         let dirid = dirid.clone();
         let name = filename.as_ref().to_vec();
         let (path, directory) = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 let path = state.child_path(service, &dirid, &name)?;
                 let stat = service
@@ -614,7 +671,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
                 ))
             })
             .await?;
-        self.mutate("nfs.remove", None, move |service| {
+        self.mutate(deadline, "nfs.remove", None, move |service| {
             if directory {
                 service.posix_rmdir(&path)
             } else {
@@ -632,12 +689,13 @@ impl NfsFileSystem for SifsNfsFileSystem {
         to_dirid: &Self::Handle,
         to_filename: &filename3<'a>,
     ) -> std::result::Result<(), nfsstat3> {
+        let deadline = self.deadline();
         let from_dirid = from_dirid.clone();
         let to_dirid = to_dirid.clone();
         let from_name = from_filename.as_ref().to_vec();
         let to_name = to_filename.as_ref().to_vec();
         let (from, to) = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 Ok((
                     state.child_path(service, &from_dirid, &from_name)?,
@@ -645,7 +703,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
                 ))
             })
             .await?;
-        self.mutate("nfs.rename", None, move |service| {
+        self.mutate(deadline, "nfs.rename", None, move |service| {
             service.posix_rename(&from, &to).map(drop)
         })
         .await
@@ -658,6 +716,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
         symlink: &nfspath3<'a>,
         attr: &sattr3,
     ) -> std::result::Result<(Self::Handle, fattr3), nfsstat3> {
+        let deadline = self.deadline();
         let dirid = dirid.clone();
         let name = linkname.as_ref().to_vec();
         let target = std::str::from_utf8(symlink.as_ref())
@@ -665,7 +724,7 @@ impl NfsFileSystem for SifsNfsFileSystem {
             .to_string();
         let attrs = create_attrs(attr, true);
         let (path, write_options) = self
-            .with_service_state(move |service, state| {
+            .with_service_state(deadline, move |service, state| {
                 state.ensure_writable()?;
                 Ok((
                     state.child_path(service, &dirid, &name)?,
@@ -674,12 +733,12 @@ impl NfsFileSystem for SifsNfsFileSystem {
             })
             .await?;
         let stat = self
-            .mutate("nfs.symlink", None, move |service| {
+            .mutate(deadline, "nfs.symlink", None, move |service| {
                 service.posix_symlink_with_create_attrs(&target, &path, write_options, attrs)
             })
             .await?;
         let handle = self
-            .with_state({
+            .with_state(deadline, {
                 let stat = stat.clone();
                 move |state| Ok(state.handle_for_stat(&stat))
             })
@@ -693,9 +752,12 @@ impl NfsFileSystem for SifsNfsFileSystem {
         _offset: u64,
         _count: u32,
     ) -> std::result::Result<(), nfsstat3> {
+        let deadline = self.deadline();
         let id = id.clone();
-        self.with_service_state(move |service, state| state.stat_handle(service, &id).map(drop))
-            .await
+        self.with_service_state(deadline, move |service, state| {
+            state.stat_handle(service, &id).map(drop)
+        })
+        .await
     }
 }
 
@@ -752,16 +814,18 @@ impl ReadDirPlusIterator<SifsNfsHandle> for SifsNfsDirIterator {
 }
 
 async fn directory_iterator(
+    deadline: Option<Instant>,
     service: Arc<Mutex<MountedSifsService>>,
     state: Arc<Mutex<SifsNfsState>>,
     handoff: Option<Arc<NfsMountedMutationHandoff>>,
     dirid: SifsNfsHandle,
     cookie: u64,
 ) -> std::result::Result<SifsNfsDirIterator, nfsstat3> {
-    tokio::task::spawn_blocking(move || {
+    blocking_request(deadline, move || {
         let directory = {
-            let mut service = service.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
-            let state = state.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
+            let mut service =
+                dfs::MountedSifsCall::lock_service(&service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let state = dfs::MountedSifsCall::lock(&state).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             state.stat_handle(&mut service, &dirid)?
         };
         if !matches!(
@@ -778,7 +842,8 @@ async fn directory_iterator(
                 })
                 .map_err(map_posix_error)?
         } else {
-            let mut service = service.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
+            let mut service =
+                dfs::MountedSifsCall::lock_service(&service).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             service
                 .posix_list_dir_distributed(&directory_path)
                 .map_err(map_posix_error)?
@@ -804,7 +869,6 @@ async fn directory_iterator(
         })
     })
     .await
-    .map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?
 }
 
 fn directory_record(entry: DfsDirEntry) -> NfsDirectoryRecord {
@@ -962,9 +1026,9 @@ fn map_posix_error(error: DfsPosixError) -> nfsstat3 {
         | DfsPosixError::SymlinkContentPending { .. }
         | DfsPosixError::PartialBulkCommit { .. } => nfsstat3::NFS3ERR_JUKEBOX,
         DfsPosixError::Conflict { .. } => nfsstat3::NFS3ERR_NOT_SYNC,
-        // Durable but not yet committed: the client retries later, as for a
-        // pending write.
-        DfsPosixError::Dfs(error) if error.is_commit_outcome_unknown() => nfsstat3::NFS3ERR_JUKEBOX,
+        // An unknown outcome is what is left once the call has followed its
+        // shard's record for as long as its caller allowed. It is an I/O
+        // error, and the export keeps serving.
         DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) => nfsstat3::NFS3ERR_IO,
     }
 }
@@ -980,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_commit_outcome_asks_the_client_to_retry_later() {
+    fn an_unknown_commit_outcome_is_an_io_error_and_a_pending_write_is_retried_later() {
         let unknown = DfsPosixError::Dfs(dfs::DfsError::MetadataCommitOutcomeUnknown {
             file_system_id: dfs::sifs_file_system_id(),
             shard_id: "root".into(),
@@ -989,7 +1053,7 @@ mod tests {
             cause: dfs::DfsCommitOutcomeUnknownCause::Deadline,
             current_primary_node_id: None,
         });
-        assert_eq!(map_posix_error(unknown), nfsstat3::NFS3ERR_JUKEBOX);
+        assert_eq!(map_posix_error(unknown), nfsstat3::NFS3ERR_IO);
         assert_eq!(
             map_posix_error(DfsPosixError::Dfs(dfs::DfsError::Network {
                 message: "unreachable".into(),
@@ -997,7 +1061,8 @@ mod tests {
             nfsstat3::NFS3ERR_IO
         );
         // A sync the write set holds but cannot yet certify, as a directory
-        // sync below the shard's W floor reports it, is retried later too.
+        // sync below the shard's W floor reports it, is a typed outcome the
+        // client retries later.
         assert_eq!(
             map_posix_error(DfsPosixError::PendingWrite {
                 intent_id: "directory-sync:dir@v1".into(),
@@ -1006,6 +1071,38 @@ mod tests {
             }),
             nfsstat3::NFS3ERR_JUKEBOX
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_and_mutation_deadlines_include_the_service_queue() {
+        let owner =
+            sinomo_vfs_sifs::test_support::NativeMountedOwner::start("nfs-budget-queue").unwrap();
+        let fs = SifsNfsFileSystem::open(Some(owner.data_dir().root()), "/".into(), false)
+            .unwrap()
+            .with_operation_budget(Some(Duration::from_millis(40)));
+        let root = fs.root_dir();
+        let service = Arc::clone(&fs.service);
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let (release, hold) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _guard = service.lock().unwrap();
+            ready.send(()).unwrap();
+            hold.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        waiting.await.unwrap();
+        assert!(matches!(fs.getattr(&root).await, Err(nfsstat3::NFS3ERR_IO)));
+        assert!(matches!(
+            fs.mkdir(&root, &filename("expired")).await,
+            Err(nfsstat3::NFS3ERR_IO)
+        ));
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        let fs = fs.with_operation_budget(None);
+        assert!(fs.getattr(&root).await.is_ok());
+        assert!(matches!(
+            fs.lookup(&root, &filename("expired")).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

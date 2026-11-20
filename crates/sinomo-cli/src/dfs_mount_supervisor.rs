@@ -569,6 +569,9 @@ impl ActiveMount {
                 .with_root_path(&config.root_path);
             options.read_only = config.read_only;
             options.allow_other = config.allow_other;
+            options.operation_budget = sinomo_runtime::dfs::parse_mount_operation_budget(
+                config.operation_budget.as_deref().unwrap_or_default(),
+            )?;
             let handle = sinomo_dfs_fuse::mount_sifs_background(options)
                 .map_err(|error| format!("start Unix FUSE mount: {error}"))?;
             return Ok(Self::Fuse {

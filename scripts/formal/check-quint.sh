@@ -355,6 +355,7 @@ run_write_set_takeover_scenarios() {
   local row name steps
   for row in \
     abrupt_takeover_scenario:21 \
+    successive_candidates_scenario:17 \
     shrink_race_scenario:13 \
     pending_add_crash_scenario:23 \
     replacement_recruit_scenario:14 \

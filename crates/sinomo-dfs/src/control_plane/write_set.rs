@@ -46,6 +46,8 @@ mod commit_native_tests;
 #[cfg(test)]
 mod crossing_native_tests;
 #[cfg(test)]
+mod follow_native_tests;
+#[cfg(test)]
 mod keeping_native_tests;
 #[cfg(test)]
 mod native_tests;
@@ -1558,8 +1560,11 @@ pub struct DfsTakeoverAnswerSummary {
 }
 
 impl DfsMetadataTakeoverEvent {
-    pub const CORROBORATION_STARTED: &'static str =
-        "dfs.metadata.takeover.corroboration_started";
+    /// An attempt started by asking the write-set members in `node_ids`.
+    pub const CORROBORATION_STARTED: &'static str = "dfs.metadata.takeover.corroboration_started";
+    /// An attempt started with no write-set member to ask: it goes straight
+    /// to the confirm read on this node's own evidence.
+    pub const UNCORROBORATED_STARTED: &'static str = "dfs.metadata.takeover.uncorroborated_started";
     pub const CORROBORATION_VETOED: &'static str = "dfs.metadata.takeover.corroboration_vetoed";
     pub const CORROBORATION_HANDED_OFF: &'static str =
         "dfs.metadata.takeover.corroboration_handed_off";

@@ -1787,6 +1787,7 @@ fn run_dfs_nfs_server(
             export_name: options.export_name,
             root_path: options.root_path,
             read_only: options.read_only,
+            operation_budget: options.operation_budget,
         };
         let read_only = server_options.read_only;
         let server = sinomo_runtime::dfs_nfs::DfsNfsServer::bind(server_options)
@@ -2274,6 +2275,9 @@ fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliErr
             read_only: options.read_only,
             allow_other: options.allow_other,
             sync_local_changes: options.sync_local_changes,
+            operation_budget: options
+                .operation_budget
+                .map(|budget| format!("{}ms", budget.as_millis())),
         };
         let resolved =
             crate::dfs_mount_supervisor::configure_managed_sifs_mount(&data_dir, &config)
@@ -2312,6 +2316,7 @@ fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliErr
         mount_options.read_only = options.read_only;
         mount_options.allow_other = options.allow_other;
         mount_options.foreground = options.foreground;
+        mount_options.operation_budget = options.operation_budget;
         sinomo_dfs_fuse::mount_sifs(mount_options).map_err(|source| CliError::Parse {
             detail: source.to_string(),
         })
@@ -2444,6 +2449,7 @@ mod dfs_mount_tests {
                 root_path: "/agents".to_string(),
                 data_dir: None,
                 read_only: true,
+                operation_budget: None,
             }))
         );
         assert_eq!(
@@ -2457,6 +2463,7 @@ mod dfs_mount_tests {
                     root_path: "/".to_string(),
                     data_dir: None,
                     read_only: false,
+                    operation_budget: None,
                 },
             }))
         );
@@ -2611,6 +2618,7 @@ mod dfs_mount_tests {
             read_only: false,
             allow_other: true,
             sync_local_changes: true,
+            operation_budget: None,
         };
         let control =
             FakeMountSupervisorControl::new(SifsMountRuntimeStatus::default(), original.clone());
@@ -2767,6 +2775,7 @@ mod dfs_mount_tests {
             allow_other: false,
             foreground: true,
             sync_local_changes: false,
+            operation_budget: None,
         }))
         .expect_err("a held lease must reject a foreground mount");
 
@@ -2796,6 +2805,7 @@ mod dfs_mount_tests {
             allow_other: false,
             foreground: true,
             sync_local_changes: true,
+            operation_budget: None,
         }))
         .expect_err("Windows foreground mount must delegate to the managed supervisor");
 

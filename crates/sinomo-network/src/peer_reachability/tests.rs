@@ -310,7 +310,26 @@ async fn running_verification_is_part_of_the_reported_entry() {
     let changes = tokio::time::timeout(Duration::from_secs(5), subscription.changed())
         .await
         .expect("a settled verification is reported even with an unchanged verdict");
-    assert!(!changes[0].current.as_ref().expect("peer entry").verifying);
+    let settled = changes[0].current.as_ref().expect("peer entry").clone();
+    assert!(!settled.verifying);
+    assert_ne!(settled.examined_generation, 0);
+    assert_eq!(current.examined_generation, 0, "nothing had settled before");
+
+    // An episode that begins and settles between two waits leaves the
+    // verdict and the verifying flag as they were. It is still reported,
+    // because the peer's examined generation moved.
+    begin_peer_verification(&fixture.paths, &fixture.b);
+    settle_peer_verification(&fixture.paths, &fixture.b);
+    let changes = tokio::time::timeout(Duration::from_secs(5), subscription.changed())
+        .await
+        .expect("an episode that ran between two waits is reported");
+    assert_eq!(changes.len(), 1);
+    let again = changes[0].current.as_ref().expect("peer entry");
+    assert_eq!(
+        (again.verdict, again.verifying),
+        (settled.verdict, settled.verifying)
+    );
+    assert_ne!(again.examined_generation, settled.examined_generation);
 }
 
 #[tokio::test]

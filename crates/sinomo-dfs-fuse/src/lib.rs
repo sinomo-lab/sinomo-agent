@@ -27,6 +27,11 @@ pub struct DfsFuseMountOptions {
     pub mount_name: String,
     pub attr_ttl: Duration,
     pub entry_ttl: Duration,
+    /// The longest one syscall waits for its DFS work. `None`, the default,
+    /// sets no deadline: a syscall waits for its outcome, however long the
+    /// cluster takes to reach one. The budget is the mount operator's own
+    /// deadline and travels with every request the syscall sends.
+    pub operation_budget: Option<Duration>,
 }
 
 impl DfsFuseMountOptions {
@@ -41,7 +46,13 @@ impl DfsFuseMountOptions {
             mount_name: "sinomo-sifs".to_string(),
             attr_ttl: Duration::from_secs(1),
             entry_ttl: Duration::from_secs(1),
+            operation_budget: None,
         }
+    }
+
+    pub fn with_operation_budget(mut self, operation_budget: Duration) -> Self {
+        self.operation_budget = Some(operation_budget);
+        self
     }
 
     pub fn with_root_path(mut self, root_path: impl Into<String>) -> Self {
@@ -751,16 +762,134 @@ mod tests {
     }
 
     #[cfg(all(unix, feature = "fuse"))]
+    struct MountedTestDaemon(std::process::Child);
+
+    #[cfg(all(unix, feature = "fuse"))]
+    impl MountedTestDaemon {
+        fn start(data: &sinomo_runtime::local::SinomoDataDir) -> Self {
+            use sinomo_runtime::api::{
+                DaemonApiClient, DaemonPaths, DaemonProbeStatus, probe_daemon_status,
+            };
+            use std::process::{Command, Stdio};
+            use std::time::{Duration, Instant};
+            data.ensure_root_layout().unwrap();
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let binary = std::env::var_os("SINOMO_TEST_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_exe()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("sinomo")
+                });
+            let spawn = |phase| {
+                let mut child = Self(
+                    Command::new(&binary)
+                        .args([
+                            "daemon",
+                            "run",
+                            "--app-owned",
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                        ])
+                        .arg(port.to_string())
+                        .env("SINOMO_DATA_DIR", data.root())
+                        .env(
+                            sinomo_runtime::api::SINOMO_APP_DAEMON_LAUNCH_ID_ENV,
+                            format!("mount-test-{}-{port}-{phase}", std::process::id()),
+                        )
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(
+                            std::fs::File::create(data.root().join(format!("{phase}.stderr")))
+                                .unwrap(),
+                        )
+                        .spawn()
+                        .expect("start isolated daemon from the test build"),
+                );
+                let until = Instant::now() + Duration::from_secs(45);
+                loop {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none() && Instant::now() < until,
+                        "{phase} daemon unavailable"
+                    );
+                    if let DaemonProbeStatus::Running(status) =
+                        probe_daemon_status(&DaemonPaths::new(data), Duration::from_millis(200))
+                    {
+                        assert_eq!(status.pid, child.0.id());
+                        if phase == "bootstrap" {
+                            break;
+                        }
+                        let client = DaemonApiClient::at_address(&status.address);
+                        let request = sinomo_runtime::dfs::dfs_status_rpc_request().unwrap();
+                        if let Ok(reply) = client.call_request(&request)
+                            && let Ok(status) =
+                                sinomo_runtime::dfs::decode_dfs_status_rpc_response(&reply)
+                            && status.incomplete_reasons.is_empty()
+                            && status.object_count > 0
+                        {
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                child
+            };
+            let mut bootstrap = spawn("bootstrap");
+            DaemonApiClient::at_address(format!("127.0.0.1:{port}"))
+                .cluster_init(sinomo_runtime::cluster::ClusterControlInitRequest {
+                    cluster_name: "kernel mount test".into(),
+                    node_display_name: None,
+                    node_role: None,
+                })
+                .expect("initialize the private test node");
+            let until = Instant::now() + Duration::from_secs(30);
+            while bootstrap.0.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < until, "bootstrap daemon did not exit");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            spawn("main")
+        }
+    }
+
+    #[cfg(all(unix, feature = "fuse"))]
+    impl Drop for MountedTestDaemon {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while matches!(self.0.try_wait(), Ok(None)) && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(all(unix, feature = "fuse"))]
     #[test]
-    #[ignore = "requires an executable FUSE helper and a usable /dev/fuse"]
+    #[ignore = "requires the built sinomo binary, a FUSE helper and a usable /dev/fuse"]
     fn owner_only_mount_can_remove_dfs_native_root_owned_entries() {
         use std::os::unix::fs::MetadataExt;
 
         let root = sinomo_testdir::TestDir::new("sinomo-fuse-owner-projection");
         let mount_point = root.join("mount");
         let data_dir = root.join("data");
-        let mut opened = sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.clone()))
-            .expect("open standalone SIFS service");
+        let data = sinomo_runtime::local::SinomoDataDir::new(data_dir.clone());
+        let _daemon = MountedTestDaemon::start(&data);
+        let peer = std::sync::Arc::new(
+            sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data.clone()).unwrap(),
+        );
+        let mut opened = sinomo_runtime::dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane(data, peer.clone(), peer).unwrap();
         opened
             .service
             .posix_mkdir_all("/service-created")
@@ -768,7 +897,7 @@ mod tests {
         assert_eq!(
             opened
                 .service
-                .posix_stat("/service-created")
+                .posix_stat_distributed("/service-created")
                 .expect("stat durable DFS-native directory")
                 .uid,
             0,
@@ -794,11 +923,13 @@ mod tests {
 
     #[cfg(all(unix, feature = "fuse"))]
     #[test]
-    #[ignore = "requires an executable FUSE helper and a usable /dev/fuse"]
+    #[ignore = "requires the built sinomo binary, a FUSE helper and a usable /dev/fuse"]
     fn dead_fuse_worker_is_unmounted_and_removed() {
         let root = sinomo_testdir::TestDir::new("sinomo-fuse-dead-worker-cleanup");
         let mount_point = root.join("mount");
         let data_dir = root.join("data");
+        let _daemon =
+            MountedTestDaemon::start(&sinomo_runtime::local::SinomoDataDir::new(data_dir.clone()));
         let mut handle =
             mount_sifs_background(DfsFuseMountOptions::new(&mount_point).with_data_dir(data_dir))
                 .expect("background SIFS mount");

@@ -98,6 +98,16 @@ fn switch_services(
             .advertise_metadata_write_set_capability(&node)
             .unwrap();
     }
+    // The switch requires evidence that each admitted member holds the
+    // primary's exact prefix. Startup can publish the assignment before the
+    // initial journal has reached every replica.
+    let head = durable_prefix(&runtime, &config.primary_node_id, &config)
+        .expect("the primary holds a durable prefix");
+    for member in &config.replica_node_ids {
+        if durable_prefix(&runtime, member, &config).as_ref() != Some(&head) {
+            assert_eq!(catch_up(&runtime, &config, member), head);
+        }
+    }
     let all = members(&config).into_iter().collect();
     let switch = build_metadata_write_set_switch(&cut(&runtime, &config), &all).unwrap();
     submit(&runtime, &config, &switch);

@@ -411,3 +411,220 @@ fn native_stale_authority_redirect_keeps_original_identity_after_lost_reply() {
     drop((old, client));
     runtime.close().unwrap();
 }
+
+/// A refusal for the write's authority is followed only to a strictly newer
+/// record of the requester's own projection. While that projection shows
+/// none, the one call waits: it is not answered with the refusal, it does
+/// not go to another node, and only the re-send timer sends it again. Its
+/// budget ends the wait with the refusal.
+#[test]
+fn native_redirect_without_a_newer_record_waits_and_does_not_loop() {
+    let nodes = DfsTestRuntime::ordered_node_ids("native-routed-redirect-wait", 3);
+    let mut runtime = DfsTestRuntime::new("native-routed-redirect-wait", nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let shard = runtime.root_shard().unwrap();
+    let primary = shard.primary_node_id.clone();
+    let requester = nodes.iter().find(|node| **node != primary).unwrap().clone();
+    let mut authority = runtime.client(&primary).unwrap();
+    let original = authority
+        .posix_write_file(
+            "/redirect-wait",
+            b"original",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    let object = runtime
+        .node_metadata(&primary)
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    let mut client = runtime.client(&requester).unwrap();
+    // A stamp ahead of every record: the primary refuses it for its
+    // authority, and no projection will show a record newer than it.
+    let mut ahead = shard.clone();
+    ahead.epoch += 1;
+    let operation = sinomo_core::Id::generate().to_string();
+    let target = DfsVersion::generate();
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let budget = Duration::from_secs(3);
+    let started = Instant::now();
+    client.set_transport_operation_deadline(Some(started + budget));
+    client.writes.follow_next_dispatch = true;
+    let pending = route(
+        &mut client,
+        &object,
+        &ahead,
+        &target,
+        &operation,
+        Body::Bytes,
+    )
+    .unwrap();
+    let outcome = client.settle_ready_write_outcome(pending, false);
+    client.set_transport_operation_deadline(None);
+    assert!(
+        started.elapsed() >= budget,
+        "the call waited for a newer record for its whole budget: {:?} {outcome:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(&outcome, Err(DfsError::Distributed { message }) if !message.contains("exceeded")),
+        "the budget ends the wait with the refusal: {outcome:?}"
+    );
+    let sends = runtime
+        .rpc_observations()
+        .into_iter()
+        .filter(|call| {
+            call.source == requester
+                && call.route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                && call.phase == RpcPhase::BeforeDispatch
+        })
+        .map(|call| call.target)
+        .collect::<Vec<_>>();
+    assert!(
+        sends.iter().all(|target| target == &primary),
+        "the write never went to a node the record does not name: {sends:?}"
+    );
+    assert!(
+        (2..=6).contains(&sends.len()),
+        "only the re-send timer sent the write again: {} sends",
+        sends.len()
+    );
+    assert_eq!(
+        authority
+            .posix_read_file_distributed("/redirect-wait")
+            .unwrap(),
+        b"original",
+        "a refused write applied nothing"
+    );
+    drop((authority, client));
+    runtime.close().unwrap();
+}
+
+/// Recruitment and retirement can change the exact shard stamp without
+/// changing its epoch or replacing the primary.
+#[test]
+fn native_resend_refreshes_the_replica_list_at_the_same_primary_and_epoch() {
+    let (runtime, nodes) = DfsTestRuntime::start_cluster("same-epoch-routed-write", 3).unwrap();
+    let shard = runtime.root_shard().unwrap();
+    let primary = &shard.primary_node_id;
+    let requester = nodes.iter().find(|node| *node != primary).unwrap();
+    let mut authority = runtime.client(primary).unwrap();
+    let path = "/same-epoch-routed-write";
+    let initial = authority
+        .posix_write_file(
+            path,
+            b"original",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    let object = runtime
+        .node_metadata(primary)
+        .unwrap()
+        .get_object(&initial.object_id)
+        .unwrap()
+        .unwrap();
+    let mut stale = shard.clone();
+    stale
+        .replica_node_ids
+        .pop()
+        .expect("the fixture has a replica");
+    let mut client = runtime.client(requester).unwrap();
+    client.set_transport_operation_deadline(Some(Instant::now() + Duration::from_secs(5)));
+    let operation = sinomo_core::Id::generate().to_string();
+    let target = DfsVersion::generate();
+    let pending = route(
+        &mut client,
+        &object,
+        &stale,
+        &target,
+        &operation,
+        Body::Bytes,
+    )
+    .unwrap();
+    assert!(
+        matches!(client.settle_ready_write_outcome(pending, false).unwrap(),
+        NetworkedDfsWriteOutcome::Committed { version, .. } if version == target)
+    );
+    assert_eq!(
+        authority.posix_read_file_distributed(path).unwrap(),
+        PAYLOAD
+    );
+    drop((authority, client));
+    runtime.close().unwrap();
+}
+
+#[test]
+fn unsent_namespace_retry_preserves_an_earlier_possible_commit() {
+    check_failed_call_after_mkdir("namespace-retry-outcome", false);
+}
+
+#[test]
+fn unsent_stat_after_acknowledged_mkdir_reports_the_mutation_may_have_applied() {
+    check_failed_call_after_mkdir("namespace-postcommit-stat", true);
+}
+
+fn check_failed_call_after_mkdir(name: &str, acknowledge_mkdir: bool) {
+    let (runtime, nodes) = DfsTestRuntime::start_cluster(name, 3).unwrap();
+    let primary = runtime.root_shard().unwrap().primary_node_id;
+    let requester = nodes.iter().find(|node| **node != primary).unwrap();
+    let mut client = runtime.client(requester).unwrap();
+    let mut authority = runtime.client(&primary).unwrap();
+    let rule = |action| FaultRule {
+        source: Some(requester.clone()),
+        target: Some(primary.clone()),
+        route: Some(DFS_DATA_NAMESPACE_ROUTE.into()),
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action,
+    };
+    let reply = Arc::new(tokio::sync::Semaphore::new(0));
+    runtime.install_fault(rule(if acknowledge_mkdir {
+        FaultAction::PauseAfterDispatch(Arc::clone(&reply))
+    } else {
+        FaultAction::LoseReplyAfterDispatch
+    }));
+    let path = "/namespace-retry-outcome";
+    let deadline = Instant::now() + Duration::from_secs(3);
+    client.set_transport_operation_deadline(Some(deadline));
+    let outcome = std::thread::scope(|scope| {
+        let call = scope.spawn(|| client.posix_mkdir_with_operation_id(path, "mkdir-outcome"));
+        while !runtime.rpc_observations().iter().any(|rpc| {
+            rpc.source == *requester
+                && rpc.target == primary
+                && rpc.route == DFS_DATA_NAMESPACE_ROUTE
+                && rpc.phase == RpcPhase::AfterDispatch
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "the primary executed the first request"
+            );
+            std::thread::yield_now();
+        }
+        runtime.clear_faults();
+        runtime.install_fault(rule(FaultAction::BudgetExhausted));
+        reply.add_permits(1);
+        call.join().unwrap()
+    });
+    assert!(
+        matches!(
+            outcome,
+            Err(DfsPosixError::Dfs(DfsError::NetworkDelivery {
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            }))
+        ),
+        "{outcome:?}"
+    );
+    runtime.clear_faults();
+    assert_eq!(
+        authority.posix_stat_distributed(path).unwrap().kind,
+        DfsObjectKind::Directory
+    );
+    drop((client, authority));
+    runtime.close().unwrap();
+}

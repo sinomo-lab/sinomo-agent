@@ -1205,8 +1205,8 @@ The `dfs_authority_routing_safety.safety` invariant combines these properties:
 - late or mismatched responses are observations only.
 
 This maps to routed namespace response settlement
-(`validate_routed_namespace_authority_redirect`), refreshed dispatch-shard
-corroboration (`refreshed_primary_after_authority_redirect`), and
+(`validate_routed_namespace_authority_redirect`), selection of the primary and reply fence from one
+projected record (`prepare_projected_namespace_request`), and
 `lookup_sifs_path_distributed_synced`. The current focused redirect regression is
 `native_stale_authority_redirect_keeps_original_identity_after_lost_reply`;
 no current focused test covers grouped-shard corroboration or the live-hit

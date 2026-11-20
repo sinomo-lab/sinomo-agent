@@ -165,7 +165,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.clear_metadata_lookup_cache();
             return conditional_delete_result(
                 &normalized,
-                self.stat_replayed_tombstone_synced(&normalized)?,
+                self.stat_replayed_tombstone_synced(&normalized)
+                    .map_err(super::metadata::committed_write_observation_error)?,
             );
         }
         if self.control_plane.is_some() {
@@ -378,7 +379,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             return conditional_delete_result(
                 &normalized,
-                self.stat_replayed_tombstone_synced(&normalized)?,
+                self.stat_replayed_tombstone_synced(&normalized)
+                    .map_err(super::metadata::committed_write_observation_error)?,
             );
         }
         if self.control_plane.is_some() {

@@ -163,6 +163,21 @@ pub enum DfsStableNamespaceOperationReconciliation {
     },
 }
 
+/// A requester's hint to its own node: a request of its could not be
+/// delivered to the primary of this shard record. The node's takeover
+/// candidate role treats it as its own hint and asks the network to verify
+/// that primary. The request names the record the requester sent with, so a
+/// hint about a record the node has since replaced is dropped. It carries no
+/// obligation and has no reply: a requester that still cannot deliver sends
+/// it again on its re-send timer.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsPrimaryVerificationRequest {
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: String,
+    pub epoch: u64,
+    pub primary_node_id: NodeId,
+}
+
 /// Read-only authority-routed query for one stable data-write outcome.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsStableWriteReconciliationRequest {
@@ -1920,6 +1935,9 @@ pub enum DfsNetworkMessage {
     MetadataSnapshotInstallResponse(DfsMetadataSnapshotInstallResponse),
     ContentRootCatalogPageRequest(DfsContentRootCatalogPageRequest),
     ContentRootCatalogPageResponse(DfsContentRootCatalogPage),
+    /// `dfs.metadata.primary.verification_requested`, from a requester to
+    /// its own node.
+    PrimaryVerificationRequest(DfsPrimaryVerificationRequest),
     // The removed original-repair custody messages had the production
     // ordinals after this one; a frame naming one fails to decode.
 }

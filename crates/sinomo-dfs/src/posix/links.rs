@@ -131,6 +131,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(error.into());
             }
         };
+        self.writes.follow_next_dispatch = options.wait_for_commit;
         let outcome = self.write_distributed_eventual_with_candidates_and_parent_touch(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),

@@ -352,10 +352,13 @@ impl Keeper {
         let Some(members) = cluster_member_facts(&snapshot) else {
             return;
         };
+        self.verdicts
+            .retain_examinations(|key| member_shards.contains_key(key));
         for peer in self.takeover.evaluate(
             &takeover_shards,
             &members,
             &verdicts,
+            &mut self.verdicts,
             &unreachable_primaries,
             snapshot.generation(),
         ) {
@@ -425,22 +428,31 @@ impl Keeper {
         let mut facts = BTreeMap::new();
         for node in members.keys().chain(configured.iter()) {
             let record = members.get(node);
-            let view = crate::write_set_member_evidence::metadata_member_view(
-                &self.local,
-                &key.1,
-                node,
-            );
+            let view =
+                crate::write_set_member_evidence::metadata_member_view(&self.local, &key.1, node);
+            // A member's no-path verdict that already stood when this node
+            // first read itself primary at this epoch removes nobody until
+            // the network has examined the member: until then it is unsettled.
+            let reach = if node == &self.local {
+                DfsWriteSetMemberReach::Path
+            } else if state
+                .switched()
+                .is_some_and(|write_set| write_set.contains(node))
+                && !self
+                    .verdicts
+                    .examined_under(verdicts, key, shard.epoch, node)
+            {
+                DfsWriteSetMemberReach::Unsettled
+            } else {
+                verdicts.reach(node)
+            };
             facts.insert(
                 node.clone(),
                 DfsWriteSetMemberFacts {
                     eligible: record.is_some_and(|record| record.eligible),
                     departed: record.is_none_or(|record| record.departed),
                     mobile: record.is_some_and(|record| record.mobile),
-                    reach: if node == &self.local {
-                        DfsWriteSetMemberReach::Path
-                    } else {
-                        verdicts.reach(node)
-                    },
+                    reach,
                     view,
                     fenced: fenced.contains(node),
                 },
@@ -1530,6 +1542,23 @@ mod test_control {
         verifying: bool,
     ) {
         super::super::peer_verdicts::test_seam::set_peer_verdict(root, peer, verdict, verifying);
+        WAKE.notify_waiters();
+    }
+
+    /// Give `root` a connectivity probe owner, so its verification requests
+    /// are accepted and wait for the test to settle them, or take it away.
+    pub(crate) fn set_test_probe_owner(root: PathBuf, owner: bool) {
+        super::super::peer_verdicts::test_seam::set_probe_owner(root, owner);
+        WAKE.notify_waiters();
+    }
+
+    /// Settle a verification episode of `peer` for `root` with `verdict`.
+    pub(crate) fn settle_test_peer_verification(
+        root: PathBuf,
+        peer: NodeId,
+        verdict: PeerPathVerdict,
+    ) {
+        super::super::peer_verdicts::test_seam::settle_peer_verification(root, peer, verdict);
         WAKE.notify_waiters();
     }
 

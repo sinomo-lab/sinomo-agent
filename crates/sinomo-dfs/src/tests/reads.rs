@@ -2911,10 +2911,12 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         &runtime, &root_primary, &users_primary, root_path, root_target,
     );
     let root_operation = sinomo_core::Id::generate().to_string();
+    root.single_attempt_for_test(true);
     assert!(
         root.posix_rename_with_operation_id(root_path, root_target, &root_operation)
             .is_err()
     );
+    root.single_attempt_for_test(false);
     let root_job = runtime
         .node_metadata(&root_primary)
         .unwrap()
@@ -2986,11 +2988,13 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         &runtime, &services_primary, &users_primary, services_path, services_target,
     );
     let services_operation = sinomo_core::Id::generate().to_string();
+    services.single_attempt_for_test(true);
     assert!(
         services
             .posix_rename_with_operation_id(services_path, services_target, &services_operation)
             .is_err()
     );
+    services.single_attempt_for_test(false);
     let services_job = runtime
         .node_metadata(&services_primary)
         .unwrap()

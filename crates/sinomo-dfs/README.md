@@ -193,6 +193,15 @@ A requester's budget and its departure reach the node that serves its request. D
 
 Timers on these paths only re-send: a waiting write re-drives its own stages, and a blind overwrite that met another writer's intent is sent again, each on an interval that doubles to the network's liveness interval and never ends the wait.
 
+A requester follows its shard's record. It sends each request to the primary its own configuration projection names, and three answers tell it that record is changing: an unknown outcome, a refusal for the request's authority, and a request that could not be delivered. None of them routes the request: a node an answer names is never sent to on that answer's word.
+
+- **Wait.** The requester waits on its projection until the shard record is strictly newer than the one it sent with: a higher epoch, at least the epoch an unknown outcome names, or another primary. It then sends the identical request, under the same operation id and with the body it kept for the whole call, to the primary the newer record names. There is no limit on how many records one call follows; each step needs a newer one.
+- **Re-send.** While the record has not changed, a timer that starts at 250 ms and doubles to the network's liveness interval sends the request to the current primary again. Each re-send uses the current projected replica list, which can change while the epoch and primary stay the same. It also covers a member that returns and a primary that had not yet read its own record. The timer never ends the wait.
+- **End.** The call ends on a definite answer, at its caller's budget, or when its caller is cancelled. At the budget the caller gets what the call still holds: the unknown outcome, the refusal, or the delivery failure.
+- **Same id.** A namespace request under a caller's operation id, and every content write, is sent again under that id, so the primary answers it from its durable record. A namespace request under an id minted per attempt is sent again only when it was refused or was not delivered; one that may have applied is returned.
+- **Verification.** A request that could not be delivered leaves a hint for its node's takeover candidate role, which asks the network to verify the primary. A requester that delegates to its node's Main (a FUSE mount, an NFS export, the CLI, a hosted client) sends the hint to its own node as the DFS message `primary-verification-request` (`dfs.metadata.primary.verification_requested`: filesystem, shard id, and the epoch and primary of the record it sent with) on the DFS read route. Main accepts it only from its own node and only while it still projects that record, and then treats it as its own hint. The message has no reply and carries no obligation: a requester that still cannot deliver sends it again with its next attempt.
+- **Who waits.** A requester that delegates to its node's Main: a mount, the CLI, a hosted client. Work Main does for itself (a request it is serving, work under a shard's mutation admission, maintenance, recovery and placement reconciliation) reads the projection once and goes on only if the record already moved, because a wait there would hold a lane or stall the pass. A read follows the record the same way within its own read budget. A requester whose configuration client has no publication events does the same single read.
+
 Shard membership changes retain the current primary and do not immediately activate a replacement authority. The quorum side first records a bounded pending handoff; this is not itself a write fence because the isolated retiring primary may not have observed it. After reconnecting, the retiring primary takes its publication guard, installs a durable local backend freeze, and acknowledges its exact journal head and fingerprint. That exact prefix must then reach and be acknowledged by the union of the retiring and desired assignments before the desired assignment activates. The local marker then advances to the activated epoch instead of disappearing: only the backend instance explicitly rebound after observing that exact control-plane generation may resume authoritative mutations, while independently opened stale instances remain fenced. Pending markers reject authoritative metadata mutations, and both pending and activated markers still permit replay and handoff transfer. This carries writes completed after the pending decision without putting healthy DFS operations through Raft.
 
 #### Unknown commit outcomes
@@ -203,10 +212,10 @@ An unknown outcome is neither success nor failure. The caller retries the same o
 
 | Surface | Form |
 |---|---|
-| Routed write reply | `DfsDistributedWriteResult::CommitOutcomeUnknown { intent_id, file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`; the requester keeps the compact pending write instead of abandoning it. A commit attempted when a completing content receipt arrives answers a pending served write the same way; the receipt stays in the durable prepare that carries it |
+| Routed write reply | `DfsDistributedWriteResult::CommitOutcomeUnknown { intent_id, file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`; the requester holds the pending write with its body and follows the shard record, and keeps a compact entry for a late response once its caller has stopped waiting. A commit attempted when a completing content receipt arrives answers a pending served write the same way; the receipt stays in the durable prepare that carries it |
 | Routed namespace reply | `Rejected` carrying `DfsNamespacePosixError::CommitOutcomeUnknown { file_system_id, shard_id, epoch, operation_id, cause, current_primary_node_id }`; the request record stays `Pending`, and admission of a request whose prepare awaits recovery answers the same way. An admission whose own request-row commit is left unknown answers the same way; the same-id retry answers from that row once it commits |
-| Routed namespace request whose caller's budget ends after dispatch | `NetworkDelivery { PossiblyApplied }`; the stable-id wrapper retries the same id, and the per-attempt-id wrapper returns instead of retrying under a new id |
-| FUSE / NFS | `EAGAIN` / `NFS3ERR_JUKEBOX`, as for a pending write |
+| Routed namespace request whose caller's budget ends after dispatch | `NetworkDelivery { PossiblyApplied }`; a request under a caller's id was sent again under that id until the budget, and a request under a per-attempt id is returned instead of being sent again under a new id |
+| FUSE / NFS | `EIO` / `NFS3ERR_IO`, returned only once the syscall has followed the shard record for as long as the mount's operation budget allows, or without limit when the mount has none. The mount keeps serving |
 | Browser conditional replace | `DaemonDfsBrowserReplaceFileIfVersionOutcome::Unknown { detail }`, also used for a pending write and a possibly applied dispatch |
 | POSIX write that committed but whose post-commit stat fails | `NetworkDelivery { PossiblyApplied }`, never `DefinitelyNotSent`: the change applied, so the caller retries the same operation id rather than writing under a new one |
 | Same-shard namespace jobs and prepared-change recovery | the job stays `Running`; a recovery pass attempts every other body and reports itself incomplete so it runs again; an unknown caused by cancellation stops the pass, and `DfsError::is_cancellation` treats it as the cancellation it is |
@@ -411,9 +420,9 @@ their existing encoding.
 
 A write-set member other than the primary starts an attempt when its own
 verdict for the primary settles to no path, or the cluster no longer
-authorizes the primary (which then has no verdict at all). A routed namespace
-request that cannot be delivered to the primary asks the network to verify it
-first. An attempt that ended on its own evidence (a veto, a newer record or a
+authorizes the primary (which then has no verdict at all). A request that
+cannot be delivered to the primary, a content write as much as a namespace
+request, asks the network to verify it first. An attempt that ended on its own evidence (a veto, a newer record or a
 failed promise) starts again only when the record, the publication or this
 node's verdicts move; a failed confirm read is re-sent instead (below). The
 decisions are pure functions
@@ -494,7 +503,8 @@ it cuts and ingests, or rejects with `epoch-alignment-required`. The primary
 seeds its replication cursor for each member from the confirmed head.
 
 Each step publishes a `dfs.metadata.takeover.*` event (schema
-`sinomo.dfs.metadata-takeover` 1.0.0): `corroboration_started`,
+`sinomo.dfs.metadata-takeover` 1.0.0): `corroboration_started` when the
+attempt asks write-set members, `uncorroborated_started` when it has none to ask,
 `corroboration_vetoed`, `corroboration_handed_off`, `promised`, `swapped`,
 `swap_superseded`, `promise_released`, `activated` and, from the new primary,
 `aligned` per member it confirmed. Each names the attempt, the read epoch, the

@@ -5204,6 +5204,10 @@ mod tests {
                 )
                 .map_err(Into::into),
                 DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE if reject_write => {
+                    // This caller supplied an operation deadline. Its remaining
+                    // transport budget must also reach the executing browser.
+                    let budgeted = sinomo_runtime::dfs::with_dfs_request_budget(request.clone(), timeout);
+                    assert_eq!(request.metadata, budgeted.metadata);
                     Err(sinomo_runtime::api::DaemonApiError::NetworkDelivery {
                         detail: "successful response was lost".into(),
                         delivery_state: network::NetworkDeliveryState::PossiblyApplied,
@@ -8698,6 +8702,106 @@ mod tests {
     }
 
     #[test]
+    fn sifs_browser_write_departure_releases_an_unbudgeted_call_to_the_shard_owner() {
+        use sinomo_runtime::dfs::test_support::{
+            DfsTestFaultAction, DfsTestFaultRule, DfsTestRpcPhase,
+        };
+
+        let (fixture, data_dir, caller, _, shards) =
+            live_replica_cli_fixture("cli-browser-write-departure");
+        let primary = shards
+            .iter()
+            .find(|shard| shard.shard_id == "services")
+            .unwrap()
+            .primary_node_id
+            .clone();
+        assert_ne!(caller, primary);
+        let route = sinomo_runtime::dfs::DFS_DATA_NAMESPACE_ROUTE;
+        let (runtime, host, observations) = fixture.with_native(|native, _| {
+            native.checkpoint_rpc_observation_window().unwrap();
+            native.install_fault(DfsTestFaultRule {
+                source: Some(caller.clone()),
+                target: Some(primary.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: None,
+                remaining_hits: 1,
+                action: DfsTestFaultAction::PauseBeforeDispatch(Arc::new(
+                    tokio::sync::Semaphore::new(0),
+                )),
+            });
+            (
+                native.runtime_handle(),
+                native
+                    .component_context(&caller)
+                    .unwrap()
+                    .object_rpc_transport()
+                    .unwrap(),
+                native.rpc_observation_reader(),
+            )
+        });
+        let path = "/services/cancelled-browser-write";
+        let write = network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+            sinomo_runtime::api::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::api::DaemonDfsBrowserWriteFileRequest {
+                path: path.into(),
+                bytes: b"not dispatched".to_vec(),
+            },
+        )
+        .unwrap();
+        runtime.block_on(async {
+            let mut browser_call = host.call_async(&caller, network::ObjectRpcCall::value(write),
+                network::ClusterObjectRpcOptions::default(), true);
+            let held = tokio::select! {
+                _ = &mut browser_call => panic!("the shard call is still held"),
+                observed = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(rpc) = observations().into_iter().find(|rpc| rpc.route == route && rpc.source == caller
+                            && rpc.target == primary && rpc.phase == DfsTestRpcPhase::BeforeDispatch) {
+                            break rpc;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }) => observed.expect("the browser dispatched to the shard owner"),
+            };
+            assert!(held.options.overall_timeout().is_none());
+            drop(browser_call);
+            // Leave the fault installed. Dropping the caller must end the exact inner RPC.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if observations().iter().any(|rpc| rpc.call_id == held.call_id && rpc.phase == DfsTestRpcPhase::EndedWithoutResponse) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("caller departure cancelled the unbudgeted inner RPC");
+        });
+        drop(host);
+        fixture.with_native(|native, _| {
+            native.clear_faults();
+            let authority = native.metadata_primary_service(path).unwrap();
+            assert!(
+                authority
+                    .metadata_backend()
+                    .unwrap()
+                    .get_object_by_path(&sifs_file_system_id(), path)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+        backend
+            .write_file_with_deadline(
+                path,
+                b"next caller",
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(backend.read_file(path).unwrap(), b"next caller");
+    }
+
+    #[test]
     fn ordinary_sifs_write_cannot_succeed_before_its_receipt_threshold() {
         use sinomo_runtime::dfs::test_support::{DfsTestFaultAction, DfsTestFaultRule};
         for overwrite in [false, true] {
@@ -8758,6 +8862,11 @@ mod tests {
                 (job.accepted_config, targets)
             });
             fixture.with_native(|native, _| {
+                // Applying the policy commits it to KV. Each node uses its own
+                // published projection when admitting the write or its receipts.
+                for node in std::iter::once(&caller).chain(&targets) {
+                    native.wait_published_configuration_current(node).unwrap();
+                }
                 let projection = native
                     .control_plane_client()
                     .unwrap()
@@ -9134,18 +9243,21 @@ mod tests {
     fn metadata_journal_heads(
         data_dir: &SinomoDataDir,
         shards: &[DfsMetadataShardConfig],
-    ) -> Vec<(String, Vec<u8>)> {
+    ) -> Vec<(String, sinomo_runtime::dfs::DfsMetadataPrefixProof)> {
         shards
             .iter()
             .map(|shard| {
-                let shard_id = sinomo_runtime::dfs::DfsMetadataShardId::new(&shard.shard_id);
-                let head = sinomo_runtime::dfs::local_dfs_metadata_shard_path(data_dir, &shard_id)
-                    .join("journal/head.sobj");
-                (
-                    shard.shard_id.clone(),
-                    fs::read(&head)
-                        .unwrap_or_else(|error| panic!("cannot read {}: {error}", head.display())),
+                let id = sinomo_runtime::dfs::DfsMetadataShardId::new(&shard.shard_id);
+                let backend = sinomo_runtime::dfs::LocalSobjMetadataBackend::open_for_inspection(
+                    id.clone(),
+                    sinomo_runtime::dfs::local_dfs_metadata_shard_path(data_dir, &id),
                 )
+                .expect("open current journal for observation");
+                let head =
+                    sinomo_runtime::dfs::DfsMetadataBackend::metadata_prefix_proof(&backend, &id)
+                        .expect("read durable journal identity")
+                        .expect("seeded shard has an exact journal prefix");
+                (shard.shard_id.clone(), head)
             })
             .collect()
     }

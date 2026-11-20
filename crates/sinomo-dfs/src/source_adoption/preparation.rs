@@ -1758,7 +1758,7 @@ mod genuine_source_first_tests {
             .find(|node| **node != coordinator && **node != nested.primary_node_id)
             .unwrap();
         let mut unrelated = native.client(outsider).unwrap();
-        let mut requester = native.client(&nodes[0]).unwrap();
+        let mut requester = native.single_attempt_client(&nodes[0]).unwrap();
         let source_pause = native
             .pause_source_preparation(
                 &coordinator,
@@ -2239,7 +2239,7 @@ mod genuine_source_first_tests {
         drop(seed);
         let (coordinator, target) = source_first_coordinator_and_target(&native, &nested, &nodes);
         assert!(nested.primary_node_id < coordinator);
-        let mut requester = native.client(&nodes[0]).unwrap();
+        let mut requester = native.single_attempt_client(&nodes[0]).unwrap();
         let source_pause = native
             .pause_source_preparation(
                 &coordinator,

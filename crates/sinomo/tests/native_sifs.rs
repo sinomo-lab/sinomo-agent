@@ -136,21 +136,13 @@ impl Node {
                     // do not initialize stores or grant serving authority.
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     assert!(!remaining.is_zero(), "isolated DFS bootstrap timed out");
-                    let request = sinomo_runtime::dfs::dfs_inspection_rpc_request(
-                        &sinomo_runtime::dfs::DaemonDfsInspectionRequest::Status,
-                    )
-                    .unwrap();
+                    let request = sinomo_runtime::dfs::dfs_status_rpc_request().unwrap();
                     let response = client
                         .with_timeout(remaining.min(Duration::from_millis(300)))
                         .call_request(&request)
-                        .expect("observe owned DFS bootstrap status");
-                    let sinomo_runtime::dfs::DaemonDfsInspectionResponse::Status {
-                        status: dfs_status,
-                    } = sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
-                        .expect("decode owned DFS bootstrap status")
-                    else {
-                        panic!("DFS status returned a different response contract");
-                    };
+                        .expect("observe resident DFS readiness");
+                    let dfs_status = sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response)
+                        .expect("decode resident DFS status");
                     if !dfs_status.incomplete_reasons.is_empty()
                         || dfs_status.file_system_count == 0
                         || dfs_status.object_count == 0
@@ -325,6 +317,14 @@ fn undeleted_chat_shutdown(fixture_unwind: bool) {
     let opened = client
         .open()
         .expect("open resident chat without a model turn");
+    client
+        .command(
+            sinomo_client::chat_contract::ChatSessionCommand::SetWorkspace {
+                session_id: String::new(),
+                workspace_root: None,
+            },
+        )
+        .expect("activate the hosted workspace without submitting a model turn");
     let mut cursor = opened.next_event_sequence;
     let deadline = Instant::now() + Duration::from_secs(30);
     let session = 'ready: loop {
@@ -445,6 +445,14 @@ fn undeleted_chat_shutdown(fixture_unwind: bool) {
         format!("readback-{mode}-{}", std::process::id()),
     );
     let opened = resumed.open().unwrap();
+    resumed
+        .command(
+            sinomo_client::chat_contract::ChatSessionCommand::SetWorkspace {
+                session_id: String::new(),
+                workspace_root: None,
+            },
+        )
+        .expect("activate the hosted workspace without submitting a model turn");
     let mut cursor = opened.next_event_sequence;
     let deadline = Instant::now() + Duration::from_secs(30);
     let resumed_session = 'ready: loop {
@@ -617,12 +625,19 @@ fn native_sifs_kernel_roundtrip_restart_and_cleanup() {
         .write_file(original, api_payload.as_bytes())
         .expect("original write outcome; never replay an uncertain write");
     // Exercise the agent's actual mount producer, not just the FUSE adapter.
-    // Opening a view initializes the hosted runtime but sends no model turn.
+    // A workspace command activates the dormant view without submitting a model turn.
     let client_id = format!("native-sifs-view-{}", std::process::id());
     let chat = ChatDaemonClient::at_address(&node.status().address, &client_id);
     let opened = chat
         .open()
         .expect("open the isolated hosted chat without a turn");
+    chat.command(
+        sinomo_client::chat_contract::ChatSessionCommand::SetWorkspace {
+            session_id: String::new(),
+            workspace_root: None,
+        },
+    )
+    .expect("activate the hosted workspace without submitting a model turn");
     let mut cursor = opened.next_event_sequence;
     let ready_by = Instant::now() + Duration::from_secs(30);
     let (session_id, info) = 'ready: loop {

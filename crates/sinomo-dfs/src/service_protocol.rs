@@ -320,6 +320,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::ContentRootCatalogPageResponse(page) => {
                 events.push(self.handle_content_root_catalog_page_response(source_node_id, page)?);
             }
+            DfsNetworkMessage::PrimaryVerificationRequest(request) => {
+                self.handle_primary_verification_request(&source_node_id, &request);
+            }
             DfsNetworkMessage::CommitVersionResponse(_)
             | DfsNetworkMessage::WriteRequest(_)
             | DfsNetworkMessage::WriteResponse(_) => {}

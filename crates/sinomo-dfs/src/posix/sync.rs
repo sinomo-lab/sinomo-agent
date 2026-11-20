@@ -11,14 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use super::Result;
 use crate::posix_model::posix_error_for_namespace_rejection;
+use crate::service_record_follow::DfsFollowedNamespaceRoute;
 use crate::{
     DfsError, DfsMessageTransport, DfsMetadataQuorumSyncCertificate, DfsNamespaceOperation,
     DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
     DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFileSyncEvidence, DfsPosixFileSyncTarget,
     DfsPosixSyncKind, DfsWriteIntentStatus, NetworkedDfsService,
 };
-
-const POSIX_SYNC_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 
 /// Certificate returned after content and metadata satisfy a file barrier.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -784,70 +783,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn route_posix_sync_operation(
         &mut self,
-        mut primary: sinomo_core::node::NodeId,
+        primary: sinomo_core::node::NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<DfsPosixCoordinationResult> {
         let file_system_id = crate::sifs_file_system_id();
-        for _ in 0..POSIX_SYNC_AUTHORITY_REDIRECT_LIMIT {
-            let settled = self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    crate::DFS_NO_CALLER_BUDGET,
-                    false,
-                    false,
-                )
-                .map_err(DfsPosixError::from)?;
-            match settled.result {
-                DfsNamespaceResult::Applied => {
-                    return settled.posix_coordination_result.ok_or_else(|| {
-                        DfsPosixError::Dfs(DfsError::Distributed {
-                            message: "POSIX sync response omitted its typed certificate"
-                                .to_string(),
-                        })
-                    });
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current == self.node_id
-                    && !self.transport.delegates_local_namespace_authority() =>
-                {
-                    return self
-                        .execute_posix_coordination_operation_local(&operation)?
-                        .ok_or_else(|| {
-                            DfsPosixError::Dfs(DfsError::Distributed {
-                                message: "local POSIX sync omitted its typed certificate"
-                                    .to_string(),
-                            })
-                        });
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current != primary => {
-                    primary = self
-                        .refreshed_primary_after_authority_redirect(
-                            &file_system_id,
-                            &operation,
-                            &primary,
-                            current,
-                        )
-                        .map_err(DfsPosixError::from)?;
-                }
+        let followed = self
+            .route_namespace_following_record(
+                None,
+                &file_system_id,
+                primary,
+                &operation,
+                crate::DFS_NO_CALLER_BUDGET,
+                false,
+                false,
+            )
+            .map_err(DfsPosixError::from)?;
+        match followed {
+            DfsFollowedNamespaceRoute::LocalAuthority => self
+                .execute_posix_coordination_operation_local(&operation)?
+                .ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "local POSIX sync omitted its typed certificate".to_string(),
+                    })
+                }),
+            DfsFollowedNamespaceRoute::Settled(settled) => match settled.result {
+                DfsNamespaceResult::Applied => settled.posix_coordination_result.ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Distributed {
+                        message: "POSIX sync response omitted its typed certificate".to_string(),
+                    })
+                }),
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
                     ..
-                } => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
-            }
+                } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+            },
         }
-        Err(DfsPosixError::Dfs(DfsError::Distributed {
-            message: format!(
-                "POSIX sync exceeded {POSIX_SYNC_AUTHORITY_REDIRECT_LIMIT} authority redirects"
-            ),
-        }))
     }
 }
 

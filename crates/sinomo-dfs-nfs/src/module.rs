@@ -35,6 +35,10 @@ pub struct NfsMountConfig {
     pub root_path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// The longest one NFS request waits for its DFS work, as a duration
+    /// such as `30s`. Absent, a request waits for its outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_budget: Option<String>,
 }
 
 impl Default for NfsMountConfig {
@@ -46,6 +50,7 @@ impl Default for NfsMountConfig {
             export_name: default_export_name(),
             root_path: default_root_path(),
             read_only: false,
+            operation_budget: None,
         }
     }
 }
@@ -211,6 +216,13 @@ pub fn nfs_mount_config_definition() -> ConfigDefinition {
                 ConfigSchemaValue::bool(),
             )
             .with_default_value(Value::Bool(false)),
+            ConfigSchemaField::new(
+                "operation_budget",
+                "Operation budget",
+                "The longest one NFS request waits for its DFS work, such as 30s or 5m. Blank waits for the outcome.",
+                ConfigSchemaValue::string(),
+            )
+            .optional(),
         ],
     ))
     .expect("valid NFS mount config schema")

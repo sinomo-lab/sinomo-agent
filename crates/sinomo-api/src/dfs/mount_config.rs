@@ -42,6 +42,41 @@ pub struct SifsMountConfig {
     pub allow_other: bool,
     #[serde(default = "default_sync_local_changes")]
     pub sync_local_changes: bool,
+    /// The longest one filesystem call waits for its DFS work, as a duration
+    /// such as `30s`. Absent, a call waits for its outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_budget: Option<String>,
+}
+
+/// Parse a mount's operation budget: a whole number followed by `ms`, `s`,
+/// `m` or `h`. Blank text is no budget.
+pub fn parse_mount_operation_budget(text: &str) -> Result<Option<std::time::Duration>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let digits = text.trim_end_matches(|unit: char| unit.is_ascii_alphabetic());
+    let unit = &text[digits.len()..];
+    let invalid =
+        || format!("operation budget `{text}` is not a duration such as 500ms, 30s, 5m or 1h");
+    let count = digits.parse::<u64>().map_err(|_| invalid())?;
+    let budget = match unit {
+        "ms" => Some(std::time::Duration::from_millis(count)),
+        "s" => Some(std::time::Duration::from_secs(count)),
+        "m" => count.checked_mul(60).map(std::time::Duration::from_secs),
+        "h" => count.checked_mul(3600).map(std::time::Duration::from_secs),
+        _ => None,
+    }
+    .ok_or_else(invalid)?;
+    if budget.is_zero() {
+        return Err(format!(
+            "operation budget `{text}` must be greater than zero"
+        ));
+    }
+    if std::time::Instant::now().checked_add(budget).is_none() {
+        return Err(invalid());
+    }
+    Ok(Some(budget))
 }
 
 impl Default for SifsMountConfig {
@@ -53,6 +88,7 @@ impl Default for SifsMountConfig {
             read_only: default_read_only(),
             allow_other: false,
             sync_local_changes: default_sync_local_changes(),
+            operation_budget: None,
         }
     }
 }
@@ -350,6 +386,13 @@ pub fn sifs_mount_config_definition_for_module(module_id: impl Into<String>) -> 
                 ConfigSchemaValue::bool(),
             )
             .with_default_value(Value::Bool(default_sync_local_changes())),
+            ConfigSchemaField::new(
+                "operation_budget",
+                "Operation budget",
+                "Unix FUSE only. The longest one filesystem call waits for its DFS work, such as 30s or 5m. Blank waits for the outcome.",
+                ConfigSchemaValue::string(),
+            )
+            .optional(),
         ],
     ))
     .expect("valid SIFS mount config schema")

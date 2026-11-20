@@ -112,6 +112,7 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
         DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
             "content-root-catalog-page-response"
         }
+        DfsNetworkMessage::PrimaryVerificationRequest(_) => "primary-verification-request",
     }
 }
 
