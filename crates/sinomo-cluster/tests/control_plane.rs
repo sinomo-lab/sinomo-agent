@@ -4063,24 +4063,65 @@ fn kv_cluster_directory_serves_authoritative_connectivity_records() {
         0,
         Some("kv success".to_string()),
         None,
-        now,
-        600,
+        OffsetDateTime::now_utc(),
+        1,
     );
-    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![record.clone()])
+    let committed = sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![record.clone()])
         .expect("sync kv connectivity");
     write_local_cluster_connectivity_record_set(&paths, &node_a, &[])
         .expect("clear active local connectivity");
 
-    assert_eq!(
-        read_cluster_connectivity_graph_from_kv(&paths).expect("legacy kv graph"),
-        vec![record.clone()],
-        "KV should expose stored connectivity rows"
+    let key = cluster_connectivity_key(
+        &record.source_node_id,
+        &record.target_node_id,
+        &record.endpoint_id,
     );
     assert_eq!(
-        read_cluster_connectivity_graph(&paths).expect("active connectivity graph"),
-        vec![record],
-        "production route truth should come from cluster KV when available"
+        committed
+            .get(&key)
+            .unwrap()
+            .decode::<ClusterConnectivityRecord>()
+            .unwrap(),
+        record
     );
+    // The source published one real row and remains silent while its
+    // observation expires. Only the committed graph keeps this edge.
+    let until_expiry = record.expires_at - OffsetDateTime::now_utc();
+    if let Ok(wait) = std::time::Duration::try_from(until_expiry) {
+        std::thread::sleep(wait);
+    }
+    assert!(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .unwrap()
+            .is_empty()
+    );
+    let mut routing = read_cluster_connectivity_graph(&paths).unwrap();
+    assert_eq!(
+        routing.len(),
+        1,
+        "the committed route remains usable after its source TTL"
+    );
+    assert!(routing[0].expires_at > OffsetDateTime::now_utc());
+    routing[0].expires_at = record.expires_at;
+    assert_eq!(
+        routing,
+        [record.clone()],
+        "routing must preserve the actual source verdict"
+    );
+
+    // Keep the old bootstrap file on disk while the committed directory
+    // revokes the target. A stale bootstrap member cannot revive the edge.
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == record.target_node_id)
+        .unwrap()
+        .state = ClusterMemberState::Removed;
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("publish the removal");
+    assert!(read_cluster_connectivity_graph(&paths).unwrap().is_empty());
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![])
+        .expect("withdraw the source edge");
+    assert!(read_cluster_connectivity_graph(&paths).unwrap().is_empty());
 }
 
 #[test]

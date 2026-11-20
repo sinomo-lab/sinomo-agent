@@ -93,6 +93,23 @@ impl DaemonDfsMountedMutationHandoffClient {
         )
     }
 
+    /// Older daemons only implement the more restrictive installation-wide probe.
+    pub fn probe_fuse(&self) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let response = match self.call(DaemonDfsMountedMutationHandoffRequest::ProbeFuse) {
+            Ok(response) => response,
+            // A legacy Ready reply requires an entirely clean outbox. It
+            // cannot admit anything that the FUSE-specific probe would fence.
+            Err(DaemonApiError::RemoteService { .. }) => return self.probe(),
+            Err(error) => return Err(error),
+        };
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Ready,
+            None,
+            None,
+        )
+    }
+
     /// Durably arm a prepared marker. A successful return is the authoritative
     /// fsynced precondition which permits the caller to enter the mutation.
     pub fn arm(
@@ -286,7 +303,8 @@ fn daemon_dfs_mounted_mutation_handoff_operation_id(
     request: &DaemonDfsMountedMutationHandoffRequest,
 ) -> Option<&str> {
     match request {
-        DaemonDfsMountedMutationHandoffRequest::Probe => None,
+        DaemonDfsMountedMutationHandoffRequest::Probe
+        | DaemonDfsMountedMutationHandoffRequest::ProbeFuse => None,
         DaemonDfsMountedMutationHandoffRequest::Arm { arm_request_id, .. }
         | DaemonDfsMountedMutationHandoffRequest::CommitApplied { arm_request_id, .. }
         | DaemonDfsMountedMutationHandoffRequest::CommitUnknown { arm_request_id, .. }

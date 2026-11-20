@@ -3312,11 +3312,11 @@ fn repair_replica_accepts_stale_base_when_content_hash_matches_current() {
 #[test]
 fn unmanaged_manifest_reconnect_requires_native_receipt_publication() {
     let bytes = b"ordinary reconnect bytes";
-    let (runtime, mut dfs, stat, removed) = native_withdrawn_local_replica_fixture_for_policy(
-        "native-unmanaged-manifest-reconnect",
-        bytes,
-        false,
-    );
+    // The explicit publisher below must own the first publication after withdrawal.
+    let (runtime, mut dfs, stat, removed, executor_hold) =
+        native_withdrawn_local_replica_fixture_with_hold(
+            "native-unmanaged-manifest-reconnect", bytes, false, true,
+        );
     assert!(dfs.control_plane.is_some());
     // A reconnect starts with a real local manifest for these already verified
     // bytes. Recording local content is not a clustered receipt publication.
@@ -3441,6 +3441,7 @@ fn unmanaged_manifest_reconnect_requires_native_receipt_publication() {
         "an exact duplicate does not mint another event or timestamp"
     );
     drop(dfs);
+    drop(executor_hold);
     runtime.close().unwrap();
 }
 
@@ -3644,7 +3645,9 @@ pub(super) fn native_withdrawn_local_replica_fixture(
     DfsStat,
     DfsReplicaReceiptRecord,
 ) {
-    native_withdrawn_local_replica_fixture_for_policy(name, bytes, true)
+    let (runtime, author, stat, receipt, _) =
+        native_withdrawn_local_replica_fixture_with_hold(name, bytes, true, false);
+    (runtime, author, stat, receipt)
 }
 
 /// The same fixture with the shard primary's repair executor held from before
@@ -3663,21 +3666,6 @@ pub(super) fn native_withdrawn_local_replica_fixture_held(
     let (runtime, author, stat, receipt, hold) =
         native_withdrawn_local_replica_fixture_with_hold(name, bytes, true, true);
     (runtime, author, stat, receipt, hold.expect("requested executor hold"))
-}
-
-fn native_withdrawn_local_replica_fixture_for_policy(
-    name: &str,
-    bytes: &[u8],
-    managed: bool,
-) -> (
-    crate::test_runtime::DfsTestRuntime,
-    NetworkedDfsService<DfsNodeTransport>,
-    DfsStat,
-    DfsReplicaReceiptRecord,
-) {
-    let (runtime, author, stat, receipt, _) =
-        native_withdrawn_local_replica_fixture_with_hold(name, bytes, managed, false);
-    (runtime, author, stat, receipt)
 }
 
 fn native_withdrawn_local_replica_fixture_with_hold(

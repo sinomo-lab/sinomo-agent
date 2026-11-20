@@ -2289,18 +2289,40 @@ fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliErr
         );
         return Ok(());
     }
-    if crate::dfs_mount_supervisor::managed_sifs_mount_config(&data_dir)
-        .map_err(|detail| CliError::Parse { detail })?
-        .enabled
-    {
-        return Err(CliError::Parse {
-            detail: "the supervised SIFS mount is enabled; disable `storage.sifs-mount` before starting a second foreground mount".to_string(),
-        });
-    }
-    let lease_owner = format!("foreground CLI mount {}", options.mount_point.display());
-    let _mount_lease =
-        crate::dfs_mount_supervisor::SifsMountLease::try_acquire(&data_dir, &lease_owner)
+    let managed = crate::dfs_mount_supervisor::managed_sifs_mount_config(&data_dir)
+        .map_err(|detail| CliError::Parse { detail })?;
+    let clustered_fuse = cfg!(all(unix, feature = "dfs-fuse"))
+        && ClusterPaths::new(&data_dir)
+            .state
+            .try_exists()
+            .map_err(|error| CliError::Parse {
+                detail: format!("inspect cluster identity for foreground mount: {error}"),
+            })?;
+    if managed.enabled {
+        let reserved = crate::dfs_mount_supervisor::resolve_mount_point(&data_dir, &managed.mount_point)
             .map_err(|detail| CliError::Parse { detail })?;
+        let same_target = reserved == options.mount_point
+            || std::fs::canonicalize(&reserved)
+                .ok()
+                .zip(std::fs::canonicalize(&options.mount_point).ok())
+                .is_some_and(|(managed, requested)| managed == requested);
+        if !clustered_fuse || same_target {
+            return Err(CliError::Parse {
+                detail: "the supervised SIFS mount owns the requested mount point".into(),
+            });
+        }
+    }
+    // Clustered FUSE mounts acquire a target-specific durable session in
+    // the outbox. The global supervisor lease still protects other backends.
+    let _mount_lease = if clustered_fuse {
+        None
+    } else {
+        let owner = format!("foreground CLI mount {}", options.mount_point.display());
+        Some(
+            crate::dfs_mount_supervisor::SifsMountLease::try_acquire(&data_dir, &owner)
+                .map_err(|detail| CliError::Parse { detail })?,
+        )
+    };
     #[cfg(windows)]
     {
         unreachable!("Windows foreground mounts are rejected before data-dir or lease effects")

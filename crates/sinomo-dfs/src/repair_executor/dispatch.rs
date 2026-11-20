@@ -148,7 +148,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let content_hash = candidate.need.content_hash.clone();
         let file_system_id = candidate.need.file_system_id.clone();
         let published =
-            self.with_table_intent_placement_authority(object_id, &intent.intent_id, |service| {
+            self.with_table_intent_placement_authority(object_id, &intent.intent_id, version, target, &candidate.need.content_hash, |service| {
                 if !service.ensure_local_repair_manifest(object_id, version, &content_hash)? {
                     return Ok(false);
                 }

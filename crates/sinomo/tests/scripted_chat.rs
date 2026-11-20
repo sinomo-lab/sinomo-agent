@@ -41,6 +41,68 @@ fn answer(text: &str) -> ScriptedReply {
 }
 
 #[test]
+fn daemon_recovers_pending_views_before_any_client_attaches() {
+    let root = sinomo_testdir::TestDir::new("sinomo-chat-boot-recovery");
+    let data = SinomoDataDir::new(root.path());
+    data.ensure_root_layout().unwrap();
+    let port = available_loopback_port();
+    initialize_cluster(&data, port);
+    let directory = data.root().join("events/agent/chat-hosts");
+    std::fs::create_dir_all(&directory).unwrap();
+    let damaged = directory.join(format!("{}.json", blake3::hash(b"damaged")));
+    std::fs::write(&damaged, b"{").unwrap();
+    let seed = |id: &str, state: &str, command: ChatSessionCommand| {
+        let path = directory.join(format!("{}.json", blake3::hash(id.as_bytes()).to_hex()));
+        let hash = blake3::hash(&serde_json::to_vec(&command).unwrap())
+            .to_hex()
+            .to_string();
+        let record = serde_json::json!({
+            "schema_version": 1, "execution_id": id, "bootstrap": [],
+            "entries": [{"id": id, "command": command, "command_hash": hash, "state": state}]
+        });
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        path
+    };
+    let running = seed(
+        "running-send",
+        "Running",
+        ChatSessionCommand::Send {
+            session_id: sinomo_runtime::events::SessionId::generate().to_string(),
+            text: "do not replay this uncertain send".into(),
+            attachments: vec![],
+        },
+    );
+    let pending = seed(
+        "pending-model",
+        "Pending",
+        ChatSessionCommand::SetModel {
+            provider: "scripted".into(),
+            model: "scripted".into(),
+            account: "default".into(),
+        },
+    );
+    let script = root.join("model.json");
+    ModelScript::new().save(&script).unwrap();
+    let _daemon = Daemon::start(&data, port, "recover-journals", &script);
+    let state = |path: &Path| {
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        journal["entries"][0]["state"].clone()
+    };
+    let deadline = Instant::now() + TURN_TIMEOUT;
+    while state(&running) != "Interrupted" || state(&pending) != "Complete" {
+        assert!(
+            Instant::now() < deadline,
+            "unexpected journal states: {}, {}",
+            state(&running),
+            state(&pending)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(std::fs::read(damaged).unwrap(), b"{");
+}
+
+#[test]
 fn a_scripted_chat_turn_runs_and_its_context_survives_a_daemon_restart() {
     let root = sinomo_testdir::TestDir::new("sinomo-scripted-chat");
     let data_dir = SinomoDataDir::new(root.path().to_path_buf());

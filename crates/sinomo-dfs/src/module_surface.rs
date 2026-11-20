@@ -60,6 +60,10 @@ pub fn register_storage_paths(
             "inline content mutation and migration owner fencing",
         ),
         (
+            "dfs/content/catalog-staging-owner.lock",
+            "DFS content catalog staging ownership",
+        ),
+        (
             "dfs/content/objects",
             "dynamic DFS object manifests stored as sinomo-object files",
         ),
@@ -496,6 +500,7 @@ mod tests {
 
         for path in [
             "dfs/content/file-readers-v2.lock",
+            "dfs/content/catalog-staging-owner.lock",
             "dfs/content/content-reservations/write.lock",
             "dfs/content/content-reservations/00/batch-format-v1.sobj",
             "dfs/content/catalog/metadata-content-roots.sobj",

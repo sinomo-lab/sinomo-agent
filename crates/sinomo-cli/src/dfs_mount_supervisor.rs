@@ -799,7 +799,10 @@ fn stop_active(active: &mut Option<ActiveMount>, disposition: ActiveMountStopDis
     }
 }
 
-fn resolve_mount_point(data_dir: &SinomoDataDir, value: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_mount_point(
+    data_dir: &SinomoDataDir,
+    value: &str,
+) -> Result<PathBuf, String> {
     if value.trim() != value || value.is_empty() {
         return Err("mount point must be non-empty without surrounding whitespace".to_string());
     }

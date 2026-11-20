@@ -490,9 +490,12 @@ fn append_jsonl_record_mode<T: Serialize>(
     let result = (|| {
         rotate_jsonl_if_needed(path, rotation)?;
         let created = !path.exists();
+        // Tail repair may resize the file. Windows append-only handles cannot
+        // do that. The journal lock serializes the repair, seek and write.
         let mut file = fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .append(!durable)
+            .write(durable)
             .read(durable)
             .open(path)
             .map_err(|source| ObserveError::Io {
@@ -2188,7 +2191,8 @@ mod tests {
 
 fn truncate_torn_jsonl_tail(file: &mut fs::File) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut cursor = file.metadata()?.len();
+    let length = file.metadata()?.len();
+    let mut cursor = length;
     let mut buffer = [0u8; 4096];
     while cursor > 0 {
         let start = cursor.saturating_sub(buffer.len() as u64);
@@ -2196,10 +2200,16 @@ fn truncate_torn_jsonl_tail(file: &mut fs::File) -> std::io::Result<()> {
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut buffer[..n])?;
         if let Some(index) = buffer[..n].iter().rposition(|byte| *byte == b'\n') {
-            file.set_len(start + index as u64 + 1)?;
+            let end = start + index as u64 + 1;
+            if end < length {
+                file.set_len(end)?;
+            }
             return Ok(());
         }
         cursor = start;
     }
-    file.set_len(0)
+    if length != 0 {
+        file.set_len(0)?;
+    }
+    Ok(())
 }

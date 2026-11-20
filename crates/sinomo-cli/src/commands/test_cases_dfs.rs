@@ -421,7 +421,21 @@ fn prepare_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             .create_dir_all(path)
             .map_err(SinomoTestError::failed)?;
         let installed = || -> Result<bool, String> {
-            Ok(browser.stat(path)?.placement.is_some_and(|placement| {
+            // Changing this rule expands the shard that serves this very stat.
+            // A receiver may reject an older membership stamp during handoff.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stat = loop {
+                match browser.stat(path) {
+                    Err(error)
+                        if error.contains("namespace authority shard stamp does not match")
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    result => break result?,
+                }
+            };
+            Ok(stat.placement.is_some_and(|placement| {
                 verify_write_latency_placement(&placement, path, &policy).is_ok()
             }))
         };
@@ -2475,7 +2489,8 @@ fn wait_for_placement_job(
                 job.last_error.as_deref().unwrap_or("none")
             ));
         }
-        let _ = browser.request_maintenance_refresh();
+        // Placement publication wakes its coordinator. This observer has not
+        // replaced cluster state and must not announce a topology change.
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
 }

@@ -373,7 +373,36 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             .field("members", "Vec<ClusterMemberRecord>"),
     )?;
     layout.register_binary("sinomo-cluster", StorageRing::R1, "cluster/state.sobj.lock")?;
+    // Installations may retain these receipts after switching to route hints.
+    // This declaration identifies their original owner and wire schema.
+    layout.register_sinomo_object(
+        "sinomo-cluster",
+        StorageRing::R1,
+        "cluster/endpoint-recovery/{operation_id}.sobj",
+        ObjectSchema::new("EndpointRecoveryReceipt", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("spec", "EndpointRecoverySpec")
+            .field("before", "ClusterBootstrapState")
+            .field("after", "ClusterBootstrapState")
+            .field("phase", "EndpointRecoveryOutcome")
+            .field("authority", "KvAuthorityProof"),
+    )?;
     Ok(())
+}
+
+#[test]
+fn storage_layout_recognizes_only_the_retained_endpoint_receipt_shape() {
+    let mut layout = StorageLayout::new();
+    register_storage_paths(&mut layout).unwrap();
+    assert!(
+        layout
+            .owner_for("cluster/endpoint-recovery/old.sobj")
+            .is_some()
+    );
+    assert!(
+        layout
+            .owner_for("cluster/endpoint-recovery/nested/old.sobj")
+            .is_none()
+    );
 }
 
 /// Installs the KV-backed [`sinomo_network::ClusterDirectory`] as the process

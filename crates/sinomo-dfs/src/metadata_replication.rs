@@ -1090,6 +1090,14 @@ pub fn dfs_metadata_replication_sent_count(report: &DfsMetadataJournalReplicatio
 pub fn dfs_metadata_replication_notice_lines(
     report: &DfsMetadataJournalReplicationReport,
 ) -> Vec<String> {
+    dfs_metadata_replication_notices(report)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+pub(crate) fn dfs_metadata_replication_notices(
+    report: &DfsMetadataJournalReplicationReport,
+) -> impl Iterator<Item = (tracing::Level, String)> {
     report
         .outcomes
         .iter()
@@ -1098,16 +1106,16 @@ pub fn dfs_metadata_replication_notice_lines(
                 target_node_id,
                 entries,
                 ..
-            } => Some(format!(
+            } => Some((tracing::Level::INFO, format!(
                 "replicated {entries} DFS metadata journal entries to {target_node_id}"
-            )),
+            ))),
             DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
                 target_node_id,
                 next_after_sequence,
                 ..
-            } => Some(format!(
+            } => Some((tracing::Level::INFO, format!(
                 "repaired DFS metadata replica {target_node_id} with snapshot through {next_after_sequence}"
-            )),
+            ))),
             DfsMetadataJournalReplicationOutcome::Rejected {
                 target_node_id,
                 shard_id,
@@ -1127,9 +1135,9 @@ pub fn dfs_metadata_replication_notice_lines(
                 ) {
                     None
                 } else {
-                    Some(format!(
+                    Some((tracing::Level::WARN, format!(
                         "DFS metadata replication to {target_node_id} failed: {reason}"
-                    ))
+                    )))
                 }
             }
             DfsMetadataJournalReplicationOutcome::BacklogRemaining {
@@ -1145,9 +1153,9 @@ pub fn dfs_metadata_replication_notice_lines(
                 ) {
                     None
                 } else {
-                    Some(format!(
+                    Some((tracing::Level::WARN, format!(
                         "DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
-                    ))
+                    )))
                 }
             }
             DfsMetadataJournalReplicationOutcome::NoChanges { .. }
@@ -1169,7 +1177,6 @@ pub fn dfs_metadata_replication_notice_lines(
                 ..
             } => None,
         })
-        .collect()
 }
 
 fn dfs_metadata_report_has_cursor_durability_inconsistency(
@@ -10101,6 +10108,12 @@ mod cursor_update_tests {
             ],
         };
 
+        assert_eq!(
+            dfs_metadata_replication_notices(&report)
+                .map(|(level, _)| level)
+                .collect::<Vec<_>>(),
+            [tracing::Level::INFO],
+        );
         assert_eq!(
             dfs_metadata_replication_notice_lines(&report),
             vec![format!(

@@ -2591,7 +2591,7 @@ async fn write_rejection<W: RpcRecordWriter>(
 /// request framing reaches a valid terminal length.
 async fn serve_object_rpc_records<R, W, F, Fut>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     context: &RpcPeerContext,
     options: ObjectFrameIoOptions,
     handler: F,
@@ -2620,8 +2620,47 @@ where
     // heads and leave no slab available to send their responses.
     drop(head_payload);
     validate_request_head(&head)?;
-    let request_is_inline = matches!(head.descriptor, BodyDescriptor::Inline { .. });
+    let route = head.method.clone();
     let request_id = head.request_id.clone();
+    serve_validated_object_rpc_records(
+        reader,
+        writer,
+        context,
+        options,
+        handler,
+        head,
+        request_ingress_started_ns,
+    )
+    .await
+    .map_err(|error| match error {
+        NetworkError::Io { operation, detail } => NetworkError::Io {
+            operation,
+            detail: format!(
+                "{detail} (RPC {route:?}, request {request_id}, session {})",
+                context.session_id
+            ),
+        },
+        other => other,
+    })
+}
+
+async fn serve_validated_object_rpc_records<R, W, F, Fut>(
+    reader: R,
+    mut writer: W,
+    context: &RpcPeerContext,
+    options: ObjectFrameIoOptions,
+    handler: F,
+    head: RequestHeadUnsigned,
+    request_ingress_started_ns: u64,
+) -> Result<(), NetworkError>
+where
+    R: RpcRecordReader,
+    W: RpcRecordWriter,
+    F: FnOnce(ObjectRpcStreamIncomingCall, RpcPeerContext) -> Fut,
+    Fut: Future<Output = Result<ObjectRpcStreamReply, NetworkError>>,
+{
+    let request_is_inline = matches!(head.descriptor, BodyDescriptor::Inline { .. });
+    let request_id = head.request_id;
     let negotiated_response_progress_interval =
         response_progress_interval(options, head.response_progress_interval_millis);
     let (body, request_body_completion, request_receive_completion) = make_incoming_body(
@@ -3693,6 +3732,45 @@ mod tests {
                 )
                 .await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_call_reports_the_route_request_and_session() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (_, context) = peer_contexts();
+        let session = context.session_id.clone();
+        let options = ObjectFrameIoOptions { idle_timeout: None };
+        let (accepted, entered) = tokio::sync::oneshot::channel();
+        let (finish, released) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            serve_object_rpc_stream(server, &context, options, |call, _| async move {
+                call.body.collect_to_vec(1).await?;
+                accepted.send(call.request_id.clone()).unwrap();
+                released.await.unwrap();
+                Ok(ObjectRpcStreamReply::new(
+                    call.request_id,
+                    ObjectRpcStreamBody::bytes(vec![]),
+                ))
+            })
+            .await
+        });
+        let calling = tokio::spawn(call_object_rpc_stream(
+            client,
+            ObjectRpcStreamCall::new("/test/poll", ObjectRpcStreamBody::bytes(vec![])),
+            options,
+            |_| async { Ok(()) },
+        ));
+        let id = tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        calling.abort();
+        assert!(calling.await.unwrap_err().is_cancelled());
+        finish.send(()).unwrap();
+        let error = serving.await.unwrap().unwrap_err().to_string();
+        for field in ["/test/poll", id.as_str(), session.as_str()] {
+            assert!(error.contains(field), "{error}");
         }
     }
 

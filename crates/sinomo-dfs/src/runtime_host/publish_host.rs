@@ -149,8 +149,12 @@ fn request_daemon_dfs_lane_publish_after_foreground_work(
 }
 
 pub(super) fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
-    for line in sinomo_dfs::dfs_metadata_replication_notice_lines(&report) {
-        tracing::warn!("sinomo daemon {line}");
+    for (level, line) in crate::metadata_replication::dfs_metadata_replication_notices(&report) {
+        if level == tracing::Level::INFO {
+            tracing::info!("sinomo daemon {line}");
+        } else {
+            tracing::warn!("sinomo daemon {line}");
+        }
     }
     for line in sinomo_dfs::dfs_metadata_replication_fault_notice_lines(&report) {
         tracing::warn!(

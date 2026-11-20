@@ -569,6 +569,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "repair reply publication requires the shard tables".into(),
             })?
             .get_version(&response.object_id, &response.version)?
+            .filter(|record| record.file_system_id == response.file_system_id)
             .and_then(|record| record.content_hash);
         if version_hash.as_deref() != Some(content_hash) {
             return Ok((
@@ -581,6 +582,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let published = self.with_table_intent_placement_authority(
             &response.object_id,
             &response.intent_id,
+            &response.version,
+            &response.replica_node_id,
+            content_hash,
             |service| {
             match service.put_metadata_receipt(
                 &response.file_system_id,

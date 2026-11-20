@@ -667,6 +667,28 @@ mod tests {
         }
     }
     #[test]
+    fn first_durable_append_recovers_a_segment_without_a_complete_record() {
+        let dir = sinomo_testdir::TestDir::new("usage-no-complete-record");
+        let ledger = UsageLedger::new(&SinomoDataDir::new(&dir));
+        fs::create_dir_all(&ledger.root).unwrap();
+        let segment = ledger.root.join("0.jsonl");
+        fs::write(&segment, vec![b'x'; 8193]).unwrap();
+        ledger.append(&sample(60_000)).unwrap();
+        let first = fs::read(&segment).unwrap();
+        assert_eq!(first.iter().filter(|&&b| b == b'\n').count(), 1);
+        ledger.append(&sample(120_000)).unwrap();
+        assert!(fs::read(&segment).unwrap().starts_with(&first));
+        assert_eq!(
+            ledger
+                .query(&UsageQuery::default(), "n1")
+                .unwrap()
+                .totals
+                .model_requests,
+            2
+        );
+    }
+
+    #[test]
     fn torn_tail_is_discarded_before_next_append() {
         let dir = sinomo_testdir::TestDir::new("usage-torn-tail");
         let data = SinomoDataDir::new(&dir);

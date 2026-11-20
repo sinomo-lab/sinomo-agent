@@ -15143,7 +15143,9 @@ fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
         .as_ref()
         .unwrap()
         .clone();
-    let opens = daemon_dfs_test_message_service_lane_open_count(&data_dir);
+    // Each newly opened mutation service allocates its own frame-ID sequence.
+    // Holding the sequence leaves the service available for the exclusive take.
+    let frame_ids = Arc::clone(&observed.lock().unwrap().service.next_frame_id);
     let admitted = preflight.for_admission(&admission);
     let error = match take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
@@ -15244,10 +15246,19 @@ fn rejected_shared_maintenance_take_keeps_the_actual_cached_service() {
         )
         .unwrap()
     );
-    assert_eq!(
-        daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        opens
-    );
+    let restored = slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .primary_service
+        .clone()
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &frame_ids,
+        &restored.lock().unwrap().service.next_frame_id
+    ));
+    drop(restored);
     drop(admission);
     drop(preflight);
     native.close().unwrap();

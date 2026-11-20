@@ -1937,7 +1937,7 @@ impl SifsFuseFileSystem {
                 client,
                 |client| {
                     client
-                        .probe()
+                        .probe_fuse()
                         .map(drop)
                         .map_err(|source| DfsFuseError::Dfs(source.to_string()))
                 },
@@ -1945,10 +1945,7 @@ impl SifsFuseFileSystem {
                     let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir)
                         .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
                     let session = store
-                        .open_host_mount_session(
-                            dfs::MountedSifsMutationAdapter::Fuse,
-                            format!("fuse:{lock_mount_session_id}"),
-                        )
+                        .open_fuse_mount_session(&options.mount_point)
                         .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
                     let resender = FuseMountedMutationHandoff::start_resender(
                         client.clone(),

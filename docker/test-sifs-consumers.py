@@ -246,6 +246,13 @@ class Consumers(history.Acceptance):
                 require(search["continuation_count"] > 0 and search["page_count"] > 1,
                         f"{phase}/{node}: search did not exercise an actual continuation")
 
+    def concurrent_fuse_sessions(self):
+        script = (DOCKER / "test-fuse-session-overlap.sh").read_text()
+        self.run("concurrent-fuse-session-crash",
+                 [*self.compose, "exec", "-T", "node1", "timeout", "--kill-after=5s",
+                  "150s", "sh", "-c", script, "fuse-session-overlap", self.agent],
+                 timeout=160)
+
     def product_home(self, phase, create=False):
         if create:
             self.native("node1", "cluster.sifs.agent-home-command", phase + "-node1-product-home-create",
@@ -864,11 +871,13 @@ def main():
                 run.verify_processes("initial"), run.verify_observe(), run.verify_online_cluster("diagnostic-initial")))
             run.phase("notes-first-private-home-interoperability", run.notes_first_home)
             run.phase("product-FUSE-sandbox-agent-home", lambda: run.product_home("initial", create=True))
+            run.phase("concurrent-fuse-session-crash", run.concurrent_fuse_sessions)
         else:
             run.phase("source-and-runtime-identity", lambda: (run.verify_processes("initial"), run.verify_observe(), run.wait_ready("consumer-initial")))
             run.phase("channels-concurrent-and-all-node", run.seed_channels)
             run.phase("notes-first-private-home-interoperability", run.notes_first_home)
             run.phase("product-FUSE-sandbox-agent-home", lambda: run.product_home("initial", create=True))
+            run.phase("concurrent-fuse-session-crash", run.concurrent_fuse_sessions)
             run.phase("canonical-home-and-memory-all-node", run.seed_storage)
             run.phase("independent-node-memory-indexes", run.index_initial)
             run.phase("memory-cas-isolation-and-index-refresh", run.replace_memory)

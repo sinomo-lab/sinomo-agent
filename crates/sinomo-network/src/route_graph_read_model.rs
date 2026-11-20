@@ -205,10 +205,9 @@ impl ClusterConnectivityGraph {
         if let Some(graph) = read_cluster_route_graph_from_cache(paths, state, before_mark, now) {
             return Ok(graph);
         }
-        let graph = Self::try_read_for_local_with_query(
-            paths,
-            state,
-            &crate::connectivity::DirectoryConnectivityRecordQuery,
+        let graph = Self::try_from_records(
+            crate::object::try_clone_id(&state.local_node_id, "build local route graph")?,
+            effective_connectivity_records(paths, Some(state))?,
         )?;
         let after_mark = cluster_route_graph_cache_mark(paths);
         if before_mark == after_mark {
@@ -226,10 +225,9 @@ impl ClusterConnectivityGraph {
         if let Some(graph) = read_cluster_route_graph_from_cache(paths, state, before_mark, now) {
             return graph;
         }
-        let graph = Self::read_for_local_with_query(
-            paths,
-            state,
-            &crate::connectivity::DirectoryConnectivityRecordQuery,
+        let graph = Self::from_records(
+            state.local_node_id.clone(),
+            effective_connectivity_records(paths, Some(state)).unwrap_or_default(),
         );
         let after_mark = cluster_route_graph_cache_mark(paths);
         if before_mark == after_mark {
@@ -415,8 +413,41 @@ fn evict_cluster_route_graph_cache_entry_if_needed(
 pub fn read_cluster_connectivity_graph(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    read_cluster_connectivity_graph_with_query(
+    let state =
+        crate::object_file_store::read_optional_object_file::<ClusterBootstrapState>(&paths.state)
+            .ok()
+            .flatten();
+    effective_connectivity_records(paths, state.as_ref())
+}
+
+fn effective_connectivity_records(
+    paths: &ClusterPaths,
+    state: Option<&ClusterBootstrapState>,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    // Use the connector's coherent membership, endpoints and committed edges.
+    // Raw observation timestamps bound local evidence, not the lifetime of a
+    // quorum-published verdict. The snapshot also excludes revoked members.
+    if let Some(state) = state {
+        match crate::directory::cluster_directory_for(paths).routing_records_snapshot() {
+            Ok(snapshot) => {
+                let (version, members, endpoints, records) = snapshot.into_parts();
+                if !members.is_empty() {
+                    let directory =
+                        crate::DirectorySnapshot::try_from_records(version, members, endpoints)?;
+                    return read_cluster_connectivity_graph_for_routing_snapshot(
+                        paths, state, &directory, records,
+                    );
+                }
+            }
+            Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    read_cluster_connectivity_graph_with_bootstrap_and_query(
         paths,
+        state.map(|s| &s.cluster_id),
+        state.map(|s| &s.local_node_id),
+        state,
         &crate::connectivity::DirectoryConnectivityRecordQuery,
     )
 }

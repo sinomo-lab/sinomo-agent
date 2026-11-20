@@ -87,6 +87,7 @@ impl CommandJournal {
         if state.execution_id != id {
             return Err("chat execution identity mismatch".into());
         }
+        let mut interrupted = false;
         for entry in &mut state.entries {
             if matches!(entry.state, CommandState::Pending | CommandState::Running)
                 && entry.command.is_none()
@@ -95,14 +96,21 @@ impl CommandJournal {
             }
             if entry.state == CommandState::Running {
                 entry.state = CommandState::Interrupted;
+                interrupted = true;
             }
         }
-        Ok(Self {
+        let journal = Self {
             path,
             data_dir: data_dir.to_path_buf(),
             _owner: Arc::new(owner),
             state: Arc::new(Mutex::new(state)),
-        })
+        };
+        // Persist the uncertainty before any network access. A second crash
+        // must see the same outcome even if this view could not be restored.
+        if interrupted {
+            journal.change(|_| Ok(()))?;
+        }
+        Ok(journal)
     }
 
     pub(super) fn data_dir(&self) -> PathBuf {
@@ -250,32 +258,45 @@ impl CommandJournal {
         })
     }
 
-    pub(super) fn discover(data_dir: &Path) -> Result<Vec<String>, String> {
+    pub(super) fn journal_paths(data_dir: &Path) -> Result<Vec<PathBuf>, String> {
         let directory = data_dir.join("events/agent/chat-hosts");
         let files = match fs::read_dir(directory) {
             Ok(files) => files,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(e.to_string()),
         };
-        let mut hosts = Vec::new();
+        let mut paths = Vec::new();
         for file in files {
-            let file = file.map_err(|e| e.to_string())?;
-            if file.path().extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let state: Journal =
-                serde_json::from_slice(&fs::read(file.path()).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            if state
-                .entries
-                .iter()
-                .any(|e| e.state == CommandState::Pending || e.state == CommandState::Running)
-            {
-                super::validate_client_id(&state.execution_id)?;
-                hosts.push(state.execution_id);
+            let path = file.map_err(|e| e.to_string())?.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                paths.push(path);
             }
         }
-        Ok(hosts)
+        Ok(paths)
+    }
+
+    pub(super) fn recoverable_execution(path: &Path) -> Result<Option<String>, String> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let state: Journal = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if !state
+            .entries
+            .iter()
+            .any(|e| matches!(e.state, CommandState::Pending | CommandState::Running))
+        {
+            return Ok(None);
+        }
+        super::validate_client_id(&state.execution_id)?;
+        let key = blake3::hash(state.execution_id.as_bytes()).to_hex();
+        if path.file_stem().and_then(|s| s.to_str()) != Some(key.as_str()) {
+            return Err(
+                "chat recovery journal filename does not match its execution identity".into(),
+            );
+        }
+        Ok(Some(state.execution_id))
     }
 
     pub(super) fn recovery(&self) -> Result<RecoveredCommands, String> {
@@ -322,6 +343,37 @@ pub(super) fn resume_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_command_is_durable_before_the_view_can_attach() {
+        let dir = sinomo_testdir::TestDir::new("chat-failed-attach");
+        let command = wire::ChatSessionCommand::Send {
+            session_id: "chat".into(),
+            text: "once".into(),
+            attachments: vec![],
+        };
+        let journal = CommandJournal::open(&dir, "view").unwrap();
+        journal.admit("original", &command).unwrap();
+        journal.start("original").unwrap();
+        drop(journal);
+        let path = CommandJournal::journal_paths(&dir).unwrap().pop().unwrap();
+        assert_eq!(
+            CommandJournal::recoverable_execution(&path)
+                .unwrap()
+                .as_deref(),
+            Some("view")
+        );
+        let reopened = CommandJournal::open(&dir, "view").unwrap();
+        assert!(reopened.recovery().unwrap().2);
+        drop(reopened);
+        assert_eq!(CommandJournal::recoverable_execution(&path).unwrap(), None);
+        assert!(
+            CommandJournal::open(&dir, "view")
+                .unwrap()
+                .admit("original", &command)
+                .is_err()
+        );
+    }
+
     #[test]
     fn only_explicit_non_admission_remains_pending_after_reopen() {
         let dir = sinomo_testdir::TestDir::new("chat-not-owner-recovery");

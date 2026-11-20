@@ -94,7 +94,7 @@ pub(super) async fn acquire(
         if let Some((hook, command)) = hook.as_ref() {
             hook(DaemonDfsPreDispatchTestPoint::PlacementPermitQuorum {releasing:false}, Some(command), None)?;
         }
-        let acquired = crate::placement::acquire_placement_permit(&mut control, &local, &command.file_system_id, job_id, Some(path),
+        let acquired = crate::placement::acquire_placement_permit(&mut control, &local, &command.file_system_id, job_id, crate::placement::PlacementPermitScope::Job(Some(path)),
             #[cfg(test)] crate::test_runtime::observe_placement_authority_call(&root, &_owner, job_id, Some(path)),
         );
         let (job, permit) = match acquired {

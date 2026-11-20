@@ -27,6 +27,7 @@ pub const MOUNTED_SIFS_MUTATION_REPROBE_INTERVAL: Duration = Duration::from_secs
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum MountedSifsMutationHandoffRequest {
     Probe,
+    ProbeFuse,
     Arm {
         marker_id: crate::MountedSifsMutationMarkerId,
         marker_nonce: crate::MountedSifsMutationNonce,
@@ -59,7 +60,9 @@ pub enum MountedSifsMutationHandoffRequest {
 impl MountedSifsMutationHandoffRequest {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Probe | Self::Arm { .. } | Self::AbortUnstarted { .. } => Ok(()),
+            Self::Probe | Self::ProbeFuse | Self::Arm { .. } | Self::AbortUnstarted { .. } => {
+                Ok(())
+            }
             Self::CommitApplied { .. } => Ok(()),
             Self::CommitUnknown { observation, .. } => {
                 validate_label("error_code", &observation.error_code)
@@ -71,6 +74,7 @@ impl MountedSifsMutationHandoffRequest {
     fn phase_and_marker_id(&self) -> (&'static str, Option<String>) {
         match self {
             Self::Probe => ("probe", None),
+            Self::ProbeFuse => ("probe-fuse", None),
             Self::Arm { marker_id, .. } => ("arm", Some(marker_id.to_string())),
             Self::CommitApplied { marker_id, .. } => {
                 ("commit-applied", Some(marker_id.to_string()))
@@ -130,9 +134,16 @@ pub fn handle_mounted_sifs_mutation_handoff(
     );
     let store = MountedSifsMutationOutboxStore::new(data_dir)?;
     let response = match request {
-        MountedSifsMutationHandoffRequest::Probe => {
-            let status = store.status()?;
-            if status.pending_marker_count > 0 || status.requires_full_recovery() {
+        MountedSifsMutationHandoffRequest::Probe | MountedSifsMutationHandoffRequest::ProbeFuse => {
+            let (status, ready) = if matches!(request, MountedSifsMutationHandoffRequest::ProbeFuse)
+            {
+                store.fuse_probe_status()?
+            } else {
+                let status = store.status()?;
+                let ready = status.pending_marker_count == 0 && !status.requires_full_recovery();
+                (status, ready)
+            };
+            if !ready {
                 if status.exact_recovery_marker_count > 0
                     || status.full_recovery_marker_count > 0
                     || status.malformed_marker_count > 0

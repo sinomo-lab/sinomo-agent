@@ -4033,11 +4033,26 @@ fn missing_placement_control() -> DfsError {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PlacementPermitScope<'a> {
+    Job(Option<&'a str>),
+    CommittedReceipt(&'a str),
+}
+
+impl<'a> PlacementPermitScope<'a> {
+    fn path(self) -> Option<&'a str> {
+        match self {
+            Self::Job(path) => path,
+            Self::CommittedReceipt(path) => Some(path),
+        }
+    }
+}
+
 fn authoritative_placement_reconciliation_for_path(
     control: &mut dyn DfsControlPlaneKvClient,
     file_system_id: &DfsFileSystemId,
     job_id: &str,
-    path: Option<&str>,
+    scope: PlacementPermitScope<'_>,
 ) -> Result<
     Option<(
         DfsPlacementReconciliationJob,
@@ -4061,7 +4076,9 @@ fn authoritative_placement_reconciliation_for_path(
     }
     if job.file_system_id != *file_system_id
         || job.state == DfsPlacementReconciliationState::Failed
-        || path.is_some_and(|path| !placement_job_matches(&job, path))
+        || scope
+            .path()
+            .is_some_and(|path| !placement_job_matches(&job, path))
     {
         return Ok(None);
     }
@@ -4078,7 +4095,25 @@ fn authoritative_placement_reconciliation_for_path(
         .ok_or_else(|| DfsError::UnknownFileSystem {
             file_system_id: file_system_id.clone(),
         })?;
-    if !placement_config_remains_authoritative_for_job(&accepted_config, &current_config, &job) {
+    // A completed job has no pages left to apply. A receipt for a previously
+    // committed object still needs the exact job, current-config CAS and
+    // holder plan, but sibling rules cannot change this object's policy.
+    let valid = match scope {
+        PlacementPermitScope::CommittedReceipt(path)
+            if job.state == DfsPlacementReconciliationState::Completed =>
+        {
+            placement_config_matches_scope(
+                &accepted_config,
+                &current_config,
+                path,
+                DfsPlacementScope::SelfOnly,
+            )
+        }
+        _ => {
+            placement_config_remains_authoritative_for_job(&accepted_config, &current_config, &job)
+        }
+    };
+    if !valid {
         return Ok(None);
     }
     Ok(Some((job, accepted_config, current_config)))
@@ -4090,7 +4125,7 @@ pub(crate) fn acquire_placement_permit(
     local: &NodeId,
     file_system_id: &DfsFileSystemId,
     job_id: &str,
-    path: Option<&str>,
+    scope: PlacementPermitScope<'_>,
     #[cfg(test)] mut observation: Option<crate::test_runtime::PlacementAuthorityCallObservation>,
 ) -> Result<
     Option<(
@@ -4102,7 +4137,12 @@ pub(crate) fn acquire_placement_permit(
 > {
     for attempt in 0..PLACEMENT_AUTHORITY_ACQUIRE_RETRIES {
         let Some((job, accepted_config, current_config)) =
-            authoritative_placement_reconciliation_for_path(control, file_system_id, job_id, path)?
+            authoritative_placement_reconciliation_for_path(
+                control,
+                file_system_id,
+                job_id,
+                scope,
+            )?
         else {
             return Ok(None);
         };
@@ -4168,6 +4208,7 @@ pub(crate) fn release_placement_permit(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    #[cfg(test)]
     fn acquire_authoritative_placement_reconciliation_for_path(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -4198,12 +4239,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )>,
         DfsError,
     > {
+        self.acquire_placement_permit_for_scope(
+            file_system_id,
+            job_id,
+            PlacementPermitScope::Job(path),
+        )
+    }
+
+    /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
+    fn acquire_placement_permit_for_scope(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        job_id: &str,
+        scope: PlacementPermitScope<'_>,
+    ) -> Result<
+        Option<(
+            DfsPlacementReconciliationJob,
+            DfsFileSystemConfig,
+            DfsPlacementAuthorityPermit,
+        )>,
+        DfsError,
+    > {
         #[cfg(test)]
         let observation =
             self.native_publication_owner_for_observation()
                 .and_then(|(root, owner)| {
                     crate::test_runtime::observe_placement_authority_call(
-                        &root, &owner, job_id, path,
+                        &root,
+                        &owner,
+                        job_id,
+                        scope.path(),
                     )
                 });
         acquire_placement_permit(
@@ -4213,7 +4278,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &self.node_id,
             file_system_id,
             job_id,
-            path,
+            scope,
             #[cfg(test)]
             observation,
         )
@@ -4318,12 +4383,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(PlacementIntentAuthority::Stale);
         };
-        self.placement_authority_for_intent(intent)
+        self.placement_authority_for_intent(intent, false)
     }
 
     fn placement_authority_for_intent(
         &mut self,
         intent: DistributedWriteIntent,
+        publishing_receipt: bool,
     ) -> Result<PlacementIntentAuthority, DfsError> {
         let intent_id = intent.intent_id.clone();
         let intent_id = intent_id.as_str();
@@ -4344,14 +4410,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let object = self.current_read_object_metadata(&intent.object_id)?;
         let path = object.path.clone();
-        let mut authority = self.acquire_authoritative_placement_reconciliation_for_path(
-            &intent.file_system_id,
-            job_id,
-            &path,
+        let scope = if publishing_receipt
+            && intent.state == DfsWriteIntentState::Committed
+            && intent.target_version == object.version
+        {
+            PlacementPermitScope::CommittedReceipt(&path)
+        } else {
+            PlacementPermitScope::Job(Some(&path))
+        };
+        let mut authority = self.acquire_placement_permit_for_scope(
+            &intent.file_system_id, job_id, scope,
         )?;
         let authoritative_result = authority
             .as_ref()
             .map(|(job, config, _)| {
+                if matches!(scope, PlacementPermitScope::CommittedReceipt(_))
+                    && job.state == DfsPlacementReconciliationState::Completed
+                {
+                    // Check the full owner under the permit. A compacted
+                    // intent can be reconstructed for history, never for this grant.
+                    let Some(backend) = self.metadata_backend() else { return Ok(false) };
+                    if crate::content_durability::current_placement_durability_for_intent_from_backend(
+                        backend, &object, intent_id,
+                    )?.is_none() {
+                        return Ok(false);
+                    }
+                }
                 self.managed_placement_intent_matches_job(&intent, &object, job, config)
             })
             .transpose();
@@ -4493,12 +4577,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object_id: &DfsObjectId,
         intent_id: &str,
+        version: &DfsVersion,
+        target: &NodeId,
+        content_hash: &str,
         action: impl FnOnce(&mut Self) -> Result<R, DfsError>,
     ) -> Result<Option<R>, DfsError> {
         let record = match self.metadata_backend.as_ref() {
             Some(backend) => backend.get_intent(object_id, intent_id)?,
             None => None,
         };
+        if let Some(record) = &record
+            && record
+                .content_hash
+                .as_deref()
+                .is_some_and(|hash| hash != content_hash)
+        {
+            return Ok(None);
+        }
+        let full_table_candidate = record
+            .as_ref()
+            .is_some_and(|record| record.content_hash.as_deref() == Some(content_hash));
         let intent = match record {
             Some(record) => crate::intent::distributed_intent_from_record(&record),
             None => match self.coordinator.intent(intent_id).cloned() {
@@ -4506,7 +4604,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 None => return Ok(None),
             },
         };
-        let authority = self.placement_authority_for_intent(intent)?;
+        if intent.object_id != *object_id
+            || intent.target_version != *version
+            || !intent.desired_replica_nodes.contains(target)
+        {
+            return Ok(None);
+        }
+        let authority = self.placement_authority_for_intent(intent, full_table_candidate)?;
         self.run_with_placement_intent_authority(authority, action)
     }
 
@@ -4536,29 +4640,39 @@ pub(crate) fn placement_config_remains_authoritative_for_job(
     current: &DfsFileSystemConfig,
     job: &DfsPlacementReconciliationJob,
 ) -> bool {
-    accepted.file_system_id == current.file_system_id
-        && accepted.owner_node_id == current.owner_node_id
-        && placement_rules_affecting_job(accepted, job)
-            == placement_rules_affecting_job(current, job)
+    placement_config_matches_scope(accepted, current, &job.path, job.scope)
 }
 
-fn placement_rules_affecting_job(
+fn placement_config_matches_scope(
+    accepted: &DfsFileSystemConfig,
+    current: &DfsFileSystemConfig,
+    path: &str,
+    scope: DfsPlacementScope,
+) -> bool {
+    accepted.file_system_id == current.file_system_id
+        && accepted.owner_node_id == current.owner_node_id
+        && placement_rules_affecting_scope(accepted, path, scope)
+            == placement_rules_affecting_scope(current, path, scope)
+}
+
+fn placement_rules_affecting_scope(
     config: &DfsFileSystemConfig,
-    job: &DfsPlacementReconciliationJob,
+    path: &str,
+    scope: DfsPlacementScope,
 ) -> Vec<DfsSubtreePolicy> {
     let mut rules = config
         .subtree_policies
         .iter()
-        .filter(|rule| match job.scope {
+        .filter(|rule| match scope {
             DfsPlacementScope::SelfOnly => match rule.scope {
-                DfsPlacementScope::SelfOnly => rule.path_prefix == job.path,
-                DfsPlacementScope::Subtree => path_is_within(&job.path, &rule.path_prefix),
+                DfsPlacementScope::SelfOnly => rule.path_prefix == path,
+                DfsPlacementScope::Subtree => path_is_within(path, &rule.path_prefix),
             },
             DfsPlacementScope::Subtree => match rule.scope {
-                DfsPlacementScope::SelfOnly => path_is_within(&rule.path_prefix, &job.path),
+                DfsPlacementScope::SelfOnly => path_is_within(&rule.path_prefix, path),
                 DfsPlacementScope::Subtree => {
-                    path_is_within(&job.path, &rule.path_prefix)
-                        || path_is_within(&rule.path_prefix, &job.path)
+                    path_is_within(path, &rule.path_prefix)
+                        || path_is_within(&rule.path_prefix, path)
                 }
             },
         })
@@ -4583,7 +4697,7 @@ pub(crate) fn scoped_placement_config_for_job(
         file_system_id: config.file_system_id.clone(),
         display_name: config.display_name.clone(),
         owner_node_id: config.owner_node_id.clone(),
-        subtree_policies: placement_rules_affecting_job(config, job),
+        subtree_policies: placement_rules_affecting_scope(config, &job.path, job.scope),
     }
 }
 

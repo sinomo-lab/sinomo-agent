@@ -1325,6 +1325,19 @@ struct LogicalChunkWriter {
 }
 
 impl LogicalChunkWriter {
+    fn send_error(&self, error: NetworkError) -> NetworkError {
+        if let NetworkError::Io { operation, .. } = &error
+            && let Ok(state) = self.slot.inbound.state.lock()
+            && let SlotTerminal::Reset(reason) = &state.terminal
+        {
+            return mux_error(
+                operation,
+                format!("logical stream {}: {reason}", self.slot.stream_id),
+            );
+        }
+        error
+    }
+
     async fn reserve_chunk(
         &self,
         chunk: OwnedChunk,
@@ -1397,8 +1410,12 @@ impl AuthenticatedChunkWriter for LogicalChunkWriter {
             let tx = self.slot.tx.upgrade().ok_or_else(|| {
                 mux_error("write owned logical stream", "carrier transmitter closed")
             })?;
-            let chunk = self.reserve_chunk(chunk, &tx).await?;
+            let chunk = self
+                .reserve_chunk(chunk, &tx)
+                .await
+                .map_err(|error| self.send_error(error))?;
             tx.enqueue_data(self.slot.stream_id, chunk)
+                .map_err(|error| self.send_error(error))
         })
     }
 
@@ -1422,9 +1439,13 @@ impl AuthenticatedChunkWriter for LogicalChunkWriter {
                     "carrier transmitter closed",
                 )
             })?;
-            let chunk = self.reserve_chunk(chunk, &tx).await?;
+            let chunk = self
+                .reserve_chunk(chunk, &tx)
+                .await
+                .map_err(|error| self.send_error(error))?;
             self.finished = true;
-            tx.enqueue_final_data(self.slot.stream_id, chunk)?
+            tx.enqueue_final_data(self.slot.stream_id, chunk)
+                .map_err(|error| self.send_error(error))?
                 .await
                 .map_err(|_| {
                     mux_error(
@@ -1444,7 +1465,7 @@ impl AuthenticatedChunkWriter for LogicalChunkWriter {
             let tx = self.slot.tx.upgrade().ok_or_else(|| {
                 mux_error("finish owned logical stream", "carrier transmitter closed")
             })?;
-            tx.finish_stream(self.slot.stream_id)?.await.map_err(|_| {
+            tx.finish_stream(self.slot.stream_id).map_err(|error| self.send_error(error))?.await.map_err(|_| {
                 mux_error(
                     "finish owned logical stream",
                     "carrier stopped before staging the final record",
@@ -2934,12 +2955,11 @@ mod tests {
 
     #[tokio::test]
     async fn peer_reset_discards_response_queue_without_reset_echo() {
-        let tx = TxScheduler::new();
-        let connection = CarrierCredits::new(&tx);
-        let stream_id = 43;
-        let slot = StreamSlot::new(stream_id, &tx, &connection);
-        tx.register_stream(stream_id, true)
-            .expect("register transmit stream");
+        let mut writer = queued_test_writer(true);
+        let tx = Arc::clone(&writer._owner.tx);
+        let connection = Arc::clone(&writer.connection);
+        let slot = Arc::clone(&writer.slot);
+        let stream_id = slot.stream_id;
         let streams = Arc::new(Mutex::new(BTreeMap::new()));
         register_slot(&streams, &slot, "register reset test slot").expect("register slot");
         let allocator = ChunkAllocator::default();
@@ -2965,6 +2985,14 @@ mod tests {
         );
 
         assert!(lookup_slot(&streams, stream_id).is_none());
+        let mut progress = allocator.allocate_control(1).await.unwrap();
+        progress.commit_payload(1).unwrap();
+        let failure = writer.send_chunk(progress).await.unwrap_err().to_string();
+        assert!(
+            failure.contains("peer reset the owned logical stream"),
+            "{failure}"
+        );
+        assert!(failure.contains(&stream_id.to_string()), "{failure}");
         let state = tx.state.lock().expect("transmitter state");
         assert!(!state.streams.contains_key(&stream_id));
         assert!(

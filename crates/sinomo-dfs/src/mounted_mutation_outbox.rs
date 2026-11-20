@@ -267,10 +267,10 @@ pub struct MountedSifsMutationOutboxStatus {
     pub terminal_marker_count: usize,
     pub marker_limit_exceeded: bool,
     /// The shared directory entry/deadline budget expired before the complete
-    /// outbox tree was classified. Only independently safe Exact candidates or
-    /// Full/corrupt candidates backed by a complete session-death proof may be
-    /// returned in this state; callers must still fail closed for admission and
-    /// schedule another bounded scan.
+    /// outbox tree was classified. Exact recovery can proceed from its own
+    /// evidence. Full recovery needs a complete session scan and release of
+    /// the relevant leases. Corrupt origins require every session to be dead.
+    /// Incomplete scans cannot admit another mount.
     pub directory_scan_limit_exceeded: bool,
 }
 
@@ -924,35 +924,88 @@ impl MountedSifsMutationOutboxStore {
         self.retain_daemon_committed_work_unlocked(committed_work)
     }
 
+    fn pending_operations_allow_mount(
+        &self,
+        scan: &MountedSifsMutationBoundedScan,
+        adapter: MountedSifsMutationAdapter,
+    ) -> Result<bool, DfsError> {
+        let status = &scan.status;
+        if status.requires_full_recovery()
+            || status.pending_marker_count != status.live_marker_count
+        {
+            return Ok(false);
+        }
+        for id in &scan.pending_marker_ids {
+            let Some(marker) = self.marker(id)? else {
+                return Ok(false);
+            };
+            // Another operation is safe only when its published FUSE session
+            // and nonce still identify the holder of its operating-system lease.
+            if adapter != MountedSifsMutationAdapter::Fuse
+                || marker.origin.adapter != MountedSifsMutationAdapter::Fuse
+                || self.session_liveness(&marker.origin)? != LeaseLiveness::Live
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn fuse_probe_status(
+        &self,
+    ) -> Result<(MountedSifsMutationOutboxStatus, bool), DfsError> {
+        let _lock = lock_file_exclusive(&self.root.join(STORE_LOCK_FILE))?;
+        let scan = self.scan_unlocked()?;
+        let ready = self.pending_operations_allow_mount(&scan, MountedSifsMutationAdapter::Fuse)?;
+        Ok((scan.status, ready))
+    }
+
+    /// The canonical target fences duplicate mounts while each view receives
+    /// its own durable session ID, nonce and process-held lease.
+    pub fn open_fuse_mount_session(
+        &self,
+        mount_point: &Path,
+    ) -> Result<MountedSifsHostMountSessionLease, DfsError> {
+        let target =
+            fs::canonicalize(mount_point).map_err(|source| lock_error(mount_point, source))?;
+        let hash = blake3::hash(target.as_os_str().as_encoded_bytes());
+        self.open_host_mount_session(
+            MountedSifsMutationAdapter::Fuse,
+            format!("fuse-root:{hash}"),
+        )
+    }
+
     pub fn open_host_mount_session(
         &self,
         adapter: MountedSifsMutationAdapter,
         mount_identity: impl Into<String>,
     ) -> Result<MountedSifsHostMountSessionLease, DfsError> {
+        let mount_identity = mount_identity.into();
+        validate_label("mount_identity", &mount_identity, false)?;
         let _store_lock = lock_file_exclusive(&self.root.join(STORE_LOCK_FILE))?;
         let mut scan_budget = MountedSifsMutationDirectoryScanBudget::production();
-        let status = self.scan_unlocked_with_budget(&mut scan_budget)?.status;
-        if status.pending_marker_count != 0
-            || status.malformed_marker_count != 0
-            || status.marker_limit_exceeded
-            || status.directory_scan_limit_exceeded
-        {
+        let scan = self.scan_unlocked_with_budget(&mut scan_budget)?;
+        if !self.pending_operations_allow_mount(&scan, adapter)? {
             return Err(outbox_error(
                 "mounted-mutation recovery must drain before a new host-mount session opens",
             ));
         }
         let mut session_phase_remaining = MOUNTED_SIFS_MUTATION_OUTBOX_SESSION_SCAN_ENTRIES;
-        if self.all_host_mount_sessions_proven_dead_with_budget(
+        let sharing = (adapter == MountedSifsMutationAdapter::Fuse
+            && mount_identity.starts_with("fuse-root:"))
+        .then_some(mount_identity.as_str());
+        let sessions = self.scan_host_sessions_with_budget(
             &mut scan_budget,
             &mut session_phase_remaining,
-        )? != HostMountSessionsDeathProof::AllDead
+            sharing,
+        )?;
+        if sessions != HostMountSessionScan::AllDead
+            && !(sharing.is_some() && sessions == HostMountSessionScan::ActiveFuse)
         {
             return Err(outbox_error(
-                "another mounted-mutation host session is live or unproven",
+                "another mounted-mutation host session is exclusive, closing or unproven",
             ));
         }
-        let mount_identity = mount_identity.into();
-        validate_label("mount_identity", &mount_identity, false)?;
         let session_id = Id::generate();
         let session_nonce = Id::generate();
         let directory = self.session_directory(&session_id);
@@ -1280,8 +1333,9 @@ impl MountedSifsMutationOutboxStore {
     }
 
     /// Claim an orphan only after acquiring and retaining its operation lock.
-    /// Full recovery additionally requires positive proof that the referenced
-    /// external host-mount session is no longer live.
+    /// A valid FUSE origin uses its own ID, nonce and OS lease. Other live
+    /// independently fenced FUSE sessions may continue. Without that proof
+    /// the installation-wide session barrier still applies.
     pub fn try_claim_recovery(
         &self,
         marker_id: &MountedSifsMutationMarkerId,
@@ -1303,7 +1357,7 @@ impl MountedSifsMutationOutboxStore {
             Some(MountedSifsMutationRecoveryKind::Exact) => MountedSifsMutationRecoveryKind::Exact,
             Some(MountedSifsMutationRecoveryKind::Full) => {
                 if !daemon_owns_finished_mount_error(&marker)
-                    && !self.all_host_mount_sessions_proven_dead()?
+                    && !self.recovery_sessions_released(Some(&marker.origin))?
                 {
                     return Ok(None);
                 }
@@ -1503,7 +1557,7 @@ impl MountedSifsMutationOutboxStore {
             status.directory_scan_limit_exceeded = true;
         }
         let mut full_recovery_sessions_dead = (!preparing_sessions_complete)
-            .then_some(HostMountSessionsDeathProof::ScanLimitExceeded);
+            .then_some(HostMountSessionScan::ScanLimitExceeded);
 
         let mut pending_marker_ids = Vec::new();
         let mut recovery_candidate_marker_ids = Vec::new();
@@ -1528,7 +1582,7 @@ impl MountedSifsMutationOutboxStore {
                         let sessions_dead = match full_recovery_sessions_dead {
                             Some(value) => value,
                             None => {
-                                let value = self.all_host_mount_sessions_proven_dead_with_budget(
+                                let value = self.scan_recovery_sessions_with_budget(
                                     budget,
                                     &mut session_phase_remaining,
                                 )?;
@@ -1537,14 +1591,14 @@ impl MountedSifsMutationOutboxStore {
                             }
                         };
                         match sessions_dead {
-                            HostMountSessionsDeathProof::AllDead => {
+                            HostMountSessionScan::AllDead => {
                                 status.full_recovery_marker_count += 1;
                                 recovery_candidate_marker_ids.push(marker_id);
                             }
-                            HostMountSessionsDeathProof::NotDeadOrUnproven => {
+                            HostMountSessionScan::ActiveFuse | HostMountSessionScan::Blocked => {
                                 status.unproven_session_marker_count += 1;
                             }
-                            HostMountSessionsDeathProof::ScanLimitExceeded => {
+                            HostMountSessionScan::ScanLimitExceeded => {
                                 status.directory_scan_limit_exceeded = true;
                                 status.unproven_session_marker_count += 1;
                             }
@@ -1572,7 +1626,7 @@ impl MountedSifsMutationOutboxStore {
                         let sessions_dead = match full_recovery_sessions_dead {
                             Some(value) => value,
                             None => {
-                                let value = self.all_host_mount_sessions_proven_dead_with_budget(
+                                let value = self.scan_recovery_sessions_with_budget(
                                     budget,
                                     &mut session_phase_remaining,
                                 )?;
@@ -1581,18 +1635,26 @@ impl MountedSifsMutationOutboxStore {
                             }
                         };
                         match sessions_dead {
-                            HostMountSessionsDeathProof::AllDead => {
+                            HostMountSessionScan::AllDead => {
                                 status.full_recovery_marker_count += 1;
                                 recovery_candidate_marker_ids.push(marker.marker_id.clone());
                             }
-                            HostMountSessionsDeathProof::NotDeadOrUnproven => {
+                            HostMountSessionScan::ActiveFuse
+                                if marker.origin.adapter == MountedSifsMutationAdapter::Fuse
+                                    && self.session_liveness(&marker.origin)?
+                                        == LeaseLiveness::Dead =>
+                            {
+                                status.full_recovery_marker_count += 1;
+                                recovery_candidate_marker_ids.push(marker.marker_id.clone());
+                            }
+                            HostMountSessionScan::ActiveFuse | HostMountSessionScan::Blocked => {
                                 if self.session_liveness(&marker.origin)? == LeaseLiveness::Live {
                                     status.deferred_live_session_marker_count += 1;
                                 } else {
                                     status.unproven_session_marker_count += 1;
                                 }
                             }
-                            HostMountSessionsDeathProof::ScanLimitExceeded => {
+                            HostMountSessionScan::ScanLimitExceeded => {
                                 status.directory_scan_limit_exceeded = true;
                                 status.unproven_session_marker_count += 1;
                             }
@@ -1677,26 +1739,51 @@ impl MountedSifsMutationOutboxStore {
     }
 
     fn all_host_mount_sessions_proven_dead(&self) -> Result<bool, DfsError> {
+        self.recovery_sessions_released(None)
+    }
+
+    fn recovery_sessions_released(
+        &self,
+        origin: Option<&MountedSifsMutationOrigin>,
+    ) -> Result<bool, DfsError> {
         let mut budget = MountedSifsMutationDirectoryScanBudget::production();
         let mut session_phase_remaining = MOUNTED_SIFS_MUTATION_OUTBOX_SESSION_SCAN_ENTRIES;
         if !self.prune_preparing_session_directories(&mut budget, &mut session_phase_remaining)? {
             return Ok(false);
         }
-        self.all_host_mount_sessions_proven_dead_with_budget(
+        let scan = self.scan_recovery_sessions_with_budget(
             &mut budget,
             &mut session_phase_remaining,
-        )
-        .map(|proof| proof == HostMountSessionsDeathProof::AllDead)
+        )?;
+        match (scan, origin) {
+            (HostMountSessionScan::AllDead, _) => Ok(true),
+            (HostMountSessionScan::ActiveFuse, Some(origin))
+                if origin.adapter == MountedSifsMutationAdapter::Fuse =>
+            {
+                Ok(self.session_liveness(origin)? == LeaseLiveness::Dead)
+            }
+            _ => Ok(false),
+        }
     }
 
-    fn all_host_mount_sessions_proven_dead_with_budget(
+    fn scan_recovery_sessions_with_budget(
         &self,
         budget: &mut MountedSifsMutationDirectoryScanBudget,
         session_phase_remaining: &mut usize,
-    ) -> Result<HostMountSessionsDeathProof, DfsError> {
+    ) -> Result<HostMountSessionScan, DfsError> {
+        self.scan_host_sessions_with_budget(budget, session_phase_remaining, None)
+    }
+
+    fn scan_host_sessions_with_budget(
+        &self,
+        budget: &mut MountedSifsMutationDirectoryScanBudget,
+        session_phase_remaining: &mut usize,
+        joining_fuse: Option<&str>,
+    ) -> Result<HostMountSessionScan, DfsError> {
+        let mut proof = HostMountSessionScan::AllDead;
         let sessions = self.root.join(SESSIONS_DIRECTORY);
         if budget.limit_reached() || *session_phase_remaining == 0 {
-            return Ok(HostMountSessionsDeathProof::ScanLimitExceeded);
+            return Ok(HostMountSessionScan::ScanLimitExceeded);
         }
         let mut entries =
             fs::read_dir(&sessions).map_err(|source| lock_error(&sessions, source))?;
@@ -1704,10 +1791,10 @@ impl MountedSifsMutationOutboxStore {
             let entry = match budget.next_entry(session_phase_remaining, &sessions, &mut entries)? {
                 MountedSifsMutationDirectoryScanStep::Entry(entry) => entry,
                 MountedSifsMutationDirectoryScanStep::Complete => {
-                    return Ok(HostMountSessionsDeathProof::AllDead);
+                    return Ok(proof);
                 }
                 MountedSifsMutationDirectoryScanStep::LimitExceeded => {
-                    return Ok(HostMountSessionsDeathProof::ScanLimitExceeded);
+                    return Ok(HostMountSessionScan::ScanLimitExceeded);
                 }
             };
             let directory = entry.path();
@@ -1716,20 +1803,29 @@ impl MountedSifsMutationOutboxStore {
                 .map_err(|source| lock_error(&directory, source))?
                 .is_dir()
             {
-                return Ok(HostMountSessionsDeathProof::NotDeadOrUnproven);
+                return Ok(HostMountSessionScan::Blocked);
             }
             let marker: MountedSifsHostMountSessionMarker =
                 match read_bounded_sobj(&directory.join(STATE_FILE)) {
                     Ok(marker) => marker,
-                    Err(_) => return Ok(HostMountSessionsDeathProof::NotDeadOrUnproven),
+                    Err(_) => return Ok(HostMountSessionScan::Blocked),
                 };
             if validate_session_marker(&marker).is_err()
                 || directory != self.session_directory(&marker.session_id)
             {
-                return Ok(HostMountSessionsDeathProof::NotDeadOrUnproven);
+                return Ok(HostMountSessionScan::Blocked);
             }
-            if lock_liveness(&directory.join(LEASE_FILE))? != LeaseLiveness::Dead {
-                return Ok(HostMountSessionsDeathProof::NotDeadOrUnproven);
+            match lock_liveness(&directory.join(LEASE_FILE))? {
+                LeaseLiveness::Dead => {}
+                LeaseLiveness::Live
+                    if marker.adapter == MountedSifsMutationAdapter::Fuse
+                        && marker.phase == MountedSifsHostMountSessionPhase::Active
+                        && marker.mount_identity.starts_with("fuse-root:")
+                        && joining_fuse != Some(marker.mount_identity.as_str()) =>
+                {
+                    proof = HostMountSessionScan::ActiveFuse;
+                }
+                _ => return Ok(HostMountSessionScan::Blocked),
             }
         }
     }
@@ -2313,9 +2409,10 @@ enum LeaseLiveness {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HostMountSessionsDeathProof {
+enum HostMountSessionScan {
     AllDead,
-    NotDeadOrUnproven,
+    ActiveFuse,
+    Blocked,
     ScanLimitExceeded,
 }
 
@@ -3897,6 +3994,94 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_fuse_mounts_fence_recovery_by_the_originating_lease() {
+        let (root, store) = store("mounted-mutation-overlapping-fuse");
+        let peer = MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path())).unwrap();
+        let first_path = root.path().join("first");
+        let second_path = root.path().join("second");
+        fs::create_dir(&first_path).unwrap();
+        fs::create_dir(&second_path).unwrap();
+        let first = store.open_fuse_mount_session(&first_path).unwrap();
+        let mutation = store
+            .prepare(&first, Some("first-write".into()), "write")
+            .unwrap();
+        let marker = mutation.marker.marker_id.clone();
+        assert!(peer.fuse_probe_status().unwrap().1);
+        let second = peer.open_fuse_mount_session(&second_path).unwrap();
+        assert_ne!(first.marker().session_nonce, second.marker().session_nonce);
+        assert!(peer.open_fuse_mount_session(&first_path).is_err());
+        assert!(
+            peer.open_host_mount_session(MountedSifsMutationAdapter::Nfs, "nfs")
+                .is_err()
+        );
+        drop(mutation);
+        assert!(
+            !peer.fuse_probe_status().unwrap().1,
+            "an orphan must drain before another mount opens"
+        );
+        assert!(peer.try_claim_recovery(&marker).unwrap().is_none());
+        drop(first);
+        assert!(
+            peer.recovery_candidate_marker_ids()
+                .unwrap()
+                .contains(&marker)
+        );
+        let recovered = peer.try_claim_recovery(&marker).unwrap().unwrap();
+        assert_eq!(
+            recovered.recovery_kind(),
+            MountedSifsMutationRecoveryKind::Full
+        );
+        recovered.terminalize(full_recovery_receipt()).unwrap();
+        let healthy = peer
+            .prepare(&second, Some("second-write".into()), "write")
+            .unwrap();
+        assert_eq!(
+            healthy.marker.origin.mount_session_id,
+            second.marker().session_id
+        );
+    }
+
+    #[test]
+    fn a_legacy_live_fuse_session_remains_exclusive_in_both_directions() {
+        let (root, store) = store("mounted-mutation-legacy-fuse");
+        let target = root.path().join("mount");
+        fs::create_dir(&target).unwrap();
+        let legacy = store
+            .open_host_mount_session(MountedSifsMutationAdapter::Fuse, "fuse:legacy-session")
+            .unwrap();
+        assert!(store.open_fuse_mount_session(&target).is_err());
+        drop(legacy);
+        let _current = store.open_fuse_mount_session(&target).unwrap();
+        assert!(
+            store
+                .open_host_mount_session(MountedSifsMutationAdapter::Fuse, "fuse:legacy-session")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn corrupt_orphan_cannot_be_recovered_while_a_different_fuse_mount_is_live() {
+        let (root, store) = store("mounted-mutation-overlapping-corruption");
+        let first_path = root.path().join("first");
+        let second_path = root.path().join("second");
+        fs::create_dir(&first_path).unwrap();
+        fs::create_dir(&second_path).unwrap();
+        let first = store.open_fuse_mount_session(&first_path).unwrap();
+        let second = store.open_fuse_mount_session(&second_path).unwrap();
+        let mutation = store.prepare(&first, None, "unlink").unwrap();
+        let id = mutation.marker.marker_id.clone();
+        drop(mutation);
+        drop(first);
+        fs::write(store.operation_directory(&id).join(STATE_FILE), b"torn").unwrap();
+        assert!(store.try_claim_corrupt_recovery(&id).unwrap().is_none());
+        let third_path = root.path().join("third");
+        fs::create_dir(&third_path).unwrap();
+        assert!(store.open_fuse_mount_session(&third_path).is_err());
+        drop(second);
+        assert!(store.try_claim_corrupt_recovery(&id).unwrap().is_some());
+    }
+
+    #[test]
     fn pending_recovery_and_live_session_gate_new_mount_sessions() {
         let (root, store) = store("mounted-mutation-session-gates");
         let session = store
@@ -3908,7 +4093,7 @@ mod tests {
             second_store
                 .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
                 .is_err(),
-            "single-session ownership is enforced inside the outbox"
+            "external-provider ownership remains exclusive"
         );
         let mutation = store
             .prepare(&session, Some("armed-before-restart".into()), "unlink")
@@ -4488,12 +4673,12 @@ mod tests {
         let mut proof_phase_remaining = MOUNTED_SIFS_MUTATION_OUTBOX_SESSION_SCAN_ENTRIES;
         assert_eq!(
             store
-                .all_host_mount_sessions_proven_dead_with_budget(
+                .scan_recovery_sessions_with_budget(
                     &mut proof_budget,
                     &mut proof_phase_remaining,
                 )
                 .expect("bounded death proof"),
-            HostMountSessionsDeathProof::ScanLimitExceeded
+            HostMountSessionScan::ScanLimitExceeded
         );
         assert!(proof_budget.visited_entries <= 1);
     }

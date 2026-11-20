@@ -608,6 +608,7 @@ impl ChatRoute {
 /// chat it currently shows. Views are independent; closing or switching one
 /// never affects another view of the same chat.
 struct ChatView {
+    restored: Arc<Mutex<bool>>,
     events: ChatEventLog,
     storage: local::AgentChatSifsStorage,
     journal: CommandJournal,
@@ -616,6 +617,11 @@ struct ChatView {
 }
 
 impl ChatView {
+    fn opening(&self) -> bool {
+        // Each open call pins restoration until its subscription is installed.
+        Arc::strong_count(&self.restored) > 1
+    }
+
     fn chat_id(&self) -> Option<String> {
         self.chat
             .lock()
@@ -1006,7 +1012,7 @@ impl HostedChatService {
             .clone()
             .unwrap_or_else(|| request.client_id.clone());
         validate_client_id(&execution_id)?;
-        let attached = {
+        let (attached, restored) = {
             let mut views = self
                 .views
                 .lock()
@@ -1025,6 +1031,7 @@ impl HostedChatService {
                 views.insert(
                     execution_id.clone(),
                     ChatView {
+                        restored: Arc::new(Mutex::new(false)),
                         events: ChatEventLog::new(),
                         storage: local::AgentChatSifsStorage::new(
                             data_dir.clone(),
@@ -1037,10 +1044,18 @@ impl HostedChatService {
                     },
                 );
             }
-            attached
+            (attached, Arc::clone(&views[&execution_id].restored))
         };
-        if !attached {
-            self.restore_view(&execution_id)?;
+        {
+            // Concurrent client attachment and startup recovery restore this
+            // journal once. A failed attach remains eligible for another try.
+            let mut ready = restored
+                .lock()
+                .map_err(|_| "chat restoration lock poisoned")?;
+            if !*ready {
+                self.restore_view(&execution_id)?;
+                *ready = true;
+            }
         }
         let (runtime_ready, generation) = {
             let views = self
@@ -1098,7 +1113,7 @@ impl HostedChatService {
     /// it showed (or a new chat), the model it selected, and any commands that
     /// were admitted but not finished.
     fn restore_view(&self, execution_id: &str) -> Result<(), String> {
-        let (journal, events) = {
+        let (journal, events, attached_chat) = {
             let views = self
                 .views
                 .lock()
@@ -1106,7 +1121,7 @@ impl HostedChatService {
             let view = views
                 .get(execution_id)
                 .ok_or_else(|| format!("chat view `{execution_id}` disappeared"))?;
-            (view.journal.clone(), view.events.clone())
+            (view.journal.clone(), view.events.clone(), view.chat_id())
         };
         let (bootstrap, pending, interrupted) = journal.recovery()?;
         let mut chat_id = None;
@@ -1123,7 +1138,9 @@ impl HostedChatService {
                 }
             }
         }
-        let chat_id = chat_id.unwrap_or_else(|| SessionId::generate().to_string());
+        let chat_id = chat_id
+            .or(attached_chat)
+            .unwrap_or_else(|| SessionId::generate().to_string());
         self.attach_view(execution_id, &chat_id, &[])?;
         if let Some(command) = models.pop()
             && let Ok(mut hosts) = self.hosts.lock()
@@ -1849,6 +1866,7 @@ impl HostedChatService {
         if ephemeral
             && let Some(id) = &execution_id
             && !clients.values().any(|other| other == id)
+            && views.get(id).is_some_and(|view| !view.opening())
             && let Some(view) = views.remove(id)
         {
             drop(clients);
@@ -1891,7 +1909,7 @@ impl HostedChatService {
             .collect::<std::collections::BTreeSet<_>>();
         let mut idle = views
             .iter()
-            .filter(|(execution_id, _)| !attached.contains(*execution_id))
+            .filter(|(execution_id, view)| !attached.contains(*execution_id) && !view.opening())
             .map(|(execution_id, view)| (view.idle_for(), execution_id.clone()))
             .filter(|(idle, _)| *idle >= min_idle)
             .collect::<Vec<_>>();
@@ -2036,11 +2054,11 @@ impl HostedChatService {
     /// Periodically keep chat ownership current, release idle detached views
     /// and hosts, and purge deleted chats whose retention window has passed.
     /// Runs until the runtime stops.
-    fn start_maintenance(
+    pub(crate) fn start_workers(
         &self,
         data_dir: sinomo_runtime::local::SinomoDataDir,
         runtime: tokio::runtime::Handle,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), String> {
         let mut workers = self
             .workers
@@ -2052,79 +2070,126 @@ impl HostedChatService {
         if workers.maintenance.is_some() {
             return Ok(());
         }
+        self.init_environment(&data_dir, &runtime);
         let service = self.clone();
         let blocking = runtime.clone();
         workers.maintenance = Some(runtime.spawn(async move {
-            let mut next_purge = Instant::now();
-            loop {
-                if *shutdown.borrow() {
-                    break;
-                }
-                let sweep = service.clone();
-                let purge = (Instant::now() >= next_purge).then(|| {
-                    next_purge = Instant::now() + DELETED_CHAT_PURGE_INTERVAL;
-                    (
-                        service.daemon_address.clone(),
-                        data_dir.clone(),
-                        blocking.clone(),
-                    )
-                });
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(error) = sweep.maintain_routes() {
-                        tracing::warn!(%error, "chat ownership maintenance failed");
-                    }
-                    if let Err(error) = sweep.sweep_idle_hosts() {
-                        tracing::warn!(%error, "chat host sweep failed");
-                    }
-                    if let Some((daemon_address, data_dir, runtime)) = purge {
-                        match purge_deleted_chats(
-                            &daemon_address,
-                            data_dir,
-                            &runtime,
-                            DELETED_CHAT_RETENTION,
-                        ) {
-                            Ok(0) => {}
-                            Ok(purged) => tracing::info!(purged, "purged deleted chats"),
-                            Err(error) => tracing::warn!(%error, "deleted chat purge failed"),
-                        }
-                    }
-                })
-                .await;
-                // Do not abort this orchestration task while a blocking sweep
-                // is in flight: it owns that child through the await above.
-                tokio::select! {
-                    _ = tokio::time::sleep(CHAT_HOST_SWEEP_INTERVAL) => {}
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() { break; }
-                    }
-                }
-            }
+            tokio::join!(
+                service.recover_journals(data_dir.clone(), blocking.clone(), shutdown.clone()),
+                service.maintain_hosts(data_dir, blocking, shutdown),
+            );
         }));
         Ok(())
     }
 
-    pub(crate) fn recover(
+    async fn maintain_hosts(
+        &self,
+        data_dir: sinomo_runtime::local::SinomoDataDir,
+        blocking: tokio::runtime::Handle,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut next_purge = Instant::now();
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let sweep = self.clone();
+            let purge = (Instant::now() >= next_purge).then(|| {
+                next_purge = Instant::now() + DELETED_CHAT_PURGE_INTERVAL;
+                (
+                    self.daemon_address.clone(),
+                    data_dir.clone(),
+                    blocking.clone(),
+                )
+            });
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(error) = sweep.maintain_routes() {
+                    tracing::warn!(%error, "chat ownership maintenance failed");
+                }
+                if let Err(error) = sweep.sweep_idle_hosts() {
+                    tracing::warn!(%error, "chat host sweep failed");
+                }
+                if let Some((daemon_address, data_dir, runtime)) = purge {
+                    match purge_deleted_chats(
+                        &daemon_address,
+                        data_dir,
+                        &runtime,
+                        DELETED_CHAT_RETENTION,
+                    ) {
+                        Ok(0) => {}
+                        Ok(purged) => tracing::info!(purged, "purged deleted chats"),
+                        Err(error) => tracing::warn!(%error, "deleted chat purge failed"),
+                    }
+                }
+            })
+            .await;
+            // Do not abort this orchestration task while a blocking sweep
+            // is in flight: it owns that child through the await above.
+            tokio::select! {
+                _ = tokio::time::sleep(CHAT_HOST_SWEEP_INTERVAL) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+            }
+        }
+    }
+
+    // Recovery calls back into the daemon. The host-ready callback must return
+    // so the listener and the component reconciler can answer those requests.
+    async fn recover_journals(
         &self,
         data_dir: sinomo_runtime::local::SinomoDataDir,
         runtime: tokio::runtime::Handle,
-        shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<(), String> {
-        self.require_running()?;
-        self.init_environment(&data_dir, &runtime);
-        self.start_maintenance(data_dir.clone(), runtime.clone(), shutdown)?;
-        for execution_id in CommandJournal::discover(&data_dir.root())? {
-            let client_id = format!("recovery-{}", SessionId::generate());
-            self.open(
-                data_dir.clone(),
-                runtime.clone(),
-                wire::ChatSessionOpenRequest {
-                    client_id: client_id.clone(),
-                    execution_id: Some(execution_id),
-                },
-            )?;
-            self.close(wire::ChatSessionCloseRequest { client_id })?;
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut remaining = None;
+        while !*shutdown.borrow() {
+            let service = self.clone();
+            let data = data_dir.clone();
+            let handle = runtime.clone();
+            let stop = shutdown.clone();
+            let retry = remaining.take();
+            let pass = tokio::task::spawn_blocking(move || {
+                let paths = match retry {
+                    Some(paths) => paths,
+                    None => CommandJournal::journal_paths(&data.root())?,
+                };
+                let mut failed = Vec::new();
+                for path in paths {
+                    if *stop.borrow() { break; }
+                    let restore = || -> Result<(), String> {
+                        let Some(execution_id) = CommandJournal::recoverable_execution(&path)? else {
+                            return Ok(());
+                        };
+                        let client_id = format!("recovery-{}", SessionId::generate());
+                        service.open(data.clone(), handle.clone(), wire::ChatSessionOpenRequest {
+                            client_id: client_id.clone(),
+                            execution_id: Some(execution_id),
+                        })?;
+                        service.close(wire::ChatSessionCloseRequest { client_id })?;
+                        Ok(())
+                    };
+                    if let Err(error) = restore() {
+                        tracing::warn!(journal = %path.display(), %error, "chat journal recovery deferred");
+                        failed.push(path);
+                    }
+                }
+                Ok::<_, String>(failed)
+            }).await;
+            match pass {
+                Ok(Ok(ids)) if ids.is_empty() => return,
+                Ok(Ok(ids)) => remaining = Some(ids),
+                Ok(Err(error)) => tracing::warn!(%error, "chat recovery scan failed"),
+                Err(error) => {
+                    tracing::error!(%error, "chat recovery worker failed");
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(CHAT_HOST_SWEEP_INTERVAL) => {}
+                _ = shutdown.changed() => return,
+            }
         }
-        Ok(())
     }
 
     fn execution_id(&self, client_id: &str) -> Result<String, String> {
@@ -4547,6 +4612,7 @@ mod tests {
         execution_id: &str,
     ) -> ChatView {
         ChatView {
+            restored: Arc::new(Mutex::new(true)),
             events: ChatEventLog::new(),
             storage: local::AgentChatSifsStorage::new(
                 sinomo_runtime::local::SinomoDataDir::new(root),

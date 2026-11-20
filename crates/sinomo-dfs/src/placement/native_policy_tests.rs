@@ -645,12 +645,12 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
     assert_eq!(candidates_a.len(), 3);
     assert_eq!(candidates_b.len(), 3);
     assert_ne!(candidates_a, candidates_b);
-    let make_job = |candidates| {
+    let make_job = |candidates, path: &str, scope| {
         crate::control_plane::build_adaptive_placement_reconciliation_job(
             sinomo_core::Id::generate().to_string(),
             &config,
-            object.path.clone(),
-            DfsPlacementScope::SelfOnly,
+            path.to_owned(),
+            scope,
             BTreeSet::new(),
             candidates,
             observed.placement_snapshot.clone().unwrap(),
@@ -660,7 +660,7 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
         )
         .unwrap()
     };
-    let prior = make_job(candidates_a);
+    let prior = make_job(candidates_a, &object.path, DfsPlacementScope::SelfOnly);
     let prior_intent_id = format!(
         "placement:{}:{}:{}",
         prior.job_id, object.object_id, object.version
@@ -798,7 +798,11 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
             .unwrap()
             .is_none()
     );
-    let job = make_job(candidates_b);
+    let job = make_job(
+        candidates_b,
+        "/services/native-policy-preservation",
+        DfsPlacementScope::Subtree,
+    );
     let (_, policy, placement) = service
         .reconciliation_placement_for_object_with_pins(&job.accepted_config, &job, &current, &[])
         .unwrap();
@@ -976,7 +980,118 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
             .unwrap()
             .unwrap()
             .content_durability,
-        Some(original_durability)
+        Some(original_durability.clone())
+    );
+    // A later sibling policy invalidates a subtree-wide mutation, but cannot
+    // invalidate the completed owner's exact receipt on this unchanged file.
+    runtime
+        .apply_placement_policy(
+            &primary,
+            "/services/native-policy-preservation/other",
+            DfsPlacementScope::Subtree,
+            DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+        )
+        .unwrap();
+    drop(service);
+    let mut service = runtime.metadata_primary_service(&object.path).unwrap();
+    assert!(
+        service
+            .acquire_authoritative_placement_reconciliation(
+                &object.file_system_id,
+                &job.job_id,
+                Some(&object.path),
+            )
+            .unwrap()
+            .is_none()
+    );
+    let target = cut
+        .current
+        .desired_replica_node_ids
+        .iter()
+        .find(|node| !original_durability.desired_replica_node_ids.contains(node))
+        .expect("adaptive target outside the original write quorum");
+    assert!(
+        service
+            .with_table_intent_placement_authority(
+                &object.object_id,
+                &prior_intent_id,
+                &object.version,
+                target,
+                object.content_hash.as_deref().unwrap(),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .is_none(),
+        "compacted placement must not regain execution authority"
+    );
+    assert!(
+        service
+            .with_table_intent_placement_authority(
+                &object.object_id,
+                &intent_id,
+                &object.version,
+                target,
+                "wrong hash",
+                |_| Ok(()),
+            )
+            .unwrap()
+            .is_none()
+    );
+    let previous = service
+        .backend_receipt_for_replica(&object.object_id, &object.version, target)
+        .unwrap()
+        .expect("the completed job published this replica");
+    // Recreate the late receipt deficit on the same bytes. Use the actual
+    // withdrawal path and wait for the content worker to publish its new proof.
+    service
+        .mark_remote_read_location_missing(
+            &object.object_id,
+            &object.version,
+            &object.content_hash,
+            target,
+        )
+        .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let seen = runtime
+            .repair_executor_progress(&primary)
+            .unwrap_or_default();
+        if let Some(receipt) = service
+            .backend_receipt_for_replica(&object.object_id, &object.version, target)
+            .unwrap()
+            && receipt.generation > previous.generation
+        {
+            assert_eq!(receipt.content_hash, previous.content_hash);
+            assert_ne!(receipt.receipt.event_id, previous.receipt.event_id);
+            break;
+        }
+        assert!(
+            runtime.wait_for_repair_executor_progress(&primary, seen, deadline),
+            "completed placement's replica receipt did not settle: {:?}",
+            repair_evidence()
+        );
+    }
+    runtime
+        .apply_placement_policy(
+            &primary,
+            &object.path,
+            DfsPlacementScope::SelfOnly,
+            DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .with_table_intent_placement_authority(
+                &object.object_id,
+                &intent_id,
+                &object.version,
+                target,
+                object.content_hash.as_deref().unwrap(),
+                |_| Ok(true)
+            )
+            .unwrap(),
+        None,
+        "a policy change applying to the file must still fence its old receipt",
     );
     drop(service);
     drop(control);

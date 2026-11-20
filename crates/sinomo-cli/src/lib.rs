@@ -845,8 +845,8 @@ pub fn hosted_agent_chat_component_factory(
                     service.mark_host_ready();
                     let data_dir = data_dir.clone();
                     let runtime = runtime.clone();
-                    if let Err(error) = service.recover(data_dir, runtime, shutdown.clone()) {
-                        tracing::error!(%error, "chat execution recovery failed");
+                    if let Err(error) = service.start_workers(data_dir, runtime, shutdown.clone()) {
+                        tracing::error!(%error, "chat workers could not start");
                     }
                 });
             }
@@ -5039,7 +5039,17 @@ fn configure_agent_tool_registry_for_workspace_projection_with_modules(
     let live_sifs_mount = if needs_live_sifs_mount {
         match ensure_simple_sandbox_sifs_mount(data_dir) {
             Ok(mount) => mount,
-            Err(error) if !workspace_uses_live_mount => {
+            Err(error)
+                if !workspace_uses_live_mount
+                    && (session_id.is_none()
+                        || matches!(
+                            probe_daemon_status(
+                                &DaemonPaths::new(data_dir),
+                                CLUSTER_HEALTH_PROBE_TIMEOUT
+                            ),
+                            DaemonProbeStatus::NotRunning
+                        )) =>
+            {
                 // The workspace can remain usable without a live SIFS projection,
                 // but this runtime cannot claim that the agent's canonical home is
                 // available in that case.
@@ -5108,6 +5118,14 @@ fn configure_agent_tool_registry_for_workspace_projection_with_modules(
             match prepare_simple_sandbox_agent_home(data_dir, definition.key()) {
                 Ok(home_sifs_path) => {
                     config = config.with_agent_home_sifs_path(home_sifs_path);
+                }
+                Err(detail) if session_id.is_some() || workspace_uses_live_mount => {
+                    return Err(CliError::Parse {
+                        detail: format!(
+                            "prepare canonical SIFS home for agent `{}`: {detail}",
+                            definition.key()
+                        ),
+                    });
                 }
                 Err(detail) => {
                     // A permissions, ownership, or cluster availability problem

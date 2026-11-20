@@ -674,8 +674,9 @@ fn native_sifs_kernel_roundtrip_restart_and_cleanup() {
         "session_id":session_id, "runtime":info, "view_generation":opened.generation,
         "mountinfo":agent_mount_entry,"model_turn_submitted":false}),
     );
-    // One writable mounted-mutation owner per DATA. Reuse the real agent's
-    // mount instead of attempting to create a competing mount in this test.
+    // The CLI and daemon have different lifetimes and independently fenced
+    // FUSE sessions on the same installation.
+    let second = mount_sifs_background(options.clone()).expect("concurrent CLI mount");
     let kernel_payload = format!("kernel {session_id} {} {binary_digest}", node.status().pid);
     let path = agent_mount.join(written.trim_start_matches('/'));
     record(
@@ -691,6 +692,13 @@ fn native_sifs_kernel_roundtrip_restart_and_cleanup() {
     file.sync_all()
         .expect("commit kernel write through the native DFS boundary");
     drop(file);
+    assert_eq!(
+        fs::read(second.mount_root().join(written.trim_start_matches('/'))).unwrap(),
+        kernel_payload.as_bytes()
+    );
+    second.shutdown().unwrap();
+    assert!(mount_entry(&mount_point).is_none());
+    assert!(mount_entry(&agent_mount).is_some());
     assert_eq!(
         browser.read_file(written).unwrap(),
         kernel_payload.as_bytes()
