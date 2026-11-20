@@ -15,7 +15,7 @@ use sinomo_runtime::cli_registry::CliCommandError;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 
-const MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 pub(crate) fn parse_usage_schema_for_test(args: &[String]) -> Result<UsageOptions, CliError> {
@@ -516,6 +516,52 @@ impl ModelConfigClusterSnapshot {
 
 pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     model_config_cluster_snapshot_read(paths).map(ModelConfigClusterSnapshot::into_snapshot)
+}
+
+/// Both chat settings must come from the same authoritative read. Fetching a
+/// whole cluster snapshot also transfers unrelated history and receipts.
+pub(crate) fn chat_model_config_entries(
+    _paths: &ClusterPaths,
+    keys: &[String],
+    timeout: Duration,
+) -> Result<Vec<sinomo_runtime::kv::KvEntry>, CliError> {
+    if let Some(status) = default_main_daemon_status()? {
+        let payload = sinomo_runtime::kv::cluster_kv_authoritative_entries_rpc_payload(keys)?;
+        let request = network::ObjectRpcRequest::from_encoded_body(
+            payload.route,
+            payload.category,
+            payload.body,
+        );
+        let options = network::ClusterObjectRpcOptions::new(
+            network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        )
+        .with_overall_timeout(timeout);
+        let response = sinomo_runtime::daemon::send_daemon_rpc_with_options(
+            &status.address,
+            &request,
+            options,
+        )?;
+        response.error_detail()?;
+        let read = sinomo_runtime::kv::decode_cluster_kv_authoritative_entries_rpc_body(
+            &response.body,
+            keys,
+        )?;
+        return Ok(read.value.into_iter().flatten().collect());
+    }
+    #[cfg(test)]
+    {
+        let snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&_paths.kv_paths())
+            .map_err(network::NetworkError::directory)?;
+        Ok(snapshot
+            .entries
+            .into_iter()
+            .filter(|entry| keys.contains(&entry.key))
+            .collect())
+    }
+    #[cfg(not(test))]
+    Err(CliError::DaemonNotRunning {
+        detail: "clustered model config requires the local daemon".to_string(),
+    })
 }
 
 pub(crate) fn model_config_cluster_snapshot_read(

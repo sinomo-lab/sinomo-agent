@@ -1,20 +1,24 @@
-//! Read-only handling of DFS browser admission backpressure.
+//! Bounded retries for DFS browser reads.
 
 use std::time::{Duration, Instant};
 
-/// Compatibility classifier for existing browser/route admission errors.
-/// Keep diagnostic-string interpretation here until those deployed peers use
-/// a structured admission result. Absence, conflicts and delivery failures are
-/// deliberately not classified as admission backpressure.
+/// Compatibility classifier for reads rejected at admission or discarded
+/// because the shard assignment changed while the read was in flight.
 pub fn dfs_browser_read_should_retry(error: &str) -> bool {
+    dfs_browser_admission_is_busy(error)
+        || (error.contains("routed namespace response authority is stale: distributed DFS error: dispatch authority for namespace shard ")
+            && error.contains(" is no longer current (current primary "))
+}
+
+pub fn dfs_browser_admission_is_busy(error: &str) -> bool {
     (error.contains("DFS browser service is busy") && error.contains("retry the read"))
         || (error.contains("object rpc route /daemon/dfs/browser/")
             && error.contains(" is saturated:"))
 }
 
-/// Retry only a read rejected by browser admission. Every attempt receives the
-/// remaining original RPC deadline; retries never grant a fresh timeout. The
-/// three-second admission budget does not shorten an admitted content fetch.
+/// Each new read receives the remainder of the original RPC deadline and
+/// resolves its current owner. The three-second retry budget does not shorten
+/// an admitted content fetch.
 pub fn retry_dfs_browser_read<T>(
     timeout: Duration,
     read: impl FnMut(Duration) -> Result<T, String>,
@@ -56,6 +60,25 @@ mod tests {
     use std::cell::Cell;
 
     const BUSY: &str = "DFS browser service is busy after waiting 100ms; retry the read";
+
+    #[test]
+    fn read_reissues_a_result_discarded_after_its_shard_assignment_changed() {
+        let stale = "routed namespace response authority is stale: distributed DFS error: dispatch authority for namespace shard services epoch 2 is no longer current (current primary node-a, epoch 2)";
+        let mut replies = [Err(stale.to_owned()), Ok("current listing")].into_iter();
+        assert_eq!(
+            retry_with_clock(
+                Duration::from_secs(1),
+                |_| replies.next().unwrap(),
+                || Duration::ZERO,
+                |_| {},
+            ),
+            Ok("current listing")
+        );
+        assert!(!dfs_browser_admission_is_busy(stale));
+        assert!(!dfs_browser_read_should_retry(
+            "routed namespace response authority is stale: clustered namespace response has no dispatch shard assignment"
+        ));
+    }
 
     #[test]
     fn read_recovers_from_wrapped_backpressure_with_one_original_deadline() {

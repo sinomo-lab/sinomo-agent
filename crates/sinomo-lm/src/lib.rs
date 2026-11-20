@@ -1764,8 +1764,13 @@ pub fn model_config_cluster_kv_txn(config: &ModelConfig) -> Result<KvTxn, Langua
 pub fn model_runtime_config_from_cluster_kv_snapshot(
     snapshot: &KvSnapshot,
 ) -> Result<Option<ModelRuntimeConfig>, LanguageModelError> {
-    snapshot
-        .entries
+    model_runtime_config_from_cluster_kv_entries(&snapshot.entries)
+}
+
+pub fn model_runtime_config_from_cluster_kv_entries(
+    entries: &[KvEntry],
+) -> Result<Option<ModelRuntimeConfig>, LanguageModelError> {
+    entries
         .iter()
         .find(|entry| entry.key == LM_RUNTIME_CONFIG_KV_KEY)
         .map(decode_model_runtime_config_entry)

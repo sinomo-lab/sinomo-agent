@@ -131,8 +131,8 @@ fn load_tui_startup_configs(
 ) -> Result<(ModelRuntimeConfig, sinomo_lm::ModelConfig), CliError> {
     let _local = enter_cli_force_local_mode(!daemon_connected);
     if model_config_uses_cluster(data_dir) {
-        return read_tui_startup_configs(|| {
-            model_config_cluster_snapshot(&ClusterPaths::new(data_dir))
+        return read_tui_startup_configs(|keys, timeout| {
+            chat_model_config_entries(&ClusterPaths::new(data_dir), keys, timeout)
         });
     }
     Ok((
@@ -142,12 +142,35 @@ fn load_tui_startup_configs(
 }
 
 fn read_tui_startup_configs(
-    read_snapshot: impl FnOnce() -> Result<KvSnapshot, CliError>,
+    mut read_entries: impl FnMut(
+        &[String],
+        Duration,
+    ) -> Result<Vec<sinomo_runtime::kv::KvEntry>, CliError>,
 ) -> Result<(ModelRuntimeConfig, ModelConfig), CliError> {
-    let snapshot = read_snapshot()?;
+    let keys = [
+        LM_PROVIDER_CONFIG_KV_KEY.into(),
+        LM_RUNTIME_CONFIG_KV_KEY.into(),
+    ];
+    let started = Instant::now();
+    let timeout = MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT;
+    let entries = match read_entries(&keys, timeout) {
+        Ok(entries) => entries,
+        Err(error) => {
+            // The local daemon can relay a transport failure from the KV leader
+            // in an RPC error response. Only this read is resubmitted.
+            let delivery_failed = matches!(&error, CliError::NetworkDelivery { .. })
+                || matches!(&error, CliError::Network { detail, .. }
+                    if detail.contains("network delivery error at daemon RPC ("));
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if !delivery_failed || remaining.is_zero() {
+                return Err(error);
+            }
+            read_entries(&keys, remaining)?
+        }
+    };
     Ok((
-        sinomo_lm::model_runtime_config_from_cluster_kv_snapshot(&snapshot)?.unwrap_or_default(),
-        sinomo_lm::model_config_from_cluster_kv_snapshot(&snapshot)?.unwrap_or_default(),
+        sinomo_lm::model_runtime_config_from_cluster_kv_entries(&entries)?.unwrap_or_default(),
+        sinomo_lm::model_config_from_cluster_kv_entries(&entries)?.unwrap_or_default(),
     ))
 }
 

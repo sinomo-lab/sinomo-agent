@@ -9950,7 +9950,7 @@ fn sifs_immutable_write_should_reconcile(error: &str) -> bool {
         || (error.contains("retained metadata authority generation")
             && error.contains("is not ready"))
         || error.contains("content is unavailable from every eligible replica")
-        || sifs_browser_read_should_retry(error)
+        || sinomo_runtime::api::dfs::read_retry::dfs_browser_admission_is_busy(error)
 }
 
 fn reconcile_conditional_replace_bytes(

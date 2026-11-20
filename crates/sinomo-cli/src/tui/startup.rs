@@ -122,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_and_runtime_settings_share_one_snapshot_read() {
+    fn startup_reads_only_the_two_model_settings_together() {
         use sinomo_runtime::kv::{KvEntry, KvOp, KvRevision, KvVersion};
         let models = ModelConfig {
             default_provider: Some("deepseek".to_string()),
@@ -136,7 +136,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let entries = [
+        let entries: Vec<_> = [
             KvOp::put_serde(LM_PROVIDER_CONFIG_KV_KEY, &models, None).unwrap(),
             KvOp::put_serde(LM_RUNTIME_CONFIG_KV_KEY, &runtime, None).unwrap(),
         ]
@@ -161,22 +161,42 @@ mod tests {
         })
         .collect();
         let mut reads = 0;
-        let (actual_runtime, actual_models) = read_tui_startup_configs(|| {
+        let (actual_runtime, actual_models) = read_tui_startup_configs(|keys, _| {
             reads += 1;
-            Ok(KvSnapshot {
-                entries,
-                revision: KvRevision(1),
-                compacted_revision: KvRevision::ZERO,
-                leases: Vec::new(),
-                events: Vec::new(),
-                committed_requests: Vec::new(),
-                expired_requests: Vec::new(),
-            })
+            assert_eq!(keys, [LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KV_KEY]);
+            Ok(entries.clone())
         })
         .unwrap();
         assert_eq!(reads, 1);
         assert_eq!(actual_runtime, runtime);
         assert_eq!(actual_models, models);
+    }
+
+    #[test]
+    fn startup_repeats_an_interrupted_settings_read_but_preserves_authorization_errors() {
+        let mut calls = 0;
+        read_tui_startup_configs(|_, timeout| {
+            calls += 1;
+            if calls == 1 {
+                return Err(CliError::Network {
+                    address: "/cluster/kv/authoritative/entries".into(),
+                    detail: "network delivery error at daemon RPC (PossiblyApplied): early eof"
+                        .into(),
+                });
+            }
+            assert!(timeout <= MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+
+        let mut denied = 0;
+        let result = read_tui_startup_configs(|_, _| {
+            denied += 1;
+            Err(CliError::AuthDenied)
+        });
+        assert!(matches!(result, Err(CliError::AuthDenied)));
+        assert_eq!(denied, 1);
     }
 
     #[test]
