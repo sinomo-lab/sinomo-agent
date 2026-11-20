@@ -57,17 +57,16 @@ resubmission mistake.
 Current entry points:
 
 ```sh
-codegraph explore 'observe_original_native_commit evaluate_original_native_commit validate_original_command_preimage placement_outcome_evaluated'
+codegraph explore 'inspect_original_job KvRequestOutcome'
 codegraph explore 'kv_request_outcome_authoritative_async replayed_routed_write_outcome_if_known recover_prepared_write_for_retry'
 ```
 
-- [handoff.rs](../../../../crates/sinomo-dfs-migration/src/authority/handoff.rs)
-  observes the original native commit; its comment explicitly excludes first
-  effects. `validate_original_command_preimage` matches the original bare body or
-  the historical physical body with captured authorization compares.
-- [placement custody](../../../../crates/sinomo-dfs-migration/src/authority/placement_work/custody.rs)
-  uses `placement_outcome_evaluated` and typed `Committed`, `RejectedBeforeCommit`,
-  `Unknown`/`Expired` outcomes. Unknown is not success or a license to resubmit.
+- [Original job inspection](../../../../crates/sinomo-dfs/src/source_adoption/job_custody.rs)
+  validates the actor, current configuration and original job body before
+  returning its receipt.
+- [KV request outcomes](../../../../crates/sinomo-kv/src/model.rs) distinguish
+  a committed request, a rejection before commit, and an unknown or expired
+  result. Preserve the original operation identity when the outcome is uncertain.
 - [service_commit.rs](../../../../crates/sinomo-dfs/src/service_commit.rs) and
   [service_routed_write.rs](../../../../crates/sinomo-dfs/src/service_routed_write.rs)
   already own same-operation DFS continuation and result replay.

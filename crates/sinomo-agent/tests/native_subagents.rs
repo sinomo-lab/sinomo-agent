@@ -1,12 +1,14 @@
 //! Exercise the independently built dylib through activation, discovery and real sessions.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#[path = "fixtures/native_module.rs"]
+mod native_module;
+
 use sinomo_agent::*;
 use sinomo_lm::{LanguageModelError, LanguageModelRequest, LanguageModelResponse};
 use sinomo_runtime::{
     events::SessionId, local::SinomoDataDir, module::*, module_api::agent::*, node::NodeId,
 };
 use std::{
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -84,24 +86,7 @@ fn wait(manager: &AgentSessionHost, parent: &SessionId, id: &TaskId) {
 
 #[test]
 fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    assert!(
-        std::process::Command::new("cargo")
-            .args(["build", "-p", "sinomo-subagents"])
-            .current_dir(workspace)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let library = workspace.join("target/debug").join(format!(
-        "{}sinomo_subagents{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    ));
+    let library = native_module::build("sinomo-subagents");
     let requirement = NativeAgentSessionTools::requirement();
     let mut descriptor = None;
     for _ in 0..2 {

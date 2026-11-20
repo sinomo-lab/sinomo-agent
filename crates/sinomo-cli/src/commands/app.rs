@@ -141,6 +141,9 @@ fn shutdown_after_parent_lease_closed(launch_id: &str) {
                     return;
                 }
             }
+            // Give an acknowledged shutdown the rest of its bounded lease
+            // deadline to drain components and retire process-owned mounts.
+            DaemonProbeStatus::NotRunning if shutdown_sent => {}
             // EOF before startup must also prevent an orphaned daemon from starting later.
             DaemonProbeStatus::NotRunning => std::process::exit(0),
         }

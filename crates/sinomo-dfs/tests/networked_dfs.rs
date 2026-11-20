@@ -3068,6 +3068,9 @@ fn native_unknown_adoption_retains_source_owner_until_exact_reopen_reconciliatio
     let old_owner = std::sync::Arc::downgrade(&actual_owner);
     drop(actual_owner);
     drop(context);
+    // Inspect the unresolved first response before the fixture reopens the
+    // source. An unbounded caller would keep following this same operation.
+    requester.single_attempt_for_test(true);
     std::thread::scope(|scope| {
         let op = operation.clone();
         let foreground =
@@ -3465,6 +3468,9 @@ fn native_whole_shard_partial_metadata_probe_uses_actual_operation_bound_native_
         wait_for_commit: true,
         foreground_replica_repair: false,
     };
+    // The missing participant is healed only after inspecting the original
+    // durable prepare. Observe one attempt at this boundary.
+    client.single_attempt_for_test(true);
     let rejected = client
         .posix_write_file_with_operation_id(path, bytes, options.clone(), operation)
         .expect_err("two participants cannot publish through a three-participant assignment");
@@ -3531,6 +3537,7 @@ fn native_whole_shard_partial_metadata_probe_uses_actual_operation_bound_native_
     // Heal the actual receiver and replay the SAME original caller identity.
     // Readiness, content and the terminal digest must come from native recovery.
     runtime.clear_faults();
+    client.single_attempt_for_test(false);
     let stat = client
         .posix_write_file_with_operation_id(path, bytes, options, operation)
         .unwrap();

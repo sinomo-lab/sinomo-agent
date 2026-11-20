@@ -534,7 +534,7 @@ fn imported_snapshot_requires_route_read_model_materialization(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    let Some(existing) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
+    let Some(existing) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(false);
     };
     route_connectivity_projection_changed(existing.as_ref(), snapshot, OffsetDateTime::now_utc())

@@ -497,9 +497,9 @@ fn crash_during_slow_job(name: &str, detached: bool, after_crash: ModelScript) -
     let data_dir = SinomoDataDir::new(root.join("data"));
     data_dir.ensure_root_layout().expect("data layout");
     let command = if cfg!(windows) {
-        "ping -n 120 127.0.0.1"
+        "echo started > slow-job-started && ping -n 120 127.0.0.1"
     } else {
-        "sleep 120"
+        "printf started > slow-job-started && exec sleep 120"
     };
     let call = serde_json::json!({
         "response_mode": "tool_calls",
@@ -552,6 +552,7 @@ fn crash_during_slow_job(name: &str, detached: bool, after_crash: ModelScript) -
     chat.drain(Duration::from_secs(1));
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
+    let started = workspace.join("slow-job-started");
     chat.command(ChatSessionCommand::SetWorkspace {
         session_id: session_id.clone(),
         workspace_root: Some(workspace),
@@ -563,13 +564,20 @@ fn crash_during_slow_job(name: &str, detached: bool, after_crash: ModelScript) -
         attachments: Vec::new(),
     });
     if detached {
-        // The turn has answered, so the call runs in the background.
-        wait_for_requests(&before, 2);
+        chat.poll_until(|event| {
+            matches!(event, ChatEvent::TurnDone { session_id: done } if done == &session_id)
+        });
     } else {
         wait_for_requests(&before, 1);
     }
-    // Let the command start.
-    chat.drain(Duration::from_secs(2));
+    let deadline = Instant::now() + TURN_TIMEOUT;
+    while !started.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the command never started in the selected workspace before the crash"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     daemon.kill();
     CrashedSlowJob {
         _root: root,

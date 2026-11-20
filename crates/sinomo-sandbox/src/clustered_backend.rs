@@ -275,11 +275,18 @@ impl ClusteredSandboxBackend {
     fn load_policy_config(&self) -> Result<SandboxClusterPolicyConfig, SandboxBackendError> {
         let definition = sandbox_policy_config_definition()
             .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
-        let entry = self
-            .cluster
-            .kv_get_local(&definition.cluster_key())
-            .map_err(|error| SandboxBackendError::Other(error.to_string()))?
-            .value;
+        let key = definition.cluster_key();
+        let entry = match self.cluster.kv_get_local(&key) {
+            Ok(read) => Ok(read.value),
+            Err(ServiceError::Kv(sinomo_core::kv::KvError::Busy { .. })) => {
+                // A checked-out local voter may have no readable checkpoint.
+                // Resolve the same policy key through its current authority.
+                self.block_on_cluster(self.cluster.kv_get_authoritative_async(&key))?
+                    .map(|read| read.value)
+            }
+            Err(error) => Err(error),
+        }
+        .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
         let entries = entry.into_iter().collect::<Vec<_>>();
         sandbox_policy_config_from_cluster_kv_entries(&entries)
             .map_err(|error| SandboxBackendError::Other(error.to_string()))

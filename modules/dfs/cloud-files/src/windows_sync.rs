@@ -5883,65 +5883,83 @@ mod tests {
             "the unfaulted lookup must receive the actual Main response"
         );
 
-        runtime.install_fault(DfsTestFaultRule {
-            source: Some(local_node.clone()),
-            target: Some(shard.primary_node_id.clone()),
-            route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.into()),
-            call_id: None,
-            origin: Some(DfsTestRpcOrigin::RegisteredHost),
-            remaining_hits: 2,
-            action: DfsTestFaultAction::BudgetExhausted,
-        });
+        let requests = runtime
+            .capture_namespace_requests(&shard.primary_node_id, 32)
+            .expect("observe commands received by the actual shard owner");
+        let fail_first_lookup = || {
+            runtime.install_fault(DfsTestFaultRule {
+                source: Some(local_node.clone()),
+                target: Some(shard.primary_node_id.clone()),
+                route: Some(dfs::DFS_DATA_NAMESPACE_ROUTE.into()),
+                call_id: None,
+                origin: Some(DfsTestRpcOrigin::RegisteredHost),
+                remaining_hits: 1,
+                action: DfsTestFaultAction::BudgetExhaustedForFirstCall,
+            })
+        };
         assert_current_reader_is_outside();
+        fail_first_lookup();
         let before_stat = runtime.rpc_observations().len();
-        assert!(
-            service
-                .posix_stat_distributed(&format!("{prefix}/missing-stat.txt"))
-                .is_err()
-        );
+        assert!(matches!(
+            service.posix_stat_distributed(&format!("{prefix}/missing-stat.txt")),
+            Err(dfs::DfsPosixError::NotFound { .. })
+        ));
         assert_current_reader_is_outside();
         let before_lstat = runtime.rpc_observations().len();
         assert_current_reader_is_outside();
-        assert!(
-            service
-                .posix_lstat_distributed(&format!("{prefix}/missing-lstat.txt"))
-                .is_err()
-        );
+        fail_first_lookup();
+        assert!(matches!(
+            service.posix_lstat_distributed(&format!("{prefix}/missing-lstat.txt")),
+            Err(dfs::DfsPosixError::NotFound { .. })
+        ));
         assert_current_reader_is_outside();
         let observations = runtime.rpc_observations();
-        let is_namespace_attempt = |event: &&dfs::test_support::DfsTestRpcObservation| {
-            event.source == local_node
-                && event.target == shard.primary_node_id
-                && event.route == dfs::DFS_DATA_NAMESPACE_ROUTE
-                && event.origin == DfsTestRpcOrigin::RegisteredHost
-                && event.phase == DfsTestRpcPhase::BeforeDispatch
-        };
-        assert_eq!(
-            [
-                observations[before_stat..before_lstat]
-                    .iter()
-                    .filter(is_namespace_attempt)
-                    .count(),
-                observations[before_lstat..]
-                    .iter()
-                    .filter(is_namespace_attempt)
-                    .count(),
-            ],
-            [1, 1],
-            "Cloud Files stat/lstat must never perform an unowned SyncPath ingest"
-        );
-        for attempt in observations[before_stat..]
-            .iter()
-            .filter(is_namespace_attempt)
-        {
-            assert!(
-                observations[before_stat..].iter().any(|event| {
-                    event.call_id == attempt.call_id
+        for calls in [
+            &observations[before_stat..before_lstat],
+            &observations[before_lstat..],
+        ] {
+            let failures = calls
+                .iter()
+                .filter(|event| {
+                    event.source == local_node
+                        && event.target == shard.primary_node_id
+                        && event.route == dfs::DFS_DATA_NAMESPACE_ROUTE
+                        && event.origin == DfsTestRpcOrigin::RegisteredHost
                         && event.phase == DfsTestRpcPhase::EndedWithoutResponse
-                }),
-                "each lookup must exercise the real negative dispatch fault"
+                })
+                .count();
+            assert_eq!(
+                failures, 1,
+                "each lookup must exercise its own negative dispatch fault"
             );
         }
+        // The requester can resend a read after delivery fails. Inspect the
+        // commands that reach the owner so a SyncPath cannot hide among retries.
+        let received = requests.records();
+        assert!(
+            received
+                .iter()
+                .any(|message| message.source_node_id == local_node)
+        );
+        for message in received
+            .into_iter()
+            .filter(|message| message.source_node_id == local_node)
+        {
+            let dfs::DfsNetworkMessage::NamespaceRequest(command) = message.message else {
+                panic!("expected a namespace request");
+            };
+            assert!(
+                matches!(
+                    command.operation,
+                    dfs::DfsNamespaceOperation::LookupPath { .. }
+                        | dfs::DfsNamespaceOperation::LookupPaths { .. }
+                        | dfs::DfsNamespaceOperation::MetadataQuery { .. }
+                ),
+                "{command:?}"
+            );
+            assert!(!command.include_metadata_journal_batches);
+        }
+        drop(requests);
         assert!(
             observations[before_stat..].iter().all(|event| {
                 event.source != local_node

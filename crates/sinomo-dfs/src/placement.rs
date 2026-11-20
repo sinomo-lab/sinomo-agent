@@ -1820,7 +1820,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .transpose()?
             .flatten();
         let ranking_object = match original.as_ref() {
-            Some(record) => recorded_placement_ranking_object(object, &intent_id, record)?,
+            Some(record) => recorded_placement_ranking_object(
+                object,
+                &intent_id,
+                record,
+                &resolved.policy.consistency,
+            )?,
             None => object.clone(),
         };
         reconciliation_placement_for_object_with_resolved_policy(
@@ -3734,6 +3739,7 @@ fn recorded_placement_ranking_object(
     object: &DfsObjectMetadata,
     intent_id: &str,
     record: &crate::DfsWriteIntentRecord,
+    applied_policy: &DfsObjectPolicy,
 ) -> Result<DfsObjectMetadata, DfsError> {
     let captured = record
         .object_metadata
@@ -3757,7 +3763,10 @@ fn recorded_placement_ranking_object(
         || captured.path != object.path
         || captured.version != object.version
         || captured.kind != object.kind
-        || captured.policy != object.policy
+        // Applying a placement rule updates policy without creating a content
+        // version. A page read before that update still names the same object.
+        // The committed intent captured the policy applied by this exact job.
+        || &captured.policy != applied_policy
         || captured.owner_node_id != object.owner_node_id
         || captured.content_hash != object.content_hash
         || captured.content_size_bytes != object.content_size_bytes

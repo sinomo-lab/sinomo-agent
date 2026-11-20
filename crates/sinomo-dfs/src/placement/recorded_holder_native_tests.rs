@@ -227,6 +227,48 @@ fn pending_case(
 }
 
 #[test]
+fn planning_a_page_read_before_the_same_jobs_policy_update_reuses_its_committed_holders() {
+    let (native, mut client, _, before) = base("placement-page-before-policy-update");
+    let primary = client.node_id().clone();
+    let policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedConfirmed, 2, 2).unwrap();
+    let job = native
+        .apply_placement_policy(&primary, PATH, DfsPlacementScope::Subtree, policy)
+        .unwrap();
+    let (resolved, replication, placement) = plan(&job, &before);
+    client.refresh_control_plane_latest().unwrap();
+    client
+        .route_namespace_operation(
+            primary.clone(),
+            DfsNamespaceOperation::ReconcilePlacement {
+                job_id: job.job_id.clone(),
+                path: before.path.clone(),
+                object_id: before.object_id.clone(),
+                expected_version: before.version.clone(),
+                object_policy: resolved.policy.consistency,
+                replication_policy: replication,
+                desired_replica_node_ids: placement.plan.desired_replica_nodes.clone(),
+            },
+        )
+        .unwrap();
+    let record = actual_record(&native, &primary, &job, &before);
+    let captured = record.object_metadata.as_ref().unwrap();
+    assert_eq!(captured.version, before.version);
+    assert_ne!(captured.policy, before.policy);
+    drop(client);
+
+    let owner = native.metadata_primary_service(PATH).unwrap();
+    let (_, _, replay) = owner
+        .reconciliation_placement_for_object_with_pins(&job.accepted_config, &job, &before, &[])
+        .unwrap();
+    assert_eq!(
+        replay.plan.desired_replica_nodes,
+        placement.plan.desired_replica_nodes
+    );
+    drop(owner);
+    native.close().unwrap();
+}
+
+#[test]
 fn native_capture_rejects_missing_or_inconsistent_original_data() {
     let (native, service, nodes, object, job, record, hold) =
         pending_case("native-recorded-capture-negative");
@@ -242,11 +284,12 @@ fn native_capture_rejects_missing_or_inconsistent_original_data() {
         .journal_last_sequence()
         .unwrap();
     assert_eq!(
-        recorded_placement_ranking_object(&object, &record.intent_id, &record).unwrap(),
+        recorded_placement_ranking_object(&object, &record.intent_id, &record, &object.policy)
+            .unwrap(),
         object
     );
     let mut rejected = Vec::new();
-    for alteration in 0..4 {
+    for alteration in 0..5 {
         let mut bad = record.clone();
         match alteration {
             0 => bad.object_metadata = None,
@@ -261,9 +304,13 @@ fn native_capture_rejects_missing_or_inconsistent_original_data() {
                 .unwrap()
                 .path
                 .push_str("-different"),
+            4 => bad.object_metadata.as_mut().unwrap().policy = DfsObjectPolicy::LocalOwned,
             _ => unreachable!(),
         }
-        rejected.push(recorded_placement_ranking_object(&object, &record.intent_id, &bad).is_err());
+        rejected.push(
+            recorded_placement_ranking_object(&object, &record.intent_id, &bad, &object.policy)
+                .is_err(),
+        );
     }
     let pin = nodes
         .iter()

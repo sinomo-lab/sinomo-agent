@@ -248,13 +248,13 @@ impl UsageLedger {
                     && start.saturating_add(BUCKET_MS) > query.start_ms
                     && (start < query.start_ms
                         || start.saturating_add(BUCKET_MS) > query.end_ms
-                        || query.bucket_ms % BUCKET_MS != 0)
+                        || !query.bucket_ms.is_multiple_of(BUCKET_MS))
             });
             for rollup in segment.rollups.values() {
                 let start = rollup.dimensions.timestamp_ms;
                 let edge = start < query.start_ms
                     || start.saturating_add(BUCKET_MS) > query.end_ms
-                    || query.bucket_ms % BUCKET_MS != 0;
+                    || !query.bucket_ms.is_multiple_of(BUCKET_MS);
                 let main_match = main_range && matches_query(&rollup.dimensions, query) && !edge;
                 if !main_match
                     && !budgets
@@ -322,7 +322,7 @@ impl UsageLedger {
                         let start = record.timestamp_ms / BUCKET_MS * BUCKET_MS;
                         if start < query.start_ms
                             || start.saturating_add(BUCKET_MS) > query.end_ms
-                            || query.bucket_ms % BUCKET_MS != 0
+                            || !query.bucket_ms.is_multiple_of(BUCKET_MS)
                         {
                             let totals = record_totals(&record);
                             merge_totals(&mut response.totals, &totals);

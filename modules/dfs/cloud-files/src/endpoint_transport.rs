@@ -500,8 +500,8 @@ mod tests {
                     if query.file_system_id == fixture.shard.file_system_id
                         && query.shard_id.0 == fixture.shard.shard_id
                         && query.epoch == fixture.shard.epoch
-                        && matches!(&query.selection, dfs::DfsMetadataSelection::StatAtPathV1 { request }
-                            if request.path == DOCUMENT)
+                        && matches!(&query.selection, dfs::DfsMetadataSelection::StatAtPathV2 { path }
+                            if path == DOCUMENT)
             )
         };
         assert!(requests.iter().any(is_requested_stat), "{requests:?}");

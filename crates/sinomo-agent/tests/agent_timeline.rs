@@ -1,4 +1,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#[path = "fixtures/native_module.rs"]
+mod native_module;
+
 use sinomo_agent::session_access::AgentSessionAccess;
 use sinomo_agent::*;
 use sinomo_runtime::events::SessionId;
@@ -110,35 +113,9 @@ fn record_tool(store: &FileAgentSessionStore, id: &SessionId, name: &str) {
 }
 #[test]
 fn native_timeline_reads_channel_sessions_and_optional_related_sessions() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    assert!(
-        std::process::Command::new("cargo")
-            .args([
-                "build",
-                "-p",
-                "sinomo-agent-timeline",
-                "-p",
-                "sinomo-subagents"
-            ])
-            .current_dir(workspace)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let library = |stem: &str| {
-        workspace.join("target/debug").join(format!(
-            "{}{stem}{}",
-            std::env::consts::DLL_PREFIX,
-            std::env::consts::DLL_SUFFIX
-        ))
-    };
     let root = sinomo_testdir::TestDir::new("agent-timeline");
     let data_dir = SinomoDataDir::new(root.path());
-    let descriptor = install(root.path(), &library("sinomo_agent_timeline"));
+    let descriptor = install(root.path(), &native_module::build("sinomo-agent-timeline"));
     let mut channel = AgentChannel::new_channel(SessionId::generate(), "Team");
     channel.ensure_participant("planner", "Planner");
     channel.ensure_participant("builder", "Builder");
@@ -218,7 +195,7 @@ fn native_timeline_reads_channel_sessions_and_optional_related_sessions() {
         assert!(matches!(valid, ActiveNativeComponentResponse::Value(_)));
         assert!(native.unload().shutdown_ok);
     }
-    install(root.path(), &library("sinomo_subagents"));
+    install(root.path(), &native_module::build("sinomo-subagents"));
     // A waiting module invocation must not prevent another session from
     // entering the same provider to deliver the event it is waiting for.
     struct WaitAccess {
@@ -491,7 +468,8 @@ fn native_timeline_reads_channel_sessions_and_optional_related_sessions() {
             .iter()
             .any(|r| r.interface_id == SESSION_INTERFACE)
     );
-    let artifact = workspace.join("target/change-scope/agent-timeline/frame.sobj");
+    let artifact = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/change-scope/agent-timeline/frame.sobj");
     std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     std::fs::write(artifact, encode_sobj(&response.frame).unwrap()).unwrap();
     remove_native_dylib_module_loader_state(

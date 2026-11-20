@@ -17174,6 +17174,13 @@ mod tests {
             .get_by_role(sui::SemanticsRole::List)
             .with_name("agent-config-list")
             .scroll_pixels(sui::Vector::new(0.0, -2000.0))?;
+        assert_agent_rows_in_view(window, names)
+    }
+
+    fn assert_agent_rows_in_view(
+        window: &sui_testing::TestWindow,
+        names: &[&str],
+    ) -> sui::Result<()> {
         window.run_until_idle()?;
         let snapshot = window.snapshot()?;
         let list = snapshot
@@ -19398,7 +19405,7 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
-        scroll_agent_rows_into_view(&window, &["render-agent"])?;
+        assert_agent_rows_in_view(&window, &["render-agent"])?;
 
         window.get_by_text("Agents").expect().to_be_visible()?;
         window

@@ -1549,7 +1549,6 @@ where
     let mut acceptor = accept_owned_routed_stream_carrier(carrier)?;
     let mut handlers = tokio::task::JoinSet::new();
     let mut accepting = true;
-    let mut stop = false;
     while accepting || !handlers.is_empty() {
         tokio::select! {
             accepted = acceptor.accept(), if accepting => {
@@ -1567,9 +1566,8 @@ where
                 .await;
                 match immediate {
                     Some(Ok(true)) => {
-                        stop = true;
-                        accepting = false;
-                        handlers.abort_all();
+                        handlers.shutdown().await;
+                        return Ok(true);
                     }
                     Some(Ok(false)) => {}
                     Some(Err(error)) => return Err(error),
@@ -1581,9 +1579,8 @@ where
             joined = handlers.join_next(), if !handlers.is_empty() => {
                 match joined {
                     Some(Ok(Ok(true))) => {
-                        stop = true;
-                        accepting = false;
-                        handlers.abort_all();
+                        handlers.shutdown().await;
+                        return Ok(true);
                     }
                     Some(Ok(Ok(false))) => {}
                     Some(Ok(Err(error))) => return Err(error),
@@ -1598,7 +1595,7 @@ where
             }
         }
     }
-    Ok(stop)
+    Ok(false)
 }
 pub async fn serve_local_object_rpc_stream_carrier<F, Fut>(
     carrier: BoxedNetworkStream,
@@ -3221,6 +3218,45 @@ mod tests {
             .expect("logical open must not wait for a remote acknowledgement");
 
         drop(stream);
+    }
+
+    #[tokio::test]
+    async fn carrier_server_preserves_shutdown_when_another_handler_is_pending() {
+        for yield_before_shutdown in [false, true] {
+            let (client_carrier, server_carrier) = carrier_pair();
+            let (started, active) = oneshot::channel();
+            let mut started = Some(started);
+            let server = tokio::spawn(serve_routed_stream_carrier(server_carrier, move |stream| {
+                let first = started.take();
+                async move {
+                    let _stream = stream;
+                    if let Some(started) = first {
+                        started.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    }
+                    if yield_before_shutdown {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(true)
+                }
+            }));
+            let client = Arc::new(OwnedRoutedStreamClient::new(client_carrier).unwrap());
+            let mut watch = client.open().unwrap();
+            watch.write_all(b"watch").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), active)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut shutdown = client.open().unwrap();
+            shutdown.write_all(b"stop").await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect("the completed handler requested shutdown")
+            );
+        }
     }
 
     #[tokio::test]

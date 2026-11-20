@@ -477,11 +477,18 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
 ) -> Result<Arc<ClusterDirectoryProjection>, NetworkError> {
     if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
         && let Some(entry) = cache.get_mut(&paths.root)
-        && Arc::ptr_eq(&entry.snapshot, &snapshot)
         && entry.module_routing_generation == module_routing_generation
     {
+        let previous = Arc::clone(&entry.snapshot);
+        let projection = Arc::clone(&entry.projection);
         entry.last_used = cluster_directory_projection_cache_tick();
-        return Ok(Arc::clone(&entry.projection));
+        drop(cache);
+        // A resident read captures fresh rows even when the directory is
+        // unchanged. Compare the entire captured cut outside the shared lock
+        // before decoding connectivity and computing the semantic marks.
+        if Arc::ptr_eq(&previous, &snapshot) || previous.entries == snapshot.entries {
+            return Ok(projection);
+        }
     }
 
     // Unrelated KV writes reuse the payload. Renewal/latency observations must

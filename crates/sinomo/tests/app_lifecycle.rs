@@ -329,8 +329,16 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
     );
     let sifs = sinomo_client::SifsBrowser::open_daemon(status.address.clone())
         .expect("open SIFS through the frontend client");
-    sifs.list("/")
-        .expect("list SIFS through the frontend client");
+    // The process publishes its status before the DFS owner has admitted
+    // the default shards. Observe that owner's readiness through the frontend.
+    let sifs_deadline = Instant::now() + Duration::from_secs(15);
+    while let Err(error) = sifs.list("/") {
+        assert!(
+            Instant::now() < sifs_deadline,
+            "SIFS root did not become readable: {error}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     // Cluster service publication follows local daemon readiness asynchronously. Wait for
     // the same provider-backed catalog used by chat before opening a session.
     let agent_client = sinomo_client::AgentManagementClient::at_address(status.address.clone());
@@ -463,6 +471,21 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
         probe_daemon_status(&paths, PROBE_TIMEOUT),
         DaemonProbeStatus::NotRunning
     ));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = data_dir.external_mounts_dir().join("sifs/by-process");
+        match std::fs::metadata(parent.join(child.id().to_string())) {
+            Ok(entry) => assert_eq!(
+                entry.dev(),
+                std::fs::metadata(parent).unwrap().dev(),
+                "the exited daemon still has a mounted SIFS workspace"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect the exited daemon's SIFS workspace: {error}"),
+        }
+    }
 }
 
 #[test]

@@ -673,39 +673,103 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
             .unwrap()
             .is_some()
     }));
-    let prior_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    loop {
-        let current = control.with_client(|kv| {
-            DfsControlPlaneStore::new(kv.as_mut())
-                .placement_reconciliation(&object.file_system_id, &prior.job_id)
-                .unwrap()
-                .unwrap()
-        });
-        assert!(
-            Instant::now() < prior_deadline,
-            "original adaptive A did not finish within its native budget: {current:?}"
+    let repair_evidence = || {
+        let attempts = crate::repair_executor::repair_executor_status_sample(
+            &runtime.data_dir(&primary).root(),
+            16,
         );
-        if current.state == DfsPlacementReconciliationState::Completed {
-            break;
-        }
-        assert_ne!(
-            current.state,
-            DfsPlacementReconciliationState::Failed,
-            "{current:?}"
-        );
-        for owner in
-            std::iter::once(&coordinator).chain((&primary != &coordinator).then_some(&primary))
-        {
-            let remaining = prior_deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "adaptive A budget exhausted");
-            let tick = runtime.maintenance_tick(owner, remaining).unwrap();
+        let deliveries = runtime
+            .rpc_observations()
+            .into_iter()
+            .rev()
+            .filter(|call| call.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE)
+            .take(12)
+            .map(|call| (call.source, call.target, call.phase, call.outcome_error))
+            .collect::<Vec<_>>();
+        (attempts, deliveries)
+    };
+    let shard = crate::select_metadata_shard_config_for_path(
+        &object.file_system_id,
+        &runtime.metadata_shards().unwrap(),
+        &object.path,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(shard.primary_node_id, primary);
+    let shard_id = crate::DfsMetadataShardId::new(shard.shard_id);
+    let objects = BTreeSet::from([object.object_id.clone()]);
+    let finish_job = |job_id: &str, intent_id: &str, deadline: Instant| {
+        loop {
+            let current = control.with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .placement_reconciliation(&object.file_system_id, job_id)
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(current.job_id, job_id);
             assert!(
-                tick.outcome.is_ok(),
-                "actual adaptive A continuation failed: {:?}",
-                tick.outcome
+                Instant::now() < deadline,
+                "adaptive job missed its budget: {current:?}, repair={:?}",
+                repair_evidence()
             );
+            if current.state == DfsPlacementReconciliationState::Completed {
+                assert_eq!(current.pending_repair_count, 0);
+                break;
+            }
+            assert_ne!(
+                current.state,
+                DfsPlacementReconciliationState::Failed,
+                "{current:?}"
+            );
+            if current.state == DfsPlacementReconciliationState::Repairing {
+                // The executor now owns the outstanding copy. Observe its edge
+                // before reading the index so a concurrent receipt cannot be
+                // missed. Forcing another placement scan here competes with
+                // that receipt for the same policy-mutation permit.
+                let seen = runtime
+                    .repair_executor_progress(&primary)
+                    .unwrap_or_default();
+                let index = runtime
+                    .node_metadata(&primary)
+                    .unwrap()
+                    .repair_index_objects(&shard_id, &objects)
+                    .unwrap();
+                if index
+                    .needs
+                    .iter()
+                    .any(|(_, need)| need.owner_intent_id.as_deref() == Some(intent_id))
+                {
+                    assert!(
+                        runtime.wait_for_repair_executor_progress(&primary, seen, deadline),
+                        "adaptive repair made no progress: {current:?}, repair={:?}",
+                        repair_evidence()
+                    );
+                    continue;
+                }
+            }
+            for owner in
+                std::iter::once(&coordinator).chain((&primary != &coordinator).then_some(&primary))
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "adaptive job budget exhausted: {current:?}"
+                );
+                let tick = runtime.maintenance_tick(owner, remaining).unwrap();
+                assert!(
+                    tick.outcome.is_ok(),
+                    "adaptive continuation failed on {owner}: {:?}, repair={:?}",
+                    tick.outcome,
+                    repair_evidence()
+                );
+            }
         }
-    }
+    };
+    finish_job(
+        &prior.job_id,
+        &prior_intent_id,
+        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+    );
     let mut service = runtime.metadata_primary_service(&object.path).unwrap();
     assert_eq!(service.node_id(), &primary);
     let current = service
@@ -859,40 +923,7 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
         cut.current
     );
     drop(service);
-    loop {
-        let recovered = control.with_client(|kv| {
-            DfsControlPlaneStore::new(kv.as_mut())
-                .placement_reconciliation(&object.file_system_id, &job.job_id)
-                .unwrap()
-                .unwrap()
-        });
-        assert!(
-            Instant::now() < deadline,
-            "original adaptive B did not resume in its native budget: {recovered:?}"
-        );
-        assert_eq!(recovered.job_id, job.job_id);
-        if recovered.state == DfsPlacementReconciliationState::Completed {
-            assert_eq!(recovered.pending_repair_count, 0);
-            break;
-        }
-        assert_ne!(
-            recovered.state,
-            DfsPlacementReconciliationState::Failed,
-            "{recovered:?}"
-        );
-        for owner in
-            std::iter::once(&coordinator).chain((&primary != &coordinator).then_some(&primary))
-        {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "original adaptive B budget exhausted");
-            let tick = runtime.maintenance_tick(owner, remaining).unwrap();
-            assert!(
-                tick.outcome.is_ok(),
-                "actual B continuation failed: {:?}",
-                tick.outcome
-            );
-        }
-    }
+    finish_job(&job.job_id, &intent_id, deadline);
     let mut service = runtime.client(&primary).unwrap();
     let current = service
         .current_read_object_metadata_distributed(&object.object_id)
