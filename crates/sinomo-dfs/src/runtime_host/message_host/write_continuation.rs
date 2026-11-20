@@ -72,6 +72,7 @@ pub(super) async fn wait(
     authority: &Arc<crate::DfsMetadataAuthorityRuntime>,
     command: &DfsMessageCommand,
     previous: &crate::DfsMetadataShardWriteSet,
+    configuration_pending: bool,
     host: &DfsRuntimeHost,
 ) -> bool {
     let mut published = authority.subscribe_configuration_snapshot();
@@ -84,7 +85,9 @@ pub(super) async fn wait(
                         if current.epoch == previous.epoch
                             && current.primary_node_id == previous.primary_node_id =>
                     {
-                        if current.generation > previous.generation {
+                        if current.generation > previous.generation
+                            || (configuration_pending && current.generation == previous.generation)
+                        {
                             return true;
                         }
                     }

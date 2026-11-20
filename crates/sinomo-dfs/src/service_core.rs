@@ -26,16 +26,15 @@ impl<T> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> DfsRoutedMessage {
-        let routed_message = build_dfs_routed_message(
+        build_dfs_routed_message(
             &self.node_id,
             target_node_id,
-            self.next_frame_id,
-            self.next_message_id,
+            self.next_frame_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            self.next_message_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             message,
-        );
-        self.next_frame_id += 1;
-        self.next_message_id += 1;
-        routed_message
+        )
     }
 }
 
@@ -89,8 +88,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             committed_work_tracker: None,
             transport,
             repair_retry_tick: 0,
-            next_frame_id: 1,
-            next_message_id: 1,
+            next_frame_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            next_message_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             next_request_id: 1,
             cancellation: None,
         }

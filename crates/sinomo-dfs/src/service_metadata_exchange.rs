@@ -1762,15 +1762,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Borrow only the existing host-owned coherent configuration. Missing or
     /// withdrawn evidence is unavailable, never an implicit KV refresh.
+    fn retained_replication_projection(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
+        let Some(control) = self.control_plane.as_ref() else {
+            return Ok(None);
+        };
+        match control.write_configuration_readiness()? {
+            crate::DfsWriteConfigurationReadiness::Ready(view) => Ok(view),
+            crate::DfsWriteConfigurationReadiness::Pending => {
+                Err(DfsError::WriteConfigurationPending)
+            }
+        }
+    }
+
     pub(crate) fn retained_metadata_replica_context(
         &self,
         file_system_id: &DfsFileSystemId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<DfsMetadataReplicaShardContext>, DfsError> {
-        let Some(control) = self.control_plane.as_ref() else {
-            return Ok(None);
-        };
-        let Some(projection) = control.write_configuration_projection()? else {
+        let Some(projection) = self.retained_replication_projection()? else {
             return Ok(None);
         };
         let entries = projection
@@ -1800,9 +1811,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let unavailable = || DfsError::Metadata {
             message: "write-set commit bounds require the retained write configuration".into(),
         };
-        let control = self.control_plane.as_ref().ok_or_else(unavailable)?;
-        let projection = control
-            .write_configuration_projection()?
+        let projection = self
+            .retained_replication_projection()?
             .ok_or_else(unavailable)?;
         let entries = projection
             .entries(crate::metadata_authority_runtime::DFS_METADATA_AUTHORITY_PREFIX)

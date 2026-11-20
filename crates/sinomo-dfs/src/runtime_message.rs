@@ -1247,9 +1247,15 @@ pub(crate) fn existing_transfer_response_service_lane(
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DfsPreparedWriteContinuation {
+    pub digest: crate::DfsPreparedOperationDigest,
+    pub configuration_pending: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct DfsRuntimeMessageExecution {
-    pub prepared_write: Option<crate::DfsPreparedOperationDigest>,
+    pub prepared_write: Option<DfsPreparedWriteContinuation>,
     pub remote_namespace_phase: Option<(
         DfsMessageCommand,
         Box<crate::source_adoption::RemoteNamespacePhase>,
@@ -1466,10 +1472,11 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
             crate::DfsCommitOutcomeUnknownCause::AcknowledgementsMissing { .. }
                 | crate::DfsCommitOutcomeUnknownCause::BelowWriteSetFloor { .. }
                 | crate::DfsCommitOutcomeUnknownCause::ReplicationBelowIntent { .. }
+                | crate::DfsCommitOutcomeUnknownCause::ConfigurationPending { .. }
         ) {
             return None;
         }
-        match &original.routed_message.message {
+        let digest = match &original.routed_message.message {
             DfsNetworkMessage::DistributedWriteRequest(w)
             | DfsNetworkMessage::ExclusiveCreateRequest(w) => service_lane
                 .service
@@ -1483,7 +1490,14 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch(
                 .flatten()
                 .map(|r| r.digest),
             _ => None,
-        }
+        }?;
+        Some(DfsPreparedWriteContinuation {
+            digest,
+            configuration_pending: matches!(
+                cause,
+                crate::DfsCommitOutcomeUnknownCause::ConfigurationPending { .. }
+            ),
+        })
     });
     if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {
         match &process_report.outcome {

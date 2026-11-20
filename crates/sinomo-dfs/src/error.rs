@@ -83,6 +83,8 @@ pub enum DfsError {
         object_id: DfsObjectId,
         reason: String,
     },
+    #[error("DFS write configuration is awaiting a coherent authoritative projection")]
+    WriteConfigurationPending,
     /// A metadata-shard reconfiguration has been durably recorded but cannot
     /// become active until the retiring authority and every required target
     /// have produced the exact handoff evidence.
@@ -206,6 +208,10 @@ pub enum DfsCommitOutcomeUnknownCause {
     Deadline,
     /// The caller or the host cancelled the attempt.
     Cancelled,
+    /// Local continuation of this exact prepare after its projection becomes ready.
+    /// Older callers receive the existing interrupted outcome if the owner exits.
+    #[serde(rename(serialize = "interrupted"), skip_deserializing)]
+    ConfigurationPending { detail: String },
     /// Any other failure after the prepare was durable.
     Interrupted { detail: String },
 }
@@ -234,7 +240,9 @@ impl std::fmt::Display for DfsCommitOutcomeUnknownCause {
             Self::RecordChanged { epoch } => write!(f, "shard record moved to epoch {epoch}"),
             Self::Deadline => f.write_str("caller deadline reached"),
             Self::Cancelled => f.write_str("cancelled"),
-            Self::Interrupted { detail } => write!(f, "interrupted: {detail}"),
+            Self::ConfigurationPending { detail } | Self::Interrupted { detail } => {
+                write!(f, "interrupted: {detail}")
+            }
         }
     }
 }
@@ -431,6 +439,21 @@ impl From<KvError> for DfsError {
 mod tests {
     use super::*;
     use sinomo_core::network::NetworkError;
+
+    #[test]
+    fn pending_configuration_keeps_the_interrupted_wire_outcome() {
+        let detail = DfsError::WriteConfigurationPending.to_string();
+        let local = DfsCommitOutcomeUnknownCause::ConfigurationPending {
+            detail: detail.clone(),
+        };
+        let wire = sinomo_core::kv::encode_kv_value(&local).unwrap();
+        let old = DfsCommitOutcomeUnknownCause::Interrupted { detail };
+        assert_eq!(wire, sinomo_core::kv::encode_kv_value(&old).unwrap());
+        assert_eq!(
+            sinomo_core::kv::decode_kv_value::<DfsCommitOutcomeUnknownCause>(&wire).unwrap(),
+            old
+        );
+    }
 
     #[test]
     fn network_conversion_preserves_possibly_applied_delivery_state() {

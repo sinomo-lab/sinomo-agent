@@ -3895,7 +3895,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else if streamed_remote_primary_write {
             None
         } else {
-            match self.content.put_object_version_blob_only(
+            let store = if requester.is_some() && candidates.contains(&self.node_id) {
+                crate::LocalContentStore::put_owner_write_content
+            } else {
+                crate::LocalContentStore::put_object_version_blob_only
+            };
+            match store(
+                &self.content,
                 object.object_id.as_str(),
                 target_version.as_str(),
                 bytes,
@@ -3916,7 +3922,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 shard,
                 &object.file_system_id,
                 manifest,
-                crate::native_shard_trace::NativeContentPersistenceKindV1::BlobOnly,
+                if self
+                    .content
+                    .read_manifest(object.object_id.as_str(), target_version.as_str())
+                    .as_ref()
+                    .ok()
+                    == Some(manifest)
+                {
+                    crate::native_shard_trace::NativeContentPersistenceKindV1::ManifestBound
+                } else {
+                    crate::native_shard_trace::NativeContentPersistenceKindV1::BlobOnly
+                },
             );
         }
         let content_elapsed = content_started.elapsed();

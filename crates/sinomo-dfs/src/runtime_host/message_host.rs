@@ -3839,7 +3839,7 @@ pub(super) enum DaemonDfsMessageDispatchAttempt {
     ReadmitOnWriteLane(Box<DaemonDfsUnexecutedReply>),
     WriteSetPending {
         command: Box<DfsMessageCommand>,
-        prepared: crate::DfsPreparedOperationDigest,
+        prepared: crate::runtime_message::DfsPreparedWriteContinuation,
         write_set: crate::DfsMetadataShardWriteSet,
         result: Result<Box<DaemonDfsMessageCommandProcessResult>, crate::DfsError>,
     },
@@ -5857,13 +5857,19 @@ async fn handle_served_daemon_dfs_message(
                 if let Some(host) = host
                     && served_write_continuation(
                         served,
-                        write_continuation::wait(&authority, &original, &write_set, &host),
+                        write_continuation::wait(
+                            &authority,
+                            &original,
+                            &write_set,
+                            prepared.configuration_pending,
+                            &host,
+                        ),
                     )
                     .await
                 {
                     last_unknown = Some(result);
                     command = *original;
-                    prepared_write = Some(prepared);
+                    prepared_write = Some(prepared.digest);
                     metadata_authority_preflight = Some(DaemonDfsMetadataAuthorityPreflight {
                         generation: authority.generation(),
                         authority,

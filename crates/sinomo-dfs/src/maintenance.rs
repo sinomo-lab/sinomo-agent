@@ -120,16 +120,10 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
         .saturating_sub(resumed_namespace_jobs_still_running);
     let namespace_job_limit_reached = terminal_namespace_jobs > 0 && skipped_namespace_jobs > 0;
 
-    let placement_page_remaining = report.placement_reconciliation.as_ref().is_some_and(|job| {
-        // Finishing a job or its scan is progress too. The post-pass work
-        // classifier decides whether another job/verification pass is ready;
-        // do not insert the routine timer between those productive phases.
-        job.state.is_terminal()
-            || (job.last_error.is_none()
-                && (job.cursor.is_some()
-                    || (job.state == crate::DfsPlacementReconciliationState::Repairing
-                        && job.pending_repair_count == 0)))
-    });
+    let placement_page_remaining = report
+        .placement_reconciliation
+        .as_ref()
+        .is_some_and(placement_page_can_continue);
     let lifecycle_limit_reached = report.lifecycle_reports.iter().any(|lifecycle| {
         lifecycle
             .stale_staging_gc
@@ -175,6 +169,17 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
         || lifecycle_limit_reached
         || (report.repair_budget_exhausted
             && (!report.scheduled_repairs.is_empty() || report.repair_examined_count > 0))
+}
+
+pub(crate) fn placement_page_can_continue(job: &crate::DfsPlacementReconciliationJob) -> bool {
+    // Finishing a job or its scan is progress too. The post-pass work
+    // classifier decides whether another job/verification pass is ready;
+    // do not insert the routine timer between those productive phases.
+    job.state.is_terminal()
+        || (job.last_error.is_none()
+            && (job.cursor.is_some()
+                || (job.state == crate::DfsPlacementReconciliationState::Repairing
+                    && job.pending_repair_count == 0)))
 }
 
 /// Bounded resident-daemon maintenance policy. Inventory-wide lifecycle work
@@ -999,6 +1004,39 @@ pub async fn run_cluster_dfs_reactive_maintenance_tick_with_reusable_service<T>(
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
+    run_reactive_maintenance_phases(
+        service,
+        data_dir,
+        cluster_paths,
+        state,
+        authoritative_prefix,
+        peer_transport,
+        peer_node_ids,
+        execution_exclusions,
+        committed_work_tracker,
+        options,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_reactive_maintenance_phases<T>(
+    service: &mut NetworkedDfsService<T>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    state: sinomo_core::ClusterBootstrapState,
+    authoritative_prefix: crate::DfsAuthoritativePrefixProjection,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    peer_node_ids: Vec<NodeId>,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: DfsCommittedWorkTracker,
+    options: DfsMaintenanceTickOptions,
+    placement_handoff: Option<&mut usize>,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
     data_dir
         .ensure_root_layout()
         .map_err(|source| DfsError::Metadata {
@@ -1042,6 +1080,7 @@ where
         Some(authoritative_prefix),
         options,
         true,
+        placement_handoff,
     )
     .await;
     result
@@ -2624,6 +2663,7 @@ where
         authoritative_prefix,
         options,
         false,
+        None,
     )
     .await?
     .ok_or_else(|| DfsError::Metadata {
@@ -2645,6 +2685,7 @@ async fn run_dfs_maintenance_turn_with_async_host_and_execution_exclusions<T>(
     authoritative_prefix: Option<crate::DfsAuthoritativePrefixProjection>,
     options: DfsMaintenanceTickOptions,
     fair_resume: bool,
+    placement_handoff: Option<&mut usize>,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
@@ -2778,7 +2819,12 @@ where
                 crate::repair_executor::repair_executor_work(&data_dir.root()).need_count;
             tokio::task::yield_now().await;
             turn.report().placement_reconciliation =
-                if options.placement_reconciliation_max_objects == 0 {
+                if let Some(budget) = placement_handoff {
+                    // Main dispatches this page after all shard and lifecycle
+                    // admission has returned. The job in KV owns its cursor.
+                    *budget = options.placement_reconciliation_max_objects;
+                    None
+                } else if options.placement_reconciliation_max_objects == 0 {
                     None
                 } else {
                     service

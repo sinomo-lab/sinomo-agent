@@ -151,9 +151,9 @@ struct ShardKeeping {
     unknown: Option<(DfsWriteSetKeepingTxn, DfsMetadataWriteSetChangeRequest)>,
     /// The evidence-decided event cause of the unknown change, if any.
     unknown_cause: Option<&'static str>,
-    /// The record generation and verdict generation a refused or rejected
-    /// change saw: no change is submitted again until one of them moves.
-    blocked: Option<(u64, u64)>,
+    /// Record, reachability, and the content W the rejected step tried to
+    /// raise. A higher content demand is a new input at an otherwise equal cut.
+    blocked: Option<(u64, u64, usize)>,
     probing: BTreeSet<NodeId>,
     joining: Option<NodeId>,
     failed: BTreeMap<NodeId, Attempt>,
@@ -625,7 +625,13 @@ impl Keeper {
         if let Some(txn) = plan.txn
             && !keeping.txn_running
             && keeping.unknown.is_none()
-            && keeping.blocked != Some((record_generation, verdict_generation))
+            && keeping
+                .blocked
+                .is_none_or(|(record, verdict, attempted_w)| {
+                    record != record_generation
+                        || verdict != verdict_generation
+                        || matches!(&txn, DfsWriteSetKeepingTxn::RaiseN { w } if *w > attempted_w)
+                })
         {
             keeping.txn_running = true;
             let mut cut_members = configured.iter().cloned().collect::<Vec<_>>();
@@ -682,10 +688,18 @@ impl Keeper {
                             keeping.unknown_cause = cause;
                         }
                     }
-                    _ => {
+                    (outcome, _) => {
+                        tracing::debug!(target: "sinomo.dfs.write_set", shard = %key.1.0,
+                            ?txn, ?outcome, record_generation, verdict_generation,
+                            "write-set change refused at this cut");
                         // Refused before submission or rejected by the record:
                         // nothing is submitted again until an input moves.
-                        keeping.blocked = Some((record_generation, verdict_generation));
+                        let attempted_w = match txn {
+                            DfsWriteSetKeepingTxn::RaiseN { w } => w,
+                            _ => 0,
+                        };
+                        keeping.blocked =
+                            Some((record_generation, verdict_generation, attempted_w));
                         keeping.unknown_cause = None;
                     }
                 }

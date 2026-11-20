@@ -205,6 +205,7 @@ impl DfsRepairExecutor {
     /// arrived meanwhile and the executor stays pending, so the retry reads
     /// the index again. Returns the edges the pass consumed, which
     /// `rewake_for_edges` checks once the pass has published its work.
+    #[cfg(test)]
     fn pass_events(
         &self,
         scheduler: &mut DfsRepairScheduler,
@@ -214,10 +215,35 @@ impl DfsRepairExecutor {
         exclusions: &DfsMaintenanceExecutionExclusions,
         limit: usize,
     ) -> Result<(scheduler::DfsRepairExecutorSelection, DfsRepairPassEdges), DfsError> {
+        Ok(self
+            .pass_events_on_shards(scheduler, source, now, primaries, exclusions, limit, None)?
+            .expect("an unrestricted pass can serve every event"))
+    }
+
+    fn pass_events_on_shards(
+        &self,
+        scheduler: &mut DfsRepairScheduler,
+        source: &dyn DfsRepairNeedSource,
+        now: u64,
+        primaries: BTreeMap<String, u64>,
+        exclusions: &DfsMaintenanceExecutionExclusions,
+        limit: usize,
+        admitted: Option<&BTreeSet<String>>,
+    ) -> Result<Option<(scheduler::DfsRepairExecutorSelection, DfsRepairPassEdges)>, DfsError> {
         // An edge is counted and recorded under the events lock, so the
         // counts read here cover exactly the events taken.
         let (events, reachability_at_take, authority_at_take) = {
             let mut events = lock(&self.events);
+            // A new edge can arrive while waiting for shard admission. Leave
+            // the original events pending until the newly required lanes join.
+            if admitted.is_some_and(|scope| {
+                !scheduler
+                    .work_shards(&primaries, &events, now)
+                    .is_subset(scope)
+            }) {
+                self.pending.store(true, Ordering::SeqCst);
+                return Ok(None);
+            }
             (
                 std::mem::take(&mut *events),
                 self.reachability_epoch.load(Ordering::SeqCst),
@@ -244,7 +270,7 @@ impl DfsRepairExecutor {
             limit,
         };
         match scheduler.pass(source, input) {
-            Ok(selection) => Ok((
+            Ok(selection) => Ok(Some((
                 selection,
                 DfsRepairPassEdges {
                     reachability_at_take,
@@ -252,7 +278,7 @@ impl DfsRepairExecutor {
                     stale_reachability,
                     stale_authority,
                 },
-            )),
+            ))),
             Err(error) => {
                 lock(&self.events).restore(events);
                 self.pending.store(true, Ordering::SeqCst);
@@ -814,6 +840,29 @@ pub(crate) fn repair_executor_await_publication(data_root: &Path) {
 }
 
 /// Shards this node is primary for, with their assignment epochs.
+pub(crate) fn repair_turn_shards(
+    root: &Path,
+    primaries: &BTreeMap<String, u64>,
+) -> BTreeSet<String> {
+    let owner = executor(root);
+    let scheduler = lock(&owner.scheduler);
+    let mut events = lock(&owner.events);
+    let mut shards = scheduler.work_shards(primaries, &events, dfs_now_unix_nanos());
+    // A reopened primary must be checked once before the scheduler observes
+    // its assignment again. An empty, unchanged turn needs no storage at all.
+    shards.extend(
+        lock(&owner.storage_closed_primaries)
+            .iter()
+            .filter(|shard| primaries.contains_key(*shard))
+            .cloned(),
+    );
+    if shards.is_empty() && scheduler.primaries() == primaries {
+        *events = Default::default();
+        owner.pending.store(false, Ordering::SeqCst);
+    }
+    shards
+}
+
 pub(crate) fn local_primary_shards(
     shards: &[DfsMetadataShardConfig],
     local_node_id: &NodeId,
@@ -915,35 +964,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusions: &DfsMaintenanceExecutionExclusions,
         limit: usize,
     ) -> Result<DfsRepairExecutorPassReport, DfsError> {
+        self.run_repair_executor_pass_on_shards(data_root, metadata_shards, exclusions, limit, None)
+    }
+
+    pub(crate) fn run_repair_executor_pass_on_shards(
+        &mut self,
+        data_root: &Path,
+        metadata_shards: &[DfsMetadataShardConfig],
+        exclusions: &DfsMaintenanceExecutionExclusions,
+        limit: usize,
+        admitted: Option<&BTreeSet<String>>,
+    ) -> Result<DfsRepairExecutorPassReport, DfsError> {
         let mut primaries = local_primary_shards(metadata_shards, &self.node_id);
         // A primary whose local copy is closed for storage is left out, as on
         // a node that is not its primary: its needs are not read or timed
         // while it is closed, and its whole index is read once it opens.
         if let Some(backend) = self.metadata_backend.as_ref() {
-            let mut closed = BTreeSet::new();
-            for shard in primaries.keys() {
-                if backend.metadata_shard_storage_is_closed(&DfsMetadataShardId::new(shard.as_str()))? {
+            let mut closed = lock(&executor(data_root).storage_closed_primaries).clone();
+            closed.retain(|shard| {
+                primaries.contains_key(shard) && admitted.is_some_and(|ids| !ids.contains(shard))
+            });
+            for shard in primaries
+                .keys()
+                .filter(|id| admitted.is_none_or(|ids| ids.contains(*id)))
+            {
+                if backend
+                    .metadata_shard_storage_is_closed(&DfsMetadataShardId::new(shard.as_str()))?
+                {
                     closed.insert(shard.clone());
                 }
             }
             primaries.retain(|shard, _| !closed.contains(shard));
             *lock(&executor(data_root).storage_closed_primaries) = closed;
         }
-        self.run_repair_executor_pass_with(data_root, Some(primaries), exclusions, limit)
+        self.run_repair_executor_pass_with(data_root, primaries, exclusions, limit, admitted)
     }
 
     fn run_repair_executor_pass_with(
         &mut self,
         data_root: &Path,
-        primaries: Option<BTreeMap<String, u64>>,
+        primaries: BTreeMap<String, u64>,
         exclusions: &DfsMaintenanceExecutionExclusions,
         limit: usize,
+        admitted: Option<&BTreeSet<String>>,
     ) -> Result<DfsRepairExecutorPassReport, DfsError> {
-        let (executor, held) = bind_pass_executor(&self.node_id, data_root);
+        // A caller-only service is unable to consume the primary's index
+        // events. In particular it must not clear the mounted executor's wake.
         if self.metadata_backend.is_none() {
-            executor.pending.store(false, Ordering::SeqCst);
             return Ok(DfsRepairExecutorPassReport::default());
         }
+        let (executor, held) = bind_pass_executor(&self.node_id, data_root);
         // A held executor leaves its events for the pass after the release,
         // which wakes it.
         if held {
@@ -952,7 +1022,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut scheduler = lock(&executor.scheduler);
         executor.pending.store(false, Ordering::SeqCst);
-        let primaries = primaries.unwrap_or_else(|| scheduler.primaries().clone());
         *lock(&executor.primary_shards) = Some(primaries.keys().cloned().collect());
         let now = dfs_now_unix_nanos();
         let selection = {
@@ -960,9 +1029,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let source = DfsBackendRepairNeedSource {
                 backend: backend.as_ref(),
             };
-            executor.pass_events(&mut scheduler, &source, now, primaries, exclusions, limit)?
+            executor.pass_events_on_shards(
+                &mut scheduler,
+                &source,
+                now,
+                primaries,
+                exclusions,
+                limit,
+                admitted,
+            )?
         };
-        let (selection, edges) = selection;
+        let Some((selection, edges)) = selection else {
+            return Ok(DfsRepairExecutorPassReport {
+                has_more: true,
+                ..Default::default()
+            });
+        };
         // A need some other producer is already sending is that attempt's
         // until its outcome or re-check; the executor does not send the
         // replica again meanwhile. An attempt past its re-check is replaced.
