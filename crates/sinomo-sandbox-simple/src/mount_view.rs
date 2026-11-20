@@ -128,6 +128,18 @@ impl MountView {
                 {
                     continue;
                 }
+                // A disconnected or vanished host submount cannot be cloned.
+                // Leave its name on the live backing filesystem; failure to
+                // access it must not prevent using an unrelated SIFS mount.
+                if let Err(error) = fs::symlink_metadata(submount) {
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOENT | libc::ENOTCONN | libc::ECONNREFUSED)
+                    ) {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 binds.push(Bind {
                     source: submount.clone(),
                     target: dest,

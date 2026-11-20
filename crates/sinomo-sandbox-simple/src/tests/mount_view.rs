@@ -128,6 +128,25 @@ fn crashed_native_host_releases_routing_mount_without_touching_host_siblings() {
             .any(|m| m.target == mount),
         "probe must exercise a disconnected router"
     );
+    // A separate sandbox routing this ancestor must still see healthy names.
+    // Its launch does not own the crashed execution's mount or its recovery.
+    let other = SandboxId::generate();
+    let (mut other_manifest, _) = store
+        .create(
+            other.clone(),
+            m.toolchain_id.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    other_manifest.cwd = SandboxPath::new(root.join("healthy-home").to_string_lossy()).unwrap();
+    other_manifest.mounts = vec![SandboxMount {
+        mount_path: other_manifest.cwd.clone(),
+        ..m.mounts[0].clone()
+    }];
+    store.save_manifest(&other_manifest).unwrap();
+    let result = start_shell(&store, &other, root, "cat ../host/sibling", &[])
+        .wait()
+        .unwrap();
     assert!(
         recover_sandbox_local_execution_journal(&store, &id, OffsetDateTime::now_utc()).unwrap()
     );
@@ -137,6 +156,13 @@ fn crashed_native_host_releases_routing_mount_without_touching_host_siblings() {
             .iter()
             .any(|m| m.target == mount)
     );
+    assert_eq!(
+        result.response.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, b"preserved");
     assert_eq!(fs::read(host_parent.join("sibling")).unwrap(), b"preserved");
     assert!(!guest.exists());
 }
