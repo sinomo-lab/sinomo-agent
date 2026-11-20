@@ -11685,10 +11685,12 @@ dependencies = [
 name = "sinomo-sandbox-simple"
 version = "0.1.0"
 dependencies = [
+ "fuser",
  "libc",
  "sinomo-core",
  "sinomo-sandbox",
  "sinomo-testdir",
+ "tempfile",
  "time",
  "windows-sys 0.61.2",
 ]

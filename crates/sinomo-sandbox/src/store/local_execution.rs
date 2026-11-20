@@ -37,6 +37,12 @@ impl Drop for SandboxLocalExecutionLease {
 }
 
 impl SandboxLocalExecutionLease {
+    /// Private staging for a native filesystem view, fenced by this command's lease.
+    #[cfg(target_os = "linux")]
+    pub fn native_mount_view_directory(&self) -> Option<PathBuf> {
+        self.command_dir.as_ref().map(|dir| dir.join("mount-view"))
+    }
+
     pub(crate) fn ensure_scope(&self, sandbox_id: &SandboxId) -> Result<(), SandboxStoreError> {
         if self.sandbox_id == *sandbox_id {
             Ok(())
@@ -216,9 +222,124 @@ fn recover_native_commands(
         recovered |=
             recover_one_journal(store, &lease, &gate.sandbox_id, OffsetDateTime::now_utc())?;
         drop(lease);
+        #[cfg(target_os = "linux")]
+        remove_native_mount_view(&dir)?;
         fs::remove_dir_all(&dir).map_err(|e| local_execution_io_error(&dir, e))?;
     }
     Ok(recovered)
+}
+
+/// Never recursively remove a directory that may still be a live filesystem.
+/// A host crash closes /dev/fuse, but its owner-only staging mount can remain.
+#[cfg(target_os = "linux")]
+fn remove_native_mount_view(command_dir: &Path) -> Result<(), SandboxStoreError> {
+    let stage = command_dir.join("mount-view");
+    match fs::symlink_metadata(&stage) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Ok(meta) if meta.is_dir() => (),
+        Ok(_) => {
+            return Err(local_execution_io_error(
+                &stage,
+                "unexpected native mount view staging entry",
+            ));
+        }
+        Err(e) => return Err(local_execution_io_error(&stage, e)),
+    }
+    let mount = stage.join("router");
+    match fs::remove_dir(&mount) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY | libc::ENOTCONN)) => {
+            let expected = fs::canonicalize(&stage)
+                .map_err(|e| local_execution_io_error(&stage, e))?
+                .join("router");
+            let table =
+                read_linux_sandbox_mounts().map_err(|e| local_execution_io_error(&mount, e))?;
+            if !table.iter().any(|m| {
+                m.target == expected
+                    && m.filesystem == "fuse.sinomo-native"
+                    && Some(m.source.as_os_str()) == command_dir.file_name()
+            }) {
+                return Err(local_execution_io_error(
+                    &mount,
+                    "unrecognized filesystem at native routing mountpoint",
+                ));
+            }
+            let output = Command::new("fusermount3")
+                .args(["-u", "-z", "--"])
+                .arg(&mount)
+                .output()
+                .map_err(|e| local_execution_io_error(&mount, e))?;
+            if !output.status.success() {
+                return Err(local_execution_io_error(
+                    &mount,
+                    String::from_utf8_lossy(&output.stderr),
+                ));
+            }
+            fs::remove_dir(&mount).map_err(|e| local_execution_io_error(&mount, e))?;
+        }
+        Err(e) => return Err(local_execution_io_error(&mount, e)),
+    }
+    fs::remove_dir(&stage).map_err(|e| local_execution_io_error(&stage, e))
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxSandboxMount {
+    pub target: PathBuf,
+    filesystem: std::ffi::OsString,
+    source: std::ffi::OsString,
+}
+
+#[cfg(target_os = "linux")]
+/// Read the calling mount namespace for native view construction and crash recovery.
+pub fn read_linux_sandbox_mounts() -> std::io::Result<Vec<LinuxSandboxMount>> {
+    use std::os::unix::ffi::OsStringExt;
+    // mountinfo escapes tabs, newlines, spaces and backslashes as octal.
+    fn decode(field: &[u8]) -> std::ffi::OsString {
+        let mut bytes = Vec::with_capacity(field.len());
+        let mut i = 0;
+        while i < field.len() {
+            if field[i] == b'\\'
+                && i + 3 < field.len()
+                && field[i + 1] <= b'3'
+                && field[i + 1..=i + 3]
+                    .iter()
+                    .all(|c| (b'0'..=b'7').contains(c))
+            {
+                bytes.push(
+                    (field[i + 1] - b'0') * 64 + (field[i + 2] - b'0') * 8 + (field[i + 3] - b'0'),
+                );
+                i += 4;
+            } else {
+                bytes.push(field[i]);
+                i += 1;
+            }
+        }
+        std::ffi::OsString::from_vec(bytes)
+    }
+    let mut mounts = Vec::new();
+    for line in fs::read("/proc/self/mountinfo")?
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+    {
+        let mut fields = line.split(|&b| b == b' ');
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid Linux mountinfo record",
+            )
+        };
+        let target = decode(fields.nth(4).ok_or_else(invalid)?).into();
+        fields.find(|f| *f == b"-").ok_or_else(invalid)?;
+        let filesystem = decode(fields.next().ok_or_else(invalid)?);
+        let source = decode(fields.next().ok_or_else(invalid)?);
+        mounts.push(LinuxSandboxMount {
+            target,
+            filesystem,
+            source,
+        });
+    }
+    Ok(mounts)
 }
 
 /// Whether a failed non-blocking lock means another owner holds it. Windows

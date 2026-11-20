@@ -194,6 +194,7 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+fuser = { version = "0.17.0", default-features = false, features = ["abi-7-31"] }
 winresource = "0.1"
 cc = "1"
 pkg-config = "0.3"

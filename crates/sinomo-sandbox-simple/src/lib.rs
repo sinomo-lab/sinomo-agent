@@ -5,6 +5,8 @@
 //! filesystem semantics; structured sandbox filesystem permissions are not an
 //! isolation boundary for this backend.
 
+#[cfg(target_os = "linux")]
+mod mount_view;
 mod session;
 #[cfg(target_os = "linux")]
 mod supervisor;
@@ -263,7 +265,12 @@ impl SandboxSimpleNativeCommandRunner {
                 "native execution ID already has a command record",
             ));
         }
-        let lease = begin_sandbox_native_command_lease(store, &gate, &manifest.sandbox_id, &id)?;
+        let lease = Arc::new(begin_sandbox_native_command_lease(
+            store,
+            &gate,
+            &manifest.sandbox_id,
+            &id,
+        )?);
         drop(gate);
         let runner = self.clone();
         let store = store.clone();
@@ -405,7 +412,7 @@ impl SandboxSimpleNativeCommandRunner {
         request: SandboxCommandRequest,
         execution: &Arc<Execution>,
         foreground: &session::ResultSender,
-        local_execution_lease: &SandboxLocalExecutionLease,
+        local_execution_lease: &Arc<SandboxLocalExecutionLease>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let cancellation_token = &execution.cancellation;
         let output_sink: Option<Arc<dyn SandboxOutputSink>> = Some(execution.clone());
@@ -1136,7 +1143,7 @@ fn execute_native_command(
     command_id: &SandboxCommandId,
     output_sink: Option<Arc<dyn SandboxOutputSink>>,
     store: &LocalSandboxInstanceStore,
-    local_execution_lease: &SandboxLocalExecutionLease,
+    local_execution_lease: &Arc<SandboxLocalExecutionLease>,
     local_journal: &mut SandboxLocalExecutionJournal,
     execution: &Execution,
     report_foreground: &dyn Fn(i32),
@@ -1201,7 +1208,7 @@ fn execute_native_command_std(
     command_id: &SandboxCommandId,
     output_sink: Option<Arc<dyn SandboxOutputSink>>,
     store: &LocalSandboxInstanceStore,
-    local_execution_lease: &SandboxLocalExecutionLease,
+    local_execution_lease: &Arc<SandboxLocalExecutionLease>,
     local_journal: &mut SandboxLocalExecutionJournal,
     execution: &Execution,
     report_foreground: &dyn Fn(i32),
@@ -1214,6 +1221,13 @@ fn execute_native_command_std(
         })?;
     let env = native_environment(request, layout, cwd);
     let program = resolve_native_program(argv0, &env, cwd)?;
+    #[cfg(target_os = "linux")]
+    let view = mount_projection
+        .map(|projection| mount_view::MountView::prepare(projection, local_execution_lease))
+        .transpose()
+        .map_err(|source| SandboxWasiError::Runtime {
+            detail: format!("prepare live native mount view: {source}"),
+        })?;
     #[cfg(target_os = "linux")]
     let mut command = {
         let mut handshake = Command::new("/bin/sh");
@@ -1230,16 +1244,9 @@ fn execute_native_command_std(
                 // host device-node usability too: plain `--bind / /` maps
                 // devices such as /dev/null to unusable user-namespace nodes.
                 .args(["--dev-bind", "/", "/"]);
-            for mount in &projection.mounts {
-                handshake
-                    .arg(if mount.mode == SandboxMountMode::ReadOnly {
-                        "--ro-bind"
-                    } else {
-                        "--bind"
-                    })
-                    .arg(&mount.source_host_path)
-                    .arg(&mount.guest_path);
-            }
+            view.as_ref()
+                .expect("projection has a view")
+                .append_arguments(&mut handshake);
             handshake
                 .arg("--chdir")
                 .arg(cwd)
@@ -3325,19 +3332,13 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    mod mount_view;
+
     #[test]
     #[cfg(target_os = "linux")]
     fn simple_native_projects_live_rw_and_ro_sifs_mounts() {
-        let Some(bwrap) = find_host_program("bwrap") else {
-            return;
-        };
-        let projection_probe = Command::new(&bwrap)
-            .args(["--dev-bind", "/", "/", "--", "/bin/true"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !projection_probe.is_ok_and(|status| status.success()) {
+        if !mount_view::available() {
             return;
         }
 
@@ -3345,9 +3346,12 @@ mod tests {
         let host_sifs_root = dir.path().join("live-sifs");
         let source = host_sifs_root.join("services/sandbox-shared/live");
         fs::create_dir_all(&source).expect("live SIFS source");
-        let (mut manifest, layout) = store.load(&sandbox_id).expect("load");
-        let guest = layout.root.join("projected-live");
-        fs::create_dir_all(&guest).expect("guest mount target");
+        let (mut manifest, _) = store.load(&sandbox_id).expect("load");
+        let host_home = dir.path().join("host-home");
+        let sibling = host_home.join("operator");
+        fs::create_dir_all(&sibling).expect("host sibling");
+        let guest = host_home.join("agent");
+        assert!(!guest.exists());
         let guest_mount_path =
             SandboxPath::new(guest.display().to_string()).expect("guest mount path");
         manifest.cwd = guest_mount_path.clone();
@@ -3358,53 +3362,49 @@ mod tests {
         }];
         store.save_manifest(&manifest).expect("save RW mount");
 
-        let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
-            host_sifs_root: Some(host_sifs_root.clone()),
-            ..SandboxSimpleNativeConfig::default()
-        });
-        let thread_store = store.clone();
-        let thread_manifest = manifest.clone();
-        let thread_layout = layout.clone();
-        let guest_for_script = guest.clone();
-        let join = std::thread::spawn(move || {
-            let lease =
-                acquire_sandbox_native_launch_lease(&thread_store, &thread_manifest.sandbox_id)
-                    .expect("execution lease");
-            runner.start_request(
-                &thread_store,
-                thread_manifest.clone(),
-                thread_layout,
-                SandboxCommandRequest {
-                    sandbox_id: thread_manifest.sandbox_id.clone(),
-                    argv: vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!(
-                            "printf probe >/dev/null || exit 97; touch {}/started; while [ ! -f {}/remote-input ] || [ \"$(cat {}/remote-input)\" != remote ]; do sleep 0.01; done; cat {}/remote-input > {}/value; touch {}/published; sleep 0.3; printf done >> {}/value",
-                            guest_for_script.display(),
-                            guest_for_script.display(),
-                            guest_for_script.display(),
-                            guest_for_script.display(),
-                            guest_for_script.display(),
-                            guest_for_script.display(),
-                            guest_for_script.display()
-                        ),
-                    ],
-                    cwd: thread_manifest.cwd.clone(),
-                    stdin: None,
-                    env: thread_manifest.env.clone(),
-                    timeout_ms: 5_000,
-                },
-                None,
-                SandboxCancellationToken::new(),
-                lease, SandboxCommandId::generate(), SandboxNativeExecutionOptions::default(),
-            ).and_then(SandboxNativeExecution::wait)
-        });
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let start = |script: &str| {
+            mount_view::start_shell(&store, &sandbox_id, &host_sifs_root, script, &[])
+        };
+        let writer = start(
+            r#"set -e
+printf probe >/dev/null
+printf guest > ../operator/value
+touch started
+until test -f remote-input && test -f peer; do sleep 0.01; done
+cat remote-input ../operator/from-host > value
+touch published
+while ! test -f finish; do sleep 0.01; done
+printf done >> value"#,
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
         while !source.join("started").exists() {
             assert!(Instant::now() < deadline, "projected writer did not start");
             std::thread::sleep(Duration::from_millis(10));
         }
+        let destination_leaked = guest.exists();
+        assert_eq!(
+            fs::read(sibling.join("value")).expect("write through host sibling"),
+            b"guest"
+        );
+        fs::write(sibling.join("from-host"), b"sibling").expect("host update during execution");
+        let peer = start(
+            "set -e; test -f started; touch peer; until test -f finish-peer; do sleep 0.01; done; printf alive > peer-finished",
+        );
+        while !source.join("peer").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mount_root = store.layout(&sandbox_id).metadata.join("native-commands");
+        assert_eq!(
+            sinomo_sandbox::read_linux_sandbox_mounts()
+                .unwrap()
+                .iter()
+                .filter(|m| m.target.starts_with(&mount_root)
+                    && m.target.ends_with("mount-view/router"))
+                .count(),
+            1,
+            "overlapping commands share the same routing filesystem"
+        );
         fs::write(source.join("remote-input"), b"remote").expect("external live SIFS update");
         while !source.join("published").exists() {
             assert!(
@@ -3415,58 +3415,42 @@ mod tests {
         }
         assert_eq!(
             fs::read_to_string(source.join("value")).expect("live projected write"),
-            "remote",
+            "remotesibling",
             "the command must observe an external live-mount update and publish its write before completion"
         );
-        assert!(
-            !join.is_finished(),
-            "the projected write must be visible before command/checkpoint completion"
+        // The foreground waits for this explicit release, so both views above
+        // were observed while its mount namespace was still in use.
+        fs::write(source.join("finish"), b"").expect("release writer");
+        let outcome = writer.wait().expect("projected writer command");
+        // The first command owns the staging lease, but its foreground can
+        // finish and the later command can keep using the same mounted view.
+        fs::write(source.join("finish-peer"), b"").unwrap();
+        let peer = peer.wait().expect("second execution");
+        assert_eq!(
+            peer.response.exit_status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&peer.stderr)
         );
-        let outcome = join
-            .join()
-            .expect("projected writer thread")
-            .expect("projected writer command");
+        assert_eq!(fs::read(source.join("peer-finished")).unwrap(), b"alive");
         assert_eq!(outcome.response.exit_status, 0);
         assert_eq!(
             fs::read_to_string(source.join("value")).expect("completed projected write"),
-            "remotedone"
+            "remotesiblingdone"
         );
 
+        assert!(
+            !destination_leaked,
+            "mount setup created the guest destination on the host"
+        );
         manifest.mounts[0].mode = SandboxMountMode::ReadOnly;
         store.save_manifest(&manifest).expect("save RO mount");
-        let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
-            host_sifs_root: Some(host_sifs_root),
-            ..SandboxSimpleNativeConfig::default()
-        });
-        let lease =
-            acquire_sandbox_native_launch_lease(&store, &sandbox_id).expect("RO execution lease");
-        let outcome = runner
-            .start_request(
-                &store,
-                manifest.clone(),
-                layout.clone(),
-                SandboxCommandRequest {
-                    sandbox_id: sandbox_id.clone(),
-                    argv: vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("printf denied > {}/ro-write", guest.display()),
-                    ],
-                    cwd: manifest.cwd.clone(),
-                    stdin: None,
-                    env: manifest.env.clone(),
-                    timeout_ms: 5_000,
-                },
-                None,
-                SandboxCancellationToken::new(),
-                lease,
-                SandboxCommandId::generate(),
-                SandboxNativeExecutionOptions::default(),
-            )
-            .and_then(SandboxNativeExecution::wait)
-            .expect("RO projection command outcome");
+        let outcome = start("printf denied > ro-write")
+            .wait()
+            .expect("RO projection command");
         assert_ne!(outcome.response.exit_status, 0);
         assert!(!source.join("ro-write").exists());
+        assert!(!guest.exists(), "guest destination leaked onto the host");
     }
 
     #[test]

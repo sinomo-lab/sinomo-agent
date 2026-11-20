@@ -192,8 +192,22 @@ interrupted work and its audit record.
 On Linux, simple-native can project policy-approved SIFS paths from an
 already-mounted live DFS/FUSE root into the command's filesystem. A bubblewrap
 (`bwrap`) mount namespace is used only to express those guest paths; it
-deliberately keeps the host root visible and writable. Other platforms reject
-manifests that declare mounts. There is no command-time copy-in or copy-back.
+keeps the host root visible and writable. When a mount target is missing,
+an owner-only FUSE directory supplies the guest entry. Other names in that
+directory are looked up on the live backing filesystem. Creates, renames,
+deletes and writes through those names are visible from the host and from
+other running executions. Mount setup leaves the missing host path absent.
+Overlapping executions in the same sandbox host share compatible routing
+mounts. Linux hosts using this facility need an accessible `/dev/fuse` and
+`fusermount3` for unprivileged mounting and recovery.
+
+Pathname Unix sockets remain usable across the two views. A socket bound
+through a routed directory publishes a host symlink to its live endpoint.
+Programs that leave a socket name behind can leave a dangling symlink after
+its routing mount is released.
+
+Other platforms reject manifests that declare mounts. There is no
+command-time copy-in or copy-back.
 Native programs therefore use the same POSIX filesystem objects as every other
 cluster client, and remote changes become visible according to the DFS
 filesystem's normal consistency rules.

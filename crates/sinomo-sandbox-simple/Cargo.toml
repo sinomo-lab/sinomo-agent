@@ -17,7 +17,10 @@ sinomo-sandbox = { path = "../sinomo-sandbox" }
 time.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.186"
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -33,4 +36,5 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+tempfile.workspace = true
 sinomo-testdir = { path = "../sinomo-testdir" }
