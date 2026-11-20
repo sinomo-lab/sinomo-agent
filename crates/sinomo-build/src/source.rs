@@ -271,7 +271,7 @@ pub fn deploy_managed_source_repo(
             "core.longpaths=true",
         ])
         .arg(sinomo_core::local::command_path(source_repo))
-        .arg(&next)
+        .arg(sinomo_core::local::command_path(&next))
         .output()
         .map_err(|source| BuildError::Io {
             path: "git clone".to_string(),
@@ -350,7 +350,7 @@ pub fn deploy_managed_source_bundle(
             "core.longpaths=true",
         ])
         .arg(sinomo_core::local::command_path(bundle_path))
-        .arg(&next)
+        .arg(sinomo_core::local::command_path(&next))
         .output()
         .map_err(|source| BuildError::Io {
             path: "git clone".to_string(),

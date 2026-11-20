@@ -383,9 +383,14 @@ pub(crate) fn materialize_build_source_bundle(
     })?;
     let output = crate::process::noninteractive_command("git")
         .arg("clone")
-        .args(["--config", "core.autocrlf=false"])
-        .arg(bundle_path)
-        .arg(&source_repo)
+        .args([
+            "--config",
+            "core.autocrlf=false",
+            "--config",
+            "core.longpaths=true",
+        ])
+        .arg(sinomo_core::local::command_path(bundle_path))
+        .arg(sinomo_core::local::command_path(&source_repo))
         .output()
         .map_err(|source| BuildError::Io {
             path: bundle_path.display().to_string(),
@@ -409,7 +414,7 @@ pub(crate) fn materialize_build_source_bundle(
 fn remove_build_source_remotes(repo: &Path) -> Result<()> {
     let output = crate::process::noninteractive_command("git")
         .arg("-C")
-        .arg(repo)
+        .arg(sinomo_core::local::command_path(repo))
         .arg("remote")
         .output()
         .map_err(|source| BuildError::Io {
@@ -430,7 +435,7 @@ fn remove_build_source_remotes(repo: &Path) -> Result<()> {
     {
         let remove = crate::process::noninteractive_command("git")
             .arg("-C")
-            .arg(repo)
+            .arg(sinomo_core::local::command_path(repo))
             .args(["remote", "remove", remote])
             .output()
             .map_err(|source| BuildError::Io {

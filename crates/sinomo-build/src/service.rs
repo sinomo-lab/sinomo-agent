@@ -962,6 +962,7 @@ fn discover_aarch64_gnu_cross_environment(
         }
     }
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aarch64-gnu-bindgen-sysroot-v1");
     hasher.update(base_toolchain_fingerprint.as_bytes());
     hasher.update(AARCH64_LINUX_GNU_TARGET.as_bytes());
     hasher.update(gcc_version.as_bytes());
@@ -977,7 +978,17 @@ fn discover_aarch64_gnu_cross_environment(
         "cargo-cross-toolchain-blake3:{}",
         hasher.finalize().to_hex()
     );
+    // Bindgen runs on the host. Give it the same target headers that the
+    // qualified cross compiler and linker use, including SDK paths with spaces.
+    let root = sysroot
+        .to_str()
+        .ok_or_else(|| "AArch64 GNU sysroot is not UTF-8".to_string())?;
+    let quoted = root.replace('\'', "'\\''");
     let environment = vec![
+        (
+            OsString::from("BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu"),
+            OsString::from(format!("--sysroot='{quoted}' -isystem '{quoted}/include'")),
+        ),
         (
             OsString::from("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"),
             gcc.as_os_str().to_os_string(),
@@ -1312,9 +1323,13 @@ mod tests {
             "git bundle",
         );
 
-        let materialized =
-            crate::manager::materialize_build_source_bundle(&root.join("work"), &bundle)
-                .expect("materialize source bundle");
+        // On Windows these are the verbatim paths supplied by an installed daemon.
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical fixture root");
+        let materialized = crate::manager::materialize_build_source_bundle(
+            &canonical_root.join("work"),
+            &canonical_root.join("source.bundle"),
+        )
+        .expect("materialize source bundle");
         assert!(materialized.join("Cargo.toml").is_file());
         assert!(
             !crate::build_source_head(&materialized)
@@ -1323,7 +1338,7 @@ mod tests {
         );
         let remotes = crate::process::noninteractive_command("git")
             .arg("-C")
-            .arg(&materialized)
+            .arg(sinomo_core::local::command_path(&materialized))
             .arg("remote")
             .output()
             .expect("git remote");
