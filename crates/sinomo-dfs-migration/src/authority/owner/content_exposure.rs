@@ -75,6 +75,31 @@ fn target_matches(data_root: &Path, publication: &Publication, relative: &Path) 
 struct HeldSource(std::fs::File);
 impl Drop for HeldSource { fn drop(&mut self) { let _ = FileExt::unlock(&self.0); } }
 
+// A Windows directory cannot move while a file opened through it is held.
+// Open the original byte lock through a hard link in the publication directory.
+// Both generations of writers still contend on the same underlying file.
+#[cfg(windows)]
+fn open_publication_lock(source: &Path, alias: &Path) -> Result<std::fs::File> {
+    match std::fs::hard_link(source, alias) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(error(e)),
+    }
+    if !std::fs::symlink_metadata(alias).map_err(error)?.is_file() {
+        return Err(error("publication lock is not a regular file"));
+    }
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(alias)
+        .map_err(error)?;
+    let opened = same_file::Handle::from_file(file.try_clone().map_err(error)?).map_err(error)?;
+    if opened != same_file::Handle::from_path(source).map_err(error)? {
+        return Err(error("publication lock does not identify the original content owner file"));
+    }
+    Ok(file)
+}
+
 /// Caller is the sole actual component data owner. This function only exposes
 /// a Pending target; it cannot claim content inventory completeness.
 pub(super) fn prepare(data_root: &Path, mut before_effect: impl FnMut(&Publication) -> Result<()>) -> Result<Publication> {
@@ -120,7 +145,11 @@ pub(super) fn prepare(data_root: &Path, mut before_effect: impl FnMut(&Publicati
     before_effect(&publication)?;
     let retained = data_root.join(&publication.retained);
     let source_path = if source_matches(data_root, &publication, &publication.retained)? { retained.clone() } else { live.clone() };
-    let source_lock = std::fs::OpenOptions::new().read(true).write(true).open(source_path.join("content-owner.lock")).map_err(error)?;
+    let lock_path = source_path.join("content-owner.lock");
+    #[cfg(windows)]
+    let source_lock = open_publication_lock(&lock_path, &work.join("source-owner.lock"))?;
+    #[cfg(not(windows))]
+    let source_lock = std::fs::File::options().read(true).write(true).open(&lock_path).map_err(error)?;
     source_lock.try_lock_exclusive().map_err(error)?;
     let _held = HeldSource(source_lock);
     if publication.phase == Phase::Prepared {

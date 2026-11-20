@@ -23,6 +23,9 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+same-file.workspace = true
+
 [dev-dependencies]
 sinomo-dfs = { workspace = true, features = ["test-support"] }
 sinomo-testdir.workspace = true

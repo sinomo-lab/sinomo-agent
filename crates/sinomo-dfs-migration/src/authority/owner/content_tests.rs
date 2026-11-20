@@ -32,6 +32,42 @@ fn managed_owner_preserves_current_initialization_at_every_durable_phase() {
 }
 
 #[test]
+#[cfg(windows)]
+fn publication_refuses_a_different_lock_and_replays_the_prepared_source() {
+    let data = sinomo_testdir::TestDir::new("windows-content-publication-lock");
+    let live = data.join("dfs/content");
+    crate::content::write_original_v3_fixture_data(&live, b"original", false);
+    let alias = data.join("dfs/.content-conversion-v2/source-owner.lock");
+    let refused = content_exposure::prepare(data.path(), |_| {
+        std::fs::write(&alias, b"unrelated file").unwrap();
+        Ok(())
+    });
+    assert!(refused.unwrap_err().to_string().contains("original content owner file"));
+    assert_eq!(std::fs::read(&alias).unwrap(), b"unrelated file");
+    let prepared = content_exposure::retained_publication(data.path()).unwrap().unwrap();
+    assert!(live.is_dir());
+    assert!(!data.join(&prepared.retained).exists());
+
+    std::fs::remove_file(&alias).unwrap();
+    std::fs::hard_link(live.join("content-owner.lock"), &alias).unwrap();
+    let competing_writer = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(live.join("content-owner.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&competing_writer).unwrap();
+    assert!(content_exposure::prepare(data.path(), |_| Ok(())).is_err());
+    assert!(!data.join(&prepared.retained).exists());
+    drop(competing_writer);
+
+    let completed = content_exposure::prepare(data.path(), |_| Ok(())).unwrap();
+    assert_eq!(completed.inventory_id, prepared.inventory_id);
+    assert_eq!(completed.target_incarnation, prepared.target_incarnation);
+    let retained_lock = data.join(completed.retained).join("content-owner.lock");
+    assert!(same_file::is_same_file(alias, retained_lock).unwrap());
+}
+
+#[test]
 fn partial_content_publication_preserves_source_and_replays_exact_target() {
     let data = sinomo_testdir::TestDir::new("single-owner-content-publication");
     let live = data.join("dfs/content");
