@@ -370,7 +370,8 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxStatusRequest,
     ) -> Result<SandboxStatusResponse, SandboxBackendError> {
-        let _lease = self.settle_local_execution(&request.sandbox_id)?;
+        let _lease =
+            crate::store::acquire_native_workspace_access(&self.store, &request.sandbox_id, false)?;
         let (manifest, _layout) = self.store.load(&request.sandbox_id)?;
         Ok(SandboxStatusResponse { manifest })
     }
@@ -489,7 +490,8 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxListRequest,
     ) -> Result<SandboxListResponse, SandboxBackendError> {
-        let _lease = self.settle_local_execution(&request.sandbox_id)?;
+        let _lease =
+            crate::store::acquire_native_workspace_access(&self.store, &request.sandbox_id, false)?;
         let (_manifest, layout) = self.store.load(&request.sandbox_id)?;
         let fs = LocalSandboxFileSystem::new(layout);
         let entries = fs.list(&request.path)?;
@@ -500,7 +502,8 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxReadRequest,
     ) -> Result<SandboxReadResponse, SandboxBackendError> {
-        let _lease = self.settle_local_execution(&request.sandbox_id)?;
+        let _lease =
+            crate::store::acquire_native_workspace_access(&self.store, &request.sandbox_id, false)?;
         let (_manifest, layout) = self.store.load(&request.sandbox_id)?;
         let fs = LocalSandboxFileSystem::new(layout);
         let bytes = fs.read(&request.path, request.range)?;
@@ -511,7 +514,8 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxWriteRequest,
     ) -> Result<SandboxWriteResponse, SandboxBackendError> {
-        let _lease = self.settle_local_execution(&request.sandbox_id)?;
+        let _lease =
+            crate::store::acquire_native_workspace_access(&self.store, &request.sandbox_id, false)?;
         let (mut manifest, layout) = self.store.load(&request.sandbox_id)?;
         let mut fs = LocalSandboxFileSystem::new(layout);
         validate_sandbox_write_resource_limits(

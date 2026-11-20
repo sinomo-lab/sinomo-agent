@@ -5,17 +5,29 @@
 //! filesystem semantics; structured sandbox filesystem permissions are not an
 //! isolation boundary for this backend.
 
+mod session;
+#[cfg(target_os = "linux")]
+mod supervisor;
+use session::Execution;
+pub use session::{
+    SandboxNativeExecution, SandboxNativeExecutionOptions, SandboxNativeExecutionView,
+    SandboxNativeInteraction, interact_with_native_execution,
+};
+use sinomo_sandbox::{acquire_sandbox_native_launch_lease, begin_sandbox_native_command_lease};
 use std::env;
 use std::fs;
+use std::io::Read;
 #[cfg(not(windows))]
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::process::Child;
 #[cfg(not(windows))]
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,8 +48,8 @@ use sinomo_sandbox::{
     record_local_command_history, recover_sandbox_local_execution_journal_with_lease,
     sandbox_command_record_status_for_wasi_error, sandbox_command_stderr_path,
     sandbox_command_stdout_path, sandbox_output_chunks, settle_sandbox_local_execution_journal,
-    try_acquire_sandbox_local_execution_lease, validate_sandbox_process_plan,
-    validate_sandbox_toolchain_argv, validate_toolchain_command_name,
+    validate_sandbox_process_plan, validate_sandbox_toolchain_argv,
+    validate_toolchain_command_name,
 };
 #[cfg(target_os = "linux")]
 use sinomo_sandbox::{
@@ -152,16 +164,9 @@ impl SandboxSimpleNativeCommandRunner {
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
-        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
-        recover_sandbox_local_execution_journal_with_lease(
+        let gate = acquire_sandbox_native_launch_lease(store, sandbox_id)?;
+        self.start_toolchain_command(
             store,
-            &local_execution_lease,
-            sandbox_id,
-            OffsetDateTime::now_utc(),
-        )?;
-        self.run_toolchain_command_with_stdin_policy_output_sink_cancellation_and_lease(
-            store,
-            _toolchain_store,
             sandbox_id,
             command_name,
             argv,
@@ -171,15 +176,17 @@ impl SandboxSimpleNativeCommandRunner {
             policy,
             output_sink,
             cancellation_token,
-            &local_execution_lease,
-        )
+            gate,
+            SandboxCommandId::generate(),
+            SandboxNativeExecutionOptions::default(),
+        )?
+        .wait()
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn run_toolchain_command_with_stdin_policy_output_sink_cancellation_and_lease(
+    pub fn start_toolchain_command(
         &self,
         store: &LocalSandboxInstanceStore,
-        _toolchain_store: &sinomo_sandbox::LocalSandboxToolchainStore,
         sandbox_id: &sinomo_sandbox::SandboxId,
         command_name: &str,
         argv: Vec<String>,
@@ -189,8 +196,10 @@ impl SandboxSimpleNativeCommandRunner {
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: SandboxCancellationToken,
-        local_execution_lease: &SandboxLocalExecutionLease,
-    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        gate: SandboxLocalExecutionLease,
+        command_id: SandboxCommandId,
+        options: SandboxNativeExecutionOptions,
+    ) -> Result<SandboxNativeExecution, SandboxCommandExecutionError> {
         validate_toolchain_command_name(command_name)?;
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(invalid_request)?;
         let (manifest, layout) = store.load(sandbox_id)?;
@@ -218,14 +227,66 @@ impl SandboxSimpleNativeCommandRunner {
             env,
             timeout_ms,
         };
-        self.run_native_command(
+        self.start_request(
             store,
-            &manifest,
-            &layout,
+            manifest,
+            layout,
             request,
             output_sink,
-            &cancellation_token,
-            local_execution_lease,
+            cancellation_token,
+            gate,
+            command_id,
+            options,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_request(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        manifest: sinomo_sandbox::SandboxInstanceManifest,
+        layout: LocalSandboxInstanceLayout,
+        request: SandboxCommandRequest,
+        sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation: SandboxCancellationToken,
+        gate: SandboxLocalExecutionLease,
+        id: SandboxCommandId,
+        options: SandboxNativeExecutionOptions,
+    ) -> Result<SandboxNativeExecution, SandboxCommandExecutionError> {
+        if options.interactive && request.stdin.is_some() {
+            return Err(invalid_request(
+                "interactive input must be written through the execution handle",
+            ));
+        }
+        if manifest.command_history.contains(&id) {
+            return Err(invalid_request(
+                "native execution ID already has a command record",
+            ));
+        }
+        let lease = begin_sandbox_native_command_lease(store, &gate, &manifest.sandbox_id, &id)?;
+        drop(gate);
+        let runner = self.clone();
+        let store = store.clone();
+        let worker_manifest = manifest.clone();
+        let worker_layout = layout.clone();
+        Execution::launch(
+            &layout,
+            &manifest,
+            id,
+            options,
+            cancellation,
+            sink,
+            move |execution, foreground| {
+                runner.run_native_command(
+                    &store,
+                    &worker_manifest,
+                    &worker_layout,
+                    request,
+                    execution,
+                    foreground,
+                    &lease,
+                )
+            },
         )
     }
 
@@ -268,18 +329,6 @@ impl SandboxSimpleNativeCommandRunner {
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
-        let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
-        recover_sandbox_local_execution_journal_with_lease(
-            store,
-            &local_execution_lease,
-            sandbox_id,
-            OffsetDateTime::now_utc(),
-        )?;
-        let (manifest, layout) = store.load(sandbox_id)?;
-        policy
-            .validate_manifest(&manifest, execution_node_id)
-            .map_err(SandboxCommandExecutionError::PolicyDenied)?;
-
         let mut step_outcomes = Vec::with_capacity(plan.steps.len());
         let mut piped_stdin: Option<Vec<u8>> = None;
         for (index, step) in plan.steps.iter().enumerate() {
@@ -289,6 +338,11 @@ impl SandboxSimpleNativeCommandRunner {
             } else {
                 step.stdin.clone()
             };
+            let gate = acquire_sandbox_native_launch_lease(store, sandbox_id)?;
+            let (manifest, layout) = store.load(sandbox_id)?;
+            policy
+                .validate_manifest(&manifest, execution_node_id)
+                .map_err(SandboxCommandExecutionError::PolicyDenied)?;
             let mut env = manifest.env.clone();
             if let Ok(path) = std::env::var("PATH") {
                 env.entry("PATH".to_string()).or_insert(path);
@@ -302,15 +356,19 @@ impl SandboxSimpleNativeCommandRunner {
                 env,
                 timeout_ms,
             };
-            let outcome = self.run_native_command(
-                store,
-                &manifest,
-                &layout,
-                request,
-                output_sink.clone(),
-                &cancellation_token,
-                &local_execution_lease,
-            )?;
+            let outcome = self
+                .start_request(
+                    store,
+                    manifest,
+                    layout,
+                    request,
+                    output_sink.clone(),
+                    cancellation_token.child(),
+                    gate,
+                    SandboxCommandId::generate(),
+                    SandboxNativeExecutionOptions::default(),
+                )?
+                .wait()?;
             if step.pipe_stdout_to_next {
                 piped_stdin = Some(outcome.stdout.clone());
             }
@@ -345,10 +403,12 @@ impl SandboxSimpleNativeCommandRunner {
         manifest: &sinomo_sandbox::SandboxInstanceManifest,
         layout: &LocalSandboxInstanceLayout,
         request: SandboxCommandRequest,
-        output_sink: Option<Arc<dyn SandboxOutputSink>>,
-        cancellation_token: &SandboxCancellationToken,
+        execution: &Arc<Execution>,
+        foreground: &session::ResultSender,
         local_execution_lease: &SandboxLocalExecutionLease,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        let cancellation_token = &execution.cancellation;
+        let output_sink: Option<Arc<dyn SandboxOutputSink>> = Some(execution.clone());
         let Some(argv0) = request.argv.first() else {
             return Err(invalid_request(
                 "simple-native command argv must include argv[0]",
@@ -356,7 +416,7 @@ impl SandboxSimpleNativeCommandRunner {
         };
         validate_sandbox_toolchain_argv(argv0, &request.argv).map_err(invalid_request)?;
         ensure_layout_dirs(layout)?;
-        let command_id = SandboxCommandId::generate();
+        let command_id = execution.id.clone();
         let started_at = OffsetDateTime::now_utc();
         let timeout_ms =
             effective_sandbox_timeout_ms(request.timeout_ms, manifest.limits.wall_time_ms);
@@ -441,6 +501,21 @@ impl SandboxSimpleNativeCommandRunner {
             OffsetDateTime::now_utc(),
         )?;
         let started = Instant::now();
+        let report_foreground = |code: i32| {
+            *execution.foreground_status.lock().unwrap() = Some(code);
+            let (stdout, stderr) = execution.streams.lock().unwrap().clone();
+            let result = native_outcome(
+                &manifest.sandbox_id,
+                &command_id,
+                layout,
+                &before,
+                started,
+                code,
+                stdout,
+                stderr,
+            );
+            let _ = foreground.send(result);
+        };
         let output = execute_native_command(
             &request,
             layout,
@@ -455,6 +530,8 @@ impl SandboxSimpleNativeCommandRunner {
             store,
             local_execution_lease,
             &mut local_journal,
+            execution,
+            &report_foreground,
         );
         let (output, _completion_guard) =
             transition_after_native_return(cancellation_token, output);
@@ -526,42 +603,27 @@ impl SandboxSimpleNativeCommandRunner {
             }
         };
 
-        let wall_time_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let exit_status = output.exit_status;
-        let stdout = output.stdout;
-        let stderr = output.stderr;
         let terminal_error = output.terminal_error;
-        let mut output_chunks = sandbox_output_chunks(
+        let SandboxLocalCommandOutcome {
+            response,
+            stdout,
+            stderr,
+            output_chunks,
+        } = native_outcome(
             &manifest.sandbox_id,
             &command_id,
-            SandboxOutputStream::Stdout,
-            &stdout,
-        );
-        output_chunks.extend(sandbox_output_chunks(
-            &manifest.sandbox_id,
-            &command_id,
-            SandboxOutputStream::Stderr,
-            &stderr,
-        ));
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        let changed_paths = sandbox_fs.changed_paths_since(&before)?;
-        let response = sinomo_sandbox::SandboxCommandResponse {
-            command_id: command_id.clone(),
-            exit_status,
-            stdout_ref: sandbox_command_stdout_path(&manifest.sandbox_id, &command_id),
-            stderr_ref: sandbox_command_stderr_path(&manifest.sandbox_id, &command_id),
-            changed_paths,
-            resource_usage: SandboxResourceUsage {
-                wall_time_ms,
-                peak_memory_bytes: 0,
-                stdout_bytes: stdout.len() as u64,
-                stderr_bytes: stderr.len() as u64,
-                // simple-native deliberately permits arbitrary host writes;
-                // its sandbox-local snapshot is only a partial view and
-                // cannot honestly enforce max_written_bytes_per_command.
-                written_bytes: SANDBOX_RESOURCE_USAGE_UNAVAILABLE,
-            },
-        };
+            layout,
+            &before,
+            started,
+            output.exit_status,
+            output.stdout,
+            output.stderr,
+        )?;
+        execution
+            .foreground_status
+            .lock()
+            .unwrap()
+            .get_or_insert(response.exit_status);
 
         let execution_error = terminal_error.map(SandboxCommandExecutionError::Wasi);
 
@@ -629,6 +691,53 @@ impl SandboxSimpleNativeCommandRunner {
             output_chunks,
         })
     }
+}
+
+fn native_outcome(
+    sandbox_id: &sinomo_sandbox::SandboxId,
+    command_id: &SandboxCommandId,
+    layout: &LocalSandboxInstanceLayout,
+    before: &sinomo_sandbox::LocalSandboxFileSnapshot,
+    started: Instant,
+    exit_status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+    let wall_time_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let mut output_chunks =
+        sandbox_output_chunks(sandbox_id, command_id, SandboxOutputStream::Stdout, &stdout);
+    output_chunks.extend(sandbox_output_chunks(
+        sandbox_id,
+        command_id,
+        SandboxOutputStream::Stderr,
+        &stderr,
+    ));
+    let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+    let changed_paths = sandbox_fs.changed_paths_since(before)?;
+    let response = sinomo_sandbox::SandboxCommandResponse {
+        command_id: command_id.clone(),
+        exit_status,
+        stdout_ref: sandbox_command_stdout_path(sandbox_id, command_id),
+        stderr_ref: sandbox_command_stderr_path(sandbox_id, command_id),
+        changed_paths,
+        resource_usage: SandboxResourceUsage {
+            wall_time_ms,
+            peak_memory_bytes: 0,
+            stdout_bytes: stdout.len() as u64,
+            stderr_bytes: stderr.len() as u64,
+            // simple-native deliberately permits arbitrary host writes;
+            // its sandbox-local snapshot is only a partial view and
+            // cannot honestly enforce max_written_bytes_per_command.
+            written_bytes: SANDBOX_RESOURCE_USAGE_UNAVAILABLE,
+        },
+    };
+
+    Ok(SandboxLocalCommandOutcome {
+        response,
+        stdout,
+        stderr,
+        output_chunks,
+    })
 }
 
 #[derive(Debug)]
@@ -920,6 +1029,101 @@ impl LiveOutputEmitter {
     }
 }
 
+/// A single consumer samples both pipes at foreground exit. Bytes already in
+/// the kernel are included even when a descendant keeps the write end open.
+#[cfg(any(unix, windows))]
+struct NativePipe {
+    file: fs::File,
+    emitter: LiveOutputEmitter,
+}
+
+#[cfg(any(unix, windows))]
+impl NativePipe {
+    #[cfg(unix)]
+    fn pending(&self) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let mut count: libc::c_int = 0;
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::FIONREAD, &mut count) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(count as usize)
+    }
+
+    #[cfg(windows)]
+    fn pending(&self) -> std::io::Result<usize> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NO_DATA};
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let mut available = 0;
+        if unsafe {
+            PeekNamedPipe(
+                self.file.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let e = std::io::Error::last_os_error();
+            if matches!(
+                e.raw_os_error().map(|code| code as u32),
+                Some(ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | ERROR_NO_DATA)
+            ) {
+                return Ok(0);
+            }
+            return Err(e);
+        }
+        Ok(available as usize)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn drain_pipes(
+    pipes: &mut [NativePipe; 2],
+    budget: &BoundedOutputBudget,
+) -> Result<bool, SandboxWasiError> {
+    let fail = |e: std::io::Error| SandboxWasiError::Runtime {
+        detail: format!("read native execution output: {e}"),
+    };
+    let mut progress = false;
+    for pipe in pipes {
+        let mut pending = pipe.pending().map_err(fail)?;
+        if pending == 0 {
+            continue;
+        }
+        let mut buffer = [0u8; 16 * 1024];
+        while pending > 0 {
+            let n = pending.min(buffer.len());
+            pipe.file.read_exact(&mut buffer[..n]).map_err(fail)?;
+            let keep = budget.reserve(n);
+            pipe.emitter.emit(&buffer[..keep]);
+            progress = true;
+            pending -= n;
+        }
+    }
+    Ok(progress)
+}
+
+#[cfg(any(unix, windows))]
+fn native_pipes(
+    stdout: fs::File,
+    stderr: fs::File,
+    sink: Option<Arc<dyn SandboxOutputSink>>,
+    sandbox: &sinomo_sandbox::SandboxId,
+    id: &SandboxCommandId,
+) -> [NativePipe; 2] {
+    [
+        (stdout, SandboxOutputStream::Stdout),
+        (stderr, SandboxOutputStream::Stderr),
+    ]
+    .map(|(file, stream)| NativePipe {
+        file,
+        emitter: LiveOutputEmitter::new(sink.clone(), sandbox.clone(), id.clone(), stream),
+    })
+}
+
 fn execute_native_command(
     request: &SandboxCommandRequest,
     layout: &LocalSandboxInstanceLayout,
@@ -934,6 +1138,8 @@ fn execute_native_command(
     store: &LocalSandboxInstanceStore,
     local_execution_lease: &SandboxLocalExecutionLease,
     local_journal: &mut SandboxLocalExecutionJournal,
+    execution: &Execution,
+    report_foreground: &dyn Fn(i32),
 ) -> Result<NativeCommandOutput, SandboxWasiError> {
     #[cfg(windows)]
     {
@@ -951,10 +1157,17 @@ fn execute_native_command(
             cancellation_token,
             command_id,
             output_sink,
+            execution,
+            report_foreground,
         );
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, unix)))]
+    return Err(SandboxWasiError::Runtime {
+        detail: "native process execution requires a supported host operating system".into(),
+    });
+
+    #[cfg(unix)]
     {
         let _ = config;
         execute_native_command_std(
@@ -970,11 +1183,13 @@ fn execute_native_command(
             store,
             local_execution_lease,
             local_journal,
+            execution,
+            report_foreground,
         )
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn execute_native_command_std(
     request: &SandboxCommandRequest,
     layout: &LocalSandboxInstanceLayout,
@@ -988,6 +1203,8 @@ fn execute_native_command_std(
     store: &LocalSandboxInstanceStore,
     local_execution_lease: &SandboxLocalExecutionLease,
     local_journal: &mut SandboxLocalExecutionJournal,
+    execution: &Execution,
+    report_foreground: &dyn Fn(i32),
 ) -> Result<NativeCommandOutput, SandboxWasiError> {
     let argv0 = request
         .argv
@@ -1002,7 +1219,7 @@ fn execute_native_command_std(
         let mut handshake = Command::new("/bin/sh");
         handshake.args([
             "-c",
-            "IFS= read -r _ <&3; exec 3<&-; exec \"$@\"",
+            "IFS= read -r _ <&3 || exit 125; exec 3<&-; exec \"$@\"",
             "sinomo-handshake",
         ]);
         if let Some(projection) = mount_projection {
@@ -1045,11 +1262,13 @@ fn execute_native_command_std(
     };
     command
         .current_dir(launch_cwd)
-        .stdin(if request.stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(
+            if request.stdin.is_some() || execution.options.interactive {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
@@ -1062,10 +1281,15 @@ fn execute_native_command_std(
             detail: format!("failed to create simple-native launch handshake: {source}"),
         })?;
     #[cfg(target_os = "linux")]
+    let (mut control, child_control) =
+        UnixStream::pair().map_err(|e| SandboxWasiError::Runtime {
+            detail: e.to_string(),
+        })?;
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
         let memory_mb = limits.memory_mb;
-        let expected_parent_pid = std::process::id() as libc::pid_t;
+        let control_fd = child_control.as_raw_fd();
         let handshake_fd = launch_handshake_child.as_raw_fd();
         // SAFETY: pre_exec only calls async-signal-safe libc/syscall operations
         // and returns an io::Error on failure before exec.
@@ -1077,7 +1301,9 @@ fn execute_native_command_std(
                 if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                linux::prepare_child_process(memory_mb, expected_parent_pid)
+                let supervisor_pid = libc::getpid();
+                supervisor::install(control_fd)?;
+                linux::prepare_child_process(memory_mb, supervisor_pid)
             });
         }
     }
@@ -1106,14 +1332,14 @@ fn execute_native_command_std(
         })?;
     #[cfg(target_os = "linux")]
     {
+        drop(child_control);
         drop(launch_handshake_child);
         let owner =
-            SandboxLocalExecutionExternalOwner::linux_process_group(child.id() as i32, child.id())
-                .map_err(|detail| {
-                    linux::kill_process_group(child.id() as i32);
-                    let _ = child.wait();
-                    SandboxWasiError::Runtime { detail }
-                })?;
+            SandboxLocalExecutionExternalOwner::linux_supervisor(child.id()).map_err(|detail| {
+                let _ = control.shutdown(std::net::Shutdown::Both);
+                let _ = child.wait();
+                SandboxWasiError::Runtime { detail }
+            })?;
         if let Err(error) = prepare_sandbox_local_execution_external_owner(
             store,
             local_execution_lease,
@@ -1121,7 +1347,7 @@ fn execute_native_command_std(
             owner,
             OffsetDateTime::now_utc(),
         ) {
-            linux::kill_process_group(child.id() as i32);
+            let _ = control.shutdown(std::net::Shutdown::Both);
             let _ = child.wait();
             return Err(SandboxWasiError::Runtime {
                 detail: format!(
@@ -1130,7 +1356,7 @@ fn execute_native_command_std(
             });
         }
         if let Err(source) = launch_handshake.write_all(b"go\n") {
-            linux::kill_process_group(child.id() as i32);
+            let _ = control.shutdown(std::net::Shutdown::Both);
             let _ = child.wait();
             return Err(SandboxWasiError::Runtime {
                 detail: format!("failed to release simple-native launch handshake: {source}"),
@@ -1138,7 +1364,15 @@ fn execute_native_command_std(
         }
         drop(launch_handshake);
     }
-    let stdin_writer = if let Some(stdin) = request.stdin.clone() {
+    let stdin_writer = if let Some(rx) = execution.input() {
+        let mut pipe = child.stdin.take().expect("interactive pipe");
+        Some(std::thread::spawn(move || {
+            for bytes in rx {
+                pipe.write_all(&bytes)?;
+            }
+            Ok(())
+        }))
+    } else if let Some(stdin) = request.stdin.clone() {
         let mut child_stdin = child
             .stdin
             .take()
@@ -1162,38 +1396,41 @@ fn execute_native_command_std(
             detail: "simple-native stderr pipe was not available".to_string(),
         })?;
     let output_limit = effective_simple_native_output_limit(limits.max_output_bytes);
-    let output_budget = Arc::new(BoundedOutputBudget::new(output_limit));
-    let stdout_reader = spawn_bounded_native_reader(
-        stdout,
-        Arc::clone(&output_budget),
-        "stdout",
-        LiveOutputEmitter::new(
-            output_sink.clone(),
-            request.sandbox_id.clone(),
-            command_id.clone(),
-            SandboxOutputStream::Stdout,
-        ),
+    let output_budget = BoundedOutputBudget::new(output_limit);
+    #[cfg(unix)]
+    let mut pipes = native_pipes(
+        fs::File::from(std::os::fd::OwnedFd::from(stdout)),
+        fs::File::from(std::os::fd::OwnedFd::from(stderr)),
+        output_sink,
+        &request.sandbox_id,
+        command_id,
     );
-    let stderr_reader = spawn_bounded_native_reader(
-        stderr,
-        Arc::clone(&output_budget),
-        "stderr",
-        LiveOutputEmitter::new(
-            output_sink,
-            request.sandbox_id.clone(),
-            command_id.clone(),
-            SandboxOutputStream::Stderr,
-        ),
-    );
+    execution.started();
+    #[cfg(target_os = "linux")]
+    let (status, mut terminal_error) = supervisor::wait(
+        &mut child,
+        &mut control,
+        timeout_ms,
+        cancellation_token,
+        &output_budget,
+        execution.options.cleanup_on_exit,
+        report_foreground,
+        &mut pipes,
+    )?;
+    #[cfg(not(target_os = "linux"))]
     let (status, mut terminal_error) = wait_for_native_output(
         &mut child,
         timeout_ms,
         cancellation_token,
         &output_budget,
         output_limit,
+        execution.options.cleanup_on_exit,
+        report_foreground,
+        &mut pipes,
     )?;
-    let stdout = join_bounded_native_reader(stdout_reader, "stdout")?;
-    let stderr = join_bounded_native_reader(stderr_reader, "stderr")?;
+    execution.close_input();
+    drain_pipes(&mut pipes, &output_budget)?;
+    let (stdout, stderr) = execution.streams.lock().unwrap().clone();
     if terminal_error.is_none() && output_budget.exceeded() {
         terminal_error = Some(SandboxWasiError::OutputLimitExceeded {
             limit: output_limit.min(usize::MAX as u64) as usize,
@@ -1217,16 +1454,21 @@ fn execute_native_command_std(
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn wait_for_native_output(
     child: &mut Child,
     timeout_ms: u64,
     cancellation_token: &SandboxCancellationToken,
     output_budget: &BoundedOutputBudget,
     output_limit: u64,
+    cleanup_on_exit: bool,
+    report_foreground: &dyn Fn(i32),
+    pipes: &mut [NativePipe; 2],
 ) -> Result<(ExitStatus, Option<SandboxWasiError>), SandboxWasiError> {
     let started = Instant::now();
+    let mut reported = false;
     loop {
+        let made_progress = drain_pipes(pipes, output_budget)?;
         if cancellation_token.is_cancelled() {
             let status = terminate_native_process_group_and_reap(child, "cancellation")?;
             return Ok((status, Some(SandboxWasiError::Cancelled)));
@@ -1254,16 +1496,28 @@ fn wait_for_native_output(
                 detail: format!("simple-native command wait failed: {source}"),
             })?
         {
-            // The command lifetime owns the whole process group. A shell may
-            // exit while a background descendant still holds a pipe open.
-            linux::kill_process_group(child.id() as i32);
-            return Ok((status, None));
+            let active = unsafe { libc::kill(-(child.id() as i32), 0) } == 0;
+            if !active {
+                return Ok((status, None));
+            }
+            if cleanup_on_exit {
+                return terminate_native_process_group_and_reap(child, "requested cleanup")
+                    .map(|s| (s, None));
+            } else if !reported {
+                drain_pipes(pipes, output_budget)?;
+                if !output_budget.exceeded() {
+                    report_foreground(exit_status_code(status));
+                }
+                reported = true;
+            }
         }
-        std::thread::sleep(wait);
+        if !made_progress {
+            std::thread::sleep(wait.min(Duration::from_millis(10)));
+        }
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn terminate_native_process_group_and_reap(
     child: &mut Child,
     reason: &str,
@@ -1276,6 +1530,8 @@ fn terminate_native_process_group_and_reap(
             .map_err(|source| SandboxWasiError::Runtime {
                 detail: format!("simple-native {reason} failed while reaping process: {source}"),
             })?
+            && unsafe { libc::kill(-(child.id() as i32), 0) } < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         {
             return Ok(status);
         }
@@ -1288,47 +1544,6 @@ fn terminate_native_process_group_and_reap(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-#[cfg(not(windows))]
-fn spawn_bounded_native_reader<R>(
-    mut reader: R,
-    budget: Arc<BoundedOutputBudget>,
-    stream: &'static str,
-    mut emitter: LiveOutputEmitter,
-) -> std::thread::JoinHandle<Result<Vec<u8>, String>>
-where
-    R: Read + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = reader
-                .read(&mut buffer)
-                .map_err(|source| format!("failed to read simple-native {stream}: {source}"))?;
-            if read == 0 {
-                break;
-            }
-            let keep = budget.reserve(read);
-            output.extend_from_slice(&buffer[..keep]);
-            emitter.emit(&buffer[..keep]);
-        }
-        Ok(output)
-    })
-}
-
-#[cfg(not(windows))]
-fn join_bounded_native_reader(
-    reader: std::thread::JoinHandle<Result<Vec<u8>, String>>,
-    stream: &str,
-) -> Result<Vec<u8>, SandboxWasiError> {
-    reader
-        .join()
-        .map_err(|_| SandboxWasiError::Runtime {
-            detail: format!("simple-native {stream} reader panicked"),
-        })?
-        .map_err(|detail| SandboxWasiError::Runtime { detail })
 }
 
 fn native_wait_poll_duration(
@@ -1490,6 +1705,7 @@ fn persist_failed_command(
     status: SandboxCommandRecordStatus,
     error: String,
 ) -> Result<(), SandboxCommandExecutionError> {
+    let _gate = acquire_sandbox_native_launch_lease(store, &manifest.sandbox_id)?;
     let completed_at = OffsetDateTime::now_utc();
     let record = SandboxCommandRecord {
         sandbox_id: manifest.sandbox_id.clone(),
@@ -1574,25 +1790,25 @@ mod windows {
     use std::ptr;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use sinomo_sandbox::SANDBOX_UNLIMITED_SIZE_LIMIT;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NO_DATA, GetLastError, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_FAILED,
+        CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_FAILED,
         WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-        SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-        TokenIntegrityLevel, WinLowLabelSid,
+        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES,
+        SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, WinLowLabelSid,
     };
-    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::SystemServices::{
@@ -1600,19 +1816,20 @@ mod windows {
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-        CreateProcessW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken,
-        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+        CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+        GetCurrentProcess, GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute,
         WaitForSingleObject,
     };
 
     use super::{
-        BoundedOutputBudget, LiveOutputEmitter, LocalSandboxInstanceLayout, NativeCommandOutput,
+        BoundedOutputBudget, LocalSandboxInstanceLayout, NativeCommandOutput,
         SandboxCancellationToken, SandboxCommandId, SandboxCommandRequest, SandboxOutputSink,
-        SandboxOutputStream, SandboxResourceLimits, SandboxSimpleNativeConfig, SandboxWasiError,
+        SandboxResourceLimits, SandboxSimpleNativeConfig, SandboxWasiError,
         effective_simple_native_output_limit, native_environment, native_wait_poll_duration,
     };
 
-    const READ_BUFFER_SIZE: usize = 64 * 1024;
     #[allow(dead_code)]
     const SECURITY_MAX_SID_SIZE: usize = 68;
 
@@ -1626,6 +1843,8 @@ mod windows {
         cancellation_token: &SandboxCancellationToken,
         command_id: &SandboxCommandId,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        execution: &super::Execution,
+        report_foreground: &dyn Fn(i32),
     ) -> Result<NativeCommandOutput, SandboxWasiError> {
         let _ = config;
         execute_with_windows_process(
@@ -1638,6 +1857,8 @@ mod windows {
             cancellation_token,
             command_id,
             output_sink,
+            execution,
+            report_foreground,
         )
     }
 
@@ -1651,6 +1872,8 @@ mod windows {
         cancellation_token: &SandboxCancellationToken,
         command_id: &SandboxCommandId,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        execution: &super::Execution,
+        report_foreground: &dyn Fn(i32),
     ) -> Result<NativeCommandOutput, SandboxWasiError> {
         let argv0 = request
             .argv
@@ -1666,12 +1889,52 @@ mod windows {
         set_handle_non_inheritable(stdout_read.raw(), "stdout read pipe")?;
         set_handle_non_inheritable(stderr_read.raw(), "stderr read pipe")?;
 
-        let startup = startup_info(stdin_read.raw(), stdout_write.raw(), stderr_write.raw());
+        let handles = [stdin_read.raw(), stdout_write.raw(), stderr_write.raw()];
+        let mut attribute_bytes = 0;
+        unsafe {
+            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attribute_bytes);
+        }
+        let mut storage = vec![0usize; attribute_bytes.div_ceil(mem::size_of::<usize>())];
+        let attributes = storage.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut attribute_bytes) } == 0
+        {
+            return Err(last_error("initialize inherited handle list"));
+        }
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo = startup_info(handles[0], handles[1], handles[2]);
+        startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes;
+        struct Attributes(windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST);
+        impl Drop for Attributes {
+            fn drop(&mut self) {
+                unsafe {
+                    DeleteProcThreadAttributeList(self.0);
+                }
+            }
+        }
+        let _attributes = Attributes(attributes);
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attributes,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                mem::size_of_val(&handles),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        } == 0
+        {
+            return Err(last_error("set inherited stdio handles"));
+        }
         let mut process_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
         let mut command_line = wide_command_line(&request.argv)?;
         let environment = wide_environment(request, layout, cwd)?;
         let current_dir = wide_path(cwd)?;
-        let creation_flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+        let creation_flags = CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_NO_WINDOW
+            | EXTENDED_STARTUPINFO_PRESENT;
 
         let created = unsafe {
             match token {
@@ -1685,7 +1948,7 @@ mod windows {
                     creation_flags,
                     environment.as_ptr().cast(),
                     current_dir.as_ptr(),
-                    &startup,
+                    &startup.StartupInfo,
                     &mut process_info,
                 ),
                 None => CreateProcessW(
@@ -1697,7 +1960,7 @@ mod windows {
                     creation_flags,
                     environment.as_ptr().cast(),
                     current_dir.as_ptr(),
-                    &startup,
+                    &startup.StartupInfo,
                     &mut process_info,
                 ),
             }
@@ -1727,36 +1990,29 @@ mod windows {
         drop(stdout_write);
         drop(stderr_write);
         let output_limit = effective_simple_native_output_limit(limits.max_output_bytes);
-        let output_budget = Arc::new(BoundedOutputBudget::new(output_limit));
-        let stdout_reader = spawn_pipe_reader(
-            stdout_read,
-            "stdout",
-            Arc::clone(&output_budget),
-            LiveOutputEmitter::new(
-                output_sink.clone(),
-                request.sandbox_id.clone(),
-                command_id.clone(),
-                SandboxOutputStream::Stdout,
-            ),
-        );
-        let stderr_reader = spawn_pipe_reader(
-            stderr_read,
-            "stderr",
-            Arc::clone(&output_budget),
-            LiveOutputEmitter::new(
-                output_sink,
-                request.sandbox_id.clone(),
-                command_id.clone(),
-                SandboxOutputStream::Stderr,
-            ),
+        let output_budget = BoundedOutputBudget::new(output_limit);
+        let mut pipes = super::native_pipes(
+            stdout_read.into_file(),
+            stderr_read.into_file(),
+            output_sink,
+            &request.sandbox_id,
+            command_id,
         );
 
-        let stdin_writer = if let Some(stdin) = request.stdin.clone() {
+        let stdin_writer = if let Some(rx) = execution.input() {
+            Some(thread::spawn(move || {
+                for bytes in rx {
+                    write_pipe_all(&stdin_write, &bytes)?;
+                }
+                Ok(())
+            }))
+        } else if let Some(stdin) = request.stdin.clone() {
             Some(thread::spawn(move || write_pipe_all(&stdin_write, &stdin)))
         } else {
             drop(stdin_write);
             None
         };
+        execution.started();
         let mut terminal_error = wait_for_process(
             &job,
             &process,
@@ -1764,13 +2020,15 @@ mod windows {
             cancellation_token,
             &output_budget,
             output_limit,
+            execution.options.cleanup_on_exit,
+            report_foreground,
+            &mut pipes,
         )?;
+        execution.close_input();
         let exit_status = process_exit_code(&process);
-        let stdout = join_pipe_reader(stdout_reader, "stdout");
-        let stderr = join_pipe_reader(stderr_reader, "stderr");
+        super::drain_pipes(&mut pipes, &output_budget)?;
         let exit_status = exit_status?;
-        let stdout = stdout?;
-        let stderr = stderr?;
+        let (stdout, stderr) = execution.streams.lock().unwrap().clone();
         if terminal_error.is_none() && output_budget.exceeded() {
             terminal_error = Some(SandboxWasiError::OutputLimitExceeded {
                 limit: output_limit.min(usize::MAX as u64) as usize,
@@ -1913,7 +2171,7 @@ mod windows {
         };
         let mut read = ptr::null_mut();
         let mut write = ptr::null_mut();
-        if unsafe { CreatePipe(&mut read, &mut write, &mut security, 0) } == 0 {
+        if unsafe { CreatePipe(&mut read, &mut write, &mut security, 64 * 1024) } == 0 {
             return Err(last_error(format!("failed to create {name} pipe")));
         }
         Ok((
@@ -1946,36 +2204,54 @@ mod windows {
         cancellation_token: &SandboxCancellationToken,
         output_budget: &BoundedOutputBudget,
         output_limit: u64,
+        cleanup_on_exit: bool,
+        report_foreground: &dyn Fn(i32),
+        pipes: &mut [super::NativePipe; 2],
     ) -> Result<Option<SandboxWasiError>, SandboxWasiError> {
         let started = Instant::now();
+        let mut foreground_reported = false;
         loop {
-            if cancellation_token.is_cancelled() {
-                terminate_job_and_wait(job, process);
-                return Ok(Some(SandboxWasiError::Cancelled));
-            }
-            if output_budget.exceeded() {
-                terminate_job_and_wait(job, process);
-                return Ok(Some(SandboxWasiError::OutputLimitExceeded {
-                    limit: output_limit.min(usize::MAX as u64) as usize,
-                }));
-            }
-            let wait = match native_wait_poll_duration(started, timeout_ms) {
-                Ok(wait) => wait,
-                Err(SandboxWasiError::TimedOut { timeout_ms }) => {
-                    terminate_job_and_wait(job, process);
-                    return Ok(Some(SandboxWasiError::TimedOut { timeout_ms }));
-                }
-                Err(error) => return Err(error),
+            let made_progress = super::drain_pipes(pipes, output_budget)?;
+            let error = if cancellation_token.is_cancelled() {
+                Some(SandboxWasiError::Cancelled)
+            } else if output_budget.exceeded() {
+                Some(SandboxWasiError::OutputLimitExceeded {
+                    limit: output_limit as usize,
+                })
+            } else {
+                native_wait_poll_duration(started, timeout_ms).err()
             };
-            let wait_ms = wait.as_millis().min(u128::from(u32::MAX)) as u32;
-            match unsafe { WaitForSingleObject(process.raw(), wait_ms) } {
-                WAIT_OBJECT_0 => {
-                    // Close the whole job before joining inherited pipe handles.
-                    terminate_job_and_wait(job, process);
+            if error.is_some() {
+                terminate_job_and_wait(job)?;
+                return Ok(error);
+            }
+            if foreground_reported {
+                if job_active_processes(job)? == 0 {
                     return Ok(None);
                 }
-                WAIT_TIMEOUT => continue,
-                WAIT_FAILED => return Err(last_error("failed to wait for simple-native process")),
+                if !made_progress {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                continue;
+            }
+            match unsafe { WaitForSingleObject(process.raw(), if made_progress { 0 } else { 10 }) }
+            {
+                WAIT_OBJECT_0 => {
+                    if job_active_processes(job)? == 0 {
+                        return Ok(None);
+                    }
+                    if cleanup_on_exit {
+                        terminate_job_and_wait(job)?;
+                        return Ok(None);
+                    }
+                    super::drain_pipes(pipes, output_budget)?;
+                    if !output_budget.exceeded() {
+                        report_foreground(process_exit_code(process)?);
+                    }
+                    foreground_reported = true;
+                }
+                WAIT_TIMEOUT => (),
+                WAIT_FAILED => return Err(last_error("wait for native process")),
                 other => {
                     return Err(SandboxWasiError::Runtime {
                         detail: format!("unexpected Windows wait result {other}"),
@@ -1985,11 +2261,37 @@ mod windows {
         }
     }
 
-    fn terminate_job_and_wait(job: &OwnedHandle, process: &OwnedHandle) {
-        unsafe {
-            let _ = TerminateJobObject(job.raw(), 1);
-            let _ = WaitForSingleObject(process.raw(), INFINITE);
+    fn job_active_processes(job: &OwnedHandle) -> Result<u32, SandboxWasiError> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                job.raw(),
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                mem::size_of_val(&info) as u32,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error("query native job membership"));
         }
+        Ok(info.ActiveProcesses)
+    }
+
+    fn terminate_job_and_wait(job: &OwnedHandle) -> Result<(), SandboxWasiError> {
+        if unsafe { TerminateJobObject(job.raw(), 1) } == 0 {
+            return Err(last_error("terminate native job"));
+        }
+        let started = Instant::now();
+        while job_active_processes(job)? > 0 {
+            if started.elapsed() >= Duration::from_secs(5) {
+                return Err(SandboxWasiError::CancelledCleanupFailed {
+                    detail: "Windows job still owns descendants".into(),
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
     }
 
     fn process_exit_code(process: &OwnedHandle) -> Result<i32, SandboxWasiError> {
@@ -1997,77 +2299,12 @@ mod windows {
         if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } == 0 {
             return Err(last_error("failed to get simple-native process exit code"));
         }
-        if exit_code == STILL_ACTIVE as u32 {
-            return Err(SandboxWasiError::Runtime {
-                detail: "simple-native process is still active after wait".to_string(),
-            });
-        }
         Ok(exit_code as i32)
-    }
-
-    fn spawn_pipe_reader(
-        handle: OwnedHandle,
-        stream: &'static str,
-        budget: Arc<BoundedOutputBudget>,
-        mut emitter: LiveOutputEmitter,
-    ) -> thread::JoinHandle<Result<Vec<u8>, String>> {
-        thread::spawn(move || {
-            read_pipe_to_end(handle, &budget, &mut emitter)
-                .map_err(|error| format!("failed to read simple-native {stream}: {error}"))
-        })
-    }
-
-    fn join_pipe_reader(
-        reader: thread::JoinHandle<Result<Vec<u8>, String>>,
-        stream: &str,
-    ) -> Result<Vec<u8>, SandboxWasiError> {
-        reader
-            .join()
-            .map_err(|_| SandboxWasiError::Runtime {
-                detail: format!("simple-native {stream} reader panicked"),
-            })?
-            .map_err(|detail| SandboxWasiError::Runtime { detail })
-    }
-
-    fn read_pipe_to_end(
-        handle: OwnedHandle,
-        budget: &BoundedOutputBudget,
-        emitter: &mut LiveOutputEmitter,
-    ) -> Result<Vec<u8>, String> {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; READ_BUFFER_SIZE];
-        loop {
-            let mut bytes_read = 0;
-            let ok = unsafe {
-                ReadFile(
-                    handle.raw(),
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                    &mut bytes_read,
-                    ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                let error = unsafe { GetLastError() };
-                if matches!(error, ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | ERROR_NO_DATA) {
-                    break;
-                }
-                return Err(format!("Windows error {error}"));
-            }
-            if bytes_read == 0 {
-                break;
-            }
-            let read = bytes_read as usize;
-            let keep = budget.reserve(read);
-            output.extend_from_slice(&buffer[..keep]);
-            emitter.emit(&buffer[..keep]);
-        }
-        Ok(output)
     }
 
     fn write_pipe_all(handle: &OwnedHandle, mut bytes: &[u8]) -> Result<(), SandboxWasiError> {
         while !bytes.is_empty() {
-            let chunk_len = bytes.len().min(READ_BUFFER_SIZE);
+            let chunk_len = bytes.len().min(64 * 1024);
             let mut bytes_written = 0;
             let ok = unsafe {
                 WriteFile(
@@ -2222,6 +2459,13 @@ mod windows {
             }
         }
 
+        fn into_file(self) -> std::fs::File {
+            use std::os::windows::io::FromRawHandle;
+            let handle = std::mem::ManuallyDrop::new(self);
+            // The File takes sole ownership of the pipe handle.
+            unsafe { std::fs::File::from_raw_handle(handle.raw()) }
+        }
+
         fn raw(&self) -> HANDLE {
             self.0
         }
@@ -2268,13 +2512,6 @@ mod linux {
         apply_memory_limit(memory_mb)
     }
 
-    pub(super) fn kill_process_group(child_pid: i32) {
-        unsafe {
-            let _ = libc::kill(-child_pid, libc::SIGKILL);
-            let _ = libc::kill(child_pid, libc::SIGKILL);
-        }
-    }
-
     fn apply_memory_limit(memory_mb: u64) -> io::Result<()> {
         if memory_mb == SANDBOX_UNLIMITED_SIZE_LIMIT {
             return Ok(());
@@ -2311,7 +2548,6 @@ mod linux {
     pub(super) fn kill_process_group(child_pid: i32) {
         unsafe {
             let _ = libc::kill(-child_pid, libc::SIGKILL);
-            let _ = libc::kill(child_pid, libc::SIGKILL);
         }
     }
 
@@ -2715,23 +2951,158 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn simple_native_leader_exit_terminates_background_pipe_holders() {
-        let (dir, store, sandbox_id) = create_store();
-        let delayed_write = dir.path().join("background-must-die");
-        let started = Instant::now();
+    fn process_plan_receives_foreground_output_before_background_exit() {
+        let (_dir, store, id) = create_store();
+        let step = |script: &str, pipe_stdout_to_next| sinomo_sandbox::SandboxProcessPlanStep {
+            command_name: "sh".into(),
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            stdin: None,
+            cwd: None,
+            env: Default::default(),
+            pipe_stdout_to_next,
+        };
+        let plan = SandboxProcessPlan {
+            steps: vec![
+                step(
+                    r#"(while ! test -e "$SINOMO_WORK/release"; do sleep 0.01; done) & printf foreground"#,
+                    true,
+                ),
+                step(r#"cat; touch "$SINOMO_WORK/release""#, false),
+            ],
+        };
+        let result = runner()
+            .run_process_plan_with_policy_and_output_sink(
+                &store,
+                &sinomo_sandbox::LocalSandboxToolchainStore::new(store.runtime_root()),
+                &id,
+                &plan,
+                5000,
+                &NodeId::from_legacy_named("plan").unwrap(),
+                &SandboxPolicy::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.exit_status, 0);
+        assert_eq!(result.stdout, b"foreground");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.load(&id).unwrap().0.command_history.len() != 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cleanup_on_exit_reaps_descendants_and_preserves_foreground_status() {
+        let (_dir, store, id) = create_store();
+        let layout = store.layout(&id);
+        let gate = acquire_sandbox_native_launch_lease(&store, &id).unwrap();
+        let handle=runner().start_toolchain_command(&store,&id,"sh",vec!["sh".into(),"-c".into(),
+            "setsid sh -c 'echo $$ > \"$SINOMO_WORK/child.pid\"; exec sleep 30' & while ! test -s \"$SINOMO_WORK/child.pid\"; do sleep 0.01; done; printf done; exit 11".into()],None,5000,
+            &NodeId::from_legacy_named("cleanup").unwrap(),&SandboxPolicy::default(),None,SandboxCancellationToken::new(),gate,SandboxCommandId::generate(),SandboxNativeExecutionOptions{cleanup_on_exit:true,interactive:false}).unwrap();
+        let result = handle.wait().unwrap();
+        assert_eq!(result.response.exit_status, 11);
+        assert_eq!(result.stdout, b"done");
+        let pid = fs::read_to_string(layout.work.join("child.pid")).unwrap();
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_crash_recovers_a_background_execution_after_foreground_exit() {
+        // The subprocess is an independent sandbox host. Stop just that host
+        // after it returns a foreground receipt and leaves a new-session child.
+        const CHILD_ROOT: &str = "SINOMO_TEST_NATIVE_CRASH_RUNTIME";
+        let id = SandboxId::from_legacy_named("native-crash").unwrap();
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let store = LocalSandboxInstanceStore::new(root);
+            let completed = run_shell(
+                &store,
+                &id,
+                "setsid sh -c 'echo $$ > \"$SINOMO_WORK/child.pid\"; exec sleep 30' & while ! test -s \"$SINOMO_WORK/child.pid\"; do sleep 0.01; done",
+                15000,
+            );
+            fs::write(
+                store.layout(&id).work.join("receipt"),
+                completed.response.command_id.as_str(),
+            )
+            .unwrap();
+            std::thread::park();
+            return;
+        }
+        let dir = sinomo_testdir::TestDir::new("native-host-crash");
+        let store = LocalSandboxInstanceStore::new(dir.path());
+        let (_, layout) = store
+            .create(
+                id.clone(),
+                SandboxToolchainId::from_legacy_named("simple-native").unwrap(),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let mut host = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::host_crash_recovers_a_background_execution_after_foreground_exit",
+            ])
+            .env(CHILD_ROOT, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !layout.work.join("receipt").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host.kill().unwrap();
+        host.wait().unwrap();
+        let command =
+            SandboxCommandId::new(fs::read_to_string(layout.work.join("receipt")).unwrap())
+                .unwrap();
+        let pid = fs::read_to_string(layout.work.join("child.pid")).unwrap();
+        sinomo_sandbox::recover_sandbox_local_execution_journal(
+            &store,
+            &id,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
+        assert_eq!(
+            store.load(&id).unwrap().0.command_history,
+            vec![command.clone()]
+        );
+        let record =
+            sinomo_sandbox::load_command_record(&mut LocalSandboxFileSystem::new(layout), &command)
+                .unwrap();
+        assert_eq!(record.status, SandboxCommandRecordStatus::Failed);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn simple_native_leader_exit_retains_background_pipe_holders() {
+        let (_dir, store, id) = create_store();
+        let layout = store.layout(&id);
         let outcome = run_shell(
             &store,
-            &sandbox_id,
-            &format!("(sleep 0.3; touch {}) &", delayed_write.display()),
-            0,
+            &id,
+            r#"mkfifo "$SINOMO_WORK/input" || exit 1; (cat < "$SINOMO_WORK/input"; touch "$SINOMO_WORK/done") & exit 3"#,
+            5000,
         );
-        assert_eq!(outcome.response.exit_status, 0);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            !delayed_write.exists(),
-            "a background descendant must not survive command completion"
-        );
+        assert_eq!(outcome.response.exit_status, 3);
+        assert!(!layout.work.join("done").exists());
+        run_shell(&store, &id, r#"printf late > "$SINOMO_WORK/input""#, 5000);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !store
+            .load(&id)
+            .unwrap()
+            .0
+            .command_history
+            .contains(&outcome.response.command_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "background execution did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(layout.work.join("done").exists());
     }
 
     #[test]
@@ -2898,14 +3269,12 @@ mod tests {
         let program = bin.join("true");
         fs::write(&program, b"#!/bin/sh\nprintf workspace-relative-tool\n")
             .expect("workspace shell fixture");
-        sinomo_testdir::install_shell_fixture(&program)
-            .expect("executable workspace tool");
+        sinomo_testdir::install_shell_fixture(&program).expect("executable workspace tool");
         manifest.cwd = SandboxPath::new(layout.work.display().to_string())
             .expect("native workspace command cwd");
-        manifest.env.insert(
-            "PATH".to_string(),
-            format!("{relative_bin}:/usr/bin:/bin"),
-        );
+        manifest
+            .env
+            .insert("PATH".to_string(), format!("{relative_bin}:/usr/bin:/bin"));
         store.save_manifest(&manifest).expect("save command cwd");
         let node_id = NodeId::from_legacy_named("simple_native_relative_path").expect("node");
         let toolchain_store =
@@ -2998,15 +3367,13 @@ mod tests {
         let thread_layout = layout.clone();
         let guest_for_script = guest.clone();
         let join = std::thread::spawn(move || {
-            let lease = try_acquire_sandbox_local_execution_lease(
+            let lease =
+                acquire_sandbox_native_launch_lease(&thread_store, &thread_manifest.sandbox_id)
+                    .expect("execution lease");
+            runner.start_request(
                 &thread_store,
-                &thread_manifest.sandbox_id,
-            )
-            .expect("execution lease");
-            runner.run_native_command(
-                &thread_store,
-                &thread_manifest,
-                &thread_layout,
+                thread_manifest.clone(),
+                thread_layout,
                 SandboxCommandRequest {
                     sandbox_id: thread_manifest.sandbox_id.clone(),
                     argv: vec![
@@ -3029,9 +3396,9 @@ mod tests {
                     timeout_ms: 5_000,
                 },
                 None,
-                &SandboxCancellationToken::new(),
-                &lease,
-            )
+                SandboxCancellationToken::new(),
+                lease, SandboxCommandId::generate(), SandboxNativeExecutionOptions::default(),
+            ).and_then(SandboxNativeExecution::wait)
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while !source.join("started").exists() {
@@ -3071,13 +3438,13 @@ mod tests {
             host_sifs_root: Some(host_sifs_root),
             ..SandboxSimpleNativeConfig::default()
         });
-        let lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
-            .expect("RO execution lease");
+        let lease =
+            acquire_sandbox_native_launch_lease(&store, &sandbox_id).expect("RO execution lease");
         let outcome = runner
-            .run_native_command(
+            .start_request(
                 &store,
-                &manifest,
-                &layout,
+                manifest.clone(),
+                layout.clone(),
                 SandboxCommandRequest {
                     sandbox_id: sandbox_id.clone(),
                     argv: vec![
@@ -3091,9 +3458,12 @@ mod tests {
                     timeout_ms: 5_000,
                 },
                 None,
-                &SandboxCancellationToken::new(),
-                &lease,
+                SandboxCancellationToken::new(),
+                lease,
+                SandboxCommandId::generate(),
+                SandboxNativeExecutionOptions::default(),
             )
+            .and_then(SandboxNativeExecution::wait)
             .expect("RO projection command outcome");
         assert_ne!(outcome.response.exit_status, 0);
         assert!(!source.join("ro-write").exists());
@@ -3281,8 +3651,8 @@ mod tests {
             host_sifs_root: (case != "unconfigured-root").then_some(host_sifs_root),
             ..SandboxSimpleNativeConfig::default()
         });
-        let lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
-            .expect("execution lease");
+        let lease =
+            acquire_sandbox_native_launch_lease(&store, &sandbox_id).expect("execution lease");
         assert!(
             sinomo_sandbox::read_sandbox_local_execution_journal(&store, &sandbox_id)
                 .expect("read journal before rejection")
@@ -3295,10 +3665,10 @@ mod tests {
             sink_chunks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
         let error = runner
-            .run_native_command(
+            .start_request(
                 &store,
-                &manifest,
-                &layout,
+                manifest.clone(),
+                layout.clone(),
                 SandboxCommandRequest {
                     sandbox_id: sandbox_id.clone(),
                     argv: vec![
@@ -3317,9 +3687,12 @@ mod tests {
                     timeout_ms: 5_000,
                 },
                 Some(sink),
-                &SandboxCancellationToken::new(),
-                &lease,
+                SandboxCancellationToken::new(),
+                lease,
+                SandboxCommandId::generate(),
+                SandboxNativeExecutionOptions::default(),
             )
+            .and_then(SandboxNativeExecution::wait)
             .expect_err("mount prerequisites reject before native launch");
         match (&error, case) {
             (
@@ -3332,9 +3705,7 @@ mod tests {
                 let expected = match case {
                     "missing-root" => "failed to resolve live host SIFS/FUSE root",
                     "missing-source" => "failed to resolve declared SIFS mount source",
-                    "missing-bwrap" => {
-                        "`bwrap` is unavailable or not executable"
-                    }
+                    "missing-bwrap" => "`bwrap` is unavailable or not executable",
                     _ => panic!("unknown prerequisite case {case}"),
                 };
                 assert!(detail.contains(expected), "unexpected error: {detail}");
@@ -3598,9 +3969,9 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn simple_native_windows_command_exit_stops_background_children() {
+    fn simple_native_windows_command_exit_retains_background_children() {
         let (dir, store, sandbox_id) = create_store();
-        let late_write = dir.path().join("background-must-die");
+        let late_write = dir.path().join("background-finished");
         let started = std::time::Instant::now();
         let outcome = run_cmd(
             &store,
@@ -3618,8 +3989,8 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         std::thread::sleep(std::time::Duration::from_millis(2_500));
         assert!(
-            !late_write.exists(),
-            "a background child must not outlive its command"
+            late_write.exists(),
+            "the sandbox retains the background child"
         );
     }
 

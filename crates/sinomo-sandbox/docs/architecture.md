@@ -175,6 +175,20 @@ lease, cancellation, and audit paths, but the admitted process sees the host fil
 normal host command semantics. Simple-native is a permission-boundary hint, not a security
 sandbox intended to contain hostile code or prevent deliberate escape.
 
+The agent can run several programs in its attached sandbox. A foreground exit
+returns the program's status. Its descendants keep the sandbox active and share
+the sandbox's filesystem view with later executions. The execution ID remains
+usable for output and cancellation until the last descendant exits. An agent
+can request descendant cleanup on foreground exit. Resource limits continue to
+apply while the execution is active.
+
+The local workspace tool `run_command` waits for foreground exit by default.
+Its `start` action returns an execution ID and keeps the program’s stdin,
+stdout and stderr pipes open. With that ID the agent can `write` more input, close stdin, `read` stdout and stderr from their
+respective byte offsets, or `cancel` the execution. Live handles belong to the
+hosting process. If that host stops, local execution recovery settles the
+interrupted work and its audit record.
+
 On Linux, simple-native can project policy-approved SIFS paths from an
 already-mounted live DFS/FUSE root into the command's filesystem. A bubblewrap
 (`bwrap`) mount namespace is used only to express those guest paths; it

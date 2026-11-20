@@ -10,6 +10,7 @@ const CANCELLATION_COMPLETED: u8 = 3;
 #[derive(Clone, Debug, Default)]
 pub struct SandboxCancellationToken {
     state: Arc<AtomicU8>,
+    parent: Option<Arc<SandboxCancellationToken>>,
     lifecycle_mutation_fenced: Arc<AtomicBool>,
     durability_failure: Arc<Mutex<Option<String>>>,
 }
@@ -17,6 +18,15 @@ pub struct SandboxCancellationToken {
 impl SandboxCancellationToken {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A process-plan step owns its completion fence while also observing
+    /// cancellation of the enclosing plan.
+    pub fn child(&self) -> Self {
+        Self {
+            parent: Some(Arc::new(self.clone())),
+            ..Self::new()
+        }
     }
 
     /// Attempt cancellation while guest execution is still active. Returns false
@@ -35,10 +45,14 @@ impl SandboxCancellationToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::SeqCst) == CANCELLATION_CANCELLED
+            || self.parent.as_ref().is_some_and(|p| p.is_cancelled())
     }
 
     /// Win the guest-completion/cancellation race before any finalization work.
     pub fn begin_completing(&self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
         self.state
             .compare_exchange(
                 CANCELLATION_ACTIVE,

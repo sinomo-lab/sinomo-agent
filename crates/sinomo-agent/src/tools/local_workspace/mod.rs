@@ -39,20 +39,21 @@ use host_probe::{current_path_dirs, program_is_available, workspace_has_git_meta
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
-#[cfg(test)]
-use sinomo_runtime::sandbox::SandboxMountMode;
 use sinomo_runtime::sandbox::{
-    LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
-    SandboxCancellationToken, SandboxCommandExecutionError, SandboxCreateInstanceRequest,
-    SandboxId, SandboxInstanceLifecycleStatus, SandboxInstanceManifest, SandboxInstancePortability,
-    SandboxLifecycleClient, SandboxLifecycleError, SandboxLocalExecutionLease, SandboxMount,
-    SandboxPath, SandboxPolicy, SandboxRuntimeBinding, SandboxStatusRequest, SandboxStoreError,
-    SandboxTempPolicy, SandboxToolchainId, SandboxTrackedProcess, SandboxTrackedProcessStatus,
-    SandboxUpdateInstanceRequest, SandboxWasiError,
-    recover_sandbox_local_execution_journal_with_lease, sandbox_env_name_is_valid,
-    sandbox_execution_placement_for_node, try_acquire_sandbox_local_execution_lease,
+    LocalSandboxInstanceLayout, LocalSandboxInstanceStore, SandboxCancellationToken,
+    SandboxCommandExecutionError, SandboxCommandId, SandboxCreateInstanceRequest, SandboxId,
+    SandboxInstanceManifest, SandboxInstancePortability, SandboxLifecycleClient,
+    SandboxLifecycleError, SandboxLocalExecutionLease, SandboxMount, SandboxPath, SandboxPolicy,
+    SandboxRuntimeBinding, SandboxStatusRequest, SandboxStoreError, SandboxTempPolicy,
+    SandboxToolchainId, SandboxUpdateInstanceRequest, SandboxWasiError,
+    acquire_sandbox_native_launch_lease, sandbox_env_name_is_valid,
+    sandbox_execution_placement_for_node,
 };
-use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
+#[cfg(test)]
+use sinomo_runtime::sandbox::{SandboxInstanceLifecycleStatus, SandboxMountMode};
+use sinomo_runtime::sandbox_simple::{
+    SandboxNativeExecutionOptions, SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig,
+};
 use sinomo_runtime::vfs::{VfsCreateMode, VfsError, VfsHandle, VfsObjectKind};
 use std::collections::BTreeMap;
 use std::env;
@@ -542,6 +543,8 @@ fn hidden_local_workspace_tool_specs() -> Vec<AgentToolSpec> {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct LocalCommandOptions {
+    interactive: bool,
+    cleanup_on_exit: bool,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
     evidence_tool_name: String,
@@ -557,6 +560,22 @@ fn local_run_command_from_call(
     cancellation_token: AgentCancellationToken,
     progress_sink: AgentToolProgressSink,
 ) -> AgentToolResult {
+    if config.allow_shell_commands {
+        let action = call
+            .input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("run");
+        if matches!(action, "read" | "write" | "cancel") {
+            return run_command::interact(config, session, call, action);
+        }
+        if !matches!(action, "run" | "start") {
+            return AgentToolResult::failed(
+                "Unknown command action",
+                serde_json::json!({"error":"unknown_action"}),
+            );
+        }
+    }
     local_shell_command_from_call(
         config,
         session,
@@ -609,6 +628,10 @@ fn local_shell_command_from_call(
         args,
         None,
         LocalCommandOptions {
+            interactive: tool_name == "run_command"
+                && input_string(call, "action").as_deref() == Some("start"),
+            cleanup_on_exit: tool_name == "run_command"
+                && input_bool(call, "cleanup_on_exit") == Some(true),
             cwd: input_string(call, "cwd"),
             timeout_ms: input_timeout_ms(call),
             evidence_tool_name: tool_name.to_string(),
@@ -663,7 +686,11 @@ fn run_local_command_with_options(
     cancellation_token: AgentCancellationToken,
     progress_sink: AgentToolProgressSink,
 ) -> AgentToolResult {
-    let execution = match execute_local_command(
+    let native = SandboxNativeExecutionOptions {
+        interactive: options.interactive,
+        cleanup_on_exit: options.cleanup_on_exit,
+    };
+    let result = execute_local_command(
         config,
         session,
         program,
@@ -673,11 +700,19 @@ fn run_local_command_with_options(
         options.cwd.as_deref(),
         &cancellation_token,
         progress_sink,
-    ) {
+        native,
+    );
+    let execution = match result {
         Ok(output) => output,
         Err(result) => return result,
     };
-    local_command_result_from_output(
+    if options.interactive && execution.output.success {
+        return AgentToolResult::succeeded(
+            "Started sandbox execution",
+            serde_json::json!({"execution_id":execution.execution_id}),
+        );
+    }
+    let mut result = local_command_result_from_output(
         config,
         execution.root,
         execution.cwd,
@@ -693,10 +728,15 @@ fn run_local_command_with_options(
         &options.evidence_reason,
         options.changed_files,
         options.summary_override,
-    )
+    );
+    if let Some(id) = execution.execution_id {
+        result.output["execution_id"] = serde_json::json!(id);
+    }
+    result
 }
 
 struct LocalCommandExecution {
+    execution_id: Option<String>,
     root: PathBuf,
     cwd: PathBuf,
     output: LocalCommandOutput,
@@ -742,6 +782,7 @@ fn execute_local_command(
     cwd: Option<&str>,
     cancellation_token: &AgentCancellationToken,
     progress_sink: AgentToolProgressSink,
+    native: SandboxNativeExecutionOptions,
 ) -> Result<LocalCommandExecution, AgentToolResult> {
     match config.command_runtime {
         LocalWorkspaceCommandRuntime::SimpleSandbox => execute_simple_sandbox_command(
@@ -754,7 +795,16 @@ fn execute_local_command(
             cwd,
             cancellation_token,
             progress_sink,
+            native,
         ),
+        LocalWorkspaceCommandRuntime::LocalProcess
+            if native.interactive || native.cleanup_on_exit =>
+        {
+            Err(AgentToolResult::failed(
+                "Execution handles require the Simple Native sandbox",
+                serde_json::json!({"error":"unsupported_command_runtime"}),
+            ))
+        }
         LocalWorkspaceCommandRuntime::LocalProcess => execute_local_process_command(
             config,
             program,
@@ -889,6 +939,7 @@ fn execute_local_process_command(
         success,
     };
     Ok(LocalCommandExecution {
+        execution_id: None,
         root,
         cwd,
         output,
@@ -909,6 +960,7 @@ fn execute_simple_sandbox_command(
     cwd: Option<&str>,
     cancellation_token: &AgentCancellationToken,
     progress_sink: AgentToolProgressSink,
+    options: SandboxNativeExecutionOptions,
 ) -> Result<LocalCommandExecution, AgentToolResult> {
     let (root, cwd) = match resolve_workspace_cwd(config, cwd) {
         Ok(paths) => paths,
@@ -974,21 +1026,11 @@ fn execute_simple_sandbox_command(
             return Err(sandbox_store_failure("load attached sandbox")(source));
         }
     }
-    let local_execution_lease = try_acquire_sandbox_local_execution_lease(&store, &sandbox_id)
-        .map_err(sandbox_store_failure(
-            "acquire simple sandbox execution lease",
-        ))?;
-    recover_sandbox_local_execution_journal_with_lease(
-        &store,
-        &local_execution_lease,
-        &sandbox_id,
-        time::OffsetDateTime::now_utc(),
-    )
-    .map_err(sandbox_store_failure(
-        "recover pending simple sandbox execution",
-    ))?;
+    let local_execution_lease = acquire_sandbox_native_launch_lease(&store, &sandbox_id).map_err(
+        sandbox_store_failure("acquire simple sandbox execution lease"),
+    )?;
     let agent_home_host_path = agent_home_live_host_path(config);
-    let (manifest, layout) = prepare_agent_sandbox_manifest(
+    let (manifest, _layout) = prepare_agent_sandbox_manifest(
         config,
         &store,
         &sandbox_id,
@@ -1019,28 +1061,14 @@ fn execute_simple_sandbox_command(
         ),
         extra_execute_paths: sandbox_extra_execute_paths(&prepared.path_prefixes),
     });
-    let toolchain_store = LocalSandboxToolchainStore::new(layout.toolchain_runtime_cache_root());
     let policy = agent_sandbox_policy(&manifest);
     let command_text = std::iter::once(program.to_string())
         .chain(args.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ");
-    let process_id = TaskId::generate().to_string();
+    let command_id = SandboxCommandId::generate();
+    let process_id = command_id.to_string();
     let started = Instant::now();
-    mark_agent_sandbox_process_started(
-        &store,
-        &sandbox_id,
-        SandboxTrackedProcess {
-            process_id: process_id.clone(),
-            command: command_text.clone(),
-            argv: std::iter::once(program.to_string())
-                .chain(args.iter().cloned())
-                .collect(),
-            cwd: sandbox_path_for_host_path(&cwd)?,
-            started_at: time::OffsetDateTime::now_utc(),
-            status: SandboxTrackedProcessStatus::Running,
-        },
-    )?;
     progress_sink.emit(AgentToolProgressEvent::ProcessStarted {
         call: None,
         process: sandbox_process_snapshot(
@@ -1062,18 +1090,10 @@ fn execute_simple_sandbox_command(
         ),
     });
     if cancellation_token.is_cancelled() {
-        let lifecycle_cleanup_failure =
-            mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None)
-                .err()
-                .map(|result| result.summary);
-        let cleanup_pending = lifecycle_cleanup_failure.is_some();
         let output = LocalCommandOutput {
             captured: None,
             stdout: Vec::new(),
-            stderr: command_stderr_with_cleanup_failure(
-                b"command cancelled before sandbox start".to_vec(),
-                lifecycle_cleanup_failure.as_deref(),
-            ),
+            stderr: b"command cancelled before sandbox start".to_vec(),
             status_code: None,
             success: false,
         };
@@ -1089,10 +1109,7 @@ fn execute_simple_sandbox_command(
                 None,
                 false,
                 true,
-                Some(
-                    lifecycle_cleanup_failure
-                        .unwrap_or_else(|| "command cancelled before sandbox start".to_string()),
-                ),
+                Some("command cancelled before sandbox start".into()),
                 started.elapsed(),
                 timeout_ms,
                 &output.stdout,
@@ -1101,38 +1118,65 @@ fn execute_simple_sandbox_command(
             ),
         });
         return Ok(LocalCommandExecution {
+            execution_id: None,
             root,
             cwd,
             output,
             timed_out: false,
             cancelled: true,
-            cleanup_pending,
+            cleanup_pending: false,
             duration_ms: duration_ms_from_elapsed(started.elapsed()),
         });
     }
 
     let (sandbox_cancellation, cancellation_bridge) =
         bridge_agent_sandbox_cancellation(cancellation_token);
-    let outcome = runner
-        .run_toolchain_command_with_stdin_policy_output_sink_cancellation_and_lease(
-            &store,
-            &toolchain_store,
-            &sandbox_id,
-            &prepared.command_name,
-            prepared.argv,
-            stdin.map(|bytes| bytes.to_vec()),
-            timeout_ms.unwrap_or(0),
-            &node_id,
-            &policy,
-            None,
-            sandbox_cancellation,
-            &local_execution_lease,
-        );
+    let started_execution = runner.start_toolchain_command(
+        &store,
+        &sandbox_id,
+        &prepared.command_name,
+        prepared.argv,
+        stdin.map(|bytes| bytes.to_vec()),
+        timeout_ms.unwrap_or(0),
+        &node_id,
+        &policy,
+        None,
+        sandbox_cancellation,
+        local_execution_lease,
+        command_id,
+        options,
+    );
+    let outcome = match started_execution {
+        Ok(handle) if options.interactive => {
+            return Ok(LocalCommandExecution {
+                execution_id: Some(handle.command_id.to_string()),
+                root,
+                cwd,
+                output: LocalCommandOutput {
+                    captured: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    status_code: None,
+                    success: true,
+                },
+                timed_out: false,
+                cancelled: false,
+                cleanup_pending: false,
+                duration_ms: duration_ms_from_elapsed(started.elapsed()),
+            });
+        }
+        Ok(handle) => handle.wait(),
+        Err(e) => Err(e),
+    };
     drop(cancellation_bridge);
-    let lifecycle_cleanup_failure =
-        mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None)
+    let lifecycle_cleanup_failure = if outcome.is_err() {
+        acquire_sandbox_native_launch_lease(&store, &sandbox_id)
+            .map_err(sandbox_store_failure("settle sandbox process"))
             .err()
-            .map(|result| result.summary);
+            .map(|r| r.summary)
+    } else {
+        None
+    };
     match outcome {
         Ok(outcome) => {
             let status_code = Some(outcome.response.exit_status);
@@ -1192,6 +1236,7 @@ fn execute_simple_sandbox_command(
                 ),
             });
             Ok(LocalCommandExecution {
+                execution_id: Some(process_id.clone()),
                 root,
                 cwd,
                 output: LocalCommandOutput {
@@ -1237,6 +1282,7 @@ fn execute_simple_sandbox_command(
                 ),
             });
             Ok(LocalCommandExecution {
+                execution_id: Some(process_id.clone()),
                 root,
                 cwd,
                 output: LocalCommandOutput {
@@ -1290,6 +1336,7 @@ fn execute_simple_sandbox_command(
                 ),
             });
             Ok(LocalCommandExecution {
+                execution_id: Some(process_id.clone()),
                 root,
                 cwd,
                 output: LocalCommandOutput {
@@ -1484,13 +1531,10 @@ fn prepare_agent_sandbox_manifest(
             ));
         }
     };
-    if local_execution_lease.is_some() && !manifest.active_processes.is_empty() {
-        manifest.active_processes.clear();
-        manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Stopped;
-        manifest.lifecycle.stopped_at = Some(now);
-        manifest.lifecycle.last_error = Some(
-            "recovered stale process lifecycle after interrupted sandbox execution".to_string(),
-        );
+    if let Some(lease) = local_execution_lease {
+        lease
+            .retain_live_native_processes(store, &mut manifest)
+            .map_err(sandbox_store_failure("recover tracked sandbox processes"))?;
     }
     validate_sandbox_runtime_binding(&manifest, node_id, config)?;
     manifest.toolchain_id = toolchain_id.clone();
@@ -1641,55 +1685,6 @@ fn validate_sandbox_runtime_binding(
             }),
         ));
     }
-    Ok(())
-}
-
-fn mark_agent_sandbox_process_started(
-    store: &LocalSandboxInstanceStore,
-    sandbox_id: &SandboxId,
-    process: SandboxTrackedProcess,
-) -> Result<(), AgentToolResult> {
-    let (mut manifest, _layout) = store
-        .load(sandbox_id)
-        .map_err(sandbox_store_failure("load simple sandbox manifest"))?;
-    manifest
-        .active_processes
-        .retain(|existing| existing.process_id != process.process_id);
-    manifest.active_processes.push(process);
-    manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Running;
-    if manifest.lifecycle.started_at.is_none() {
-        manifest.lifecycle.started_at = Some(time::OffsetDateTime::now_utc());
-    }
-    manifest.lifecycle.stopped_at = None;
-    manifest.lifecycle.last_error = None;
-    manifest.updated_at = time::OffsetDateTime::now_utc();
-    store
-        .save_manifest(&manifest)
-        .map_err(sandbox_store_failure("save simple sandbox manifest"))?;
-    Ok(())
-}
-
-fn mark_agent_sandbox_process_finished(
-    store: &LocalSandboxInstanceStore,
-    sandbox_id: &SandboxId,
-    process_id: &str,
-    last_error: Option<String>,
-) -> Result<(), AgentToolResult> {
-    let (mut manifest, _layout) = store
-        .load(sandbox_id)
-        .map_err(sandbox_store_failure("load simple sandbox manifest"))?;
-    manifest
-        .active_processes
-        .retain(|process| process.process_id != process_id);
-    if manifest.active_processes.is_empty() {
-        manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Stopped;
-        manifest.lifecycle.stopped_at = Some(time::OffsetDateTime::now_utc());
-    }
-    manifest.lifecycle.last_error = last_error;
-    manifest.updated_at = time::OffsetDateTime::now_utc();
-    store
-        .save_manifest(&manifest)
-        .map_err(sandbox_store_failure("save simple sandbox manifest"))?;
     Ok(())
 }
 
@@ -3500,6 +3495,7 @@ mod tests {
         fs::write(mount_root.join("sinomo"), b"blocks directory traversal").expect("blocking file");
         let session = test_session("unavailable-live-home");
         let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(root.join("runtime"))
             .with_sandbox_sifs_mount_root(&mount_root)
             .with_agent_home_sifs_path("/sinomo/agents/test/home")
             .allowing_shell_commands(true);
@@ -3659,50 +3655,35 @@ mod tests {
         let runtime_root = root.join("sandbox-runtime");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
-        let config =
-            LocalWorkspaceAgentConfig::new(&workspace).with_sandbox_runtime_root(&runtime_root);
-        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
-        let sandbox_id = agent_sandbox_id(&config, &canonical_workspace);
-        let node_id = NodeId::from_legacy_named("node-process").expect("node");
-        let toolchain_id =
-            SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
+        let session = test_session("process-tracking");
+        let config = provision_test_agent_sandbox(
+            LocalWorkspaceAgentConfig::new(&workspace)
+                .with_sandbox_runtime_root(&runtime_root)
+                .without_agent_home_sifs_path()
+                .allowing_shell_commands(true),
+            &session,
+        );
+        let sandbox_id = config.sandbox_instance_id.clone().unwrap();
         let store = LocalSandboxInstanceStore::new(&runtime_root);
-        store
-            .create(
-                sandbox_id.clone(),
-                toolchain_id.clone(),
-                time::OffsetDateTime::now_utc(),
+        let registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(config));
+        let run = |input| {
+            registry.execute(
+                &session,
+                0,
+                0,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: "run_command".into(),
+                    input,
+                    r#async: false,
+                    summary: "track sandbox process".into(),
+                },
             )
-            .expect("provision sandbox before process tracking");
-        let sandbox_cwd =
-            sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
-        prepare_agent_sandbox_manifest(
-            &config,
-            &store,
-            &sandbox_id,
-            &toolchain_id,
-            sandbox_cwd.clone(),
-            &canonical_workspace,
-            &canonical_workspace,
-            &[],
-            &node_id,
-            None,
-        )
-        .expect("manifest");
-
-        mark_agent_sandbox_process_started(
-            &store,
-            &sandbox_id,
-            SandboxTrackedProcess {
-                process_id: "proc-1".to_string(),
-                command: "sleep 1".to_string(),
-                argv: vec!["sleep".to_string(), "1".to_string()],
-                cwd: sandbox_cwd,
-                started_at: time::OffsetDateTime::now_utc(),
-                status: SandboxTrackedProcessStatus::Running,
-            },
-        )
-        .expect("process started");
+        };
+        let command = if cfg!(windows) { "cmd.exe /Q" } else { "sh" };
+        let start = run(serde_json::json!({"action":"start","command":command,"timeout_ms":5000}));
+        assert_eq!(start.status, AgentToolStatus::Succeeded, "{start:?}");
         let (manifest, _layout) = store.load(&sandbox_id).expect("load running manifest");
         assert_eq!(
             manifest.lifecycle.status,
@@ -3710,8 +3691,13 @@ mod tests {
         );
         assert_eq!(manifest.active_processes.len(), 1);
 
-        mark_agent_sandbox_process_finished(&store, &sandbox_id, "proc-1", None)
-            .expect("process finished");
+        let cancelled =
+            run(serde_json::json!({"action":"cancel","execution_id":start.output["execution_id"]}));
+        assert_eq!(
+            cancelled.status,
+            AgentToolStatus::Succeeded,
+            "{cancelled:?}"
+        );
         let (manifest, _layout) = store.load(&sandbox_id).expect("load stopped manifest");
         assert_eq!(
             manifest.lifecycle.status,
@@ -3719,6 +3705,110 @@ mod tests {
         );
         assert!(manifest.active_processes.is_empty());
         assert!(manifest.lifecycle.stopped_at.is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn run_command_reuses_live_shell_and_cancels_its_descendants_after_exit() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-native-interaction");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(root.join("runtime"))
+            .without_agent_home_sifs_path()
+            .allowing_shell_commands(true);
+        let session = test_session("interactive");
+        let other = test_session("other");
+        let attached = provision_test_agent_sandbox(config.clone(), &session);
+        let sandbox_id = attached.sandbox_instance_id.clone().unwrap();
+        let store = LocalSandboxInstanceStore::new(&attached.sandbox_runtime_root);
+        let registry = with_remote_management_for_test(
+            AgentToolRegistry::local_workspace_with_config(attached.clone()),
+        );
+        let other_registry =
+            with_remote_management_for_test(AgentToolRegistry::local_workspace_with_config(
+                provision_test_agent_sandbox(config, &other),
+            ));
+        let invoke = |registry: &AgentToolRegistry, session: &InteractionSession, input| {
+            registry.execute(
+                session,
+                0,
+                0,
+                &AgentToolCall {
+                    call_id: None,
+                    tool: "run_command".into(),
+                    input,
+                    r#async: false,
+                    summary: "sandbox interaction".into(),
+                },
+            )
+        };
+        let run = |input| invoke(&registry, &session, input);
+        let start = run(
+            serde_json::json!({"action":"start","command":"read -r name; printf 'hello %s' \"$name\"; read -r value; printf '%s' \"$value\" >&2; setsid sh -c 'echo $$ > child.pid; exec sleep 30' & exit 7","timeout_ms":15000}),
+        );
+        assert_eq!(start.status, AgentToolStatus::Succeeded, "{start:?}");
+        let lifecycle = SandboxLifecycleClient::in_process_at_runtime_root(store.runtime_root());
+        assert_eq!(
+            provision_default_agent_session_sandbox(&lifecycle, &attached, Vec::new()).unwrap(),
+            sandbox_id
+        );
+        assert!(matches!(
+            store.destroy(&sandbox_id),
+            Err(SandboxStoreError::LocalExecutionBusy { .. })
+        ));
+        let id = start.output["execution_id"].as_str().unwrap();
+        let denied = invoke(
+            &other_registry,
+            &other,
+            serde_json::json!({"action":"cancel","execution_id":id}),
+        );
+        assert_eq!(denied.status, AgentToolStatus::Failed);
+        let poll = |stdout, stderr| {
+            run(
+                serde_json::json!({"action":"read","execution_id":id,"stdout_offset":stdout,"stderr_offset":stderr}),
+            )
+        };
+        let wait = |check: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !check() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let write = |s, close| {
+            run(
+                serde_json::json!({"action":"write","execution_id":id,"input":s,"close_stdin":close}),
+            )
+        };
+        assert_eq!(write("agent\n", false).status, AgentToolStatus::Succeeded);
+        wait(&|| poll(0, 0).output["stdout"] == "hello agent");
+        // A second foreground command can finish while the first awaits stdin.
+        assert_eq!(
+            run(serde_json::json!({"command":"printf shared > peer.txt"})).status,
+            AgentToolStatus::Succeeded
+        );
+        assert_eq!(store.load(&sandbox_id).unwrap().0.active_processes.len(), 1);
+        assert_eq!(write("again\n", true).status, AgentToolStatus::Succeeded);
+        wait(&|| poll(11, 0).output["exit_status"] == 7 && workspace.join("child.pid").is_file());
+        let view = poll(11, 0);
+        assert_eq!(view.output["active"], true);
+        assert_eq!(view.output["stdout"], "");
+        assert_eq!(view.output["stderr"], "again");
+        let pid = fs::read_to_string(workspace.join("child.pid")).unwrap();
+        let child = PathBuf::from(format!("/proc/{}", pid.trim()));
+        assert!(child.is_dir());
+        let cancel = run(serde_json::json!({"action":"cancel","execution_id":id}));
+        assert_eq!(cancel.status, AgentToolStatus::Succeeded, "{cancel:?}");
+        assert_eq!(cancel.output["active"], false);
+        assert!(!child.exists());
+        let archived = poll(6, 2);
+        assert_eq!(archived.output["active"], false, "{archived:?}");
+        assert_eq!(archived.output["stdout"], "agent");
+        assert_eq!(archived.output["stderr"], "ain");
+        let manifest = store.load(&sandbox_id).unwrap().0;
+        assert!(manifest.active_processes.is_empty());
+        assert_eq!(manifest.command_history.len(), 2);
     }
 
     #[test]
@@ -3848,6 +3938,7 @@ mod tests {
             None,
             &AgentCancellationToken::new(),
             AgentToolProgressSink::default(),
+            SandboxNativeExecutionOptions::default(),
         )
         .expect("sandbox command");
 

@@ -145,12 +145,16 @@ impl LocalSandboxFileSystem {
     ) -> Result<(), SandboxFsError> {
         let host_path = self.host_path(path)?;
         let metadata = self.stat(path)?;
-        let content_hash = if metadata.is_dir {
+        let kind = fs::symlink_metadata(&host_path)
+            .map_err(|source| SandboxFsError::Unavailable {
+                reason: format!("inspect {path}: {source}"),
+            })?
+            .file_type();
+        // A running native program may own sockets and FIFOs here. Opening
+        // them for a content hash can consume input or wait for a peer.
+        let content_hash = if !kind.is_file() && !kind.is_symlink() {
             None
-        } else if fs::symlink_metadata(&host_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
+        } else if kind.is_symlink() {
             let target =
                 fs::read_link(&host_path).map_err(|source| SandboxFsError::Unavailable {
                     reason: format!("read symlink {}: {source}", path),
@@ -189,12 +193,16 @@ impl LocalSandboxFileSystem {
         checkpoint()?;
         let host_path = self.host_path(path)?;
         let metadata = self.stat(path)?;
-        let content_hash = if metadata.is_dir {
+        let kind = fs::symlink_metadata(&host_path)
+            .map_err(|source| SandboxFsError::Unavailable {
+                reason: format!("inspect {path}: {source}"),
+            })?
+            .file_type();
+        // A running native program may own sockets and FIFOs here. Opening
+        // them for a content hash can consume input or wait for a peer.
+        let content_hash = if !kind.is_file() && !kind.is_symlink() {
             None
-        } else if fs::symlink_metadata(&host_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
+        } else if kind.is_symlink() {
             let target =
                 fs::read_link(&host_path).map_err(|source| SandboxFsError::Unavailable {
                     reason: format!("read symlink {}: {source}", path),

@@ -208,6 +208,7 @@ fn run_git_diff_command(
         None,
         cancellation_token,
         progress_sink,
+        SandboxNativeExecutionOptions::default(),
     )?;
     if execution.output.success && !execution.cancelled && !execution.timed_out {
         return Ok(execution);

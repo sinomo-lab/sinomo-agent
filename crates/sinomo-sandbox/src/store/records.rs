@@ -63,6 +63,17 @@ pub fn record_local_command_history(
         manifest.command_history.push(command_id.clone());
         manifest.advance_generation()?;
     }
+    if let Some(index) = manifest
+        .active_processes
+        .iter()
+        .position(|p| p.process_id == command_id.as_str())
+    {
+        manifest.active_processes.remove(index);
+        if manifest.active_processes.is_empty() {
+            manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Stopped;
+            manifest.lifecycle.stopped_at = Some(now);
+        }
+    }
     manifest.updated_at = now;
     store.save_manifest(&manifest).map(|_| ())
 }

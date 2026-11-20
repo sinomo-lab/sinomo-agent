@@ -1,7 +1,8 @@
 use crate::internal::*;
 use fs2::FileExt;
 use sinomo_core::storage::durable_file::{
-    DurableAtomicFileOptions, remove_file_if_exists_and_sync_parent, write_file_atomic,
+    DurableAtomicFileOptions, remove_file_if_exists_and_sync_parent, sync_directory,
+    write_file_atomic,
 };
 use std::ffi::OsStr;
 use std::io::Read;
@@ -19,14 +20,14 @@ const SANDBOX_EXTERNAL_COMMAND_WAIT_MS: u64 = 750;
 const SANDBOX_EXTERNAL_ABSENCE_STABILITY_MS: u64 = 500;
 const SANDBOX_EXTERNAL_OUTPUT_LIMIT: usize = 64 * 1024;
 
-/// Cross-process exclusive ownership of one local sandbox execution workspace.
-/// The native runner keeps this guard alive from recovery through terminal
-/// settlement; observers use a non-blocking acquisition and surface `Busy`
-/// instead of mistaking a live `GuestActive` marker for a crashed host.
+/// Cross-process custody of the instance mutation gate or a single native
+/// command journal. An exclusive workspace operation contends with both.
 #[derive(Debug)]
 pub struct SandboxLocalExecutionLease {
     sandbox_id: SandboxId,
     _file: fs::File,
+    command_dir: Option<PathBuf>,
+    recovered_native: bool,
 }
 
 impl Drop for SandboxLocalExecutionLease {
@@ -55,30 +56,169 @@ pub fn try_acquire_sandbox_local_execution_lease(
     store: &LocalSandboxInstanceStore,
     sandbox_id: &SandboxId,
 ) -> Result<SandboxLocalExecutionLease, SandboxStoreError> {
-    // The anchor deliberately lives outside the replaceable instance tree.
-    // Destroy/recreate of an instance must continue contending on the same
-    // inode while an older owner is still alive.
-    let locks_root = store.runtime_root().join("locks");
-    fs::create_dir_all(&locks_root)
-        .map_err(|source| local_execution_io_error(&locks_root, source))?;
-    let path = locks_root.join(format!("{}.lock", sandbox_id.as_str()));
+    let mut lease = acquire_instance_gate(store, sandbox_id, false)?;
+    lease.recovered_native = recover_native_commands(store, &lease, true)?;
+    Ok(lease)
+}
+
+/// Serialize native launch and manifest updates while admitting other commands
+/// in the same sandbox. Each admitted command holds its own journal lock.
+pub fn acquire_sandbox_native_launch_lease(
+    store: &LocalSandboxInstanceStore,
+    sandbox_id: &SandboxId,
+) -> Result<SandboxLocalExecutionLease, SandboxStoreError> {
+    acquire_native_workspace_access(store, sandbox_id, true)
+}
+
+pub(crate) fn acquire_native_workspace_access(
+    store: &LocalSandboxInstanceStore,
+    sandbox_id: &SandboxId,
+    wait: bool,
+) -> Result<SandboxLocalExecutionLease, SandboxStoreError> {
+    let lease = acquire_instance_gate(store, sandbox_id, wait)?;
+    recover_native_commands(store, &lease, false)?;
+    recover_one_journal(store, &lease, sandbox_id, OffsetDateTime::now_utc())?;
+    Ok(lease)
+}
+
+fn acquire_instance_gate(
+    store: &LocalSandboxInstanceStore,
+    sandbox_id: &SandboxId,
+    wait: bool,
+) -> Result<SandboxLocalExecutionLease, SandboxStoreError> {
+    let locks = store.runtime_root().join("locks");
+    fs::create_dir_all(&locks).map_err(|e| local_execution_io_error(&locks, e))?;
+    let path = locks.join(format!("{}.lock", sandbox_id.as_str()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match lock_execution(&path, sandbox_id, None) {
+            Err(SandboxStoreError::LocalExecutionBusy { .. })
+                if wait && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn lock_execution(
+    path: &Path,
+    sandbox_id: &SandboxId,
+    command_dir: Option<PathBuf>,
+) -> Result<SandboxLocalExecutionLease, SandboxStoreError> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
-        .map_err(|source| local_execution_io_error(&path, source))?;
+        .open(path)
+        .map_err(|e| local_execution_io_error(path, e))?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(SandboxLocalExecutionLease {
             sandbox_id: sandbox_id.clone(),
             _file: file,
+            command_dir,
+            recovered_native: false,
         }),
-        Err(source) if lock_is_contended(&source) => Err(SandboxStoreError::LocalExecutionBusy {
+        Err(e) if lock_is_contended(&e) => Err(SandboxStoreError::LocalExecutionBusy {
             sandbox_id: sandbox_id.clone(),
         }),
-        Err(source) => Err(local_execution_io_error(&path, source)),
+        Err(e) => Err(local_execution_io_error(path, e)),
     }
+}
+
+impl SandboxLocalExecutionLease {
+    /// Reconcile tracked agent processes while holding the instance launch gate.
+    pub fn retain_live_native_processes(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        manifest: &mut SandboxInstanceManifest,
+    ) -> Result<(), SandboxStoreError> {
+        self.ensure_scope(&manifest.sandbox_id)?;
+        let root = store
+            .layout(&manifest.sandbox_id)
+            .metadata
+            .join("native-commands");
+        let before = manifest.active_processes.len();
+        manifest.active_processes.retain(|p| {
+            SandboxCommandId::new(p.process_id.clone())
+                .is_ok_and(|id| root.join(id.as_str()).is_dir())
+        });
+        if before > 0 && manifest.active_processes.is_empty() {
+            manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Stopped;
+            manifest.lifecycle.stopped_at = Some(OffsetDateTime::now_utc());
+        }
+        Ok(())
+    }
+
+    fn directory(&self, store: &LocalSandboxInstanceStore) -> PathBuf {
+        self.command_dir
+            .clone()
+            .unwrap_or_else(|| store.layout(&self.sandbox_id).metadata)
+    }
+}
+
+pub fn begin_sandbox_native_command_lease(
+    store: &LocalSandboxInstanceStore,
+    gate: &SandboxLocalExecutionLease,
+    sandbox_id: &SandboxId,
+    command_id: &SandboxCommandId,
+) -> Result<SandboxLocalExecutionLease, SandboxStoreError> {
+    gate.ensure_scope(sandbox_id)?;
+    let metadata = store.layout(sandbox_id).metadata;
+    let root = metadata.join("native-commands");
+    match fs::create_dir(&root) {
+        Ok(()) => sync_directory(&metadata).map_err(|e| local_execution_io_error(&metadata, e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(local_execution_io_error(&root, e)),
+    }
+    let dir = root.join(command_id.as_str());
+    fs::create_dir(&dir).map_err(|e| local_execution_io_error(&dir, e))?;
+    sync_directory(&root).map_err(|e| local_execution_io_error(&root, e))?;
+    lock_execution(&dir.join("owner.lock"), sandbox_id, Some(dir.clone()))
+}
+
+fn recover_native_commands(
+    store: &LocalSandboxInstanceStore,
+    gate: &SandboxLocalExecutionLease,
+    exclusive: bool,
+) -> Result<bool, SandboxStoreError> {
+    let root = gate.directory(store).join("native-commands");
+    let dirs = match fs::read_dir(&root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        result => result.map_err(|e| local_execution_io_error(&root, e))?,
+    };
+    let mut recovered = false;
+    for dir in dirs {
+        let entry = dir.map_err(|e| local_execution_io_error(&root, e))?;
+        let dir = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|e| local_execution_io_error(&dir, e))?
+            .is_dir()
+            || entry
+                .file_name()
+                .to_str()
+                .and_then(|name| SandboxCommandId::new(name.to_owned()).ok())
+                .is_none()
+        {
+            return Err(local_execution_io_error(
+                &dir,
+                "invalid native command journal directory",
+            ));
+        }
+        let lease =
+            match lock_execution(&dir.join("owner.lock"), &gate.sandbox_id, Some(dir.clone())) {
+                Err(SandboxStoreError::LocalExecutionBusy { .. }) if !exclusive => continue,
+                result => result?,
+            };
+        recovered |=
+            recover_one_journal(store, &lease, &gate.sandbox_id, OffsetDateTime::now_utc())?;
+        drop(lease);
+        fs::remove_dir_all(&dir).map_err(|e| local_execution_io_error(&dir, e))?;
+    }
+    Ok(recovered)
 }
 
 /// Whether a failed non-blocking lock means another owner holds it. Windows
@@ -135,6 +275,10 @@ pub enum SandboxLocalExecutionExternalOwner {
     LinuxProcessGroup {
         process_group: SandboxLocalExecutionLinuxProcessGroup,
     },
+    LinuxSupervisor {
+        pid: u32,
+        start_time_ticks: u64,
+    },
 }
 
 impl SandboxLocalExecutionExternalOwner {
@@ -162,6 +306,16 @@ impl SandboxLocalExecutionExternalOwner {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn linux_supervisor(pid: u32) -> Result<Self, String> {
+        let start_time_ticks = linux_process_start_time_ticks(pid)
+            .ok_or_else(|| format!("cannot identify native execution supervisor {pid}"))?;
+        Ok(Self::LinuxSupervisor {
+            pid,
+            start_time_ticks,
+        })
+    }
+
     pub fn with_container_launcher(
         self,
         launcher: SandboxLocalExecutionLinuxProcessGroup,
@@ -176,7 +330,7 @@ impl SandboxLocalExecutionExternalOwner {
                 container_name,
                 launcher: Some(launcher),
             }),
-            Self::LinuxProcessGroup { .. } => {
+            Self::LinuxProcessGroup { .. } | Self::LinuxSupervisor { .. } => {
                 Err("cannot attach a container launcher to a process-group owner".to_string())
             }
         }
@@ -318,10 +472,14 @@ pub fn read_sandbox_local_execution_journal(
     sandbox_id: &SandboxId,
 ) -> Result<Option<SandboxLocalExecutionJournal>, SandboxStoreError> {
     let path = sandbox_local_execution_journal_path(&store.layout(sandbox_id));
-    let bytes = match fs::read(&path) {
+    read_journal_at(&path)
+}
+
+fn read_journal_at(path: &Path) -> Result<Option<SandboxLocalExecutionJournal>, SandboxStoreError> {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(local_execution_io_error(&path, source)),
+        Err(source) => return Err(local_execution_io_error(path, source)),
     };
     let record =
         sinomo_object_serde::from_bytes(&bytes).map_err(|source| SandboxStoreError::Object {
@@ -337,10 +495,10 @@ pub fn write_sandbox_local_execution_journal(
     record: &SandboxLocalExecutionJournal,
 ) -> Result<(), SandboxStoreError> {
     lease.ensure_scope(&record.sandbox_id)?;
-    let layout = store.layout(&record.sandbox_id);
-    fs::create_dir_all(&layout.metadata)
-        .map_err(|source| local_execution_io_error(&layout.metadata, source))?;
-    let path = sandbox_local_execution_journal_path(&layout);
+    let directory = lease.directory(store);
+    fs::create_dir_all(&directory)
+        .map_err(|source| local_execution_io_error(&directory, source))?;
+    let path = directory.join(SANDBOX_LOCAL_EXECUTION_FILE);
     let bytes = sinomo_object_serde::to_bytes(
         record,
         SANDBOX_LOCAL_EXECUTION_OBJECT_VERSION,
@@ -450,6 +608,30 @@ pub fn activate_sandbox_local_execution_journal(
     journal: &mut SandboxLocalExecutionJournal,
     now: OffsetDateTime,
 ) -> Result<(), SandboxStoreError> {
+    if lease.command_dir.is_some() {
+        let _gate = acquire_instance_gate(store, &journal.sandbox_id, true)?;
+        let record = journal.pending_command_record.as_ref().ok_or_else(|| {
+            local_execution_io_error(
+                &lease.directory(store),
+                "native admission requires a command identity",
+            )
+        })?;
+        let (mut manifest, _) = store.load(&journal.sandbox_id)?;
+        manifest.active_processes.push(SandboxTrackedProcess {
+            process_id: record.command_id.to_string(),
+            command: record.argv.join(" "),
+            argv: record.argv.clone(),
+            cwd: record.cwd.clone(),
+            started_at: record.started_at,
+            status: SandboxTrackedProcessStatus::Running,
+        });
+        manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Running;
+        manifest.lifecycle.started_at.get_or_insert(now);
+        manifest.lifecycle.stopped_at = None;
+        manifest.lifecycle.last_error = None;
+        manifest.updated_at = now;
+        store.save_manifest(&manifest)?;
+    }
     journal.transition(SandboxLocalExecutionJournalPhase::GuestActive, now);
     write_sandbox_local_execution_journal(store, lease, journal)
 }
@@ -478,14 +660,12 @@ pub fn settle_sandbox_local_execution_journal(
     let (stdout_ref, stderr_ref) = if command_record.response.is_some() {
         (
             Some(write_local_execution_output(
-                store,
-                &journal.sandbox_id,
+                &lease.directory(store),
                 SANDBOX_LOCAL_EXECUTION_STDOUT_FILE,
                 &stdout,
             )?),
             Some(write_local_execution_output(
-                store,
-                &journal.sandbox_id,
+                &lease.directory(store),
                 SANDBOX_LOCAL_EXECUTION_STDERR_FILE,
                 &stderr,
             )?),
@@ -503,15 +683,15 @@ pub fn remove_sandbox_local_execution_journal(
     sandbox_id: &SandboxId,
 ) -> Result<bool, SandboxStoreError> {
     lease.ensure_scope(sandbox_id)?;
-    let layout = store.layout(sandbox_id);
+    let directory = lease.directory(store);
     for path in [
-        layout.metadata.join(SANDBOX_LOCAL_EXECUTION_STDOUT_FILE),
-        layout.metadata.join(SANDBOX_LOCAL_EXECUTION_STDERR_FILE),
+        directory.join(SANDBOX_LOCAL_EXECUTION_STDOUT_FILE),
+        directory.join(SANDBOX_LOCAL_EXECUTION_STDERR_FILE),
     ] {
         remove_file_if_exists_and_sync_parent(&path)
             .map_err(|source| local_execution_io_error(&path, source))?;
     }
-    let path = sandbox_local_execution_journal_path(&layout);
+    let path = directory.join(SANDBOX_LOCAL_EXECUTION_FILE);
     remove_file_if_exists_and_sync_parent(&path)
         .map_err(|source| local_execution_io_error(&path, source))
 }
@@ -539,7 +719,23 @@ pub fn recover_sandbox_local_execution_journal_with_lease(
     now: OffsetDateTime,
 ) -> Result<bool, SandboxStoreError> {
     lease.ensure_scope(sandbox_id)?;
-    let Some(mut journal) = read_sandbox_local_execution_journal(store, sandbox_id)? else {
+    let _gate = if lease.command_dir.is_some() {
+        Some(acquire_instance_gate(store, sandbox_id, true)?)
+    } else {
+        None
+    };
+    Ok(recover_one_journal(store, lease, sandbox_id, now)? || lease.recovered_native)
+}
+
+fn recover_one_journal(
+    store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
+    sandbox_id: &SandboxId,
+    now: OffsetDateTime,
+) -> Result<bool, SandboxStoreError> {
+    let Some(mut journal) =
+        read_journal_at(&lease.directory(store).join(SANDBOX_LOCAL_EXECUTION_FILE))?
+    else {
         return Ok(false);
     };
     if matches!(journal.outcome, SandboxLocalExecutionOutcome::InProgress) {
@@ -566,7 +762,8 @@ pub fn recover_sandbox_local_execution_journal_with_lease(
     )?;
 
     if !journal.audit_completed {
-        if let Err(error) = persist_sandbox_local_execution_journal_command_record(store, &journal)
+        if let Err(error) =
+            persist_sandbox_local_execution_journal_command_record(store, lease, &journal)
         {
             journal.record_cleanup_failure(
                 SandboxLocalExecutionCleanupStage::AuditRecord,
@@ -615,6 +812,46 @@ pub fn recover_sandbox_local_execution_journal_with_lease(
 
 fn cleanup_external_owner(owner: &SandboxLocalExecutionExternalOwner) -> Result<(), String> {
     match owner {
+        SandboxLocalExecutionExternalOwner::LinuxSupervisor {
+            pid,
+            start_time_ticks,
+        } => {
+            // Closing the host socket instructs the subreaper to terminate and
+            // reap its descendants. Killing the supervisor here would orphan them.
+            #[cfg(target_os = "linux")]
+            {
+                let deadline =
+                    Instant::now() + Duration::from_millis(SANDBOX_EXTERNAL_CLEANUP_WAIT_MS);
+                loop {
+                    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                        Err(e) => return Err(e.to_string()),
+                        Ok(stat)
+                            if linux_start_ticks(&stat).ok_or_else(|| {
+                                format!("invalid process identity for native supervisor {pid}")
+                            })? != *start_time_ticks
+                                || matches!(
+                                    linux_process_state_and_group(&stat),
+                                    Some(('Z' | 'X' | 'x', _))
+                                ) =>
+                        {
+                            return Ok(());
+                        }
+                        Ok(_) => (),
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "native execution supervisor {pid} still owns descendants"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            Err(format!(
+                "cannot verify Linux supervisor {pid} with start identity {start_time_ticks} on this platform"
+            ))
+        }
         SandboxLocalExecutionExternalOwner::Container {
             runtime_command,
             container_name,
@@ -776,8 +1013,16 @@ fn spawn_bounded_external_reader<R: Read + Send + 'static>(
 #[cfg(target_os = "linux")]
 fn linux_process_start_time_ticks(process_id: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
-    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
-    fields.nth(19)?.parse().ok()
+    linux_start_ticks(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_start_ticks(stat: &str) -> Option<u64> {
+    stat.get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -876,7 +1121,7 @@ pub fn persist_sandbox_local_execution_audit(
     journal: &SandboxLocalExecutionJournal,
 ) -> Result<(), SandboxStoreError> {
     lease.ensure_scope(&journal.sandbox_id)?;
-    persist_sandbox_local_execution_journal_command_record(store, journal)?;
+    persist_sandbox_local_execution_journal_command_record(store, lease, journal)?;
     let Some(command_record) = journal.pending_command_record.as_ref() else {
         return Ok(());
     };
@@ -890,6 +1135,7 @@ pub fn persist_sandbox_local_execution_audit(
 
 fn persist_sandbox_local_execution_journal_command_record(
     store: &LocalSandboxInstanceStore,
+    lease: &SandboxLocalExecutionLease,
     journal: &SandboxLocalExecutionJournal,
 ) -> Result<(), SandboxStoreError> {
     let Some(command_record) = journal.pending_command_record.as_ref() else {
@@ -898,14 +1144,12 @@ fn persist_sandbox_local_execution_journal_command_record(
     let mut sandbox_fs = LocalSandboxFileSystem::new(store.layout(&journal.sandbox_id));
     if command_record.response.is_some() {
         let stdout = read_local_execution_output(
-            store,
-            &journal.sandbox_id,
+            &lease.directory(store),
             journal.pending_stdout.as_ref(),
             SANDBOX_LOCAL_EXECUTION_STDOUT_FILE,
         )?;
         let stderr = read_local_execution_output(
-            store,
-            &journal.sandbox_id,
+            &lease.directory(store),
             journal.pending_stderr.as_ref(),
             SANDBOX_LOCAL_EXECUTION_STDERR_FILE,
         )?;
@@ -917,12 +1161,11 @@ fn persist_sandbox_local_execution_journal_command_record(
 }
 
 fn write_local_execution_output(
-    store: &LocalSandboxInstanceStore,
-    sandbox_id: &SandboxId,
+    directory: &Path,
     file_name: &'static str,
     bytes: &[u8],
 ) -> Result<SandboxLocalExecutionOutputRef, SandboxStoreError> {
-    let path = store.layout(sandbox_id).metadata.join(file_name);
+    let path = directory.join(file_name);
     write_file_atomic(
         &path,
         bytes,
@@ -937,8 +1180,7 @@ fn write_local_execution_output(
 }
 
 fn read_local_execution_output(
-    store: &LocalSandboxInstanceStore,
-    sandbox_id: &SandboxId,
+    directory: &Path,
     output_ref: Option<&SandboxLocalExecutionOutputRef>,
     expected_file_name: &'static str,
 ) -> Result<Vec<u8>, SandboxStoreError> {
@@ -954,7 +1196,7 @@ fn read_local_execution_output(
             ),
         });
     }
-    let path = store.layout(sandbox_id).metadata.join(expected_file_name);
+    let path = directory.join(expected_file_name);
     let bytes = fs::read(&path).map_err(|source| local_execution_io_error(&path, source))?;
     let actual_hash = blake3::hash(&bytes).to_hex().to_string();
     if bytes.len() as u64 != output_ref.length || actual_hash != output_ref.blake3 {

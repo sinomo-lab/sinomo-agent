@@ -34,6 +34,7 @@ impl AgentTool for ChangedFilesTool {
             None,
             &request.cancellation_token,
             request.progress_sink.clone(),
+            SandboxNativeExecutionOptions::default(),
         ) {
             Ok(execution) => execution,
             Err(result) => return result,
