@@ -203,14 +203,29 @@ fn managed_waiter_deadline_does_not_cancel_owned_source_relocation() {
         }
         Ok(())
     }));
+    // The provider can be doing real work before the host accepts endpoint
+    // requests. Observe its mounted context directly while startup is held.
+    let (mounted_provider, provider_context) = std::sync::mpsc::channel();
+    let dfs = sinomo_dfs::component_factory_with_storage_preparation(Arc::new(
+        move |context, scope, lifecycle| {
+            let binding = storage_preparation_provider(context, scope, lifecycle)?;
+            mounted_provider
+                .send(context.clone())
+                .expect("fixture still observes the mounted provider");
+            Ok(binding)
+        },
+    ))
+    .unwrap();
     native.configure_component_factories(vec![
-        Arc::new(sinomo_dfs::component_factory_with_storage_preparation(Arc::new(storage_preparation_provider)).unwrap()),
+        Arc::new(dfs),
         Arc::new(staged_import_component_factory().unwrap()),
     ]).unwrap();
     let first_wait = native.start_nodes();
     observed.recv_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).unwrap();
     assert!(first_wait.is_err(), "held source relocation must not satisfy ordinary startup");
-    let context = native.component_context(&node).unwrap();
+    let context = provider_context
+        .try_recv()
+        .expect("the paused migration has a mounted provider");
     let owner = native_fixtures::canonical_migration_runtime(&context);
     assert!(owner.work.active.load(std::sync::atomic::Ordering::Acquire) > 0);
     assert!(!*owner.lifecycle.borrow(), "caller deadline cancelled the actual owner");
