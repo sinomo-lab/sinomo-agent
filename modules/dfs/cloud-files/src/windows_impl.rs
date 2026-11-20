@@ -7103,8 +7103,11 @@ fn open_sifs_service(
         .transpose()
         .map_err(error("network"))?;
     let control_plane = daemon_peer.as_ref().map(|peer_transport| {
-        let peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
-        MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths.clone(), peer_transport)
+        MountedSifsControlPlaneKvClient::new_authoritative(
+            &data_dir,
+            peer_transport.clone(),
+            peer_transport.clone(),
+        )
     });
     let replica_candidates = mounted_content_replica_candidates(
         cluster_state.is_some(),
