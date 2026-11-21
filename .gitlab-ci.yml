@@ -110,9 +110,16 @@ build:desktop-linux-x86_64:
     name: "sinomo-desktop-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
     when: always
     paths:
-      - dist/
+      - dist/*.tar.gz
+      - dist/SHA256SUMS
+      - dist/installers/*/*.AppImage
+      - dist/installers/*/*.tar.gz
+      - dist/installers/*/SHA256SUMS
+      - dist/installers/*/build.json
       - target/ci/installer-stage/x86_64-unknown-linux-gnu/headless-cli.tar.gz
-      - target/installer-rollout-acceptance/
+      - target/installer-rollout-acceptance/*.json
+      - target/installer-rollout-acceptance/*.out
+      - target/installer-rollout-acceptance/*.err
     expire_in: 3 days
 
 # A shell runner tagged windows must provide MSVC/Windows SDK, Rustup, Python >=3.11,
@@ -163,6 +170,11 @@ validate:headless-container-install:
   artifacts:
     when: always
     paths:
-      - target/linux-installer-parity/
-      - target/headless-desktop-cli/
+      - target/linux-installer-parity/acceptance.json
+      - target/linux-installer-parity/*/*.out
+      - target/linux-installer-parity/*/*.err
+      - target/headless-desktop-cli/acceptance.json
+      - target/headless-desktop-cli/dependencies.txt
+      - target/headless-desktop-cli/*.out
+      - target/headless-desktop-cli/*.err
     expire_in: 3 days
