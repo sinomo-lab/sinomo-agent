@@ -87,7 +87,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                     .collect::<Vec<_>>();
                 let mut prefetched =
-                    self.prefetch_no_link_path_components(&paths, shard_snapshot.as_deref())?;
+                    self.prefetch_exact_path_components(&paths, shard_snapshot.as_deref())?;
                 for (index, current) in paths.into_iter().enumerate() {
                     let object = match prefetched.remove(&current) {
                         Some(object) => object,
@@ -151,7 +151,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// still validated in path order by the caller. One frozen routing snapshot
     /// and the existing validated LookupPaths response keep authority checks
     /// unchanged while avoiding one RPC for every directory in a deep path.
-    fn prefetch_no_link_path_components(
+    pub(super) fn prefetch_exact_path_components(
         &mut self,
         paths: &[String],
         shards: Option<&[crate::DfsMetadataShardConfig]>,
@@ -167,29 +167,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     || self.transport.delegates_local_namespace_authority())
             {
                 groups
-                    .entry(shard.primary_node_id)
+                    .entry((shard.shard_id, shard.primary_node_id))
                     .or_default()
                     .insert(path.clone());
             }
         }
-        for (primary, requested) in groups {
-            match self.route_authoritative_bulk_lookup_paths(
-                &sifs_file_system_id(),
-                primary,
-                requested.clone(),
-            ) {
-                Ok(mut lookup) => {
-                    for path in requested {
-                        let object = lookup.exact_objects_by_path.remove(&path);
-                        prefetched.insert(path, object);
+        for ((_, primary), paths) in groups {
+            let paths: Vec<_> = paths.into_iter().collect();
+            for batch in paths.chunks(64) {
+                let requested: std::collections::BTreeSet<_> = batch.iter().cloned().collect();
+                match self.route_authoritative_bulk_lookup_paths(
+                    &sifs_file_system_id(),
+                    primary.clone(),
+                    requested.clone(),
+                ) {
+                    Ok(mut lookup) => {
+                        for path in requested {
+                            let object = lookup.exact_objects_by_path.remove(&path);
+                            prefetched.insert(path, object);
+                        }
                     }
+                    // Retain the existing per-component bounded transport fallback.
+                    // Malformed/foreign responses remain errors, never cached absence.
+                    Err(DfsPosixError::Dfs(
+                        crate::DfsError::Network { .. } | crate::DfsError::NetworkDelivery { .. },
+                    )) => {}
+                    Err(error) => return Err(error),
                 }
-                // Retain the existing per-component bounded transport fallback.
-                // Malformed/foreign responses remain errors, never cached absence.
-                Err(DfsPosixError::Dfs(
-                    crate::DfsError::Network { .. } | crate::DfsError::NetworkDelivery { .. },
-                )) => {}
-                Err(error) => return Err(error),
             }
         }
         Ok(prefetched)
@@ -589,6 +593,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &path,
                 |service, shard_snapshot| {
                     service.check_cancelled("distributed list")?;
+                    if !service.local_metadata_answers_path_from_snapshot(&path, shard_snapshot)? {
+                        // The paged path below owns the authoritative walk.
+                        return Ok(None);
+                    }
                     let path = service.resolve_existing_posix_path_distributed(&path, true)?;
                     if service
                         .local_metadata_can_list_resolved_dir_from_snapshot(&path, shard_snapshot)?
@@ -636,12 +644,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        if self.local_metadata_can_list_resolved_dir(&path)? {
-            return self.posix_list_resolved_dir_page(&path, after, max_entries);
-        }
-        let opened = self.posix_namespace_lstat_distributed(&path)?;
-        self.owner_directory_page(&opened, after, max_entries, true)
+        self.with_metadata_lookup_cache_mut(|service| {
+            let path = service.resolve_existing_posix_path_distributed(path, true)?;
+            if service.local_metadata_can_list_resolved_dir(&path)? {
+                return service.posix_list_resolved_dir_page(&path, after, max_entries);
+            }
+            let opened = service.posix_namespace_lstat_distributed(&path)?;
+            service.owner_directory_page(&opened, after, max_entries, true)
+        })
     }
 
     /// List one bounded page from an exact no-link directory open beneath

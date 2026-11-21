@@ -6,8 +6,8 @@
 //! current file bytes before applying a range patch.
 
 use super::{
-    POSIX_READ_FRESHNESS_SYNC_TIMEOUT, POSIX_REMOTE_READ_IDLE_WAIT_INITIAL,
-    POSIX_REMOTE_READ_IDLE_WAIT_MAX, POSIX_REMOTE_READ_TIMEOUT, now_unix_nanos,
+    POSIX_REMOTE_READ_IDLE_WAIT_INITIAL, POSIX_REMOTE_READ_IDLE_WAIT_MAX,
+    POSIX_REMOTE_READ_TIMEOUT, now_unix_nanos,
 };
 use crate::namespace::next_version;
 use crate::posix_model::{
@@ -1005,67 +1005,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         paths: &[String],
     ) -> BTreeMap<String, DfsObjectMetadata> {
-        if paths.len() <= 1 {
+        let Ok(Some(shards)) = self.refresh_sifs_metadata_shards() else {
             return BTreeMap::new();
+        };
+        // A plain path and its ancestors can be read together at their shard
+        // owners. Share exact directory observations across sibling inputs.
+        // Special paths retain the ordinary component and link resolver.
+        let mut components = BTreeSet::new();
+        for path in paths {
+            if normalize_posix_path(path).ok().as_ref() != Some(path) || path == "/" {
+                continue;
+            }
+            for (end, _) in path.match_indices('/').skip(1) {
+                components.insert(path[..end].to_owned());
+            }
+            components.insert(path.clone());
         }
-        let trace_started = Instant::now();
-        let mut grouped = BTreeMap::<NodeId, Vec<String>>::new();
-        let mut seen = BTreeSet::<(NodeId, String)>::new();
-        let mut prefetched = BTreeMap::new();
-        for input_path in paths {
-            let resolved = match self.resolve_existing_posix_path_distributed(input_path, true) {
-                Ok(resolved) => resolved,
-                Err(DfsPosixError::NotFound { .. }) => {
-                    let Ok(normalized) = normalize_posix_path(input_path) else {
-                        continue;
-                    };
-                    normalized
-                }
-                Err(_) => continue,
+        let components: Vec<_> = components.into_iter().collect();
+        let Ok(records) = self.prefetch_exact_path_components(&components, Some(&shards)) else {
+            // A speculative batch cannot decide an error for an unrelated
+            // input. Each read obtains its own authoritative outcome below.
+            return BTreeMap::new();
+        };
+        let mut files = BTreeMap::new();
+        for path in paths {
+            let Some(Some(file)) = records.get(path) else {
+                continue;
             };
-            if self.lookup_sifs_path(&resolved).ok().flatten().is_some() {
+            if !matches!(file.kind, DfsObjectKind::File | DfsObjectKind::Artifact) {
                 continue;
             }
-            let Ok(Some(shard)) = self.routed_namespace_shard_for_path(&resolved) else {
-                continue;
-            };
-            if !self.is_local_metadata_replica_for_shard(&shard) {
-                continue;
-            }
-            let key = (shard.primary_node_id.clone(), resolved.clone());
-            if seen.insert(key) {
-                grouped
-                    .entry(shard.primary_node_id)
-                    .or_default()
-                    .push(resolved);
-            }
-        }
-        if grouped.is_empty() {
-            return prefetched;
-        }
-        let mut requested_paths = 0_usize;
-        let mut returned_objects = 0_usize;
-        for (primary_node_id, lookup_paths) in grouped {
-            requested_paths = requested_paths.saturating_add(lookup_paths.len());
-            if let Ok(objects) = self.route_namespace_lookup_paths_to_metadata_primary(
-                sifs_file_system_id(),
-                primary_node_id,
-                lookup_paths,
-                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
-            ) {
-                returned_objects = returned_objects.saturating_add(objects.len());
-                for object in objects {
-                    prefetched.insert(object.path.clone(), object);
+            let parents = path.match_indices('/').skip(1).map(|(end, _)| &path[..end]);
+            if parents.clone().all(|parent| {
+                records
+                    .get(parent)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|row| row.kind == DfsObjectKind::Directory)
+            }) {
+                for selected in parents.chain(std::iter::once(path.as_str())) {
+                    self.namespace_execution.observe_path(
+                        &file.file_system_id,
+                        selected,
+                        records[selected].as_ref(),
+                    );
                 }
+                files.insert(path.clone(), file.clone());
             }
         }
-        crate::dfs_perf_trace(format_args!(
-            "bulk-read-prefetch paths={} objects={} elapsed_ms={}",
-            requested_paths,
-            returned_objects,
-            trace_started.elapsed().as_millis()
-        ));
-        prefetched
+        files
     }
 
     fn prepare_posix_bulk_read(
@@ -1074,34 +1061,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         index: usize,
         prefetched_objects: &BTreeMap<String, DfsObjectMetadata>,
     ) -> Result<PosixBulkReadPlan> {
-        let resolved = match self.resolve_existing_posix_path_distributed(input_path, true) {
-            Ok(resolved) => resolved,
-            Err(DfsPosixError::NotFound { .. }) => {
-                return match self.distributed_posix_file_content_object_outcome(input_path, true)? {
-                    DistributedPosixFileContentObjectOutcome::Found { path, object } => {
-                        self.prepare_posix_bulk_read_for_object(path, object, index)
-                    }
-                    DistributedPosixFileContentObjectOutcome::NotFound { path } => {
-                        Ok(PosixBulkReadPlan::Immediate(
-                            DfsPosixDistributedFileReadOutcome::NotFound { path },
-                        ))
-                    }
-                    DistributedPosixFileContentObjectOutcome::ContentUnavailable {
-                        path,
-                        detail,
-                    } => Ok(PosixBulkReadPlan::Immediate(
-                        DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail },
-                    )),
-                };
-            }
-            Err(error) => return Err(error),
-        };
-        let candidate = match prefetched_objects.get(&resolved) {
-            Some(object) => {
-                self.posix_file_content_object_candidate_outcome(resolved, object.clone())?
-            }
-            None => self.distributed_posix_file_content_object_outcome(input_path, true)?,
-        };
+        if let Some(file) = prefetched_objects.get(input_path) {
+            return self.prepare_posix_bulk_read_for_object(
+                input_path.to_owned(),
+                file.clone(),
+                index,
+            );
+        }
+        let path = self.resolve_posix_dot_components_distributed(input_path)?;
+        let lookup = path_after_dot_resolution(input_path, &path);
+        let candidate =
+            self.with_local_primary_metadata_read_snapshot(&path, |service, shards| {
+                service.distributed_posix_file_content_object_outcome_from_snapshot(
+                    &lookup, true, shards,
+                )
+            })?;
         match candidate {
             DistributedPosixFileContentObjectOutcome::Found { path, object } => {
                 self.prepare_posix_bulk_read_for_object(path, object, index)

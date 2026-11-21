@@ -4105,6 +4105,7 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         shared_kv,
         services_primary_node,
         users_primary_node,
+        replica_node,
         _runtime,
         root,
         users_primary,
@@ -4150,6 +4151,36 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
             "reader unexpectedly had remote-primary metadata before bulk read for {path}"
         );
     }
+    let capture = _runtime
+        .capture_namespace_requests(&services_primary_node, 32)
+        .unwrap();
+    let small = users_primary.posix_read_files_distributed(&read_paths[..2]);
+    for (read, (_, bytes)) in small.into_iter().zip(&batch) {
+        assert_eq!(read.unwrap(), *bytes);
+    }
+    let requests = capture.records();
+    let mut batches = Vec::new();
+    for msg in &requests {
+        if let DfsNetworkMessage::NamespaceRequest(req) = &msg.message
+            && req.requesting_node_id == users_primary_node
+        {
+            match &req.operation {
+                DfsNamespaceOperation::LookupPaths { paths } => batches.push(paths),
+                DfsNamespaceOperation::LookupPath { path, .. } => {
+                    panic!("ordinary sibling files required a second point lookup of {path}")
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        batches.len(),
+        1,
+        "one authority lookup covers both files and their ancestors"
+    );
+    assert!(batches[0].contains(&remote_dir.to_string()));
+    assert!(read_paths[..2].iter().all(|path| batches[0].contains(path)));
+    drop(capture);
     let read_results = users_primary.posix_read_files_distributed(&read_paths);
     for ((path, bytes), result) in batch.iter().zip(read_results) {
         assert_eq!(
@@ -4180,6 +4211,61 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         );
     }
 
+    // A speculative exact-path lookup must not turn a link, failed prefix
+    // walk, or duplicate argument into an unrelated file's answer.
+    let mut owner = _runtime.metadata_primary_service(remote_dir).unwrap();
+    let symlink = format!("{remote_dir}/symbolic");
+    let parent_link = "/services/bulk-read-parent-link";
+    let hardlink = format!("{remote_dir}/hard");
+    let options = DfsWriteOptions::replicated_eventual(vec![
+        services_primary_node.clone(),
+        replica_node.clone(),
+    ]);
+    owner
+        .posix_symlink(&read_paths[1], &symlink, options.clone())
+        .unwrap();
+    owner
+        .posix_symlink(remote_dir, parent_link, options)
+        .unwrap();
+    owner.posix_hardlink(&read_paths[0], &hardlink).unwrap();
+    drop(owner);
+    let mut reader = _runtime.client(&users_primary_node).unwrap();
+    let mixed = vec![
+        read_paths[0].clone(),
+        symlink,
+        hardlink,
+        format!("{parent_link}/bulk-000001.bin"),
+        format!("{remote_dir}/missing"),
+        format!("{}/", read_paths[0]),
+        remote_dir.to_owned(),
+        format!("{remote_dir}/missing/../bulk-000001.bin"),
+        read_paths[0].clone(),
+    ];
+    let normal: Vec<_> = mixed
+        .iter()
+        .map(|path| {
+            reader
+                .posix_read_file_distributed_outcome(path)
+                .map_err(|e| e.to_string())
+        })
+        .collect();
+    let actual: Vec<_> = reader
+        .posix_read_files_distributed_outcomes(&mixed)
+        .into_iter()
+        .map(|result| result.map_err(|e| e.to_string()))
+        .collect();
+    assert_eq!(actual, normal);
+    assert_eq!(actual[0], actual[2]);
+    assert_eq!(actual[1], actual[3]);
+    assert!(
+        matches!(&actual[1], Ok(crate::DfsPosixDistributedFileReadOutcome::Found { bytes })
+        if bytes == &batch[1].1)
+    );
+    assert!(matches!(
+        &actual[4],
+        Ok(crate::DfsPosixDistributedFileReadOutcome::NotFound { .. })
+    ));
+    drop(reader);
     // The final check is the authoritative local view, after the unchanged
     // 64-file remote write/read/stat workload above has exercised Main routing.
     let author = _runtime.metadata_primary_service(remote_dir).unwrap();
