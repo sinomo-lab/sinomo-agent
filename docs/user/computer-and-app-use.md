@@ -47,9 +47,11 @@ Wayland uses the session bus and desktop portals. The Linux provider requires
 the PipeWire runtime library. See [Wayland setup](../../modules/desktop/app-use/README.md#linux-wayland)
 for build dependencies and portal prerequisites.
 See the provider's [Android setup](../../modules/desktop/app-use/README.md#android)
-for APK packaging and native artifact activation. On Android, open Sinomo and
-enable Remote Management locally, then use the **Sinomo App Use** launcher entry
-to enable Accessibility and allow persistent observation with optional control.
+for APK packaging and native artifact activation. On Android, open Sinomo's
+**Settings → Host access** for this device and enable **Remote management**.
+Under **Device sharing**, choose **Manage App Use**. Open **Android accessibility
+service** to enable Sinomo App Use in Android, then return and choose **Agent access**
+to allow observation or observation and control.
 These grants survive agent sessions and app switches. Disabling Accessibility in
 Android Settings or revoking App Use access locally removes access; neither
 changes a separate screen-sharing session. Android OS consent does not enable

@@ -2,8 +2,9 @@
 
 Use a development device explicitly selected for testing. Preserve its installed
 APK, local permission document, accessibility services and rotation settings.
-Install the current Sinomo APK without clearing app data, and use the local
-Sinomo App Use screen to enable persistent Accessibility observation/control.
+Install the current Sinomo APK without clearing app data. In Sinomo's
+**Settings → Host access → Device sharing**, select **Manage App Use** to enable
+persistent Accessibility observation/control.
 Test it before starting screen sharing. For video tests, approve a separate screen
 share and grant its exact capture/stop resource. Keep other accessibility services
 intact.

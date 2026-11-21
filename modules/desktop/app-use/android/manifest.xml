@@ -5,12 +5,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <application>
         <activity android:name="net.sinomo.app.use.AppUseConsentActivity"
-            android:label="Sinomo App Use" android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:label="App Use" android:exported="false"
+            android:theme="@android:style/Theme.DeviceDefault.Settings" />
         <service android:name="net.sinomo.app.use.AppUseProjectionService"
             android:exported="false" android:foregroundServiceType="mediaProjection" />
         <service android:name="net.sinomo.app.use.AppUseAccessibilityService"

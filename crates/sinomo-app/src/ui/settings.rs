@@ -1239,7 +1239,7 @@ enum SettingsOperation {
     },
     RefreshRemoteManagement,
     #[cfg(target_os = "android")]
-    OpenAndroidMediaSettings,
+    OpenAndroidAppUseSettings,
     SetDeviceExposure {
         kind: String,
         enabled: bool,
@@ -2666,10 +2666,10 @@ impl SettingsState {
                 self.external_integrations_permission_status = None;
             }
             #[cfg(target_os = "android")]
-            SettingsOperation::OpenAndroidMediaSettings => {
+            SettingsOperation::OpenAndroidAppUseSettings => {
                 self.remote_management_permission_error = None;
                 self.remote_management_permission_status =
-                    Some("Opening Android App Use setup…".into());
+                    Some("Opening App Use settings…".into());
             }
             SettingsOperation::SetDeviceExposure { .. } => {
                 self.remote_management_permission_error = None;
@@ -4676,7 +4676,7 @@ fn execute_settings_operation(
             ))
         }
         #[cfg(target_os = "android")]
-        SettingsOperation::OpenAndroidMediaSettings => {
+        SettingsOperation::OpenAndroidAppUseSettings => {
             SettingsOperationPayload::RemoteManagement((|| {
                 crate::android_media::request("app-use")?;
                 let permissions =
@@ -4686,7 +4686,7 @@ fn execute_settings_operation(
                 Ok(RemoteManagementOperationSuccess::PermissionChanged {
                     permissions,
                     target: LocalPermissionTarget::RemoteManagement,
-                    message: "App Use setup opened on this device".into(),
+                    message: "App Use settings opened on this device".into(),
                 })
             })())
         }
@@ -9034,15 +9034,15 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         let s = shared.clone();
         devices = devices.row(
             SettingRow::new("App Use")
-                .help("Share the display and enable accessibility for touch and text input.")
+                .help("Manage screen observation, touch control, and screen sharing on this device.")
                 .control(
-                    sui::Button::new("Set up App Use")
+                    sui::Button::new("Manage App Use")
                         .theme_when(clone_reader(reader))
                         .on_press(move || {
                             queue_settings_operation(
                                 &s,
                                 SettingsOperationScope::RemoteManagementPermission,
-                                SettingsOperation::OpenAndroidMediaSettings,
+                                SettingsOperation::OpenAndroidAppUseSettings,
                             );
                         }),
                 )

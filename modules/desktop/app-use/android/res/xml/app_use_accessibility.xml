@@ -7,5 +7,4 @@
     android:canRetrieveWindowContent="true"
     android:canPerformGestures="true"
     android:notificationTimeout="100"
-    android:description="@string/app_use_accessibility_description"
-    android:settingsActivity="net.sinomo.app.use.AppUseConsentActivity" />
+    android:description="@string/app_use_accessibility_description" />

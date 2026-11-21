@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+    <PreferenceCategory android:title="Accessibility">
+        <Preference android:key="accessibility_service" android:title="Android accessibility service" />
+        <ListPreference android:key="persistent_access" android:title="Agent access"
+            android:dialogTitle="Agent access" android:persistent="false"
+            android:entries="@array/app_use_access_levels" android:entryValues="@array/app_use_access_values" />
+    </PreferenceCategory>
+    <PreferenceCategory android:title="Screen sharing">
+        <SwitchPreference android:key="screen_sharing" android:title="Share this screen"
+            android:persistent="false"
+            android:summaryOff="Android will ask for permission to share your screen."
+            android:summaryOn="Sharing continues when you switch apps." />
+        <SwitchPreference android:key="share_access" android:title="Allow agents to view and stop this share"
+            android:persistent="false" />
+    </PreferenceCategory>
+</PreferenceScreen>

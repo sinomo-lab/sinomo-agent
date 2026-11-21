@@ -249,10 +249,10 @@ uses the Android media optimization settings. Activate its `.so` through the ord
 node. The Android embedded profile exposes the same App Use tools as desktop;
 there is no linked provider fallback.
 
-On the device, open Sinomo and enable Remote Management in local Settings.
-The **Sinomo App Use** launcher entry separates persistent Accessibility access
-from screen sharing. Enable Accessibility in Android Settings, then allow
-observation and optional control for its persistent display resource. App switches
+On the device, open **Settings → Host access** in Sinomo and enable Remote
+management. Under **Device sharing**, select **Manage App Use**. Open Android's
+accessibility settings from this page, enable Sinomo App Use, then return to
+choose observation or observation and control under **Agent access**. App switches
 and agent disconnects do not revoke that grant. Disable Accessibility or revoke
 the local resource grant to remove access.
 

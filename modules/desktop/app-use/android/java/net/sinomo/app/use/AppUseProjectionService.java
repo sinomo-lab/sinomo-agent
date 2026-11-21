@@ -63,7 +63,8 @@ public final class AppUseProjectionService extends Service {
             NotificationManager notifications = getSystemService(NotificationManager.class);
             notifications.createNotificationChannel(new NotificationChannel("app-use", "App Use screen sharing", NotificationManager.IMPORTANCE_LOW));
             PendingIntent controls = PendingIntent.getActivity(this, 0,
-                    new Intent(this, AppUseConsentActivity.class), PendingIntent.FLAG_IMMUTABLE);
+                    new Intent(this, AppUseConsentActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    PendingIntent.FLAG_IMMUTABLE);
             PendingIntent stop = PendingIntent.getService(this, 1,
                     new Intent(this, AppUseProjectionService.class).setAction(STOP_ACTION), PendingIntent.FLAG_IMMUTABLE);
             Notification notification = new Notification.Builder(this, "app-use")
@@ -97,6 +98,7 @@ public final class AppUseProjectionService extends Service {
             },() -> stopSelf()));
             display = projection.createVirtualDisplay("Sinomo App Use", width, height, metrics.densityDpi,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, gpu.surface, null, handler);
+            AppUseConsentActivity.serviceStateChanged();
             // The explicit sharing session owns projection lifetime, independently
             // of transient readers, input leases and the foreground application.
         } catch (Exception error) {
@@ -157,6 +159,7 @@ public final class AppUseProjectionService extends Service {
     }
     @Override public void onDestroy() {
         synchronized (LOCK) { closing = true; if (current == this) { current = null; target = null; LOCK.notifyAll(); } }
+        AppUseConsentActivity.serviceStateChanged();
         if (display != null) display.release();
         if (gpu != null) { try { invoke(() -> { gpu.close();return null; }); } catch(Exception error) { android.util.Log.w("SinomoAppUse","GPU shutdown failed",error); } }
         if (projection != null) projection.stop();

@@ -37,6 +37,9 @@ class ManifestBoundaryTests(unittest.TestCase):
             app = root.find("application")
             self.assertEqual(app.get(A + "hasCode"), "true")
             self.assertEqual(app.find("activity/meta-data").get(A + "value"), "main")
+            consent = app.find(f"activity[@{A}name='net.sinomo.app.use.AppUseConsentActivity']")
+            self.assertEqual(consent.get(A + "exported"), "false")
+            self.assertEqual(consent.findall("intent-filter"), [])
             services = {s.get(A + "name"): s for s in app.findall("service")}
             self.assertEqual(services["net.sinomo.app.use.AppUseProjectionService"].get(A + "exported"), "false")
             self.assertEqual(services["net.sinomo.app.use.AppUseAccessibilityService"].get(A + "permission"), "android.permission.BIND_ACCESSIBILITY_SERVICE")

@@ -41,6 +41,7 @@ public final class AppUseAccessibilityService extends AccessibilityService {
         current=this;
         try { AppUseBridge.start(this); }
         catch(Exception error) { android.util.Log.e("SinomoAppUse","Accessibility bridge unavailable",error); }
+        AppUseConsentActivity.serviceStateChanged();
     }
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
         // An observation is tied to its window; app switches cannot retarget a
@@ -51,6 +52,7 @@ public final class AppUseAccessibilityService extends AccessibilityService {
     @Override public void onInterrupt() { clearSnapshots(); }
     @Override public void onDestroy() {
         if(current==this)current=null;
+        AppUseConsentActivity.serviceStateChanged();
         clearSnapshots();screenshotWorker.shutdown();AppUseBridge.stopIfUnused();super.onDestroy();
     }
     private void clearSnapshots() { for(Snapshot snapshot:snapshots.values())snapshot.close();snapshots.clear(); }

@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_use_accessibility_description">Allows Sinomo App Use to observe accessible UI, take screenshots, and perform actions when you grant access locally in Sinomo. It can affect the app you are using. This access does not require screen sharing. Disable this service here to revoke Accessibility access; separate screen video continues until stopped.</string>
+    <string-array name="app_use_access_levels">
+        <item>Off</item>
+        <item>Observe the screen</item>
+        <item>Observe and control the screen</item>
+    </string-array>
+    <string-array name="app_use_access_values" translatable="false">
+        <item>off</item>
+        <item>observe</item>
+        <item>control</item>
+    </string-array>
 </resources>

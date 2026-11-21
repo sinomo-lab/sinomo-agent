@@ -43,6 +43,11 @@ pub(crate) fn install(app: &sui::AndroidApp) -> jni::errors::Result<()> {
                 &class,
                 &[
                     NativeMethod::from_raw_parts(
+                        jni_str!("accessState"),
+                        jni_str!("(Ljava/lang/String;)I"),
+                        access_state as *mut _,
+                    ),
+                    NativeMethod::from_raw_parts(
                         jni_str!("grantDisplay"),
                         jni_str!("(Ljava/lang/String;Z)Z"),
                         grant_display as *mut _,
@@ -57,6 +62,29 @@ pub(crate) fn install(app: &sui::AndroidApp) -> jni::errors::Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(target_os = "android")]
+extern "system" fn access_state<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: JClass<'local>,
+    resource: JString<'local>,
+) -> jni::sys::jint {
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let resource = resource.try_to_string(env)?;
+        let Ok(data_dir) = sinomo_runtime::local::SinomoDataDir::from_env_or_home() else {
+            return Ok(-1);
+        };
+        let store = sinomo_runtime::node::LocalNodePermissionStore::new(data_dir.root());
+        Ok(store.load().map_or(-1, |permissions| {
+            // Shared with the App Use settings page: management, capture, input and stop.
+            i32::from(permissions.remote_management_enabled())
+                | (i32::from(permissions.resource_operation_exposed(&resource, "capture")) << 1)
+                | (i32::from(permissions.resource_operation_exposed(&resource, "input")) << 2)
+                | (i32::from(permissions.resource_operation_exposed(&resource, "stop")) << 3)
+        }))
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
 #[cfg(target_os = "android")]
@@ -93,18 +121,26 @@ extern "system" fn revoke_access<'local>(
     })
     .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
+const ACCESSIBILITY_RESOURCE: &str = "display:android:accessibility:display:0";
+
+fn is_local_display(resource: &str) -> bool {
+    resource == ACCESSIBILITY_RESOURCE
+        || (resource.starts_with("display:android:display:0:") && resource.len() <= 128)
+}
+
 fn revoke_local_access(
     store: &sinomo_runtime::node::LocalNodePermissionStore,
     resource: &str,
 ) -> bool {
-    if resource != "display:android:accessibility:display:0" {
+    if !is_local_display(resource) {
         return false;
     }
     store
         .mutate(|permissions| {
             let capture = permissions.hide_resource_operation(resource, "capture")?;
             let input = permissions.hide_resource_operation(resource, "input")?;
-            Ok(capture || input)
+            let stop = permissions.hide_resource_operation(resource, "stop")?;
+            Ok(capture || input || stop)
         })
         .is_ok()
 }
@@ -114,10 +150,7 @@ fn grant_local_display(
     resource: &str,
     input: bool,
 ) -> bool {
-    let accessibility = resource == "display:android:accessibility:display:0";
-    if (!accessibility && !resource.starts_with("display:android:display:0:"))
-        || resource.len() > 128
-    {
+    if !is_local_display(resource) {
         return false;
     }
     let result = store.mutate(|permissions| {
@@ -126,7 +159,7 @@ fn grant_local_display(
             return Ok(false);
         }
         let mut changed = permissions.expose_resource_operation(resource, "capture")?;
-        if !accessibility {
+        if resource != ACCESSIBILITY_RESOURCE {
             changed |= permissions.expose_resource_operation(resource, "stop")?;
         }
         if input {
@@ -197,6 +230,12 @@ mod tests {
         let permissions = store.load().unwrap();
         assert!(!permissions.resource_operation_exposed(resource, "input"));
         assert!(permissions.resource_operation_exposed(resource, "capture"));
+        assert!(permissions.resource_operation_exposed(resource, "stop"));
+        assert!(revoke_local_access(&store, resource));
+        assert!(!store.resource_operation_exposed(resource, "capture"));
+        assert!(!store.resource_operation_exposed(resource, "stop"));
+        assert!(store.load().unwrap().remote_management_enabled());
+        assert!(!revoke_local_access(&store, "display:another-device"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
