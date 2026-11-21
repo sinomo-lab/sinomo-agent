@@ -31,7 +31,14 @@ default:
       - .cache/cargo/registry/cache/
       - .cache/cargo/git/db/
 
+.except-android-apk-tags:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^android-apk-/'
+      when: never
+    - when: on_success
+
 build:documentation:
+  extends: .except-android-apk-tags
   stage: build
   image: python:3.12-slim
   cache: []
@@ -43,6 +50,7 @@ build:documentation:
     - python3 -m unittest discover -s scripts/ci -p 'test_desktop_installer.py'
 
 build:dfs-kv-boundary:
+  extends: .except-android-apk-tags
   stage: build
   timeout: 1h
   before_script:
@@ -59,6 +67,7 @@ build:dfs-kv-boundary:
     expire_in: 3 days
 
 build:cross-platform-cli:
+  extends: .except-android-apk-tags
   stage: build
   timeout: 2h
   before_script:
@@ -118,6 +127,7 @@ build:android-arm64:
     expire_in: 3 days
 
 build:desktop-linux-x86_64:
+  extends: .except-android-apk-tags
   stage: build
   timeout: 2h
   variables:
@@ -160,6 +170,7 @@ build:desktop-linux-x86_64:
 # A shell runner tagged windows must provide MSVC/Windows SDK, Rustup, Python >=3.11,
 # CMake, LLVM and Git. No signing credentials or upstream binary updater are required.
 build:desktop-windows-x86_64:
+  extends: .except-android-apk-tags
   stage: build
   tags: [windows]
   timeout: 3h
@@ -193,6 +204,7 @@ build:desktop-windows-x86_64:
     expire_in: 3 days
 
 validate:headless-container-install:
+  extends: .except-android-apk-tags
   stage: validate
   image: python:3.12-slim-bookworm
   needs:

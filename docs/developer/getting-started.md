@@ -223,7 +223,7 @@ HOST_UID="$(id -u)" HOST_GID="$(id -g)" \
 
 GitLab's `build:android-arm64` job publishes the signed ARM64 testing APK and
 its checksum under `dist/android/` in the job artifacts. It runs on protected
-`main` and protected tags such as `android-apk-*`. CI uses the same
+`main` and protected tags. Push an `android-apk-*` tag for an APK-only pipeline. CI uses the same
 `android-debug-small` profile as the container build.
 
 Configure two protected GitLab variables scoped to `android-ci-testing`.
