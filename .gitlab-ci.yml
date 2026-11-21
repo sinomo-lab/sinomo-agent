@@ -97,7 +97,7 @@ build:desktop-linux-x86_64:
       libssl-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
       libx11-dev libxrandr-dev libxi-dev libxext-dev libxcursor-dev libxinerama-dev
       libvulkan-dev libv4l-dev libfuse2 patchelf squashfs-tools desktop-file-utils
-      librsvg2-bin libpipewire-0.3-dev
+      librsvg2-bin libpipewire-0.3-dev libgtk-3-dev libwebkit2gtk-4.1-dev
     - cargo install cargo-packager --version 0.11.8 --locked --root target/packager-tool --target-dir target/packager-tool-build
   script:
     - ./scripts/ci/build-release-artifacts.sh
