@@ -114,8 +114,16 @@ def main():
     ready("approved-main", revision)
     if digest(installed) != digest(candidate):
         raise RuntimeError("Rollout did not replace the PATH/service binary")
-    run("restart-shadow-stop", [cli, "daemon", "shadow", "stop"])
-    run("restart-main-stop", [cli, "daemon", "stop"])
+    for role, name in ((["daemon", "shadow"], "shadow daemon"), (["daemon"], "daemon")):
+        run(f"restart-stop-{'-'.join(role)}", [cli, *role, "stop"])
+        deadline = time.monotonic() + 30
+        while True:
+            status = run(f"restart-status-{'-'.join(role)}", [cli, *role, "status"], timeout=10)
+            if f"sinomo {name} is not running" in status.splitlines():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"{name} still owns the fixture after stop:\n{status}")
+            time.sleep(0.25)
     # Explicit start through the canonical executable also exercises its data binding.
     run("restart-main", [installed, "daemon", "start", "--host", "127.0.0.1", "--port", main_port])
     ready("restarted-approved-main", revision)
