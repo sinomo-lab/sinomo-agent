@@ -12,6 +12,8 @@ use std::{
 };
 
 pub const PAYLOAD: &str = "initial-payload.tar";
+/// Libraries in this format live in the package's sibling lib/ directory.
+pub const EXTERNAL_LIBRARIES_SCHEMA: u32 = 2;
 const RETAINED_PAYLOAD: &str = "config/initial-payload.json";
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PayloadModule {
@@ -107,7 +109,7 @@ fn prepare_payload(
     unpack(&archive, &stage)?;
     let manifest_bytes = fs::read(stage.join("initial-payload.json"))?;
     let manifest: PayloadManifest = serde_json::from_slice(&manifest_bytes)?;
-    if manifest.schema != 1
+    if !matches!(manifest.schema, 1 | EXTERNAL_LIBRARIES_SCHEMA)
         || manifest.os != std::env::consts::OS
         || manifest.arch != std::env::consts::ARCH
         || manifest.revision.is_empty()
@@ -139,13 +141,7 @@ fn prepare_payload(
             return Err("invalid bootstrap module artifact".into());
         }
     }
-    for library in &manifest.libraries {
-        if !single_name(&library.file)
-            || hash(&stage.join("lib").join(&library.file))? != library.hash
-        {
-            return Err("invalid runtime dependency".into());
-        }
-    }
+    stage_libraries(&manifest, package, stage)?;
     if !repair && !source.exists() {
         let prepared = stage.join("source");
         unpack(&stage.join("source.tar"), &prepared)?;
@@ -158,6 +154,38 @@ fn prepare_payload(
         manifest,
         manifest_bytes,
     }))
+}
+
+fn stage_libraries(manifest: &PayloadManifest, package: &Path, stage: &Path) -> Result<()> {
+    let staged = stage.join("lib");
+    let packaged = package.join("lib");
+    if manifest.schema == EXTERNAL_LIBRARIES_SCHEMA && !manifest.libraries.is_empty() {
+        if !fs::symlink_metadata(&packaged)?.is_dir() {
+            return Err("expected a package lib directory".into());
+        }
+        fs::create_dir(&staged)?;
+    }
+    let mut names = BTreeSet::new();
+    for library in &manifest.libraries {
+        if !single_name(&library.file) || !names.insert(&library.file) {
+            return Err("invalid runtime dependency name".into());
+        }
+        let path = staged.join(&library.file);
+        if manifest.schema == EXTERNAL_LIBRARIES_SCHEMA {
+            let source = packaged.join(&library.file);
+            if !fs::symlink_metadata(&source)?.is_file() {
+                return Err(
+                    format!("expected a regular runtime library: {}", source.display()).into(),
+                );
+            }
+            // Install and repair consume this private copy after preflight.
+            fs::copy(source, &path)?;
+        }
+        if hash(&path)? != library.hash {
+            return Err(format!("invalid runtime dependency: {}", library.file).into());
+        }
+    }
+    Ok(())
 }
 
 pub struct PreparedPayload {
@@ -310,7 +338,7 @@ pub fn install_missing(package: &Path, data: &Path, seed_defaults: bool) -> Resu
 fn validate_retained(data: &Path) -> Result<()> {
     let manifest: PayloadManifest =
         serde_json::from_slice(&fs::read(data.join(RETAINED_PAYLOAD))?)?;
-    if manifest.schema != 1
+    if !matches!(manifest.schema, 1 | EXTERNAL_LIBRARIES_SCHEMA)
         || manifest.modules.is_empty()
         || manifest.os != std::env::consts::OS
         || manifest.arch != std::env::consts::ARCH

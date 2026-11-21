@@ -139,7 +139,11 @@ fn main() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let libraries = Vec::new();
     let manifest = PayloadManifest {
-        schema: 1,
+        schema: if libraries.is_empty() {
+            1
+        } else {
+            EXTERNAL_LIBRARIES_SCHEMA
+        },
         os: target.os,
         arch: target.arch,
         revision,
@@ -168,10 +172,6 @@ fn main() -> Result<()> {
         .chain(manifest.modules.iter().map(|m| m.file.as_str()))
     {
         archive.append_path_with_name(work.join(file), file)?;
-    }
-    for library in manifest.libraries {
-        let file = format!("lib/{}", library.file);
-        archive.append_path_with_name(work.join(&file), &file)?;
     }
     archive.finish()?;
     Ok(())

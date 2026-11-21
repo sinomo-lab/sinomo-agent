@@ -28,6 +28,12 @@ def main():
     payload = root / "desktop-payload"
     with tarfile.open(appimage_bin / "sinomo-payload.tar") as archive:
         archive.extractall(payload, filter="data")
+    with tarfile.open(payload / "initial-payload.tar") as bootstrap:
+        if any(name.startswith("lib/") for name in bootstrap.getnames()):
+            raise RuntimeError("Bootstrap archive duplicates package libraries")
+        inventory = json.load(bootstrap.extractfile("initial-payload.json"))["libraries"]
+    if {item["file"] for item in inventory} != {p.name for p in (payload / "lib").iterdir()}:
+        raise RuntimeError("Package lib directory differs from the bootstrap manifest")
 
     def digest(path):
         with path.open("rb") as stream:

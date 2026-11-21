@@ -130,7 +130,7 @@ impl RepairPlan {
 mod tests {
     use super::*;
 
-    fn package(root: &Path, library: bool) -> PathBuf {
+    fn package(root: &Path, library_schema: Option<u32>) -> PathBuf {
         use crate::bundle::{PAYLOAD, PayloadLibrary, PayloadManifest, PayloadModule, hash};
         fs::create_dir_all(root).unwrap();
         let cli = root.join(binary("sinomo"));
@@ -143,7 +143,7 @@ mod tests {
         fs::write(root.join("module.bin"), b"unselected module").unwrap();
         fs::write(root.join("runtime.bin"), b"packaged library").unwrap();
         let manifest = PayloadManifest {
-            schema: 1,
+            schema: library_schema.unwrap_or(1),
             os: env::consts::OS.into(),
             arch: env::consts::ARCH.into(),
             revision: "older".into(),
@@ -160,7 +160,7 @@ mod tests {
                     "fixture",
                 ),
             }],
-            libraries: if library {
+            libraries: if library_schema.is_some() {
                 vec![PayloadLibrary {
                     file: "runtime.bin".into(),
                     hash: hash(&root.join("runtime.bin")).unwrap(),
@@ -182,12 +182,34 @@ mod tests {
         ] {
             tar.append_path_with_name(root.join(file), name).unwrap();
         }
-        if library {
+        if library_schema == Some(1) {
             tar.append_path_with_name(root.join("runtime.bin"), "lib/runtime.bin")
                 .unwrap();
+        } else if library_schema.is_some() {
+            fs::create_dir(root.join("lib")).unwrap();
+            fs::rename(root.join("runtime.bin"), root.join("lib/runtime.bin")).unwrap();
         }
         tar.finish().unwrap();
         cli
+    }
+
+    #[test]
+    fn package_libraries_are_verified_before_repair_and_pinned_until_publication() {
+        let fixture = sinomo_testdir::TestDir::new("external-library-repair");
+        let source = fixture.join("package");
+        let data = fixture.join("data");
+        let cli = package(&source, Some(crate::bundle::EXTERNAL_LIBRARIES_SCHEMA));
+        let incoming = source.join("lib/runtime.bin");
+        let payload = crate::bundle::prepare_repair(&source, &data, &cli).unwrap();
+        fs::write(&incoming, b"changed").unwrap();
+        assert!(crate::bundle::prepare_repair(&source, &data, &cli).is_err());
+        fs::remove_file(&incoming).unwrap();
+        assert!(crate::bundle::prepare_repair(&source, &data, &cli).is_err());
+        let files = payload.stage_repair(&data, &fixture.join("stage")).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, data.join("bin/lib/runtime.bin"));
+        assert_eq!(fs::read(&files[0].0).unwrap(), b"packaged library");
+        assert!(!data.exists());
     }
 
     #[test]
@@ -200,7 +222,7 @@ mod tests {
             b"future incompatible data format",
         )
         .unwrap();
-        let cli = package(&fixture.join("package"), false);
+        let cli = package(&fixture.join("package"), None);
         crate::bundle::prepare_repair(cli.parent().unwrap(), &data, &cli).unwrap();
         fs::write(&cli, b"tampered CLI").unwrap();
         assert!(
@@ -235,7 +257,7 @@ mod tests {
             startup: Some(false),
             ..services::Options::default()
         };
-        let cli = package(&fixture.join("package"), false);
+        let cli = package(&fixture.join("package"), None);
         install(
             &cli,
             None,
@@ -343,7 +365,7 @@ mod tests {
         // overwrites in place and the node stopped; rerunning repair can finish.
         fs::write(data.join("bin/sinomo"), b"old runtime").unwrap();
         fs::create_dir_all(data.join("bin/lib/runtime.bin")).unwrap();
-        let failing = package(&fixture.join("bad-publication"), true);
+        let failing = package(&fixture.join("bad-publication"), Some(1));
         assert!(
             repair(
                 &failing,
