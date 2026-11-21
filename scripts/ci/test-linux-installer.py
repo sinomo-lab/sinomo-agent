@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare actual AppImage and CLI setup against the same offline desktop payload."""
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -51,6 +52,8 @@ def main():
         else:
             run("install", [payload / "sinomo", "install", "--install-dir", setup, "--data-dir", data])
         cli = data / "bin/sinomo"
+        # Exercise the keyboard library the GUI loads dynamically on X11.
+        ctypes.CDLL(str(data / "bin/lib/libxkbcommon-x11.so.0"))
         receipt = json.loads((setup / "sinomo-install.json").read_text())
         if (setup / "sinomo").exists() or (setup / "Sinomo.AppImage").exists():
             raise RuntimeError("Setup retained a second executable distribution")

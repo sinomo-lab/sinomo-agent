@@ -181,8 +181,24 @@ fn main() -> Result<()> {
 fn bundle_libraries(inputs: &[PathBuf], work: &Path) -> Result<Vec<PayloadLibrary>> {
     let lib = work.join("lib");
     fs::create_dir(&lib)?;
-    let mut names = std::collections::BTreeSet::new();
-    for input in inputs {
+    // The X11 keyboard backend opens this library with dlopen, so ldd on the GUI
+    // cannot discover it. Include its dependencies just like the GUI's linked ones.
+    let mut dynamically_loaded = Vec::new();
+    if inputs
+        .iter()
+        .any(|p| p.file_name().is_some_and(|name| name == "sinomo-app"))
+    {
+        let output = Command::new("pkg-config")
+            .args(["--variable=libdir", "xkbcommon-x11"])
+            .output()?;
+        if !output.status.success() {
+            return Err("desktop packaging requires the xkbcommon-x11 development package".into());
+        }
+        let dir = String::from_utf8(output.stdout)?;
+        dynamically_loaded.push(Path::new(dir.trim()).join("libxkbcommon-x11.so.0"));
+    }
+    let mut dependencies = Vec::new();
+    for input in inputs.iter().chain(&dynamically_loaded) {
         let output = Command::new("ldd").arg(input).output()?;
         let text = String::from_utf8(output.stdout)?;
         if text.contains("not found") {
@@ -192,32 +208,35 @@ fn bundle_libraries(inputs: &[PathBuf], work: &Path) -> Result<Vec<PayloadLibrar
             let Some(path) = line.split_whitespace().find(|word| word.starts_with('/')) else {
                 continue;
             };
-            let source = Path::new(path);
-            let name = source
-                .file_name()
-                .ok_or("no dependency filename")?
-                .to_str()
-                .ok_or("invalid dependency filename")?;
-            // glibc and its loader belong to the host. Packaging those independently
-            // would couple the distribution to a different dynamic loader ABI.
-            if name.starts_with("ld-linux")
-                || [
-                    "libc.so.6",
-                    "libm.so.6",
-                    "libpthread.so.0",
-                    "librt.so.1",
-                    "libdl.so.2",
-                ]
-                .contains(&name)
-            {
-                continue;
-            }
-            let destination = lib.join(name);
-            if names.insert(name.to_owned()) {
-                fs::copy(source, &destination)?;
-            } else if hash(source)? != hash(&destination)? {
-                return Err(format!("conflicting runtime library: {name}").into());
-            }
+            dependencies.push(PathBuf::from(path));
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for source in dynamically_loaded.iter().chain(&dependencies) {
+        let name = source
+            .file_name()
+            .ok_or("no dependency filename")?
+            .to_str()
+            .ok_or("invalid dependency filename")?;
+        // glibc and its loader belong to the host. Packaging those independently
+        // would couple the distribution to a different dynamic loader ABI.
+        if name.starts_with("ld-linux")
+            || [
+                "libc.so.6",
+                "libm.so.6",
+                "libpthread.so.0",
+                "librt.so.1",
+                "libdl.so.2",
+            ]
+            .contains(&name)
+        {
+            continue;
+        }
+        let destination = lib.join(name);
+        if names.insert(name.to_owned()) {
+            fs::copy(source, &destination)?;
+        } else if hash(source)? != hash(&destination)? {
+            return Err(format!("conflicting runtime library: {name}").into());
         }
     }
     let mut result = Vec::new();
