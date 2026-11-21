@@ -756,7 +756,18 @@ mod tests {
         deploy_managed_source_repo(&paths, &external).expect("initial deploy");
         fs::write(paths.source_repo.join("local.txt"), "managed-only\n").expect("local file");
         run_git_for_test(&paths.source_repo, &["add", "-A"]);
-        run_git_for_test(&paths.source_repo, &["commit", "-m", "managed-only"]);
+        run_git_for_test(
+            &paths.source_repo,
+            &[
+                "-c",
+                "user.name=Sinomo Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "managed-only",
+            ],
+        );
         let diverged_head =
             git_one_line(&paths.source_repo, &["rev-parse", "HEAD"]).expect("diverged head");
 
