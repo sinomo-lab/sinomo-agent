@@ -23,10 +23,13 @@ def check(apk):
     services = {s.get(android + "name") for s in app.findall("service")}
     if not {"net.sinomo.app.use.AppUseProjectionService", "net.sinomo.app.use.AppUseAccessibilityService"} <= services:
         raise ValueError("App Use service declarations are missing")
-    if app.get(android + "icon") != "@mipmap/ic_launcher":
-        raise ValueError("launcher icon missing from the merged manifest")
+    badging = subprocess.check_output([tools / "aapt", "dump", "badging", apk], text=True)
+    icons = {line.split(":'", 1)[1].rstrip("'") for line in badging.splitlines()
+             if line.startswith("application-icon-")}
     with zipfile.ZipFile(apk) as package:
         files = package.namelist()
+        if not icons or not icons.issubset(files) or any(Path(icon).stem != "ic_launcher" for icon in icons):
+            raise ValueError(f"expected packaged Sinomo launcher icons, got {sorted(icons)}")
         if "lib/arm64-v8a/libmain.so" not in files or "classes.dex" not in files:
             raise ValueError("ARM64 NativeActivity library or application DEX is missing")
         if len(files) != len(set(files)):
