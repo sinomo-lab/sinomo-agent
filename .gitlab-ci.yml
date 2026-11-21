@@ -82,6 +82,41 @@ build:cross-platform-cli:
       - dist/
     expire_in: 3 days
 
+build:android-arm64:
+  stage: build
+  timeout: 2h
+  rules:
+    - if: '$CI_COMMIT_REF_PROTECTED == "true"'
+  environment:
+    name: android-ci-testing
+    action: prepare
+  variables:
+    ANDROID_HOME: /opt/android-sdk
+    ANDROID_NDK_HOME: /opt/android-sdk/ndk/27.2.12479018
+  before_script:
+    - bash docker/install-android-toolchain.sh
+  script:
+    - |
+      set -euo pipefail
+      : "${SINOMO_ANDROID_TEST_KEYSTORE_B64:?missing CI testing keystore}"
+      : "${CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE_PASSWORD:?missing CI testing keystore password}"
+      keys=$(mktemp -d)
+      trap 'rm -r -- "$keys"' EXIT
+      export CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE="$keys/testing.p12"
+      base64 --decode "$SINOMO_ANDROID_TEST_KEYSTORE_B64" > "$CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE"
+      python3 -m unittest discover -s modules/desktop/app-use/android -p test_package.py
+      scripts/build-android-apk.sh --profile android-debug-small
+      packaged="$CARGO_TARGET_DIR/android-debug-small/apk/sinomo-app.apk"
+      python3 scripts/ci/test-android-apk.py "$packaged"
+      mkdir -p dist/android
+      cp "$packaged" dist/android/sinomo-app.apk
+      (cd dist/android && sha256sum sinomo-app.apk > SHA256SUMS)
+  artifacts:
+    name: "sinomo-android-arm64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/android/
+    expire_in: 3 days
+
 build:desktop-linux-x86_64:
   stage: build
   timeout: 2h

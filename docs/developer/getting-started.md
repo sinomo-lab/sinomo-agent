@@ -221,6 +221,17 @@ HOST_UID="$(id -u)" HOST_GID="$(id -g)" \
   docker compose -f docker/docker-compose.android.yml run --build --rm android-apk
 ```
 
+GitLab's `build:android-arm64` job publishes the signed ARM64 testing APK and
+its checksum under `dist/android/` in the job artifacts. It runs on protected
+`main` and protected tags such as `android-apk-*`. CI uses the same
+`android-debug-small` profile as the container build.
+
+Configure two protected GitLab variables scoped to `android-ci-testing`.
+`SINOMO_ANDROID_TEST_KEYSTORE_B64` is a file variable containing the
+base64-encoded testing keystore. `CARGO_APK_ANDROID_DEBUG_SMALL_KEYSTORE_PASSWORD`
+holds the store and key password. Keep this testing identity stable so one CI
+build can update another on a device.
+
 For an attached ARM64 development device:
 
 ```sh

@@ -27,11 +27,6 @@ export CARGO_TARGET_DIR="${SINOMO_ANDROID_TARGET_DIR:-${repo_root}/target/androi
 export CARGO_PROFILE_ANDROID_DEBUG_DEBUG="${CARGO_PROFILE_ANDROID_DEBUG_DEBUG:-${CARGO_PROFILE_DEV_DEBUG:-1}}"
 
 apk_path="${CARGO_TARGET_DIR}/${profile_dir}/apk/sinomo-app.apk"
-debug_keystore="${CARGO_TARGET_DIR}/android-debug.keystore"
-debug_keystore_password="android"
-export CARGO_APK_ANDROID_DEBUG_KEYSTORE="${debug_keystore}"
-export CARGO_APK_ANDROID_DEBUG_KEYSTORE_PASSWORD="${debug_keystore_password}"
-
 usage() {
   cat <<'EOF'
 Usage: scripts/android-dev.sh <command>
@@ -56,24 +51,6 @@ require_command() {
   fi
 }
 
-ensure_debug_keystore() {
-  require_command keytool
-  if [[ -f "${debug_keystore}" ]]; then
-    return
-  fi
-  mkdir -p "$(dirname "${debug_keystore}")"
-  keytool -genkeypair \
-    -keystore "${debug_keystore}" \
-    -storepass "${debug_keystore_password}" \
-    -keypass "${debug_keystore_password}" \
-    -alias androiddebugkey \
-    -keyalg RSA \
-    -keysize 2048 \
-    -validity 10000 \
-    -dname "CN=Android Debug,O=Android,C=US" \
-    -noprompt
-}
-
 device_serial() {
   if [[ -n "${ANDROID_SERIAL:-}" ]]; then
     printf '%s\n' "${ANDROID_SERIAL}"
@@ -95,14 +72,7 @@ device_serial() {
 }
 
 build_apk() {
-  require_command cargo
-  ensure_debug_keystore
-  cargo apk build -p sinomo-app-android --profile "${profile_dir}" --target-dir "${CARGO_TARGET_DIR}"
-  python3 scripts/android-runtime-jars.py --output "${CARGO_TARGET_DIR}/android-java"
-  python3 modules/desktop/app-use/android/package.py "${apk_path}" --debuggable \
-    --keystore "${debug_keystore}" --password-env CARGO_APK_ANDROID_DEBUG_KEYSTORE_PASSWORD \
-    --java-archive "${CARGO_TARGET_DIR}/android-java/rustls-platform-verifier.jar" \
-    --java-archive "${CARGO_TARGET_DIR}/android-java/kotlin-stdlib.jar"
+  scripts/build-android-apk.sh --profile "${profile_dir}" --target-dir "${CARGO_TARGET_DIR}"
 }
 
 install_apk() {

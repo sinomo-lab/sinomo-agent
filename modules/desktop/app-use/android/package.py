@@ -48,7 +48,8 @@ def signers(tools, apk):
     return {line.strip() for line in result.splitlines() if "certificate SHA-256 digest:" in line}
 
 
-def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archives=(), debuggable=False):
+def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archives=(), debuggable=False,
+            app_res=None):
     if not apk.is_file() or not manifest.is_file() or not keystore.is_file():
         raise ValueError("APK, generated manifest and existing signing keystore are required")
     if password_env not in os.environ:
@@ -70,20 +71,24 @@ def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archi
         dex.mkdir()
         run(tools / "d8", "--lib", android_jar, "--min-api", "26", "--output", dex,
             *sorted(classes.rglob("*.class")), *java_archives)
-        resources = work / "resources.zip"
-        run(tools / "aapt2", "compile", "--dir", SOURCE / "res", "-o", resources)
+        resources = []
+        for directory in ([app_res] if app_res is not None else []) + [SOURCE / "res"]:
+            compiled_dir = work / f"resources-{len(resources)}.zip"
+            run(tools / "aapt2", "compile", "--dir", directory, "-o", compiled_dir)
+            resources.append(compiled_dir)
         compiled = work / "resources.apk"
-        run(tools / "aapt2", "link", "-I", android_jar, "--manifest", merged, "-o", compiled, resources)
+        run(tools / "aapt2", "link", "-I", android_jar, "--manifest", merged, "-o", compiled, *resources)
         unsigned = work / "unsigned.apk"
         with zipfile.ZipFile(apk) as original, zipfile.ZipFile(compiled) as resource_apk, zipfile.ZipFile(unsigned, "w") as output:
             # App's existing Java bytecode is not silently replaced. The current
             # lifecycle bridge is embedded DEX loaded by Rust, not classes.dex.
             if any(n.startswith("classes") and n.endswith(".dex") for n in original.namelist()):
                 raise ValueError("base APK already contains DEX; use a merged DEX build")
-            if any(n.startswith("res/") for n in original.namelist()):
-                raise ValueError("base APK has resources; merge their source resources before packaging")
+            original_resources = {n for n in original.namelist() if n.startswith("res/") and not n.endswith("/")}
+            if original_resources and (app_res is None or original_resources.difference(resource_apk.namelist())):
+                raise ValueError("base APK resources are missing from the merged resources")
             for info in original.infolist():
-                if info.filename in ("AndroidManifest.xml", "resources.arsc") or info.filename.startswith("META-INF/"):
+                if info.filename in ("AndroidManifest.xml", "resources.arsc") or info.filename.startswith(("META-INF/", "res/")):
                     continue
                 output.writestr(info, original.read(info))
             for info in resource_apk.infolist():
@@ -117,6 +122,7 @@ def main():
     parser.add_argument("--alias", help="key alias, only needed for keystores with multiple entries")
     parser.add_argument("--java-archive", type=Path, action="append", default=[],
                         help="additional application JAR to merge into the APK's DEX")
+    parser.add_argument("--app-res", type=Path, help="host application's Android resource source directory")
     parser.add_argument("--debuggable", action="store_true",
                         help="enable Android debugging for an explicitly selected development build")
     args = parser.parse_args()
@@ -124,7 +130,7 @@ def main():
         parser.error("--sdk or ANDROID_HOME is required")
     manifest = args.manifest or args.apk.parent / "AndroidManifest.xml"
     package(args.apk.resolve(), manifest.resolve(), args.sdk, args.sdk / "build-tools" / args.build_tools,
-            args.keystore, args.password_env, args.alias, args.java_archive, args.debuggable)
+            args.keystore, args.password_env, args.alias, args.java_archive, args.debuggable, args.app_res)
 
 
 if __name__ == "__main__":
