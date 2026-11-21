@@ -40,6 +40,10 @@ pub enum CliError {
         detail: String,
         exit_code: i32,
     },
+    DesktopApp {
+        detail: String,
+        exit_code: i32,
+    },
     ExternalCommand {
         command: String,
         detail: String,
@@ -552,6 +556,7 @@ impl std::fmt::Display for CliError {
                 write!(formatter, "{artifact} has not been written")
             }
             Self::Parse { detail } => write!(formatter, "failed to parse command: {detail}"),
+            Self::DesktopApp { detail, .. } => formatter.write_str(detail),
             Self::ExternalCommand { command, detail }
             | Self::ModuleCommandExit {
                 command, detail, ..
@@ -616,7 +621,9 @@ impl From<sinomo_runtime::rollout_host::RolloutHostError> for CliError {
 impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::ModuleCommandExit { exit_code, .. } => *exit_code,
+            Self::ModuleCommandExit { exit_code, .. } | Self::DesktopApp { exit_code, .. } => {
+                *exit_code
+            }
             Self::Parse { .. } | Self::Usage => 2,
             _ => 1,
         }

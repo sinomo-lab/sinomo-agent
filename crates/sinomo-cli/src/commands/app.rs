@@ -8,9 +8,12 @@ use sinomo_runtime::cli_registry::{
 };
 
 #[derive(Debug, Eq, PartialEq)]
-struct AppSupervisorCommand {
-    executable: PathBuf,
-    args: Vec<String>,
+enum AppCommand {
+    LaunchInstalled,
+    Supervise {
+        executable: PathBuf,
+        args: Vec<String>,
+    },
 }
 
 pub(crate) fn app_cli_command_handler() -> impl sinomo_runtime::cli_registry::CliCommandHandler {
@@ -19,44 +22,66 @@ pub(crate) fn app_cli_command_handler() -> impl sinomo_runtime::cli_registry::Cl
         CliCommandPolicy::default(),
         app_cli_spec,
         parse_app_matches,
-        run_app_supervisor,
+        run_app_command,
     )
 }
 
 fn app_cli_spec() -> CliCommandSpec {
-    CliCommandSpec::new("app", "control the desktop application")
-        .help_on_empty()
-        .with_children([CliCommandSpec::new(
-            "supervise",
-            "supervise the desktop session and its daemon",
-        )
-        .with_positionals([
-            CliPositionalSpec::required(CliValueSpec::new("executable", "app executable")),
-            CliPositionalSpec::optional(CliValueSpec::new("args", "app arguments")).repeatable(),
-        ])])
+    CliCommandSpec::new("app", "launch the installed desktop application").with_children([
+        CliCommandSpec::new("supervise", "supervise the desktop session and its daemon")
+            .with_positionals([
+                CliPositionalSpec::required(CliValueSpec::new("executable", "app executable")),
+                CliPositionalSpec::optional(CliValueSpec::new("args", "app arguments"))
+                    .repeatable(),
+            ]),
+    ])
 }
 
-fn parse_app_matches(matches: &CliCommandMatches) -> Result<AppSupervisorCommand, CliParseError> {
-    Ok(AppSupervisorCommand {
-        executable: PathBuf::from(required_positional(matches, 0)?),
-        args: matches.positionals()[1..].to_vec(),
-    })
+fn parse_app_matches(matches: &CliCommandMatches) -> Result<AppCommand, CliParseError> {
+    match matches.path().get(1).map(String::as_str) {
+        None => Ok(AppCommand::LaunchInstalled),
+        Some("supervise") => Ok(AppCommand::Supervise {
+            executable: PathBuf::from(required_positional(matches, 0)?),
+            args: matches.positionals()[1..].to_vec(),
+        }),
+        _ => Err(CliParseError::Usage),
+    }
 }
 
-fn run_app_supervisor(command: AppSupervisorCommand) -> Result<(), CliError> {
+fn run_app_command(command: AppCommand) -> Result<(), CliError> {
+    match command {
+        AppCommand::LaunchInstalled => launch_installed_app(&SinomoDataDir::from_env_or_home()?),
+        AppCommand::Supervise { executable, args } => run_app_supervisor(&executable, &args),
+    }
+}
+
+pub(super) fn launch_installed_app(data_dir: &SinomoDataDir) -> Result<(), CliError> {
+    let executable = data_dir.binary("sinomo-app");
+    if matches!(executable.try_exists(), Ok(false)) {
+        return Err(CliError::DesktopApp {
+            detail: format!("Desktop app is not installed at {}", executable.display()),
+            exit_code: 1,
+        });
+    }
+    supervise_desktop(data_dir, &executable, &[])
+}
+
+fn run_app_supervisor(executable: &Path, args: &[String]) -> Result<(), CliError> {
     use sinomo_runtime::api::app::update::{
         APP_FATAL_DIALOG_ARG, APP_FATAL_DIALOG_ENV, APP_REPORTED_ERROR_EXIT_CODE,
     };
 
-    let result = supervise_desktop(&command);
+    let result = SinomoDataDir::from_env_or_home()
+        .map_err(CliError::from)
+        .and_then(|data_dir| supervise_desktop(&data_dir, executable, args));
     if let Err(error) = &result
         && std::env::var_os(APP_FATAL_DIALOG_ENV).is_some()
-        && !matches!(error, CliError::ModuleCommandExit {exit_code, ..} if *exit_code == i32::from(APP_REPORTED_ERROR_EXIT_CODE))
+        && error.exit_code() != i32::from(APP_REPORTED_ERROR_EXIT_CODE)
     {
         // This mode runs just the native dialog, even if startup failed before
         // the daemon, the renderer or the user's data directory was available.
         let detail = error.to_string();
-        if let Err(report_error) = std::process::Command::new(&command.executable)
+        if let Err(report_error) = std::process::Command::new(executable)
             .arg(APP_FATAL_DIALOG_ARG)
             .arg(detail.chars().take(4096).collect::<String>())
             .spawn()
@@ -67,19 +92,21 @@ fn run_app_supervisor(command: AppSupervisorCommand) -> Result<(), CliError> {
     result
 }
 
-fn supervise_desktop(command: &AppSupervisorCommand) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    let code = run_desktop_app_supervisor(&data_dir, &command.executable, &command.args).map_err(
-        |detail| CliError::ExternalCommand {
-            command: "app supervise".into(),
+fn supervise_desktop(
+    data_dir: &SinomoDataDir,
+    executable: &Path,
+    args: &[String],
+) -> Result<(), CliError> {
+    let code = run_desktop_app_supervisor(data_dir, executable, args).map_err(|detail| {
+        CliError::DesktopApp {
             detail,
-        },
-    )?;
+            exit_code: 1,
+        }
+    })?;
     if code == 0 {
         Ok(())
     } else {
-        Err(CliError::ModuleCommandExit {
-            command: "app supervise".into(),
+        Err(CliError::DesktopApp {
             detail: format!("desktop application exited with status {code}"),
             exit_code: code.clamp(1, 255),
         })
@@ -173,10 +200,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            command.executable,
-            PathBuf::from("path with spaces/sinomo-app")
+            command,
+            AppCommand::Supervise {
+                executable: PathBuf::from("path with spaces/sinomo-app"),
+                args: ["--help", "--", "hello world"].map(String::from).to_vec(),
+            }
         );
-        assert_eq!(command.args, ["--help", "--", "hello world"]);
         assert!(parse_schema_command_for_test(
             app_cli_spec(),
             &["supervise".into()],

@@ -98,20 +98,7 @@ pub(super) fn run(options: DesktopOptions) -> Result<(), CliError> {
             return Ok(());
         }
         "build" => return build(options),
-        "launch" => {
-            let app = data_dir
-                .root()
-                .join("bin")
-                .join(sinomo_runtime::rollout::executable_name("sinomo-app"));
-            let code = crate::run_desktop_app_supervisor(&data_dir, &app, &[])
-                .map_err(|detail| CliError::Parse { detail })?;
-            if code != 0 {
-                return Err(CliError::Parse {
-                    detail: format!("desktop app exited with status {code}"),
-                });
-            }
-            return Ok(());
-        }
+        "launch" => return launch_installed_app(&data_dir),
         _ => Err("unknown app rollout action".into()),
     };
     let status = result.map_err(|detail| CliError::Parse { detail })?;

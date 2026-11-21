@@ -66,6 +66,81 @@ fn supervised_app_fixture() {
 }
 
 #[test]
+fn desktop_cli_help_and_headless_launch() {
+    let root = sinomo_testdir::TestDir::new("desktop-cli-headless");
+    let data_dir = SinomoDataDir::new(root.path());
+    let help = Command::new(env!("CARGO_BIN_EXE_sinomo"))
+        .args(["app", "--help"])
+        .env("SINOMO_DATA_DIR", data_dir.root())
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("supervise"));
+
+    let message = format!(
+        "Desktop app is not installed at {}",
+        data_dir.binary("sinomo-app").display()
+    );
+    for args in [&["app"][..], &["rollout", "app", "launch"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sinomo"))
+            .args(args)
+            .env("SINOMO_DATA_DIR", data_dir.root())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&message));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_cli_launches_the_managed_app_and_returns_its_status() {
+    use sinomo_runtime::installer::{InstallLayout, install_desktop_bundle};
+    use sinomo_runtime::rollout::desktop::{DESKTOP_BINARY_STEMS, write_bundle_manifest};
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let root = sinomo_testdir::TestDir::new("desktop-cli-installed");
+    let data_dir = SinomoDataDir::new(root.join("installed data"));
+    let bundle = root.join("bundle");
+    fs::create_dir(&bundle).unwrap();
+    let app = bundle.join("sinomo-app");
+    fs::write(
+        &app,
+        "#!/bin/sh\n[ -n \"$SINOMO_APP_LAUNCH_TOKEN\" ] && exit 23\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(bundle.join("sinomo-ui-extension-host"), b"fixture host").unwrap();
+    write_bundle_manifest(
+        &bundle,
+        "fixture".into(),
+        &DESKTOP_BINARY_STEMS.map(str::to_owned),
+    )
+    .unwrap();
+    install_desktop_bundle(&InstallLayout::new(&data_dir, root.join("boot")), &bundle).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_sinomo"), data_dir.binary("sinomo")).unwrap();
+
+    for args in [&["app"][..], &["rollout", "app", "launch"]] {
+        let mut child = TestProcess(
+            Command::new(env!("CARGO_BIN_EXE_sinomo"))
+                .args(args)
+                .env("SINOMO_DATA_DIR", data_dir.root())
+                .env_remove(sinomo_client::api::app::update::APP_LAUNCH_TOKEN_ENV)
+                .env(
+                    sinomo_runtime::api::SINOMO_DAEMON_PORT_ENV,
+                    available_loopback_port().to_string(),
+                )
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            wait_for_exit(&mut child, Duration::from_secs(60)).code(),
+            Some(23)
+        );
+    }
+}
+
+#[test]
 fn desktop_cli_supervises_and_reaps_its_owned_daemon() {
     for exit_code in [0, 23] {
         let root = sinomo_testdir::TestDir::new("desktop-cli-supervisor");

@@ -274,7 +274,8 @@ Run that command from the workspace the agent is meant to see. The built-in
 coding agent rejects unsafe roots and restricts file-changing tools to the
 explicit current workspace.
 
-To open the graphical application from the repository:
+With a desktop installation, run `sinomo app` to open the graphical application
+in the foreground. To launch a development build from the repository, run
 
 ```sh
 cargo build -p sinomo -p sinomo-ui-extension-host -p sinomo-app
