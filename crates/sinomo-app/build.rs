@@ -59,6 +59,7 @@ fn build_android_lifecycle_java() {
     JavaBuild::new()
         .file(java_path)
         .file("java/net/sinomo/app/runtime/SinomoVideoEncoder.java")
+        .file("java/net/sinomo/app/runtime/SinomoVideoDecoder.java")
         .class_path(&android_jar)
         .classes_out_dir(&classes_out_dir)
         .java_source_version(8)
