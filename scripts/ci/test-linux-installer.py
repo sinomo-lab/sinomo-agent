@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import select
 import subprocess
 import tarfile
 
@@ -74,7 +76,17 @@ def main():
         run("configure-off", [cli, "install", "--no-add-to-path", "--no-menu-shortcut", "--no-desktop-shortcut", "--startup"])
 
         for role in (["daemon", "shadow"], ["daemon"]):
-            run("stop-before-repair-" + "-".join(role), [cli, *role, "stop"])
+            status = run("status-before-repair-" + "-".join(role), [cli, *role, "status"])
+            pid = int(re.search(r"^  pid: (\d+)$", status, re.MULTILINE)[1])
+            # A stop response acknowledges the request. The daemon still has to
+            # append its shutdown event before we snapshot the retained files.
+            pidfd = os.pidfd_open(pid)
+            try:
+                run("stop-before-repair-" + "-".join(role), [cli, *role, "stop"])
+                if not select.select([pidfd], [], [], 30)[0]:
+                    raise RuntimeError(f"{' '.join(role)} pid {pid} did not exit before repair")
+            finally:
+                os.close(pidfd)
         sentinel = data / "repair-retained-data"
         sentinel.write_bytes(b"application data survives binary repair")
         excluded = ("bin/", "module/", "rollout/", "daemon/", "shadow-daemon/", "boot/")
@@ -88,8 +100,9 @@ def main():
             run("repair", [payload / "sinomo", "install", "--repair", "--no-start", "--install-dir", setup, "--data-dir", data])
         if digest(cli) != initial_digest or digest(data / "bin/sinomo-shadow") != initial_digest:
             raise RuntimeError("Repair did not restore packaged daemon binaries")
-        if any(digest(data / p) != value for p, value in retained.items()):
-            raise RuntimeError("Repair changed retained application data or source")
+        for path, before in retained.items():
+            if digest(data / path) != before:
+                raise RuntimeError(f"Repair changed retained file: {path}")
         run("start-after-repair", [cli, "install"])
 
         # Content identity is independent of chosen paths and fallback listener ports.
