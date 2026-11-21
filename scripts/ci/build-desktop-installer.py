@@ -26,14 +26,14 @@ def write_icon(path):
 
 def configuration(stage, output, target, version):
     windows = "windows" in target
+    binaries = ("sinomo-setup", "sinomo", "sinomo-app", "sinomo-ui-extension-host") if windows else ("sinomo-setup",)
     config = {
         "name": "sinomo-setup", "productName": "Sinomo Setup", "version": version,
         "identifier": "net.sinomo.setup", "publisher": "Sinomo", "authors": ["Sinomo"],
         "description": "Install the Sinomo CLI and desktop app",
         "category": "Utility", "binariesDir": str(stage), "outDir": str(output),
         "targetTriple": target, "icons": [str(stage / "icon.png")],
-        "binaries": [{"path": name, "main": name == "sinomo-setup"}
-                     for name in ("sinomo-setup", "sinomo", "sinomo-app", "sinomo-ui-extension-host")],
+        "binaries": [{"path": name, "main": name == "sinomo-setup"} for name in binaries],
         "formats": ["nsis" if windows else "appimage"],
     }
     manifest = stage / "desktop-release.json"
@@ -45,8 +45,8 @@ def configuration(stage, output, target, version):
         config["nsis"] = {"installMode": "currentUser", "template": str(ROOT / "packaging/windows/installer.nsi"),
                           "installerIcon": str(ROOT / "crates/sinomo-app/assets/logo.ico")}
     else:
-        # linuxdeploy patches ELF RPATHs. Preserve the verified originals in an opaque archive,
-        # while the loose binary copies let linuxdeploy discover all runtime dependencies.
+        # linuxdeploy handles the setup executable and its own dependencies.
+        # The installable binaries retain their verified bytes inside the payload.
         config["appimage"] = {"files": {str(stage / "sinomo-payload.tar"): "usr/bin/sinomo-payload.tar"}}
     return config
 

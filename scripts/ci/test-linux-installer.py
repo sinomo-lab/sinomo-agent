@@ -21,8 +21,12 @@ def main():
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
     subprocess.run([str(image), "--appimage-extract"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+    appimage_bin = root / "squashfs-root/usr/bin"
+    for name in ("sinomo", "sinomo-app", "sinomo-ui-extension-host"):
+        if (appimage_bin / name).exists():
+            raise RuntimeError(f"AppImage contains a loose copy of {name}")
     payload = root / "desktop-payload"
-    with tarfile.open(root / "squashfs-root/usr/bin/sinomo-payload.tar") as archive:
+    with tarfile.open(appimage_bin / "sinomo-payload.tar") as archive:
         archive.extractall(payload, filter="data")
 
     def digest(path):
