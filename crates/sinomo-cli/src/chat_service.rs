@@ -3925,39 +3925,32 @@ fn history_load(
 ) -> Result<wire::ChatHistoryLoadResponse, String> {
     let channel_id = SessionId::from_str(&request.session_id).map_err(|error| error.to_string())?;
     let store = open_history_store(daemon_address, data_dir, &runtime)?;
-    let (page, discovered_message_ids) = match request.mode {
-        wire::ChatHistoryLoadMode::Initial | wire::ChatHistoryLoadMode::ReconcileLatest => {
-            let known = request
-                .known_message_ids
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>();
-            let result = store
-                .load_message_reconciliation_page(&channel_id, &known, request.limit)
-                .map_err(|error| error.to_string())?;
-            (result.page, result.discovered_message_ids)
-        }
-        wire::ChatHistoryLoadMode::Before => (
-            store
-                .load_message_page_before(&channel_id, request.sequence.unwrap_or(1), request.limit)
-                .map_err(|error| error.to_string())?,
+    let Some(kind) = store
+        .transcript_channel_kind(&channel_id)
+        .map_err(|e| e.to_string())?
+    else {
+        let page = history_page(
+            local::AgentChannelMessagePage::empty(&channel_id, 0),
             Vec::new(),
-        ),
-        wire::ChatHistoryLoadMode::After => (
-            store
-                .load_message_page_from(
-                    &channel_id,
-                    request.sequence.unwrap_or(0).saturating_add(1),
-                    request.limit,
-                )
-                .map_err(|error| error.to_string())?,
-            Vec::new(),
-        ),
+        );
+        return Ok(wire::ChatHistoryLoadResponse {
+            overview: request
+                .include_overview
+                .then(|| wire::ChatHistoryTimelineOverview {
+                    chunk_size: page.chunk_size,
+                    ..Default::default()
+                }),
+            page,
+            sources: request.known_sources.map(|_| Default::default()),
+            channel_kind: None,
+        });
     };
-    let overview = request
-        .include_overview
-        .then(|| store.load_timeline_overview(&channel_id))
-        .transpose()
-        .map_err(|error| error.to_string())?
+    let channel_kind = request.known_sources.as_ref().map(|_| history_kind(kind));
+    let transcript = store
+        .read_transcript(&channel_id, &request)
+        .map_err(|e| e.to_string())?;
+    let overview = transcript
+        .overview
         .map(|overview| wire::ChatHistoryTimelineOverview {
             total_messages: overview.total_messages,
             oldest_sequence: overview.oldest_sequence,
@@ -3977,8 +3970,13 @@ fn history_load(
                 .collect(),
         });
     Ok(wire::ChatHistoryLoadResponse {
-        page: history_page(page, discovered_message_ids),
+        page: history_page(
+            transcript.reconciliation.page,
+            transcript.reconciliation.discovered_message_ids,
+        ),
         overview,
+        sources: request.known_sources.map(|_| transcript.sources),
+        channel_kind,
     })
 }
 
@@ -3990,7 +3988,7 @@ fn history_channel(
 ) -> Result<Option<wire::ChatHistoryChannel>, String> {
     let channel_id = SessionId::from_str(session_id).map_err(|error| error.to_string())?;
     open_history_store(daemon_address, data_dir, &runtime)?
-        .load_channel(&channel_id)
+        .load_channel_metadata_only(&channel_id)
         .map_err(|error| error.to_string())
         .map(|channel| channel.map(history_channel_wire))
 }

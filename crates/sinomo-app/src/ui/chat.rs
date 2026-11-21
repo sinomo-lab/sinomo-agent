@@ -85,20 +85,18 @@ use sinomo_cli::app_api::SifsAgentChannelStore;
 use sinomo_cli::app_api::agent_summaries_with_error;
 #[cfg(test)]
 use sinomo_cli::app_api::{
-    AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
-    AgentChannelTimelineSegment,
+    AgentChannelMessagePage, AgentChannelTimelineOverview, AgentChannelTimelineSegment,
 };
 #[cfg(not(test))]
 use sinomo_client::chat_contract::{
-    ChatHistoryAuthor, ChatHistoryConversationKind, ChatHistoryLoadMode, ChatHistoryLoadRequest,
-    ChatHistoryMessageKind, ChatHistoryPage as AgentChannelMessagePage,
-    ChatHistoryParticipantRequest, ChatHistoryStoredMessage,
-    ChatHistoryTimelineOverview as AgentChannelTimelineOverview,
+    ChatHistoryAuthor, ChatHistoryConversationKind, ChatHistoryMessageKind,
+    ChatHistoryPage as AgentChannelMessagePage, ChatHistoryParticipantRequest,
+    ChatHistoryStoredMessage, ChatHistoryTimelineOverview as AgentChannelTimelineOverview,
     ChatHistoryTimelineSegment as AgentChannelTimelineSegment,
 };
 use sinomo_client::chat_contract::{
-    ChatSessionActivityRequest, ChatSessionActivityResponse, ChatToolOutputFile,
-    fallback_agent_summaries, reasoning_efforts,
+    ChatHistoryLoadMode, ChatHistoryLoadRequest, ChatHistorySources, ChatSessionActivityRequest,
+    ChatSessionActivityResponse, ChatToolOutputFile, fallback_agent_summaries, reasoning_efforts,
 };
 #[cfg(test)]
 use sinomo_runtime::vfs::VfsHandle;
@@ -1569,6 +1567,8 @@ struct ConversationTimelineState {
     has_newer: bool,
     overview: Vec<ConversationTimelineSegment>,
     discovered_message_ids: BTreeSet<String>,
+    #[serde(default)]
+    sources: ChatHistorySources,
 }
 
 impl ConversationTimelineState {
@@ -1728,6 +1728,7 @@ struct ConversationTimelineLoad {
     page: AgentChannelMessagePage,
     overview: Option<AgentChannelTimelineOverview>,
     discovered_message_ids: Vec<String>,
+    sources: Option<ChatHistorySources>,
 }
 
 /// State backing the chat tab.
@@ -4990,6 +4991,7 @@ impl ChatState {
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
         let known_message_ids = self.timeline.discovered_message_ids.clone();
+        let sources = self.timeline.sources.clone();
         let worker_session = session.clone();
         let worker_waker = self.ui_waker.clone();
         let spawn_result = thread::Builder::new()
@@ -5002,6 +5004,7 @@ impl ChatState {
                     worker_session.kind,
                     mode,
                     &known_message_ids,
+                    &sources,
                 );
                 let _ = tx.send(TranscriptLoadWorkerResult {
                     session: worker_session,
@@ -5115,6 +5118,9 @@ impl ChatState {
                 self.timeline
                     .discovered_message_ids
                     .extend(std::mem::take(&mut load.discovered_message_ids));
+                if let Some(sources) = load.sources.take() {
+                    self.timeline.sources = sources;
+                }
                 match result.mode {
                     TranscriptLoadMode::Initial => {
                         let history: Vec<ChatHistoryMessage> = load
@@ -8367,6 +8373,7 @@ fn load_conversation_messages(
         kind,
         TranscriptLoadMode::Initial,
         &BTreeSet::new(),
+        &ChatHistorySources::default(),
     )?
     .messages)
 }
@@ -8378,9 +8385,13 @@ fn load_conversation_timeline(
     kind: ConversationKind,
     mode: TranscriptLoadMode,
     known_message_ids: &BTreeSet<String>,
+    sources: &ChatHistorySources,
 ) -> Result<ConversationTimelineLoad, String> {
-    let timeline =
-        load_channel_timeline_from_sifs(data_dir, sifs_daemon, id, mode, known_message_ids)?;
+    let timeline = load_channel_timeline_from_sifs(
+        data_dir,
+        sifs_daemon,
+        history_load_request(id, mode, known_message_ids, sources),
+    )?;
     match (timeline, kind) {
         (Some(timeline), _) => Ok(timeline),
         (None, ConversationKind::Chat) => {
@@ -8391,100 +8402,12 @@ fn load_conversation_timeline(
     }
 }
 
-#[cfg(test)]
-fn load_channel_timeline_from_sifs(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&SifsDaemonAccess>,
+fn history_load_request(
     id: &str,
     mode: TranscriptLoadMode,
-    known_message_ids: &BTreeSet<String>,
-) -> Result<Option<ConversationTimelineLoad>, String> {
-    let channel_id = parse_channel_id(id).map_err(|error| error.to_string())?;
-    let store =
-        open_agent_channel_store(data_dir, sifs_daemon).map_err(|error| error.to_string())?;
-    let summary = store
-        .load_channel_summary(&channel_id)
-        .map_err(channel_store_io_error)
-        .map_err(|error| error.to_string())?;
-    let Some(summary) = summary else {
-        return Ok(None);
-    };
-    if summary.deleted_at.is_some() {
-        return Ok(None);
-    }
-    let reconciliation = match mode {
-        TranscriptLoadMode::Initial => store.load_message_reconciliation_page(
-            &channel_id,
-            &BTreeSet::new(),
-            TRANSCRIPT_PAGE_SIZE,
-        ),
-        TranscriptLoadMode::Older { before_sequence } => store
-            .load_message_page_before(&channel_id, before_sequence, TRANSCRIPT_PAGE_SIZE)
-            .map(reconciliation_from_page),
-        TranscriptLoadMode::Newer { after_sequence } => store
-            .load_message_page_from(
-                &channel_id,
-                after_sequence.saturating_add(1),
-                TRANSCRIPT_PAGE_SIZE,
-            )
-            .map(reconciliation_from_page),
-        TranscriptLoadMode::ReconcileLatest => store.load_message_reconciliation_page(
-            &channel_id,
-            known_message_ids,
-            TRANSCRIPT_PAGE_SIZE,
-        ),
-    }
-    .map_err(channel_store_io_error)
-    .map_err(|error| error.to_string())?;
-    let AgentChannelMessageReconciliation {
-        page,
-        discovered_message_ids,
-    } = reconciliation;
-    let overview = if mode == TranscriptLoadMode::Initial {
-        Some(
-            store
-                .load_timeline_overview(&channel_id)
-                .map_err(channel_store_io_error)
-                .map_err(|error| error.to_string())?,
-        )
-    } else {
-        None
-    };
-    Ok(Some(ConversationTimelineLoad {
-        messages: channel_messages_from_agent(&page.messages, summary.channel_kind),
-        page,
-        overview,
-        discovered_message_ids,
-    }))
-}
-
-#[cfg(test)]
-fn reconciliation_from_page(page: AgentChannelMessagePage) -> AgentChannelMessageReconciliation {
-    let discovered_message_ids = page
-        .messages
-        .iter()
-        .map(|message| message.message_id.to_string())
-        .collect();
-    AgentChannelMessageReconciliation {
-        page,
-        discovered_message_ids,
-    }
-}
-
-#[cfg(not(test))]
-fn load_channel_timeline_from_sifs(
-    _data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&SifsDaemonAccess>,
-    id: &str,
-    mode: TranscriptLoadMode,
-    known_message_ids: &BTreeSet<String>,
-) -> Result<Option<ConversationTimelineLoad>, String> {
-    let client = sifs_daemon
-        .map(SifsDaemonAccess::history_client)
-        .ok_or_else(|| "chat history requires a daemon connection".to_string())?;
-    let Some(channel) = client.channel(id).map_err(|error| error.to_string())? else {
-        return Ok(None);
-    };
+    known: &BTreeSet<String>,
+    sources: &ChatHistorySources,
+) -> ChatHistoryLoadRequest {
     let (wire_mode, sequence) = match mode {
         TranscriptLoadMode::Initial => (ChatHistoryLoadMode::Initial, None),
         TranscriptLoadMode::Older { before_sequence } => {
@@ -8495,23 +8418,93 @@ fn load_channel_timeline_from_sifs(
         }
         TranscriptLoadMode::ReconcileLatest => (ChatHistoryLoadMode::ReconcileLatest, None),
     };
-    let response = client
-        .load(ChatHistoryLoadRequest {
-            session_id: id.to_string(),
-            mode: wire_mode,
-            sequence,
-            limit: TRANSCRIPT_PAGE_SIZE,
-            include_overview: mode == TranscriptLoadMode::Initial,
-            known_message_ids: known_message_ids.iter().cloned().collect(),
-        })
-        .map_err(|error| error.to_string())?;
-    let messages = channel_messages_from_wire(&response.page.messages, channel.kind);
-    let discovered_message_ids = response.page.discovered_message_ids.clone();
+    ChatHistoryLoadRequest {
+        session_id: id.to_string(),
+        mode: wire_mode,
+        sequence,
+        limit: TRANSCRIPT_PAGE_SIZE,
+        include_overview: mode == TranscriptLoadMode::Initial,
+        known_message_ids: if mode == TranscriptLoadMode::ReconcileLatest {
+            known.iter().cloned().collect()
+        } else {
+            Vec::new()
+        },
+        known_sources: Some(sources.clone()),
+    }
+}
+
+#[cfg(test)]
+fn load_channel_timeline_from_sifs(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    request: ChatHistoryLoadRequest,
+) -> Result<Option<ConversationTimelineLoad>, String> {
+    let channel_id = parse_channel_id(&request.session_id).map_err(|error| error.to_string())?;
+    let store =
+        open_agent_channel_store(data_dir, sifs_daemon).map_err(|error| error.to_string())?;
+    let Some(kind) = store
+        .transcript_channel_kind(&channel_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let transcript = store
+        .read_transcript(&channel_id, &request)
+        .map_err(|e| e.to_string())?;
+    let page = transcript.reconciliation.page;
+    Ok(Some(ConversationTimelineLoad {
+        messages: channel_messages_from_agent(&page.messages, kind),
+        page,
+        overview: transcript.overview,
+        discovered_message_ids: transcript.reconciliation.discovered_message_ids,
+        sources: matches!(
+            request.mode,
+            ChatHistoryLoadMode::Initial | ChatHistoryLoadMode::ReconcileLatest
+        )
+        .then_some(transcript.sources),
+    }))
+}
+
+#[cfg(not(test))]
+fn load_channel_timeline_from_sifs(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    request: ChatHistoryLoadRequest,
+) -> Result<Option<ConversationTimelineLoad>, String> {
+    let client = sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| "chat history requires a daemon connection".to_string())?;
+    let mut response = client.load(request.clone()).map_err(|e| e.to_string())?;
+    let kind = if response.sources.is_some() {
+        let Some(kind) = response.channel_kind else {
+            return Ok(None);
+        };
+        kind
+    } else {
+        // Older daemons recover turn outboxes during the descriptor read.
+        // Fetch the page after that recovery before displaying it.
+        let Some(channel) = client
+            .channel(&request.session_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        response = client.load(request.clone()).map_err(|e| e.to_string())?;
+        channel.kind
+    };
+    let messages = channel_messages_from_wire(&response.page.messages, kind);
+    let discovered_message_ids = std::mem::take(&mut response.page.discovered_message_ids);
     Ok(Some(ConversationTimelineLoad {
         messages,
         page: response.page,
         overview: response.overview,
         discovered_message_ids,
+        sources: response.sources.filter(|_| {
+            matches!(
+                request.mode,
+                ChatHistoryLoadMode::Initial | ChatHistoryLoadMode::ReconcileLatest
+            )
+        }),
     }))
 }
 
@@ -8620,6 +8613,7 @@ fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimeli
             segments: Vec::new(),
         }),
         discovered_message_ids: Vec::new(),
+        sources: None,
     }
 }
 
@@ -8646,6 +8640,7 @@ fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimeli
             segments: Vec::new(),
         }),
         discovered_message_ids: Vec::new(),
+        sources: None,
     }
 }
 
@@ -21816,6 +21811,7 @@ mod tests {
                     })
                     .collect(),
                 discovered_message_ids: BTreeSet::new(),
+                sources: ChatHistorySources::default(),
             };
             chat.stick_bottom = false;
             chat.scroll = 0.0;
@@ -22099,6 +22095,86 @@ mod tests {
             state.can_send(),
             "composer should become available after the transcript loads"
         );
+    }
+
+    #[test]
+    fn saved_conversation_reaches_the_visible_transcript() -> sui::Result<()> {
+        let shared = crate::boot(crate::state::Tab::Sinomo);
+        let id = SessionId::generate();
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_backend_chat(
+                &chat.data_dir,
+                &id,
+                "Saved conversation",
+                &[
+                    ChatMessage::user("visible saved question"),
+                    ChatMessage::model("visible saved reply"),
+                ],
+            );
+            chat.sessions = vec![SessionRef {
+                id: id.to_string(),
+                title: "Saved conversation".into(),
+                kind: ConversationKind::Chat,
+                updated_unix: 1,
+                participant_count: 1,
+                participant_names: Vec::new(),
+            }];
+        }
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Transcript open")
+                    .controller(crate::ui::shell::BackgroundWorkController::new(
+                        shared.clone(),
+                    ))
+                    .root(TranscriptView::new(shared.clone(), SelectionScope::new())),
+            )
+            .build()?;
+        let sender = runtime.command_sender();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                720.0, 540.0,
+            ))))?;
+        app.run_until_idle()?;
+        let started = Instant::now();
+        shared.chat_mut().open_session(0);
+        loop {
+            sender.broadcast_application(CHAT_WORK_READY, ());
+            app.run_until_idle()?;
+            if window.snapshot()?.accessibility.nodes.iter().any(|node| {
+                node.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("visible saved question"))
+            }) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "saved message never appeared in the transcript; state={:?}, nodes={:?}",
+                shared
+                    .chat()
+                    .messages
+                    .iter()
+                    .map(|m| &m.text)
+                    .collect::<Vec<_>>(),
+                window
+                    .snapshot()?
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .filter_map(|n| n.name.as_deref())
+                    .take(30)
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("first visible saved message: {:?}", started.elapsed());
+        Ok(())
     }
 
     #[test]
@@ -22424,6 +22500,7 @@ mod tests {
             has_newer: false,
             overview: Vec::new(),
             discovered_message_ids: BTreeSet::new(),
+            sources: ChatHistorySources::default(),
         };
 
         state.set_draft("follow up while history loads".to_string());
@@ -22463,6 +22540,7 @@ mod tests {
                 },
                 overview: None,
                 discovered_message_ids: Vec::new(),
+                sources: None,
             }),
         })
         .expect("queue older transcript page");
@@ -30393,6 +30471,7 @@ mod tests {
                 },
                 overview: None,
                 discovered_message_ids: vec!["saved-message".into()],
+                sources: None,
             }),
         };
         state.apply_transcript_load_result(recovered());

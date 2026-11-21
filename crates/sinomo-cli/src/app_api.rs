@@ -12,6 +12,7 @@ pub use sinomo_runtime::api::app::chat::{
     ChatToolOutputSnapshot, ProviderSummary,
 };
 pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
+mod transcript;
 use sinomo_runtime::cluster;
 use std::cell::RefCell;
 use std::fs;
@@ -245,7 +246,7 @@ pub struct AgentChannelMessagePage {
 }
 
 impl AgentChannelMessagePage {
-    fn empty(channel_id: &SessionId, total_messages: u64) -> Self {
+    pub(crate) fn empty(channel_id: &SessionId, total_messages: u64) -> Self {
         Self {
             channel_id: channel_id.clone(),
             messages: Vec::new(),
@@ -384,6 +385,20 @@ struct SifsAgentChannelHistoryMetadataProjection {
     metadata_records_version: String,
 }
 
+impl SifsAgentChannelHistoryMetadataProjection {
+    fn matches_revision(
+        &self,
+        channel_id: &SessionId,
+        object_id: Option<&str>,
+        version: Option<&str>,
+    ) -> bool {
+        self.schema_version == SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION
+            && self.channel.channel_id == *channel_id
+            && object_id == Some(self.metadata_records_object_id.as_str())
+            && version == Some(self.metadata_records_version.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AgentChannelMetadataNamespaceRevision {
     Missing,
@@ -434,6 +449,12 @@ fn channel_metadata_namespace_revision(
 pub struct AgentChannelMessageReconciliation {
     pub page: AgentChannelMessagePage,
     pub discovered_message_ids: Vec<String>,
+}
+
+pub struct AgentChannelTranscript {
+    pub reconciliation: AgentChannelMessageReconciliation,
+    pub overview: Option<AgentChannelTimelineOverview>,
+    pub sources: sinomo_runtime::api::app::chat::ChatHistorySources,
 }
 
 /// Coarse chunk-level timeline metadata for long-history navigation.
@@ -1574,36 +1595,52 @@ impl SifsAgentChannelStore {
         &self,
         paths: &[String],
     ) -> Result<Vec<(String, T)>, AgentChannelStoreError> {
+        self.record_bytes(paths)?
+            .into_iter()
+            .map(|(path, bytes)| {
+                let value = Self::decode_record(&path, &bytes)?;
+                Ok((path, value))
+            })
+            .collect()
+    }
+
+    fn decode_record<T: DeserializeOwned>(
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<T, AgentChannelStoreError> {
+        serde_json::from_slice(bytes).map_err(|source| AgentChannelStoreError::Serialization {
+            detail: format!("invalid channel record at {path}: {source}"),
+        })
+    }
+
+    fn record_bytes(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(String, Vec<u8>)>, AgentChannelStoreError> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let mut values = Vec::with_capacity(paths.len());
+        let mut records = Vec::with_capacity(paths.len());
         for (path, result) in self
             .browser
             .read_files(paths)
             .map_err(|detail| channel_store_io(&self.channels_root, detail))?
         {
-            let Some(bytes) = channel_optional_bulk_read_bytes(&path, result)? else {
-                continue;
-            };
-            let value = serde_json::from_slice(&bytes).map_err(|source| {
-                AgentChannelStoreError::Serialization {
-                    detail: format!("invalid channel record at {path}: {source}"),
-                }
-            })?;
-            values.push((path, value));
+            if let Some(bytes) = channel_optional_bulk_read_bytes(&path, result)? {
+                records.push((path, bytes));
+            }
         }
-        Ok(values)
+        Ok(records)
     }
 
-    fn load_message_record_documents(
+    fn message_record_bytes(
         &self,
         paths: &[String],
-    ) -> Result<Vec<(String, AgentChannelMessage)>, AgentChannelStoreError> {
+    ) -> Result<Vec<(String, Vec<u8>)>, AgentChannelStoreError> {
         #[cfg(test)]
         self.message_record_body_reads
             .fetch_add(paths.len(), std::sync::atomic::Ordering::Relaxed);
-        self.load_json_documents_with_paths(paths)
+        self.record_bytes(paths)
     }
 
     #[cfg(test)]
@@ -1621,14 +1658,7 @@ impl SifsAgentChannelStore {
             return Ok(Vec::new());
         }
         let mut values = Vec::new();
-        for (path, result) in self
-            .browser
-            .read_files(&paths)
-            .map_err(|detail| channel_store_io(dir, detail))?
-        {
-            let Some(bytes) = channel_optional_bulk_read_bytes(&path, result)? else {
-                continue;
-            };
+        for (_, bytes) in self.record_bytes(&paths)? {
             values.extend(parse_json_lines::<T>(&bytes)?);
         }
         Ok(values)
@@ -1643,11 +1673,9 @@ impl SifsAgentChannelStore {
         let mut messages = self.load_legacy_json_lines(&self.message_chunks_dir(channel_id))?;
         let record_paths =
             self.paths_in_dir_with_suffix(&self.message_records_dir(channel_id), ".json")?;
-        messages.extend(
-            self.load_message_record_documents(&record_paths)?
-                .into_iter()
-                .map(|(_, message)| message),
-        );
+        for (path, bytes) in self.message_record_bytes(&record_paths)? {
+            messages.push(Self::decode_record(&path, &bytes)?);
+        }
         canonicalize_channel_messages(messages)
     }
 
@@ -1963,16 +1991,14 @@ impl SifsAgentChannelStore {
                 );
                 let current_records = history_vfs.stat_beneath_no_links(&records_dir);
                 let source_exists = history_vfs.stat_beneath_no_links(&source_record).is_ok();
-                let current_matches = current_records.is_ok_and(|metadata| {
-                    metadata.object_id.as_deref()
-                        == Some(projection.metadata_records_object_id.as_str())
-                        && metadata.version.as_deref()
-                            == Some(projection.metadata_records_version.as_str())
-                });
-                if projection.schema_version == SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION
-                    && projection.channel.channel_id == *channel_id
-                    && source_exists
-                    && current_matches
+                if source_exists
+                    && current_records.is_ok_and(|metadata| {
+                        projection.matches_revision(
+                            channel_id,
+                            metadata.object_id.as_deref(),
+                            metadata.version.as_deref(),
+                        )
+                    })
                 {
                     return Ok(AgentChannelHistoryMetadataRead {
                         channel: Some(projection.channel),
@@ -2146,35 +2172,29 @@ impl SifsAgentChannelStore {
         known_message_ids: &BTreeSet<String>,
         tail_limit: usize,
     ) -> Result<AgentChannelMessageReconciliation, AgentChannelStoreError> {
-        let legacy_messages = self
-            .load_legacy_json_lines::<AgentChannelMessage>(&self.message_chunks_dir(channel_id))?;
-        let record_paths =
-            self.paths_in_dir_with_suffix(&self.message_records_dir(channel_id), ".json")?;
-        let missing_record_paths = record_paths
-            .into_iter()
-            .filter(|path| {
-                json_record_id_from_path(path)
-                    .is_some_and(|message_id| !known_message_ids.contains(message_id))
-            })
-            .collect::<Vec<_>>();
-        let loaded_records = self.load_message_record_documents(&missing_record_paths)?;
+        use sinomo_runtime::api::app::chat::{ChatHistoryLoadMode, ChatHistoryLoadRequest};
+        Ok(self
+            .read_transcript(
+                channel_id,
+                &ChatHistoryLoadRequest {
+                    session_id: channel_id.to_string(),
+                    mode: ChatHistoryLoadMode::ReconcileLatest,
+                    sequence: None,
+                    limit: tail_limit,
+                    include_overview: false,
+                    known_message_ids: known_message_ids.iter().cloned().collect(),
+                    known_sources: None,
+                },
+            )?
+            .reconciliation)
+    }
 
-        let mut messages = legacy_messages
-            .into_iter()
-            .filter(|message| !known_message_ids.contains(message.message_id.as_str()))
-            .collect::<Vec<_>>();
-        for (path, message) in loaded_records {
-            if json_record_id_from_path(&path) != Some(message.message_id.as_str()) {
-                return Err(AgentChannelStoreError::Serialization {
-                    detail: format!(
-                        "channel message record {} does not match path {path}",
-                        message.message_id
-                    ),
-                });
-            }
-            messages.push(message);
-        }
-        messages = deduplicate_channel_messages_preserving_sequence(messages)?;
+    fn delta_from_messages(
+        channel_id: &SessionId,
+        messages: Vec<AgentChannelMessage>,
+        known_message_ids: &BTreeSet<String>,
+    ) -> Result<AgentChannelMessageReconciliation, AgentChannelStoreError> {
+        let mut messages = deduplicate_channel_messages_preserving_sequence(messages)?;
 
         let mut newly_discovered_message_ids = messages
             .iter()
@@ -2187,41 +2207,23 @@ impl SifsAgentChannelStore {
             .saturating_add(newly_discovered_message_ids.len())
             .min(u64::MAX as usize) as u64;
 
-        let page = if known_message_ids.is_empty() {
-            let messages = canonicalize_channel_messages(messages)?;
-            if tail_limit == 0 || messages.is_empty() {
-                AgentChannelMessagePage::empty(channel_id, total_messages)
-            } else {
-                let first_sequence = total_messages
-                    .saturating_sub(tail_limit as u64)
-                    .saturating_add(1);
-                Self::message_page_from_records(
-                    channel_id,
-                    messages,
-                    first_sequence,
-                    total_messages,
-                    tail_limit,
-                )
-            }
-        } else {
-            messages.sort_by(|left, right| {
-                left.sequence
-                    .cmp(&right.sequence)
-                    .then_with(|| left.created_at.cmp(&right.created_at))
-                    .then_with(|| left.message_id.cmp(&right.message_id))
-            });
-            let start_sequence = messages.iter().map(|message| message.sequence).min();
-            let end_sequence = messages.iter().map(|message| message.sequence).max();
-            AgentChannelMessagePage {
-                channel_id: channel_id.clone(),
-                messages,
-                start_sequence,
-                end_sequence,
-                has_older: total_messages > newly_discovered_message_ids.len() as u64,
-                has_newer: false,
-                total_messages,
-                chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
-            }
+        messages.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.message_id.cmp(&right.message_id))
+        });
+        let start_sequence = messages.iter().map(|message| message.sequence).min();
+        let end_sequence = messages.iter().map(|message| message.sequence).max();
+        let page = AgentChannelMessagePage {
+            channel_id: channel_id.clone(),
+            messages,
+            start_sequence,
+            end_sequence,
+            has_older: total_messages > newly_discovered_message_ids.len() as u64,
+            has_newer: false,
+            total_messages,
+            chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
         };
         Ok(AgentChannelMessageReconciliation {
             page,
@@ -2257,29 +2259,33 @@ impl SifsAgentChannelStore {
         start_sequence: u64,
         limit: usize,
     ) -> Result<AgentChannelMessagePage, AgentChannelStoreError> {
-        let messages = self.load_all_messages(channel_id)?;
+        Ok(Self::page_from_messages(
+            channel_id,
+            self.load_all_messages(channel_id)?,
+            start_sequence,
+            limit,
+        ))
+    }
+
+    fn page_from_messages(
+        channel_id: &SessionId,
+        messages: Vec<AgentChannelMessage>,
+        start_sequence: u64,
+        limit: usize,
+    ) -> AgentChannelMessagePage {
         let total_messages = messages.len() as u64;
         if limit == 0 || total_messages == 0 {
-            return Ok(AgentChannelMessagePage::empty(channel_id, total_messages));
+            return AgentChannelMessagePage::empty(channel_id, total_messages);
         }
         if start_sequence > total_messages {
-            return Ok(Self::empty_message_page_after_end(
-                channel_id,
-                total_messages,
-            ));
+            return Self::empty_message_page_after_end(channel_id, total_messages);
         }
         let start_sequence = start_sequence.max(1).min(total_messages);
         let end_sequence = start_sequence
             .saturating_add(limit as u64)
             .saturating_sub(1)
             .min(total_messages);
-        Ok(Self::message_page_from_records(
-            channel_id,
-            messages,
-            start_sequence,
-            end_sequence,
-            limit,
-        ))
+        Self::message_page_from_records(channel_id, messages, start_sequence, end_sequence, limit)
     }
 
     pub fn load_message_page_before(
@@ -2288,32 +2294,33 @@ impl SifsAgentChannelStore {
         before_sequence: u64,
         limit: usize,
     ) -> Result<AgentChannelMessagePage, AgentChannelStoreError> {
-        let messages = self.load_all_messages(channel_id)?;
+        Ok(Self::page_before_messages(
+            channel_id,
+            self.load_all_messages(channel_id)?,
+            before_sequence,
+            limit,
+        ))
+    }
+
+    fn page_before_messages(
+        channel_id: &SessionId,
+        messages: Vec<AgentChannelMessage>,
+        before_sequence: u64,
+        limit: usize,
+    ) -> AgentChannelMessagePage {
         let total_messages = messages.len() as u64;
         if limit == 0 || total_messages == 0 {
-            return Ok(AgentChannelMessagePage::empty(channel_id, total_messages));
+            return AgentChannelMessagePage::empty(channel_id, total_messages);
         }
         if before_sequence <= 1 {
-            return Ok(Self::empty_message_page_before_start(
-                channel_id,
-                total_messages,
-            ));
+            return Self::empty_message_page_before_start(channel_id, total_messages);
         }
         let end_sequence = before_sequence.saturating_sub(1).min(total_messages);
         if end_sequence == 0 {
-            return Ok(Self::empty_message_page_before_start(
-                channel_id,
-                total_messages,
-            ));
+            return Self::empty_message_page_before_start(channel_id, total_messages);
         }
         let start_sequence = end_sequence.saturating_sub(limit as u64).saturating_add(1);
-        Ok(Self::message_page_from_records(
-            channel_id,
-            messages,
-            start_sequence,
-            end_sequence,
-            limit,
-        ))
+        Self::message_page_from_records(channel_id, messages, start_sequence, end_sequence, limit)
     }
 
     /// Read at most `limit` immutable message-record bodies in stable
@@ -2758,17 +2765,26 @@ impl SifsAgentChannelStore {
         &self,
         channel_id: &SessionId,
     ) -> Result<AgentChannelTimelineOverview, AgentChannelStoreError> {
-        let messages = self.load_all_messages(channel_id)?;
+        Ok(Self::overview_from_messages(
+            channel_id,
+            &self.load_all_messages(channel_id)?,
+        ))
+    }
+
+    fn overview_from_messages(
+        channel_id: &SessionId,
+        messages: &[AgentChannelMessage],
+    ) -> AgentChannelTimelineOverview {
         let total_messages = messages.len() as u64;
         if messages.is_empty() {
-            return Ok(AgentChannelTimelineOverview {
+            return AgentChannelTimelineOverview {
                 channel_id: channel_id.clone(),
                 total_messages: 0,
                 oldest_sequence: None,
                 newest_sequence: None,
                 chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
                 segments: Vec::new(),
-            });
+            };
         }
 
         let mut segments = Vec::new();
@@ -2785,14 +2801,14 @@ impl SifsAgentChannelStore {
             });
         }
 
-        Ok(AgentChannelTimelineOverview {
+        AgentChannelTimelineOverview {
             channel_id: channel_id.clone(),
             total_messages,
             oldest_sequence: segments.first().map(|segment| segment.start_sequence),
             newest_sequence: segments.last().map(|segment| segment.end_sequence),
             chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
             segments,
-        })
+        }
     }
 
     fn channel_ids_from_sifs(&self) -> Result<BTreeSet<SessionId>, AgentChannelStoreError> {
@@ -3312,7 +3328,12 @@ fn copy_channel_workspace_projection(target: &mut AgentChannel, source: &AgentCh
 fn canonicalize_channel_messages(
     messages: Vec<AgentChannelMessage>,
 ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
-    let mut messages = deduplicate_channel_messages_preserving_sequence(messages)?;
+    Ok(sequence_channel_messages(
+        deduplicate_channel_messages_preserving_sequence(messages)?,
+    ))
+}
+
+fn sequence_channel_messages(mut messages: Vec<AgentChannelMessage>) -> Vec<AgentChannelMessage> {
     messages.sort_by(|left, right| {
         left.sequence
             .cmp(&right.sequence)
@@ -3322,7 +3343,7 @@ fn canonicalize_channel_messages(
     for (index, message) in messages.iter_mut().enumerate() {
         message.sequence = (index as u64).saturating_add(1);
     }
-    Ok(messages)
+    messages
 }
 
 fn deduplicate_channel_messages_preserving_sequence(
@@ -14863,6 +14884,60 @@ mod tests {
             "the failpoint must leave the response unmaterialized"
         );
 
+        use sinomo_runtime::api::app::chat::{ChatHistoryLoadMode, ChatHistoryLoadRequest};
+        let mut request = ChatHistoryLoadRequest {
+            session_id: channel_id.to_string(),
+            mode: ChatHistoryLoadMode::Initial,
+            sequence: None,
+            limit: 1,
+            include_overview: true,
+            known_message_ids: Vec::new(),
+            known_sources: Some(Default::default()),
+        };
+        let reads = reopened.message_record_body_read_count();
+        assert!(
+            reopened
+                .load_channel_metadata_only(&channel_id)
+                .unwrap()
+                .unwrap()
+                .transcript
+                .is_empty()
+        );
+        assert_eq!(reopened.message_record_body_read_count(), reads);
+        assert!(
+            reopened
+                .load_immutable_message_record(&channel_id, &response.message_id)
+                .unwrap()
+                .is_none()
+        );
+        let initial = reopened.read_transcript(&channel_id, &request).unwrap();
+        assert_eq!(initial.reconciliation.page.messages.len(), 1);
+        assert_eq!(
+            initial.reconciliation.page.messages[0].message_id,
+            response.message_id
+        );
+        assert_eq!(initial.reconciliation.discovered_message_ids.len(), 2);
+        assert_eq!(initial.overview.unwrap().total_messages, 2);
+        assert_eq!(
+            reopened.message_record_body_read_count(),
+            reads + 1,
+            "read the existing prompt once for both the page and overview"
+        );
+        assert!(
+            reopened
+                .load_immutable_message_record(&channel_id, &response.message_id)
+                .unwrap()
+                .is_some()
+        );
+        request.mode = ChatHistoryLoadMode::ReconcileLatest;
+        request.include_overview = false;
+        request.known_message_ids = initial.reconciliation.discovered_message_ids;
+        request.known_sources = Some(initial.sources);
+        let refresh = reopened.read_transcript(&channel_id, &request).unwrap();
+        assert_eq!(refresh.reconciliation.page.total_messages, 2);
+        assert!(refresh.reconciliation.page.messages.is_empty());
+        assert_eq!(reopened.message_record_body_read_count(), reads + 1);
+
         let recovered = reopened
             .load_channel(&channel_id)
             .expect("load recovered channel")
@@ -14898,6 +14973,50 @@ mod tests {
             1,
             "replaying the turn outbox must stay idempotent"
         );
+
+        // The view stays open while a second writer crashes. Its cursor has
+        // seen the first turn only, so the new outbox must still be recovered.
+        let mut writer = AgentChannelRuntime::new(
+            recovered_again,
+            CrashAfterTurnChannelStore::new(SifsAgentChannelStore::open(&data_dir).unwrap()),
+            FixedChannelReply("second durable answer"),
+        )
+        .with_loop_config(AgentChannelLoopConfig {
+            max_agent_messages_per_ingress: 1,
+        });
+        assert!(matches!(
+            writer.send_user_message("second turn", &mut |_| {}),
+            Err(sinomo_agent::AgentChannelRuntimeError::Store { .. })
+        ));
+        drop(writer);
+        let before = reopened.message_record_body_read_count();
+        let after_crash = reopened.read_transcript(&channel_id, &request).unwrap();
+        assert_eq!(after_crash.reconciliation.page.total_messages, 4);
+        assert_eq!(
+            after_crash
+                .reconciliation
+                .page
+                .messages
+                .iter()
+                .filter(|m| m.content == "second durable answer")
+                .count(),
+            1
+        );
+        assert_eq!(reopened.message_record_body_read_count(), before + 1);
+        request
+            .known_message_ids
+            .extend(after_crash.reconciliation.discovered_message_ids);
+        request.known_sources = Some(after_crash.sources);
+        assert!(
+            reopened
+                .read_transcript(&channel_id, &request)
+                .unwrap()
+                .reconciliation
+                .page
+                .messages
+                .is_empty()
+        );
+        assert_eq!(reopened.message_record_body_read_count(), before + 1);
     }
 
     #[test]
@@ -15544,6 +15663,70 @@ mod tests {
             initial_count + 1,
             "only the newly discovered immutable record body should be read"
         );
+    }
+
+    #[test]
+    fn transcript_refresh_detects_growth_in_a_known_legacy_chunk() {
+        use sinomo_runtime::api::app::chat::{ChatHistoryLoadMode, ChatHistoryLoadRequest};
+        let root = sinomo_testdir::TestDir::new("chat-legacy-incremental");
+        let data = SinomoDataDir::new(&root);
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data);
+        let store = SifsAgentChannelStore::open(&data).unwrap();
+        let id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(id.clone(), "Legacy");
+        store.save_channel(&channel).unwrap();
+        let first = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "older",
+            AgentChannelSource::app(),
+        );
+        let chunk = store.message_chunk_path(&id, 1);
+        let mut jsonl = serde_json::to_vec(&first).unwrap();
+        jsonl.push(b'\n');
+        store.write_file(&chunk, &jsonl).unwrap();
+        let mut request = ChatHistoryLoadRequest {
+            session_id: id.to_string(),
+            mode: ChatHistoryLoadMode::Initial,
+            sequence: None,
+            limit: 1,
+            include_overview: true,
+            known_message_ids: Vec::new(),
+            known_sources: Some(Default::default()),
+        };
+        let initial = store.read_transcript(&id, &request).unwrap();
+        assert_eq!(initial.reconciliation.page.messages[0].content, "older");
+        assert_eq!(initial.sources.legacy_chunks.len(), 1);
+        request.mode = ChatHistoryLoadMode::ReconcileLatest;
+        request.include_overview = false;
+        request.known_message_ids = initial.reconciliation.discovered_message_ids;
+        request.known_sources = Some(initial.sources);
+        assert!(
+            store
+                .read_transcript(&id, &request)
+                .unwrap()
+                .reconciliation
+                .page
+                .messages
+                .is_empty()
+        );
+        let next = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "arrived later",
+            AgentChannelSource::app(),
+        );
+        jsonl.extend(serde_json::to_vec(&next).unwrap());
+        jsonl.push(b'\n');
+        store.write_file(&chunk, &jsonl).unwrap();
+        let refresh = store.read_transcript(&id, &request).unwrap();
+        assert_eq!(refresh.reconciliation.page.messages, vec![next.clone()]);
+        assert_eq!(refresh.reconciliation.page.total_messages, 2);
+        // An older view checkpoint may retain a different set of message IDs.
+        request.known_sources = Some(refresh.sources);
+        request.known_message_ids = vec![next.message_id.to_string()];
+        let partial = store.read_transcript(&id, &request).unwrap();
+        assert_eq!(partial.reconciliation.page.messages, vec![first]);
     }
 
     #[test]

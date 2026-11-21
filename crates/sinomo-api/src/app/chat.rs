@@ -313,6 +313,17 @@ pub enum ChatHistoryLoadMode {
     ReconcileLatest,
 }
 
+/// Sources consumed by one desktop view. Turn records are immutable. Legacy
+/// JSONL chunks may grow in place, so their content hashes identify the read.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatHistorySources {
+    pub turn_records: std::collections::BTreeSet<String>,
+    pub legacy_chunks: std::collections::BTreeMap<String, String>,
+    /// A legacy chunk can be skipped only with the message IDs that its reader acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_message_set: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatHistoryLoadRequest {
     pub session_id: String,
@@ -322,12 +333,20 @@ pub struct ChatHistoryLoadRequest {
     pub include_overview: bool,
     #[serde(default)]
     pub known_message_ids: Vec<String>,
+    /// Request the channel kind and the incremental read cursor in the same reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_sources: Option<ChatHistorySources>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatHistoryLoadResponse {
     pub page: ChatHistoryPage,
     pub overview: Option<ChatHistoryTimelineOverview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<ChatHistorySources>,
+    /// With a source cursor, absence means the requested channel is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_kind: Option<ChatHistoryConversationKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -153,6 +153,33 @@ fn a_scripted_chat_turn_runs_and_its_context_survives_a_daemon_restart() {
 
     let daemon = Daemon::start(&data_dir, port, "after-restart", &after_restart);
     daemon.wait_for_agent_catalog();
+    {
+        let client = sinomo_client::ChatHistoryClient::at_address(daemon.address.clone());
+        let mut request = ChatHistoryLoadRequest {
+            session_id: session_id.clone(),
+            mode: ChatHistoryLoadMode::Initial,
+            sequence: None,
+            limit: 100,
+            include_overview: true,
+            known_message_ids: Vec::new(),
+            known_sources: Some(Default::default()),
+        };
+        let initial = client
+            .load(request.clone())
+            .expect("load chat history and overview");
+        assert!(initial.channel_kind.is_some());
+        assert_eq!(
+            initial.overview.unwrap().total_messages,
+            initial.page.total_messages
+        );
+        request.mode = ChatHistoryLoadMode::ReconcileLatest;
+        request.include_overview = false;
+        request.known_message_ids = initial.page.discovered_message_ids.clone();
+        request.known_sources = Some(initial.sources.expect("daemon issued a source cursor"));
+        let refreshed = client.load(request).expect("refresh known chat history");
+        assert!(refreshed.page.messages.is_empty());
+        assert_eq!(refreshed.page.total_messages, initial.page.total_messages);
+    }
     let history = daemon.history(&session_id);
     assert!(
         history
@@ -780,6 +807,7 @@ impl Daemon {
                 limit: 100,
                 include_overview: false,
                 known_message_ids: Vec::new(),
+                known_sources: None,
             })
             .expect("load chat history")
             .page;
