@@ -4,13 +4,17 @@
 //! subscriber; this source subscribes only while a role needs them. The
 //! keeper reads it to keep and take over shards, and the takeover
 //! corroboration service reads it to answer whether this node still reaches a
-//! shard primary. Tests may supply the verdicts of one data root instead.
+//! shard primary. Every role of one node judges a no-path verdict under a
+//! record's epoch from the same examinations, so a member answering a
+//! candidate meets the candidate's own rule. Tests may supply the verdicts of
+//! one data root instead.
 
 use super::write_set_takeover::ShardKey;
 use super::*;
 use crate::DfsWriteSetMemberReach;
 use sinomo_core::network::PeerPathVerdict;
 use std::collections::BTreeMap;
+use std::sync::{LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// The first re-send of a request that the network examine a peer, after an
@@ -67,6 +71,27 @@ impl DfsPeerVerdictSnapshot {
     pub(super) fn concluded_generation(&self, node: &NodeId) -> u64 {
         self.concluded.get(node).copied().unwrap_or_default()
     }
+}
+
+/// Per shard and peer, the record epoch a verdict was last judged under.
+type Examinations = BTreeMap<(ShardKey, NodeId), (u64, Examination)>;
+
+/// Every node's examinations, by data root, while some role of it holds them.
+static EXAMINATIONS: LazyLock<Mutex<BTreeMap<std::path::PathBuf, Weak<Mutex<Examinations>>>>> =
+    LazyLock::new(Default::default);
+
+/// The examinations every role of the node owning `root` shares.
+fn shared_examinations(root: std::path::PathBuf) -> Arc<Mutex<Examinations>> {
+    let mut all = EXAMINATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    all.retain(|_, shared| shared.strong_count() > 0);
+    if let Some(shared) = all.get(&root).and_then(Weak::upgrade) {
+        return shared;
+    }
+    let shared = Arc::new(Mutex::new(Examinations::new()));
+    all.insert(root, Arc::downgrade(&shared));
+    shared
 }
 
 /// Whether a peer's no-path verdict is evidence gathered under one epoch of
@@ -130,13 +155,13 @@ pub(super) struct DfsPeerVerdicts {
     /// The test verdict generation this role last read or woke for.
     #[cfg(any(test, feature = "test-support"))]
     test_seen: std::sync::atomic::AtomicU64,
-    /// Per shard and peer, the record epoch a verdict was last judged under.
-    examinations: BTreeMap<(ShardKey, NodeId), (u64, Examination)>,
+    /// This node's examinations, shared with its other roles.
+    examinations: Arc<Mutex<Examinations>>,
 }
 
 impl DfsPeerVerdicts {
     pub(super) fn new(
-        _data_dir: &SinomoDataDir,
+        data_dir: &SinomoDataDir,
         cluster_paths: &ClusterPaths,
         state: &sinomo_core::ClusterBootstrapState,
     ) -> Self {
@@ -145,10 +170,10 @@ impl DfsPeerVerdicts {
             state: state.clone(),
             subscription: None,
             #[cfg(any(test, feature = "test-support"))]
-            test: _data_dir.root(),
+            test: data_dir.root(),
             #[cfg(any(test, feature = "test-support"))]
             test_seen: std::sync::atomic::AtomicU64::new(0),
-            examinations: BTreeMap::new(),
+            examinations: shared_examinations(data_dir.root()),
         }
     }
 
@@ -196,7 +221,11 @@ impl DfsPeerVerdicts {
         let stands = snapshot.entry(peer).0 == PeerPathVerdict::NoPath;
         let concluded_generation = snapshot.concluded_generation(peer);
         let key = (shard.clone(), peer.clone());
-        let awaiting = match self.examinations.get(&key) {
+        // Held for the whole judgement, so two roles of this node never
+        // interleave on one peer. Nothing below takes this lock again.
+        let shared = Arc::clone(&self.examinations);
+        let mut examinations = shared.lock().unwrap_or_else(|error| error.into_inner());
+        let awaiting = match examinations.get(&key) {
             Some((seen, Examination::Bound)) if *seen == epoch => return StandingVerdict::Counts,
             Some((
                 seen,
@@ -210,7 +239,7 @@ impl DfsPeerVerdicts {
         };
         let examined = awaiting.is_some_and(|(noted, ..)| concluded_generation > noted);
         if !stands || examined {
-            self.examinations.insert(key, (epoch, Examination::Bound));
+            examinations.insert(key, (epoch, Examination::Bound));
             return StandingVerdict::Counts;
         }
         // On the first read of this epoch with the verdict standing, note
@@ -247,7 +276,7 @@ impl DfsPeerVerdicts {
                 ExaminationRequest::NotAccepted
             };
         }
-        self.examinations.insert(
+        examinations.insert(
             key,
             (
                 epoch,
@@ -279,9 +308,33 @@ impl DfsPeerVerdicts {
         });
     }
 
+    /// Ask the network to examine `peer` on the next judgement under `epoch`
+    /// even if the re-send after an examination that concluded nothing is not
+    /// due yet: a question about the peer is a reason to examine it again.
+    pub(super) fn examine_again(&mut self, shard: &ShardKey, epoch: u64, peer: &NodeId) {
+        let mut examinations = self
+            .examinations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((
+            seen,
+            Examination::Awaiting {
+                request: request @ ExaminationRequest::Resend { .. },
+                ..
+            },
+        )) = examinations.get_mut(&(shard.clone(), peer.clone()))
+            && *seen == epoch
+        {
+            *request = ExaminationRequest::NotAccepted;
+        }
+    }
+
     /// Forget the examinations of shards `keep` rejects.
     pub(super) fn retain_examinations(&mut self, keep: impl Fn(&ShardKey) -> bool) {
-        self.examinations.retain(|(shard, _), _| keep(shard));
+        self.examinations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(shard, _), _| keep(shard));
     }
 
     pub(super) fn retain(&mut self, needed: bool) {
@@ -599,6 +652,13 @@ mod tests {
         other: NodeId,
     }
 
+    /// Another role of the fixture's node: it shares the node's examinations.
+    fn other_role(fixture: &Fixture) -> DfsPeerVerdicts {
+        let data_dir = SinomoDataDir::new(fixture.root.clone());
+        let state = fixture.verdicts.state.clone();
+        DfsPeerVerdicts::new(&data_dir, &ClusterPaths::new(&data_dir), &state)
+    }
+
     /// One node's verdicts, set by the test; nothing touches disk.
     fn fixture(name: &str, probe_owner: bool) -> Fixture {
         let data_dir = SinomoDataDir::new(format!("/nonexistent/sinomo-dfs-examination-{name}"));
@@ -836,6 +896,73 @@ mod tests {
         // That conclusion came before the next epoch was read: it is not one
         // under it.
         assert!(!fixture.examined(4), "the next epoch is read anew");
+    }
+
+    #[test]
+    fn every_role_of_a_node_judges_from_the_same_examinations() {
+        let mut fixture = fixture("shared", true);
+        let mut member = other_role(&fixture);
+        let (shard, peer) = (fixture.shard.clone(), fixture.peer.clone());
+        let judge = |verdicts: &mut DfsPeerVerdicts| {
+            let snapshot = verdicts.current();
+            verdicts.standing_verdict(&snapshot, &shard, 3, &peer)
+        };
+        // One role reads the epoch with a path; the verdict then turns no-path.
+        fixture.set(&fixture.peer, PeerPathVerdict::Path, false);
+        assert_eq!(judge(&mut fixture.verdicts), StandingVerdict::Counts);
+        fixture.set(&fixture.peer, PeerPathVerdict::NoPath, false);
+        assert_eq!(
+            judge(&mut member),
+            StandingVerdict::Counts,
+            "the loss turned under the epoch for the whole node"
+        );
+        assert_eq!(fixture.asked(), 0);
+
+        // A verdict that stood when the node first read the next epoch waits
+        // for the same examination in every role.
+        let epoch = |verdicts: &mut DfsPeerVerdicts| {
+            let snapshot = verdicts.current();
+            verdicts.standing_verdict(&snapshot, &fixture.shard, 4, &fixture.peer)
+        };
+        assert_eq!(epoch(&mut member), StandingVerdict::BeingExamined);
+        assert_eq!(epoch(&mut fixture.verdicts), StandingVerdict::BeingExamined);
+        test_seam::settle_peer_verification(
+            fixture.root.clone(),
+            fixture.peer.clone(),
+            PeerPathVerdict::NoPath,
+        );
+        assert_eq!(epoch(&mut fixture.verdicts), StandingVerdict::Counts);
+        assert_eq!(epoch(&mut member), StandingVerdict::Counts);
+        // A role dropped and made again still shares them.
+        drop(member);
+        assert_eq!(epoch(&mut other_role(&fixture)), StandingVerdict::Counts);
+    }
+
+    #[test]
+    fn a_question_has_the_peer_examined_again_before_the_re_send_is_due() {
+        let mut fixture = fixture("examine-again", true);
+        fixture.set(&fixture.peer, PeerPathVerdict::NoPath, false);
+        assert_eq!(fixture.standing(3), StandingVerdict::BeingExamined);
+        fixture.end_unconcluded();
+        assert_eq!(fixture.standing(3), StandingVerdict::Unexamined);
+        assert_eq!(fixture.asked(), 1);
+        // A question about the peer asks at once; the re-send would not yet.
+        let (shard, peer) = (fixture.shard.clone(), fixture.peer.clone());
+        fixture.verdicts.examine_again(&shard, 3, &peer);
+        assert_eq!(fixture.standing(3), StandingVerdict::BeingExamined);
+        assert_eq!(fixture.asked(), 2);
+        // It is no reason to ask for an epoch it was not judged under, and
+        // changes nothing for a verdict that counts.
+        fixture.verdicts.examine_again(&shard, 9, &peer);
+        test_seam::settle_peer_verification(
+            fixture.root.clone(),
+            fixture.peer.clone(),
+            PeerPathVerdict::NoPath,
+        );
+        assert_eq!(fixture.standing(3), StandingVerdict::Counts);
+        fixture.verdicts.examine_again(&shard, 3, &peer);
+        assert_eq!(fixture.standing(3), StandingVerdict::Counts);
+        assert_eq!(fixture.asked(), 2);
     }
 
     #[test]

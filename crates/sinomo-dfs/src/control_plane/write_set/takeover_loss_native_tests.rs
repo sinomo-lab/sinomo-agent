@@ -1866,21 +1866,21 @@ fn native_elected_primary_keeps_a_member_whose_examination_concludes_nothing() {
     race.close();
 }
 
-/// A candidate whose own verdict qualifies and the member it ranks first,
+/// A candidate whose own verdict qualifies, and the member it ranks first,
 /// whose no-path verdict for the primary already stood when it first read the
 /// epoch and whose network holds the examination open.
-struct HandOff {
+struct StandingMember {
     runtime: DfsTestRuntime,
     config: DfsMetadataShardConfig,
     /// The candidate: its verdict turned no-path under the epoch.
     asker: NodeId,
-    /// The member ranked first: it is handed the attempt.
-    target: NodeId,
+    /// The member it asks, ranked first by journal head and node id.
+    member: NodeId,
 }
 
-impl HandOff {
+impl StandingMember {
     fn nodes(&self) -> [&NodeId; 2] {
-        [&self.asker, &self.target]
+        [&self.asker, &self.member]
     }
 
     fn events(&self, node: &NodeId, name: &str) -> Vec<DfsMetadataTakeoverEvent> {
@@ -1892,24 +1892,30 @@ impl HandOff {
         (record.shard.primary_node_id.clone(), record.shard.epoch)
     }
 
-    /// The target holds the hand-off: it promised and swapped nothing, the
-    /// asker waits for it, and the record is unchanged.
-    fn target_waits(&self, when: &str) {
+    /// The member has not answered: nobody promised, the asker neither handed
+    /// the attempt off nor was vetoed, and the record is unchanged.
+    fn unanswered(&self, when: &str) {
         let log = || event_log(&self.runtime, &self.nodes());
-        assert!(
-            promise_of(&self.runtime, &self.target, &self.config).is_none()
-                && self
-                    .events(&self.target, DfsMetadataTakeoverEvent::PROMISED)
-                    .is_empty(),
-            "the target promises nothing {when}:\n{}",
-            log()
-        );
-        assert!(
-            self.events(&self.asker, DfsMetadataTakeoverEvent::PROMISED)
-                .is_empty(),
-            "the asker waits for the target {when}:\n{}",
-            log()
-        );
+        for node in self.nodes() {
+            assert!(
+                promise_of(&self.runtime, node, &self.config).is_none()
+                    && self
+                        .events(node, DfsMetadataTakeoverEvent::PROMISED)
+                        .is_empty(),
+                "{node} promises nothing {when}:\n{}",
+                log()
+            );
+        }
+        for name in [
+            DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF,
+            DfsMetadataTakeoverEvent::CORROBORATION_VETOED,
+        ] {
+            assert!(
+                self.events(&self.asker, name).is_empty(),
+                "the asker waits for the member's answer {when}: {name}\n{}",
+                log()
+            );
+        }
         assert_eq!(
             self.primary(),
             (self.config.primary_node_id.clone(), self.config.epoch),
@@ -1919,245 +1925,294 @@ impl HandOff {
 }
 
 /// The primary stays up, and every member's keeper but its own runs. The
-/// target's keeper starts with its no-path verdict for the primary standing,
-/// so it asks its network to examine the primary and that episode stays
-/// open. The asker reaches the primary when it first reads the epoch and
-/// loses it afterwards, so its own verdict qualifies: it asks the target,
-/// which answers that it lost the primary too, ranks it first and hands the
-/// attempt to it.
-fn handed_to_a_member_with_a_standing_verdict(name: &str) -> HandOff {
+/// member's keeper starts with its no-path verdict for the primary standing,
+/// so its network is asked to examine the primary and that episode stays
+/// open. The asker reaches the primary when it first reads the epoch and loses
+/// it afterwards, so its own verdict qualifies, and it asks the member.
+fn asked_a_member_with_a_standing_verdict(name: &str) -> StandingMember {
     let (runtime, config) = switched_with_kv_voters(name, None);
     let p = config.primary_node_id.clone();
     let b = config.replica_node_ids[0].clone();
     let c = config.replica_node_ids[1].clone();
     {
         let mut service = primary(&runtime);
-        directory(&mut service, "/services/hand-off");
+        directory(&mut service, "/services/standing-member");
     }
     for member in [&b, &c] {
         catch_up(&runtime, &config, member);
     }
-    // The member ranked first by journal head, then node id, is asked.
+    // The member ranked first by journal head, then node id, is asked; were
+    // it to answer lost it would be handed the attempt.
     let mut ranking = [&b, &c].map(|node| (journal_head(&runtime, node, &config), node.clone()));
     ranking.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    let (target, asker) = (ranking[0].1.clone(), ranking[1].1.clone());
+    let (member, asker) = (ranking[0].1.clone(), ranking[1].1.clone());
 
     keep_with_paths(&runtime, &config, &[]);
-    runtime.set_probe_owner(&target, true);
-    lose(&runtime, &[&target], &p);
-    runtime.enable_write_set_keeping(&target);
+    runtime.set_probe_owner(&member, true);
+    lose(&runtime, &[&member], &p);
+    runtime.enable_write_set_keeping(&member);
     wait_until(
-        "the target asks its network to examine the primary",
+        "the member asks its network to examine the primary",
         &runtime,
-        &[&asker, &target],
-        || runtime.peer_verification_requests(&target).contains(&p),
+        &[&asker, &member],
+        || runtime.peer_verification_requests(&member).contains(&p),
     );
     assert!(
-        attempts_started_at(&runtime, &target, &config, config.epoch).is_empty(),
-        "the target starts nothing on a verdict that only stood"
+        attempts_started_at(&runtime, &member, &config, config.epoch).is_empty(),
+        "the member starts nothing on a verdict that only stood"
     );
 
     runtime.enable_write_set_keeping(&asker);
     lose(&runtime, &[&asker], &p);
-    let hand_off = HandOff {
+    let standing = StandingMember {
         runtime,
         config,
         asker,
-        target,
+        member,
     };
     wait_until(
-        "the asker hands the attempt to the target",
-        &hand_off.runtime,
-        &hand_off.nodes(),
+        "the asker asks the member",
+        &standing.runtime,
+        &standing.nodes(),
         || {
-            hand_off
+            standing
                 .events(
-                    &hand_off.asker,
-                    DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF,
+                    &standing.asker,
+                    DfsMetadataTakeoverEvent::CORROBORATION_STARTED,
                 )
                 .iter()
-                .any(|event| event.node_ids == vec![hand_off.target.clone()])
+                .any(|event| event.node_ids.contains(&standing.member))
         },
     );
-    hand_off
+    standing
 }
 
-/// A hand-off target swaps on its own verdict, so that verdict must count
-/// under the epoch as for an attempt of its own. With its examination of the
-/// primary open the target holds the hand-off: it promises nothing however
-/// often its keeper evaluates. Once the episode's own probe finds no path it
-/// runs the attempt and its swap applies.
+/// A member does not answer lost from a verdict that only stood: it has the
+/// network examine the primary first, and the asker waits for it however often
+/// the member's keeper evaluates. The examination concludes with no path, the
+/// member answers that it lost the primary, ranks first, runs the attempt it
+/// is handed, and its swap applies.
 #[test]
-fn native_hand_off_target_waits_for_the_network_to_examine_the_primary() {
-    let hand_off = handed_to_a_member_with_a_standing_verdict("native-loss-hand-off-waits");
-    let (runtime, config) = (&hand_off.runtime, &hand_off.config);
-    let (asker, target) = (&hand_off.asker, &hand_off.target);
+fn native_member_with_a_standing_verdict_answers_lost_once_its_examination_concludes() {
+    let standing = asked_a_member_with_a_standing_verdict("native-loss-member-examined");
+    let (runtime, config) = (&standing.runtime, &standing.config);
+    let (asker, member) = (&standing.asker, &standing.member);
     let p = config.primary_node_id.clone();
     std::thread::sleep(Duration::from_millis(500));
-    hand_off.target_waits("while its network has examined nothing");
-    // The target's keeper evaluates again: another peer's entry moves.
-    let asked = verification_requests(runtime, target, &p);
-    runtime.set_peer_verdict(target, asker, PeerPathVerdict::Path, false);
+    standing.unanswered("while its network has examined nothing");
+    // The member's keeper evaluates again: another peer's entry moves.
+    let asked = verification_requests(runtime, member, &p);
+    runtime.set_peer_verdict(member, asker, PeerPathVerdict::Path, false);
     wait_until(
-        "the target's keeper evaluates again",
+        "the member's keeper evaluates again",
         runtime,
-        &hand_off.nodes(),
-        || verification_requests(runtime, target, &p) > asked,
+        &standing.nodes(),
+        || verification_requests(runtime, member, &p) > asked,
     );
-    hand_off.target_waits("when its keeper evaluates again");
+    standing.unanswered("when its keeper evaluates again");
 
-    runtime.settle_peer_verification(target, &p, PeerPathVerdict::NoPath);
+    runtime.settle_peer_verification(member, &p, PeerPathVerdict::NoPath);
     wait_until(
-        "the target's swap applies",
+        "the member's swap applies",
         runtime,
-        &hand_off.nodes(),
+        &standing.nodes(),
         || {
-            !hand_off
-                .events(target, DfsMetadataTakeoverEvent::SWAPPED)
+            !standing
+                .events(member, DfsMetadataTakeoverEvent::SWAPPED)
                 .is_empty()
         },
     );
-    assert_eq!(hand_off.primary(), (target.clone(), config.epoch + 1));
+    assert_eq!(standing.primary(), (member.clone(), config.epoch + 1));
     assert!(
-        hand_off
+        standing
+            .events(asker, DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF)
+            .iter()
+            .any(|event| event.node_ids == vec![member.clone()]),
+        "the member answered lost and ranked first:\n{}",
+        event_log(runtime, &standing.nodes())
+    );
+    assert!(
+        standing
             .events(asker, DfsMetadataTakeoverEvent::SWAPPED)
             .is_empty(),
-        "the asker follows the target"
+        "the asker follows the member"
     );
-    hand_off.runtime.close().unwrap();
+    standing.runtime.close().unwrap();
 }
 
-/// The target's examination of the primary ends without a conclusion: it
-/// declines the hand-off and promises nothing. The asker, whose own verdict
-/// qualifies, ranks again without it and takes over itself, so the takeover
-/// does not wait on a member that cannot examine the primary.
+/// The member's examination ends without a conclusion: it answers that it has
+/// no evidence, which neither vetoes nor ranks it, so the asker does not wait
+/// on it any longer. The asker ranks alone and takes over; the member promised
+/// nothing.
 #[test]
-fn native_hand_off_target_declines_when_its_examination_concludes_nothing() {
-    let hand_off = handed_to_a_member_with_a_standing_verdict("native-loss-hand-off-declines");
-    let (runtime, config) = (&hand_off.runtime, &hand_off.config);
-    let (asker, target) = (&hand_off.asker, &hand_off.target);
+fn native_member_whose_examination_concludes_nothing_answers_without_evidence() {
+    let standing = asked_a_member_with_a_standing_verdict("native-loss-member-unexamined");
+    let (runtime, config) = (&standing.runtime, &standing.config);
+    let (asker, member) = (&standing.asker, &standing.member);
     let p = config.primary_node_id.clone();
-    hand_off.target_waits("while its network has examined nothing");
+    standing.unanswered("while its network has examined nothing");
 
-    runtime.end_peer_verification_unconcluded(target, &p);
+    runtime.end_peer_verification_unconcluded(member, &p);
     wait_until(
         "the asker's own swap applies",
         runtime,
-        &hand_off.nodes(),
+        &standing.nodes(),
         || {
-            !hand_off
+            !standing
                 .events(asker, DfsMetadataTakeoverEvent::SWAPPED)
                 .is_empty()
         },
     );
-    assert_eq!(hand_off.primary(), (asker.clone(), config.epoch + 1));
+    assert_eq!(standing.primary(), (asker.clone(), config.epoch + 1));
+    for name in [
+        DfsMetadataTakeoverEvent::PROMISED,
+        DfsMetadataTakeoverEvent::SWAPPED,
+    ] {
+        assert!(
+            standing.events(member, name).is_empty(),
+            "the member: no {name}:\n{}",
+            event_log(runtime, &standing.nodes())
+        );
+    }
     assert!(
-        hand_off
-            .events(target, DfsMetadataTakeoverEvent::PROMISED)
-            .is_empty()
-            && hand_off
-                .events(target, DfsMetadataTakeoverEvent::SWAPPED)
-                .is_empty(),
-        "the target promised and swapped nothing:\n{}",
-        event_log(runtime, &hand_off.nodes())
+        standing
+            .events(asker, DfsMetadataTakeoverEvent::CORROBORATION_HANDED_OFF)
+            .is_empty(),
+        "a member without evidence is not ranked"
     );
-    assert!(
-        runtime
-            .write_set_takeover_trace(asker)
-            .iter()
-            .any(|line| line.contains("primary-unexamined")),
-        "the target declined for its unexamined verdict: {:?}",
-        runtime.write_set_takeover_trace(asker)
-    );
-    hand_off.runtime.close().unwrap();
+    standing.runtime.close().unwrap();
 }
 
-/// The target's examination of the primary finds a path: the target reaches
-/// the primary, so its decline vetoes the asker's attempt, as a `reaches`
-/// answer in the round does. The asker does not rank again without it, so
-/// nobody promises or swaps and the record is unchanged. The veto ends that
-/// attempt only: once the primary is really lost, the next verdict change
-/// starts a new one and the takeover proceeds.
+/// A member whose no-path verdict for the primary is stale: its examination
+/// finds a path. It answers that it reaches the primary, which vetoes the
+/// attempt, so nobody promises or swaps and the record is unchanged. The veto
+/// ends that attempt only: once the primary is really lost, the next verdict
+/// change starts a new one and the takeover proceeds.
 #[test]
-fn native_hand_off_target_that_finds_a_path_vetoes_until_the_primary_is_really_lost() {
-    let mut hand_off = handed_to_a_member_with_a_standing_verdict("native-loss-hand-off-vetoes");
-    let config = hand_off.config.clone();
-    let (asker, target) = (hand_off.asker.clone(), hand_off.target.clone());
+fn native_member_with_a_stale_standing_verdict_that_reaches_the_primary_vetoes() {
+    let mut standing = asked_a_member_with_a_standing_verdict("native-loss-member-vetoes");
+    let config = standing.config.clone();
+    let (asker, member) = (standing.asker.clone(), standing.member.clone());
     let p = config.primary_node_id.clone();
-    hand_off.target_waits("while its network has examined nothing");
+    standing.unanswered("while its network has examined nothing");
 
-    hand_off
+    standing
         .runtime
-        .settle_peer_verification(&target, &p, PeerPathVerdict::Path);
+        .settle_peer_verification(&member, &p, PeerPathVerdict::Path);
     wait_until(
-        "the target vetoes the asker's attempt",
-        &hand_off.runtime,
-        &hand_off.nodes(),
+        "the member vetoes the asker's attempt",
+        &standing.runtime,
+        &standing.nodes(),
         || {
-            hand_off
+            standing
                 .events(&asker, DfsMetadataTakeoverEvent::CORROBORATION_VETOED)
                 .iter()
-                .any(|event| event.node_ids == vec![target.clone()])
+                .any(|event| event.node_ids == vec![member.clone()])
         },
-    );
-    assert!(
-        hand_off
-            .runtime
-            .write_set_takeover_trace(&asker)
-            .iter()
-            .any(|line| line.contains("primary-reached")),
-        "the target declined as reaching the primary: {:?}",
-        hand_off.runtime.write_set_takeover_trace(&asker)
     );
     // Nothing follows the veto while nothing changes.
     std::thread::sleep(Duration::from_millis(1500));
-    for node in hand_off.nodes() {
+    for node in standing.nodes() {
         for name in [
             DfsMetadataTakeoverEvent::PROMISED,
             DfsMetadataTakeoverEvent::SWAPPED,
         ] {
             assert!(
-                hand_off.events(node, name).is_empty(),
+                standing.events(node, name).is_empty(),
                 "{node}: no {name} after the veto:\n{}",
-                event_log(&hand_off.runtime, &hand_off.nodes())
+                event_log(&standing.runtime, &standing.nodes())
             );
         }
-        assert!(promise_of(&hand_off.runtime, node, &config).is_none());
+        assert!(promise_of(&standing.runtime, node, &config).is_none());
     }
     assert_eq!(
-        hand_off.primary(),
+        standing.primary(),
         (p.clone(), config.epoch),
         "the record is unchanged"
     );
 
     // The primary is really lost: it stops, and both members' networks
-    // examine it and find no path. For the target that is a path lost under
+    // examine it and find no path. For the member that is a path lost under
     // the epoch; for the asker it is the verdict change a new attempt needs.
-    hand_off.runtime.stop_node(&p).unwrap();
-    for node in [&target, &asker] {
-        hand_off
+    standing.runtime.stop_node(&p).unwrap();
+    for node in [&member, &asker] {
+        standing
             .runtime
             .settle_peer_verification(node, &p, PeerPathVerdict::NoPath);
     }
     wait_until(
         "a survivor takes over",
-        &hand_off.runtime,
-        &hand_off.nodes(),
+        &standing.runtime,
+        &standing.nodes(),
         || {
-            try_record_from(&hand_off.runtime, &config, &asker)
+            try_record_from(&standing.runtime, &config, &asker)
                 .is_some_and(|record| record.shard.primary_node_id != p)
         },
     );
-    let (primary, epoch) = hand_off.primary();
-    assert!(primary == asker || primary == target);
+    let (primary, epoch) = standing.primary();
+    assert!(primary == asker || primary == member);
     assert_eq!(epoch, config.epoch + 1);
-    hand_off.runtime.close().unwrap();
+    standing.runtime.close().unwrap();
 }
 
-/// A hand-off to a member whose network cannot examine the primary at all
-/// (it has no probe owner) is declined at once, and one whose examination
-/// finds a path is declined as reaching the primary, which vetoes. Neither
-/// promises anything.
+/// A member that lost its path to the primary while it already read the
+/// primary at the epoch answers lost at once: it asks the network nothing, even
+/// with a probe owner that would hold any examination open. Its first read was
+/// the earlier question, which found a path.
+#[test]
+fn native_member_whose_path_loss_happened_under_the_epoch_answers_at_once() {
+    use crate::takeover_corroboration::DfsTakeoverPrimaryReach;
+    let (runtime, config) = switched_with_kv_voters("native-loss-member-at-once", None);
+    let p = config.primary_node_id.clone();
+    let b = config.replica_node_ids[0].clone();
+    let c = config.replica_node_ids[1].clone();
+    let head = catch_up(&runtime, &config, &c);
+    let record = record_from(&runtime, &config, &b);
+    let request = super::takeover_native_tests::corroboration_request(&config, &record, &b);
+    runtime.set_peer_verdict(&c, &p, PeerPathVerdict::Path, false);
+    assert_eq!(
+        super::takeover_native_tests::ask(&runtime, &b, &c, &request).answer,
+        DfsTakeoverPrimaryReach::Reaches
+    );
+
+    // Any examination would now stay open until the test settled it.
+    runtime.set_probe_owner(&c, true);
+    let asked = verification_requests(&runtime, &c, &p);
+    runtime.set_peer_verdict(&c, &p, PeerPathVerdict::NoPath, false);
+    let data_dir = runtime.data_dir(&b).clone();
+    let handle = runtime.runtime_handle();
+    let reply = std::thread::scope(|scope| {
+        let answered = scope.spawn(|| {
+            crate::runtime_host::ask_dfs_takeover_corroboration_for_test(
+                &data_dir, &handle, &c, &request,
+            )
+            .expect("the member answers")
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !answered.is_finished() {
+            if Instant::now() >= deadline {
+                // Release the answer so the scope can end, then fail.
+                runtime.settle_peer_verification(&c, &p, PeerPathVerdict::NoPath);
+                panic!("the member waited for an examination");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        answered.join().unwrap()
+    });
+    assert_eq!(reply.answer, DfsTakeoverPrimaryReach::Lost, "{reply:?}");
+    assert_eq!(reply.durable_sequence, Some(head.journal_sequence));
+    assert_eq!(
+        verification_requests(&runtime, &c, &p),
+        asked,
+        "the member asked its network nothing"
+    );
+    runtime.close().unwrap();
+}
+
+/// A member asked to run the attempt whose network cannot examine the primary
+/// at all (it has no probe owner) answers at once that it has no evidence and
+/// declines; once its network examines the primary and finds a path, it
+/// declines as reaching the primary, which vetoes. Neither promises anything.
 #[test]
 fn native_hand_off_target_without_an_examination_or_with_a_path_declines() {
     use crate::takeover_corroboration::{DfsTakeoverCorroborationKind, DfsTakeoverHandOffOutcome};
@@ -2204,7 +2259,16 @@ fn native_hand_off_target_without_an_examination_or_with_a_path_declines() {
         Some(DfsTakeoverHandOffOutcome::Declined { reason, .. }) => reason,
         other => panic!("the target declines: {other:?}"),
     };
-    assert_eq!(declined_for(hand_off().hand_off), "primary-unexamined");
+    let reply = hand_off();
+    assert_eq!(
+        reply.answer,
+        crate::takeover_corroboration::DfsTakeoverPrimaryReach::Abstain {
+            reason: crate::takeover_corroboration::DfsTakeoverAbstainReason::NoEvidence,
+        },
+        "nothing can examine the primary, so the standing verdict is no evidence"
+    );
+    assert!(!reply.reaches_primary());
+    assert_eq!(declined_for(reply.hand_off), "primary-not-lost");
 
     // Its network returns and examines P: the episode's probe finds a path.
     runtime.set_probe_owner(&target, true);
@@ -2224,7 +2288,7 @@ fn native_hand_off_target_without_an_examination_or_with_a_path_declines() {
         std::thread::sleep(Duration::from_millis(500));
         assert!(
             !asked.is_finished(),
-            "the hand-off waits for the open examination"
+            "the member waits for the examination it asked for"
         );
         runtime.settle_peer_verification(&target, &p, PeerPathVerdict::Path);
         asked.join().unwrap()

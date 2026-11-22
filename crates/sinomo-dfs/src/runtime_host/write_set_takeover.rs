@@ -14,11 +14,12 @@
 //! reconciliation that resumes the shard's work.
 //!
 //! The member side answers corroboration from this node's own retained record
-//! and its own network verdict, after asking the network to verify the
-//! primary unless its verdict already settled that there is no path. The
-//! answer takes no shard lock, lane or admission, so it is given while the
-//! shard's mutation lanes are busy, and it never waits on a DFS timer: the
-//! network bounds a verification episode.
+//! and its own network verdict. It answers that the primary is lost only by
+//! the candidate's rule: its no-path verdict counts under its record's epoch.
+//! Otherwise it has the network examine the primary first. The answer takes
+//! no shard lock, lane or admission, so it is given while the shard's mutation
+//! lanes are busy, and it never waits on a DFS timer: the network bounds a
+//! verification episode.
 //!
 //! Every wait is an event: a verdict change, a publication, a reply, or a
 //! completion. The only timers re-send: an unknown swap, a failed confirm
@@ -27,7 +28,7 @@
 //! or verdict change may arrive to wake the candidate; a timer never decides
 //! an outcome.
 
-use super::peer_verdicts::DfsPeerVerdicts;
+use super::peer_verdicts::{DfsPeerVerdicts, StandingVerdict};
 use super::write_set_keeping::cluster_member_facts;
 use super::*;
 use crate::takeover_corroboration::{
@@ -201,8 +202,15 @@ pub(crate) async fn answer_dfs_takeover_corroboration(
         .is_some_and(|member| member.mobile);
     let mut verdicts = DfsPeerVerdicts::new(&data_dir, &cluster_paths, &state);
     verdicts.retain(true);
-    let (answer, evidence) =
-        judge_takeover_primary(&mut verdicts, &request.primary_node_id, departed).await;
+    let shard = (request.file_system_id.clone(), request.shard_id.clone());
+    let (answer, evidence) = judge_takeover_primary(
+        &mut verdicts,
+        &shard,
+        view.epoch,
+        &request.primary_node_id,
+        departed,
+    )
+    .await;
     let durable_sequence =
         local_durable_sequence(&data_dir, &request.file_system_id, &request.shard_id).await;
     // This node has the asker's evidence: its own keeper evaluates the shard
@@ -240,22 +248,41 @@ fn unavailable(
     )
 }
 
-/// This node's judgement of `primary`. Unless its verdict already settled
-/// `NoPath` it asks the network to verify the primary, then waits for an
-/// episode that was running or requested when the question arrived to end, so
-/// a verdict from edge records that have not aged out cannot veto a primary
-/// that died. Any end of that episode ends the wait, with or without a
-/// conclusion: the answer is this node's verdict, not a certificate. Without
-/// a probe owner the current settled verdict answers.
+/// This node's judgement of `primary` under `epoch` of `shard`'s record, by
+/// the candidate's own rule ([`DfsPeerVerdicts::standing_verdict`]).
+///
+/// - A departed primary is lost: it has no verdict at all.
+/// - A no-path verdict that counts under the epoch, because it turned while
+///   this node already read the epoch or an examination of the primary has
+///   concluded since, answers `lost` at once.
+/// - Any other no-path verdict has the network examine the primary first, even
+///   if the re-send after an earlier unconcluded examination is not due: the
+///   question is a reason to examine. The answer then comes from how that
+///   examination ends: `lost` when it concludes with no path, `reaches` when it
+///   finds a path, and `abstain { no-evidence }` when it ends without a
+///   conclusion or this process has no probe owner to run it.
+/// - A verdict that is not no-path has the network verify the primary and
+///   answers once an episode that was running or requested when the question
+///   arrived has ended, so edge records that have not aged out cannot veto a
+///   primary that died. Without a probe owner the current verdict answers.
+///
+/// Every wait ends when the network settles an episode for the primary, which
+/// it bounds, or when the verdict changes; there is no DFS timer.
 async fn judge_takeover_primary(
     verdicts: &mut DfsPeerVerdicts,
+    shard: &ShardKey,
+    epoch: u64,
     primary: &NodeId,
     departed: bool,
 ) -> (DfsTakeoverPrimaryReach, DfsTakeoverVerdictEvidence) {
+    use sinomo_core::network::PeerPathVerdict;
     let asked = verdicts.current();
-    let settled_lost = asked.reach(primary) == DfsWriteSetMemberReach::NoPath;
     let settled_before = asked.settled_generation(primary);
-    let requested = !departed && !settled_lost && verdicts.request_verification(primary);
+    let stands = asked.entry(primary).0 == PeerPathVerdict::NoPath;
+    if !departed && stands {
+        verdicts.examine_again(shard, epoch, primary);
+    }
+    let requested = !departed && !stands && verdicts.request_verification(primary);
     let mut episode_seen = false;
     loop {
         let snapshot = verdicts.current();
@@ -268,12 +295,28 @@ async fn judge_takeover_primary(
             snapshot_generation: snapshot.generation,
             verification_generation: snapshot.verification_generation,
         };
-        if (departed
-            || !requested
-            || episode_seen
-            || (!verifying && !verdicts.request_verification(primary)))
-            && let Some(answer) = takeover_corroboration_judgement(departed, verdict, verifying)
-        {
+        if departed {
+            return (DfsTakeoverPrimaryReach::Lost, evidence);
+        }
+        // Judged on every wake, so the epoch is noted as this node first
+        // reads it, whatever the verdict.
+        let standing = verdicts.standing_verdict(&snapshot, shard, epoch, primary);
+        let answer = if verifying {
+            None
+        } else if verdict == PeerPathVerdict::NoPath {
+            match standing {
+                StandingVerdict::Counts => Some(DfsTakeoverPrimaryReach::Lost),
+                StandingVerdict::BeingExamined => None,
+                StandingVerdict::Unexamined => Some(DfsTakeoverPrimaryReach::Abstain {
+                    reason: DfsTakeoverAbstainReason::NoEvidence,
+                }),
+            }
+        } else if !requested || episode_seen || !verdicts.request_verification(primary) {
+            takeover_corroboration_judgement(false, verdict, false)
+        } else {
+            None
+        };
+        if let Some(answer) = answer {
             return (answer, evidence);
         }
         verdicts.changed().await;

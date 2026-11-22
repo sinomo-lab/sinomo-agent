@@ -449,10 +449,15 @@ them.
   (`DfsMetadataTakeoverCorroborationRequest`, format 1, exact member identity),
   served without a shard lock, lane or admission. The member checks the request
   against its own record (`abstain`: `not-a-member`, `newer-record`,
-  `malformed`), asks the network to verify the primary unless its verdict is
-  already a settled no path, waits for that episode to end, and answers
-  `reaches`, `lost` or `abstain { no-evidence }` with its record view and
-  durable journal head. A call ends on the reply, a network delivery failure or
+  `malformed`) and answers with its record view and durable journal head. It
+  answers `lost` only when its own no-path verdict counts under its record's
+  epoch by the rule above, at once. Any other no-path verdict has the network
+  examine the primary first, and the answer follows how that examination ends:
+  `lost` on a concluded no path, `reaches` on a path, `abstain { no-evidence }`
+  when it ends without a conclusion or nothing can run it. A verdict that is
+  not no-path has the network verify the primary and answers `reaches` or
+  `abstain { no-evidence }` once that episode ends. The network bounds every
+  episode, so the member always answers. A call ends on the reply, a network delivery failure or
   this node's no-path verdict for that member; nothing re-sends it on a timer.
   Any `reaches` vetoes the attempt and a `newer-record` ends it. Otherwise the
   candidate and every `lost` member are ranked by journal head, then non-mobile

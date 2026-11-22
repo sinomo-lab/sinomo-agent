@@ -4,8 +4,9 @@
 //!
 //! The route is direct object RPC between write-set members. A member answers
 //! from its own retained record and its own network verdict for the named
-//! primary, and asks the network to verify the primary first unless its
-//! verdict is already a settled `NoPath`. A member that still reaches the
+//! primary. It answers that the primary is lost only by the candidate's own
+//! rule, a no-path verdict that counts under its record's epoch; otherwise it
+//! has the network examine the primary first. A member that still reaches the
 //! primary vetoes the attempt. A hand-off request asks the member the asker
 //! ranked first to run the takeover itself.
 //!
@@ -102,7 +103,10 @@ pub enum DfsTakeoverAbstainReason {
     NotAMember,
     /// This node's record names a later epoch than the asker's.
     NewerRecord,
-    /// This node's network has no verdict for the primary.
+    /// This node has no verdict for the primary that counts under its
+    /// record: the network has none, or a no-path verdict that already stood
+    /// when this node first read the epoch was examined without a conclusion,
+    /// or could not be examined.
     NoEvidence,
     /// The request is not a well-formed request from the asker.
     Malformed,

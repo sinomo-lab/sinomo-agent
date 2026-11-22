@@ -209,9 +209,15 @@ shard record wins.
 
 1. **Corroborate.** The candidate asks the other reachable write-set members, in
    one round, whether they still have a path to the primary and how far their
-   journal goes. A member asked has the network verify the primary first, unless
-   its verdict already says there is no path, so connectivity records that have
-   not yet aged out cannot veto a primary that died. Any member that still
+   journal goes. A member asked says it lost the primary only by the
+   candidate's own rule: its verdict turned to no path while it already observed
+   that primary at the current epoch, or an examination of the primary has
+   concluded with no path since. Otherwise it has the network examine the
+   primary first, so connectivity records that have not yet aged out can neither
+   veto a primary that died nor depose one that is alive. A member whose
+   examination ends without a conclusion answers that it has no evidence, which
+   neither vetoes nor ranks it, and a later question has the network examine
+   the primary again. Any member that still
    reaches the primary vetoes the attempt, so one node's poor link cannot depose
    a healthy primary. The remaining members are ranked by journal position, then
    non-mobile before mobile, then node id. A candidate that does not rank first
